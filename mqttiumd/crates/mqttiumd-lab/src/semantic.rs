@@ -1626,6 +1626,7 @@ pub fn representative_fact(kind: &str, topic_hex: &str) -> Option<RecoveredFact>
             revision: Revision::new(0),
             expiry: mqttiumd_contract::session::SessionExpiry::Never,
             opened_by: None,
+            detached: None,
         },
         "InboundExchange" => RecoveredFact::InboundExchange {
             exchange: ExchangeId {
@@ -1852,7 +1853,10 @@ fn store_snapshot(document: &Value, out: &mut Vec<Diagnostic>) {
 /// Names of the members that hold a 64-bit decimal string, in a trace
 /// payload or a snapshot. A test walks the schemas and fails when one of
 /// their 64-bit members is missing here.
-const COMPONENTS: [&str; 48] = [
+const COMPONENTS: [&str; 51] = [
+    "deadline",
+    "tick",
+    "logical",
     "source_observation_sequence",
     "through",
     "publication_through",
@@ -1964,6 +1968,30 @@ mod tests {
     use std::path::Path;
 
     use super::*;
+
+    #[test]
+    fn expiry_deadlines_and_anchor_ticks_are_canonical_u64_strings() {
+        for name in ["deadline", "tick", "logical"] {
+            let mut out = Vec::new();
+            decimal_strings(
+                Some(&serde_json::json!({(name): "18446744073709551615"})),
+                "",
+                &mut out,
+            );
+            assert!(out.is_empty());
+            decimal_strings(
+                Some(&serde_json::json!({(name): "18446744073709551616"})),
+                "",
+                &mut out,
+            );
+            assert_eq!(out.len(), 1);
+            assert_eq!(out[0].code, code::U64_OUT_OF_RANGE);
+            out.clear();
+            decimal_strings(Some(&serde_json::json!({(name): "01"})), "", &mut out);
+            assert_eq!(out.len(), 1);
+            assert_eq!(out[0].code, code::U64_NOT_CANONICAL);
+        }
+    }
 
     /// The rules of the P1 registry and the notes of its validation.
     fn p1_registry() -> (Value, Report) {

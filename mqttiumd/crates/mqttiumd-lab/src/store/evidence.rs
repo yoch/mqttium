@@ -25,7 +25,7 @@ use mqttiumd_contract::outcome::{
 };
 use mqttiumd_contract::packet::Qos;
 use mqttiumd_contract::receipts::ReceiptClosure;
-use mqttiumd_contract::session::{SessionChange, SessionExpiry};
+use mqttiumd_contract::session::{SessionChange, SessionDetachment, SessionExpiry};
 
 use super::adapter::{Answer, FaultId, FaultPoint, StoreEvent, Uncorrelated, WorkId, WorkKind};
 use super::durable::{Decision, DurableState, ObligationPhase, SessionState};
@@ -58,6 +58,21 @@ fn hex(bytes: &[u8]) -> String {
 
 fn qos(qos: Qos) -> Value {
     json!(qos as u8)
+}
+
+fn session_expiry(expiry: SessionExpiry) -> Value {
+    match expiry {
+        SessionExpiry::OnDisconnect => json!("OnDisconnect"),
+        SessionExpiry::Never => json!("Never"),
+        SessionExpiry::After(seconds) => json!({"After": seconds}),
+    }
+}
+
+fn detachment(detached: SessionDetachment) -> Value {
+    json!({
+        "operation": operation_id(detached.operation),
+        "deadline": detached.deadline.map(decimal),
+    })
 }
 
 fn operation_id(operation: OperationId) -> Value {
@@ -151,9 +166,17 @@ fn facts(facts: CommitFacts) -> Value {
                     cancelled,
                 } => json!({
                     "kind": "Opened", "session": session(id), "revision": decimal(revision.get()),
-                    "session_present": session_present, "expiry": match expiry { SessionExpiry::OnDisconnect => "OnDisconnect", SessionExpiry::Never => "Never" },
+                    "session_present": session_present, "expiry": session_expiry(expiry),
                     "retired": retired.map(session), "route_revision": decimal(route_revision.get()),
                     "cancelled": { "inbound": cancelled.inbound, "deliveries": cancelled.deliveries, "routes": cancelled.routes },
+                }),
+                SessionChange::Detached {
+                    session: id,
+                    expiry,
+                    detached,
+                } => json!({
+                    "kind": "Detached", "session": session(id),
+                    "expiry": session_expiry(expiry), "detached": detachment(detached),
                 }),
                 SessionChange::Closed {
                     session: id,
@@ -266,17 +289,21 @@ pub fn snapshot(state: &DurableState, context: SnapshotContext<'_>) -> Value {
         .sessions
         .iter()
         .map(|(id, record)| {
-            json!({
+            let mut row = json!({
                 "session": session(*id),
                 "client_id_hex": hex(&record.client_id),
                 "revision": decimal(record.revision.get()),
-                "expiry": match record.expiry { SessionExpiry::OnDisconnect => "OnDisconnect", SessionExpiry::Never => "Never" },
+                "expiry": session_expiry(record.expiry),
                 "opened_by": record.opened_by.map(operation_id),
                 "state": match record.state {
                     SessionState::Active => "Active",
                     SessionState::Terminal => "Terminal",
                 },
-            })
+            });
+            if let Some(detached) = record.detached {
+                row["detached"] = detachment(detached);
+            }
+            row
         })
         .collect();
     let routes: Vec<Value> = state
@@ -383,7 +410,7 @@ pub fn snapshot(state: &DurableState, context: SnapshotContext<'_>) -> Value {
         .collect();
     let limits = state.limits;
     let used = state.accounts;
-    json!({
+    let mut document = json!({
         "format": "mqttiumd.store-snapshot",
         "schema_version": 1,
         "run_id": context.run_id,
@@ -430,7 +457,17 @@ pub fn snapshot(state: &DurableState, context: SnapshotContext<'_>) -> Value {
                 "max_route_targets": usize_decimal(limits.max_route_targets),
             },
         },
-    })
+    });
+    if let Some(anchor) = state.session_clock {
+        document["meta"]["session_clock"] = json!({
+            "reading": {
+                "domain": hex(&anchor.reading.domain),
+                "tick": decimal(anchor.reading.tick),
+            },
+            "logical": decimal(anchor.logical),
+        });
+    }
+    document
 }
 
 /// One recovered fact as a `RecoveryPageRead` record writes it. The
@@ -481,14 +518,21 @@ pub fn recovered_fact(fact: &RecoveredFact) -> Value {
             revision,
             expiry,
             opened_by,
-        } => json!({
-            "kind": "Session",
-            "session": session(*id),
-            "client_id_hex": hex(client_id.as_slice()),
-            "revision": decimal(revision.get()),
-            "expiry": match expiry { SessionExpiry::OnDisconnect => "OnDisconnect", SessionExpiry::Never => "Never" },
-            "opened_by": opened_by.map(operation_id),
-        }),
+            detached,
+        } => {
+            let mut row = json!({
+                "kind": "Session",
+                "session": session(*id),
+                "client_id_hex": hex(client_id.as_slice()),
+                "revision": decimal(revision.get()),
+                "expiry": session_expiry(*expiry),
+                "opened_by": opened_by.map(operation_id),
+            });
+            if let Some(detached) = detached {
+                row["detached"] = detachment(*detached);
+            }
+            row
+        }
         RecoveredFact::InboundExchange {
             exchange,
             packet_id,
@@ -1024,5 +1068,67 @@ impl<'a> TraceWriter<'a> {
             }
             _ => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod expiry_tests {
+    use super::*;
+    use mqttiumd_contract::ids::{
+        LogicalOwnerId, OperationSeq, Revision, RunEpoch, StoreIncarnation,
+    };
+    use mqttiumd_contract::packet::SharedBytes;
+
+    fn operation() -> OperationId {
+        OperationId::new(
+            StoreIncarnation::new(1),
+            RunEpoch::new(2),
+            LogicalOwnerId::new(3),
+            OperationSeq::new(4),
+        )
+    }
+
+    #[test]
+    fn finite_recovery_and_detach_results_keep_the_occurrence_and_exact_deadline() {
+        let detached = SessionDetachment {
+            operation: operation(),
+            deadline: Some(u64::MAX),
+        };
+        let fact = RecoveredFact::Session {
+            session: SessionId::new(5),
+            client_id: SharedBytes::copy_from(b"client", 1024).unwrap(),
+            revision: Revision::new(1),
+            expiry: SessionExpiry::After(7),
+            opened_by: Some(operation()),
+            detached: Some(detached),
+        };
+        let row = recovered_fact(&fact);
+        assert_eq!(row["expiry"], json!({"After": 7}));
+        assert_eq!(row["detached"]["deadline"], json!("18446744073709551615"));
+        assert_eq!(row["detached"]["operation"], operation_id(operation()));
+        let result = facts(CommitFacts::SessionLifecycle(SessionChange::Detached {
+            session: SessionId::new(5),
+            expiry: SessionExpiry::After(7),
+            detached,
+        }));
+        assert_eq!(result["change"]["kind"], "Detached");
+        assert_eq!(result["change"]["detached"], row["detached"]);
+        assert_eq!(result["change"]["expiry"], row["expiry"]);
+    }
+
+    #[test]
+    fn legacy_recovery_keeps_its_shape_without_inventing_a_detachment() {
+        let fact = RecoveredFact::Session {
+            session: SessionId::new(5),
+            client_id: SharedBytes::copy_from(b"client", 1024).unwrap(),
+            revision: Revision::new(1),
+            expiry: SessionExpiry::Never,
+            opened_by: None,
+            detached: None,
+        };
+        let row = recovered_fact(&fact);
+        assert_eq!(row["expiry"], "Never");
+        assert!(row.get("detached").is_none());
+        assert_eq!(session_expiry(SessionExpiry::OnDisconnect), "OnDisconnect");
     }
 }

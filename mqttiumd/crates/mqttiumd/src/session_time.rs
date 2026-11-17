@@ -47,6 +47,10 @@ impl std::error::Error for TimeError {}
 /// The adapter owns the provider. Tests inject readings, never host clock changes.
 pub trait SessionClock: Send + Sync {
     fn read(&self) -> Result<SessionClockReading, TimeError>;
+
+    fn origin_status(&self) -> &'static str {
+        "injected_clock"
+    }
 }
 
 pub struct SystemClock {
@@ -81,6 +85,10 @@ impl SystemClock {
     }
 }
 impl SessionClock for SystemClock {
+    fn origin_status(&self) -> &'static str {
+        self.origin_status
+    }
+
     fn read(&self) -> Result<SessionClockReading, TimeError> {
         let time =
             clock_gettime(ClockId::CLOCK_BOOTTIME).map_err(|_| TimeError::ClockUnavailable)?;
