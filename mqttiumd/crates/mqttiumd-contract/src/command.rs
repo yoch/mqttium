@@ -961,6 +961,15 @@ mod tests {
     }
 
     #[test]
+    fn retained_acknowledged_recipe_rejects_qos0() {
+        let Recipe::AdmitPublication(mut admit) = admission(&[]) else { panic!() };
+        admit.retain = true;
+        admit.qos = Qos::AtMostOnce;
+        let recipe=Recipe::RetainedPublication(crate::retained::RetainedPublication{admission:admit,retain_targets:0});
+        assert_eq!(recipe.check(),Err(RecipeError::InvalidField("retained_qos")));
+    }
+
+    #[test]
     fn retained_extension_preserves_legacy_bytes_and_bounds_nesting() {
         let Recipe::AdmitPublication(mut admit) = admission(&[target(2, 0)]) else {
             panic!()
