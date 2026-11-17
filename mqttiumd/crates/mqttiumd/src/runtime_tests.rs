@@ -2563,6 +2563,110 @@ fn relay_control_reply(runtime: &mut Runtime<'_>, response: ControlResponse) {
 }
 
 #[test]
+fn a_real_duplicated_message_expiry_reply_cannot_reapply_removed_deliveries() {
+    use crate::session_time::testing::FakeClock;
+    let sample = |tick| SessionClockReading {
+        domain: [77; 32],
+        tick,
+    };
+    let clock = Arc::new(FakeClock::new(sample(100)));
+    with_runtime_clock(128, clock.clone(), |runtime, directory| {
+        let (subscriber, mut receiver) = peer(runtime);
+        runtime
+            .connect(subscriber, connect_packet(b"expiry-copy-target"))
+            .unwrap();
+        until(runtime, |r| r.session_requests.is_empty());
+        assert_eq!(read_frame(&mut receiver).0, 0x20);
+        runtime
+            .packet(subscriber, 0x82, vec![0, 1, 0, 0, 1, b't', 1])
+            .unwrap();
+        until(runtime, |r| r.inflight.is_empty() && r.inputs.is_empty());
+        assert_eq!(read_frame(&mut receiver).0, 0x90);
+        runtime.close(subscriber, "test_offline").unwrap();
+        until(runtime, |r| r.closing_inputs.is_empty());
+
+        let (publisher, mut sender) = peer(runtime);
+        runtime
+            .connect(publisher, connect_packet(b"expiry-copy-source"))
+            .unwrap();
+        until(runtime, |r| r.session_requests.is_empty());
+        assert_eq!(read_frame(&mut sender).0, 0x20);
+        runtime
+            .packet(
+                publisher,
+                0x32,
+                vec![0, 1, b't', 0, 1, 5, 2, 0, 0, 0, 1, b'v'],
+            )
+            .unwrap();
+        until(runtime, |r| r.inflight.is_empty() && r.inputs.is_empty());
+        assert_eq!(read_frame(&mut sender).0, 0x40);
+        let path = directory.join("store.sqlite");
+        let queued = mqttiumd_store_sqlite::SqliteStore::inspect(&path).unwrap();
+        assert_eq!(queued.obligations.len(), 1);
+        let original = *queued.obligations.keys().next().unwrap();
+
+        clock.set(sample(1_000_000_100));
+        let now = runtime.message_now().unwrap();
+        runtime.message_expiry_request = Some((now, None));
+        runtime
+            .writer
+            .control_sender
+            .send(ControlRequest::MessageExpiry {
+                now,
+                after: None,
+                limit: 4,
+            })
+            .unwrap();
+        let response = runtime
+            .writer
+            .control_receiver
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap();
+        let ControlResponse::MessageExpiry {
+            result: Ok(sweep), ..
+        } = &response
+        else {
+            panic!("real committed Message Expiry response");
+        };
+        assert_eq!(sweep.removed.len(), 1);
+        assert_eq!(sweep.removed.as_slice()[0].delivery, original);
+        let duplicate = response.clone();
+        relay_control_reply(runtime, response);
+        runtime.drain_inputs().unwrap();
+        assert!(runtime.message_expiry_input.is_none());
+        let expired = mqttiumd_store_sqlite::SqliteStore::inspect(&path).unwrap();
+        assert!(expired.obligations.is_empty());
+        assert_eq!(expired.accounts.references.get(), 0);
+
+        runtime
+            .packet(
+                publisher,
+                0x32,
+                vec![0, 1, b't', 0, 2, 5, 2, 0, 0, 0, 30, b'w'],
+            )
+            .unwrap();
+        until(runtime, |r| r.inflight.is_empty() && r.inputs.is_empty());
+        assert_eq!(read_frame(&mut sender).0, 0x40);
+        let fresh = mqttiumd_store_sqlite::SqliteStore::inspect(&path).unwrap();
+        assert_eq!(fresh.obligations.len(), 1);
+        assert_ne!(*fresh.obligations.keys().next().unwrap(), original);
+        relay_control_reply(runtime, duplicate);
+        assert!(
+            runtime.message_expiry_input.is_none(),
+            "duplicate_message_expiry_reply_reapplied_removed_ids"
+        );
+        let after = mqttiumd_store_sqlite::SqliteStore::inspect(&path).unwrap();
+        assert_eq!(
+            after.accounts, fresh.accounts,
+            "duplicate_expiry_reply_changed_credits"
+        );
+        assert_eq!(after.obligations, fresh.obligations);
+        assert_eq!(after.publications, fresh.publications);
+        assert_eq!(after.payloads, fresh.payloads);
+    });
+}
+
+#[test]
 fn disconnect_zero_applies_open_already_relayed_during_its_own_drain() {
     with_runtime(128, |runtime, directory| {
         let (generation, _client) = peer(runtime);
