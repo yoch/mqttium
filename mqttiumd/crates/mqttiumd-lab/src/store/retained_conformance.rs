@@ -1100,13 +1100,11 @@ pub mod expiry {
             "unknown_origin_replayed_as_fresh"
         );
         let before = w.store.snapshot().unwrap();
-        for bad in [at(100)] {
-            assert_eq!(
-                w.store.expire_messages(bad, None, 4),
-                Err(ReadError::InvalidData)
-            );
-            assert_eq!(w.store.snapshot().unwrap(), before);
-        }
+        assert_eq!(
+            w.store.expire_messages(at(100), None, 4),
+            Err(ReadError::InvalidData)
+        );
+        assert_eq!(w.store.snapshot().unwrap(), before);
         let stale = w
             .store
             .expire_messages(
