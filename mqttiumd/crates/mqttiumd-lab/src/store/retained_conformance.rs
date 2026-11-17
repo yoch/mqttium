@@ -875,7 +875,8 @@ pub mod expiry {
         for target in [w.b, w.c] {
             assert_eq!(
                 w.store.read_work(target, None, 8).unwrap().items.as_slice()[0].expiry,
-                Some(expiry)
+                Some(expiry),
+                "replay_refreshed_expiry_origin"
             );
         }
         let sweep = w.store.expire_messages(at(2), None, 4).unwrap();
@@ -948,10 +949,7 @@ pub mod expiry {
             ),
         );
         let sweep = w.store.expire_messages(at(1), None, 4).unwrap();
-        assert!(
-            sweep.removed.is_empty(),
-            "sweep_invented_certain_not_started"
-        );
+        assert!(sweep.removed.is_empty(), "started_claim_payload_released");
         assert_eq!(sweep.retained_removed, 1);
         let state = w.store.snapshot().unwrap();
         assert_eq!(state.accounts.references.get(), 2);
@@ -1109,7 +1107,17 @@ pub mod expiry {
             );
             assert_eq!(w.store.snapshot().unwrap(), before);
         }
-        let stale = w.store.expire_messages(MessageTime { tick: foreign.tick - 1, ..foreign }, None, 4).unwrap();
+        let stale = w
+            .store
+            .expire_messages(
+                MessageTime {
+                    tick: foreign.tick - 1,
+                    ..foreign
+                },
+                None,
+                4,
+            )
+            .unwrap();
         assert_eq!(stale.quarantined, 1);
         // Historical tag 12 has no temporal observation and must skip expiring values.
         let legacy = subscribe(&w, 3, w.c, 2000, &[(b"expiry/#", Qos::AtMostOnce, 0)]);
@@ -1160,7 +1168,7 @@ pub mod expiry {
         );
         assert_eq!(state.accounts.references.get(), 64);
         for row in state.publications.values() {
-            assert_eq!(row.expiry, Some(expiry));
+            assert_eq!(row.expiry, Some(expiry), "replay_refreshed_expiry_origin");
         }
         let mut cursor = None;
         let mut removed = 0;
@@ -1186,7 +1194,143 @@ pub mod expiry {
         assert!(w.store.read_work(w.c, None, 8).unwrap().items.is_empty());
     }
 
+    pub fn expired_retained_values_are_skipped_without_maintenance<S: DurableStore>(
+        make: &dyn Fn(StoreIncarnation, Limits) -> S,
+    ) {
+        let mut w = World::with_limits(make, limits());
+        clock(&mut w.store, at(0));
+        let c = expiring(
+            admitted(&w, 1, b"expiry/value", b"old", Qos::AtLeastOnce, &[]),
+            lifetime(1),
+        );
+        commit(&mut w.store, &c);
+        let replay = timed(
+            subscribe(&w, 2, w.b, 1000, &[(b"expiry/#", Qos::AtMostOnce, 0)]),
+            at(1),
+        );
+        commit(&mut w.store, &replay);
+        assert!(
+            w.store.read_work(w.b, None, 8).unwrap().items.is_empty(),
+            "expired_retained_replayed"
+        );
+        assert_eq!(
+            w.store.snapshot().unwrap().retained.len(),
+            1,
+            "selection performed unrequested maintenance"
+        );
+    }
+
+    pub fn offline_expiry_removes_pending_copies<S: DurableStore>(
+        make: &dyn Fn(StoreIncarnation, Limits) -> S,
+    ) {
+        use mqttiumd_contract::session::{
+            SessionAction, SessionExpiry, SessionGuard, SessionLifecycle,
+        };
+        let mut w = World::with_limits(make, limits());
+        clock(&mut w.store, at(0));
+        let b = w.b;
+        let client = w.store.snapshot().unwrap().sessions[&b].client_id.clone();
+        let opened = operation_id(w.epoch, 1);
+        commit(
+            &mut w.store,
+            &frozen(
+                Recipe::SessionLifecycle(SessionLifecycle {
+                    operation: opened,
+                    action: SessionAction::Open {
+                        client_id: bytes(&client),
+                        expected: Some(SessionGuard {
+                            session: b,
+                            opened_by: None,
+                        }),
+                        clean_start: false,
+                        expiry: SessionExpiry::Never,
+                    },
+                }),
+                None,
+            ),
+        );
+        let c = expiring(
+            admitted(&w, 2, b"expiry/offline", b"pending", Qos::AtLeastOnce, &[b]),
+            lifetime(2),
+        );
+        commit(&mut w.store, &c);
+        commit(
+            &mut w.store,
+            &frozen(
+                Recipe::SessionLifecycle(SessionLifecycle {
+                    operation: operation_id(w.epoch, 3),
+                    action: SessionAction::Detach {
+                        guard: SessionGuard {
+                            session: b,
+                            opened_by: Some(opened),
+                        },
+                        expiry: SessionExpiry::Never,
+                        observed_at: 0,
+                    },
+                }),
+                None,
+            ),
+        );
+        assert!(w.store.snapshot().unwrap().sessions[&b].detached.is_some());
+        let result = w.store.expire_messages(at(2), None, 4).unwrap();
+        assert_eq!(result.removed.len(), 1, "offline_expiry_ignored");
+        assert!(
+            w.store.read_work(b, None, 8).unwrap().items.is_empty(),
+            "offline_expiry_ignored"
+        );
+        assert!(
+            w.store.snapshot().unwrap().sessions[&b].detached.is_some(),
+            "message expiry ended persistent session"
+        );
+    }
+
+    pub fn frozen_observations_may_precede_latest_checkpoint<S: DurableStore>(
+        make: &dyn Fn(StoreIncarnation, Limits) -> S,
+    ) {
+        let mut w = World::with_limits(make, limits());
+        clock(&mut w.store, at(5));
+        let expiry = lifetime(10);
+        let c = expiring(
+            admitted(&w, 1, b"expiry/frozen", b"held", Qos::AtLeastOnce, &[]),
+            expiry,
+        );
+        commit(&mut w.store, &c);
+        let replay = timed(
+            subscribe(&w, 2, w.b, 1000, &[(b"expiry/#", Qos::AtMostOnce, 0)]),
+            at(4),
+        );
+        commit(&mut w.store, &replay);
+        assert_eq!(
+            w.store.read_work(w.b, None, 8).unwrap().items.as_slice()[0].expiry,
+            Some(expiry),
+            "checkpoint_renewed_or_refused_frozen_lifetime"
+        );
+        let future = MessageExpiry {
+            observed: at(20),
+            interval: 1,
+        };
+        let c = expiring(
+            admitted(&w, 3, b"expiry/future", b"future", Qos::AtLeastOnce, &[]),
+            future,
+        );
+        commit(&mut w.store, &c);
+        let before = w.store.snapshot().unwrap();
+        assert_eq!(
+            w.store.expire_messages(at(19), None, 4),
+            Err(ReadError::InvalidData),
+            "future_origin_was_treated_as_expired"
+        );
+        assert_eq!(
+            w.store.snapshot().unwrap(),
+            before,
+            "partial maintenance survived temporal refusal"
+        );
+    }
+
     pub fn all<S: DurableStore>(make: &dyn Fn(StoreIncarnation, Limits) -> S) {
+        expired_retained_values_are_skipped_without_maintenance(make);
+        offline_expiry_removes_pending_copies(make);
+        frozen_observations_may_precede_latest_checkpoint(make);
         shared_refs_replay_and_source_end(make);
         claimed_copies_require_exact_never_started_guard(make);
         zero_replacement_at_capacity_and_qos2_continuation(make);
