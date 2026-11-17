@@ -316,6 +316,7 @@ pub mod transport {
                 let raw = packet_id.map(InboundPacketId::get);
                 Ok((
                     InboundPacket::Publish {
+                        expiry: None,
                         topic,
                         qos,
                         retain,
