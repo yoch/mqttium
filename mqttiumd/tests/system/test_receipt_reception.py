@@ -53,6 +53,16 @@ class Broker:
 
 
 class ReceiptControlWaitTests(unittest.TestCase):
+    def test_current_business_window_matches_its_independent_profile_and_pressure(self):
+        profile_path = Path(__file__).resolve().parents[2] / 'contracts/v1/product-profile.json'
+        window = json.loads(profile_path.read_text())['receipt_data_window']
+        self.assertEqual(BUSINESS_WINDOW, window, 'receipt_pressure_window_drift')
+        event = {**PRESSURE, 'details': {**PRESSURE['details'], 'span': window}}
+        state = {'durable_floor': 0, 'maximum_retained_sequence': window,
+                 'retained_span': window, 'unknown_receipt_present': True}
+        self.assertTrue(stable_receipt_pressure(event, state, 1),
+                        'effective_receipt_pressure_not_recognized')
+
     def test_interim_unknown_resolution_does_not_hide_later_commit(self):
         operation = {"incarnation": "1", "epoch": "1", "owner": "0", "sequence": "13"}
         unknown = {"kind": "store_resolved", "seq": "10", "operation": operation,
