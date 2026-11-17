@@ -33,18 +33,28 @@ async def peer(kind, broker, case, label, *, will=None, expiry=0xFFFFFFFF,
     try:
         await client.open(present)
     except BaseException:
-        await client.disconnect()
-        tap.close()
+        try:
+            await client.disconnect()
+        finally:
+            tap.close()
         raise
     return client, tap
 
 
 async def close_peers(values):
+    failures = []
     for client, tap in values:
         try:
             await client.disconnect()
+        except Exception as error:
+            failures.append(error)
         finally:
-            tap.close()
+            try:
+                tap.close()
+            except Exception as error:
+                failures.append(error)
+    if failures:
+        raise failures[0]
 
 
 class Sensor:

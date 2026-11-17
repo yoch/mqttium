@@ -10,7 +10,6 @@ import argparse
 import asyncio
 from dataclasses import dataclass
 import hashlib
-import json
 import os
 from pathlib import Path
 import time
@@ -34,7 +33,7 @@ class Will:
         if (not isinstance(self.topic, str) or not 0 < len(self.topic.encode()) <= 1024
                 or any(value in self.topic for value in ('\0', '+', '#'))
                 or not isinstance(self.payload, bytes) or len(self.payload) > 32768
-                or self.delay not in (None, 0)):
+                or not (self.delay is None or type(self.delay) is int and self.delay == 0)):
             raise ValueError('non-retained QoS1 Will, exact topic, bounded payload and delay0 required')
 
     def observation(self):
