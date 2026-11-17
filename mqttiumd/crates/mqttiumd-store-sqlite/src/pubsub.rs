@@ -363,6 +363,11 @@ pub(super) fn consume(
 pub(super) fn facts_blob(facts: CommitFacts) -> Option<(i64, Vec<u8>)> {
     let mut bytes = Vec::new();
     let code = match facts {
+        CommitFacts::WillPublished { will, publication } => {
+            bytes.extend_from_slice(&will.to_be_bytes());
+            bytes.extend_from_slice(&publication.to_be_bytes());
+            12
+        }
         CommitFacts::SessionLifecycle(change) => return Some((8, sessions::encode(change))),
         CommitFacts::RetainedQos0Stored { publication } => {
             bytes.extend_from_slice(&publication.to_be_bytes());
@@ -425,6 +430,12 @@ pub(super) fn facts_blob(facts: CommitFacts) -> Option<(i64, Vec<u8>)> {
 }
 
 pub(super) fn decode_facts(code: i64, bytes: &[u8]) -> Result<CommitFacts, Corrupt> {
+    if code == 12 && bytes.len() == 64 {
+        return Ok(CommitFacts::WillPublished {
+            will: OperationId::from_be_slice(&bytes[..32]).map_err(|_| Corrupt)?,
+            publication: PublicationId::from_be_slice(&bytes[32..]).map_err(|_| Corrupt)?,
+        });
+    }
     if code == 9 {
         return Ok(CommitFacts::RetainedQos0Stored {
             publication: PublicationId::from_be_slice(bytes).map_err(|_| Corrupt)?,

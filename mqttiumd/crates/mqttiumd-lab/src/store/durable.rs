@@ -14,6 +14,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 #[path = "retained.rs"]
 mod retained_memory;
+#[path = "will.rs"]
+mod will_memory;
 
 use mqttiumd_contract::capacity::{
     BoundedVec, ExchangeSlots, PayloadBytes, ReceiptSlots, References, Resource,
@@ -62,7 +64,8 @@ pub struct MemoryStore {
 struct Admission<'a> {
     expiry: Option<MessageExpiry>,
     operation: OperationId,
-    request: mqttiumd_contract::ids::RequestId,
+    request: Option<mqttiumd_contract::ids::RequestId>,
+    will: Option<OperationId>,
     publication: PublicationId,
     source_session: SessionId,
     source_revision: Revision,
@@ -83,7 +86,8 @@ impl<'a> From<&'a AdmitPublication> for Admission<'a> {
         Self {
             expiry: None,
             operation: a.operation,
-            request: a.request,
+            request: Some(a.request),
+            will: None,
             publication: a.publication,
             source_session: a.source.session,
             source_revision: a.source.session_revision,
@@ -103,7 +107,8 @@ impl<'a> From<&'a mqttiumd_contract::retained::RetainedQos0> for Admission<'a> {
         Self {
             expiry: None,
             operation: a.operation,
-            request: a.request,
+            request: Some(a.request),
+            will: None,
             publication: a.publication,
             source_session: a.session,
             source_revision: a.session_revision,
@@ -142,6 +147,7 @@ impl MemoryStore {
                 fences: BTreeSet::new(),
                 receipt_frontiers: BTreeMap::new(),
                 retained: BTreeMap::new(),
+                wills: BTreeMap::new(),
                 publications: BTreeMap::new(),
                 payloads: BTreeMap::new(),
                 obligations: BTreeMap::new(),
@@ -401,6 +407,7 @@ fn delivery_claim(
 }
 
 fn check_inventory_bound(state: &DurableState) -> Result<(), ReadError> {
+    will_memory::validate(state)?;
     for publication in state.publications.values() {
         if let Some(expiry) = publication.expiry {
             if expiry.observed.domain == [0; 32] {
@@ -542,6 +549,18 @@ fn check_snapshot(state: &DurableState, budget: ReadBudget) -> Result<(), ReadEr
     if state.session_clock.is_some() {
         budget.check_field(32)?;
         meter.charge(176)?;
+    }
+    for intent in state.wills.values() {
+        for field in [&intent.client_id, &intent.spec.topic, &intent.spec.payload] {
+            budget.check_field(field.len())?;
+        }
+        meter.charge(
+            128usize
+                .checked_add(intent.client_id.len())
+                .and_then(|n| n.checked_add(intent.spec.topic.len()))
+                .and_then(|n| n.checked_add(intent.spec.payload.len()))
+                .ok_or(ReadError::LimitExceeded)?,
+        )?;
     }
     for record in state.sessions.values() {
         meter.field(record.client_id.len(), MAX_CLIENT_ID_BYTES)?;
@@ -802,11 +821,9 @@ impl Staging for DurableState {
             admit.payload.id.incarnation(),
             admit.payload.id.epoch(),
             admit.payload.id.owner(),
-        ) || !same_scope(
-            admit.request.incarnation(),
-            admit.request.epoch(),
-            admit.request.owner(),
-        ) {
+        ) || admit.request.is_some_and(|request| {
+            !same_scope(request.incarnation(), request.epoch(), request.owner())
+        }) {
             return Err(failed);
         }
         let expired = if let Some(expiry) = admit.expiry {
@@ -850,7 +867,9 @@ impl Staging for DurableState {
         {
             return Err(failed);
         }
-        self.active_session(admit.source_session, admit.source_revision)?;
+        if admit.will.is_none() {
+            self.active_session(admit.source_session, admit.source_revision)?;
+        }
 
         // A payload identity names one payload, kept or not.
         if self.publications.contains_key(&admit.publication)
@@ -1380,7 +1399,14 @@ impl Staging for DurableState {
 
     fn stage_session(&mut self, command: &SessionLifecycle) -> Guard<CommitFacts> {
         let failed = RejectReason::PreconditionFailed;
+        if matches!(command.action, SessionAction::OpenWillAt { .. }) {
+            return will_memory::open(self, command);
+        }
+        if matches!(command.action, SessionAction::EndWill { .. }) {
+            return will_memory::end(self, command);
+        }
         let change = match &command.action {
+            SessionAction::OpenWillAt { .. } | SessionAction::EndWill { .. } => return Err(failed),
             SessionAction::Open {
                 client_id,
                 expected,
@@ -1395,6 +1421,9 @@ impl Staging for DurableState {
                 ..
             } => {
                 if matches!(expiry, SessionExpiry::After(_)) && self.session_clock.is_none() {
+                    return Err(failed);
+                }
+                if self.wills.values().any(|i| i.client_id == *client_id) {
                     return Err(failed);
                 }
                 let mut found = self.sessions.iter().filter(|(_, r)| {
@@ -1660,6 +1689,9 @@ fn cancel_session(
     session: SessionId,
 ) -> Result<SessionCancellations, AdminRefused> {
     let broken = AdminRefused::Inconsistent;
+    for intent in state.wills.values_mut().filter(|i| i.session == session) {
+        intent.state = mqttiumd_contract::will::WillState::Pending;
+    }
     let row = state
         .sessions
         .get(&session)
@@ -1830,6 +1862,15 @@ fn check_message_observation(state: &DurableState, now: MessageTime) -> Result<(
 }
 
 impl DurableStore for MemoryStore {
+    fn read_wills(
+        &self,
+        after: Option<OperationId>,
+        limit: usize,
+        budget: ReadBudget,
+    ) -> Result<WillPage, ReadError> {
+        will_memory::page(&self.committed, after, limit, budget)
+    }
+
     fn expire_messages(
         &mut self,
         now: MessageTime,
@@ -2006,6 +2047,9 @@ impl DurableStore for MemoryStore {
             check_inventory_bound(&self.committed)?;
             let mut staged = self.committed.clone();
             staged.ledger = ledger;
+            for intent in staged.wills.values_mut() {
+                intent.state = mqttiumd_contract::will::WillState::Pending;
+            }
             // Previous transports are gone. Already-detached deadlines never
             // restart; attached finite sessions get the first reliable startup
             // observation exactly once in this new-epoch transaction.
@@ -2146,6 +2190,9 @@ impl DurableStore for MemoryStore {
         // 2 to 5. Guards, capacities and every row, on a staged copy.
         let mut staged = self.committed.clone();
         let facts = match recipe {
+            Recipe::WillPublication(value) => {
+                will_memory::publish(&mut staged, value, command.payload.as_ref())
+            }
             Recipe::AdmitPublication(admit) => {
                 staged.stage_admission(admit, command.payload.as_ref())
             }

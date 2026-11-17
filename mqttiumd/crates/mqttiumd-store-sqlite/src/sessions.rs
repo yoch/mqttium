@@ -176,6 +176,8 @@ pub(super) fn erase(
     session: SessionId,
 ) -> Result<SessionCancellations, Abort<AdminRefused>> {
     let broken = Abort::Refused(AdminRefused::Inconsistent);
+    conn.prepare_cached("UPDATE wills SET state=2 WHERE session=?1 AND state=1")?
+        .execute([session.to_be_bytes().as_slice()])?;
     let revision = match session_row(conn, session)? {
         Some((revision, SessionState::Active)) => revision,
         _ => return Err(Abort::Refused(AdminRefused::UnknownSession)),
@@ -354,7 +356,14 @@ pub(super) fn stage(
     command: &SessionLifecycle,
 ) -> Guard<CommitFacts> {
     let failed = RejectReason::PreconditionFailed;
+    if matches!(command.action, SessionAction::OpenWillAt { .. }) {
+        return will::open(conn, meta, command);
+    }
+    if matches!(command.action, SessionAction::EndWill { .. }) {
+        return will::end(conn, meta, command);
+    }
     let change = match &command.action {
+        SessionAction::OpenWillAt { .. } | SessionAction::EndWill { .. } => return refused(failed),
         SessionAction::Open {
             client_id,
             expected,
@@ -369,6 +378,9 @@ pub(super) fn stage(
             ..
         } => {
             if matches!(expiry, SessionExpiry::After(_)) && clock(conn)?.is_none() {
+                return refused(failed);
+            }
+            if will::has_client(conn, client_id.as_slice())? {
                 return refused(failed);
             }
             let current = active_for_client(conn, meta, client_id.as_slice())?;

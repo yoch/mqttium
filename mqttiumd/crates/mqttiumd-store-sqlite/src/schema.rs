@@ -1,11 +1,11 @@
-//! The schema of version 9. Every table is `STRICT`; identities and 64-bit
+//! The schema of version 10. Every table is `STRICT`; identities and 64-bit
 //! values are 8-byte big-endian BLOBs (32 bytes for an operation-scoped
 //! identity, 16 for an exchange, 24 for an opening attempt); large BLOBs
 //! come last in their row.
 
 /// `PRAGMA user_version` of the schema below. Any other version is
 /// refused before anything is written.
-pub const SCHEMA_VERSION: i64 = 9;
+pub const SCHEMA_VERSION: i64 = 10;
 
 /// The format named in `meta`.
 pub const FORMAT: &str = "mqttiumd-store-sqlite";
@@ -45,6 +45,15 @@ CREATE TABLE sessions (
     detached_by BLOB CHECK (detached_by IS NULL OR length(detached_by) = 32),
     deadline BLOB CHECK (deadline IS NULL OR length(deadline) = 8),
     client_id BLOB NOT NULL
+) STRICT, WITHOUT ROWID;
+
+CREATE TABLE wills (
+    id BLOB PRIMARY KEY CHECK (length(id)=32),
+    session BLOB NOT NULL CHECK (length(session)=8),
+    state INTEGER NOT NULL,
+    client_id BLOB NOT NULL,
+    topic BLOB NOT NULL,
+    payload BLOB NOT NULL
 ) STRICT, WITHOUT ROWID;
 
 CREATE TABLE session_clock (

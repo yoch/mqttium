@@ -155,6 +155,9 @@ fn reason(reason: RejectReason) -> &'static str {
 
 fn facts(facts: CommitFacts) -> Value {
     match facts {
+        CommitFacts::WillPublished { will, publication } => {
+            json!({"kind":"WillPublished","will_id":operation_id(will),"publication_id":publication_id(publication)})
+        }
         CommitFacts::SessionLifecycle(change) => {
             let change = match change {
                 SessionChange::Opened {
@@ -498,6 +501,9 @@ pub fn snapshot(state: &DurableState, context: SnapshotContext<'_>) -> Value {
             },
         },
     });
+    if !state.wills.is_empty() {
+        document["wills"]=json!(state.wills.values().map(|intent|json!({"will_id":operation_id(intent.id),"source_session":session(intent.session),"client_id_hex":hex(intent.client_id.as_slice()),"state":match intent.state {mqttiumd_contract::will::WillState::Armed=>"Armed",mqttiumd_contract::will::WillState::Pending=>"Pending"},"topic_hex":hex(intent.spec.topic.as_slice()),"payload_hex":hex(intent.spec.payload.as_slice())})).collect::<Vec<_>>());
+    }
     if !state.retained.is_empty() {
         document["retained"]=json!(state.retained.iter().map(|(topic,record)|json!({"topic_hex":hex(topic),"publication_id":publication_id(record.publication),"producer_client_id_hex":hex(&record.producer_client_id)})).collect::<Vec<_>>());
     }
@@ -932,7 +938,8 @@ impl<'a> TraceWriter<'a> {
                             "operation_id": operation_id(*operation),
                         }),
                     ),
-                    WorkKind::ExpiringPublication
+                    WorkKind::WillPublication
+                    | WorkKind::ExpiringPublication
                     | WorkKind::TimedReplaySubscriptions
                     | WorkKind::MarkDeliveryStarted
                     | WorkKind::ExpireDelivery

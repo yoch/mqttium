@@ -201,7 +201,7 @@ pub(crate) fn snapshot(conn: &Connection, meta: &Meta, budget: ReadBudget) -> Re
         budget.check_field(24)?;
     }
     meter.charge(256)?;
-    let tables: [(&str, &[(usize, usize)]); 12] = [
+    let tables: [(&str, &[(usize, usize)]); 13] = [
         (
             "SELECT id, client_id, revision, state, expiry, opened_by, detached_by, deadline FROM sessions",
             &[
@@ -211,6 +211,16 @@ pub(crate) fn snapshot(conn: &Connection, meta: &Meta, budget: ReadBudget) -> Re
                 (5, 32),
                 (6, 32),
                 (7, 8),
+            ],
+        ),
+        (
+            "SELECT id,session,state,client_id,topic,payload FROM wills",
+            &[
+                (0, 32),
+                (1, 8),
+                (3, mqttiumd_contract::session::MAX_SESSION_CLIENT_BYTES),
+                (4, mqttiumd_contract::will::MAX_WILL_TOPIC_BYTES),
+                (5, mqttiumd_contract::will::MAX_WILL_PAYLOAD_BYTES),
             ],
         ),
         (

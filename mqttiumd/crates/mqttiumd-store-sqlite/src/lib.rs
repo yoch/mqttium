@@ -53,6 +53,7 @@ mod receipts;
 mod retained;
 mod schema;
 mod sessions;
+mod will;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{File, OpenOptions, TryLockError};
@@ -108,7 +109,8 @@ pub use schema::{FORMAT, SCHEMA_VERSION};
 struct Admission<'a> {
     expiry: Option<MessageExpiry>,
     operation: OperationId,
-    request: mqttiumd_contract::ids::RequestId,
+    request: Option<mqttiumd_contract::ids::RequestId>,
+    will: Option<OperationId>,
     publication: PublicationId,
     source_session: SessionId,
     source_revision: Revision,
@@ -129,7 +131,8 @@ impl<'a> From<&'a AdmitPublication> for Admission<'a> {
         Self {
             expiry: None,
             operation: a.operation,
-            request: a.request,
+            request: Some(a.request),
+            will: None,
             publication: a.publication,
             source_session: a.source.session,
             source_revision: a.source.session_revision,
@@ -149,7 +152,8 @@ impl<'a> From<&'a mqttiumd_contract::retained::RetainedQos0> for Admission<'a> {
         Self {
             expiry: None,
             operation: a.operation,
-            request: a.request,
+            request: Some(a.request),
+            will: None,
             publication: a.publication,
             source_session: a.session,
             source_revision: a.session_revision,
@@ -624,7 +628,7 @@ impl DecisionColumns {
                 self.reason.ok_or(Corrupt)?,
                 self.resource,
             )?)),
-            4..=11 => Ok(Decision::Committed(pubsub::decode_facts(
+            4..=12 => Ok(Decision::Committed(pubsub::decode_facts(
                 self.decision,
                 self.facts.as_deref().ok_or(Corrupt)?,
             )?)),
@@ -855,11 +859,10 @@ fn stage_publication(
         admit.payload.id.incarnation(),
         admit.payload.id.epoch(),
         admit.payload.id.owner(),
-    ) || !same_scope(
-        admit.request.incarnation(),
-        admit.request.epoch(),
-        admit.request.owner(),
-    ) {
+    ) || admit
+        .request
+        .is_some_and(|request| !same_scope(request.incarnation(), request.epoch(), request.owner()))
+    {
         return refused(failed);
     }
     let expired = if let Some(expiry) = admit.expiry {
@@ -906,7 +909,9 @@ fn stage_publication(
     {
         return refused(failed);
     }
-    active_session(conn, admit.source_session, admit.source_revision)?;
+    if admit.will.is_none() {
+        active_session(conn, admit.source_session, admit.source_revision)?;
+    }
 
     if retained::identity_was_used(
         conn,
@@ -2525,6 +2530,7 @@ fn read_snapshot(conn: &Connection, budget: ReadBudget) -> Result<DurableState, 
             fences,
             receipt_frontiers: receipts::all_frontiers(conn, &meta, budget)?,
             retained: retained::snapshot(conn, &meta, budget)?,
+            wills: will::snapshot(conn, &meta, budget)?,
             publications,
             payloads,
             obligations,
@@ -2534,7 +2540,24 @@ fn read_snapshot(conn: &Connection, budget: ReadBudget) -> Result<DurableState, 
     }
 }
 
+impl SqliteStore {
+    /// Bounded attachment barrier, independent of mutable ClientID caches.
+    pub fn has_will_for_client(&self, client: &[u8]) -> Result<bool, ReadError> {
+        will::has_client(&self.conn, client).map_err(|e| e.read_error())
+    }
+}
+
 impl DurableStore for SqliteStore {
+    fn read_wills(
+        &self,
+        after: Option<OperationId>,
+        limit: usize,
+        budget: ReadBudget,
+    ) -> Result<mqttiumd_store_api::WillPage, ReadError> {
+        let meta = read_meta(&self.conn).map_err(|e| e.read_error())?;
+        will::page(&self.conn, &meta, after, limit, budget).map_err(|e| e.read_error())
+    }
+
     fn expire_messages(
         &mut self,
         now: MessageTime,
@@ -2615,6 +2638,7 @@ impl DurableStore for SqliteStore {
         if let LedgerOpening::Opens { ledger } = self.read_ledger()?.open(command)
             && let Txn::ReadFailed(error) = self.transact(|conn, meta| {
                 meta.ledger = ledger;
+                will::recover(conn)?;
                 sessions::expire(conn, meta)?;
                 Ok::<(), Abort<()>>(())
             })
@@ -2720,6 +2744,7 @@ impl DurableStore for SqliteStore {
         let payload = command.payload.as_ref();
         let written = self.transact(|conn, meta| {
             let facts = match recipe {
+                Recipe::WillPublication(value) => will::publish(conn, meta, value, payload)?,
                 Recipe::AdmitPublication(admit) => stage_admission(conn, meta, admit, payload)?,
                 Recipe::RetainedPublication(value) => stage_publication(
                     conn,

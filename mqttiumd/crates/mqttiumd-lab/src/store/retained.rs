@@ -19,6 +19,9 @@ pub(super) fn bounds(recipe: &Recipe) -> Result<Option<IdentityBounds>, ReadErro
             payload: Some(payload),
         })
     };
+    if let Recipe::WillPublication(a) = recipe {
+        return Ok(one(a.publication, a.payload.id));
+    }
     if let Some(a) = recipe.admission() {
         return Ok(one(a.publication, a.payload.id));
     }
@@ -80,6 +83,9 @@ pub(super) fn receipt_bounds(
     };
     let valid = match record.decision {
         Decision::Rejected(_) => recipe.replay_subscriptions().is_some(),
+        Decision::Committed(CommitFacts::WillPublished { will, publication }) => {
+            matches!(&recipe,Recipe::WillPublication(a) if a.will==will && a.publication==publication)
+        }
         Decision::Committed(CommitFacts::PublicationAdmitted {
             publication,
             exchange,
