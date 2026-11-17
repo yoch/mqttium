@@ -15,7 +15,7 @@ Install the Mosquitto **client tools** using your distribution's package manager
 In a second terminal, start the temperature dashboard:
 
 ```sh
-mosquitto_sub -V mqttv5 -c -i preview-dashboard \
+mosquitto_sub -d -V mqttv5 -c -i preview-dashboard \
   -D CONNECT session-expiry-interval 4294967295 \
   -h 127.0.0.1 -p 1883 -q 1 -t 'atelier/+/temperature' -v
 ```
@@ -24,7 +24,7 @@ In a third terminal, start the archive receiver (it prints messages; the broker
 is a delivery service, not a permanent publication archive):
 
 ```sh
-mosquitto_sub -V mqttv5 -c -i preview-archive \
+mosquitto_sub -d -V mqttv5 -c -i preview-archive \
   -D CONNECT session-expiry-interval 4294967295 \
   -h 127.0.0.1 -p 1883 -q 1 -t 'atelier/#' -v
 ```
@@ -53,6 +53,19 @@ local contribution. Unsubscribe removes the literal filter, not other overlaps.
 Stop the archive receiver, publish another QoS 1 message, stop the broker with
 Ctrl-C, then restart `./start.sh ./data` and reconnect that receiver with the
 same identity and flags. Its persistent session and pending delivery survive.
+To replace the archive receiver's wildcard with a single room temperature,
+stop its old process and reconnect the same session with a literal unsubscribe:
+
+```sh
+mosquitto_sub -d -V mqttv5 -c -i preview-archive \
+  -D CONNECT session-expiry-interval 4294967295 \
+  -h 127.0.0.1 -p 1883 -q 1 \
+  -t atelier/salle1/temperature -U 'atelier/#' -v
+```
+
+Wait for its SUBACK and UNSUBACK before publishing the next sample. Previously
+admitted offline work remains due; future room2 messages no longer match it.
+
 Initially QoS 0 publications are volatile and are dropped for offline receivers.
 Deliveries at QoS 0 originating from durable QoS 1/2 admissions are consumed
 before a single emission; a crash after consumption can lose that delivery.

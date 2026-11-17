@@ -101,9 +101,12 @@ def build_pinned(out: Path, target: Path, root: Path, source: str) -> Path:
     build_record = {
         "source_sha": source, "platform": platform.platform(), "machine": platform.machine(),
         "compiler": command("rustc", "-Vv"), "profile": "release", "features": [],
+        "build_options": ["--release", "--locked", "--no-default-features", "-p", "mqttiumd"],
+        "build_environment": {key: os.environ.get(key) for key in ("RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS", "CARGO_PROFILE_RELEASE_DEBUG", "CARGO_PROFILE_RELEASE_OPT_LEVEL", "CARGO_PROFILE_RELEASE_OVERFLOW_CHECKS")},
         "sqlite_schema": 7, "instrumented": False,
         "binary_sha256": hashlib.sha256(binary.read_bytes()).hexdigest(),
-        "runtime_dependencies": runtime.splitlines(), "execution_verified": False,
+        "runtime_dependencies": runtime.splitlines(),
+        "execution_verification": "Separate extraction receipt names this exact archive hash",
         "execution_receipt": "See the separately identified archive extraction smoke and wildcard reception.",
     }
     (package / "BUILD.json").write_text(json.dumps(build_record, indent=2) + "\n")
