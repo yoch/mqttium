@@ -1527,10 +1527,18 @@ impl Owner {
                 packet_id,
                 ..
             } => {
-                if *retain && (!self.lifecycle_enabled || *qos == Qos::AtMostOnce) {
+                if *retain && !self.lifecycle_enabled {
                     return protocol_error(draft);
                 }
                 if *qos == Qos::AtMostOnce {
+                    if *retain {
+                        return self.plan_retained_qos0(
+                            index,
+                            (connection, ingress_order),
+                            packet,
+                            draft,
+                        );
+                    }
                     return self.plan_qos0_packet(
                         index,
                         (connection, ingress_order),
@@ -2857,6 +2865,7 @@ mod tests {
         outgoing_connections: Vec<pubsub::Connection>,
         outgoing_deliveries: Vec<pubsub::Delivery>,
         volatile: Vec<pubsub::Volatile>,
+        retained_qos0: Option<pubsub::RetainedFlight>,
         continuation: (Option<crate::contract::ids::ContinuationId>, bool),
         subscription: Option<ControlSnapshot>,
         leases: (Credits, Vec<crate::leases::LeaseSlotView>),
@@ -3329,6 +3338,7 @@ mod tests {
                 outgoing_connections: owner.pubsub.connections.as_slice().to_vec(),
                 outgoing_deliveries: owner.pubsub.deliveries.as_slice().to_vec(),
                 volatile: owner.pubsub.volatile.as_slice().to_vec(),
+                retained_qos0: owner.pubsub.retained,
                 continuation: (
                     owner.pubsub.continuation,
                     owner.pubsub.continuations_started,
@@ -9101,17 +9111,38 @@ mod tests {
     }
     #[test]
     fn a_retained_qos0_occurrence_has_a_durable_command_without_an_mqtt_identifier() {
-        let mut world=World::connected();
-        world.owner.lifecycle_enabled=true;
-        world.applied(product_settings(CONN,8));
-        let _=world.drain();
-        let input=Input::Packet {connection:ConnectionGeneration::new(CONN),ingress_order:1,packet:InboundPacket::Publish {topic:bytes(b"retained/q0"),payload:bytes(b"q0"),qos:Qos::AtMostOnce,retain:true,dup:false,packet_id:None}};
-        assert!(matches!(world.owner.step(input,TurnGrant {work_limit:WorkUnits::new(100000)}),StepOutcome::Applied {..}));
-        let effects=world.drain();
+        let mut world = World::connected();
+        world.owner.lifecycle_enabled = true;
+        world.applied(product_settings(CONN, 8));
+        let _ = world.drain();
+        let input = Input::Packet {
+            connection: ConnectionGeneration::new(CONN),
+            ingress_order: 1,
+            packet: InboundPacket::Publish {
+                topic: bytes(b"retained/q0"),
+                payload: bytes(b"q0"),
+                qos: Qos::AtMostOnce,
+                retain: true,
+                dup: false,
+                packet_id: None,
+            },
+        };
+        assert!(matches!(
+            world.owner.step(
+                input,
+                TurnGrant {
+                    work_limit: WorkUnits::new(100000)
+                }
+            ),
+            StepOutcome::Applied { .. }
+        ));
+        let effects = world.drain();
         assert!(effects.iter().any(|(_,effect)| matches!(effect,Effect::Persist {command} if matches!(command.recipe.get(),Recipe::RetainedQos0(value) if value.costs.exchange_slots==ExchangeSlots::ZERO))), "retained_qos0_bypassed_durable_mutation_or_invented_exchange");
         assert!(world.owner.slots.is_empty());
-        assert_eq!(world.owner.leases.held(),0);
-        assert!(!effects.iter().any(|(_,effect)|matches!(effect,Effect::EmitFrame {..}|Effect::EmitQos0 {..}|Effect::EmitPublish {..})));
+        assert_eq!(world.owner.leases.held(), 0);
+        assert!(!effects.iter().any(|(_, effect)| matches!(
+            effect,
+            Effect::EmitFrame { .. } | Effect::EmitQos0 { .. } | Effect::EmitPublish { .. }
+        )));
     }
-
 }

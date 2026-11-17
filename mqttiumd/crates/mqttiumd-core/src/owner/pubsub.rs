@@ -44,6 +44,14 @@ pub(super) struct Control {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) struct RetainedFlight {
+    publication: PublicationId,
+    origin: VolatilePublicationId,
+    in_flight: InFlight,
+    retired: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Phase {
     Queued,
     ClaimPending(InFlight),
@@ -142,6 +150,7 @@ pub(super) struct State {
     pub(super) connections: BoundedVec<Connection>,
     pub(super) deliveries: BoundedVec<Delivery>,
     pub(super) control: Option<Control>,
+    pub(super) retained: Option<RetainedFlight>,
     payload_limit: PayloadBytes,
     pub(super) volatile: BoundedVec<Volatile>,
     pub(super) continuation: Option<ContinuationId>,
@@ -150,6 +159,13 @@ pub(super) struct State {
 
 #[derive(Debug)]
 pub(super) enum Change {
+    RetainedSubmit {
+        connection: usize,
+        flight: RetainedFlight,
+    },
+    RetainedDone {
+        finished: Finished,
+    },
     Qos0Admit {
         connection: usize,
         ingress_order: u64,
@@ -244,8 +260,16 @@ impl State {
             .iter()
             .filter(|d| d.retired && d.in_flight().is_some())
             .count()
+            + usize::from(self.retained.is_some_and(|flight| flight.retired))
     }
     pub(super) fn retire_session(&mut self, session: SessionId) {
+        if let Some(flight) = self
+            .retained
+            .as_mut()
+            .filter(|f| f.origin.source.session == session)
+        {
+            flight.retired = true;
+        }
         let mut index = 0;
         while index < self.deliveries.len() {
             let d = &mut self.deliveries.as_mut_slice()[index];
@@ -351,6 +375,7 @@ impl State {
             connections: table(config.max_sessions)?,
             deliveries: table(config.max_exchanges)?,
             control: None,
+            retained: None,
             payload_limit: config.payload_bytes,
             volatile: table(config.max_exchanges)?,
             continuation: None,
@@ -399,9 +424,11 @@ impl State {
         }
     }
     pub(super) fn deadline_is_live(&self, token: DeadlineToken) -> bool {
-        self.control
-            .as_ref()
-            .is_some_and(|c| c.in_flight.deadline == token)
+        self.retained.is_some_and(|f| f.in_flight.deadline == token)
+            || self
+                .control
+                .as_ref()
+                .is_some_and(|c| c.in_flight.deadline == token)
             || self
                 .deliveries
                 .as_slice()
@@ -512,6 +539,237 @@ impl Owner {
         Ok(continuation)
     }
 
+    pub(super) fn plan_retained_qos0(
+        &self,
+        session: usize,
+        origin: (ConnectionGeneration, u64),
+        packet: &InboundPacket,
+        draft: &mut Draft,
+    ) -> Result<super::Change, Stop> {
+        let (generation, ingress_order) = origin;
+        let Some(connection) = self.pubsub.connection(generation) else {
+            return Err(IMPOSSIBLE);
+        };
+        let InboundPacket::Publish {
+            qos: Qos::AtMostOnce,
+            retain: true,
+            dup: false,
+            packet_id: None,
+            topic,
+            payload,
+        } = packet
+        else {
+            return Self::plan_close(generation, Some(session), CloseReason::ProtocolError, draft);
+        };
+        if ingress_order <= self.pubsub.connections.as_slice()[connection].last_qos0_ingress {
+            return Self::plan_close(generation, Some(session), CloseReason::ProtocolError, draft);
+        }
+        if self.pubsub.retained.is_some() {
+            return Err(blocked());
+        }
+        let limits = self.limits.ok_or(IMPOSSIBLE)?;
+        if topic.len() as u64 > u64::from(limits.max_topic_bytes)
+            || payload.len() as u64 > limits.max_payload_bytes.get()
+        {
+            return Self::plan_close(
+                generation,
+                Some(session),
+                CloseReason::CapacityExceeded,
+                draft,
+            );
+        }
+        let source = &self.sessions.as_slice()[session];
+        let selected = match super::routing::select(
+            self.routes.as_slice(),
+            self.sessions.as_slice(),
+            source.id,
+            topic.as_slice(),
+            Qos::AtMostOnce,
+            limits.max_targets,
+        ) {
+            Ok(selected) => selected,
+            Err(super::routing::Refusal::Revision) => return Err(IMPOSSIBLE),
+            Err(super::routing::Refusal::Capacity) => {
+                draft.emit(Effect::Qos0Dropped {
+                    origin: Qos0Origin::Volatile {
+                        publication: VolatilePublicationId {
+                            source: ConnectionKey {
+                                session: source.id,
+                                generation,
+                            },
+                            ingress_order,
+                        },
+                    },
+                    target: None,
+                    reason: Qos0DropReason::CapacityExceeded,
+                })?;
+                return Ok(changed(Change::Qos0Admit {
+                    connection,
+                    ingress_order,
+                    records: BoundedVec::with_capacity(0)?,
+                    continuation: None,
+                }));
+            }
+        };
+        let operation = self.operation(draft)?;
+        let request = RequestId::new(
+            self.incarnation,
+            self.epoch,
+            self.id,
+            draw(&mut draft.counters.request, RequestSeq::checked_next)?,
+        );
+        let publication = PublicationId::new(
+            self.incarnation,
+            self.epoch,
+            self.id,
+            draw(
+                &mut draft.counters.publication,
+                PublicationSeq::checked_next,
+            )?,
+        );
+        let payload_id = PayloadId::new(
+            self.incarnation,
+            self.epoch,
+            self.id,
+            draw(&mut draft.counters.payload, PayloadSeq::checked_next)?,
+        );
+        let mut targets = BoundedVec::with_capacity(selected.len())?;
+        let mut retain_targets = 0u16;
+        for (index, target) in selected.iter().enumerate() {
+            targets
+                .try_push(Target {
+                    session: target.session,
+                    session_revision: target.revision,
+                    delivery: DeliveryId {
+                        publication,
+                        index: u32::try_from(index).map_err(|_| IMPOSSIBLE)?,
+                    },
+                    effective_qos: Qos::AtMostOnce,
+                    cause: DeliveryCause::LiveExact,
+                })
+                .map_err(|_| IMPOSSIBLE)?;
+            if target.rap {
+                retain_targets |= 1u16 << index;
+            }
+        }
+        let recipe = Recipe::RetainedQos0(crate::contract::retained::RetainedQos0 {
+            operation,
+            request,
+            publication,
+            session: source.id,
+            session_revision: source.revision,
+            connection: generation,
+            ingress_order,
+            route_revision: self.route_revision.ok_or(IMPOSSIBLE)?,
+            topic: topic.clone(),
+            payload: PayloadRef {
+                id: payload_id,
+                length: PayloadBytes::new(payload.len() as u64),
+            },
+            costs: Costs {
+                payload_bytes: PayloadBytes::new(payload.len() as u64),
+                references: References::new(
+                    (selected.len() as u64)
+                        .checked_add(u64::from(!payload.is_empty()))
+                        .ok_or(IMPOSSIBLE)?,
+                ),
+                exchange_slots: ExchangeSlots::ZERO,
+                receipt_slots: ReceiptSlots::new(1),
+            },
+            targets,
+            retain_targets,
+        });
+        let in_flight = self.plan_submission(operation, recipe, Some(payload.clone()), draft)?;
+        Ok(changed(Change::RetainedSubmit {
+            connection,
+            flight: RetainedFlight {
+                publication,
+                origin: VolatilePublicationId {
+                    source: ConnectionKey {
+                        session: source.id,
+                        generation,
+                    },
+                    ingress_order,
+                },
+                in_flight,
+                retired: false,
+            },
+        }))
+    }
+    fn plan_retained_qos0_result(
+        &self,
+        effect: EffectId,
+        operation: OperationId,
+        reply: &StoreReply,
+        draft: &mut Draft,
+    ) -> Result<Option<super::Change>, Stop> {
+        let Some(flight) = self
+            .pubsub
+            .retained
+            .filter(|f| f.in_flight.operation == operation)
+        else {
+            return Ok(None);
+        };
+        if !flight.in_flight.answers.names(effect) {
+            return Ok(Some(super::Change::Nothing));
+        }
+        let outcome = match reply {
+            StoreReply::Outcome(outcome) => *outcome,
+            StoreReply::Violation(StoreViolation::RecipeMismatch) => {
+                return Err(Stop::Fatal(CoreFault::RecipeMismatch { operation }));
+            }
+        };
+        let verdict = flight
+            .in_flight
+            .phase
+            .on(CommandEvent::StoreResult(OutcomeClass::of(&outcome)));
+        let (phase, facts) = match (verdict, outcome) {
+            (Verdict::Transition(CommandPhase::Committed), StoreOutcome::Committed(facts)) => {
+                if facts
+                    != (CommitFacts::RetainedQos0Stored {
+                        publication: flight.publication,
+                    })
+                {
+                    return Err(Stop::Fatal(CoreFault::ContradictoryOutcome { operation }));
+                }
+                (CommandPhase::Consumed, Some(facts))
+            }
+            (
+                Verdict::Transition(CommandPhase::RejectedCertain),
+                StoreOutcome::RejectedCertain(reason),
+            ) => {
+                draft.emit(Effect::Qos0Dropped {
+                    origin: Qos0Origin::Volatile {
+                        publication: flight.origin,
+                    },
+                    target: None,
+                    reason: if matches!(reason, RejectReason::CapacityExceeded(_)) {
+                        Qos0DropReason::CapacityExceeded
+                    } else {
+                        Qos0DropReason::WriteFailed
+                    },
+                })?;
+                (CommandPhase::RejectedCertain, None)
+            }
+            (Verdict::Transition(CommandPhase::Indeterminate), _) => {
+                return Ok(Some(changed(Change::Await {
+                    operation,
+                    phase: CommandPhase::Indeterminate,
+                    resolution: None,
+                })));
+            }
+            _ => return Err(IMPOSSIBLE),
+        };
+        draft.receipt_consumed = Some(operation);
+        Ok(Some(changed(Change::RetainedDone {
+            finished: Finished {
+                operation,
+                answers: flight.in_flight.answers,
+                phase,
+                facts,
+            },
+        })))
+    }
     pub(super) fn plan_qos0_packet(
         &self,
         session: usize,
@@ -1523,6 +1781,9 @@ impl Owner {
         reply: &StoreReply,
         draft: &mut Draft,
     ) -> Result<Option<super::Change>, Stop> {
+        if let Some(change) = self.plan_retained_qos0_result(effect, operation, reply, draft)? {
+            return Ok(Some(change));
+        }
         let control = self
             .pubsub
             .control
@@ -1799,17 +2060,23 @@ impl Owner {
     ) -> Result<Option<super::Change>, Stop> {
         let waiting = self
             .pubsub
-            .control
-            .as_ref()
-            .map(|c| c.in_flight)
+            .retained
+            .map(|f| f.in_flight)
             .filter(|f| f.deadline == token)
             .or_else(|| {
                 self.pubsub
-                    .deliveries
-                    .as_slice()
-                    .iter()
-                    .filter_map(Delivery::in_flight)
-                    .find(|f| f.deadline == token)
+                    .control
+                    .as_ref()
+                    .map(|c| c.in_flight)
+                    .filter(|f| f.deadline == token)
+                    .or_else(|| {
+                        self.pubsub
+                            .deliveries
+                            .as_slice()
+                            .iter()
+                            .filter_map(Delivery::in_flight)
+                            .find(|f| f.deadline == token)
+                    })
             });
         let Some(in_flight) = waiting else {
             return Ok(None);
@@ -1896,6 +2163,19 @@ impl Owner {
     pub(super) fn apply_pubsub(&mut self, change: Change, input: Input) -> Result<(), CoreFault> {
         let stale = CoreFault::StalePlan;
         match change {
+            Change::RetainedSubmit { connection, flight } => {
+                self.pubsub
+                    .connections
+                    .as_mut_slice()
+                    .get_mut(connection)
+                    .ok_or(stale)?
+                    .last_qos0_ingress = flight.origin.ingress_order;
+                self.pubsub.retained = Some(flight);
+            }
+            Change::RetainedDone { finished } => {
+                self.pubsub.retained.take().ok_or(stale)?;
+                remember(&mut self.finished, finished)?;
+            }
             Change::Qos0Admit {
                 connection,
                 ingress_order,
@@ -2177,6 +2457,13 @@ impl Owner {
                     .filter(|c| c.in_flight.operation == operation)
                 {
                     &mut control.in_flight
+                } else if let Some(flight) = self
+                    .pubsub
+                    .retained
+                    .as_mut()
+                    .filter(|f| f.in_flight.operation == operation)
+                {
+                    &mut flight.in_flight
                 } else {
                     let d = self
                         .pubsub
