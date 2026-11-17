@@ -1231,6 +1231,7 @@ fn a_saturated_four_slot_output_retains_the_committed_puback_until_terminal_fail
         for _ in 0..net::OUTPUT_SLOTS {
             blocked
                 .try_send(net::Write {
+                    expiry: None,
                     correlation: None,
                     bytes: vec![0xd0, 0],
                 })
