@@ -896,17 +896,35 @@ impl Owner {
         } else {
             None
         };
-        let mut report = if let Some(ref control) = lifecycle
-            && control.blocked.is_some()
-        {
+        let will = if self.will_status().reading || self.will_status().admission_pending {
+            if lifecycle
+                .as_ref()
+                .is_none_or(|control| control.blocked.is_none())
+            {
+                let flight = self.will_dispatch();
+                Some(self.outbox.dispatch_will_controls(sink, flight))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let blocked = lifecycle
+            .as_ref()
+            .and_then(|control| control.blocked)
+            .or_else(|| will.as_ref().and_then(|control| control.blocked));
+        let mut report = if blocked.is_some() {
             DispatchReport {
                 accepted: 0,
-                blocked: control.blocked,
+                blocked,
             }
         } else {
             self.outbox.dispatch(sink)
         };
         if let Some(control) = lifecycle {
+            report.accepted += control.accepted;
+        }
+        if let Some(control) = will {
             report.accepted += control.accepted;
         }
         if let Some(priority) = priority {
