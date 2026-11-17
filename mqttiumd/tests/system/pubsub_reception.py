@@ -665,17 +665,17 @@ def filter_result_order(binary: Path, case: Path) -> dict:
                                                   ("reception/wildcard/+", 1)]))
             mid, reasons = decode_filter_ack(subscriber.wait(0x90, 17))
             require(mid == 17 and len(reasons) == 3 and reasons[0] == 1
-                    and reasons[1] == 0 and reasons[2] == 0xA2,
+                    and reasons[1] == 0 and reasons[2] == 1,
                     "subscription_results_out_of_order_or_unsupported_granted", repr(reasons))
             state = durable(broker.db)
             routes = state["tables"]["routes"]
             granted = {row["topic"]:row["qos"] for row in routes}
-            require(granted == {b"reception/allowed".hex():1,b"reception/qos0-granted".hex():0}, "granted_filter_not_durable")
-            subscriber.unsubscribe(18, ["reception/allowed", "reception/qos0-granted", "reception/not-subscribed"])
+            require(granted == {b"reception/allowed".hex():1,b"reception/qos0-granted".hex():0,b"reception/wildcard/+".hex():1}, "granted_filter_not_durable")
+            subscriber.unsubscribe(18, ["reception/allowed", "reception/qos0-granted", "reception/wildcard/+", "reception/not-subscribed"])
         require(durable(broker.db)["counts"]["routes"] == 0, "unsubscribe_not_durable")
         broker.stop()
         return {"criterion": "F-filter-results", "status": "PASS", "ordered_reason_codes": list(reasons),
-                "qos2_granted_qos1": True, "qos0_granted": True, "wildcard_refused": True}
+                "qos2_granted_qos1": True, "qos0_granted": True, "wildcard_granted": True}
     finally:
         broker.cleanup()
 

@@ -2,7 +2,7 @@
 
 use mqttiumd_contract::ids::{InboundPacketId, OutboundPacketId};
 use mqttiumd_contract::packet::{AckReason, InboundPacket, OutboundFrame, Qos, SharedBytes};
-use mqttiumd_contract::pubsub::{FilterList, MAX_FILTERS, SubscriptionFilter};
+use mqttiumd_contract::pubsub::{FilterList, MAX_FILTERS, SubscriptionFilter, SubscriptionOptions};
 use mqttiumd_contract::session::SessionExpiry;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -658,7 +658,7 @@ fn subscribe(body: &[u8], unsubscribe: bool, bounds: Bounds) -> Result<Packet, E
         return Err(protocol("EmptySubscriptionList"));
     }
     let mut parsed = Vec::with_capacity(MAX_FILTERS);
-    let mut outside = props.unsupported;
+    let outside = props.unsupported;
     while !input.is_empty() {
         if parsed.len() == MAX_FILTERS {
             return Err(oversized("TooManyFilters"));
@@ -669,6 +669,7 @@ fn subscribe(body: &[u8], unsubscribe: bool, bounds: Bounds) -> Result<Packet, E
             return Err(oversized("FilterTooLarge"));
         }
         let mut qos = Qos::AtLeastOnce;
+        let mut subscription_options = SubscriptionOptions::DEFAULT;
         if !unsubscribe {
             let options = input.byte()?;
             if options & 0xc0 != 0
@@ -679,16 +680,17 @@ fn subscribe(body: &[u8], unsubscribe: bool, bounds: Bounds) -> Result<Packet, E
                 return Err(protocol("InvalidSubscriptionOptions"));
             }
             qos = Qos::from_wire(options & 3).ok_or_else(|| protocol("InvalidSubscriptionQos"))?;
-            outside |= options & 0x0c != 0;
+            subscription_options = SubscriptionOptions::from_bits(options & !3)
+                .ok_or_else(|| protocol("InvalidSubscriptionOptions"))?;
         }
-        parsed.push((text, qos));
+        parsed.push((text, qos, subscription_options));
     }
     if outside {
         return Err(unsupported("SubscriptionOptionsOutsideProfile"));
     }
     if unsubscribe {
         let mut filters = Vec::with_capacity(parsed.len());
-        for (text, _) in parsed {
+        for (text, _, _) in parsed {
             filters.push(
                 SharedBytes::copy_from(text, bounds.max_topic)
                     .map_err(|_| oversized("FilterTooLarge"))?,
@@ -700,11 +702,12 @@ fn subscribe(body: &[u8], unsubscribe: bool, bounds: Bounds) -> Result<Packet, E
         }))
     } else {
         let mut filters = Vec::with_capacity(parsed.len());
-        for (text, qos) in parsed {
+        for (text, qos, options) in parsed {
             filters.push(SubscriptionFilter {
                 filter: SharedBytes::copy_from(text, bounds.max_topic)
                     .map_err(|_| oversized("FilterTooLarge"))?,
                 qos,
+                options,
             });
         }
         Ok(Packet::Core(InboundPacket::Subscribe {
@@ -860,7 +863,7 @@ pub fn encode(frame: OutboundFrame) -> Result<Vec<u8>, Error> {
             0,
             0,
             0x28,
-            0,
+            1,
             0x29,
             0,
             0x2a,
@@ -1439,11 +1442,22 @@ mod tests {
     }
 
     #[test]
-    fn no_local_subscribe_is_unsupported_but_a_truncated_one_is_malformed() {
-        kind(
-            decode(0x82, b"\0\x01\0\0\x03a/#\x06", BOUNDS),
-            ErrorKind::Unsupported,
-        );
+    fn valid_subscription_options_reach_the_core_without_loss() {
+        for bits in [0, 4, 8, 12, 16, 20, 24, 28, 32, 36, 40, 44] {
+            let packet =
+                decode(0x82, &[0, 1, 0, 0, 3, b'a', b'/', b'#', bits | 2], BOUNDS).unwrap();
+            let Packet::Core(InboundPacket::Subscribe { filters, .. }) = packet else {
+                panic!("subscribe");
+            };
+            assert_eq!(filters.as_slice()[0].options.bits(), bits);
+            assert_eq!(filters.as_slice()[0].qos, Qos::ExactlyOnce);
+        }
+        for bits in [0x30, 0x40, 0x80, 3] {
+            kind(
+                decode(0x82, &[0, 1, 0, 0, 3, b'a', b'/', b'#', bits], BOUNDS),
+                ErrorKind::Protocol,
+            );
+        }
         kind(
             decode(0x82, b"\0\x01\0\0\x03a/#", BOUNDS),
             ErrorKind::Malformed,
@@ -1460,7 +1474,7 @@ mod tests {
         assert_eq!(
             &packet[5..],
             &[
-                0x21, 0, 8, 0x27, 0, 1, 0, 0, 0x25, 0, 0x22, 0, 0, 0x28, 0, 0x29, 0, 0x2a, 0
+                0x21, 0, 8, 0x27, 0, 1, 0, 0, 0x25, 0, 0x22, 0, 0, 0x28, 1, 0x29, 0, 0x2a, 0
             ]
         );
         assert_eq!(encode(OutboundFrame::Pingresp).unwrap(), [0xd0, 0]);

@@ -1,4 +1,4 @@
-//! Experimental durable exact-topic MQTT 5 TCP broker.
+//! Experimental durable hierarchical MQTT 5 TCP broker.
 use mqttiumd::{
     runtime::{Config, run},
     writer::Hooks,
