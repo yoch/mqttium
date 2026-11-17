@@ -71,11 +71,7 @@ impl Owner {
             d.operation.incarnation() == self.incarnation
                 && d.operation.epoch().get() > 0
                 && d.operation.epoch() <= self.epoch
-                && match expiry {
-                    SessionExpiry::OnDisconnect => false,
-                    SessionExpiry::Never => d.deadline.is_none(),
-                    SessionExpiry::After(_) => d.deadline.is_some(),
-                }
+                && d.valid_for(expiry)
         })
     }
     /// The one accepted opening request, including a transport already closed.
@@ -289,7 +285,8 @@ impl Owner {
         else {
             return Ok(super::Change::Nothing);
         };
-        if session.opened_by != opened_by
+        if opened_by.is_none()
+            || session.opened_by != opened_by
             || session.detached.is_some()
             || session
                 .connection

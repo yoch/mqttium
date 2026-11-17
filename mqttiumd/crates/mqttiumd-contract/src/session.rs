@@ -47,6 +47,23 @@ pub struct SessionDetachment {
     pub deadline: Option<u64>,
 }
 
+impl SessionDetachment {
+    /// Validate the policy-dependent shape before a durable row becomes a
+    /// scheduling fact. Logical time starts at zero, so a finite deadline
+    /// cannot precede the interval itself, even without the original sample.
+    #[must_use]
+    pub fn valid_for(self, expiry: SessionExpiry) -> bool {
+        match (expiry, self.deadline) {
+            (SessionExpiry::Never, None) => true,
+            (SessionExpiry::After(_), Some(deadline)) => expiry
+                .deadline(0)
+                .flatten()
+                .is_some_and(|minimum| deadline >= minimum),
+            _ => false,
+        }
+    }
+}
+
 impl SessionExpiry {
     /// Logical nanoseconds. Overflow refuses the command, never expires early.
     pub fn deadline(self, observed_at: u64) -> Option<Option<u64>> {
@@ -682,5 +699,42 @@ mod tests {
             recipe.encode_canonical(&mut Vec::new()),
             Err(RecipeError::InvalidField("legacy_session_expiry"))
         ));
+    }
+
+    #[test]
+    fn a_detachment_deadline_must_have_a_possible_nonnegative_observation() {
+        for expiry in [
+            SessionExpiry::OnDisconnect,
+            SessionExpiry::Never,
+            SessionExpiry::After(0),
+            SessionExpiry::After(1),
+            SessionExpiry::After(u32::MAX - 1),
+            SessionExpiry::After(u32::MAX),
+        ] {
+            let minimum = expiry.deadline(0).flatten();
+            for deadline in [
+                None,
+                Some(0),
+                Some(999_999_999),
+                Some(1_000_000_000),
+                minimum,
+                Some(u64::MAX),
+            ] {
+                let detached = SessionDetachment {
+                    operation: operation(7),
+                    deadline,
+                };
+                let expected = match (expiry, deadline) {
+                    (SessionExpiry::Never, None) => true,
+                    (SessionExpiry::After(seconds), Some(deadline))
+                        if seconds > 0 && seconds < u32::MAX =>
+                    {
+                        deadline >= u64::from(seconds) * 1_000_000_000
+                    }
+                    _ => false,
+                };
+                assert_eq!(detached.valid_for(expiry), expected);
+            }
+        }
     }
 }
