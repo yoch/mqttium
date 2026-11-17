@@ -951,6 +951,10 @@ pub mod expiry {
         let sweep = w.store.expire_messages(at(1), None, 4).unwrap();
         assert!(sweep.removed.is_empty(), "started_claim_payload_released");
         assert_eq!(sweep.retained_removed, 1);
+        assert_eq!(
+            sweep.quarantined, 1,
+            "expired_unstarted_claim_not_reported_uncertain"
+        );
         let state = w.store.snapshot().unwrap();
         assert_eq!(state.accounts.references.get(), 2);
         assert!(!state.outbound[&b_id].started);
