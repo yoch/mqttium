@@ -97,6 +97,9 @@
         },
         "next_session": {
           "$ref": "primitives.schema.json#/$defs/u64"
+        },
+        "session_clock": {
+          "$ref": "primitives.schema.json#/$defs/session_clock_anchor"
         }
       }
     },
@@ -134,6 +137,9 @@
           },
           "opened_by": {
             "$ref": "primitives.schema.json#/$defs/session_opening"
+          },
+          "detached": {
+            "$ref": "primitives.schema.json#/$defs/session_detachment_optional"
           }
         }
       },

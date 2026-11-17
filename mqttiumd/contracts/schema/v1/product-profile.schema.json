@@ -60,7 +60,14 @@
     "terminal_input_slots",
     "frame_registration_slots",
     "pre_connack_packet_slots",
-    "session_shutdown_timeout_ms"
+    "session_shutdown_timeout_ms",
+    "session_clock",
+    "session_time_unit",
+    "session_clock_checkpoint_period_ms",
+    "session_clock_degraded_after_ms",
+    "max_session_expiry_timers",
+    "session_expiry_batch",
+    "sqlite_schema_version"
   ],
   "properties": {
     "format": {
@@ -85,10 +92,10 @@
       ]
     },
     "session_expiry_interval": {
-      "const": [
-        0,
-        4294967295
-      ]
+      "const": {
+        "minimum": 0,
+        "maximum": 4294967295
+      }
     },
     "incoming_qos": {
       "const": [
@@ -206,7 +213,7 @@
       "const": 1024
     },
     "receipt_data_window": {
-      "const": 640
+      "const": 512
     },
     "receipt_control_reserve": {
       "const": 512
@@ -235,10 +242,10 @@
       "const": 0
     },
     "disconnect_session_expiry_interval": {
-      "const": [
-        0,
-        4294967295
-      ]
+      "const": {
+        "minimum": 0,
+        "maximum": 4294967295
+      }
     },
     "lifecycle_transition_effect_slots": {
       "const": 3
@@ -257,6 +264,27 @@
     },
     "session_shutdown_timeout_ms": {
       "const": 2000
+    },
+    "session_clock": {
+      "const": "CLOCK_BOOTTIME"
+    },
+    "session_time_unit": {
+      "const": "nanoseconds"
+    },
+    "session_clock_checkpoint_period_ms": {
+      "const": 30000
+    },
+    "session_clock_degraded_after_ms": {
+      "const": 31000
+    },
+    "max_session_expiry_timers": {
+      "const": 128
+    },
+    "session_expiry_batch": {
+      "const": 4
+    },
+    "sqlite_schema_version": {
+      "const": 6
     }
   }
 }

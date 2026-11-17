@@ -172,7 +172,8 @@ FIXTURE_SESSION_SCOPE = "the fixture-based qualifier does not cover product sess
 def _product_session(row):
     # Missing fields in historical fixture snapshots/recovery mean Never/None.
     # Describing new policy or attachment facts cannot enlarge qualification.
-    return row.get("expiry", "Never") != "Never" or row.get("opened_by") is not None
+    return (row.get("expiry", "Never") != "Never" or row.get("opened_by") is not None
+            or row.get("detached") is not None)
 
 UNCORROBORATED_QUEUED = (
     "queued recovery delivery metadata is not corroborated by a durable snapshot"
@@ -202,6 +203,7 @@ def _scope_unmet(contracts, scenario_path, trace_path):
     receipt_retirement = False
     session_lifecycle = False
     for _, snapshot in run.snapshots.values():
+        session_lifecycle |= snapshot.get("meta", {}).get("session_clock") is not None
         session_lifecycle |= any(_product_session(row) for row in snapshot.get("sessions", ()))
         # A zero producer registration does not establish collection. A
         # positive compact boundary belongs to a new, unexamined state machine.

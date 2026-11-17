@@ -2482,7 +2482,7 @@ lifecycle_close["operations"].append(product_operation(
 lifecycle_close["account"]["used"].update(exchange_slots="0", receipt_slots="2")
 ok("store-snapshot-session-close-receipt.json", lifecycle_close)
 bad("store-snapshot-session-policy-invalid.json", "schema-violation", "/sessions/3/expiry",
-    "Persisted policy is a closed discriminant; intermediate expiry values are outside this format.",
+    "Persisted policy is a closed discriminant, including an explicit bounded finite After variant.",
     edited(lifecycle_open, lambda v: v["sessions"][3].update(expiry="Sometimes")))
 bad("store-snapshot-session-attachment-overflow.json", "u64-out-of-range", "/sessions/3/opened_by/sequence",
     "An attachment is the original complete OperationId, not a reusable ClientID.",
@@ -3670,6 +3670,96 @@ bad("product-session-missing-policy.json", "schema-violation", "/details",
 bad("product-session-refused-success.json", "schema-violation", "/details/reason_code",
     "A refusal must not describe a success CONNACK or fabricate a session identity.",
     env("mqttiumd.product-event", seq="13", kind="session_refused", pid=1, connection="2", details={"reason_code": 0}))
+# Finite expiry is a descriptive extension, never a fixture-based qualification.
+expiry_transitions = json.loads((V1 / "expiry.transitions.json").read_text())
+ok("product-expiry-transitions.json", expiry_transitions)
+bad("product-expiry-transitions-wrong-decision.json", "schema-violation", "/decision",
+    "The finite time subset retains Proposed0030 and system-test scope.",
+    {**expiry_transitions, "decision": "0029"})
+finite_open = copy.deepcopy(lifecycle_open)
+finite_operation = {**OP, "sequence": "28"}
+finite_clock = {"reading": {"domain": "ab" * 32, "tick": "100"}, "logical": "100"}
+finite_open["meta"]["session_clock"] = copy.deepcopy(finite_clock)
+finite_open["sessions"][3].update(expiry={"After": 7}, opened_by=finite_operation)
+finite_open["operations"][-1] = product_operation(
+    28, 8, be(2, 1) + be(1, 1) + be(2, 1) + be(7, 4) + be(0, 1)
+    + be(10, 2) + b"new-client".hex() + be(100),
+    {"kind": "SessionLifecycle", "change": {
+        "kind": "Opened", "session": "4", "revision": "1", "session_present": False,
+        "expiry": {"After": 7}, "retired": None, "route_revision": "2",
+        "cancelled": {"inbound": 0, "deliveries": 0, "routes": 0},
+    }},
+)
+ok("store-snapshot-session-finite-open.json", finite_open)
+finite_detached = copy.deepcopy(finite_open)
+detach_operation = {**OP, "sequence": "29"}
+detached = {"operation": detach_operation, "deadline": "7000000100"}
+finite_detached["sessions"][3]["detached"] = detached
+finite_detached["operations"].append(product_operation(
+    29, 8, be(3, 1) + be(4) + be(1, 1) + scoped(28) + be(2, 1) + be(7, 4) + be(100),
+    {"kind": "SessionLifecycle", "change": {
+        "kind": "Detached", "session": "4", "expiry": {"After": 7}, "detached": detached,
+    }},
+))
+finite_detached["account"]["used"]["receipt_slots"] = "3"
+ok("store-snapshot-session-finite-detached.json", finite_detached)
+finite_expired = copy.deepcopy(finite_detached)
+finite_expired["sessions"].pop(3)
+finite_expired["operations"].append(product_operation(
+    30, 8, be(4, 1) + be(4) + be(1, 1) + scoped(28) + scoped(29) + be(1, 1)
+    + be(7_000_000_100) + be(7_000_000_100),
+    {"kind": "SessionLifecycle", "change": {
+        "kind": "Closed", "session": "4", "route_revision": "2",
+        "cancelled": {"inbound": 0, "deliveries": 0, "routes": 0},
+    }},
+))
+finite_expired["account"]["used"]["receipt_slots"] = "4"
+ok("store-snapshot-session-finite-expired.json", finite_expired)
+for seconds in (0, 4294967295):
+    bad(f"store-snapshot-session-after-{seconds}.json", "schema-violation", "/sessions/3/expiry",
+        "Zero and infinity are not aliases for the finite After discriminant.",
+        edited(finite_detached, lambda v, n=seconds: v["sessions"][3].update(expiry={"After": n})))
+bad("store-snapshot-session-deadline-overflow.json", "u64-out-of-range", "/sessions/3/detached/deadline",
+    "An offline deadline is checked logical nanoseconds, never a saturating value.",
+    edited(finite_detached, lambda v: v["sessions"][3]["detached"].update(deadline=OVER)))
+for field in ("logical", "tick"):
+    target = finite_detached["meta"]["session_clock"]
+    pointer = "/meta/session_clock/" + ("reading/" if field == "tick" else "") + field
+    def bad_anchor(v, name=field):
+        anchor = v["meta"]["session_clock"]
+        (anchor["reading"] if name == "tick" else anchor)[name] = OVER
+    bad(f"store-snapshot-session-clock-{field}-overflow.json", "u64-out-of-range", pointer,
+        "The one anchor preserves checked durable logical progress.", edited(finite_detached, bad_anchor))
+bad("store-snapshot-session-clock-invalid-domain.json", "schema-violation", "/meta/session_clock/reading/domain",
+    "A domain is a fixed bounded lower-case 32-byte identity, not UTC.",
+    edited(finite_detached, lambda v: v["meta"]["session_clock"]["reading"].update(domain="AB" * 32)))
+finite_recovery = copy.deepcopy(PAGE_READ)
+finite_recovery["payload"]["facts"][1].update(expiry={"After": 7}, opened_by=finite_operation, detached=detached)
+ok("trace-record-session-finite-recovery.json", finite_recovery)
+finite_changed = env("mqttiumd.product-event", seq="20", kind="session_changed", pid=1,
+    operation=detach_operation, connection="1", details={
+        "action": "Detached", "session": "4", "expiry": {"After": 7},
+        "detached_by": detach_operation, "deadline": "7000000100"})
+ok("product-session-detached.json", finite_changed)
+ok("product-session-opened-finite.json", edited(session_changed, lambda v: v["details"].update(expiry={"After": 7})))
+for field in ("deadline", "detached_by"):
+    bad(f"product-session-detached-missing-{field}.json", "schema-violation", "/details",
+        "The detached occurrence retains both its original operation and deadline.",
+        edited(finite_changed, lambda v, key=field: v["details"].pop(key)))
+for kind, details in (
+    ("session_clock_checkpoint", {"logical": "100", "tick": "100"}),
+    ("session_clock_checkpoint", {"logical": "100", "tick": "100", "same_domain": True, "source": "maintenance_commit"}),
+    ("session_clock_degraded", {"code": "checkpoint_late", "age_ms": "31001"}),
+    ("expiry_inventory", {"finite_timers": 128, "checkpoint_inflight": True, "queued": 4, "period_ms": 30000}),
+):
+    suffix = "-writer" if "source" in details else ""
+    ok("product-" + kind.replace("_", "-") + suffix + ".json",
+       env("mqttiumd.product-event", seq="21", kind=kind, pid=1, details=details))
+bad("product-expiry-timer-budget-exceeded.json", "schema-violation", "/details/finite_timers",
+    "A session has at most one keyed wakeup within the unchanged128-session budget.",
+    env("mqttiumd.product-event", seq="22", kind="expiry_inventory", pid=1,
+        details={"finite_timers": 129, "checkpoint_inflight": False, "queued": 0, "period_ms": 30000}))
+
 dump(EX / "index.json", env("mqttiumd.example-index", valid=valid, invalid=invalid))
 
 

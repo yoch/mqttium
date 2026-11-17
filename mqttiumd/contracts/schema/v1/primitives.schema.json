@@ -407,10 +407,28 @@
       }
     },
     "session_expiry": {
-      "description": "Never for an omitted legacy fixture field; current schema5 SQLite always persists and validates it.",
-      "enum": [
-        "OnDisconnect",
-        "Never"
+      "description": "Omitted legacy fixtures mean Never. Finite seconds use an explicit After discriminant; zero and infinity have distinct representations. SQLite schema6 persists and validates every policy.",
+      "oneOf": [
+        {
+          "enum": [
+            "OnDisconnect",
+            "Never"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "After"
+          ],
+          "properties": {
+            "After": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 4294967294
+            }
+          }
+        }
       ]
     },
     "session_opening": {
@@ -523,8 +541,99 @@
               "$ref": "primitives.schema.json#/$defs/session_cancellations"
             }
           }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "session",
+            "expiry",
+            "detached"
+          ],
+          "properties": {
+            "kind": {
+              "const": "Detached"
+            },
+            "session": {
+              "$ref": "primitives.schema.json#/$defs/u64"
+            },
+            "expiry": {
+              "$ref": "primitives.schema.json#/$defs/session_expiry"
+            },
+            "detached": {
+              "$ref": "primitives.schema.json#/$defs/session_detachment"
+            }
+          }
         }
       ]
+    },
+    "session_detachment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "operation",
+        "deadline"
+      ],
+      "properties": {
+        "operation": {
+          "$ref": "primitives.schema.json#/$defs/operation_id"
+        },
+        "deadline": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "primitives.schema.json#/$defs/u64"
+            }
+          ]
+        }
+      },
+      "description": "One immutable durable offline occurrence; deadline is logical nanoseconds, or null for retained infinity. Omission/null in legacy Session JSON means no durable detachment."
+    },
+    "session_detachment_optional": {
+      "oneOf": [
+        {
+          "type": "null"
+        },
+        {
+          "$ref": "primitives.schema.json#/$defs/session_detachment"
+        }
+      ]
+    },
+    "session_clock_anchor": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "reading",
+        "logical"
+      ],
+      "properties": {
+        "reading": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "domain",
+            "tick"
+          ],
+          "properties": {
+            "domain": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{64}$",
+              "minLength": 64,
+              "maxLength": 64
+            },
+            "tick": {
+              "$ref": "primitives.schema.json#/$defs/u64"
+            }
+          }
+        },
+        "logical": {
+          "$ref": "primitives.schema.json#/$defs/u64"
+        }
+      },
+      "description": "The one overwritable BOOTTIME anchor. A changed/unproven domain preserves committed logical progress and does not invent downtime. UTC is not an expiry authority."
     }
   }
 }

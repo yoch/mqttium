@@ -20,6 +20,7 @@ it. The examples illustrate the contract and are not part of the digest.
 | `v1/profiles.json` | Profiles and their perimeter |
 | `v1/product-profile.json` | Fixed bounds and MQTT feature restrictions of the experimental TCP broker |
 | `v1/sessions.transitions.json` | Partial lifecycle transitions under Proposed0029, with product-system-test scope |
+| `v1/expiry.transitions.json` | Partial finite expiry/time transitions under Proposed0030, with product-system-test scope |
 | `schema/v1/product-event.schema.json` | Bounded product observations; separate from fixture-based qualifying campaign traces |
 | `v1/assertions.json` | Assertion names, their meaning and the requirements they serve |
 | `v1/requirements.json` | Every identifier the specification defines, each with its source: a chapter or an accepted decision record |
@@ -479,7 +480,7 @@ ClientID is a reusable name; SessionId, opening OperationId and transport
 generation retain separate identities. JSON snapshot/recovery fields `expiry`
 and `opened_by` are optional only for historical fixture compatibility: omitted
 means `Never` and null respectively. New emitters always carry both. SQLite
-schema5 always persists and validates both; formats1--4 are refused before
+schema6 always persists and validates both; formats1--5 are refused before
 write-affecting pragmas. `Terminal` session rows remain readable historical
 format evidence, but current atomic cleanup removes them and never resets the
 monotone `next_session` counter. A publication's historical producer SessionId
@@ -494,7 +495,8 @@ by a strict opening-token presence bit and optional opening OperationId.
 Close holds that exact guard and reason0(Disconnect),1(TransportLost),2(Replaced)
 or3(Startup). No result loss authorizes a new request identity. Close is a
 control; Open consumes the business window. The window remains1024; its
-business threshold640 reserves384 positions for bounded continuation needs.
+business threshold512 reserves512 positions for bounded continuation needs,
+including detach and expiry controls for128 sessions.
 Physical receipt quota8192/control reserve512 are unchanged.
 
 Committed facts are `{kind: "SessionLifecycle", change: ...}`. Opened identifies
@@ -516,7 +518,7 @@ Absent CONNECT expiry means0. Clean Start0 may resume a persistent incarnation
 and set policy0, retaining its business state until later closure. Clean Start1
 creates a new incarnation. DISCONNECT may retain policy, set0, or request the
 supported infinity value; CONNECT0 to nonzero DISCONNECT is Protocol Error0x82.
-Finite intermediate intervals remain explicitly unsupported. Ephemeral sessions
+Finite intermediate intervals are represented by the Proposed0030 extension below. Ephemeral sessions
 from a previous process are atomically terminated on actual epoch opening before
 readiness. Duplicate opening replay does not repeat startup expiry.
 
@@ -578,3 +580,63 @@ operation. These compact copied/replayed details are closed scalar shapes and
 never contain a ClientID. All their durable/transport identity components retain
 the checked u64 domain. Their format records which fact was injected; system
 assertions separately decide whether the actual stale-event guard held.
+
+
+### Finite session expiry (Proposed0030)
+
+The product accepts every u32 Session Expiry Interval. Zero and infinity retain
+JSON strings `OnDisconnect` and `Never`; finite values use `{"After": seconds}`
+with seconds in1..4294967294. Legacy omitted policy/attachment/detachment remain
+Never/null/null. A detached fact is `{operation: OperationId, deadline: u64|null}`;
+the deadline is logical nanoseconds. Snapshot `meta.session_clock`, when present,
+is `{reading: {domain: 64lowerhex, tick: u64}, logical: u64}`. Only one anchor is
+stored. These are descriptive facts, not an extension of fixture qualification. Snapshot
+readers deliberately accept well-formed but unsound combinations so that evidence
+can describe corruption. Storage and core separately reject incoherent policy/
+deadline combinations before cleanup.
+
+Canonical kind8 preserves actions0/1 byte-for-byte and adds2(OpenAt),3(Detach),
+and4(Expire). OpenAt replaces legacy policy encoding with0/1/2, where2 is followed
+by finite u32 seconds, and appends logical `now`. Detach holds the exact opening
+guard, that policy encoding and the original logical close observation. Expire
+holds the guard, detached OperationId, a strict deadline-present bit and optional
+u64 deadline, then logical `now`. All identity/presence booleans remain strict;
+truncations, trailing bytes, finite aliases0/MAX and deadline overflow are refused.
+The independent Python recipe reader decodes these bytes without product help.
+
+Known `SessionLifecycle` facts add `Detached` with session, policy and immutable
+detachment. Product `session_changed` uses actionDetached, session, policy,
+`detached_by` and nullable deadline. An old attachment or timer cannot be retargeted
+through ClientID. Same-operation reconciliation retains the original recipe/time.
+OpenAt and conditional expiry share the writer order: a due Open cannot resume
+expired state merely because timer processing is delayed. Attached sessions never
+expire from their offline retention policy.
+
+The Linux provider uses safe CLOCK_BOOTTIME, identified by boot UUID and verified
+effective time-namespace offset. Unknown continuity creates a conservative new
+domain anchored at committed progress; UTC never authorizes deletion. Same-domain
+process downtime counts. Changed-domain unknown downtime does not. Previously
+durable deadlines remain unchanged; startup detaches a previously attached finite
+session from its first reliable new observation. Schema6 is explicit and old
+formats are refused without reset or implicit migration.
+
+One keyed timer per finite offline session, four due requests per reactor turn,
+and at most one checkpoint in flight bound maintenance. A single anchor is
+checkpointed every30s while such sessions exist. Commitment/scheduling delay is
+additional; `session_clock_degraded` with code`checkpoint_late` and actual decimal
+`age_ms` reports crossing31s. `expiry_inventory` records finite_timers<=128,
+checkpoint_inflight, queued<=128 and period_ms30000. `session_clock_checkpoint`
+records logical/tick; the writer additionally records same_domain and
+source`maintenance_commit`. Neither checkpoint allocates an operation receipt.
+
+| Test point/control | Authority exercised | Observation |
+| - | - | - |
+| `session.detach.prepared`, `session.expire.prepared` | Actual SQLite writes before COMMIT | `barrier_hit` with exact OperationId and SessionDetach/SessionExpire |
+| `session.detach.committed`, `session.expire.committed` | Actual COMMIT before result delivery | `barrier_hit` retaining that same operation |
+| `hold-session-detach-result`, `hold-session-expire-result` | Hold authentic committed result and same-operation resolutions | `store_result_held` |
+| `drop-next-session-detach-result`, `drop-next-session-expire-result` | Lose one authentic committed response, preserve uncertainty | `store_result_dropped` |
+
+These product hooks remain feature-gated and outside the fixture fault catalogue.
+A compiled mutation or process witness belongs to its own identified run. The
+partial expiry registry, finite model and system tests do not qualify arbitrary
+session time behavior through the fixture oracle.

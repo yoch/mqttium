@@ -1102,6 +1102,13 @@ def _product_event(contracts, document, out):
             _u64(document, f"/details/returned_{member}", out)
     if document["kind"] == "command_submitted" and "expected_session" in document.get("details", {}):
         _u64(document, "/details/expected_session", out)
+    if document["kind"] in {"session_changed", "session_clock_checkpoint", "session_clock_degraded"}:
+        for member in ("deadline", "logical", "tick", "age_ms"):
+            if member in document.get("details", {}):
+                _u64(document, f"/details/{member}", out)
+        if "detached_by" in document.get("details", {}):
+            for member in ("incarnation", "epoch", "owner", "sequence"):
+                _u64(document, f"/details/detached_by/{member}", out)
     if document["kind"] in {"session_changed", "session_change_copied", "session_change_replayed",
                              "session_close_copied", "session_close_replayed"}:
         for member in ("session", "route_revision", "revision", "retired_session"):

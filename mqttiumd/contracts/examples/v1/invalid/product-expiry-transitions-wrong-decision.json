@@ -1,0 +1,246 @@
+{
+  "format": "mqttiumd.product-transition-registry",
+  "schema_version": 1,
+  "id": "tcp-session-expiry-v1",
+  "decision": "0029",
+  "scope": "product-system-tests",
+  "partition_complete": false,
+  "description": "Partial Proposed0030 finite-session expiry contract: exact closure observations, durable offline occurrences, BOOTTIME-domain anchors, conditional timer/Open ordering and bounded checkpoint/timer work. This describes implementation/system reception, not fixture-oracle qualification or general MQTT conformance.",
+  "rules": [
+    {
+      "id": "expiry.active.retains",
+      "machine": "SessionExpiry",
+      "state_class": "ActiveFinite",
+      "event_class": "TimerObserved",
+      "guard": "An attached transport never expires from its retention interval. Expiry starts only from one captured closure observation, not CONNECT or last packet.",
+      "next_state_class": "ActiveFinite",
+      "required_actions": [
+        "PreserveAttachedSession"
+      ],
+      "forbidden_actions": [
+        "ExpireActiveSession"
+      ],
+      "reception_groups": [
+        "B",
+        "C"
+      ]
+    },
+    {
+      "id": "expiry.detach.capture",
+      "machine": "SessionExpiry",
+      "state_class": "ActiveFinite",
+      "event_class": "TransportClosed",
+      "guard": "Original SessionId, opening attachment and generation; capture admissible logical close time once, select CONNECT/DISCONNECT policy and reserve a control continuation before submitting canonical Detach.",
+      "next_state_class": "DetachPending",
+      "required_actions": [
+        "PersistGuardedDetach",
+        "RetainCapturedObservation"
+      ],
+      "forbidden_actions": [
+        "RecalculateDeadlineAtCommit",
+        "ReturnCapacityBeforeKnown"
+      ],
+      "reception_groups": [
+        "A",
+        "C",
+        "D"
+      ]
+    },
+    {
+      "id": "expiry.detach.unknown",
+      "machine": "SessionExpiry",
+      "state_class": "DetachPending",
+      "event_class": "UnknownResult",
+      "guard": "Keep the same OperationId and canonical observed_at. Resolve with reserved capacity; no timer or new detachment occurrence may turn unknown into certainty.",
+      "next_state_class": "DetachPending",
+      "required_actions": [
+        "ResolveSameOperation",
+        "RetainReservation"
+      ],
+      "forbidden_actions": [
+        "RetryWithNewIdentity",
+        "RearmFromNow"
+      ],
+      "reception_groups": [
+        "D"
+      ]
+    },
+    {
+      "id": "expiry.detach.known",
+      "machine": "SessionExpiry",
+      "state_class": "DetachPending",
+      "event_class": "KnownDetachApplied",
+      "guard": "Known durable offline occurrence contains its original operation and exact deadline. Retain at most one keyed timer for the session; a timer is a request, not direct cache deletion.",
+      "next_state_class": "DetachedFinite",
+      "required_actions": [
+        "InstallCurrentDeadline"
+      ],
+      "forbidden_actions": [
+        "AppendHistoricalTimer"
+      ],
+      "reception_groups": [
+        "C",
+        "D",
+        "F"
+      ]
+    },
+    {
+      "id": "expiry.resume.before",
+      "machine": "SessionExpiry",
+      "state_class": "DetachedFinite",
+      "event_class": "OpenRequested",
+      "guard": "OpenAt and Expire share the writer order. If now is strictly before the current deadline, retain the same session/business state, replace its attachment and invalidate the old detachment.",
+      "next_state_class": "OpenPending",
+      "required_actions": [
+        "PersistTimeAwareOpen",
+        "InvalidateOldDeadline"
+      ],
+      "forbidden_actions": [
+        "ResumeThroughCache"
+      ],
+      "reception_groups": [
+        "B",
+        "C",
+        "E"
+      ]
+    },
+    {
+      "id": "expiry.resume.due",
+      "machine": "SessionExpiry",
+      "state_class": "DetachedFinite",
+      "event_class": "OpenRequested",
+      "guard": "At or after the applicable deadline, OpenAt atomically cleans up the expired incarnation before establishing a new one with Session Present0, even if the timer has not run.",
+      "next_state_class": "OpenPending",
+      "required_actions": [
+        "PersistExpiredReplacement",
+        "PreserveOtherDestinations"
+      ],
+      "forbidden_actions": [
+        "DependOnTimerScheduling",
+        "ResumeExpiredIncarnation"
+      ],
+      "reception_groups": [
+        "B",
+        "C",
+        "F"
+      ]
+    },
+    {
+      "id": "expiry.timer.due",
+      "machine": "SessionExpiry",
+      "state_class": "DetachedFinite",
+      "event_class": "ExpiryRequested",
+      "guard": "Exact SessionId, opening guard and current detached operation/deadline; still offline, finite, and admissible now at or after deadline. Reserve control receipt and reuse atomic target-only cleanup.",
+      "next_state_class": "ExpirePending",
+      "required_actions": [
+        "PersistGuardedExpire"
+      ],
+      "forbidden_actions": [
+        "DeleteByClientId",
+        "FreeBeforeKnownFinish"
+      ],
+      "reception_groups": [
+        "C",
+        "D",
+        "E"
+      ]
+    },
+    {
+      "id": "expiry.timer.stale",
+      "machine": "SessionExpiry",
+      "state_class": "ActiveFinite",
+      "event_class": "OldExpiryObserved",
+      "guard": "Resume, another detachment, takeover, Clean Start or a new same-name incarnation changed the current guard. Ignore the old timer without retargeting it.",
+      "next_state_class": "ActiveFinite",
+      "required_actions": [
+        "PreserveCurrentAttachment"
+      ],
+      "forbidden_actions": [
+        "ExpireNewOccurrence"
+      ],
+      "reception_groups": [
+        "C",
+        "E",
+        "G"
+      ]
+    },
+    {
+      "id": "expiry.expiry.known",
+      "machine": "SessionExpiry",
+      "state_class": "ExpirePending",
+      "event_class": "KnownCloseApplied",
+      "guard": "Known atomic expiry removes this target only, including its routes, claims and inbound state. Shared payload and obligations owed to other destinations remain; credits return once.",
+      "next_state_class": "Absent",
+      "required_actions": [
+        "ReclaimExactSessionResources",
+        "PreserveOtherDestinations"
+      ],
+      "forbidden_actions": [
+        "CountCancellationAsDelivery",
+        "RetainHistoricalTerminalRows"
+      ],
+      "reception_groups": [
+        "E",
+        "F"
+      ]
+    },
+    {
+      "id": "expiry.clock.changed",
+      "machine": "SessionExpiry",
+      "state_class": "ClockAnchorPending",
+      "event_class": "ClockOriginChanged",
+      "guard": "No continuity proved: preserve committed logical progress, ignore unknown downtime, and commit the new domain/tick anchor before durable decisions. Existing logical deadlines do not reset.",
+      "next_state_class": "ClockReady",
+      "required_actions": [
+        "CommitConservativeAnchor"
+      ],
+      "forbidden_actions": [
+        "AuthorizeExpiryFromUtc",
+        "RearmExistingDeadline"
+      ],
+      "reception_groups": [
+        "D",
+        "G"
+      ]
+    },
+    {
+      "id": "expiry.clock.continuous",
+      "machine": "SessionExpiry",
+      "state_class": "ClockReady",
+      "event_class": "ProcessRestarted",
+      "guard": "Same recognized domain and nondecreasing tick: account elapsed BOOTTIME through repeated process crashes. Attached-at-crash finite sessions get one reliable startup detach; durable detachments retain their deadline.",
+      "next_state_class": "ClockReady",
+      "required_actions": [
+        "AccountContinuousElapsedTime",
+        "PreserveDurableDetachment"
+      ],
+      "forbidden_actions": [
+        "LoseContinuousProgress",
+        "DetachAgainFromNow"
+      ],
+      "reception_groups": [
+        "D"
+      ]
+    },
+    {
+      "id": "expiry.checkpoint",
+      "machine": "SessionExpiry",
+      "state_class": "ClockReady",
+      "event_class": "CheckpointRequested",
+      "guard": "Only while finite offline sessions exist: one coalesced CAS checkpoint in flight, overwrite the single anchor, no operation receipt/history. Period30s; observation after31s reports actual delayed commitment instead of promising a false bound.",
+      "next_state_class": "ClockReady",
+      "required_actions": [
+        "PersistBoundedCheckpoint",
+        "ReportLateCheckpoint"
+      ],
+      "forbidden_actions": [
+        "AccumulateCheckpointRows",
+        "BlockControlProgress"
+      ],
+      "reception_groups": [
+        "D",
+        "F"
+      ]
+    }
+  ]
+}

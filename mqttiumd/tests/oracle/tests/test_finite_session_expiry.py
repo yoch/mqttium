@@ -125,6 +125,39 @@ class FiniteSessionFormats(unittest.TestCase):
         invalid["details"]["finite_timers"] = 129
         self.assertTrue(self.contracts.check_value(invalid))
 
+    def test_new_corpus_recipes_are_read_independently_with_the_same_detachment(self):
+        decoded = []
+        for name in ("open", "detached", "expired"):
+            path = ROOT / f"contracts/examples/v1/valid/store-snapshot-session-finite-{name}.json"
+            snapshot = json.loads(path.read_text())
+            self.assertEqual(self.contracts.check_value(snapshot), [])
+            decoded.append(recipe.decode(bytes.fromhex(snapshot["operations"][-1]["recipe_hex"])))
+        opened, detached, expired = decoded
+        self.assertEqual([item.action for item in decoded], ["OpenAt", "Detach", "Expire"])
+        self.assertEqual(opened.expiry.seconds, 7)
+        self.assertEqual(detached.guard, (4, opened.operation))
+        self.assertEqual(expired.guard, detached.guard)
+        self.assertEqual(expired.detached_operation, detached.operation)
+        self.assertEqual(expired.deadline, detached.observed_at + detached.expiry.seconds * 1_000_000_000)
+
+    def test_descriptive_shape_can_report_semantically_invalid_durable_state(self):
+        # Storage/core validate policy/deadline coherence before any cleanup.
+        # Reading a snapshot is not an assertion that its rows are sound.
+        value = self.finite_snapshot()
+        value["sessions"][0]["detached"]["deadline"] = "0"
+        self.assertEqual(self.contracts.check_value(value), [])
+
+    def test_clock_observation_u64_overflow_keeps_its_programmatic_reason(self):
+        for kind, details, member in (
+            ("session_clock_checkpoint", {"logical": "100", "tick": "100"}, "logical"),
+            ("session_clock_degraded", {"code": "checkpoint_late", "age_ms": "31001"}, "age_ms"),
+        ):
+            details[member] = "18446744073709551616"
+            value = {"format": "mqttiumd.product-event", "schema_version": 1,
+                     "seq": "1", "pid": 1, "kind": kind, "details": details}
+            self.assertEqual([(d.code, d.pointer) for d in self.contracts.check_value(value)],
+                             [("u64-out-of-range", f"/details/{member}")])
+
     def test_detached_metadata_and_clock_only_cannot_enlarge_qualification(self):
         def unmet(snapshot):
             snapshot = {"sessions": [], "outbound": [], "operations": [], **snapshot}

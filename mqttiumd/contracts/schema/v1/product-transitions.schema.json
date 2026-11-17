@@ -26,7 +26,8 @@
         "tcp-qos0-exact-pubsub-v1",
         "tcp-receipt-maintenance-v1",
         "tcp-outgoing-pi-reuse-v1",
-        "tcp-session-lifecycle-v1"
+        "tcp-session-lifecycle-v1",
+        "tcp-session-expiry-v1"
       ]
     },
     "decision": {
@@ -34,7 +35,8 @@
         "0026",
         "0027",
         "0028",
-        "0029"
+        "0029",
+        "0030"
       ]
     },
     "scope": {
@@ -78,7 +80,8 @@
               "ConsumedQos0",
               "ReceiptMaintenance",
               "OutgoingPacketIdentifier",
-              "SessionLifecycle"
+              "SessionLifecycle",
+              "SessionExpiry"
             ]
           },
           "state_class": {
@@ -111,7 +114,13 @@
               "OpenPending",
               "ClosePending",
               "RetiredDetached",
-              "Absent"
+              "Absent",
+              "ActiveFinite",
+              "DetachPending",
+              "DetachedFinite",
+              "ExpirePending",
+              "ClockAnchorPending",
+              "ClockReady"
             ]
           },
           "event_class": {
@@ -152,7 +161,13 @@
               "OpenPending",
               "ClosePending",
               "RetiredDetached",
-              "Absent"
+              "Absent",
+              "ActiveFinite",
+              "DetachPending",
+              "DetachedFinite",
+              "ExpirePending",
+              "ClockAnchorPending",
+              "ClockReady"
             ]
           },
           "required_actions": {
@@ -266,6 +281,25 @@
         "properties": {
           "decision": {
             "const": "0029"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": [
+          "id"
+        ],
+        "properties": {
+          "id": {
+            "const": "tcp-session-expiry-v1"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "decision": {
+            "const": "0030"
           }
         }
       }

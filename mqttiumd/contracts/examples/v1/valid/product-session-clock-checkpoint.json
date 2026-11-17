@@ -1,0 +1,11 @@
+{
+  "format": "mqttiumd.product-event",
+  "schema_version": 1,
+  "seq": "21",
+  "kind": "session_clock_checkpoint",
+  "pid": 1,
+  "details": {
+    "logical": "100",
+    "tick": "100"
+  }
+}

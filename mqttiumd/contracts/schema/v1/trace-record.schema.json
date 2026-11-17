@@ -1916,6 +1916,9 @@
               },
               "opened_by": {
                 "$ref": "primitives.schema.json#/$defs/session_opening"
+              },
+              "detached": {
+                "$ref": "primitives.schema.json#/$defs/session_detachment_optional"
               }
             }
           }

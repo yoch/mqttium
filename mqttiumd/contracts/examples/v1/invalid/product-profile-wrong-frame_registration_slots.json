@@ -8,10 +8,10 @@
     false,
     true
   ],
-  "session_expiry_interval": [
-    0,
-    4294967295
-  ],
+  "session_expiry_interval": {
+    "minimum": 0,
+    "maximum": 4294967295
+  },
   "incoming_qos": [
     0,
     1,
@@ -57,7 +57,7 @@
   "volatile_payload_reference_bytes": 4194304,
   "outbox_slots": 128,
   "receipt_window": 1024,
-  "receipt_data_window": 640,
+  "receipt_data_window": 512,
   "receipt_control_reserve": 512,
   "receipt_collection_rows": 128,
   "receipt_collection_trigger": 64,
@@ -66,14 +66,21 @@
   "outgoing_packet_identifier_max": 65535,
   "outgoing_packet_identifier_probe_limit": 129,
   "session_expiry_default": 0,
-  "disconnect_session_expiry_interval": [
-    0,
-    4294967295
-  ],
+  "disconnect_session_expiry_interval": {
+    "minimum": 0,
+    "maximum": 4294967295
+  },
   "lifecycle_transition_effect_slots": 3,
   "closing_input_slots": 32,
   "terminal_input_slots": 336,
   "frame_registration_slots": 209,
   "pre_connack_packet_slots": 1,
-  "session_shutdown_timeout_ms": 2000
+  "session_shutdown_timeout_ms": 2000,
+  "session_clock": "CLOCK_BOOTTIME",
+  "session_time_unit": "nanoseconds",
+  "session_clock_checkpoint_period_ms": 30000,
+  "session_clock_degraded_after_ms": 31000,
+  "max_session_expiry_timers": 128,
+  "session_expiry_batch": 4,
+  "sqlite_schema_version": 6
 }

@@ -1,0 +1,13 @@
+{
+  "format": "mqttiumd.product-event",
+  "schema_version": 1,
+  "seq": "21",
+  "kind": "expiry_inventory",
+  "pid": 1,
+  "details": {
+    "finite_timers": 128,
+    "checkpoint_inflight": true,
+    "queued": 4,
+    "period_ms": 30000
+  }
+}

@@ -67,3 +67,50 @@ fn kind_eight_examples_preserve_distinct_open_and_close_identities() {
     assert_eq!(reason, SessionEndReason::Disconnect);
     assert_ne!(open.operation, close.operation);
 }
+
+#[test]
+fn finite_lifecycle_examples_preserve_the_original_detachment_across_readers() {
+    let Recipe::SessionLifecycle(open) =
+        last_recipe(&example("store-snapshot-session-finite-open"))
+    else {
+        panic!("finite open example");
+    };
+    let SessionAction::OpenAt { expiry, now, .. } = open.action else {
+        panic!("time-aware open action");
+    };
+    assert_eq!(expiry, SessionExpiry::After(7));
+    assert_eq!(now, 100);
+    let Recipe::SessionLifecycle(detach) =
+        last_recipe(&example("store-snapshot-session-finite-detached"))
+    else {
+        panic!("detach example");
+    };
+    let SessionAction::Detach {
+        guard,
+        expiry,
+        observed_at,
+    } = detach.action
+    else {
+        panic!("detach action");
+    };
+    assert_eq!(guard.opened_by, Some(open.operation));
+    assert_eq!(expiry, SessionExpiry::After(7));
+    assert_eq!(observed_at, now);
+    let Recipe::SessionLifecycle(expire) =
+        last_recipe(&example("store-snapshot-session-finite-expired"))
+    else {
+        panic!("expiry example");
+    };
+    let SessionAction::Expire {
+        guard: expired_guard,
+        detached,
+        now,
+    } = expire.action
+    else {
+        panic!("expiry action");
+    };
+    assert_eq!(expired_guard, guard);
+    assert_eq!(detached.operation, detach.operation);
+    assert_eq!(detached.deadline, Some(observed_at + 7_000_000_000));
+    assert_eq!(Some(now), detached.deadline);
+}

@@ -80,7 +80,11 @@
         "session.open.prepared",
         "session.close.prepared",
         "session.open.committed",
-        "session.close.committed"
+        "session.close.committed",
+        "session.detach.prepared",
+        "session.detach.committed",
+        "session.expire.prepared",
+        "session.expire.committed"
       ]
     },
     "command_kind": {
@@ -93,7 +97,9 @@
         "Consume",
         "ReceiptCollection",
         "SessionOpen",
-        "SessionClose"
+        "SessionClose",
+        "SessionDetach",
+        "SessionExpire"
       ]
     },
     "cause": {
@@ -187,6 +193,40 @@
               "$ref": "primitives.schema.json#/$defs/u64"
             }
           ]
+        },
+        "expiry": {
+          "oneOf": [
+            {
+              "$ref": "primitives.schema.json#/$defs/session_expiry"
+            },
+            {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 4294967295
+            }
+          ]
+        },
+        "detached_by": {
+          "$ref": "primitives.schema.json#/$defs/operation_id"
+        },
+        "deadline": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "primitives.schema.json#/$defs/u64"
+            }
+          ]
+        },
+        "logical": {
+          "$ref": "primitives.schema.json#/$defs/u64"
+        },
+        "tick": {
+          "$ref": "primitives.schema.json#/$defs/u64"
+        },
+        "age_ms": {
+          "$ref": "primitives.schema.json#/$defs/u64"
         }
       }
     },
@@ -267,17 +307,14 @@
           "details": {
             "required": [
               "action",
-              "session",
-              "route_revision",
-              "cancelled_inbound",
-              "cancelled_deliveries",
-              "cancelled_routes"
+              "session"
             ],
             "properties": {
               "action": {
                 "enum": [
                   "Opened",
-                  "Closed"
+                  "Closed",
+                  "Detached"
                 ]
               },
               "cancelled_inbound": {
@@ -310,7 +347,11 @@
                     "revision",
                     "session_present",
                     "expiry",
-                    "retired_session"
+                    "retired_session",
+                    "route_revision",
+                    "cancelled_inbound",
+                    "cancelled_deliveries",
+                    "cancelled_routes"
                   ],
                   "properties": {
                     "expiry": {
@@ -318,6 +359,44 @@
                     },
                     "session_present": {
                       "type": "boolean"
+                    }
+                  }
+                }
+              },
+              {
+                "if": {
+                  "properties": {
+                    "action": {
+                      "const": "Closed"
+                    }
+                  }
+                },
+                "then": {
+                  "required": [
+                    "route_revision",
+                    "cancelled_inbound",
+                    "cancelled_deliveries",
+                    "cancelled_routes"
+                  ]
+                }
+              },
+              {
+                "if": {
+                  "properties": {
+                    "action": {
+                      "const": "Detached"
+                    }
+                  }
+                },
+                "then": {
+                  "required": [
+                    "expiry",
+                    "detached_by",
+                    "deadline"
+                  ],
+                  "properties": {
+                    "expiry": {
+                      "$ref": "primitives.schema.json#/$defs/session_expiry"
                     }
                   }
                 }
@@ -571,7 +650,8 @@
               "action": {
                 "enum": [
                   "Opened",
-                  "Closed"
+                  "Closed",
+                  "Detached"
                 ]
               },
               "session": {
@@ -743,6 +823,151 @@
             }
           }
         ]
+      }
+    },
+    {
+      "if": {
+        "required": [
+          "kind"
+        ],
+        "properties": {
+          "kind": {
+            "const": "expiry_inventory"
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "details"
+        ],
+        "properties": {
+          "details": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "finite_timers",
+              "checkpoint_inflight",
+              "queued",
+              "period_ms"
+            ],
+            "properties": {
+              "finite_timers": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 128
+              },
+              "checkpoint_inflight": {
+                "type": "boolean"
+              },
+              "queued": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 128
+              },
+              "period_ms": {
+                "const": 30000
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": [
+          "kind"
+        ],
+        "properties": {
+          "kind": {
+            "const": "session_clock_checkpoint"
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "details"
+        ],
+        "properties": {
+          "details": {
+            "oneOf": [
+              {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "logical",
+                  "tick"
+                ],
+                "properties": {
+                  "logical": {
+                    "$ref": "primitives.schema.json#/$defs/u64"
+                  },
+                  "tick": {
+                    "$ref": "primitives.schema.json#/$defs/u64"
+                  }
+                }
+              },
+              {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "logical",
+                  "tick",
+                  "same_domain",
+                  "source"
+                ],
+                "properties": {
+                  "logical": {
+                    "$ref": "primitives.schema.json#/$defs/u64"
+                  },
+                  "tick": {
+                    "$ref": "primitives.schema.json#/$defs/u64"
+                  },
+                  "same_domain": {
+                    "type": "boolean"
+                  },
+                  "source": {
+                    "const": "maintenance_commit"
+                  }
+                }
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": [
+          "kind"
+        ],
+        "properties": {
+          "kind": {
+            "const": "session_clock_degraded"
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "details"
+        ],
+        "properties": {
+          "details": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "code",
+              "age_ms"
+            ],
+            "properties": {
+              "code": {
+                "const": "checkpoint_late"
+              },
+              "age_ms": {
+                "$ref": "primitives.schema.json#/$defs/u64"
+              }
+            }
+          }
+        }
       }
     }
   ],

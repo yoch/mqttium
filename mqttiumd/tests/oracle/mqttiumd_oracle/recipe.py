@@ -147,6 +147,47 @@ class SessionClose:
     action = "Close"
 
 
+@dataclass(frozen=True)
+class SessionExpiryAfter:
+    seconds: int
+
+
+@dataclass(frozen=True)
+class SessionOpenAt:
+    operation: tuple
+    clean_start: bool
+    expiry: str | SessionExpiryAfter
+    expected: tuple | None
+    client_id: bytes
+    now: int
+
+    kind = "SessionLifecycle"
+    action = "OpenAt"
+
+
+@dataclass(frozen=True)
+class SessionDetach:
+    operation: tuple
+    guard: tuple
+    expiry: str | SessionExpiryAfter
+    observed_at: int
+
+    kind = "SessionLifecycle"
+    action = "Detach"
+
+
+@dataclass(frozen=True)
+class SessionExpire:
+    operation: tuple
+    guard: tuple
+    detached_operation: tuple
+    deadline: int | None
+    now: int
+
+    kind = "SessionLifecycle"
+    action = "Expire"
+
+
 class _Reader:
     def __init__(self, data: bytes) -> None:
         self.data = data
@@ -174,6 +215,29 @@ class _Reader:
     def session_guard(self) -> tuple:
         session = self.number(8)
         return session, self.scoped() if self.boolean() else None
+
+    def session_expiry(self) -> str | SessionExpiryAfter:
+        tag = self.number(1)
+        if tag in (0, 1):
+            return ("OnDisconnect", "Never")[tag]
+        if tag == 2:
+            seconds = self.number(4)
+            if 1 <= seconds <= 0xFFFF_FFFE:
+                return SessionExpiryAfter(seconds)
+        raise RecipeError("invalid session expiry")
+
+    def client_id(self) -> bytes:
+        length = self.number(2)
+        if not 1 <= length <= MAX_SESSION_CLIENT_BYTES:
+            raise RecipeError("invalid ClientID length")
+        client = self.take(length)
+        try:
+            client.decode("utf-8", errors="strict")
+        except UnicodeDecodeError as error:
+            raise RecipeError("invalid ClientID") from error
+        if b"\x00" in client:
+            raise RecipeError("invalid ClientID")
+        return client
 
 
 def decode(data: bytes):
@@ -283,6 +347,24 @@ def decode(data: bytes):
                 raise RecipeError("invalid session end reason")
             recipe = SessionClose(operation, guard,
                                   ("Disconnect", "TransportLost", "Replaced", "Startup")[reason])
+        elif action == 2:
+            clean_start = reader.boolean()
+            expiry = reader.session_expiry()
+            expected = reader.session_guard() if reader.boolean() else None
+            client = reader.client_id()
+            recipe = SessionOpenAt(operation, clean_start, expiry, expected, client, reader.number(8))
+        elif action == 3:
+            guard = reader.session_guard()
+            expiry = reader.session_expiry()
+            observed_at = reader.number(8)
+            if isinstance(expiry, SessionExpiryAfter) and observed_at + expiry.seconds * 1_000_000_000 > 0xFFFF_FFFF_FFFF_FFFF:
+                raise RecipeError("invalid session deadline")
+            recipe = SessionDetach(operation, guard, expiry, observed_at)
+        elif action == 4:
+            guard = reader.session_guard()
+            detached_operation = reader.scoped()
+            deadline = reader.number(8) if reader.boolean() else None
+            recipe = SessionExpire(operation, guard, detached_operation, deadline, reader.number(8))
         else:
             raise RecipeError("invalid session action")
     else:

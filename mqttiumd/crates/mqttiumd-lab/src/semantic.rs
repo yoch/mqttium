@@ -180,6 +180,24 @@ pub fn check(workspace: &Workspace, document: &Value, report: &mut Report) {
                     u64_at(document, &pointer, &mut report.diagnostics);
                 }
             }
+            if matches!(
+                text(document, "kind"),
+                "session_changed" | "session_clock_checkpoint" | "session_clock_degraded"
+            ) {
+                for member in ["deadline", "logical", "tick", "age_ms"] {
+                    let pointer = format!("/details/{member}");
+                    if document.pointer(&pointer).is_some_and(Value::is_string) {
+                        u64_at(document, &pointer, &mut report.diagnostics);
+                    }
+                }
+                if let Some(detached) = document.pointer("/details/detached_by") {
+                    decimal_strings(
+                        Some(detached),
+                        "/details/detached_by",
+                        &mut report.diagnostics,
+                    );
+                }
+            }
             if text(document, "kind") == "command_submitted"
                 && document
                     .pointer("/details/expected_session")

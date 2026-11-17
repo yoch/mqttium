@@ -133,7 +133,18 @@
     "contracts/examples/v1/valid/product-session-opened.json",
     "contracts/examples/v1/valid/product-session-closed.json",
     "contracts/examples/v1/valid/product-session-refused.json",
-    "contracts/examples/v1/valid/product-session-cardinality.json"
+    "contracts/examples/v1/valid/product-session-cardinality.json",
+    "contracts/examples/v1/valid/product-expiry-transitions.json",
+    "contracts/examples/v1/valid/store-snapshot-session-finite-open.json",
+    "contracts/examples/v1/valid/store-snapshot-session-finite-detached.json",
+    "contracts/examples/v1/valid/store-snapshot-session-finite-expired.json",
+    "contracts/examples/v1/valid/trace-record-session-finite-recovery.json",
+    "contracts/examples/v1/valid/product-session-detached.json",
+    "contracts/examples/v1/valid/product-session-opened-finite.json",
+    "contracts/examples/v1/valid/product-session-clock-checkpoint.json",
+    "contracts/examples/v1/valid/product-session-clock-checkpoint-writer.json",
+    "contracts/examples/v1/valid/product-session-clock-degraded.json",
+    "contracts/examples/v1/valid/product-expiry-inventory.json"
   ],
   "invalid": [
     {
@@ -1256,7 +1267,7 @@
       "file": "contracts/examples/v1/invalid/store-snapshot-session-policy-invalid.json",
       "code": "schema-violation",
       "pointer": "/sessions/3/expiry",
-      "why": "Persisted policy is a closed discriminant; intermediate expiry values are outside this format."
+      "why": "Persisted policy is a closed discriminant, including an explicit bounded finite After variant."
     },
     {
       "file": "contracts/examples/v1/invalid/store-snapshot-session-attachment-overflow.json",
@@ -2361,6 +2372,66 @@
       "code": "schema-violation",
       "pointer": "/details/reason_code",
       "why": "A refusal must not describe a success CONNACK or fabricate a session identity."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/product-expiry-transitions-wrong-decision.json",
+      "code": "schema-violation",
+      "pointer": "/decision",
+      "why": "The finite time subset retains Proposed0030 and system-test scope."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/store-snapshot-session-after-0.json",
+      "code": "schema-violation",
+      "pointer": "/sessions/3/expiry",
+      "why": "Zero and infinity are not aliases for the finite After discriminant."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/store-snapshot-session-after-4294967295.json",
+      "code": "schema-violation",
+      "pointer": "/sessions/3/expiry",
+      "why": "Zero and infinity are not aliases for the finite After discriminant."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/store-snapshot-session-deadline-overflow.json",
+      "code": "u64-out-of-range",
+      "pointer": "/sessions/3/detached/deadline",
+      "why": "An offline deadline is checked logical nanoseconds, never a saturating value."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/store-snapshot-session-clock-logical-overflow.json",
+      "code": "u64-out-of-range",
+      "pointer": "/meta/session_clock/logical",
+      "why": "The one anchor preserves checked durable logical progress."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/store-snapshot-session-clock-tick-overflow.json",
+      "code": "u64-out-of-range",
+      "pointer": "/meta/session_clock/reading/tick",
+      "why": "The one anchor preserves checked durable logical progress."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/store-snapshot-session-clock-invalid-domain.json",
+      "code": "schema-violation",
+      "pointer": "/meta/session_clock/reading/domain",
+      "why": "A domain is a fixed bounded lower-case 32-byte identity, not UTC."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/product-session-detached-missing-deadline.json",
+      "code": "schema-violation",
+      "pointer": "/details",
+      "why": "The detached occurrence retains both its original operation and deadline."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/product-session-detached-missing-detached_by.json",
+      "code": "schema-violation",
+      "pointer": "/details",
+      "why": "The detached occurrence retains both its original operation and deadline."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/product-expiry-timer-budget-exceeded.json",
+      "code": "schema-violation",
+      "pointer": "/details/finite_timers",
+      "why": "A session has at most one keyed wakeup within the unchanged128-session budget."
     }
   ]
 }
