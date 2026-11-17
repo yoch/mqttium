@@ -1,11 +1,11 @@
-//! The schema of version 6. Every table is `STRICT`; identities and 64-bit
+//! The schema of version 7. Every table is `STRICT`; identities and 64-bit
 //! values are 8-byte big-endian BLOBs (32 bytes for an operation-scoped
 //! identity, 16 for an exchange, 24 for an opening attempt); large BLOBs
 //! come last in their row.
 
 /// `PRAGMA user_version` of the schema below. Any other version is
 /// refused before anything is written.
-pub const SCHEMA_VERSION: i64 = 6;
+pub const SCHEMA_VERSION: i64 = 7;
 
 /// The format named in `meta`.
 pub const FORMAT: &str = "mqttiumd-store-sqlite";
@@ -59,6 +59,7 @@ CREATE TABLE routes (
     position BLOB NOT NULL CHECK (length(position) = 8),
     session BLOB NOT NULL CHECK (length(session) = 8),
     qos INTEGER NOT NULL,
+    options INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (topic, position)
 ) STRICT, WITHOUT ROWID;
 

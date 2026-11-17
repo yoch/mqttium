@@ -1,10 +1,26 @@
-//! Schema-5 subscription and outgoing delivery transactions and bounded reads.
+//! Schema-7 subscription and outgoing delivery transactions and bounded reads.
 use super::*;
 use mqttiumd_contract::command::{
     ChangeSubscriptions, ClaimDelivery, ConsumeDelivery, FinishDelivery, UpdateSubscriptions,
 };
 use mqttiumd_contract::ids::OutboundPacketId;
-use mqttiumd_contract::pubsub::{DeliveryClaim, MAX_SUBSCRIPTIONS, WORK_PAGE_LIMIT, WorkItem};
+use mqttiumd_contract::pubsub::{
+    DeliveryClaim, MAX_SUBSCRIPTIONS, SubscriptionOptions, WORK_PAGE_LIMIT, WorkItem,
+};
+
+/// Validate discriminants before a route can be selected or copied.
+pub(super) fn route_options(value: i64) -> Result<SubscriptionOptions, Fault> {
+    u8::try_from(value)
+        .ok()
+        .and_then(SubscriptionOptions::from_bits)
+        .ok_or(Fault::Corrupt)
+}
+pub(super) fn route_filter(bytes: &[u8]) -> Result<(), Fault> {
+    if !mqttiumd_contract::topic::valid_filter(bytes) {
+        return Err(Fault::Corrupt);
+    }
+    Ok(())
+}
 
 pub(super) fn subscriptions(
     conn: &Connection,
@@ -17,11 +33,13 @@ pub(super) fn subscriptions(
         command.session,
         command.session_revision,
         command.route_revision,
-        command
-            .changes
-            .as_slice()
-            .iter()
-            .map(|c| (&c.topic, c.subscribe.then_some(Qos::AtLeastOnce))),
+        command.changes.as_slice().iter().map(|c| {
+            (
+                &c.topic,
+                c.subscribe.then_some(Qos::AtLeastOnce),
+                SubscriptionOptions::DEFAULT,
+            )
+        }),
     )
 }
 pub(super) fn updates(
@@ -39,7 +57,7 @@ pub(super) fn updates(
             .changes
             .as_slice()
             .iter()
-            .map(|c| (&c.topic, c.granted)),
+            .map(|c| (&c.topic, c.granted, c.options)),
     )
 }
 fn route_updates<'a>(
@@ -48,15 +66,19 @@ fn route_updates<'a>(
     session: SessionId,
     session_revision: Revision,
     route_revision: Revision,
-    changes: impl Iterator<Item = (&'a SharedBytes, Option<Qos>)>,
+    changes: impl Iterator<Item = (&'a SharedBytes, Option<Qos>, SubscriptionOptions)>,
 ) -> Guard<CommitFacts> {
     let failed = RejectReason::PreconditionFailed;
     active_session(conn, session, session_revision)?;
     if meta.route_revision != route_revision {
         return refused(failed);
     }
-    for (topic, granted) in changes {
-        if topic.len() > meta.limits.max_topic_bytes {
+    for (topic, granted, options) in changes {
+        if topic.len() > meta.limits.max_topic_bytes
+            || !mqttiumd_contract::topic::valid_filter(topic.as_slice())
+            || SubscriptionOptions::from_bits(options.bits()) != Some(options)
+            || (granted.is_none() && options != SubscriptionOptions::DEFAULT)
+        {
             return refused(failed);
         }
         let topic = topic.as_slice();
@@ -71,8 +93,15 @@ fn route_updates<'a>(
                 .optional()?
                 .is_some();
             if present {
-                conn.prepare_cached("UPDATE routes SET qos=?3 WHERE topic=?1 AND session=?2")?
-                    .execute(params![topic, target.as_slice(), qos_code(qos)])?;
+                conn.prepare_cached(
+                    "UPDATE routes SET qos=?3,options=?4 WHERE topic=?1 AND session=?2",
+                )?
+                .execute(params![
+                    topic,
+                    target.as_slice(),
+                    qos_code(qos),
+                    i64::from(options.bits())
+                ])?;
             } else {
                 let count: i64 = conn
                     .prepare_cached(
@@ -105,13 +134,14 @@ fn route_updates<'a>(
                     None => 0,
                 };
                 conn.prepare_cached(
-                    "INSERT INTO routes(topic,position,session,qos) VALUES(?1,?2,?3,?4)",
+                    "INSERT INTO routes(topic,position,session,qos,options) VALUES(?1,?2,?3,?4,?5)",
                 )?
                 .execute(params![
                     topic,
                     u64_blob(position).as_slice(),
                     target.as_slice(),
-                    qos_code(qos)
+                    qos_code(qos),
+                    i64::from(options.bits())
                 ])?;
             }
         } else {

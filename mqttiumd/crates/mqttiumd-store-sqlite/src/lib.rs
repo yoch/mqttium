@@ -1164,6 +1164,9 @@ fn stage_admin(
             if topic.len() > meta.limits.max_topic_bytes {
                 return admin_refused(AdminRefused::TopicTooLong);
             }
+            if !mqttiumd_contract::topic::valid_filter(&topic) {
+                return admin_refused(AdminRefused::Inconsistent);
+            }
             match session_row(conn, session)? {
                 Some((_, SessionState::Active)) => {}
                 _ => return admin_refused(AdminRefused::UnknownSession),
@@ -1198,7 +1201,7 @@ fn stage_admin(
                 None => 0,
             };
             conn.prepare_cached(
-                "INSERT INTO routes (topic, position, session, qos) VALUES (?1, ?2, ?3, ?4)",
+                "INSERT INTO routes (topic, position, session, qos, options) VALUES (?1, ?2, ?3, ?4, 0)",
             )?
             .execute(params![
                 topic.as_slice(),
@@ -1954,7 +1957,7 @@ impl SqliteStore {
         // ?1 is the code of an active session and ?2 the open epoch, in
         // every query, used or not.
         section(
-            "SELECT r.topic, r.session, r.qos, s.revision, s.state FROM routes r
+            "SELECT r.topic, r.session, r.qos, s.revision, s.state, r.options FROM routes r
                LEFT JOIN sessions s ON s.id = r.session
               WHERE ?1 = ?1 AND ?2 = ?2 ORDER BY r.topic, r.position",
             &mut out,
@@ -1970,6 +1973,8 @@ impl SqliteStore {
                 )?;
                 let target = SessionId::from_be_slice(reader::borrow_blob(row, 1, 8)?)
                     .map_err(|_| Fault::Corrupt)?;
+                pubsub::route_filter(topic)?;
+                let options = pubsub::route_options(row.get(5)?)?;
                 let max_qos = code_qos(row.get(2)?)?;
                 let revision = reader::optional_blob(row, 3, 8)?;
                 let state: Option<i64> = row.get(4)?;
@@ -1984,7 +1989,7 @@ impl SqliteStore {
                     target,
                     target_revision: Revision::new(blob_u64(&revision)?),
                     max_qos,
-                    options: mqttiumd_contract::pubsub::SubscriptionOptions::DEFAULT,
+                    options,
                 }))
             },
         )?;
@@ -2213,10 +2218,18 @@ fn read_snapshot(conn: &Connection, budget: ReadBudget) -> Result<DurableState, 
         }
         let mut routes: BTreeMap<Vec<u8>, Vec<RouteTarget>> = BTreeMap::new();
         {
-            let mut statement =
-                conn.prepare("SELECT topic, session, qos FROM routes ORDER BY topic, position")?;
+            let mut statement = conn.prepare(
+                "SELECT topic, session, qos, options FROM routes ORDER BY topic, position",
+            )?;
             let mut rows = statement.query([])?;
             while let Some(row) = rows.next()? {
+                let filter = reader::borrow_blob(
+                    row,
+                    0,
+                    meta.limits.max_topic_bytes.min(budget.max_field_bytes),
+                )?;
+                pubsub::route_filter(filter)?;
+                let options = pubsub::route_options(row.get(3)?)?;
                 routes
                     .entry(reader::copy_blob(row, 0, budget.max_field_bytes)?)
                     .or_default()
@@ -2224,7 +2237,7 @@ fn read_snapshot(conn: &Connection, budget: ReadBudget) -> Result<DurableState, 
                         session: SessionId::from_be_slice(reader::borrow_blob(row, 1, 8)?)
                             .map_err(|_| Fault::Corrupt)?,
                         qos: code_qos(row.get(2)?)?,
-                        options: mqttiumd_contract::pubsub::SubscriptionOptions::DEFAULT,
+                        options,
                     });
             }
         }

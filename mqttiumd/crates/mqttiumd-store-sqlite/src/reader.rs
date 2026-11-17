@@ -218,7 +218,7 @@ pub(crate) fn snapshot(conn: &Connection, meta: &Meta, budget: ReadBudget) -> Re
             &[(0, 32), (1, 8), (2, 8)],
         ),
         (
-            "SELECT topic, session, qos FROM routes",
+            "SELECT topic, session, qos, options FROM routes",
             &[(0, meta.limits.max_topic_bytes), (1, 8)],
         ),
         (

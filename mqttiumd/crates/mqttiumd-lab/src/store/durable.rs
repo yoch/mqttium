@@ -30,7 +30,9 @@ use mqttiumd_contract::outcome::{
     CommitFacts, Knowledge, OpeningOutcome, RejectReason, StoreOutcome, StoreReply, StoreViolation,
 };
 use mqttiumd_contract::packet::{Qos, SharedBytes};
-use mqttiumd_contract::pubsub::{DeliveryClaim, MAX_SUBSCRIPTIONS, WORK_PAGE_LIMIT, WorkItem};
+use mqttiumd_contract::pubsub::{
+    DeliveryClaim, MAX_SUBSCRIPTIONS, SubscriptionOptions, WORK_PAGE_LIMIT, WorkItem,
+};
 use mqttiumd_contract::receipts::{
     ClosedReceiptCollection, ClosedReceiptReply, MAX_COLLECTION_ROWS, MAX_RECEIPT_ORIGINS,
     RECEIPT_CONTROL_RESERVE, RECEIPT_DATA_WINDOW, RECEIPT_WINDOW, ReceiptClass, ReceiptClosure,
@@ -305,6 +307,7 @@ impl FactRef<'_> {
                     target: target.session,
                     target_revision: session.revision,
                     max_qos: target.qos,
+                    options: target.options,
                 }
             }
             Self::Session(session, record) => {
@@ -451,7 +454,15 @@ fn check_inventory_bound(state: &DurableState) -> Result<(), ReadError> {
     ] {
         rows = rows.checked_add(size).ok_or(ReadError::LimitExceeded)?;
     }
-    for targets in state.routes.values() {
+    for (filter, targets) in &state.routes {
+        if filter.len() > state.limits.max_topic_bytes
+            || !mqttiumd_contract::topic::valid_filter(filter)
+            || targets.iter().any(|target| {
+                SubscriptionOptions::from_bits(target.options.bits()) != Some(target.options)
+            })
+        {
+            return Err(ReadError::InvalidData);
+        }
         rows = rows
             .checked_add(targets.len())
             .ok_or(ReadError::LimitExceeded)?;
@@ -498,7 +509,7 @@ fn check_snapshot(state: &DurableState, budget: ReadBudget) -> Result<(), ReadEr
         meter.field(topic.len(), state.limits.max_topic_bytes)?;
         for _ in targets {
             meter.charge(
-                144usize
+                152usize
                     .checked_add(topic.len())
                     .ok_or(ReadError::LimitExceeded)?,
             )?;
@@ -596,7 +607,7 @@ trait Staging {
         session: SessionId,
         revision: Revision,
         route_revision: Revision,
-        changes: impl Iterator<Item = (&'a SharedBytes, Option<Qos>)>,
+        changes: impl Iterator<Item = (&'a SharedBytes, Option<Qos>, SubscriptionOptions)>,
     ) -> Guard<CommitFacts>;
     fn stage_claim(&mut self, command: &ClaimDelivery) -> Guard<CommitFacts>;
     fn stage_finish(&mut self, command: &FinishDelivery) -> Guard<CommitFacts>;
@@ -834,11 +845,13 @@ impl Staging for DurableState {
             command.session,
             command.session_revision,
             command.route_revision,
-            command
-                .changes
-                .as_slice()
-                .iter()
-                .map(|c| (&c.topic, c.subscribe.then_some(Qos::AtLeastOnce))),
+            command.changes.as_slice().iter().map(|c| {
+                (
+                    &c.topic,
+                    c.subscribe.then_some(Qos::AtLeastOnce),
+                    SubscriptionOptions::DEFAULT,
+                )
+            }),
         )
     }
     fn stage_updates(&mut self, command: &UpdateSubscriptions) -> Guard<CommitFacts> {
@@ -850,7 +863,7 @@ impl Staging for DurableState {
                 .changes
                 .as_slice()
                 .iter()
-                .map(|c| (&c.topic, c.granted)),
+                .map(|c| (&c.topic, c.granted, c.options)),
         )
     }
     fn stage_route_updates<'a>(
@@ -858,15 +871,19 @@ impl Staging for DurableState {
         session: SessionId,
         revision: Revision,
         route_revision: Revision,
-        changes: impl Iterator<Item = (&'a SharedBytes, Option<Qos>)>,
+        changes: impl Iterator<Item = (&'a SharedBytes, Option<Qos>, SubscriptionOptions)>,
     ) -> Guard<CommitFacts> {
         let failed = RejectReason::PreconditionFailed;
         self.active_session(session, revision)?;
         if route_revision != self.route_revision {
             return Err(failed);
         }
-        for (topic, granted) in changes {
-            if topic.len() > self.limits.max_topic_bytes {
+        for (topic, granted, options) in changes {
+            if topic.len() > self.limits.max_topic_bytes
+                || !mqttiumd_contract::topic::valid_filter(topic.as_slice())
+                || SubscriptionOptions::from_bits(options.bits()) != Some(options)
+                || (granted.is_none() && options != SubscriptionOptions::DEFAULT)
+            {
                 return Err(failed);
             }
             if let Some(qos) = granted {
@@ -876,13 +893,18 @@ impl Staging for DurableState {
                 let targets = self.routes.entry(topic.as_slice().to_vec()).or_default();
                 if let Some(target) = targets.iter_mut().find(|target| target.session == session) {
                     target.qos = qos;
+                    target.options = options;
                 } else {
                     if targets.len() >= self.limits.max_route_targets
                         || targets.len() >= self.limits.max_targets_per_admission
                     {
                         return Err(RejectReason::CapacityExceeded(Resource::References));
                     }
-                    targets.push(RouteTarget { session, qos });
+                    targets.push(RouteTarget {
+                        session,
+                        qos,
+                        options,
+                    });
                 }
             } else if let Some(targets) = self.routes.get_mut(topic.as_slice()) {
                 targets.retain(|target| target.session != session);
@@ -1106,6 +1128,9 @@ impl Staging for DurableState {
                 if topic.len() > self.limits.max_topic_bytes {
                     return Err(AdminRefused::TopicTooLong);
                 }
+                if !mqttiumd_contract::topic::valid_filter(&topic) {
+                    return Err(AdminRefused::Inconsistent);
+                }
                 match self.sessions.get(&session) {
                     Some(record) if record.state == SessionState::Active => {}
                     _ => return Err(AdminRefused::UnknownSession),
@@ -1117,7 +1142,11 @@ impl Staging for DurableState {
                 if targets.len() >= self.limits.max_route_targets {
                     return Err(AdminRefused::TableFull);
                 }
-                targets.push(RouteTarget { session, qos });
+                targets.push(RouteTarget {
+                    session,
+                    qos,
+                    options: SubscriptionOptions::DEFAULT,
+                });
                 self.route_revision = self
                     .route_revision
                     .checked_next()

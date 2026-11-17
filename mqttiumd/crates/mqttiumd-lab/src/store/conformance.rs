@@ -1970,6 +1970,7 @@ pub fn recovered_facts_follow_the_order_of_an_inventory<S: DurableStore>(
     let facts = whole.facts.as_slice();
     let limits = fixture_limits();
     let route = |topic: &[u8], target, max_qos| RecoveredFact::Route {
+        options: mqttiumd_contract::pubsub::SubscriptionOptions::DEFAULT,
         topic: SharedBytes::copy_from(topic, 256).expect("fits"),
         target,
         target_revision: Revision::new(1),
@@ -2360,6 +2361,7 @@ pub fn qos0_grants_and_consumption_preserve_durable_delivery_identity<S: Durable
             route_revision: revision,
             changes: BoundedVec::from_slice(
                 &[GrantedSubscriptionChange {
+                    options: mqttiumd_contract::pubsub::SubscriptionOptions::DEFAULT,
                     topic: SharedBytes::copy_from(TOPIC, 256).unwrap(),
                     granted,
                 }],
@@ -2651,6 +2653,7 @@ pub fn replacing_and_removing_qos0_routes_preserves_older_work<S: DurableStore>(
             route_revision: revision,
             changes: BoundedVec::from_slice(
                 &[GrantedSubscriptionChange {
+                    options: mqttiumd_contract::pubsub::SubscriptionOptions::DEFAULT,
                     topic: SharedBytes::copy_from(TOPIC, 256).unwrap(),
                     granted,
                 }],
@@ -3973,6 +3976,7 @@ pub fn a_maximum_product_subscription_prefix_fits_the_collection_budget<S: Durab
             let mut topic = vec![b'a'; 1024];
             topic[1023] = b'0' + u8::try_from(index).unwrap();
             GrantedSubscriptionChange {
+                options: mqttiumd_contract::pubsub::SubscriptionOptions::DEFAULT,
                 topic: SharedBytes::copy_from(&topic, 1024).unwrap(),
                 granted: Some(Qos::AtLeastOnce),
             }
