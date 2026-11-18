@@ -1,4 +1,9 @@
 paho-mqtt==2.1.0
 mqttium==1.3.0
+# Exact versions of the second schema reader (tools/check_schemas.py).
+# Install with: python -m pip install -r tools/requirements.txt
+attrs==26.1.0
 jsonschema==4.26.0
+jsonschema-specifications==2025.9.1
 referencing==0.37.0
+rpds-py==2026.6.3

@@ -32,6 +32,8 @@ class PreviewCommandTests(unittest.TestCase):
                          "SECURE.md", "start-tls.sh", "secure-demo.sh", "demo-pki.py", "identities.example.json",
                          "POLICY.md", "policy-demo.py", "identities.next.example.json", "retained-will-demo.py", "PILOT.md"):
                 (root/"preview"/name).write_text("fixture "+name)
+            (root/"docs/pilot").mkdir(parents=True)
+            (root/"docs/pilot/decision.md").write_text("identified qualification fixture\n")
             (root/"preview/pilot").mkdir()
             (root/"preview/pilot/load.py").write_text("# normal pilot fixture\n")
             (root/"tools").mkdir()
@@ -66,7 +68,8 @@ class PreviewCommandTests(unittest.TestCase):
                              "POLICY.md", "policy-demo.py", "identities.next.example.json", "retained-will-demo.py"):
                     self.assertTrue(any(member.endswith("/" + name) for member in names), name)
                 for name in ("PILOT.md", "run-qualification.sh", "pilot/load.py",
-                             "tests/system/policy_transition_reception.py", "tests/system/normal_helper.py"):
+                             "tests/system/policy_transition_reception.py", "tests/system/normal_helper.py",
+                             "preview/demo-pki.py", "preview/policy-demo.py", "qualification/decision.md"):
                     self.assertTrue(any(member.endswith("/"+name) for member in names),
                                     "packaged_pilot_dependency_missing: "+name)
                 info=next(item for item in packed.getmembers() if item.name.endswith("/BUILD.json"))

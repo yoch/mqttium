@@ -195,7 +195,7 @@ client certificates. Durable ClientID ownership and immutable authorization
 policy bound session recovery. See [the secure preview guide](../../preview/SECURE.md).
 
 Proposed 0036 provides a read-only plan and a single-transaction offline apply
-for monotone authorization changes on schema 11. The tool preserves historic
+for monotone authorization changes on current secure schema13. The tool preserves historic
 MQTT state and makes a verified standalone backup before changing authority.
 Grant removal and principal or ClientID transfer still need explicit
 reconciliation. See [the offline operator guide](../../preview/POLICY.md).
@@ -205,3 +205,13 @@ automated rotation and revocation, tenant isolation, and restrictive policy chan
 remain separate. System reception reports finite service distributions for
 the verified environment. MQTT conformance and storage power-loss behavior
 retain their separate evidence requirements.
+
+## Pre-pilot operating decision
+
+The source51be4079 executable passed the healthy50/s workload and targeted
+recovery/security receptions. The requested persistent-dashboard-outage profile
+is NO-GO. The128-reference quota accepted127 messages and refused373 of500
+at50/s, beginning at2.54 seconds. A received producer back-pressure/spooling
+contract is required for that service profile. See `docs/pilot/decision.md` and
+its evidence manifest. The original49bbaaa4 runtime race findings were corrected
+and requalified. Full-PR independent review and power-loss reception remain open.

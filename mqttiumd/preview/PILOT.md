@@ -1,11 +1,18 @@
 # Private pilot evaluation
 
-The qualification dossier identifies each tested executable and its source SHA.
-Read the decision in `docs/pilot/decision.md` in the source repository before
-using this preview for a private pilot. The original candidate is
-`49bbaaa4d1d080f458980e3498e90638e317668d`. Its normal load passed the traffic
-counts, and its shutdown exposed a false Will. Three deterministic regressions
-cover corrected transport retirement and simultaneous session opening.
+The qualification decision is **NO-GO for 50 publications/s with persistent
+dashboard outages**. Healthy-load tests completed 90,000 incoming publications
+and 180,000 outgoing recipient Finishes. One offline dashboard exhausted the
+unchanged reference budget after 127 messages, 2.54 seconds at 50/s. Subsequent
+publications received definite quota refusals. The accepted backlog recovered.
+Read `qualification/decision.md` in the archive and the corresponding
+`mqttiumd/docs/pilot/decision.md` in the source repository.
+
+This evaluation package preserves the qualified normal executable from
+`51be4079f7ee42f46500e993315eddc971f0a8d4`. `BUILD.json` identifies that build.
+`PACKAGE.json` identifies the separate operator-document revision. The source
+reference 49bbaaa4 had three corrected P1 runtime races. No new MQTT feature or
+quota increase was used to obtain the corrected healthy-load result.
 
 ## Start and observe
 
@@ -25,8 +32,8 @@ The generator creates eight sensor identities and two dashboard identities.
 Each sensor owns its ClientID and `atelier/capteur-N` publication prefix. Both
 dashboards can read `atelier`. Keep the two-day demo CA and all private keys in
 this private directory. Provision real credentials before an operational pilot.
-The secure launcher requires client certificates and retains SQLite schema13.
-The plaintext launcher is restricted to loopback and uses schema12.
+The secure launcher requires client certificates and retains SQLite schema 13.
+The plaintext launcher is restricted to loopback and uses schema 12.
 An older format is refused without modification. There is no automatic migration.
 
 In another terminal, connect a dashboard and publish with the first sensor.
@@ -55,6 +62,7 @@ on loopback, create local temporary keys and preserve the database and receipts.
 .venv/bin/python pilot/load.py ./load-30m --rate 50 --seconds 1800 --size 256
 .venv/bin/python pilot/load.py ./load-1k --rate 50 --seconds 120 --size 1024
 .venv/bin/python pilot/perturb.py ./perturbations
+.venv/bin/python pilot/pressure.py ./pressure
 .venv/bin/python pilot/restore.py ./charged-restore --mode charged
 ```
 
@@ -63,7 +71,7 @@ samples, process identities and an aggregate event inventory across log rotation
 It requires 90,000 positive PUBACKs, both complete received sequences and 180,000
 durable Finishes in the default run. Its closure check requires zero Will
 admissions after the normal disconnections. It uses public Paho APIs and strict
-TLS1.3. The charged restore uses the existing independent socket probe to retain
+TLS 1.3. The charged restore uses the existing independent socket probe to retain
 an actual PUBACK and PUBREL at precise boundaries. Normal application clients
 verify restoration in the quiet procedure and other packaged demonstrations.
 
@@ -77,8 +85,8 @@ lease requires operator discipline against aliases and uncoordinated writers.
 
 Follow `POLICY.md` to generate a ninth device and make a monotone policy update.
 `policy apply` creates a verified SQLite backup of the full committed image,
-including committed WAL pages. Protect backup directories with mode0700 and
-backup files with mode0600. Restore into a new private directory with its matching
+including committed WAL pages. Protect backup directories with mode 0700 and
+backup files with mode 0600. Restore into a new private directory with its matching
 old identity configuration, leaving the original file intact. A copied main file
 from a running broker is insufficient. Reopen the restored broker and verify
 Session Present, retained values and delivery completion with real clients.
@@ -92,26 +100,29 @@ reopens the original with the new policy. It leaves both files for inspection.
   --db ./load-30m/broker.sqlite --pki ./private-pki
 ```
 
-For this command, create the load with `--pki ./private-pki`. The file supplied
+For this command, create the load with `--pki ./private-pki`. After apply,
+the original file uses `quiet-restore/new-identities.json`. Keep the old file
+with the backup and deploy the new file to the launcher's identities path. The file supplied
 must have been created by the pilot generator and the default ten identities.
 Do not mix credentials or schema versions from unrelated demonstrations.
 
 ## Operational limits
 
 Use this package on an explicitly provisioned private host. The quotas remain
-16 transports, eight unauthenticated handshakes,128 sessions,128 subscriptions,
-16 live destinations,32 retained topics,128 references and8,192 receipt slots.
-An offline dashboard can fill the durable reference budget quickly at50 messages
-per second. Pause or slow sensors before exceeding the reported capacity and
-resume after drainage. A rejected publication requires application handling.
+16 transports, eight unauthenticated handshakes, 128 sessions, 128 subscriptions,
+16 live destinations, 32 retained topics, 128 references and 8,192 receipt slots.
+The outage test at 50/s admitted 127 messages and then certainly refused 373
+with PUBACK 0x97. Producer handling must inspect that reason and retain the
+application responsibility for a refused message. Pause or slow the sources,
+resume the dashboard, wait for drainage and explicitly retry certain refusals. A rejected publication requires application handling.
 
 Monitor free disk, RSS, writer errors, receipt pressure, backlog and clock events.
-Each process retains two event segments of at most16MiB each. Launches keep their
+Each process retains two event segments of at most 16 MiB each. Launches keep their
 own directories, so archive and rotate old logs under a host disk policy. Preserve
 incident evidence before removing old log directories. Logical live quotas do
 not cap physical database size, WAL, backup files or filesystem use.
-Offline policy maintenance caps the committed SQLite image at128MiB and its
-logical inventory at32MiB. Run `policy plan` on the stopped served file before
+Offline policy maintenance caps the committed SQLite image at 128 MiB and its
+logical inventory at 32 MiB. Run `policy plan` on the stopped served file before
 approaching either bound. A large WAL alone does not equal a large committed
 image. Do not use VACUUM or manual SQL cleanup to manufacture a passing result.
 

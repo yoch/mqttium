@@ -1,0 +1,147 @@
+{
+  "broker_binary_sha256": "9ef097977c2cb86669e11e98d7fbceeac87a4f86fd6a24c7deb76ea9c31bf119",
+  "broker_source_sha": "51be4079f7ee42f46500e993315eddc971f0a8d4",
+  "contracts_sha256": "bf9bbc0a9d74a4a5b72330f60038b2f51189eca58b5784c6c40a54bfe7e22d1a",
+  "evidence_paths_relative_to": "mqttiumd-prepilot-evidence directory in the separately supplied evidence archive",
+  "files": {
+    "ci-execution-51be4079/receipt.json": {
+      "bytes": 8060,
+      "sha256": "5c6e3ffcb45dda36f5b48c5ebcb1439a522b0ea470ed26e978a8d56f8a9c20a1"
+    },
+    "clippy-hooks.log": {
+      "bytes": 376,
+      "sha256": "5ffeebebc5be02270d094db8790f088200db109dd82c3d65cb9c67c495b5ac1f"
+    },
+    "clippy-normal-final.log": {
+      "bytes": 144,
+      "sha256": "0d4da953d47a7531cae1cc6f4e4b3cb52aaf4abd5bcacc5d28f1b2cbad61972b"
+    },
+    "contracts.log": {
+      "bytes": 113,
+      "sha256": "fc8ad224c2fe81bf54d35de5dfc976e4f28ec1aae2e81937561483ba6f81c5dd"
+    },
+    "corrected-1k/campaign.json": {
+      "bytes": 17218,
+      "sha256": "a5111768cefb2b32bf895bf33559573bf2a76e4f21ebf4cf5eba569835b7de7b"
+    },
+    "corrected-30m/campaign.json": {
+      "bytes": 17387,
+      "sha256": "1d7ea863a9d3408f17bfab02f3b4cd4e3c6af79e33a904895cb08a2b0087054d"
+    },
+    "corrected-30m/samples.jsonl": {
+      "bytes": 3500871,
+      "sha256": "6104cbda10e1ae46f9c043781563e2897fdbe0596f75574c6fd5d9d59c56967b"
+    },
+    "corrected-30m/sequence-ledger.csv.gz": {
+      "bytes": 2233615,
+      "sha256": "4cd6c97372d2e66ce6a1e860e7fb22b7342dba6bd721a9cd5a00e5fbc4aeccb3"
+    },
+    "corrected-charged/restore.json": {
+      "bytes": 10527,
+      "sha256": "63e4431e4c5614b2320bf8c47f5093dcac4cfa023ddcd55c683a1250c869d523"
+    },
+    "corrected-perturb-complete/perturbations.json": {
+      "bytes": 6428,
+      "sha256": "838321d46e432b6699b84fd85aefdfc648836bece3d0295141d4780055ab3cbd"
+    },
+    "corrected-pressure/pressure.json": {
+      "bytes": 3036,
+      "sha256": "2b423354443d03610903b8bc415a538d183150e93cbaed2fa7778130e8350d21"
+    },
+    "corrected-quiet/restore.json": {
+      "bytes": 13968,
+      "sha256": "9b6f6b12af0dcd3eeeadfc395cefc96067e81624c1457e96a014b1cbf9415b42"
+    },
+    "disconnect-red-run.log": {
+      "bytes": 1010,
+      "sha256": "14d071dd410b46b4d1507ad383f9301c6259445c10a5867efdb25e42cc46c17b"
+    },
+    "mosquitto-2m/campaign.json": {
+      "bytes": 4076,
+      "sha256": "4a82eb4a410879c758f48ed861e2bc8ac8968c907ddf2f9ddd39028e67c76e2c"
+    },
+    "mosquitto-crash-compare/crash-comparison.json": {
+      "bytes": 1188,
+      "sha256": "da69786320422b3ce082520a42d963583668373064b0b6a63fa0528a76035c79"
+    },
+    "mqttiumd-30m/campaign.json": {
+      "bytes": 17573,
+      "sha256": "d7ee9404d1706709e04652366936f1cc0f2f069c87a055dfdbc34ec1b8240d1e"
+    },
+    "mqttiumd-comparison-2m/campaign.json": {
+      "bytes": 17236,
+      "sha256": "e8bd8f22ef330ff85ac7ddef5550c00d821acfb23c7fce38274bb3dbf003c4ed"
+    },
+    "mqttiumd-crash-compare/crash-comparison.json": {
+      "bytes": 4058,
+      "sha256": "7e194da683c46e6c8200a88b67c8a4f53707c1186ae33d66a2375bc5daab95f9"
+    },
+    "onboarding-loaded/receipt.json": {
+      "bytes": 2113,
+      "sha256": "4b471c22e936a401d0cf666e4df9bc2aed091b1972c777cdbe8fac660150cb38"
+    },
+    "open-red-review.md": {
+      "bytes": 3547,
+      "sha256": "5aa3663e7bd11fd99dabd1fbd23c41a1198918ee9cdcd5f140ab18bacf2f6b89"
+    },
+    "oracle.log": {
+      "bytes": 370,
+      "sha256": "2e61cc6551024e3384a34a176b9df2657b061749eb3711ebf2909ef8e4daf3c5"
+    },
+    "pilots-final.log": {
+      "bytes": 288,
+      "sha256": "1bc7987d975a2b894fce0bd27b0e5bdd3175f297f81b516c9fa5bd8023476d27"
+    },
+    "presence-measurement/receipt.json": {
+      "bytes": 122745,
+      "sha256": "5e91adcc74afd796f6d9f254197e06d2fc4133159028971bdedd7dcb79d54fed"
+    },
+    "rust-hooks.log": {
+      "bytes": 109585,
+      "sha256": "1aefaf82552e380c4c17c549c064ebd054c032b8dc0e54ba7150c10ee873634b"
+    },
+    "rust-normal-final.log": {
+      "bytes": 107996,
+      "sha256": "e679c7b380c3ed529f2a1222022c021b61f02b806d006e6c9812e37166d3c97c"
+    },
+    "schemas.log": {
+      "bytes": 39,
+      "sha256": "fb775ce00cbe4200094d48eb50655e4512e4ae4b197922f5ac1ea78eb67c830f"
+    },
+    "sealed-presence-demo/retained-will-demo.json": {
+      "bytes": 10297,
+      "sha256": "7eb1afb964cdc44afb55d56833ba3e73dfab52489a5e8950c4d21c00327406f0"
+    },
+    "security-corrected-complete/receipt.json": {
+      "bytes": 10699,
+      "sha256": "ce3b65c79a93d20f060b02b0815f89476afa9990d675a7a10dfae31062a2797c"
+    },
+    "started-red-run.log": {
+      "bytes": 1378,
+      "sha256": "0267901a8864d6ffaf02d8ad16d8e32ce8467a224c0a688194f6919420e6860f"
+    }
+  },
+  "format": "mqttiumd.prepilot.manifest.v1",
+  "normal_archive": {
+    "github_url": "https://github.com/yoch/mqttium/actions/runs/44334052710/artifacts/14440822872",
+    "tar_sha256": "154bca883981e8092d1385ec5278d41458c45b8dae5c1120ea408448144d884f",
+    "zip_sha256": "1b6761b30ce7ca59baed143a511fc5bc21b436645fc086ab039a9f194750e3b5"
+  },
+  "original_candidate": {
+    "binary_sha256": "30f5a54e371cb2af9e895a3e30ed3bf408dceb87a6d54134be6e969518fd4c7c",
+    "decision": "NO-GO",
+    "sha": "49bbaaa4d1d080f458980e3498e90638e317668d"
+  },
+  "packaging": "PACKAGE.json records the separate operator-document source. The broker executable is copied unchanged from the frozen normal archive.",
+  "scope_limits": [
+    "independent durability review limited to ordinary QoS1 accounting",
+    "internal queue peaks not recorded over the complete long window",
+    "filesystem medium below overlayfs unidentified",
+    "process crashes and restoration, without power-loss claims",
+    "system receptions do not extend K1/K2b/K3 or oracle qualification"
+  ],
+  "sqlite_schemas": {
+    "loopback": 12,
+    "mtls": 13
+  }
+}

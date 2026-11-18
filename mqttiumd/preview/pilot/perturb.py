@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 from contextlib import ExitStack
 import json
 import os
@@ -116,7 +117,9 @@ def run(args):
                 dashboards = [peers.enter_context(Client(pki, broker.port, cid)) for cid in DASHBOARDS]
                 if any(c.connack != [0, True] for c in dashboards):
                     raise ValueError("persistent_dashboard_did_not_resume")
-                wait_for(lambda: inventory(db)["counts"]["obligations"] == 0, "recovered_backlog_not_drained")
+                wait_for(lambda: all(inventory(db)["counts"][name] == 0
+                                     for name in ("wills", "obligations", "outbound")),
+                         "recovered_wills_and_backlog_not_drained")
                 backlog = []
                 for client in dashboards:
                     rows = []
@@ -126,6 +129,9 @@ def run(args):
                 # The offline dashboard must recover every acknowledged online
                 # and every distinct offline responsibility admitted afterwards.
                 expected = {(topic(c, "status"), value) for c in CAPTEURS for value in (b"online", b"offline")}
+                result["recovered_counts"] = [len(rows) for rows in backlog]
+                result["recovered_identity_hashes"] = [[hashlib.sha256(m[0].encode()+b"\0"+m[1]).hexdigest()
+                    for m in rows] for rows in backlog]
                 if {(m[0], m[1]) for m in backlog[1]} != expected:
                     raise ValueError("offline_dashboard_responsibility_missing")
                 result["offline_dashboard_deliveries"] = len(backlog[1])

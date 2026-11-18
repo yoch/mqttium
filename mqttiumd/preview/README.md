@@ -1,5 +1,9 @@
 # mqttiumd — MQTT 5 preview for private networks
 
+The pre-pilot50/s outage profile has a **NO-GO** decision. Read
+[the qualification and operator guide](PILOT.md) for the measured capacity
+bound and executable reception.
+
 [Run the TLS 1.3 demonstration and provision two client identities](SECURE.md).
 [Add a sensor to an existing mTLS database with plan and apply](POLICY.md).
 [Pilot qualification and operator procedure](PILOT.md).

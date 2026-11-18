@@ -1,0 +1,13 @@
+# Independent review of Open correction
+
+Reviewed the uncommitted Open-specific diff in `/workspace/mqttium-prepilot/mqttiumd/crates/mqttiumd/src/runtime.rs` over the integration tree containing red test commit `319bbd5c`. Source inspection only; no edits or compilation performed for this review. The unrelated transport-retirement correction was outside this assigned scope.
+
+No blocking defect found in the reviewed Open correction.
+
+- `PendingSession.client_id` retains the ClientID throughout an unresolved Open. `earlier_open` orders same-ClientID requests by monotonically allocated connection generation. An unresolved earlier request, including one whose durable result is unknown, prevents a later negative barrier response from submitting its Open. The lower generation does not wait on the higher one, so this ordering does not create a mutual wait.
+- The response-side current-attachment check closes the stale-read window: a negative read no longer authorizes Open over a currently attached peer. On retry, `pump_will_connects` re-reads the owner attachment rather than trusting the intake snapshot, records the actual previous generation, and starts its takeover. The next barrier is not submitted until that actual peer disappears.
+- `start_takeover` is a direct extraction of the prior bounded DISCONNECT enqueue/close fallback. Recording `previous` before calling it prevents repeated takeover enqueue while the same old peer is closing.
+- An absent peer with pending lifecycle End does not get mistaken for a safe durable Will state. The real writer barrier still scans all matching Will rows (Armed and Pending); SQLite `will::open` independently rejects any remaining matching Will. End/Will work can advance because the replacement has not occupied the singleton lifecycle flight. Once the old Will is admitted or cancelled and removed, a fresh negative read can release the replacement.
+- With no Will, an outstanding End is still serialized by the owner's existing lifecycle flight and closing input lane. A queued, unstarted Open whose peer disappears is discarded by `drain_inputs`; an already allocated Open keeps its pending request on close (`operation.is_some()`), preserving the earlier-request guard until the known result is reconciled. Thus the new guard does not silently forget an unknown earlier Open.
+
+Limits: this establishes consistency of the targeted source ordering, not runtime acceptance evidence. Root is running the integrated runtime suite. The original small-cap P1 remains retracted as explained in `open-red-review.md`; this correction does not imply a new rollback requirement.

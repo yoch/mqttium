@@ -23,5 +23,6 @@ PY
 "$python" "$package/pilot/load.py" "$out/normal" --seconds "$seconds" --pki "$private/pki"
 "$python" "$package/pilot/load.py" "$out/one-kib" --seconds 120 --size 1024
 "$python" "$package/pilot/perturb.py" "$out/perturbations"
+"$python" "$package/pilot/pressure.py" "$out/pressure"
 "$python" "$package/pilot/restore.py" "$out/quiet-restore" --mode quiet --db "$out/normal/broker.sqlite" --pki "$private/pki"
 "$python" "$package/pilot/restore.py" "$out/charged-restore" --mode charged

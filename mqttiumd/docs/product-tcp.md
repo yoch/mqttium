@@ -27,7 +27,7 @@ future matching decisions, not the QoS of an existing obligation.
 
 ## Downloadable local preview
 
-The PR's `mqttiumd-message-expiry-preview-linux-x86_64` artifact contains the normal
+The PR's `mqttiumd-secure-preview-linux-x86_64` artifact contains the normal
 standalone archive. Extract it and run `./start.sh ./data`; no laboratory,
 Git or compiler is required. The bundled [quick start](../preview/README.md)
 starts temperature and archive receivers with the Mosquitto MQTT 5 clients.
@@ -48,7 +48,7 @@ matching filters. Exactly 16 is allowed. A seventeenth refuses the complete
 durable admission or explicitly drops the whole volatile occurrence before any
 output. Existing per-literal route limit 16 and total subscription limit 128
 remain in force. [ADR 0031](decisions/0031-hierarchical-subscriptions.md) records
-the decision and versioned canonical options; current schema10 refuses older formats
+the decision and versioned canonical options; current schema12 (loopback) and schema13 (mTLS) refuse older formats
 without modification or implicit migration.
 
 ## Launch and external clients
@@ -396,7 +396,7 @@ SQLite schema **6** stores compact receipt guards, retention/attachment, durable
 detachment/deadline and one temporal anchor. Schemas 1/2/3/4/5 and other
 incompatible versions are refused with typed InvalidData before write-affecting
 pragmas. There is no implicit migration, checkpoint, reset or empty replacement.
-Fresh and existing schema 6 files are supported; older-format files remain
+Current schema12 loopback and schema13 mTLS files are supported; older-format files remain
 historical inputs until a separate migration is supplied. Invalid/over-budget current files also refuse
 readiness without resetting partial recovery.
 
@@ -674,7 +674,7 @@ is unlimited, zero expires at reception and every positive value including
 The original domain/tick/interval is frozen at TCP frame completion before the
 reader channel, pending CONNECT or core input deferral and copied
 unchanged through retained replay and old owed versions. Tags13..16 preserve
-all historical tags1..12. SQLite schema10 refuses old formats before modification.
+all historical tags1..12. Current SQLite schema12/13 refuses older formats before modification.
 
 Known same-origin time can establish expiry across process restarts. Unknown
 continuity quarantines expiring state, with bounded references and no fresh

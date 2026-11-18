@@ -18,7 +18,7 @@ import threading
 import time
 
 from common import (Broker, CAPTEURS, DASHBOARDS, FOREVER, PACKAGE, inventory,
-                    mqtt_client, pki_tools, principal, require, sha, topic, wait_for, write)
+                    mqtt_client, pki_tools, principal, read_db, require, sha, topic, wait_for, write)
 
 
 def demonstration(package):
@@ -94,6 +94,11 @@ def policy_command(binary, verb, db, old, new, plan, backup=None):
 def recover_quiet(binary, db, out, pki, policy, expected, package):
     out.mkdir(mode=0o700)
     demo = demonstration(package)
+    with read_db(db) as snapshot:
+        expected_values = {bytes(name).decode(): bytes(value) for name, value in snapshot.execute(
+            "SELECT r.topic,b.bytes FROM retained r JOIN publications p ON r.publication=p.id "
+            "JOIN payloads b ON b.id=p.payload")}
+    require(len(expected_values) == expected, "quiet_retained_inventory_mismatch")
     broker = Broker(binary, db, out, pki, policy=policy)
     result = {}
     try:
@@ -108,7 +113,7 @@ def recover_quiet(binary, db, out, pki, policy, expected, package):
                     c.messages.get_nowait()
             dashboards[0].subscribe(["atelier/#"])
             replays = [dashboards[0].messages.get(timeout=6) for _ in range(expected)]
-            require(len({m[0] for m in replays}) == expected and all(m[5] for m in replays),
+            require({m[0]: m[1] for m in replays} == expected_values and all(m[5] for m in replays),
                     "quiet_retained_replay_incorrect")
             with Client(pki, broker.port, CAPTEURS[0]) as sensor:
                 require(sensor.connack == [0, True], "quiet_sensor_session_lost")
@@ -125,6 +130,29 @@ def recover_quiet(binary, db, out, pki, policy, expected, package):
     result["after_stop"] = inventory(db)
     require(result["process"]["wait_status"] == 0 and result["after_stop"]["invariants_ok"],
             "quiet_restored_broker_failed")
+    return result
+
+
+def onboard(args, out, policy):
+    out.mkdir(mode=0o700)
+    demo = demonstration(args.package)
+    broker = Broker(args.binary, args.db, out, args.pki, policy=policy)
+    result = {}
+    try:
+        with Client(args.pki, broker.port, DASHBOARDS[0]) as first, Client(args.pki, broker.port, DASHBOARDS[1]) as second:
+            with Client(args.pki, broker.port, "capteur-9") as sensor:
+                require(sensor.connack == [0, False], "new_principal_did_not_open_new_session")
+                sensor.publish(topic("capteur-9", "status"), b"new-device", retain=True)
+                for dashboard in (first, second):
+                    require(dashboard.messages.get(timeout=5)[:3] == (topic("capteur-9", "status"), b"new-device", 1),
+                            "new_device_not_received_by_old_dashboard")
+            foreign = demo.mqtt_session(broker.port, args.pki, "capteur-9", "capteur-1")
+            require(foreign == {"present": False, "reason": 135, "transport": "TLSv1.3"},
+                    "new_device_rebound_old_client_id")
+            wait_for(lambda: inventory(args.db)["counts"]["obligations"] == 0, "new_device_work_not_finished")
+            result = {"new_device_deliveries": 2, "foreign_connack": foreign, "after": inventory(args.db)}
+    finally:
+        result["process"] = broker.stop()
     return result
 
 
@@ -155,6 +183,7 @@ def quiet(args, out):
                                          before["counts"]["retained"], args.package)}
     result["same_file_after_apply"] = recover_quiet(args.binary, args.db, out / "original-run", args.pki,
         new_file, before["counts"]["retained"], args.package)
+    result["new_device"] = onboard(args, out / "new-device", new_file)
     return result
 
 
@@ -191,6 +220,9 @@ def charged(args, out):
                 dashboard.message(b"current-retained")
                 dashboard.message(b"seed-inbound")
                 dashboard.message(b"armed-will")
+                dashboard.subscribe(22, [("atelier/capteur-1/status", 1)])
+                replay = dashboard.message(b"current-retained")
+                require(replay.retain, "charged_current_retained_not_replayed")
                 with Peer(broker, "restored-source", client_context(pki)) as sensor:
                     require(sensor.open("capteur-1"), "charged_source_not_resumed")
                     sensor.send(packet(0x62, b"\x00\x11"))
@@ -201,7 +233,7 @@ def charged(args, out):
                 for key in ("obligations", "inbound", "outbound", "wills")) else None)(demo.inspect(restored)),
                 "charged_restore_not_finished")
             result.update(original_claim_pi=first.packet_id, retransmitted=first.dup,
-                          application_deliveries=4, inbound_qos2_completed=17,
+                          application_deliveries=5, inbound_qos2_completed=17,
                           after=drained, schema=13)
         finally:
             result["process"] = {"pid": broker.process.pid, "wait_status": broker.stop()}
