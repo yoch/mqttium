@@ -23,10 +23,10 @@ def need(condition, failure):
 
 
 def summarize(root):
-    names = {"endurance": "final-endurance/result.json", "dense_archive": "archive-scale/result.json",
+    names = {"endurance": "received-endurance/result.json", "dense_archive": "archive-scale/result.json",
              "segment_ceiling": "catalog-full/result.json", "guards": "guard-green/result.json",
              "pressure": "pressure-green/result.json", "storage": "storage/result.json",
-             "demo_certificate_horizon": "certificate-horizon.json", "sealed_reception": "package-local-check/site/result.json"}
+             "demo_certificate_horizon": "certificate-horizon.json", "sealed_reception": "package-rc-check/site/result.json"}
     files = {key: root / name for key, name in names.items()}
     inputs = {key: json.loads(path.read_text()) for key, path in files.items()}
     need(all(row["status"] == "PASS" for name, row in inputs.items() if name != "dense_archive"),
@@ -48,7 +48,7 @@ def summarize(root):
          "expected_saturation_and_resume_not_observed")
     for value in old["copy_result"]["counts"].values():
         need(value == old["final_events"], "incomplete_restored_dataset")
-    trace = root / "final-endurance/samples.jsonl"
+    trace = root / "received-endurance/samples.jsonl"
     count = 0
     peak = {"charged_archive_bytes": 0, "hot_rows": 0, "outbox_bytes": 0, "history_references": 0,
             "archive_segments_per_receiver": 0}
@@ -84,7 +84,7 @@ def summarize(root):
     limit = inputs["segment_ceiling"]["ceiling"]
     need(limit["state"]["segment_count"] == 32768 and limit["state"]["hot_count"] == 1,
          "catalog_limit_not_reached")
-    evidence_paths = [*files.values(), trace, root / "final-endurance/site-backup-manifest.json",
+    evidence_paths = [*files.values(), trace, root / "received-endurance/site-backup-manifest.json",
                       root / "archive-scale.log", root / "pressure-red.log", root / "guard-red.log",
                       root / "python-gates.log", root / "rust-gates.log"]
     storage = inputs["storage"]

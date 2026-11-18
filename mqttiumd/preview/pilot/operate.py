@@ -116,7 +116,8 @@ def main():
                 request(site, "stop")
                 result = site_backup.backup(site, args.target)
             else:
-                result = request(site, args.command, getattr(args, "role", None))["last_command"]
+                status = request(site, args.command, getattr(args, "role", None))
+                result = {"status": "stopped"} if status["phase"] == "stopped" else status["last_command"]
         print(json.dumps(result, indent=2, sort_keys=True))
         return 0
     except (OSError, ValueError, RuntimeError, sqlite3.Error) as error:

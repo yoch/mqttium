@@ -4,6 +4,7 @@ from __future__ import annotations
 from collections import Counter, deque
 from dataclasses import dataclass, field
 import ctypes
+import json
 import os
 from pathlib import Path
 import signal
@@ -130,7 +131,6 @@ class Supervisor:
         lines = (actor.partial + data).split(b"\n")
         actor.partial = lines.pop()
         require(len(actor.partial) <= 65536, "service_log_record_budget")
-        import json
         for line in lines:
             if line.startswith(b"{"):
                 row = json.loads(line)
@@ -157,24 +157,32 @@ class Supervisor:
 
     def broker_events(self, actor):
         path = actor.events
-        if path is None or not path.exists():
+        if path is None:
             return
-        import json
-        current = path.stat().st_ino
-        if actor.inode is not None and current != actor.inode:
-            prior = path.with_suffix(path.suffix + ".previous")
-            if prior.exists() and prior.stat().st_ino == actor.inode:
-                self.read_events(actor, prior)
-            actor.offset = 0
-        actor.inode = current
-        self.read_events(actor, path)
+        try:
+            active = path.open("rb")
+        except FileNotFoundError:
+            # The broker renames the old journal before exclusively creating
+            # the new one. Leave the cursor intact for the next pass.
+            return
+        with active:
+            current = os.fstat(active.fileno()).st_ino
+            if actor.inode is not None and actor.inode != current:
+                prior = path.with_suffix(path.suffix + ".previous")
+                try:
+                    with prior.open("rb") as rotated:
+                        if os.fstat(rotated.fileno()).st_ino == actor.inode:
+                            self.read_events(actor, rotated)
+                except FileNotFoundError:
+                    pass
+                actor.offset = 0
+            actor.inode = current
+            self.read_events(actor, active)
 
-    def read_events(self, actor, path):
-        import json
-        with path.open("rb") as handle:
-            handle.seek(actor.offset)
-            # 1 MiB per turn, independent of the amount of retained log.
-            data = handle.read(1024 * 1024)
+    def read_events(self, actor, handle):
+        handle.seek(actor.offset)
+        # 1 MiB per turn, independent of the amount of retained log.
+        data = handle.read(1024 * 1024)
         end = data.rfind(b"\n")
         if end < 0:
             return
