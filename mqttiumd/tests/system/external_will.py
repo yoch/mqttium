@@ -124,7 +124,9 @@ async def sensor(arguments):
                       reason_code=client.result['reason_code'])
         client.log.record('sensor_ready', pid=os.getpid(),
                           meaning='positive CONNACK and retained online MQTT PUBACK received')
-        write_json(arguments.ready, result)
+        staged = arguments.ready.with_suffix('.tmp')
+        write_json(staged, result)
+        staged.replace(arguments.ready)
         deadline = time.monotonic() + 30
         while not arguments.finish.exists():
             require(time.monotonic() < deadline, 'will_sensor_control_deadline')
