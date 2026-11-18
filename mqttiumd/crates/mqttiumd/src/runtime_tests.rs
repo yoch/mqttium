@@ -642,6 +642,133 @@ fn recipient_puback_preceding_disconnect_is_applied_before_generation_closes() {
 }
 
 #[test]
+fn expiring_received_puback_disconnect_preserves_exact_durable_finish() {
+    with_runtime(128, |runtime, path| {
+        let (subscriber, mut receiver) = peer(runtime);
+        runtime
+            .connect(subscriber, connect_packet(b"started-subscriber"))
+            .unwrap();
+        until(runtime, |r| r.session_requests.is_empty());
+        assert_eq!(read_frame(&mut receiver).0, 0x20);
+        runtime
+            .packet(subscriber, 0x82, vec![0, 1, 0, 0, 1, b't', 1])
+            .unwrap();
+        until(runtime, |r| r.inflight.is_empty() && r.inputs.is_empty());
+        assert_eq!(read_frame(&mut receiver).0, 0x90);
+        let session = runtime.sessions[b"started-subscriber".as_slice()].id;
+        let connection = ConnectionKey {
+            session,
+            generation: subscriber,
+        };
+        let identifier = OutboundPacketId::new(1).unwrap();
+        let (publisher, mut sender) = peer(runtime);
+        runtime
+            .connect(publisher, connect_packet(b"started-publisher"))
+            .unwrap();
+        until(runtime, |r| r.session_requests.is_empty());
+        assert_eq!(read_frame(&mut sender).0, 0x20);
+        // Normal MQTT 5 Message Expiry Interval, long enough to stay fresh.
+        runtime
+            .packet(
+                publisher,
+                0x32,
+                vec![0, 1, b't', 0, 1, 5, 2, 0, 0, 0, 60, b'v'],
+            )
+            .unwrap();
+        until_without_socket_receipts(runtime, |r| {
+            r.outgoing_bindings.contains_key(&(connection, identifier))
+        });
+        let target = runtime.outgoing_bindings[&(connection, identifier)];
+        let (header, body) = read_frame(&mut receiver);
+        assert_eq!(header, 0x32);
+        assert_eq!(&body[3..5], &[0, 1]);
+        assert_eq!(body.last(), Some(&b'v'));
+        // Observe authentic writer receipts only to establish the cut. Forward
+        // those same values unchanged to the unread reactor lane: no invented
+        // FrameResult or StoreReply and no owner knowledge of Started yet.
+        let (held_tx, held_rx) = std::sync::mpsc::sync_channel(net::WRITTEN_SLOTS);
+        let mut genuine_started = false;
+        loop {
+            let receipt = runtime.peers[&subscriber]
+                .io
+                .written
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap();
+            genuine_started |= matches!(&receipt, net::Written::Started { correlation: Some((effect, key)) } if *effect == target.frame && *key == connection);
+            let complete = matches!(&receipt, net::Written::Complete { correlation: Some((effect, key)), .. } if *effect == target.frame && *key == connection);
+            held_tx.send(receipt).unwrap();
+            if complete {
+                break;
+            }
+        }
+        assert!(
+            genuine_started,
+            "actual positive socket write receipt must precede Complete"
+        );
+        runtime.peers.get_mut(&subscriber).unwrap().io.written = held_rx;
+        let before =
+            mqttiumd_store_sqlite::SqliteStore::inspect(&path.join("store.sqlite")).unwrap();
+        assert_eq!(before.outbound[&target.delivery].claim, target.claim);
+        assert!(!before.outbound[&target.delivery].started);
+        // Valid PUBACK then ordinary MQTT DISCONNECT in stream order; the
+        // runtime's decoder entry point freezes the exact registered target.
+        runtime
+            .packet(subscriber, 0x40, body[3..5].to_vec())
+            .unwrap();
+        runtime.packet(subscriber, 0xe0, vec![]).unwrap();
+        until(runtime, |r| {
+            r.inflight.is_empty()
+                && r.inputs.is_empty()
+                && r.session_requests.is_empty()
+                && r.lifecycle_inflight.is_empty()
+        });
+        let (resumed, mut reconnected) = peer(runtime);
+        runtime
+            .connect(resumed, connect_packet(b"started-subscriber"))
+            .unwrap();
+        until(runtime, |r| r.session_requests.is_empty());
+        let (header, connack) = read_frame(&mut reconnected);
+        assert_eq!(header, 0x20);
+        assert_eq!(connack[0] & 1, 1, "persistent session must actually resume");
+        assert_eq!(
+            runtime.sessions[b"started-subscriber".as_slice()].id,
+            session
+        );
+        let after =
+            mqttiumd_store_sqlite::SqliteStore::inspect(&path.join("store.sqlite")).unwrap();
+        assert!(
+            after.sessions.contains_key(&session),
+            "Finish must not be session deletion"
+        );
+        let events = std::fs::read_to_string(path.join("events.jsonl")).unwrap();
+        assert!(
+            events
+                .lines()
+                .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                .any(|event| event["kind"] == "connection_closed"
+                    && event["connection"] == subscriber.get().to_string()
+                    && event["details"]["code"] == "client_disconnect"),
+            "original generation must close for its ordinary MQTT DISCONNECT"
+        );
+        let exact_finish = events
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .any(|event| {
+                event["kind"] == "core_finish_observed"
+                    && event["details"]["delivery"] == delivery_text(target.delivery)
+            });
+        assert!(
+            exact_finish
+                && !after.outbound.contains_key(&target.delivery)
+                && !after.obligations.contains_key(&target.delivery),
+            "received and PUBACKed delivery must have exact durable Finish after DISCONNECT and same-session resume: exact_finish={exact_finish}, remaining_claim={:?}, remaining_obligation={:?}",
+            after.outbound.get(&target.delivery),
+            after.obligations.get(&target.delivery)
+        );
+    });
+}
+
+#[test]
 fn a_deferred_subscription_cannot_be_overtaken_by_its_later_unsubscribe() {
     with_runtime(128, |runtime, directory| {
         let (generation, mut client) = peer(runtime);
@@ -4480,5 +4607,79 @@ fn takeover_waits_for_old_will_admission_and_old_close_cannot_publish_new_will()
         let state =
             mqttiumd_store_sqlite::SqliteStore::inspect(&directory.join("store.sqlite")).unwrap();
         assert!(state.wills.is_empty(), "new_normal_close_failed_to_cancel");
+    });
+}
+
+#[test]
+fn overlapping_same_client_will_connects_leave_the_replacement_connected() {
+    with_runtime(128, |runtime, directory| {
+        let (first, mut first_client) = peer(runtime);
+        let (replacement, mut replacement_client) = peer(runtime);
+        runtime
+            .connect(first, will_connect(b"overlap-will", SessionExpiry::Never))
+            .unwrap();
+        runtime
+            .connect(
+                replacement,
+                will_connect(b"overlap-will", SessionExpiry::Never),
+            )
+            .unwrap();
+        // Both authentic SQLite barrier reads precede either Open submission.
+        let one = runtime
+            .writer
+            .control_receiver
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap();
+        let two = runtime
+            .writer
+            .control_receiver
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap();
+        assert!(matches!(
+            &one,
+            ControlResponse::WillBarrier {
+                result: Ok(false),
+                ..
+            }
+        ));
+        assert!(matches!(
+            &two,
+            ControlResponse::WillBarrier {
+                result: Ok(false),
+                ..
+            }
+        ));
+        runtime.apply_control_response(one).unwrap();
+        runtime.drain_inputs().unwrap();
+        runtime.apply_control_response(two).unwrap();
+        runtime.drain_inputs().unwrap();
+        until(runtime, |r| {
+            r.session_requests.is_empty()
+                && r.lifecycle_inflight.is_empty()
+                && !r.owner.session_status().lifecycle_pending
+                && r.closing_inputs.is_empty()
+        });
+        let initial = read_frame(&mut first_client);
+        assert!(
+            matches!(initial.0, 0x20 | 0xe0),
+            "first transport receives CONNACK or takeover DISCONNECT"
+        );
+        assert!(
+            !runtime.peers.contains_key(&first),
+            "takeover must close the first generation"
+        );
+        let reply = read_frame(&mut replacement_client);
+        let state =
+            mqttiumd_store_sqlite::SqliteStore::inspect(&directory.join("store.sqlite")).unwrap();
+        assert_eq!(reply.0, 0x20);
+        assert_eq!(
+            reply.1[1], 0,
+            "replacement refused after overlapping real barriers; durable wills={:?}",
+            state.wills
+        );
+        assert!(
+            runtime.peers.get(&replacement).is_some_and(|p| p.connected),
+            "replacement transport lost"
+        );
     });
 }
