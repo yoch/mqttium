@@ -588,6 +588,22 @@ def resources(pid):
             "cpu_ticks": int(stat[11]) + int(stat[12])}
 
 
+def cpu_quota(root=Path("/sys/fs/cgroup")):
+    try:
+        return {"source": "cgroup_v2", "limit": (root / "cpu.max").read_text().strip()}
+    except (OSError, UnicodeError):
+        pass
+    for controller in ("cpu", "cpu,cpuacct", "cpuacct,cpu"):
+        directory = root / controller
+        try:
+            quota_us = int((directory / "cpu.cfs_quota_us").read_text())
+            period_us = int((directory / "cpu.cfs_period_us").read_text())
+        except (OSError, ValueError):
+            continue
+        return {"source": "cgroup_v1", "quota_us": quota_us, "period_us": period_us}
+    return {"source": "unavailable"}
+
+
 def distribution(series):
     ordered = sorted(series)
     return {"count": len(series), "min_ms": ordered[0], "p50_ms": ordered[(len(ordered) + 1)//2 - 1],
@@ -742,7 +758,7 @@ def main():
                                                              only="unstarted" if mode == "seal" else None)
                 elif mode == "measurement":
                     receipt["conditions"] = {"cpu_count": os.cpu_count(), "load_before": os.getloadavg(),
-                        "cpu_quota": Path("/sys/fs/cgroup/cpu.max").read_text().strip(),
+                        "cpu_quota": cpu_quota(),
                         "workload": "100 sequential + 24 connections across four independent workers per mode"}
                     for label, mode_pki in (("tls", pki), ("cleartext", None)):
                         receipt["groups"][label] = measure(binary, out / label, mode_pki)
