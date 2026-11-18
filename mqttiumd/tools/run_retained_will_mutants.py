@@ -25,9 +25,9 @@ CASES = (
     ('leave-committed-will-pending', 'mqttiumd-store-sqlite/src/will.rs',
      'DELETE FROM wills WHERE id=?1 AND state=2', 'UPDATE wills SET state=2 WHERE id=?1 AND state=2',
      'lost-admission', 'retained_will_lost_reply_left_pending_intent'),
-    ('allow-reconnect-before-will', 'mqttiumd/src/runtime.rs',
-     'waiting.awaiting = false;\n                    if pending {',
-     'waiting.awaiting = false;\n                    if pending && false {',
+    # CONNECT and the writer's Open guard share this durable lookup.
+    ('allow-reconnect-before-will', 'mqttiumd-store-sqlite/src/will.rs',
+     'Ok(found)', 'Ok(found && false)',
      'pressure', 'retained_will_reconnect_overtook_pending_write'),
 )
 
