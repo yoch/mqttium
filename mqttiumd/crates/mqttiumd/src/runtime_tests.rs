@@ -256,6 +256,7 @@ fn peer(runtime: &mut Runtime<'_>) -> (ConnectionGeneration, TcpStream) {
             receiving: crate::receiving::Window::default(),
             closing: None,
             deferred_publish: None,
+            retire_code: None,
         },
     );
     (generation, client)
@@ -741,12 +742,13 @@ fn expiring_received_puback_disconnect_preserves_exact_durable_finish() {
             "Finish must not be session deletion"
         );
         let events = std::fs::read_to_string(path.join("events.jsonl")).unwrap();
+        let generation_text = subscriber.get().to_string();
         assert!(
             events
                 .lines()
                 .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
                 .any(|event| event["kind"] == "connection_closed"
-                    && event["connection"] == subscriber.get().to_string()
+                    && event["connection"].as_str() == Some(generation_text.as_str())
                     && event["details"]["code"] == "client_disconnect"),
             "original generation must close for its ordinary MQTT DISCONNECT"
         );

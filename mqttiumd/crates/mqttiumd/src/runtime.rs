@@ -115,6 +115,7 @@ struct Peer {
     receiving: crate::receiving::Window,
     closing: Option<(&'static str, Instant)>,
     deferred_publish: Option<DeferredPublish>,
+    retire_code: Option<&'static str>,
 }
 struct DeferredPublish {
     packet: InboundPacket,
@@ -137,6 +138,7 @@ struct PendingWillConnect {
     retry_at: Instant,
 }
 struct PendingSession {
+    client_id: mqttiumd_contract::packet::SharedBytes,
     connection: ConnectionGeneration,
     operation: Option<OperationId>,
     close_intent: Option<CloseIntent>,
@@ -545,6 +547,7 @@ impl Runtime<'_> {
                 receiving: crate::receiving::Window::default(),
                 closing: None,
                 deferred_publish: None,
+                retire_code: None,
             },
         );
         self.events.emit("connection_opened", json!({"connection":self.generation.get().to_string(),"details":{"send_buffer_bytes":sendbuf}})).map_err(event_failure)?;
@@ -623,6 +626,57 @@ impl Runtime<'_> {
             || matches!(input,Input::Deadline {token,..} if self.owner.collection_deadline_is_live(*token) || self.owner.lifecycle_dispatch().is_some_and(|(_,deadline)| deadline == *token) || self.owner.will_dispatch().is_some_and(|(_,deadline)| deadline == *token))
     }
     fn close(
+        &mut self,
+        generation: ConnectionGeneration,
+        code: &'static str,
+    ) -> Result<(), Failure> {
+        let Some(peer) = self.peers.get_mut(&generation) else {
+            return Ok(());
+        };
+        if peer.retire_code.is_some() {
+            return Ok(());
+        }
+        peer.retire_code = Some(code);
+        peer.closing.get_or_insert((code, Instant::now()));
+        if peer.close_observed_at.is_none() {
+            let observed = self.session_now()?;
+            self.peers
+                .get_mut(&generation)
+                .expect("live retiring peer")
+                .close_observed_at = Some(observed);
+        }
+        self.peers[&generation].io.close();
+        let must_preserve_write_facts = self
+            .frames
+            .values()
+            .any(|frame| frame.connection.generation == generation && frame.kind == "PUBLISH")
+            || self.terminal_inputs.iter().any(|input| {
+                matches!(input,
+            Input::FrameResult {connection,..} | Input::Qos0EmitRefused {connection,..}
+                if connection.generation == generation)
+            });
+        if must_preserve_write_facts {
+            self.collect_written(generation)?;
+            self.drain_inputs()?;
+            // An accepted QoS 1 frame retains its authoritative generation
+            // until its stopped producer has published all network facts.
+            if self
+                .frames
+                .values()
+                .any(|frame| frame.connection.generation == generation)
+                || self.terminal_inputs.iter().any(|input| {
+                    matches!(input,
+                    Input::FrameResult {connection,..} | Input::Qos0EmitRefused {connection,..}
+                        if connection.generation == generation)
+                })
+            {
+                return Ok(());
+            }
+        }
+        self.finish_close(generation, code)
+    }
+
+    fn finish_close(
         &mut self,
         generation: ConnectionGeneration,
         code: &'static str,
@@ -1650,6 +1704,18 @@ impl Runtime<'_> {
             return Err(error);
         }
         for (generation, code) in close {
+            // A terminated TLS sender can reject a queued PINGRESP before
+            // the reactor reaches the normal DISCONNECT already in its reader
+            // lane. The ordered input terminal decides that transport loss.
+            if code == "outgoing_queue_full"
+                && self.peers.get(&generation).is_some_and(|peer| {
+                    peer.io.is_tls()
+                        && peer.io.terminal_reason().is_some()
+                        && peer.closing.is_none()
+                })
+            {
+                continue;
+            }
             self.close(generation, code)?;
         }
         if let Some(changed) = changed {
@@ -1665,12 +1731,24 @@ impl Runtime<'_> {
         match response {
             ControlResponse::WillBarrier { connection, result } => {
                 let pending = result?;
+                let earlier_open = self.will_connects.get(&connection).is_some_and(|waiting| {
+                    self.session_requests.values().any(|request| {
+                        request.connection < connection
+                            && request.client_id == waiting.connect.client_id
+                    })
+                });
+                let attached = self
+                    .will_connects
+                    .get(&connection)
+                    .and_then(|waiting| self.sessions.get(waiting.connect.client_id.as_slice()))
+                    .and_then(|session| self.owner.connection_of(session.id))
+                    .is_some_and(|old| old != connection && self.peers.contains_key(&old));
                 if let Some(waiting) = self.will_connects.get_mut(&connection) {
                     if !waiting.awaiting {
                         return Err(Failure::plain("will_barrier_correlation"));
                     }
                     waiting.awaiting = false;
-                    if pending {
+                    if pending || earlier_open || attached {
                         if !waiting.reported_pending {
                             self.events
                                 .emit(
@@ -2158,6 +2236,7 @@ impl Runtime<'_> {
         self.session_requests.insert(
             request,
             PendingSession {
+                client_id: connect.client_id.clone(),
                 connection: generation,
                 operation: None,
                 close_intent: None,
@@ -2175,24 +2254,7 @@ impl Runtime<'_> {
             .get(connect.client_id.as_slice())
             .and_then(|session| self.owner.connection_of(session.id));
         if let Some(old) = old.filter(|old| *old != generation) {
-            // The old transport closes before the new Will/Open can be accepted.
-            if let Some(peer) = self.peers.get_mut(&old) {
-                let bytes = codec::disconnect_reason(0x8e);
-                if peer
-                    .io
-                    .outgoing
-                    .try_send(net::Write {
-                        expiry: None,
-                        correlation: None,
-                        bytes,
-                    })
-                    .is_ok()
-                {
-                    peer.closing = Some(("session_taken_over", Instant::now()));
-                } else {
-                    self.close(old, "session_taken_over")?;
-                }
-            }
+            self.start_takeover(old)?;
         }
         self.will_connects.insert(
             generation,
@@ -2205,6 +2267,27 @@ impl Runtime<'_> {
             },
         );
         self.pump_will_connects()?;
+        Ok(())
+    }
+    fn start_takeover(&mut self, old: ConnectionGeneration) -> Result<(), Failure> {
+        // The old transport closes before the new Will/Open can be accepted.
+        if let Some(peer) = self.peers.get_mut(&old) {
+            let bytes = codec::disconnect_reason(0x8e);
+            if peer
+                .io
+                .outgoing
+                .try_send(net::Write {
+                    expiry: None,
+                    correlation: None,
+                    bytes,
+                })
+                .is_ok()
+            {
+                peer.closing = Some(("session_taken_over", Instant::now()));
+            } else {
+                self.close(old, "session_taken_over")?;
+            }
+        }
         Ok(())
     }
     fn begin_session_open(
@@ -2239,6 +2322,20 @@ impl Runtime<'_> {
             .map(|(id, _)| *id)
             .collect();
         for connection in ready {
+            let current = self
+                .will_connects
+                .get(&connection)
+                .and_then(|pending| self.sessions.get(pending.connect.client_id.as_slice()))
+                .and_then(|session| self.owner.connection_of(session.id))
+                .filter(|old| *old != connection && self.peers.contains_key(old));
+            if let Some(old) = current {
+                self.will_connects
+                    .get_mut(&connection)
+                    .expect("pending connect")
+                    .previous = Some(old);
+                self.start_takeover(old)?;
+                continue;
+            }
             let pending = self
                 .will_connects
                 .get_mut(&connection)
@@ -2646,11 +2743,40 @@ impl Runtime<'_> {
         self.pump_will_connects()?;
         let keys: Vec<_> = self.peers.keys().copied().collect();
         for generation in keys {
+            if let Some(code) = self
+                .peers
+                .get(&generation)
+                .and_then(|peer| peer.retire_code)
+            {
+                self.wire_progress(generation)?;
+                self.collect_written(generation)?;
+                self.drain_inputs()?;
+                if !self
+                    .peers
+                    .get(&generation)
+                    .is_some_and(|peer| peer.io.is_finished())
+                {
+                    continue;
+                }
+                // JoinHandle completion makes the producer's final sends visible.
+                self.collect_written(generation)?;
+                self.drain_inputs()?;
+                if self
+                    .terminal_inputs
+                    .iter()
+                    .any(|input| matches!(input, Input::FrameResult {connection,..} | Input::Qos0EmitRefused {connection,..} if connection.generation == generation))
+                {
+                    continue;
+                }
+                self.finish_close(generation, code)?;
+                continue;
+            }
             let tls = self
                 .peers
                 .get(&generation)
                 .is_some_and(|peer| peer.io.is_tls());
             let mut tls_close = None;
+            let mut input_ended = false;
             self.wire_progress(generation)?;
             self.retry_deferred_publish(generation)?;
             for _ in 0..4 {
@@ -2691,6 +2817,7 @@ impl Runtime<'_> {
                     }
                     Ok(net::Incoming::Closed { code }) => {
                         if tls {
+                            input_ended = true;
                             tls_close = Some(code);
                             break;
                         }
@@ -2706,6 +2833,7 @@ impl Runtime<'_> {
                             .and_then(|p| p.io.terminal_reason())
                             .unwrap_or("reader_closed");
                         if tls {
+                            input_ended = true;
                             tls_close = Some(code);
                             break;
                         }
@@ -2715,142 +2843,23 @@ impl Runtime<'_> {
                     }
                 }
             }
-            let receipt_limit = if tls { net::WRITTEN_SLOTS } else { 8 };
-            for _ in 0..receipt_limit {
-                let written = match self.peers.get(&generation) {
-                    Some(p) => p.io.written.try_recv(),
-                    None => break,
-                };
-                match written {
-                    Ok(net::Written::Started { correlation }) => {
-                        if let Some((effect, connection)) = correlation
-                            && self.frames.get(&effect).is_some_and(|frame| {
-                                frame.connection == connection
-                                    && matches!(frame.kind, "PUBLISH" | "PUBLISH0")
-                            })
-                        {
-                            self.events.emit("message_transmission_started",json!({"connection":connection.generation.get().to_string(),"details":{"effect":effect_text(effect),"authority":"positive_socket_write"}})).map_err(event_failure)?;
-                            self.queue(Input::FrameResult {
-                                effect,
-                                connection,
-                                progress: FrameProgress::Started,
-                            })?;
-                        }
-                    }
-                    Ok(net::Written::NotStarted {
-                        correlation,
-                        reason,
-                    }) => {
-                        if let Some((effect, connection)) = correlation
-                            && let Some(pending) = self.frames.remove(&effect)
-                        {
-                            if pending.connection != connection {
-                                return Err(Failure::plain("frame_connection_mismatch"));
-                            }
-                            self.outgoing_bindings
-                                .retain(|_, value| value.frame != effect);
-                            self.events.emit("message_transmission_not_started",json!({"connection":connection.generation.get().to_string(),"details":{"effect":effect_text(effect),"reason":format!("{reason:?}"),"authority":"zero_socket_bytes"}})).map_err(event_failure)?;
-                            if pending.kind == "PUBLISH0" {
-                                let reason = match reason {
-                                    mqttiumd_contract::message_expiry::MessageExpiryBlock::Expired => Qos0DropReason::MessageExpired,
-                                    mqttiumd_contract::message_expiry::MessageExpiryBlock::TemporalUncertain => Qos0DropReason::TemporalUncertain,
-                                };
-                                self.queue(Input::Qos0EmitRefused {
-                                    effect,
-                                    connection,
-                                    reason,
-                                })?;
-                            } else {
-                                self.queue(Input::FrameResult {
-                                    effect,
-                                    connection,
-                                    progress: FrameProgress::NotStarted { reason },
-                                })?;
-                            }
-                        }
-                    }
-                    Ok(net::Written::Complete { correlation, bytes }) => {
-                        if let Some((effect, connection)) = correlation {
-                            #[cfg(feature = "test-hooks")]
-                            if self
-                                .frames
-                                .get(&effect)
-                                .is_some_and(|frame| frame.kind == "PUBLISH")
-                                && self.hooks.directory.as_ref().is_some_and(|dir| {
-                                    consume_control(&dir.join("hold-next-outgoing-written"))
-                                })
-                            {
-                                if self.deferred_outgoing_written.is_some() {
-                                    return Err(Failure::plain("outgoing_written_hold_overlap"));
-                                }
-                                self.copied_outgoing_frame = Some((
-                                    effect,
-                                    connection,
-                                    FrameProgress::Written {
-                                        confirmed: bytes as u64,
-                                        total: bytes as u64,
-                                    },
-                                ));
-                                self.deferred_outgoing_written =
-                                    Some((effect, connection, bytes, Instant::now()));
-                                self.events.emit("outgoing_written_held",json!({"connection":connection.generation.get().to_string(),"details":{"effect":effect_text(effect),"socket_write_complete":true,"bytes":bytes}})).map_err(event_failure)?;
-                                continue;
-                            }
-                            #[cfg(feature = "test-hooks")]
-                            if !self.deferred_ack_used
-                                && self.hooks.pause.iter().any(|p| p == "ack.receipt")
-                                && let Some(pending) = self.frames.get(&effect)
-                                && pending.kind == "PUBACK"
-                            {
-                                self.events.emit("barrier_hit", json!({"point":"ack.receipt","connection":generation.get().to_string(),"details":{"effect":effect_text(effect),"packet_id":pending.packet_id.unwrap_or(0),"publish_order":pending.receive_serial.map(|v|v.to_string()).unwrap_or_default(),"bytes":bytes,"socket_write_complete":true}})).map_err(event_failure)?;
-                                self.deferred_ack_used = true;
-                                self.deferred_ack =
-                                    Some((effect, connection, bytes, Instant::now()));
-                                continue;
-                            }
-                            self.written_complete(effect, connection, bytes)?;
-                        } else if let Some((code, _)) =
-                            self.peers.get(&generation).and_then(|p| p.closing)
-                        {
-                            if tls {
-                                tls_close = Some(code);
-                            } else {
-                                self.close(generation, code)?;
-                            }
-                        }
-                    }
-                    Ok(net::Written::Failed { correlation, code }) => {
-                        if let Some((effect, connection)) = correlation {
-                            self.frames.remove(&effect);
-                            self.queue(Input::FrameResult {
-                                effect,
-                                connection,
-                                progress: FrameProgress::Failed,
-                            })?;
-                        }
-                        if tls {
-                            tls_close.get_or_insert(code);
-                        } else {
-                            self.close(generation, code)?;
-                            break;
-                        }
-                    }
-                    Err(TryRecvError::Empty) => break,
-                    Err(TryRecvError::Disconnected) => {
-                        if tls {
-                            let reason = self
-                                .peers
-                                .get(&generation)
-                                .and_then(|peer| peer.io.terminal_reason());
-                            tls_close.get_or_insert(reason.unwrap_or("writer_closed"));
-                        } else {
-                            self.close(generation, "writer_closed")?;
-                        }
-                        break;
-                    }
+            if let Some(code) = self.collect_written(generation)? {
+                if tls {
+                    tls_close.get_or_insert(code);
+                } else {
+                    self.close(generation, code)?;
                 }
             }
-            if let Some(code) = tls_close {
+            // A TLS write terminal can precede a decoded normal DISCONNECT.
+            // Defer this close until the ordered input terminal. Keep running
+            // connection deadlines while earlier input is held behind Open.
+            if let Some(code) = tls_close
+                && (input_ended
+                    || self
+                        .peers
+                        .get(&generation)
+                        .is_some_and(|peer| peer.closing.is_some()))
+            {
                 // The two queue observations may race even though they come
                 // from one TLS task. Apply the frame facts while the exact
                 // generation still owns its exchange.
@@ -2914,6 +2923,150 @@ impl Runtime<'_> {
         }
         Ok(())
     }
+    /// Collect exact frame facts independently of whether transport retirement
+    /// was requested. A terminal task does not order the other input channel.
+    fn collect_written(
+        &mut self,
+        generation: ConnectionGeneration,
+    ) -> Result<Option<&'static str>, Failure> {
+        let tls = self
+            .peers
+            .get(&generation)
+            .is_some_and(|peer| peer.io.is_tls());
+        let mut tls_close = None;
+        let receipt_limit = net::WRITTEN_SLOTS;
+        for _ in 0..receipt_limit {
+            let written = match self.peers.get(&generation) {
+                Some(p) => p.io.written.try_recv(),
+                None => break,
+            };
+            match written {
+                Ok(net::Written::Started { correlation }) => {
+                    if let Some((effect, connection)) = correlation
+                        && self.frames.get(&effect).is_some_and(|frame| {
+                            frame.connection == connection
+                                && matches!(frame.kind, "PUBLISH" | "PUBLISH0")
+                        })
+                    {
+                        self.events.emit("message_transmission_started",json!({"connection":connection.generation.get().to_string(),"details":{"effect":effect_text(effect),"authority":"positive_socket_write"}})).map_err(event_failure)?;
+                        self.queue(Input::FrameResult {
+                            effect,
+                            connection,
+                            progress: FrameProgress::Started,
+                        })?;
+                    }
+                }
+                Ok(net::Written::NotStarted {
+                    correlation,
+                    reason,
+                }) => {
+                    if let Some((effect, connection)) = correlation
+                        && let Some(pending) = self.frames.remove(&effect)
+                    {
+                        if pending.connection != connection {
+                            return Err(Failure::plain("frame_connection_mismatch"));
+                        }
+                        self.outgoing_bindings
+                            .retain(|_, value| value.frame != effect);
+                        self.events.emit("message_transmission_not_started",json!({"connection":connection.generation.get().to_string(),"details":{"effect":effect_text(effect),"reason":format!("{reason:?}"),"authority":"zero_socket_bytes"}})).map_err(event_failure)?;
+                        if pending.kind == "PUBLISH0" {
+                            let reason = match reason {
+                                mqttiumd_contract::message_expiry::MessageExpiryBlock::Expired => Qos0DropReason::MessageExpired,
+                                mqttiumd_contract::message_expiry::MessageExpiryBlock::TemporalUncertain => Qos0DropReason::TemporalUncertain,
+                            };
+                            self.queue(Input::Qos0EmitRefused {
+                                effect,
+                                connection,
+                                reason,
+                            })?;
+                        } else {
+                            self.queue(Input::FrameResult {
+                                effect,
+                                connection,
+                                progress: FrameProgress::NotStarted { reason },
+                            })?;
+                        }
+                    }
+                }
+                Ok(net::Written::Complete { correlation, bytes }) => {
+                    if let Some((effect, connection)) = correlation {
+                        #[cfg(feature = "test-hooks")]
+                        if self
+                            .frames
+                            .get(&effect)
+                            .is_some_and(|frame| frame.kind == "PUBLISH")
+                            && self.hooks.directory.as_ref().is_some_and(|dir| {
+                                consume_control(&dir.join("hold-next-outgoing-written"))
+                            })
+                        {
+                            if self.deferred_outgoing_written.is_some() {
+                                return Err(Failure::plain("outgoing_written_hold_overlap"));
+                            }
+                            self.copied_outgoing_frame = Some((
+                                effect,
+                                connection,
+                                FrameProgress::Written {
+                                    confirmed: bytes as u64,
+                                    total: bytes as u64,
+                                },
+                            ));
+                            self.deferred_outgoing_written =
+                                Some((effect, connection, bytes, Instant::now()));
+                            self.events.emit("outgoing_written_held",json!({"connection":connection.generation.get().to_string(),"details":{"effect":effect_text(effect),"socket_write_complete":true,"bytes":bytes}})).map_err(event_failure)?;
+                            continue;
+                        }
+                        #[cfg(feature = "test-hooks")]
+                        if !self.deferred_ack_used
+                            && self.hooks.pause.iter().any(|p| p == "ack.receipt")
+                            && let Some(pending) = self.frames.get(&effect)
+                            && pending.kind == "PUBACK"
+                        {
+                            self.events.emit("barrier_hit", json!({"point":"ack.receipt","connection":generation.get().to_string(),"details":{"effect":effect_text(effect),"packet_id":pending.packet_id.unwrap_or(0),"publish_order":pending.receive_serial.map(|v|v.to_string()).unwrap_or_default(),"bytes":bytes,"socket_write_complete":true}})).map_err(event_failure)?;
+                            self.deferred_ack_used = true;
+                            self.deferred_ack = Some((effect, connection, bytes, Instant::now()));
+                            continue;
+                        }
+                        self.written_complete(effect, connection, bytes)?;
+                    } else if let Some((code, _)) =
+                        self.peers.get(&generation).and_then(|p| p.closing)
+                    {
+                        tls_close = Some(code);
+                    }
+                }
+                Ok(net::Written::Failed { correlation, code }) => {
+                    if let Some((effect, connection)) = correlation {
+                        self.frames.remove(&effect);
+                        self.queue(Input::FrameResult {
+                            effect,
+                            connection,
+                            progress: FrameProgress::Failed,
+                        })?;
+                    }
+                    if tls {
+                        tls_close.get_or_insert(code);
+                    } else {
+                        tls_close = Some(code);
+                        break;
+                    }
+                }
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    if tls {
+                        let reason = self
+                            .peers
+                            .get(&generation)
+                            .and_then(|peer| peer.io.terminal_reason());
+                        tls_close.get_or_insert(reason.unwrap_or("writer_closed"));
+                    } else {
+                        tls_close = Some("writer_closed");
+                    }
+                    break;
+                }
+            }
+        }
+        Ok(tls_close)
+    }
+
     /// Network completion and core receipt consumption have separate lanes.
     /// No lock is held across I/O. Scope/occurrence/QoS are checked for every
     /// early receive-credit release; stale progress is never inferred by PI.
