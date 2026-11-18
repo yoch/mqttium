@@ -731,6 +731,7 @@ jobs:
             python "$pilot/pilot/perturb.py" "$RUNNER_TEMP/pilot-presence"
             python "$pilot/pilot/pressure.py" "$RUNNER_TEMP/pilot-pressure"
             python "$pilot/pilot/restore.py" "$RUNNER_TEMP/pilot-restore" --mode charged
+            PYTHON=python "$pilot/run-forward-reception.sh" "$RUNNER_TEMP/pilot-forward" "$pilot"
           done
       - name: Publish the sealed pilot archive
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -750,4 +751,5 @@ jobs:
             ${{ runner.temp }}/pilot-presence
             ${{ runner.temp }}/pilot-pressure
             ${{ runner.temp }}/pilot-restore
+            ${{ runner.temp }}/pilot-forward
           if-no-files-found: warn

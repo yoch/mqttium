@@ -20,7 +20,9 @@ def command(*args: str, cwd: Path | None = None) -> str:
 
 def copy_pilot_files(root: Path, package: Path) -> None:
     shutil.copy2(root / "preview/PILOT.md", package / "PILOT.md")
+    shutil.copy2(root / "preview/FORWARD.md", package / "FORWARD.md")
     shutil.copy2(root / "tools/run_prepilot_reception.sh", package / "run-qualification.sh")
+    shutil.copy2(root / "tools/run_forward_reception.sh", package / "run-forward-reception.sh")
     shutil.copytree(root / "preview/pilot", package / "pilot",
                     ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
     shutil.copytree(root / "docs/pilot", package / "qualification")

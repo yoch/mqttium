@@ -14,6 +14,9 @@ import tempfile
 from build_preview import copy_pilot_files
 
 
+FORWARD_COMPONENTS = ("forward_store.py", "forward_client.py", "forward_reception.py", "common.py", "load.py")
+
+
 def digest(path):
     with path.open("rb") as source:
         return hashlib.file_digest(source, "sha256").hexdigest()
@@ -62,12 +65,23 @@ def package(args):
         copy_pilot_files(root, sealed)
         for doc in ("README.md", "SECURE.md", "POLICY.md"):
             shutil.copy2(root / "preview" / doc, sealed / doc)
-        (sealed / "PACKAGE.json").write_text(json.dumps({
+        metadata = {
             "format": "mqttiumd.prepilot.package.v1", "broker_source_sha": args.source,
             "broker_binary_sha256": args.binary_sha256, "package_source_sha": revision,
             "frozen_archive_sha256": args.archive_sha256,
             "build_record": "BUILD.json", "decision": "qualification/decision.md",
-        }, indent=2) + "\n")
+        }
+        results = sealed / "qualification/forward-results.json"
+        if results.is_file():
+            observed = json.loads(results.read_text())
+            files = {name: digest(sealed / "pilot" / name) for name in FORWARD_COMPONENTS}
+            if observed["implementation"] != files or observed["binary_sha256"] != args.binary_sha256:
+                raise ValueError("forward_evidence_component_mismatch")
+            metadata["forward_application"] = {
+                "measured_source_sha": observed["application_source_sha"], "component_sha256": files,
+                "decision": "qualification/forward-decision.md", "results": "qualification/forward-results.json",
+            }
+        (sealed / "PACKAGE.json").write_text(json.dumps(metadata, indent=2) + "\n")
         sums = [f"{digest(f)}  {f.relative_to(sealed)}" for f in sorted(sealed.rglob("*"))
                 if f.is_file() and f.name != "SHA256SUMS"]
         (sealed / "SHA256SUMS").write_text("\n".join(sums) + "\n")

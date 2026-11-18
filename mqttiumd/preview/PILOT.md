@@ -1,18 +1,26 @@
 # Private pilot evaluation
 
-The qualification decision is **NO-GO for 50 publications/s with persistent
-dashboard outages**. Healthy-load tests completed 90,000 incoming publications
+The original direct-publication qualification was **NO-GO for 50 publications/s
+with persistent dashboard outages**. Healthy-load tests completed 90,000 incoming publications
 and 180,000 outgoing recipient Finishes. One offline dashboard exhausted the
 unchanged reference budget after 127 messages, 2.54 seconds at 50/s. Subsequent
 publications received definite quota refusals. The accepted backlog recovered.
 Read `qualification/decision.md` in the archive and the corresponding
 `mqttiumd/docs/pilot/decision.md` in the source repository.
 
+[Deferred delivery with producer outboxes](FORWARD.md) covers the separate
+application profile and its measured freshness limits.
+
 This evaluation package preserves the qualified normal executable from
 `51be4079f7ee42f46500e993315eddc971f0a8d4`. `BUILD.json` identifies that build.
 `PACKAGE.json` identifies the separate operator-document revision. The source
 reference 49bbaaa4 had three corrected P1 runtime races. No new MQTT feature or
 quota increase was used to obtain the corrected healthy-load result.
+
+The predecessor sealed package from GitHub artifact `14448387514`, package
+source `c155933ca411d1641a089ef3925bd7c76eac69e7`, has TAR SHA-256
+`83f0ab354cfd2d39193e3f8f1c9669a13088977c60a736575232fde54a5c47a5`.
+Verify the sidecar for each downloaded TAR and `SHA256SUMS` after extraction.
 
 ## Start and observe
 
