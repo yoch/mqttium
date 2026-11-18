@@ -84,7 +84,7 @@ def credentials(root):
     return old, new
 
 
-def seed(binary, out, pki, *, pending_will=False):
+def seed(binary, out, pki, *, pending_will=False, old_retained_reference=False):
     broker = broker_with(binary, out, pki, pauses=("will.admission.prepared",) if pending_will else ())
     wire = WireMetadata(out / "wire-metadata.jsonl")
     try:
@@ -99,6 +99,8 @@ def seed(binary, out, pki, *, pending_will=False):
             sensor.publish(STATUS, b"seed-retained", retain=True)
             first = dashboard.message(b"seed-retained", ack=False)
             require(first.qos == 1 and first.packet_id is not None, "old_claim_not_transmitted")
+            if old_retained_reference:
+                sensor.publish(STATUS, b"current-retained", retain=True)
             sensor.send(publish_packet(STATUS, b"seed-inbound", 17, qos=2))
             sensor.expect(0x50, 17)
             if pending_will:

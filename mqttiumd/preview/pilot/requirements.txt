@@ -1,0 +1,4 @@
+paho-mqtt==2.1.0
+mqttium==1.3.0
+jsonschema==4.26.0
+referencing==0.37.0

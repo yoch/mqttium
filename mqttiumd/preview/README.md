@@ -2,6 +2,7 @@
 
 [Run the TLS 1.3 demonstration and provision two client identities](SECURE.md).
 [Add a sensor to an existing mTLS database with plan and apply](POLICY.md).
+[Pilot qualification and operator procedure](PILOT.md).
 The historical loopback demonstration is below.
 
 Extract on compatible Linux x86_64 with glibc (see `BUILD.json` and `RUNTIME.txt`).
@@ -14,7 +15,7 @@ trusted local machine:
 
 It listens on `127.0.0.1:1883`; `MQTTIUMD_LISTEN` overrides the address.
 `./data/broker.sqlite` survives restarts; every start creates fresh logs.
-**Schema10 only:** older databases are refused without modification. Keep an
+**Schema12 for loopback TCP, schema13 for mTLS:** older databases are refused without modification. Keep an
 old installation's data separately; there is no automatic migration or reset.
 This launcher uses the plaintext loopback profile. Use the secure guide for mTLS.
 

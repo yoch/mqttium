@@ -2,6 +2,7 @@
 """Package a normal MQTTiumd executable; running it requires no build tools."""
 from __future__ import annotations
 import argparse
+import ast
 import hashlib
 import json
 import os
@@ -55,6 +56,28 @@ def build_pinned(out: Path, target: Path, root: Path, source: str) -> Path:
                  "SECURE.md", "start-tls.sh", "secure-demo.sh", "demo-pki.py", "identities.example.json",
                  "POLICY.md", "policy-demo.py", "identities.next.example.json", "retained-will-demo.py"):
         shutil.copy2(root / "preview" / name, package / name)
+    shutil.copy2(root / "preview/PILOT.md", package / "PILOT.md")
+    shutil.copy2(root / "tools/run_prepilot_reception.sh", package / "run-qualification.sh")
+    shutil.copytree(root / "preview/pilot", package / "pilot",
+                    ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+    # Ship the existing normal socket helpers used by charged restoration.
+    # Follow only local Python imports, without copying proof laboratories.
+    modules = ["policy_transition_reception"]
+    copied = set()
+    while modules:
+        name = modules.pop()
+        path = root / "tests/system" / (name + ".py")
+        if name in copied or not path.is_file():
+            continue
+        copied.add(name)
+        destination = package / "tests/system" / path.name
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(path, destination)
+        for node in ast.walk(ast.parse(path.read_text())):
+            if isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+                modules.append(node.module)
+            elif isinstance(node, ast.Import):
+                modules.extend(alias.name for alias in node.names)
     (package / "NORMAL-FEATURES.txt").write_text(features)
     runtime = command("ldd", str(binary))
     if "not found" in runtime:
