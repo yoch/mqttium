@@ -27,8 +27,9 @@ def main():
     else:
         require(root.is_dir() and root.stat().st_mode & 0o077 == 0, "private_pilot_directory_required")
         require_binary(PACKAGE / "mqttiumd", PACKAGE)
-        with tempfile.NamedTemporaryFile(prefix=args.lane + "-", suffix=".jsonl", dir=root, delete=False) as log:
-            events = Path(log.name)
+        run = Path(tempfile.mkdtemp(prefix=args.lane + "-", dir=root))
+        # The broker exclusively creates the journal at startup.
+        events = run / "events.jsonl"
         port = args.port if args.port is not None else (8883 if args.lane == "live" else 8884)
         argv = broker_argv(PACKAGE / "mqttiumd", root / (args.lane + ".sqlite"), events, root / args.lane,
                            listen=f"127.0.0.1:{port}")

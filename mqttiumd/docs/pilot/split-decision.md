@@ -177,6 +177,12 @@ PYTHON="$PWD/.venv/bin/python" ./run-split-reception.sh ./qualification-short "$
 PYTHON="$PWD/.venv/bin/python" ./run-split-reception.sh ./qualification-full "$PWD" full
 ```
 
+The operator launcher check starts both lanes from the sealed package, probes
+TLS and MQTT, and restarts both on their original SQLite files with fresh
+journals. Candidate `289ca304` failed with `events_unavailable` because the
+launcher created the journal before the broker's exclusive open. The updated
+launcher creates a private directory and passes an unused journal path.
+
 The 30-minute outage acceptance is a system test. It leaves the historical
 K1/K2b/K3 qualifications at their original scope. No broker or contract
 change was required.
