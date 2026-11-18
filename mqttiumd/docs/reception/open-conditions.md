@@ -208,10 +208,13 @@ retain their separate evidence requirements.
 
 ## Pre-pilot operating decision
 
-The source51be4079 executable passed the healthy50/s workload and targeted
-recovery/security receptions. The requested persistent-dashboard-outage profile
-is NO-GO. The128-reference quota accepted127 messages and refused373 of500
-at50/s, beginning at2.54 seconds. A received producer back-pressure/spooling
-contract is required for that service profile. See `docs/pilot/decision.md` and
-its evidence manifest. The original49bbaaa4 runtime race findings were corrected
-and requalified. Full-PR independent review and power-loss reception remain open.
+The source 51be4079 executable passed the healthy 50/s workload and targeted
+recovery/security receptions. Direct publication under one persistent dashboard
+outage admitted 127 messages and refused 373 of 500 at 50/s. The application
+outbox and durable recipient ledgers now receive deferred delivery for one
+30-minute dashboard outage, with explicit acceptance of measured freshness
+and finite storage before pilot activation. Independent real-time dashboard
+supervision remains NO-GO under the shared broker quota. The measured online
+gap was 1,798.11 seconds. See `docs/pilot/forward-decision.md` and the results
+manifest. The original 49bbaaa4 runtime races were corrected and requalified.
+Full-PR independent review and power-loss reception remain open.

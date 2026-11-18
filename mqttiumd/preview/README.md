@@ -1,8 +1,9 @@
 # mqttiumd — MQTT 5 preview for private networks
 
-The pre-pilot50/s outage profile has a **NO-GO** decision. Read
-[the qualification and operator guide](PILOT.md) for the measured capacity
-bound and executable reception.
+The private pilot has a deferred-delivery profile using durable producer
+outboxes and dashboard ledgers. Read [the store-and-forward guide](FORWARD.md)
+for the measured envelope, the Q9 decision and the executable reception. The
+shared broker quota still prevents independent real-time dashboard supervision.
 
 [Run the TLS 1.3 demonstration and provision two client identities](SECURE.md).
 [Add a sensor to an existing mTLS database with plan and apply](POLICY.md).

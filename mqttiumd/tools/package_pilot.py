@@ -81,6 +81,8 @@ def package(args):
                 "measured_source_sha": observed["application_source_sha"], "component_sha256": files,
                 "decision": "qualification/forward-decision.md", "results": "qualification/forward-results.json",
             }
+            metadata["baseline_decision"] = metadata["decision"]
+            metadata["decision"] = metadata["forward_application"]["decision"]
         (sealed / "PACKAGE.json").write_text(json.dumps(metadata, indent=2) + "\n")
         sums = [f"{digest(f)}  {f.relative_to(sealed)}" for f in sorted(sealed.rglob("*"))
                 if f.is_file() and f.name != "SHA256SUMS"]

@@ -1,0 +1,2807 @@
+{
+  "acl_wire": {
+    "admissions": 0,
+    "binary_sha256": "9ef097977c2cb86669e11e98d7fbceeac87a4f86fd6a24c7deb76ea9c31bf119",
+    "packet": "e0028700",
+    "process": {
+      "argv": [
+        "/workspace/outbox-qualification/operator-extraction/extracted/mqttiumd-prepilot-51be4079-9c514e66-x86_64-linux/mqttiumd",
+        "--listen",
+        "127.0.0.1:0",
+        "--db",
+        "/workspace/outbox-qualification/acl-wire/broker.sqlite",
+        "--events",
+        "/workspace/outbox-qualification/acl-wire/broker.jsonl",
+        "--tls-cert",
+        "/tmp/q9-acl-ug5zoew7/pki/server.crt",
+        "--tls-key",
+        "/tmp/q9-acl-ug5zoew7/pki/server.key",
+        "--client-ca",
+        "/tmp/q9-acl-ug5zoew7/pki/ca.crt",
+        "--identities",
+        "/tmp/q9-acl-ug5zoew7/pki/identities.json"
+      ],
+      "pid": 1980887,
+      "requested_signal": "SIGINT",
+      "signalled": true,
+      "wait_status": 0
+    },
+    "status": "PASS"
+  },
+  "application_final_metrics": {
+    "capteur-1": {
+      "attempts": 19836,
+      "blocked": 0,
+      "budget": 67108864,
+      "checkpoint_busy": 0,
+      "checkpoint_count": 361,
+      "confirmed": 14184,
+      "enqueued": 14184,
+      "files": {
+        "database": 3309568,
+        "shm": 32768,
+        "wal": 461472
+      },
+      "freelist_count": 805,
+      "head_attempts": 0,
+      "identity": "capteur-1",
+      "inflight": 0,
+      "kind": "outbox_final",
+      "last_ack_mono": 257084602085919,
+      "last_ack_ns": 1795027407914967843,
+      "last_reason": 0,
+      "monotonic_ns": 257086463496436,
+      "no_match": 0,
+      "occupied_bytes": 3803808,
+      "oldest_age_ms": 0,
+      "oldest_ns": null,
+      "page_count": 808,
+      "page_limit": 7896,
+      "pending": 0,
+      "quota": 5652,
+      "rejected": 0,
+      "retries": 5652,
+      "rows": 0,
+      "source_offered": 14184,
+      "streak": 0,
+      "stream": "14323f1124134abd999a8dd2e146f98b",
+      "synchronous": 2,
+      "unknown": 0,
+      "wal_mark": 1048576
+    },
+    "capteur-2": {
+      "attempts": 19355,
+      "blocked": 0,
+      "budget": 67108864,
+      "checkpoint_busy": 0,
+      "checkpoint_count": 355,
+      "confirmed": 14184,
+      "enqueued": 14184,
+      "files": {
+        "database": 3309568,
+        "shm": 32768,
+        "wal": 786952
+      },
+      "freelist_count": 805,
+      "head_attempts": 0,
+      "identity": "capteur-2",
+      "inflight": 0,
+      "kind": "outbox_final",
+      "last_ack_mono": 257084637214975,
+      "last_ack_ns": 1795027407950096749,
+      "last_reason": 0,
+      "monotonic_ns": 257086497505450,
+      "no_match": 0,
+      "occupied_bytes": 4129288,
+      "oldest_age_ms": 0,
+      "oldest_ns": null,
+      "page_count": 808,
+      "page_limit": 7896,
+      "pending": 0,
+      "quota": 5171,
+      "rejected": 0,
+      "retries": 5171,
+      "rows": 0,
+      "source_offered": 14184,
+      "streak": 0,
+      "stream": "687b6a12527a4190a9b7291bb363effd",
+      "synchronous": 2,
+      "unknown": 0,
+      "wal_mark": 1048576
+    },
+    "capteur-3": {
+      "attempts": 19264,
+      "blocked": 0,
+      "budget": 67108864,
+      "checkpoint_busy": 0,
+      "checkpoint_count": 354,
+      "confirmed": 14184,
+      "enqueued": 14184,
+      "files": {
+        "database": 3313664,
+        "shm": 32768,
+        "wal": 865232
+      },
+      "freelist_count": 806,
+      "head_attempts": 0,
+      "identity": "capteur-3",
+      "inflight": 0,
+      "kind": "outbox_final",
+      "last_ack_mono": 257084649213020,
+      "last_ack_ns": 1795027407962095025,
+      "last_reason": 0,
+      "monotonic_ns": 257086562802999,
+      "no_match": 0,
+      "occupied_bytes": 4211664,
+      "oldest_age_ms": 0,
+      "oldest_ns": null,
+      "page_count": 809,
+      "page_limit": 7896,
+      "pending": 0,
+      "quota": 5080,
+      "rejected": 0,
+      "retries": 5080,
+      "rows": 0,
+      "source_offered": 14184,
+      "streak": 0,
+      "stream": "0cb0563b53b0460da8bf6843fa70dcee",
+      "synchronous": 2,
+      "unknown": 0,
+      "wal_mark": 1048576
+    },
+    "capteur-4": {
+      "attempts": 19628,
+      "blocked": 0,
+      "budget": 67108864,
+      "checkpoint_busy": 0,
+      "checkpoint_count": 359,
+      "confirmed": 14184,
+      "enqueued": 14184,
+      "files": {
+        "database": 3313664,
+        "shm": 32768,
+        "wal": 53592
+      },
+      "freelist_count": 806,
+      "head_attempts": 0,
+      "identity": "capteur-4",
+      "inflight": 0,
+      "kind": "outbox_final",
+      "last_ack_mono": 257084653891966,
+      "last_ack_ns": 1795027407966773930,
+      "last_reason": 0,
+      "monotonic_ns": 257086617784553,
+      "no_match": 0,
+      "occupied_bytes": 3400024,
+      "oldest_age_ms": 0,
+      "oldest_ns": null,
+      "page_count": 809,
+      "page_limit": 7896,
+      "pending": 0,
+      "quota": 5444,
+      "rejected": 0,
+      "retries": 5444,
+      "rows": 0,
+      "source_offered": 14184,
+      "streak": 0,
+      "stream": "ab7ceaba3c384d45ac362d0b910ffe5d",
+      "synchronous": 2,
+      "unknown": 0,
+      "wal_mark": 1048576
+    },
+    "capteur-5": {
+      "attempts": 19811,
+      "blocked": 0,
+      "budget": 67108864,
+      "checkpoint_busy": 0,
+      "checkpoint_count": 360,
+      "confirmed": 14184,
+      "enqueued": 14184,
+      "files": {
+        "database": 3309568,
+        "shm": 32768,
+        "wal": 671592
+      },
+      "freelist_count": 805,
+      "head_attempts": 0,
+      "identity": "capteur-5",
+      "inflight": 0,
+      "kind": "outbox_final",
+      "last_ack_mono": 257084680909262,
+      "last_ack_ns": 1795027407993791206,
+      "last_reason": 0,
+      "monotonic_ns": 257086691951950,
+      "no_match": 0,
+      "occupied_bytes": 4013928,
+      "oldest_age_ms": 0,
+      "oldest_ns": null,
+      "page_count": 808,
+      "page_limit": 7896,
+      "pending": 0,
+      "quota": 5627,
+      "rejected": 0,
+      "retries": 5627,
+      "rows": 0,
+      "source_offered": 14184,
+      "streak": 0,
+      "stream": "fe283facf4124419966d8b0d6ffccb70",
+      "synchronous": 2,
+      "unknown": 0,
+      "wal_mark": 1048576
+    },
+    "capteur-6": {
+      "attempts": 19948,
+      "blocked": 0,
+      "budget": 67108864,
+      "checkpoint_busy": 0,
+      "checkpoint_count": 362,
+      "confirmed": 14184,
+      "enqueued": 14184,
+      "files": {
+        "database": 3313664,
+        "shm": 32768,
+        "wal": 444992
+      },
+      "freelist_count": 806,
+      "head_attempts": 0,
+      "identity": "capteur-6",
+      "inflight": 0,
+      "kind": "outbox_final",
+      "last_ack_mono": 257084691041556,
+      "last_ack_ns": 1795027408003923440,
+      "last_reason": 0,
+      "monotonic_ns": 257086753191637,
+      "no_match": 0,
+      "occupied_bytes": 3791424,
+      "oldest_age_ms": 0,
+      "oldest_ns": null,
+      "page_count": 809,
+      "page_limit": 7896,
+      "pending": 0,
+      "quota": 5764,
+      "rejected": 0,
+      "retries": 5764,
+      "rows": 0,
+      "source_offered": 14184,
+      "streak": 0,
+      "stream": "8e01695046b64f7993c0602807d47de9",
+      "synchronous": 2,
+      "unknown": 0,
+      "wal_mark": 1048576
+    },
+    "capteur-7": {
+      "attempts": 19969,
+      "blocked": 0,
+      "budget": 67108864,
+      "checkpoint_busy": 0,
+      "checkpoint_count": 362,
+      "confirmed": 14183,
+      "enqueued": 14183,
+      "files": {
+        "database": 3313664,
+        "shm": 32768,
+        "wal": 708672
+      },
+      "freelist_count": 806,
+      "head_attempts": 0,
+      "identity": "capteur-7",
+      "inflight": 0,
+      "kind": "outbox_final",
+      "last_ack_mono": 257084559360062,
+      "last_ack_ns": 1795027407872241936,
+      "last_reason": 0,
+      "monotonic_ns": 257086823687802,
+      "no_match": 0,
+      "occupied_bytes": 4055104,
+      "oldest_age_ms": 0,
+      "oldest_ns": null,
+      "page_count": 809,
+      "page_limit": 7896,
+      "pending": 0,
+      "quota": 5786,
+      "rejected": 0,
+      "retries": 5786,
+      "rows": 0,
+      "source_offered": 14183,
+      "streak": 0,
+      "stream": "1da42003e1d74e969a4e4b08de248ad9",
+      "synchronous": 2,
+      "unknown": 0,
+      "wal_mark": 1048576
+    },
+    "capteur-8": {
+      "attempts": 19979,
+      "blocked": 0,
+      "budget": 67108864,
+      "checkpoint_busy": 0,
+      "checkpoint_count": 362,
+      "confirmed": 14183,
+      "enqueued": 14183,
+      "files": {
+        "database": 3309568,
+        "shm": 32768,
+        "wal": 889952
+      },
+      "freelist_count": 805,
+      "head_attempts": 0,
+      "identity": "capteur-8",
+      "inflight": 0,
+      "kind": "outbox_final",
+      "last_ack_mono": 257084554887201,
+      "last_ack_ns": 1795027407867769185,
+      "last_reason": 0,
+      "monotonic_ns": 257086916561000,
+      "no_match": 0,
+      "occupied_bytes": 4232288,
+      "oldest_age_ms": 0,
+      "oldest_ns": null,
+      "page_count": 808,
+      "page_limit": 7896,
+      "pending": 0,
+      "quota": 5796,
+      "rejected": 0,
+      "retries": 5796,
+      "rows": 0,
+      "source_offered": 14183,
+      "streak": 0,
+      "stream": "319788a949854dceaf5a59d78b0be2ae",
+      "synchronous": 2,
+      "unknown": 0,
+      "wal_mark": 1048576
+    },
+    "dashboard-1": {
+      "budget": 268435456,
+      "checkpoint_busy": 0,
+      "checkpoint_count": 1551,
+      "conflicts": 0,
+      "duplicates": 0,
+      "files": {
+        "database": 39006208,
+        "shm": 32768,
+        "wal": 201912
+      },
+      "freelist_count": 0,
+      "identity": "dashboard-1",
+      "invalid": 0,
+      "kind": "inbox_final",
+      "last_unique_mono": 257084694120589,
+      "monotonic_ns": 257086408519091,
+      "mqtt_dup": 0,
+      "mqtt_received": 113470,
+      "occupied_bytes": 39240888,
+      "page_count": 9525,
+      "page_limit": 32018,
+      "subscribed": 1,
+      "synchronous": 2,
+      "unique_count": 113470,
+      "wal_mark": 1048576
+    },
+    "dashboard-2": {
+      "budget": 268435456,
+      "checkpoint_busy": 0,
+      "checkpoint_count": 1551,
+      "conflicts": 0,
+      "duplicates": 0,
+      "files": {
+        "database": 39006208,
+        "shm": 32768,
+        "wal": 201912
+      },
+      "freelist_count": 0,
+      "identity": "dashboard-2",
+      "invalid": 0,
+      "kind": "inbox_final",
+      "last_unique_mono": 257084694673334,
+      "monotonic_ns": 257087005253196,
+      "mqtt_dup": 0,
+      "mqtt_received": 113470,
+      "occupied_bytes": 39240888,
+      "page_count": 9525,
+      "page_limit": 32018,
+      "subscribed": 1,
+      "synchronous": 2,
+      "unique_count": 113470,
+      "wal_mark": 1048576
+    }
+  },
+  "application_rest_footprint": {
+    "capteur-1": {
+      "database": 3309568,
+      "shm": 0,
+      "wal": 0
+    },
+    "capteur-2": {
+      "database": 3309568,
+      "shm": 0,
+      "wal": 0
+    },
+    "capteur-3": {
+      "database": 3313664,
+      "shm": 0,
+      "wal": 0
+    },
+    "capteur-4": {
+      "database": 3313664,
+      "shm": 0,
+      "wal": 0
+    },
+    "capteur-5": {
+      "database": 3309568,
+      "shm": 0,
+      "wal": 0
+    },
+    "capteur-6": {
+      "database": 3313664,
+      "shm": 0,
+      "wal": 0
+    },
+    "capteur-7": {
+      "database": 3313664,
+      "shm": 0,
+      "wal": 0
+    },
+    "capteur-8": {
+      "database": 3309568,
+      "shm": 0,
+      "wal": 0
+    },
+    "dashboard-1": {
+      "database": 39014400,
+      "shm": 0,
+      "wal": 0
+    },
+    "dashboard-2": {
+      "database": 39014400,
+      "shm": 0,
+      "wal": 0
+    }
+  },
+  "application_source_sha": "acdaf4641912ab7fb42f40f8159f79ed789efa67",
+  "asserted_on_campaign": [
+    "all enqueued event identities and bytes found on both dashboards"
+  ],
+  "binary_sha256": "9ef097977c2cb86669e11e98d7fbceeac87a4f86fd6a24c7deb76ea9c31bf119",
+  "broker_event_counts": {
+    "Admission_committed": 113470,
+    "Claim_committed": 226940,
+    "Finish_committed": 226940,
+    "SessionClose_committed": 8,
+    "SessionOpen_committed": 11,
+    "Subscriptions_committed": 2,
+    "command_submitted": 611691,
+    "connect_validated": 11,
+    "connection_closed": 11,
+    "connection_opened": 11,
+    "core_finish_observed": 226940,
+    "effect_retained": 98,
+    "expiry_inventory": 1,
+    "frame_queued": 384743,
+    "frame_written": 384743,
+    "log_rotated": 101,
+    "message_expiry_clock": 1,
+    "puback_observed": 226940,
+    "publish_validated": 157790,
+    "ready": 1,
+    "receipt_collection_applied": 9469,
+    "receipt_collection_result": 9469,
+    "receipt_collection_submitted": 9469,
+    "receipt_policy": 1,
+    "receive_credit": 157790,
+    "session_cardinality": 2235453,
+    "session_changed": 19,
+    "session_clock_anchor": 1,
+    "session_established": 11,
+    "session_shutdown_completed": 1,
+    "sqlite_configuration": 1,
+    "starting": 1,
+    "stopped": 1,
+    "store_result": 611691,
+    "tls_authenticated": 11,
+    "tls_profile": 1,
+    "will_capabilities": 1,
+    "wire_receive_credit": 157789,
+    "writer_operations_with_write": 611691
+  },
+  "broker_result_counts": {
+    "Admission/Committed": 113470,
+    "Admission/RejectedCertain": 44320,
+    "Claim/Committed": 226940,
+    "Finish/Committed": 226940,
+    "SessionClose/Committed": 8,
+    "SessionOpen/Committed": 11,
+    "Subscriptions/Committed": 2
+  },
+  "broker_runtime": {
+    "message_expiry_clock": {
+      "batch": 4,
+      "domain": "13c3ab88a7ee937d1df9dee7b51efa34bd32c6be45ef7e5df1302be442503031",
+      "origin_status": "boottime_namespace_unavailable",
+      "policy": "quarantine-on-unknown-origin",
+      "scan_ms": 100,
+      "socket_write_receipt_slots": 18,
+      "started_proof": "positive-socket-write-then-durable-marker",
+      "terminal_input_slots": 544,
+      "tick": "254814253223788",
+      "time_unit": "nanoseconds"
+    },
+    "ready": {
+      "address": "127.0.0.1:44141",
+      "commands_in_flight": 16,
+      "connect_ms": 3000,
+      "epoch": "1",
+      "incarnation": "17312139159778462875",
+      "input_slots": 4,
+      "max_client_id_bytes": 1024,
+      "max_connections": 16,
+      "max_exchange_slots": 128,
+      "max_packet_bytes": 65536,
+      "max_payload_bytes": 32768,
+      "max_replay_candidates": 256,
+      "max_sessions": 128,
+      "max_subscriptions": 128,
+      "max_targets": 16,
+      "max_timers": 512,
+      "max_topic_bytes": 1024,
+      "no_local": true,
+      "outgoing_metadata": 128,
+      "outgoing_packet_identifier_max": 65535,
+      "outgoing_packet_identifier_probe_limit": 129,
+      "outgoing_payload_bytes": 4194304,
+      "outgoing_per_connection": 8,
+      "output_slots": 4,
+      "partial_packet_ms": 5000,
+      "profile": "mtls-will-pubsub-v1",
+      "receipt_slots": 8192,
+      "receive_maximum": 8,
+      "remembered_connections": 8,
+      "retained_available": true,
+      "retained_bytes": 1048576,
+      "retained_topics": 32,
+      "shared_subscriptions": false,
+      "sqlite_schema": 13,
+      "subscription_identifiers": false,
+      "wildcard_subscriptions": true,
+      "work_page_items": 8,
+      "work_scan_ms": 100,
+      "write_ms": 250,
+      "writer_slots": 32
+    },
+    "receipt_policy": {
+      "control_input_slots": 4,
+      "control_reply_slots": 4,
+      "control_request_slots": 4,
+      "max_receipt_origins": 64,
+      "receipt_collection_bytes": 2097152,
+      "receipt_collection_rows": 128,
+      "receipt_collection_trigger": 64,
+      "receipt_control_reserve": 512,
+      "receipt_data_window": 512,
+      "receipt_window": 1024,
+      "startup_closed_collection": false,
+      "startup_origins_trigger": 32,
+      "startup_receipts_trigger": 4096
+    },
+    "session_clock_anchor": {
+      "domain": "13c3ab88a7ee937d1df9dee7b51efa34bd32c6be45ef7e5df1302be442503031",
+      "logical": "0",
+      "origin_status": "boottime_namespace_unavailable",
+      "tick": "254814246730334"
+    },
+    "sqlite_configuration": {
+      "checkpoint_policy": "sqlite-autocheckpoint",
+      "hooks_active": false,
+      "install_order": "sqlite-autocheckpoint-before-optional-business-hook",
+      "journal_mode": "wal",
+      "kill_points": false,
+      "page_size": 4096,
+      "sqlite_version": "3.54.1",
+      "synchronous": 2,
+      "user_version": 13,
+      "wal_autocheckpoint": 1000
+    },
+    "tls_profile": {
+      "certificate_bytes": 8192,
+      "chain_bytes": 32768,
+      "chain_certificates": 4,
+      "client_certificate": "required",
+      "early_data": false,
+      "handshake_bytes": 65536,
+      "handshake_ms": 2000,
+      "max_handshakes": 8,
+      "policy_fingerprint": "04744608892f17b2e3b08f4e004569046e2cfe0156537fb6a2e7f9fc866f1d3a",
+      "resumption": false,
+      "tls_buffer_bytes": 98304,
+      "version": "TLS1.3"
+    }
+  },
+  "broker_source_sha": "51be4079f7ee42f46500e993315eddc971f0a8d4",
+  "campaign_status": "PASS",
+  "catchup": {
+    "admission_rate": 242.56029637879672,
+    "best_backlogged_60s": {
+      "admission_rate": 253.16496362915206,
+      "backlog_end": 44719,
+      "backlog_start": 57063,
+      "end_ns": 256851685410447,
+      "generation_rate": 50.00098553538967,
+      "seconds": 60.758802401,
+      "start_ns": 256790926608046
+    },
+    "counts": {
+      "attempts": 157688,
+      "confirmed": 113368,
+      "enqueued": 113369,
+      "no_match": 0,
+      "pending": 1,
+      "quota": 44320,
+      "rejected": 0,
+      "retries": 44320,
+      "rows": 1,
+      "unknown": 0
+    },
+    "generation_rate": 50.017444924906016,
+    "net_rate": 192.5428514538907,
+    "seconds": 466.857114254
+  },
+  "controls": {
+    "collect-negative": {
+      "assertion": "negative_puback_dropped_fifo_head",
+      "exit_status": 1,
+      "module": "forward_store.py",
+      "mutant_sha256": "7b57bba497b85de683eb9fdd256648efb5b6a9de5a9255f028aece4e3a6850cd",
+      "reference_sha256": "b20e442f6bff275405d59e3e3c740f7b450c85624b04dea82e1ff22053071eda",
+      "status": "DETECTED",
+      "test": "test_quota_preserves_fifo_and_event_id"
+    },
+    "forget-on-reopen": {
+      "assertion": "uncertain_event_lost_on_reopen",
+      "exit_status": 1,
+      "module": "forward_store.py",
+      "mutant_sha256": "6a6593ffcc8f2029374e90dc75cc1fba504b92a161962992417cd8633b516991",
+      "reference_sha256": "b20e442f6bff275405d59e3e3c740f7b450c85624b04dea82e1ff22053071eda",
+      "status": "DETECTED",
+      "test": "test_recovery_keeps_uncertain_event"
+    },
+    "ignore-disk-budget": {
+      "assertion": "physical_local_quota_exceeded",
+      "exit_status": 1,
+      "module": "forward_store.py",
+      "mutant_sha256": "8ceb583d4808db33434e407c0307c69a8992fd19217a1622e2259e4a99570c21",
+      "reference_sha256": "b20e442f6bff275405d59e3e3c740f7b450c85624b04dea82e1ff22053071eda",
+      "status": "DETECTED",
+      "test": "test_local_disk_quota_preserves_prior_events_and_recovers"
+    },
+    "overwrite-conflict": {
+      "assertion": "contradictory_payload_applied",
+      "exit_status": 1,
+      "module": "forward_store.py",
+      "mutant_sha256": "b13b4225543637b9dfb0f6d2935cc69372eb4b225ae6dfb482d5e383db1a3264",
+      "reference_sha256": "b20e442f6bff275405d59e3e3c740f7b450c85624b04dea82e1ff22053071eda",
+      "status": "DETECTED",
+      "test": "test_conflict_cannot_replace_application"
+    },
+    "reapply-repeat": {
+      "assertion": "duplicate_was_applied_again",
+      "exit_status": 1,
+      "module": "forward_store.py",
+      "mutant_sha256": "9018c42eb69f5bca92f5bd456c7f9818d2e8380a16b2342b08d2acaa3569052f",
+      "reference_sha256": "b20e442f6bff275405d59e3e3c740f7b450c85624b04dea82e1ff22053071eda",
+      "status": "DETECTED",
+      "test": "test_repeat_has_no_second_application"
+    },
+    "spin-on-quota": {
+      "assertion": "quota_retries_without_backoff",
+      "exit_status": 1,
+      "module": "forward_client.py",
+      "mutant_sha256": "22354249ca9b5361ff8bb622037031e50346f3461acef7616205c0522d474a84",
+      "reference_sha256": "107bae1ec989bd05e479c198b7cb6ad7bae0ebe0c0081b9ffb4d789d4f363585",
+      "status": "DETECTED",
+      "test": "test_real_sender_waits_between_quota_retries"
+    }
+  },
+  "dashboard_return": {
+    "connections": 1,
+    "identity": "dashboard-2",
+    "kind": "dashboard_ready",
+    "monotonic_ns": 256615830249008,
+    "offline_s": 1801.341336395,
+    "outage_boundary_ns": 256615288513013,
+    "session_present": true
+  },
+  "delivery": {
+    "delay_ms": [
+      {
+        "max": 1800293,
+        "p50": 906641,
+        "p95": 1708296,
+        "p99": 1779828,
+        "samples": 113470
+      },
+      {
+        "max": 1800629,
+        "p50": 909094,
+        "p95": 1710702,
+        "p99": 1782291,
+        "samples": 113470
+      }
+    ],
+    "outage_events_delay_ms": [
+      {
+        "max": 1800293,
+        "p50": 1092376,
+        "p95": 1727182,
+        "p99": 1783617,
+        "samples": 90000
+      },
+      {
+        "max": 1800629,
+        "p50": 1094888,
+        "p95": 1729507,
+        "p99": 1786181,
+        "samples": 90000
+      }
+    ],
+    "verified_identities_by_dashboard": [
+      113470,
+      113470
+    ]
+  },
+  "direct_pressure": {
+    "first_rejection_s": 2.54,
+    "negative_pubacks": 373,
+    "positive_pubacks": 127,
+    "reason": 151
+  },
+  "evidence_files": {
+    "acl-wire/acl-wire.json": {
+      "bytes": 881,
+      "sha256": "7c7129939a663ce16f2a47622b6cb9a901c97b4f44425d28533dcd007ac639a3"
+    },
+    "acl-wire/wire.jsonl": {
+      "bytes": 1126,
+      "sha256": "c85f0b644e77a672a64f25116042d5462a7dad4ed773e91ad2d982dbb5d985c1"
+    },
+    "cli-smoke/cli.json": {
+      "bytes": 6938,
+      "sha256": "000005b2f3ad905be20bb1e9f8a4214d7605fcf956d1c379fa84fb86e767d7e1"
+    },
+    "decisive/dashboard-1.sqlite": {
+      "bytes": 39014400,
+      "sha256": "92891af96be6b2afed6d200490085e793bcb09f639ba41064b496b42386b14e9"
+    },
+    "decisive/dashboard-2.sqlite": {
+      "bytes": 39014400,
+      "sha256": "ee41b03b18f13e3c782b92e9bd62ae9e3b5672d8227237e5b770f52512eb29ba"
+    },
+    "decisive/reception.json": {
+      "bytes": 59438,
+      "sha256": "7a7be17af0532024fd9519fadda289d39275bc53ccb47bfbc4775846507c36a5"
+    },
+    "decisive/samples.jsonl": {
+      "bytes": 18550523,
+      "sha256": "a1ac9befc5790e658f73f261efe77a79d7845e683b99a05c4029a05dabf3cabc"
+    },
+    "decisive/schedule.json": {
+      "bytes": 68,
+      "sha256": "96cee423f95894a17ce39e2b9c095dbb2072be7a7c6c98f341d3275d5f68a9ac"
+    },
+    "decisive/schedule.stop.json": {
+      "bytes": 23,
+      "sha256": "5dc498bb709873fe168fdda1611ff5c4e73fb7e746f3d4ff40118ce1756b0f7b"
+    },
+    "default-budget/capacity.json": {
+      "bytes": 2037,
+      "sha256": "5a33e87ea19d5baf25f061347d03b01a30c843b1dd62dc383c3729e667f9bf6d"
+    },
+    "operator-short/controls/controls.json": {
+      "bytes": 2547,
+      "sha256": "6e85741c0622a91a44a99a8fe582b4053c6ea4dfbeacd740d84dbac134b1dd9a"
+    },
+    "operator-short/direct-pressure/pressure.json": {
+      "bytes": 3072,
+      "sha256": "f27aec53a5440a79fda11ea0a51d09f49306db9ed72c0720a20035679cb92f82"
+    },
+    "operator-short/faults/faults.json": {
+      "bytes": 56187,
+      "sha256": "8d1e765ea7d30211bbb7d899241c5e00cd47d2ca829c9e4333bad3eb97af7303"
+    },
+    "operator-short/short/reception.json": {
+      "bytes": 58261,
+      "sha256": "44e44e028ba7caca39fcf4c7b7e15d36dcd6680b5b8e361c9898831f68e8cdd6"
+    }
+  },
+  "failure": null,
+  "final": {
+    "broker": {
+      "accounts": {
+        "exchange_slots": 0,
+        "payload_bytes": 0,
+        "receipt_slots": 41,
+        "references": 0
+      },
+      "backlog_by_session": {},
+      "broken_references": 0,
+      "counts": {
+        "fences": 0,
+        "inbound": 0,
+        "obligations": 0,
+        "operations": 41,
+        "outbound": 0,
+        "payloads": 0,
+        "publications": 0,
+        "receipt_origins": 1,
+        "retained": 0,
+        "routes": 2,
+        "sessions": 10,
+        "wills": 0
+      },
+      "freelist_count": 26,
+      "invariants_ok": true,
+      "limits": {
+        "exchange_slots": 128,
+        "payload_bytes": 4194304,
+        "receipt_slots": 8192,
+        "references": 128
+      },
+      "measured": {
+        "exchange_slots": 0,
+        "payload_bytes": 0,
+        "receipt_slots": 41,
+        "references": 0
+      },
+      "page_count": 53,
+      "page_size": 4096,
+      "user_version": 13
+    },
+    "dashboards": [
+      {
+        "budget": 268435456,
+        "conflicts": 0,
+        "duplicates": 0,
+        "files": {
+          "database": 39006208,
+          "shm": 32768,
+          "wal": 201912
+        },
+        "freelist_count": 0,
+        "identity": "dashboard-1",
+        "invalid": 0,
+        "last_unique_mono": 257084694120589,
+        "mqtt_dup": 0,
+        "mqtt_received": 113470,
+        "occupied_bytes": 39240888,
+        "page_count": 9525,
+        "subscribed": 1,
+        "unique_count": 113470
+      },
+      {
+        "budget": 268435456,
+        "conflicts": 0,
+        "duplicates": 0,
+        "files": {
+          "database": 39006208,
+          "shm": 32768,
+          "wal": 201912
+        },
+        "freelist_count": 0,
+        "identity": "dashboard-2",
+        "invalid": 0,
+        "last_unique_mono": 257084694673334,
+        "mqtt_dup": 0,
+        "mqtt_received": 113470,
+        "occupied_bytes": 39240888,
+        "page_count": 9525,
+        "subscribed": 1,
+        "unique_count": 113470
+      }
+    ],
+    "monotonic_ns": 257084723880899,
+    "phase": "drained",
+    "resources": {
+      "broker": {
+        "cpu_system_s": 159.43,
+        "cpu_user_s": 524.58,
+        "disk": {
+          "-shm": 32768,
+          "-wal": 4210672,
+          "database": 217088
+        },
+        "rss_kib": 9208,
+        "threads": 13,
+        "wchar": 20944884815,
+        "write_bytes": 23488385024
+      },
+      "capteur-1": {
+        "cpu_system_s": 7.46,
+        "cpu_user_s": 24.55,
+        "disk": {
+          "-shm": 32768,
+          "-wal": 461472,
+          "database": 3309568
+        },
+        "rss_kib": 28280,
+        "threads": 2,
+        "wchar": 405221852,
+        "write_bytes": 622563328
+      },
+      "capteur-2": {
+        "cpu_system_s": 7.63,
+        "cpu_user_s": 24.32,
+        "disk": {
+          "-shm": 32768,
+          "-wal": 786952,
+          "database": 3309568
+        },
+        "rss_kib": 28304,
+        "threads": 2,
+        "wchar": 398298849,
+        "write_bytes": 613773312
+      },
+      "capteur-3": {
+        "cpu_system_s": 7.65,
+        "cpu_user_s": 24.22,
+        "disk": {
+          "-shm": 32768,
+          "-wal": 865232,
+          "database": 3313664
+        },
+        "rss_kib": 28208,
+        "threads": 2,
+        "wchar": 397162614,
+        "write_bytes": 612143104
+      },
+      "capteur-4": {
+        "cpu_system_s": 7.67,
+        "cpu_user_s": 23.8,
+        "disk": {
+          "-shm": 32768,
+          "-wal": 53592,
+          "database": 3313664
+        },
+        "rss_kib": 28288,
+        "threads": 2,
+        "wchar": 402270581,
+        "write_bytes": 618586112
+      },
+      "capteur-5": {
+        "cpu_system_s": 7.4,
+        "cpu_user_s": 24.82,
+        "disk": {
+          "-shm": 32768,
+          "-wal": 671592,
+          "database": 3309568
+        },
+        "rss_kib": 28244,
+        "threads": 2,
+        "wchar": 404477092,
+        "write_bytes": 622206976
+      },
+      "capteur-6": {
+        "cpu_system_s": 7.13,
+        "cpu_user_s": 25.23,
+        "disk": {
+          "-shm": 32768,
+          "-wal": 444992,
+          "database": 3313664
+        },
+        "rss_kib": 27584,
+        "threads": 2,
+        "wchar": 406521140,
+        "write_bytes": 624160768
+      },
+      "capteur-7": {
+        "cpu_system_s": 7.67,
+        "cpu_user_s": 24.45,
+        "disk": {
+          "-shm": 32768,
+          "-wal": 708672,
+          "database": 3313664
+        },
+        "rss_kib": 27064,
+        "threads": 2,
+        "wchar": 406956029,
+        "write_bytes": 624463872
+      },
+      "capteur-8": {
+        "cpu_system_s": 7.64,
+        "cpu_user_s": 24.55,
+        "disk": {
+          "-shm": 32768,
+          "-wal": 889952,
+          "database": 3309568
+        },
+        "rss_kib": 28260,
+        "threads": 2,
+        "wchar": 407070526,
+        "write_bytes": 624742400
+      },
+      "dashboard-1": {
+        "cpu_system_s": 15.92,
+        "cpu_user_s": 33.4,
+        "disk": {
+          "-shm": 32768,
+          "-wal": 201912,
+          "database": 39006208
+        },
+        "rss_kib": 26500,
+        "threads": 1,
+        "wchar": 1925118692,
+        "write_bytes": 2391166976
+      },
+      "dashboard-2": {
+        "cpu_system_s": 15.59,
+        "cpu_user_s": 31.45,
+        "disk": {
+          "-shm": 32768,
+          "-wal": 201912,
+          "database": 39006208
+        },
+        "rss_kib": 26460,
+        "threads": 1,
+        "wchar": 1924916958,
+        "write_bytes": 2390454272
+      }
+    },
+    "sensors": [
+      {
+        "attempts": 19836,
+        "blocked": 0,
+        "budget": 67108864,
+        "confirmed": 14184,
+        "enqueued": 14184,
+        "files": {
+          "database": 3309568,
+          "shm": 32768,
+          "wal": 461472
+        },
+        "freelist_count": 805,
+        "head_attempts": 0,
+        "identity": "capteur-1",
+        "inflight": 0,
+        "last_ack_mono": 257084602085919,
+        "last_ack_ns": 1795027407914967843,
+        "last_reason": 0,
+        "no_match": 0,
+        "occupied_bytes": 3803808,
+        "oldest_age_ms": 0,
+        "oldest_ns": null,
+        "page_count": 808,
+        "pending": 0,
+        "quota": 5652,
+        "rejected": 0,
+        "retries": 5652,
+        "rows": 0,
+        "streak": 0,
+        "stream": "14323f1124134abd999a8dd2e146f98b",
+        "unknown": 0
+      },
+      {
+        "attempts": 19355,
+        "blocked": 0,
+        "budget": 67108864,
+        "confirmed": 14184,
+        "enqueued": 14184,
+        "files": {
+          "database": 3309568,
+          "shm": 32768,
+          "wal": 786952
+        },
+        "freelist_count": 805,
+        "head_attempts": 0,
+        "identity": "capteur-2",
+        "inflight": 0,
+        "last_ack_mono": 257084637214975,
+        "last_ack_ns": 1795027407950096749,
+        "last_reason": 0,
+        "no_match": 0,
+        "occupied_bytes": 4129288,
+        "oldest_age_ms": 0,
+        "oldest_ns": null,
+        "page_count": 808,
+        "pending": 0,
+        "quota": 5171,
+        "rejected": 0,
+        "retries": 5171,
+        "rows": 0,
+        "streak": 0,
+        "stream": "687b6a12527a4190a9b7291bb363effd",
+        "unknown": 0
+      },
+      {
+        "attempts": 19264,
+        "blocked": 0,
+        "budget": 67108864,
+        "confirmed": 14184,
+        "enqueued": 14184,
+        "files": {
+          "database": 3313664,
+          "shm": 32768,
+          "wal": 865232
+        },
+        "freelist_count": 806,
+        "head_attempts": 0,
+        "identity": "capteur-3",
+        "inflight": 0,
+        "last_ack_mono": 257084649213020,
+        "last_ack_ns": 1795027407962095025,
+        "last_reason": 0,
+        "no_match": 0,
+        "occupied_bytes": 4211664,
+        "oldest_age_ms": 0,
+        "oldest_ns": null,
+        "page_count": 809,
+        "pending": 0,
+        "quota": 5080,
+        "rejected": 0,
+        "retries": 5080,
+        "rows": 0,
+        "streak": 0,
+        "stream": "0cb0563b53b0460da8bf6843fa70dcee",
+        "unknown": 0
+      },
+      {
+        "attempts": 19628,
+        "blocked": 0,
+        "budget": 67108864,
+        "confirmed": 14184,
+        "enqueued": 14184,
+        "files": {
+          "database": 3313664,
+          "shm": 32768,
+          "wal": 53592
+        },
+        "freelist_count": 806,
+        "head_attempts": 0,
+        "identity": "capteur-4",
+        "inflight": 0,
+        "last_ack_mono": 257084653891966,
+        "last_ack_ns": 1795027407966773930,
+        "last_reason": 0,
+        "no_match": 0,
+        "occupied_bytes": 3400024,
+        "oldest_age_ms": 0,
+        "oldest_ns": null,
+        "page_count": 809,
+        "pending": 0,
+        "quota": 5444,
+        "rejected": 0,
+        "retries": 5444,
+        "rows": 0,
+        "streak": 0,
+        "stream": "ab7ceaba3c384d45ac362d0b910ffe5d",
+        "unknown": 0
+      },
+      {
+        "attempts": 19811,
+        "blocked": 0,
+        "budget": 67108864,
+        "confirmed": 14184,
+        "enqueued": 14184,
+        "files": {
+          "database": 3309568,
+          "shm": 32768,
+          "wal": 671592
+        },
+        "freelist_count": 805,
+        "head_attempts": 0,
+        "identity": "capteur-5",
+        "inflight": 0,
+        "last_ack_mono": 257084680909262,
+        "last_ack_ns": 1795027407993791206,
+        "last_reason": 0,
+        "no_match": 0,
+        "occupied_bytes": 4013928,
+        "oldest_age_ms": 0,
+        "oldest_ns": null,
+        "page_count": 808,
+        "pending": 0,
+        "quota": 5627,
+        "rejected": 0,
+        "retries": 5627,
+        "rows": 0,
+        "streak": 0,
+        "stream": "fe283facf4124419966d8b0d6ffccb70",
+        "unknown": 0
+      },
+      {
+        "attempts": 19948,
+        "blocked": 0,
+        "budget": 67108864,
+        "confirmed": 14184,
+        "enqueued": 14184,
+        "files": {
+          "database": 3313664,
+          "shm": 32768,
+          "wal": 444992
+        },
+        "freelist_count": 806,
+        "head_attempts": 0,
+        "identity": "capteur-6",
+        "inflight": 0,
+        "last_ack_mono": 257084691041556,
+        "last_ack_ns": 1795027408003923440,
+        "last_reason": 0,
+        "no_match": 0,
+        "occupied_bytes": 3791424,
+        "oldest_age_ms": 0,
+        "oldest_ns": null,
+        "page_count": 809,
+        "pending": 0,
+        "quota": 5764,
+        "rejected": 0,
+        "retries": 5764,
+        "rows": 0,
+        "streak": 0,
+        "stream": "8e01695046b64f7993c0602807d47de9",
+        "unknown": 0
+      },
+      {
+        "attempts": 19969,
+        "blocked": 0,
+        "budget": 67108864,
+        "confirmed": 14183,
+        "enqueued": 14183,
+        "files": {
+          "database": 3313664,
+          "shm": 32768,
+          "wal": 708672
+        },
+        "freelist_count": 806,
+        "head_attempts": 0,
+        "identity": "capteur-7",
+        "inflight": 0,
+        "last_ack_mono": 257084559360062,
+        "last_ack_ns": 1795027407872241936,
+        "last_reason": 0,
+        "no_match": 0,
+        "occupied_bytes": 4055104,
+        "oldest_age_ms": 0,
+        "oldest_ns": null,
+        "page_count": 809,
+        "pending": 0,
+        "quota": 5786,
+        "rejected": 0,
+        "retries": 5786,
+        "rows": 0,
+        "streak": 0,
+        "stream": "1da42003e1d74e969a4e4b08de248ad9",
+        "unknown": 0
+      },
+      {
+        "attempts": 19979,
+        "blocked": 0,
+        "budget": 67108864,
+        "confirmed": 14183,
+        "enqueued": 14183,
+        "files": {
+          "database": 3309568,
+          "shm": 32768,
+          "wal": 889952
+        },
+        "freelist_count": 805,
+        "head_attempts": 0,
+        "identity": "capteur-8",
+        "inflight": 0,
+        "last_ack_mono": 257084554887201,
+        "last_ack_ns": 1795027407867769185,
+        "last_reason": 0,
+        "no_match": 0,
+        "occupied_bytes": 4232288,
+        "oldest_age_ms": 0,
+        "oldest_ns": null,
+        "page_count": 808,
+        "pending": 0,
+        "quota": 5796,
+        "rejected": 0,
+        "retries": 5796,
+        "rows": 0,
+        "streak": 0,
+        "stream": "319788a949854dceaf5a59d78b0be2ae",
+        "unknown": 0
+      }
+    ],
+    "total": {
+      "attempts": 157790,
+      "confirmed": 113470,
+      "enqueued": 113470,
+      "no_match": 0,
+      "pending": 0,
+      "quota": 44320,
+      "rejected": 0,
+      "retries": 44320,
+      "rows": 0,
+      "unknown": 0
+    }
+  },
+  "format": "mqttiumd.pilot.forward.v1",
+  "implementation": {
+    "common.py": "eb28d065e27f6d47dfbb02838418d3f3cbd5a833ab5e04a03a5ab02d8ac1ad0b",
+    "forward_client.py": "107bae1ec989bd05e479c198b7cb6ad7bae0ebe0c0081b9ffb4d789d4f363585",
+    "forward_reception.py": "c7660c77277fcf0d675f6d2f3740de485636fcaf141ebbbd61481baa3817234a",
+    "forward_store.py": "b20e442f6bff275405d59e3e3c740f7b450c85624b04dea82e1ff22053071eda",
+    "load.py": "3b88974c7ce49a3a245719dc7733f451567350ede9b1735d81e78c4e67e64ca0"
+  },
+  "incidents": {
+    "authorization-and-conflict": {
+      "broker_signals": [
+        {
+          "argv": [
+            "/workspace/outbox-qualification/operator-extraction/extracted/mqttiumd-prepilot-51be4079-9c514e66-x86_64-linux/mqttiumd",
+            "--listen",
+            "127.0.0.1:0",
+            "--db",
+            "/workspace/outbox-qualification/operator-short/faults/authorization-and-conflict/broker.sqlite",
+            "--events",
+            "/workspace/outbox-qualification/operator-short/faults/authorization-and-conflict/broker.jsonl",
+            "--tls-cert",
+            "/tmp/forward-fault-pki-2ofqpvx4/pki/server.crt",
+            "--tls-key",
+            "/tmp/forward-fault-pki-2ofqpvx4/pki/server.key",
+            "--client-ca",
+            "/tmp/forward-fault-pki-2ofqpvx4/pki/ca.crt",
+            "--identities",
+            "/tmp/forward-fault-pki-2ofqpvx4/pki/identities.json"
+          ],
+          "pid": 1980459,
+          "requested_signal": "SIGINT",
+          "signalled": true,
+          "wait_status": 0
+        }
+      ],
+      "cut_processes": [],
+      "status": "PASS"
+    },
+    "enqueue-before-publish": {
+      "broker_signals": [
+        {
+          "argv": [
+            "/workspace/outbox-qualification/operator-extraction/extracted/mqttiumd-prepilot-51be4079-9c514e66-x86_64-linux/mqttiumd",
+            "--listen",
+            "127.0.0.1:0",
+            "--db",
+            "/workspace/outbox-qualification/operator-short/faults/enqueue-before-publish/broker.sqlite",
+            "--events",
+            "/workspace/outbox-qualification/operator-short/faults/enqueue-before-publish/broker.jsonl",
+            "--tls-cert",
+            "/tmp/forward-fault-pki-2ofqpvx4/pki/server.crt",
+            "--tls-key",
+            "/tmp/forward-fault-pki-2ofqpvx4/pki/server.key",
+            "--client-ca",
+            "/tmp/forward-fault-pki-2ofqpvx4/pki/ca.crt",
+            "--identities",
+            "/tmp/forward-fault-pki-2ofqpvx4/pki/identities.json"
+          ],
+          "pid": 1980384,
+          "requested_signal": "SIGINT",
+          "signalled": true,
+          "wait_status": 0
+        }
+      ],
+      "cut_processes": [
+        {
+          "argv": [
+            "/workspace/.mqttiumd-tools/venv313/bin/python",
+            "/workspace/outbox-qualification/operator-extraction/extracted/mqttiumd-prepilot-51be4079-9c514e66-x86_64-linux/pilot/forward_faults.py",
+            "producer",
+            "--id",
+            "capteur-1",
+            "--db",
+            "/workspace/outbox-qualification/operator-short/faults/enqueue-before-publish/capteur-1.sqlite",
+            "--pki",
+            "/tmp/forward-fault-pki-2ofqpvx4/pki",
+            "--port",
+            "45241",
+            "--stage",
+            "before_publish",
+            "--sequence",
+            "1"
+          ],
+          "forced": false,
+          "identity": "capteur-1",
+          "pid": 1980391,
+          "signal": "SIGKILL",
+          "signalled": true,
+          "wait_status": -9
+        }
+      ],
+      "status": "PASS"
+    },
+    "inbox-commit-before-ack": {
+      "broker_signals": [
+        {
+          "argv": [
+            "/workspace/outbox-qualification/operator-extraction/extracted/mqttiumd-prepilot-51be4079-9c514e66-x86_64-linux/mqttiumd",
+            "--listen",
+            "127.0.0.1:0",
+            "--db",
+            "/workspace/outbox-qualification/operator-short/faults/inbox-commit-before-ack/broker.sqlite",
+            "--events",
+            "/workspace/outbox-qualification/operator-short/faults/inbox-commit-before-ack/broker.jsonl",
+            "--tls-cert",
+            "/tmp/forward-fault-pki-2ofqpvx4/pki/server.crt",
+            "--tls-key",
+            "/tmp/forward-fault-pki-2ofqpvx4/pki/server.key",
+            "--client-ca",
+            "/tmp/forward-fault-pki-2ofqpvx4/pki/ca.crt",
+            "--identities",
+            "/tmp/forward-fault-pki-2ofqpvx4/pki/identities.json"
+          ],
+          "pid": 1980447,
+          "requested_signal": "SIGINT",
+          "signalled": true,
+          "wait_status": 0
+        }
+      ],
+      "cut_processes": [
+        {
+          "argv": [
+            "/workspace/.mqttiumd-tools/venv313/bin/python",
+            "/workspace/outbox-qualification/operator-extraction/extracted/mqttiumd-prepilot-51be4079-9c514e66-x86_64-linux/pilot/forward_faults.py",
+            "dashboard",
+            "--id",
+            "dashboard-1",
+            "--db",
+            "/workspace/outbox-qualification/operator-short/faults/inbox-commit-before-ack/dashboard-1.sqlite",
+            "--pki",
+            "/tmp/forward-fault-pki-2ofqpvx4/pki",
+            "--port",
+            "46049",
+            "--stage",
+            "consumer_committed",
+            "--sequence",
+            "1"
+          ],
+          "forced": false,
+          "identity": "dashboard-1",
+          "pid": 1980450,
+          "signal": "SIGKILL",
+          "signalled": true,
+          "wait_status": -9
+        }
+      ],
+      "status": "PASS"
+    },
+    "positive-before-collection": {
+      "broker_signals": [
+        {
+          "argv": [
+            "/workspace/outbox-qualification/operator-extraction/extracted/mqttiumd-prepilot-51be4079-9c514e66-x86_64-linux/mqttiumd",
+            "--listen",
+            "127.0.0.1:0",
+            "--db",
+            "/workspace/outbox-qualification/operator-short/faults/positive-before-collection/broker.sqlite",
+            "--events",
+            "/workspace/outbox-qualification/operator-short/faults/positive-before-collection/broker.jsonl",
+            "--tls-cert",
+            "/tmp/forward-fault-pki-2ofqpvx4/pki/server.crt",
+            "--tls-key",
+            "/tmp/forward-fault-pki-2ofqpvx4/pki/server.key",
+            "--client-ca",
+            "/tmp/forward-fault-pki-2ofqpvx4/pki/ca.crt",
+            "--identities",
+            "/tmp/forward-fault-pki-2ofqpvx4/pki/identities.json"
+          ],
+          "pid": 1980410,
+          "requested_signal": "SIGINT",
+          "signalled": true,
+          "wait_status": 0
+        }
+      ],
+      "cut_processes": [
+        {
+          "argv": [
+            "/workspace/.mqttiumd-tools/venv313/bin/python",
+            "/workspace/outbox-qualification/operator-extraction/extracted/mqttiumd-prepilot-51be4079-9c514e66-x86_64-linux/pilot/forward_faults.py",
+            "producer",
+            "--id",
+            "capteur-1",
+            "--db",
+            "/workspace/outbox-qualification/operator-short/faults/positive-before-collection/capteur-1.sqlite",
+            "--pki",
+            "/tmp/forward-fault-pki-2ofqpvx4/pki",
+            "--port",
+            "43005",
+            "--stage",
+            "result_recorded",
+            "--sequence",
+            "1",
+            "--reason",
+            "0"
+          ],
+          "forced": false,
+          "identity": "capteur-1",
+          "pid": 1980417,
+          "signal": "SIGKILL",
+          "signalled": true,
+          "wait_status": -9
+        }
+      ],
+      "status": "PASS"
+    },
+    "quota-broker-and-drain": {
+      "broker_signals": [
+        {
+          "argv": [
+            "/workspace/outbox-qualification/operator-extraction/extracted/mqttiumd-prepilot-51be4079-9c514e66-x86_64-linux/mqttiumd",
+            "--listen",
+            "127.0.0.1:0",
+            "--db",
+            "/workspace/outbox-qualification/operator-short/faults/quota-broker-and-drain/broker.sqlite",
+            "--events",
+            "/workspace/outbox-qualification/operator-short/faults/quota-broker-and-drain/broker.jsonl",
+            "--tls-cert",
+            "/tmp/forward-fault-pki-2ofqpvx4/pki/server.crt",
+            "--tls-key",
+            "/tmp/forward-fault-pki-2ofqpvx4/pki/server.key",
+            "--client-ca",
+            "/tmp/forward-fault-pki-2ofqpvx4/pki/ca.crt",
+            "--identities",
+            "/tmp/forward-fault-pki-2ofqpvx4/pki/identities.json"
+          ],
+          "pid": 1980423,
+          "requested_signal": "SIGKILL",
+          "signalled": true,
+          "wait_status": -9
+        },
+        {
+          "argv": [
+            "/workspace/outbox-qualification/operator-extraction/extracted/mqttiumd-prepilot-51be4079-9c514e66-x86_64-linux/mqttiumd",
+            "--listen",
+            "127.0.0.1:0",
+            "--db",
+            "/workspace/outbox-qualification/operator-short/faults/quota-broker-and-drain/broker.sqlite",
+            "--events",
+            "/workspace/outbox-qualification/operator-short/faults/quota-broker-and-drain/broker-restarted.jsonl",
+            "--tls-cert",
+            "/tmp/forward-fault-pki-2ofqpvx4/pki/server.crt",
+            "--tls-key",
+            "/tmp/forward-fault-pki-2ofqpvx4/pki/server.key",
+            "--client-ca",
+            "/tmp/forward-fault-pki-2ofqpvx4/pki/ca.crt",
+            "--identities",
+            "/tmp/forward-fault-pki-2ofqpvx4/pki/identities.json"
+          ],
+          "pid": 1980434,
+          "requested_signal": "SIGINT",
+          "signalled": true,
+          "wait_status": 0
+        }
+      ],
+      "cut_processes": [
+        {
+          "argv": [
+            "/workspace/.mqttiumd-tools/venv313/bin/python",
+            "/workspace/outbox-qualification/operator-extraction/extracted/mqttiumd-prepilot-51be4079-9c514e66-x86_64-linux/pilot/forward_faults.py",
+            "producer",
+            "--id",
+            "capteur-1",
+            "--db",
+            "/workspace/outbox-qualification/operator-short/faults/quota-broker-and-drain/capteur-1.sqlite",
+            "--pki",
+            "/tmp/forward-fault-pki-2ofqpvx4/pki",
+            "--port",
+            "44669",
+            "--stage",
+            "result_recorded",
+            "--sequence",
+            "0",
+            "--reason",
+            "151"
+          ],
+          "forced": false,
+          "identity": "capteur-1",
+          "pid": 1980430,
+          "signal": "SIGKILL",
+          "signalled": true,
+          "wait_status": -9
+        },
+        {
+          "argv": [
+            "/workspace/.mqttiumd-tools/venv313/bin/python",
+            "/workspace/outbox-qualification/operator-extraction/extracted/mqttiumd-prepilot-51be4079-9c514e66-x86_64-linux/pilot/forward_faults.py",
+            "producer",
+            "--id",
+            "capteur-1",
+            "--db",
+            "/workspace/outbox-qualification/operator-short/faults/quota-broker-and-drain/capteur-1.sqlite",
+            "--pki",
+            "/tmp/forward-fault-pki-2ofqpvx4/pki",
+            "--port",
+            "37809",
+            "--stage",
+            "sent",
+            "--sequence",
+            "129"
+          ],
+          "forced": false,
+          "identity": "capteur-1",
+          "pid": 1980441,
+          "signal": "SIGKILL",
+          "signalled": true,
+          "wait_status": -9
+        }
+      ],
+      "status": "PASS"
+    },
+    "sent-before-puback-read": {
+      "broker_signals": [
+        {
+          "argv": [
+            "/workspace/outbox-qualification/operator-extraction/extracted/mqttiumd-prepilot-51be4079-9c514e66-x86_64-linux/mqttiumd",
+            "--listen",
+            "127.0.0.1:0",
+            "--db",
+            "/workspace/outbox-qualification/operator-short/faults/sent-before-puback-read/broker.sqlite",
+            "--events",
+            "/workspace/outbox-qualification/operator-short/faults/sent-before-puback-read/broker.jsonl",
+            "--tls-cert",
+            "/tmp/forward-fault-pki-2ofqpvx4/pki/server.crt",
+            "--tls-key",
+            "/tmp/forward-fault-pki-2ofqpvx4/pki/server.key",
+            "--client-ca",
+            "/tmp/forward-fault-pki-2ofqpvx4/pki/ca.crt",
+            "--identities",
+            "/tmp/forward-fault-pki-2ofqpvx4/pki/identities.json"
+          ],
+          "pid": 1980397,
+          "requested_signal": "SIGINT",
+          "signalled": true,
+          "wait_status": 0
+        }
+      ],
+      "cut_processes": [
+        {
+          "argv": [
+            "/workspace/.mqttiumd-tools/venv313/bin/python",
+            "/workspace/outbox-qualification/operator-extraction/extracted/mqttiumd-prepilot-51be4079-9c514e66-x86_64-linux/pilot/forward_faults.py",
+            "producer",
+            "--id",
+            "capteur-1",
+            "--db",
+            "/workspace/outbox-qualification/operator-short/faults/sent-before-puback-read/capteur-1.sqlite",
+            "--pki",
+            "/tmp/forward-fault-pki-2ofqpvx4/pki",
+            "--port",
+            "39011",
+            "--stage",
+            "sent",
+            "--sequence",
+            "1"
+          ],
+          "forced": false,
+          "identity": "capteur-1",
+          "pid": 1980404,
+          "signal": "SIGKILL",
+          "signalled": true,
+          "wait_status": -9
+        }
+      ],
+      "status": "PASS"
+    }
+  },
+  "independent_dashboard_ledgers": {
+    "dashboard-1": {
+      "conflicts": 0,
+      "duplicates": 0,
+      "first_after_pressure_clear_monotonic_ns": 256615991784368,
+      "first_receipt_order_reversals": 0,
+      "inter_delivery_gap_s": 1798.107533536,
+      "invalid": 0,
+      "last_before_pressure_clear_monotonic_ns": 254817884250832,
+      "last_receipt_monotonic_ns": 257084694120589,
+      "ledger_integrity": "ok",
+      "mqtt_received": 113470,
+      "streams": [
+        [
+          "capteur-1",
+          "14323F1124134ABD999A8DD2E146F98B",
+          1,
+          14184,
+          14184
+        ],
+        [
+          "capteur-2",
+          "687B6A12527A4190A9B7291BB363EFFD",
+          1,
+          14184,
+          14184
+        ],
+        [
+          "capteur-3",
+          "0CB0563B53B0460DA8BF6843FA70DCEE",
+          1,
+          14184,
+          14184
+        ],
+        [
+          "capteur-4",
+          "AB7CEABA3C384D45AC362D0B910FFE5D",
+          1,
+          14184,
+          14184
+        ],
+        [
+          "capteur-5",
+          "FE283FACF4124419966D8B0D6FFCCB70",
+          1,
+          14184,
+          14184
+        ],
+        [
+          "capteur-6",
+          "8E01695046B64F7993C0602807D47DE9",
+          1,
+          14184,
+          14184
+        ],
+        [
+          "capteur-7",
+          "1DA42003E1D74E969A4E4B08DE248AD9",
+          1,
+          14183,
+          14183
+        ],
+        [
+          "capteur-8",
+          "319788A949854DCEAF5A59D78B0BE2AE",
+          1,
+          14183,
+          14183
+        ]
+      ],
+      "unique": 113470
+    },
+    "dashboard-2": {
+      "conflicts": 0,
+      "duplicates": 0,
+      "first_receipt_order_reversals": 0,
+      "invalid": 0,
+      "last_receipt_monotonic_ns": 257084694673334,
+      "ledger_integrity": "ok",
+      "mqtt_received": 113470,
+      "streams": [
+        [
+          "capteur-1",
+          "14323F1124134ABD999A8DD2E146F98B",
+          1,
+          14184,
+          14184
+        ],
+        [
+          "capteur-2",
+          "687B6A12527A4190A9B7291BB363EFFD",
+          1,
+          14184,
+          14184
+        ],
+        [
+          "capteur-3",
+          "0CB0563B53B0460DA8BF6843FA70DCEE",
+          1,
+          14184,
+          14184
+        ],
+        [
+          "capteur-4",
+          "AB7CEABA3C384D45AC362D0B910FFE5D",
+          1,
+          14184,
+          14184
+        ],
+        [
+          "capteur-5",
+          "FE283FACF4124419966D8B0D6FFCCB70",
+          1,
+          14184,
+          14184
+        ],
+        [
+          "capteur-6",
+          "8E01695046B64F7993C0602807D47DE9",
+          1,
+          14184,
+          14184
+        ],
+        [
+          "capteur-7",
+          "1DA42003E1D74E969A4E4B08DE248AD9",
+          1,
+          14183,
+          14183
+        ],
+        [
+          "capteur-8",
+          "319788A949854DCEAF5A59D78B0BE2AE",
+          1,
+          14183,
+          14183
+        ]
+      ],
+      "unique": 113470
+    }
+  },
+  "local_budget_exercise": {
+    "after_reuse": {
+      "attempts": 512,
+      "blocked": 0,
+      "budget": 67108864,
+      "confirmed": 512,
+      "enqueued": 110223,
+      "files": {
+        "database": 32342016,
+        "shm": 32768,
+        "wal": 354352
+      },
+      "freelist_count": 35,
+      "head_attempts": 0,
+      "identity": "capteur-1",
+      "inflight": 0,
+      "last_ack_mono": 255816966195177,
+      "last_ack_ns": 1795026140279077122,
+      "last_reason": 0,
+      "no_match": 0,
+      "occupied_bytes": 32729136,
+      "oldest_age_ms": 42920.112425,
+      "oldest_ns": 1795026097375023665,
+      "page_count": 7896,
+      "pending": 109711,
+      "quota": 0,
+      "rejected": 0,
+      "retries": 0,
+      "rows": 109711,
+      "streak": 0,
+      "stream": "6b3155e9a5df4fe59188b2811aa44c46",
+      "unknown": 0
+    },
+    "at_refusal": {
+      "attempts": 0,
+      "blocked": 0,
+      "budget": 67108864,
+      "confirmed": 0,
+      "enqueued": 110222,
+      "files": {
+        "database": 32337920,
+        "shm": 32768,
+        "wal": 214272
+      },
+      "freelist_count": 0,
+      "head_attempts": 0,
+      "identity": "capteur-1",
+      "inflight": 0,
+      "last_ack_mono": null,
+      "last_ack_ns": null,
+      "last_reason": null,
+      "no_match": 0,
+      "occupied_bytes": 32584960,
+      "oldest_age_ms": 42691.687574,
+      "oldest_ns": 1795026097174868935,
+      "page_count": 7896,
+      "pending": 110222,
+      "quota": 0,
+      "rejected": 0,
+      "retries": 0,
+      "rows": 110222,
+      "streak": 0,
+      "stream": "6b3155e9a5df4fe59188b2811aa44c46",
+      "unknown": 0
+    },
+    "budget_bytes": 67108864,
+    "elapsed_s": 43.13409739499912,
+    "implementation_sha256": "b20e442f6bff275405d59e3e3c740f7b450c85624b04dea82e1ff22053071eda",
+    "next_sequence": 110223,
+    "refusal": "local_disk_budget_or_filesystem_full",
+    "released_rows": 512,
+    "sampled_peak_bytes": 33104920,
+    "scope": "Local SQLite capacity geometry, synthetic positive transitions, no broker admission claim",
+    "settings": {
+      "checkpoint_busy": 0,
+      "checkpoint_count": 931,
+      "page_limit": 7896,
+      "synchronous": 2,
+      "wal_mark": 1048576
+    },
+    "status": "PASS"
+  },
+  "machine": {
+    "affinity": [
+      0,
+      1,
+      2,
+      3,
+      4
+    ],
+    "cgroup_io": "259:0 rbytes=120360960 wbytes=0 rios=29154 wios=0 dbytes=0 dios=0\n254:0 rbytes=64521588736 wbytes=646429155328 rios=2942915 wios=16244152 dbytes=0 dios=0",
+    "cpu_max": "400000 100000",
+    "cpu_model": "AMD EPYC 9V74 80-Core Processor",
+    "cpuset": "0-4",
+    "free_bytes": 2789232640,
+    "fs": "overlayfs",
+    "glibc": [
+      "glibc",
+      "2.41"
+    ],
+    "inspector_sqlite": "3.46.1",
+    "memory_current": "4396232704",
+    "memory_max": "17179869184",
+    "paho": "2.1.0",
+    "paho_module_sha256": "5a3f0f73b344541828586a90f79a6beecb8e4396d8b81064bc2920c1a853618a",
+    "platform": "Linux-6.18.57-x86_64-with-glibc2.41",
+    "python": "3.13.5",
+    "storage": "overlay[/workspace] overlay",
+    "uname": [
+      "Linux",
+      "92430b1a8840",
+      "6.18.57",
+      "#1 SMP Tue Oct 20 21:56:04 UTC 2026",
+      "x86_64"
+    ]
+  },
+  "maximums": {
+    "all_pending_events": 89901,
+    "broker_claims": 7,
+    "broker_obligations": 128,
+    "broker_receipts": 69,
+    "broker_references": 128
+  },
+  "measured_archive": {
+    "bytes": 11499263,
+    "sha256": "1fdb4af7035fd1a1a42999be7966309808a5373e06ec62a2943c5195fde76a5f"
+  },
+  "normal_application_processes": [
+    {
+      "argv": [
+        "/workspace/.mqttiumd-tools/venv313/bin/python",
+        "/workspace/outbox-qualification/measured-extraction/extracted/mqttiumd-prepilot-51be4079-acdaf464-x86_64-linux/pilot/forward_client.py",
+        "dashboard",
+        "--id",
+        "dashboard-1",
+        "--db",
+        "/workspace/outbox-qualification/decisive/dashboard-1.sqlite",
+        "--pki",
+        "/tmp/mqttiumd-forward-pki-9le04c0e/pki",
+        "--port",
+        "44141"
+      ],
+      "forced": false,
+      "identity": "dashboard-1",
+      "pid": 1970957,
+      "signal": "SIGINT",
+      "signalled": true,
+      "wait_status": 0
+    },
+    {
+      "argv": [
+        "/workspace/.mqttiumd-tools/venv313/bin/python",
+        "/workspace/outbox-qualification/measured-extraction/extracted/mqttiumd-prepilot-51be4079-acdaf464-x86_64-linux/pilot/forward_client.py",
+        "dashboard",
+        "--id",
+        "dashboard-2",
+        "--db",
+        "/workspace/outbox-qualification/decisive/dashboard-2.sqlite",
+        "--pki",
+        "/tmp/mqttiumd-forward-pki-9le04c0e/pki",
+        "--port",
+        "44141"
+      ],
+      "forced": false,
+      "identity": "dashboard-2",
+      "pid": 1970958,
+      "signal": "SIGINT",
+      "signalled": false,
+      "wait_status": 0
+    },
+    {
+      "argv": [
+        "/workspace/.mqttiumd-tools/venv313/bin/python",
+        "/workspace/outbox-qualification/measured-extraction/extracted/mqttiumd-prepilot-51be4079-acdaf464-x86_64-linux/pilot/forward_client.py",
+        "producer",
+        "--id",
+        "capteur-1",
+        "--db",
+        "/workspace/outbox-qualification/decisive/capteur-1.sqlite",
+        "--pki",
+        "/tmp/mqttiumd-forward-pki-9le04c0e/pki",
+        "--port",
+        "44141",
+        "--schedule",
+        "/workspace/outbox-qualification/decisive/schedule.json"
+      ],
+      "forced": false,
+      "identity": "capteur-1",
+      "pid": 1970961,
+      "signal": "SIGINT",
+      "signalled": true,
+      "wait_status": 0
+    },
+    {
+      "argv": [
+        "/workspace/.mqttiumd-tools/venv313/bin/python",
+        "/workspace/outbox-qualification/measured-extraction/extracted/mqttiumd-prepilot-51be4079-acdaf464-x86_64-linux/pilot/forward_client.py",
+        "producer",
+        "--id",
+        "capteur-2",
+        "--db",
+        "/workspace/outbox-qualification/decisive/capteur-2.sqlite",
+        "--pki",
+        "/tmp/mqttiumd-forward-pki-9le04c0e/pki",
+        "--port",
+        "44141",
+        "--schedule",
+        "/workspace/outbox-qualification/decisive/schedule.json"
+      ],
+      "forced": false,
+      "identity": "capteur-2",
+      "pid": 1970962,
+      "signal": "SIGINT",
+      "signalled": true,
+      "wait_status": 0
+    },
+    {
+      "argv": [
+        "/workspace/.mqttiumd-tools/venv313/bin/python",
+        "/workspace/outbox-qualification/measured-extraction/extracted/mqttiumd-prepilot-51be4079-acdaf464-x86_64-linux/pilot/forward_client.py",
+        "producer",
+        "--id",
+        "capteur-3",
+        "--db",
+        "/workspace/outbox-qualification/decisive/capteur-3.sqlite",
+        "--pki",
+        "/tmp/mqttiumd-forward-pki-9le04c0e/pki",
+        "--port",
+        "44141",
+        "--schedule",
+        "/workspace/outbox-qualification/decisive/schedule.json"
+      ],
+      "forced": false,
+      "identity": "capteur-3",
+      "pid": 1970963,
+      "signal": "SIGINT",
+      "signalled": true,
+      "wait_status": 0
+    },
+    {
+      "argv": [
+        "/workspace/.mqttiumd-tools/venv313/bin/python",
+        "/workspace/outbox-qualification/measured-extraction/extracted/mqttiumd-prepilot-51be4079-acdaf464-x86_64-linux/pilot/forward_client.py",
+        "producer",
+        "--id",
+        "capteur-4",
+        "--db",
+        "/workspace/outbox-qualification/decisive/capteur-4.sqlite",
+        "--pki",
+        "/tmp/mqttiumd-forward-pki-9le04c0e/pki",
+        "--port",
+        "44141",
+        "--schedule",
+        "/workspace/outbox-qualification/decisive/schedule.json"
+      ],
+      "forced": false,
+      "identity": "capteur-4",
+      "pid": 1970964,
+      "signal": "SIGINT",
+      "signalled": true,
+      "wait_status": 0
+    },
+    {
+      "argv": [
+        "/workspace/.mqttiumd-tools/venv313/bin/python",
+        "/workspace/outbox-qualification/measured-extraction/extracted/mqttiumd-prepilot-51be4079-acdaf464-x86_64-linux/pilot/forward_client.py",
+        "producer",
+        "--id",
+        "capteur-5",
+        "--db",
+        "/workspace/outbox-qualification/decisive/capteur-5.sqlite",
+        "--pki",
+        "/tmp/mqttiumd-forward-pki-9le04c0e/pki",
+        "--port",
+        "44141",
+        "--schedule",
+        "/workspace/outbox-qualification/decisive/schedule.json"
+      ],
+      "forced": false,
+      "identity": "capteur-5",
+      "pid": 1970965,
+      "signal": "SIGINT",
+      "signalled": true,
+      "wait_status": 0
+    },
+    {
+      "argv": [
+        "/workspace/.mqttiumd-tools/venv313/bin/python",
+        "/workspace/outbox-qualification/measured-extraction/extracted/mqttiumd-prepilot-51be4079-acdaf464-x86_64-linux/pilot/forward_client.py",
+        "producer",
+        "--id",
+        "capteur-6",
+        "--db",
+        "/workspace/outbox-qualification/decisive/capteur-6.sqlite",
+        "--pki",
+        "/tmp/mqttiumd-forward-pki-9le04c0e/pki",
+        "--port",
+        "44141",
+        "--schedule",
+        "/workspace/outbox-qualification/decisive/schedule.json"
+      ],
+      "forced": false,
+      "identity": "capteur-6",
+      "pid": 1970966,
+      "signal": "SIGINT",
+      "signalled": true,
+      "wait_status": 0
+    },
+    {
+      "argv": [
+        "/workspace/.mqttiumd-tools/venv313/bin/python",
+        "/workspace/outbox-qualification/measured-extraction/extracted/mqttiumd-prepilot-51be4079-acdaf464-x86_64-linux/pilot/forward_client.py",
+        "producer",
+        "--id",
+        "capteur-7",
+        "--db",
+        "/workspace/outbox-qualification/decisive/capteur-7.sqlite",
+        "--pki",
+        "/tmp/mqttiumd-forward-pki-9le04c0e/pki",
+        "--port",
+        "44141",
+        "--schedule",
+        "/workspace/outbox-qualification/decisive/schedule.json"
+      ],
+      "forced": false,
+      "identity": "capteur-7",
+      "pid": 1970967,
+      "signal": "SIGINT",
+      "signalled": true,
+      "wait_status": 0
+    },
+    {
+      "argv": [
+        "/workspace/.mqttiumd-tools/venv313/bin/python",
+        "/workspace/outbox-qualification/measured-extraction/extracted/mqttiumd-prepilot-51be4079-acdaf464-x86_64-linux/pilot/forward_client.py",
+        "producer",
+        "--id",
+        "capteur-8",
+        "--db",
+        "/workspace/outbox-qualification/decisive/capteur-8.sqlite",
+        "--pki",
+        "/tmp/mqttiumd-forward-pki-9le04c0e/pki",
+        "--port",
+        "44141",
+        "--schedule",
+        "/workspace/outbox-qualification/decisive/schedule.json"
+      ],
+      "forced": false,
+      "identity": "capteur-8",
+      "pid": 1970968,
+      "signal": "SIGINT",
+      "signalled": true,
+      "wait_status": 0
+    },
+    {
+      "argv": [
+        "/workspace/.mqttiumd-tools/venv313/bin/python",
+        "/workspace/outbox-qualification/measured-extraction/extracted/mqttiumd-prepilot-51be4079-acdaf464-x86_64-linux/pilot/forward_client.py",
+        "dashboard",
+        "--id",
+        "dashboard-2",
+        "--db",
+        "/workspace/outbox-qualification/decisive/dashboard-2.sqlite",
+        "--pki",
+        "/tmp/mqttiumd-forward-pki-9le04c0e/pki",
+        "--port",
+        "44141"
+      ],
+      "forced": false,
+      "identity": "dashboard-2",
+      "pid": 1980925,
+      "signal": "SIGINT",
+      "signalled": true,
+      "wait_status": 0
+    }
+  ],
+  "normal_broker_process": {
+    "argv": [
+      "/workspace/outbox-qualification/measured-extraction/extracted/mqttiumd-prepilot-51be4079-acdaf464-x86_64-linux/mqttiumd",
+      "--listen",
+      "127.0.0.1:0",
+      "--db",
+      "/workspace/outbox-qualification/decisive/broker.sqlite",
+      "--events",
+      "/workspace/outbox-qualification/decisive/broker.jsonl",
+      "--tls-cert",
+      "/tmp/mqttiumd-forward-pki-9le04c0e/pki/server.crt",
+      "--tls-key",
+      "/tmp/mqttiumd-forward-pki-9le04c0e/pki/server.key",
+      "--client-ca",
+      "/tmp/mqttiumd-forward-pki-9le04c0e/pki/ca.crt",
+      "--identities",
+      "/tmp/mqttiumd-forward-pki-9le04c0e/pki/identities.json"
+    ],
+    "pid": 1970954,
+    "requested_signal": "SIGINT",
+    "signalled": true,
+    "wait_status": 0
+  },
+  "outage_snapshot": {
+    "broker_inventory": {
+      "accounts": {
+        "exchange_slots": 0,
+        "payload_bytes": 32512,
+        "receipt_slots": 29,
+        "references": 127
+      },
+      "backlog_by_session": {
+        "2": 127
+      },
+      "broken_references": 0,
+      "counts": {
+        "fences": 0,
+        "inbound": 0,
+        "obligations": 127,
+        "operations": 29,
+        "outbound": 0,
+        "payloads": 127,
+        "publications": 127,
+        "receipt_origins": 1,
+        "retained": 0,
+        "routes": 2,
+        "sessions": 10,
+        "wills": 0
+      },
+      "freelist_count": 3,
+      "invariants_ok": true,
+      "limits": {
+        "exchange_slots": 128,
+        "payload_bytes": 4194304,
+        "receipt_slots": 8192,
+        "references": 128
+      },
+      "measured": {
+        "exchange_slots": 0,
+        "payload_bytes": 32512,
+        "receipt_slots": 29,
+        "references": 127
+      },
+      "page_count": 52,
+      "page_size": 4096,
+      "user_version": 13
+    },
+    "dashboard_unique": [
+      127,
+      0
+    ],
+    "first_sample_with_quota_s": 3.559005471,
+    "sensors": [
+      {
+        "attempts": 2389,
+        "blocked": 0,
+        "budget": 67108864,
+        "confirmed": 17,
+        "enqueued": 11253,
+        "files": {
+          "database": 3309568,
+          "shm": 32768,
+          "wal": 70072
+        },
+        "freelist_count": 0,
+        "head_attempts": 2372,
+        "identity": "capteur-1",
+        "inflight": 0,
+        "last_ack_mono": 254817880930601,
+        "last_ack_ns": 1795025141193812416,
+        "last_reason": 151,
+        "no_match": 0,
+        "occupied_bytes": 3412408,
+        "oldest_age_ms": 1797630.396635,
+        "oldest_ns": 1795025141321725571,
+        "page_count": 808,
+        "pending": 11236,
+        "quota": 2372,
+        "rejected": 0,
+        "retries": 2371,
+        "rows": 11236,
+        "streak": 2372,
+        "stream": "14323f1124134abd999a8dd2e146f98b",
+        "unknown": 0
+      },
+      {
+        "attempts": 2391,
+        "blocked": 0,
+        "budget": 67108864,
+        "confirmed": 16,
+        "enqueued": 11253,
+        "files": {
+          "database": 3309568,
+          "shm": 32768,
+          "wal": 32992
+        },
+        "freelist_count": 0,
+        "head_attempts": 2375,
+        "identity": "capteur-2",
+        "inflight": 0,
+        "last_ack_mono": 254817754093717,
+        "last_ack_ns": 1795025141066975742,
+        "last_reason": 151,
+        "no_match": 0,
+        "occupied_bytes": 3375328,
+        "oldest_age_ms": 1797773.503345,
+        "oldest_ns": 1795025141181680521,
+        "page_count": 808,
+        "pending": 11237,
+        "quota": 2375,
+        "rejected": 0,
+        "retries": 2374,
+        "rows": 11237,
+        "streak": 2375,
+        "stream": "687b6a12527a4190a9b7291bb363effd",
+        "unknown": 0
+      },
+      {
+        "attempts": 2398,
+        "blocked": 0,
+        "budget": 67108864,
+        "confirmed": 16,
+        "enqueued": 11252,
+        "files": {
+          "database": 3309568,
+          "shm": 32768,
+          "wal": 65952
+        },
+        "freelist_count": 0,
+        "head_attempts": 2382,
+        "identity": "capteur-3",
+        "inflight": 0,
+        "last_ack_mono": 254817764282796,
+        "last_ack_ns": 1795025141077164821,
+        "last_reason": 151,
+        "no_match": 0,
+        "occupied_bytes": 3408288,
+        "oldest_age_ms": 1797755.784522,
+        "oldest_ns": 1795025141201855563,
+        "page_count": 808,
+        "pending": 11236,
+        "quota": 2382,
+        "rejected": 0,
+        "retries": 2381,
+        "rows": 11236,
+        "streak": 2382,
+        "stream": "0cb0563b53b0460da8bf6843fa70dcee",
+        "unknown": 0
+      },
+      {
+        "attempts": 2389,
+        "blocked": 0,
+        "budget": 67108864,
+        "confirmed": 16,
+        "enqueued": 11252,
+        "files": {
+          "database": 3309568,
+          "shm": 32768,
+          "wal": 16512
+        },
+        "freelist_count": 0,
+        "head_attempts": 2373,
+        "identity": "capteur-4",
+        "inflight": 0,
+        "last_ack_mono": 254817759169929,
+        "last_ack_ns": 1795025141072051974,
+        "last_reason": 151,
+        "no_match": 0,
+        "occupied_bytes": 3358848,
+        "oldest_age_ms": 1797738.24826,
+        "oldest_ns": 1795025141221777268,
+        "page_count": 808,
+        "pending": 11236,
+        "quota": 2373,
+        "rejected": 0,
+        "retries": 2372,
+        "rows": 11236,
+        "streak": 2373,
+        "stream": "ab7ceaba3c384d45ac362d0b910ffe5d",
+        "unknown": 0
+      },
+      {
+        "attempts": 2404,
+        "blocked": 0,
+        "budget": 67108864,
+        "confirmed": 16,
+        "enqueued": 11252,
+        "files": {
+          "database": 3305472,
+          "shm": 32768,
+          "wal": 131872
+        },
+        "freelist_count": 0,
+        "head_attempts": 2388,
+        "identity": "capteur-5",
+        "inflight": 0,
+        "last_ack_mono": 254817819725339,
+        "last_ack_ns": 1795025141132607144,
+        "last_reason": 151,
+        "no_match": 0,
+        "occupied_bytes": 3470112,
+        "oldest_age_ms": 1797720.637555,
+        "oldest_ns": 1795025141241702430,
+        "page_count": 808,
+        "pending": 11236,
+        "quota": 2388,
+        "rejected": 0,
+        "retries": 2387,
+        "rows": 11236,
+        "streak": 2388,
+        "stream": "fe283facf4124419966d8b0d6ffccb70",
+        "unknown": 0
+      },
+      {
+        "attempts": 2382,
+        "blocked": 0,
+        "budget": 67108864,
+        "confirmed": 16,
+        "enqueued": 11252,
+        "files": {
+          "database": 3284992,
+          "shm": 32768,
+          "wal": 972352
+        },
+        "freelist_count": 0,
+        "head_attempts": 2366,
+        "identity": "capteur-6",
+        "inflight": 0,
+        "last_ack_mono": 254817837172667,
+        "last_ack_ns": 1795025141150054681,
+        "last_reason": 151,
+        "no_match": 0,
+        "occupied_bytes": 4290112,
+        "oldest_age_ms": 1797702.994937,
+        "oldest_ns": 1795025141261765434,
+        "page_count": 808,
+        "pending": 11236,
+        "quota": 2366,
+        "rejected": 0,
+        "retries": 2365,
+        "rows": 11236,
+        "streak": 2366,
+        "stream": "8e01695046b64f7993c0602807d47de9",
+        "unknown": 0
+      },
+      {
+        "attempts": 2404,
+        "blocked": 0,
+        "budget": 67108864,
+        "confirmed": 15,
+        "enqueued": 11252,
+        "files": {
+          "database": 3305472,
+          "shm": 32768,
+          "wal": 131872
+        },
+        "freelist_count": 0,
+        "head_attempts": 2389,
+        "identity": "capteur-7",
+        "inflight": 0,
+        "last_ack_mono": 254817682238936,
+        "last_ack_ns": 1795025140995120921,
+        "last_reason": 151,
+        "no_match": 0,
+        "occupied_bytes": 3470112,
+        "oldest_age_ms": 1797845.152701,
+        "oldest_ns": 1795025141121904009,
+        "page_count": 808,
+        "pending": 11237,
+        "quota": 2389,
+        "rejected": 0,
+        "retries": 2388,
+        "rows": 11237,
+        "streak": 2389,
+        "stream": "1da42003e1d74e969a4e4b08de248ad9",
+        "unknown": 0
+      },
+      {
+        "attempts": 2398,
+        "blocked": 0,
+        "budget": 67108864,
+        "confirmed": 15,
+        "enqueued": 11252,
+        "files": {
+          "database": 3305472,
+          "shm": 32768,
+          "wal": 98912
+        },
+        "freelist_count": 0,
+        "head_attempts": 2383,
+        "identity": "capteur-8",
+        "inflight": 0,
+        "last_ack_mono": 254817684422139,
+        "last_ack_ns": 1795025140997303923,
+        "last_reason": 151,
+        "no_match": 0,
+        "occupied_bytes": 3437152,
+        "oldest_age_ms": 1797827.78729,
+        "oldest_ns": 1795025141141713352,
+        "page_count": 808,
+        "pending": 11237,
+        "quota": 2383,
+        "rejected": 0,
+        "retries": 2382,
+        "rows": 11237,
+        "streak": 2383,
+        "stream": "319788a949854dceaf5a59d78b0be2ae",
+        "unknown": 0
+      }
+    ],
+    "totals": {
+      "attempts": 19155,
+      "confirmed": 127,
+      "enqueued": 90018,
+      "no_match": 0,
+      "pending": 89891,
+      "quota": 19028,
+      "rejected": 0,
+      "retries": 19020,
+      "rows": 89891,
+      "unknown": 0
+    }
+  },
+  "parameters": {
+    "catchup_limit_s": 3600,
+    "dashboard_budget_bytes": 268435456,
+    "outage_events": 90000,
+    "outage_s": 1800,
+    "payload_bytes": 256,
+    "producer_budget_bytes": 67108864,
+    "rate": 50
+  },
+  "previous_sealed_package": {
+    "artifact_id": 14448387514,
+    "source_sha": "c155933ca411d1641a089ef3925bd7c76eac69e7",
+    "tar_sha256": "83f0ab354cfd2d39193e3f8f1c9669a13088977c60a736575232fde54a5c47a5"
+  },
+  "resource_peaks": {
+    "broker": {
+      "cpu_system_s": 159.43,
+      "cpu_user_s": 524.58,
+      "peak_-shm": 32768,
+      "peak_-wal": 4210672,
+      "peak_database": 217088,
+      "rss_kib": 9632,
+      "wchar": 20944884815,
+      "write_bytes": 23488385024
+    },
+    "capteur-1": {
+      "cpu_system_s": 7.46,
+      "cpu_user_s": 24.55,
+      "peak_-shm": 32768,
+      "peak_-wal": 1067112,
+      "peak_database": 3309568,
+      "peak_occupied_bytes": 4397088,
+      "peak_oldest_age_ms": 1797828.765348,
+      "peak_page_count": 808,
+      "peak_pending": 11237,
+      "rss_kib": 28280,
+      "wchar": 405221852,
+      "write_bytes": 622563328
+    },
+    "capteur-2": {
+      "cpu_system_s": 7.63,
+      "cpu_user_s": 24.32,
+      "peak_-shm": 32768,
+      "peak_-wal": 1054752,
+      "peak_database": 3309568,
+      "peak_occupied_bytes": 4397088,
+      "peak_oldest_age_ms": 1797971.832518,
+      "peak_page_count": 808,
+      "peak_pending": 11238,
+      "rss_kib": 28304,
+      "wchar": 398298849,
+      "write_bytes": 613773312
+    },
+    "capteur-3": {
+      "cpu_system_s": 7.65,
+      "cpu_user_s": 24.22,
+      "peak_-shm": 32768,
+      "peak_-wal": 1062992,
+      "peak_database": 3313664,
+      "peak_occupied_bytes": 4405304,
+      "peak_oldest_age_ms": 1798983.081869,
+      "peak_page_count": 809,
+      "peak_pending": 11244,
+      "rss_kib": 28208,
+      "wchar": 397162614,
+      "write_bytes": 612143104
+    },
+    "capteur-4": {
+      "cpu_system_s": 7.67,
+      "cpu_user_s": 23.8,
+      "peak_-shm": 32768,
+      "peak_-wal": 1062992,
+      "peak_database": 3313664,
+      "peak_occupied_bytes": 4409424,
+      "peak_oldest_age_ms": 1800078.704029,
+      "peak_page_count": 809,
+      "peak_pending": 11251,
+      "rss_kib": 28288,
+      "wchar": 402270581,
+      "write_bytes": 618586112
+    },
+    "capteur-5": {
+      "cpu_system_s": 7.4,
+      "cpu_user_s": 24.82,
+      "peak_-shm": 32768,
+      "peak_-wal": 1054752,
+      "peak_database": 3309568,
+      "peak_occupied_bytes": 4397088,
+      "peak_oldest_age_ms": 1797921.752133,
+      "peak_page_count": 808,
+      "peak_pending": 11237,
+      "rss_kib": 28244,
+      "wchar": 404477092,
+      "write_bytes": 622206976
+    },
+    "capteur-6": {
+      "cpu_system_s": 7.13,
+      "cpu_user_s": 25.23,
+      "peak_-shm": 32768,
+      "peak_-wal": 1054752,
+      "peak_database": 3313664,
+      "peak_occupied_bytes": 4397064,
+      "peak_oldest_age_ms": 1797904.454103,
+      "peak_page_count": 809,
+      "peak_pending": 11237,
+      "rss_kib": 27788,
+      "wchar": 406521140,
+      "write_bytes": 624160768
+    },
+    "capteur-7": {
+      "cpu_system_s": 7.67,
+      "cpu_user_s": 24.45,
+      "peak_-shm": 32768,
+      "peak_-wal": 1054752,
+      "peak_database": 3313664,
+      "peak_occupied_bytes": 4413544,
+      "peak_oldest_age_ms": 1798047.153561,
+      "peak_page_count": 809,
+      "peak_pending": 11238,
+      "rss_kib": 27556,
+      "wchar": 406956029,
+      "write_bytes": 624463872
+    },
+    "capteur-8": {
+      "cpu_system_s": 7.64,
+      "cpu_user_s": 24.55,
+      "peak_-shm": 32768,
+      "peak_-wal": 1062992,
+      "peak_database": 3309568,
+      "peak_occupied_bytes": 4397088,
+      "peak_oldest_age_ms": 1798029.859016,
+      "peak_page_count": 808,
+      "peak_pending": 11238,
+      "rss_kib": 28260,
+      "wchar": 407070526,
+      "write_bytes": 624742400
+    },
+    "dashboard-1": {
+      "cpu_system_s": 15.92,
+      "cpu_user_s": 33.4,
+      "peak_-shm": 32768,
+      "peak_-wal": 1075352,
+      "peak_database": 39006208,
+      "peak_occupied_bytes": 39933384,
+      "peak_oldest_age_ms": 0,
+      "peak_page_count": 9525,
+      "peak_pending": 0,
+      "rss_kib": 26500,
+      "wchar": 1925118692,
+      "write_bytes": 2391166976
+    },
+    "dashboard-2": {
+      "cpu_system_s": 15.59,
+      "cpu_user_s": 31.45,
+      "peak_-shm": 32768,
+      "peak_-wal": 1071232,
+      "peak_database": 39006208,
+      "peak_occupied_bytes": 39933384,
+      "peak_oldest_age_ms": 0,
+      "peak_page_count": 9525,
+      "peak_pending": 0,
+      "rss_kib": 27396,
+      "wchar": 1924916958,
+      "write_bytes": 2390454272
+    }
+  },
+  "sample_counts": {
+    "catchup": 431,
+    "drained": 3,
+    "outage": 1769
+  },
+  "sensor_first_sample_with_at_most_one_pending_s_after_resume": {
+    "capteur-1": 443.289019145,
+    "capteur-2": 352.037121151,
+    "capteur-3": 339.122070487,
+    "capteur-4": 403.547268448,
+    "capteur-5": 421.776877835,
+    "capteur-6": 452.93978868,
+    "capteur-7": 463.706868267,
+    "capteur-8": 466.857114254
+  },
+  "short": {
+    "catchup": {
+      "admission_rate": 118.62616336924893,
+      "best_backlogged_60s": null,
+      "counts": {
+        "attempts": 656,
+        "confirmed": 500,
+        "enqueued": 500,
+        "no_match": 0,
+        "pending": 0,
+        "quota": 156,
+        "rejected": 0,
+        "retries": 156,
+        "rows": 0,
+        "unknown": 0
+      },
+      "generation_rate": 0.0,
+      "net_rate": 118.62616336924893,
+      "seconds": 3.14433165
+    },
+    "delivery": {
+      "delay_ms": [
+        {
+          "max": 10195,
+          "p50": 4443,
+          "p95": 8498,
+          "p99": 9421,
+          "samples": 500
+        },
+        {
+          "max": 10806,
+          "p50": 6994,
+          "p95": 10395,
+          "p99": 10722,
+          "samples": 500
+        }
+      ],
+      "outage_events_delay_ms": [
+        {
+          "max": 10195,
+          "p50": 4443,
+          "p95": 8498,
+          "p99": 9421,
+          "samples": 500
+        },
+        {
+          "max": 10806,
+          "p50": 6994,
+          "p95": 10395,
+          "p99": 10722,
+          "samples": 500
+        }
+      ],
+      "verified_identities_by_dashboard": [
+        500,
+        500
+      ]
+    },
+    "drained": {
+      "attempts": 656,
+      "confirmed": 500,
+      "enqueued": 500,
+      "no_match": 0,
+      "pending": 0,
+      "quota": 156,
+      "rejected": 0,
+      "retries": 156,
+      "rows": 0,
+      "unknown": 0
+    },
+    "outage": {
+      "attempts": 238,
+      "confirmed": 127,
+      "enqueued": 500,
+      "no_match": 0,
+      "pending": 373,
+      "quota": 111,
+      "rejected": 0,
+      "retries": 103,
+      "rows": 373,
+      "unknown": 0
+    }
+  },
+  "source_events_offered": 113470
+}

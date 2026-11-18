@@ -22,3 +22,7 @@ Every confirmed correction is local to runtime ordering. MQTT contracts,
 canonical recipes, SQLite schema 12/13 and configured business quotas keep their
 existing representations. Red regressions are committed separately from the
 correction. The source reports and red evidence keep their original SHA.
+
+The [Q9 follow-up](forward-decision.md) receives a separate application
+store-and-forward profile. The original direct-publication pressure observation
+continues to describe the shared broker capacity and its effect on live delivery.
