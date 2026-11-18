@@ -51,6 +51,7 @@ class Child:
     security: Counter = field(default_factory=Counter)
     last_status: str | None = None
     ready_events: set = field(default_factory=set)
+    sqlite_page_limit: int | None = None
 
     def view(self):
         return {"pid": self.process.pid if self.process and self.process.poll() is None else None,
@@ -141,8 +142,12 @@ class Supervisor:
                         actor.ready = {"live_producer_ready", "producer_ready"} <= actor.ready_events
                     else:
                         actor.ready = True
+                elif kind in ("outbox_metrics", "history_metrics"):
+                    actor.sqlite_page_limit = row.get("page_limit")
                 elif kind in ("history_retry", "archive_pressure", "enqueue_refused", "storage_pressure"):
                     actor.last_status = row.get("reason", kind)
+                    if kind == "enqueue_refused" and actor.last_status == "local_disk_budget_or_filesystem_full":
+                        actor.suspended = actor.last_status
             else:
                 message = line.decode("utf-8", "replace")
                 for check in FATAL_LINES:

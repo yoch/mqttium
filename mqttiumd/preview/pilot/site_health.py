@@ -38,13 +38,13 @@ def alert(cause, severity, action, **more):
     return {"cause": cause, "severity": severity, "action": action, **more}
 
 
-def capacity(cause, usage, limit, action):
+def capacity(cause, usage, limit, action, **details):
     if limit <= 0:
         return None
     percent = 100 * usage / limit
     for threshold, severity in ((95, "critical"), (85, "warning"), (70, "notice")):
         if percent >= threshold:
-            return alert(cause, severity, action, percent=round(percent, 3), threshold=threshold)
+            return alert(cause, severity, action, percent=round(percent, 3), threshold=threshold, **details)
     return None
 
 
@@ -242,8 +242,13 @@ class Health:
             site.assert_store(role)
             state = snapshot(site.db(role))
             readings[role] = state
+            limit = actors[role].sqlite_page_limit
+            state["sqlite_page_limit"] = limit
+            if limit is not None:
+                alerts.append(capacity("outbox_page_capacity", state["page_count"] - state["freelist_count"], limit,
+                                       "Slow generation and restore HISTORY drain capacity.", role=role))
             alerts.append(capacity("outbox_capacity", state["occupied_bytes"], state["budget"],
-                                   "Slow the producer and restore HISTORY drain capacity."))
+                                   "Slow the producer and restore HISTORY drain capacity.", role=role))
             self.progress(role, state["enqueued"], active_generation and actors[role].ready, now, alerts)
         backlog = broker.get("history", {}).get("counts", {}).get("obligations")
         for role in CONSUMERS:
@@ -263,10 +268,15 @@ class Health:
             state["cold_committed_file_count"] = state["segment_count"] * 2
             state["cold_committed_directory_count"] = state["segment_count"]
             history[role] = state
+            limit = actors[role].sqlite_page_limit
+            state["sqlite_page_limit"] = limit
+            if limit is not None:
+                alerts.append(capacity("history_page_capacity", state["page_count"] - state["freelist_count"], limit,
+                                       "Check archive publication and stop generation before the warm limit.", role=role))
             alerts.append(capacity("archive_capacity", state["archive_charge"], state["archive_budget"],
-                                   "Export a verified backup and stop before the cold budget is exhausted."))
+                                   "Export a verified backup and stop before the cold budget is exhausted.", role=role))
             alerts.append(capacity("segment_capacity", state["segment_count"], state["segment_limit"],
-                                   "Plan controlled retention before registering another segment."))
+                                   "Plan controlled retention before registering another segment.", role=role))
             self.progress(role, state["unique_count"], bool(backlog) and actors[role].ready, now, alerts)
             confirmed = sum(row["confirmed"] for row in readings.values())
             # Readers take independent snapshots. Require consecutive empty-backlog
