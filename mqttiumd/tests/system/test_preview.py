@@ -41,6 +41,8 @@ class PreviewCommandTests(unittest.TestCase):
             (root/"tests/system").mkdir(parents=True)
             (root/"tests/system/policy_transition_reception.py").write_text("from normal_helper import recovery\n")
             (root/"tests/system/normal_helper.py").write_text("recovery = True\n")
+            (root/"contracts/v1").mkdir(parents=True)
+            (root/"contracts/v1/product-profile.json").write_text('{"receipt_slots":8192}\n')
             for name in ("LICENSE","NOTICE"):
                 (root.parent/name).write_text("license fixture")
             product=root/"crates"/"mqttiumd"
@@ -69,7 +71,8 @@ class PreviewCommandTests(unittest.TestCase):
                     self.assertTrue(any(member.endswith("/" + name) for member in names), name)
                 for name in ("PILOT.md", "run-qualification.sh", "pilot/load.py",
                              "tests/system/policy_transition_reception.py", "tests/system/normal_helper.py",
-                             "preview/demo-pki.py", "preview/policy-demo.py", "qualification/decision.md"):
+                             "preview/demo-pki.py", "preview/policy-demo.py", "qualification/decision.md",
+                             "contracts/v1/product-profile.json"):
                     self.assertTrue(any(member.endswith("/"+name) for member in names),
                                     "packaged_pilot_dependency_missing: "+name)
                 info=next(item for item in packed.getmembers() if item.name.endswith("/BUILD.json"))
