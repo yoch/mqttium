@@ -194,6 +194,7 @@
     "contracts/examples/v1/valid/product-hook-work-read-before.json",
     "contracts/examples/v1/valid/product-will-detached-infinite-diagnostic.json",
     "contracts/examples/v1/valid/product-will-detached-finite-diagnostic.json",
+    "contracts/examples/v1/valid/product-mtls-profile.json",
     "contracts/examples/v1/valid/product-secure-authorization-refused.json",
     "contracts/examples/v1/valid/product-hook-tls-frame-sealed.json",
     "contracts/examples/v1/valid/product-hook-tls-frame-first_bytes.json"
