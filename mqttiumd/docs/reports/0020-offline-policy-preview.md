@@ -38,6 +38,14 @@ four compiled faults, including a fingerprint committed ahead of owner
 insertion and a write to a retained record. Ordinary TLS reception and the
 durable MQTT campaign suites keep their individual scopes.
 
+The first CI run also exposed a conflict between the historical mixed-QoS
+capacity fixture and the live writer during receipt maintenance. An
+offline override would violate the startup profile. The control now fills
+127 of the 128 reference slots with real MQTT obligations for an offline
+destination, then drains them through acknowledgements on the same file.
+The mixed-QoS fanout is refused atomically under pressure and delivered
+after the acknowledgements release capacity. The quota stays unchanged.
+
 Download the normal archive and the `mqttiumd-policy-transition-<SHA>`
 receipt from the exact [mqttiumd CI run](https://github.com/yoch/mqttium/actions/workflows/mqttiumd.yml).
 The archive includes [the operator guide](../../preview/POLICY.md), both

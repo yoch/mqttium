@@ -454,23 +454,25 @@ def mixed_fanout(binary: Path, case: Path) -> dict:
         broker.cleanup()
 
 
-def capacity_fixture_limit(db_path: Path, limit: bytes) -> bytes:
-    try:
-        writer_available(db_path)
-    except BlockingIOError:
-        raise ReceiptFailure("capacity_fixture_writer_active") from None
-    with sqlite3.connect(db_path, timeout=.25) as db:
-        original = db.execute("SELECT limit_references FROM meta").fetchone()[0]
-        db.execute("UPDATE meta SET limit_references=?", (limit,))
-        return original
-
-
 def atomic_capacity(binary: Path, case: Path) -> dict:
     broker = Broker(binary, case)
-    original = None
     topic = "reception/qos0/capacity"
+    held_topic = "reception/qos0/capacity-held"
     try:
         broker.ready()
+        with PubsubWire(broker.address, broker.observations, "capacity-fill-destination") as held:
+            held.connect("capacity-held", session_present=False)
+            held.subscribe(1, [(held_topic, 1)])
+            generation = [e["connection"] for e in broker.events() if e["kind"] == "connection_opened"][-1]
+        until(lambda: any(e["kind"] == "connection_closed" and e.get("connection") == generation
+                          for e in broker.events()), "capacity_destination_not_offline")
+        # Use real MQTT obligations to leave one reference free. The
+        # published profile and the SQLite writer retain their authority.
+        filler = {f"held:{i}".encode() for i in range(1, 128)}
+        with PubsubWire(broker.address, broker.observations, "capacity-fill-source") as source:
+            source.connect("capacity-source", session_present=False)
+            for number in range(1, 128):
+                source.exchange(number, f"held:{number}".encode(), topic=held_topic, qos=1)
         with PubsubWire(broker.address, broker.observations, "capacity-zero") as zero, \
                 PubsubWire(broker.address, broker.observations, "capacity-one") as one:
             zero.connect("capacity-zero", session_present=False)
@@ -478,32 +480,40 @@ def atomic_capacity(binary: Path, case: Path) -> dict:
             zero.subscribe(1, [(topic, 0)], expected=(0,))
             one.subscribe(1, [(topic, 1)])
             before = durable(broker.db)
-            original = capacity_fixture_limit(broker.db, (1).to_bytes(8, "big"))
+            meta = before["tables"]["meta"][0]
+            require(int(meta["limit_references"], 16) == 128 and len(obligations(before)) == 127
+                    and not before["tables"]["outbound"], "capacity_reference_pressure_missing")
             rejected = publish(broker, case, "capacity-rejected", "mqttium", topic, b"no-partial-fanout", 1, "rejected")
             require(any(e["kind"] == "publication_rejected" and e.get("reason_code") == 0x97
                         for e in rejected["result"]["events"]), "mixed_capacity_wrong_refusal")
             after = durable(broker.db)
-            require(not after["admissions"] and not obligations(after), "mixed_capacity_partial_admission")
             for name in ("obligations", "payloads", "publications", "routes", "outbound"):
                 require(after["tables"][name] == before["tables"][name], "mixed_capacity_partial_admission", name)
             zero.no_publication(.15, code="mixed_capacity_early_qos0")
             one.no_publication(.15, code="mixed_capacity_early_qos1")
-            capacity_fixture_limit(broker.db, original)
-            original = None
+            with PubsubWire(broker.address, broker.observations, "capacity-drain") as held:
+                held.connect("capacity-held", session_present=True)
+                for _ in range(127):
+                    message = held.next_publication()
+                    require(message.topic == held_topic and message.qos == 1
+                            and message.payload in filler, "capacity_wrong_held_delivery")
+                    filler.remove(message.payload)
+                    held.acknowledge(message)
+                require(not filler, "capacity_held_deliveries_missing")
+                drained(broker, case)
             accepted = publish(broker, case, "capacity-accepted", "paho", topic, b"capacity-restored", 2)
             zm, om = zero.next_publication(), one.next_publication()
             message_is(zm, topic, b"capacity-restored", 0)
             message_is(om, topic, b"capacity-restored", 1)
             one.acknowledge(om)
-        drained(broker, case, admissions=1)
+            drained(broker, case)
+            zero.no_publication(.15, code="mixed_capacity_duplicate_qos0")
+            one.no_publication(.15, code="mixed_capacity_duplicate_qos1")
         broker.stop()
         return {"criterion": "F-capacity", "status": "PASS", "clients": [rejected, accepted],
-                "intervention": "isolated post-readiness reference limit lowered to one, then restored",
+                "reference_limit": 128, "held_and_drained_obligations": 127,
                 "refusal_atomic_across_both_qos": True}
     finally:
-        if original is not None and broker.process.poll() is None:
-            with sqlite3.connect(broker.db, timeout=.25) as db:
-                db.execute("UPDATE meta SET limit_references=?", (original,))
         broker.cleanup()
 
 
