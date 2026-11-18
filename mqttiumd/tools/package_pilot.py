@@ -83,6 +83,19 @@ def package(args):
             }
             metadata["baseline_decision"] = metadata["decision"]
             metadata["decision"] = metadata["forward_application"]["decision"]
+        split = sealed / "qualification/split-results.json"
+        if split.is_file():
+            observed = json.loads(split.read_text())
+            files = observed["application_files"]
+            if (observed["binary_sha256"] != args.binary_sha256
+                    or any(digest(sealed / "pilot" / name) != expected for name, expected in files.items())):
+                raise ValueError("split_evidence_component_mismatch")
+            metadata["split_application"] = {
+                "measured_source_sha": observed["application_source_sha"], "component_sha256": files,
+                "decision": "qualification/split-decision.md", "results": "qualification/split-results.json",
+            }
+            metadata["forward_decision"] = metadata.get("decision")
+            metadata["decision"] = metadata["split_application"]["decision"]
         (sealed / "PACKAGE.json").write_text(json.dumps(metadata, indent=2) + "\n")
         sums = [f"{digest(f)}  {f.relative_to(sealed)}" for f in sorted(sealed.rglob("*"))
                 if f.is_file() and f.name != "SHA256SUMS"]
