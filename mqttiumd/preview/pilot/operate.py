@@ -44,6 +44,9 @@ def schedule(site, additional, rate, *, start_ns=None):
     require(1 <= additional <= 14_000_000 and 1 <= rate <= 50, "demo_schedule_budget_invalid")
     with locked(site.runtime / "operator.lock"):
         path = site.runtime / "schedule.json"
+        health = site.status()
+        require(health["phase"] == "running" and all(health["actors"][r]["ready"] for r in PRODUCERS),
+                "generation_requires_running_sources")
         require(not path.exists(), "site_already_has_source_schedule")
         counts = [snapshot(site.db(role))["enqueued"] for role in PRODUCERS]
         boundary = max((count - 1) * len(PRODUCERS) + i + 1 for i, count in enumerate(counts) if count) if any(counts) else 0

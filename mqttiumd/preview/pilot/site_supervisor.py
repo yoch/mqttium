@@ -282,6 +282,13 @@ class Supervisor:
                 if not actor.suspended:
                     actor.suspended = reason
                     self.stop_roles((role,))
+        failed_history = [role for role in ("broker-history", *CONSUMERS) if self.actors[role].suspended]
+        if failed_history:
+            for role in PRODUCERS:
+                actor = self.actors[role]
+                if not actor.suspended:
+                    actor.suspended = "history_authority_fault:" + ",".join(failed_history)
+            self.stop_roles(PRODUCERS)
         self.metrics["suspended_services"] = [
             alert(child.suspended, "critical", "Leave the role stopped and reconcile the original store.", role=role)
             for role, child in self.actors.items() if child.suspended
@@ -313,8 +320,8 @@ class Supervisor:
             self.last_command = {"token": request["token"], "status": "accepted"}
         except (ValueError, OSError) as error:
             self.last_command = {"token": request["token"], "status": "refused", "reason": str(error)}
-        self.publish_status()
         path.unlink()
+        self.publish_status()
 
     def await_group(self, roles):
         for role in roles:
