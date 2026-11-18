@@ -138,6 +138,25 @@ class ForwardChecks(unittest.TestCase):
             self.assertEqual(store.head()[0], original)
             self.assertEqual(store.enqueue(b"next").sequence, 2)
 
+    def test_immediate_puback_callback_is_correlated_and_keeps_reason(self):
+        class ImmediateClient:
+            def max_inflight_messages_set(self, _):
+                pass
+
+            def max_queued_messages_set(self, _):
+                pass
+
+            def publish(self, _topic, _payload, *, qos, retain):
+                self.on_publish(self, None, 17, types.SimpleNamespace(value=QUOTA), None)
+                return types.SimpleNamespace(rc=0, mid=17)
+
+        event = Event.encode("capteur-1", b"s" * 16, 1, 12, b"callback order")
+        args = types.SimpleNamespace(identity="capteur-1", pki=self.directory)
+        with patch.object(forward_client, "mqtt_client", return_value=(ImmediateClient(), None, 10)):
+            wire = forward_client.Wire(args, 0)
+        self.assertEqual(wire.send(event, None), QUOTA)
+        self.assertIsNone(wire.reply)
+
     def test_real_sender_waits_between_quota_retries(self):
         stop = threading.Event()
         timestamps = []
