@@ -129,7 +129,10 @@ qualification report. Plan scheduled export and surveillance early, and
 stop admitting new measurements before any storage budget is exhausted.
 Keep all accepted records until operator retention is satisfied. The reference
 export does not reclaim cold files on the serving ledger. A deployment that
-requires indefinite admission needs an archive retention and handoff policy.
+requires indefinite admission needs an archive retention and handoff policy. The
+split fixture starts each stream at sequence 1. Existing Q9 dashboard ledgers
+use the old format and must be kept separately. This package does not convert
+them or seed a prefix from unverified history.
 
 On archive pressure the receiver keeps committed hot rows. When the warm
 budget can no longer admit a new event, it closes without ACK and retries;

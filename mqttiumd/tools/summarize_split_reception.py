@@ -70,6 +70,26 @@ def trace(path, end_state, start=None, end=None, saturation=None):
     return seen, gaps, gap_ns, times
 
 
+def recovery_freshness(path, boundary):
+    delays = []
+    previous = None
+    spacing_ns = 0
+    for row in records(path):
+        if row["kind"] != "live_received" or row["monotonic_ns"] < boundary:
+            continue
+        arrival = row["monotonic_ns"]
+        if previous is not None:
+            spacing_ns = max(spacing_ns, arrival - previous)
+        previous = arrival
+        delays.append(row["received_ns"] - row["created_ns"])
+    require(delays and min(delays) >= 0, "live_recovery_time_sample_unavailable")
+    delays.sort()
+    ranks = {"p50_ms": .50, "p95_ms": .95, "p99_ms": .99, "max_ms": 1.0}
+    return {"samples": len(delays), "largest_interarrival_ms": spacing_ns / 1e6, **{
+        label: delays[math.ceil(rank * len(delays)) - 1] / 1e6 for label, rank in ranks.items()
+    }}
+
+
 def evidence(args):
     out = args.qualification
     paths = {
@@ -136,6 +156,8 @@ def evidence(args):
                  "history_returned_mono": run["dashboard_return"]["monotonic_ns"],
                  "counts_at_outage_end": run["outage"]["total"], "final": state["total"],
                  "catchup": run["catchup"], "live": run["live_delivery"], "history": historical,
+                 "live_after_outage": recovery_freshness(trace_path, schedule["outage_boundary_ns"]),
+                 "sqlite": run["history_broker_events"]["runtime"]["sqlite_configuration"],
                  "history_commit_counts": {k: v for k, v in run["history_broker_events"]["counts"].items()
                                            if k in ("Admission_committed", "Finish_committed")},
                  "broker_resource_peaks": {"live": live_peaks, "history": history_peaks},
