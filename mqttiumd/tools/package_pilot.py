@@ -15,6 +15,7 @@ from build_preview import copy_pilot_files
 
 
 FORWARD_COMPONENTS = ("forward_store.py", "forward_client.py", "forward_reception.py", "common.py", "load.py")
+SPLIT_COMPONENTS = (*FORWARD_COMPONENTS, "split_reception.py", "split_client.py", "segment_store.py")
 
 
 def digest(path):
@@ -86,9 +87,8 @@ def package(args):
         split = sealed / "qualification/split-results.json"
         if split.is_file():
             observed = json.loads(split.read_text())
-            files = observed["application_files"]
-            if (observed["binary_sha256"] != args.binary_sha256
-                    or any(digest(sealed / "pilot" / name) != expected for name, expected in files.items())):
+            files = {name: digest(sealed / "pilot" / name) for name in SPLIT_COMPONENTS}
+            if observed["binary_sha256"] != args.binary_sha256 or files != observed["application_files"]:
                 raise ValueError("split_evidence_component_mismatch")
             metadata["split_application"] = {
                 "measured_source_sha": observed["application_source_sha"], "component_sha256": files,
