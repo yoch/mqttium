@@ -29,9 +29,10 @@ checking MQTT-3.1.2-4 and 3.1.2-24. Its original assessment is preserved and the
 findings register records the correction.
 
 No public MQTT contract, canonical recipe or SQLite representation changed.
-Contract hash remainedbf 9bbc 0a9d74a4a5b72330f60038b2f51189eca 58b5784c6c40a54bfe 7e22d1a.
+Contract hash remained
+`bf9bbc0a9d74a4a5b72330f60038b2f51189eca58b5784c6c40a54bfe7e22d1a`.
 Local formatting, Clippy, both Rust configurations, 269 oracle tests, 646 schema
-agreements and 188 system-driver tests passed. The candidate's36 CI checks also
+agreements and 188 system-driver tests passed. The candidate's 36 CI checks also
 passed. Its separate qualifying K1/K2b/K3 gates retain their historical scope.
 The new runtime tests and system workloads have the stated implementation scope.
 
