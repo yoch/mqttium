@@ -7,7 +7,7 @@
   "details": {
     "version": "TLS1.3",
     "client_certificate": "required",
-    "policy_sha256": "abababababababababababababababababababababababababababababababab",
+    "policy_fingerprint": "abababababababababababababababababababababababababababababababab",
     "max_handshakes": 8,
     "handshake_ms": 2000,
     "handshake_bytes": 65536,

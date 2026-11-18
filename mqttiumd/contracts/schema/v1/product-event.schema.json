@@ -1269,7 +1269,7 @@
             "required": [
               "version",
               "client_certificate",
-              "policy_sha256",
+              "policy_fingerprint",
               "max_handshakes",
               "handshake_ms",
               "handshake_bytes",
@@ -1287,7 +1287,7 @@
               "client_certificate": {
                 "const": "required"
               },
-              "policy_sha256": {
+              "policy_fingerprint": {
                 "type": "string",
                 "pattern": "^[0-9a-f]{64}$"
               },

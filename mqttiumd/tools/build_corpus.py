@@ -4041,7 +4041,7 @@ bad("product-will-detached-infinite-has-deadline.json", "schema-violation", "/de
 secure_denial = env("mqttiumd.product-event", seq="1", pid=1, kind="authorization_refused",
                    connection="1", details={"stage":"subscribe","reason":135})
 ok("product-mtls-profile.json", env("mqttiumd.product-event", seq="2", pid=1, kind="tls_profile", details={
-    "version":"TLS1.3","client_certificate":"required","policy_sha256":"ab" * 32,"max_handshakes":8,
+    "version":"TLS1.3","client_certificate":"required","policy_fingerprint":"ab" * 32,"max_handshakes":8,
     "handshake_ms":2000,"handshake_bytes":65536,"certificate_bytes":8192,"chain_bytes":32768,
     "chain_certificates":4,"tls_buffer_bytes":98304,"resumption":False,"early_data":False}))
 ok("product-secure-authorization-refused.json", secure_denial)
