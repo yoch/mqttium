@@ -328,7 +328,7 @@ fn until(runtime: &mut Runtime<'_>, condition: impl Fn(&Runtime<'_>) -> bool) {
     );
 }
 
-fn read_frame(client: &mut TcpStream) -> (u8, Vec<u8>) {
+fn read_frame(client: &mut impl Read) -> (u8, Vec<u8>) {
     let mut byte = [0];
     client.read_exact(&mut byte).unwrap();
     let first = byte[0];
@@ -4680,6 +4680,159 @@ fn overlapping_same_client_will_connects_leave_the_replacement_connected() {
         assert!(
             runtime.peers.get(&replacement).is_some_and(|p| p.connected),
             "replacement transport lost"
+        );
+    });
+}
+
+/// Use the production TLS task with locally generated, verified demo credentials.
+fn tls_test_peer(
+    runtime: &mut Runtime<'_>,
+    directory: &Path,
+) -> (
+    ConnectionGeneration,
+    rustls::StreamOwned<rustls::ClientConnection, TcpStream>,
+) {
+    let pki = directory.join("pki");
+    let status = std::process::Command::new("python3")
+        .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../preview/demo-pki.py"))
+        .arg(&pki)
+        .output()
+        .expect("local demo credential generator");
+    assert!(
+        status.status.success(),
+        "local TLS fixture generation failed"
+    );
+    let security = Security::load(&TlsFiles {
+        cert: pki.join("server.crt"),
+        key: pki.join("server.key"),
+        client_ca: pki.join("ca.crt"),
+        identities: pki.join("identities.json"),
+    })
+    .unwrap();
+    let certs = |name: &str| {
+        rustls_pemfile::certs(&mut std::io::Cursor::new(
+            std::fs::read(pki.join(name)).unwrap(),
+        ))
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap()
+    };
+    let mut roots = rustls::RootCertStore::empty();
+    for certificate in certs("ca.crt") {
+        roots.add(certificate).unwrap();
+    }
+    let key = rustls_pemfile::private_key(&mut std::io::Cursor::new(
+        std::fs::read(pki.join("sensor.key")).unwrap(),
+    ))
+    .unwrap()
+    .unwrap();
+    let config = rustls::ClientConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
+        .with_root_certificates(roots)
+        .with_client_auth_cert(certs("sensor.crt"), key)
+        .unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let socket = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+    socket
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    let (server, _) = listener.accept().unwrap();
+    let io = net::spawn_tls(
+        server,
+        security.tls,
+        security.policy,
+        runtime.clock.clone(),
+        #[cfg(feature = "test-hooks")]
+        (runtime.hooks.clone(), runtime.events.clone()),
+    )
+    .unwrap();
+    let (generation, previous_client) = peer(runtime);
+    drop(previous_client);
+    let previous = std::mem::replace(&mut runtime.peers.get_mut(&generation).unwrap().io, io);
+    previous.close();
+    runtime.retiring.push(previous);
+    let client =
+        rustls::ClientConnection::new(Arc::new(config), "127.0.0.1".try_into().unwrap()).unwrap();
+    let mut client = rustls::StreamOwned::new(client, socket);
+    while client.conn.is_handshaking() {
+        client.conn.complete_io(&mut client.sock).unwrap();
+    }
+    (generation, client)
+}
+
+#[test]
+fn tls_terminal_writer_cannot_discard_an_already_decoded_normal_disconnect() {
+    with_runtime(128, |runtime, directory| {
+        let (generation, mut client) = tls_test_peer(runtime, directory);
+        runtime
+            .connect(
+                generation,
+                will_connect(b"tls-ordered-normal", SessionExpiry::Never),
+            )
+            .unwrap();
+        until(runtime, |r| {
+            r.session_requests.is_empty() && r.frames.is_empty()
+        });
+        assert_eq!(read_frame(&mut client).0, 0x20);
+        client.write_all(&[0xc0, 0].repeat(5)).unwrap();
+        client.write_all(&[0xe0, 0]).unwrap();
+        client.flush().unwrap();
+        // Retain the exact six facts decoded by the real TLS task. No fact or
+        // writer result is manufactured. Requeue through a bounded lane so the
+        // reactor's four-input turn leaves the normal DISCONNECT for next turn.
+        let mut facts = Vec::new();
+        for _ in 0..6 {
+            facts.push(
+                runtime.peers[&generation]
+                    .io
+                    .incoming
+                    .recv_timeout(Duration::from_secs(2))
+                    .unwrap(),
+            );
+        }
+        assert!(matches!(
+            facts.last(),
+            Some(net::Incoming::Packet { first: 0xe0, .. })
+        ));
+        client.sock.shutdown(std::net::Shutdown::Both).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !runtime.peers[&generation].io.is_finished() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(
+            runtime.peers[&generation].io.is_finished(),
+            "real TLS task did not terminate"
+        );
+        let (sender, lane) = std::sync::mpsc::sync_channel(net::INPUT_SLOTS);
+        let tail = facts.split_off(net::INPUT_SLOTS);
+        for fact in facts {
+            sender.send(fact).unwrap();
+        }
+        runtime.peers.get_mut(&generation).unwrap().io.incoming = lane;
+        let forwarding = thread::spawn(move || {
+            for fact in tail {
+                if sender.send(fact).is_err() {
+                    break;
+                }
+            }
+        });
+        until(runtime, |r| {
+            !r.peers.contains_key(&generation)
+                && r.closing_inputs.is_empty()
+                && !r.owner.session_status().lifecycle_pending
+                && r.lifecycle_inflight.is_empty()
+        });
+        forwarding.join().unwrap();
+        let state =
+            mqttiumd_store_sqlite::SqliteStore::inspect(&directory.join("store.sqlite")).unwrap();
+        assert!(
+            state.wills.is_empty(),
+            "a received normal DISCONNECT must cancel the exact durable Will even when the TLS writer has already terminated"
+        );
+        assert!(
+            state.operations.values().all(|row| !matches!(
+                row.decision,
+                mqttiumd_store_api::Decision::Committed(CommitFacts::WillPublished { .. })
+            )),
+            "normal TLS disconnect admitted an unauthorized Will occurrence"
         );
     });
 }
