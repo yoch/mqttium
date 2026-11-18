@@ -1239,9 +1239,37 @@
                 "minimum": 0,
                 "maximum": 16
               },
+              "retained": {
+                "type": "boolean"
+              },
               "authority": {
                 "const": "durable_admission_commit"
               }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": [
+          "kind"
+        ],
+        "properties": {
+          "kind": {
+            "const": "will_connect_deferred"
+          }
+        }
+      },
+      "then": {
+        "required": ["connection", "details"],
+        "properties": {
+          "details": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["authority"],
+            "properties": {
+              "authority": {"const": "durable_will_barrier"}
             }
           }
         }

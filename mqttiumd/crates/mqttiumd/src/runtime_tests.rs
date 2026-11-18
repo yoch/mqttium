@@ -4296,6 +4296,7 @@ fn will_connect(name: &[u8], expiry: SessionExpiry) -> codec::Connect {
     let mut connect = connect_packet(name);
     connect.expiry = expiry;
     connect.will = Some(mqttiumd_contract::will::WillSpec {
+        retain: false,
         topic: SharedBytes::copy_from(b"atelier/sensor/status", 1024).unwrap(),
         payload: SharedBytes::copy_from(b"offline-private", 32768).unwrap(),
     });

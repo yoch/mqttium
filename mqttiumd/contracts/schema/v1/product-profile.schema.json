@@ -309,7 +309,7 @@
       "const": 4
     },
     "sqlite_schema_version": {
-      "const": 10
+      "const": 12
     },
     "wildcard_subscriptions": {
       "const": true
@@ -375,7 +375,7 @@
       ]
     },
     "will_retain": {
-      "const": false
+      "const": true
     },
     "will_delay_interval": {
       "const": [

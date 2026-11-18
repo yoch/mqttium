@@ -255,7 +255,11 @@ impl SessionLifecycle {
                 now,
                 will,
             } => {
-                out.push(5);
+                out.push(if will.as_ref().is_some_and(|spec| spec.retain) {
+                    7
+                } else {
+                    5
+                });
                 out.push(u8::from(*clean_start));
                 encode_expiry(out, *expiry);
                 out.push(u8::from(expected.is_some()));
@@ -360,7 +364,7 @@ impl SessionLifecycle {
     pub(crate) fn decode(bytes: &mut &[u8]) -> Result<Self, RecipeError> {
         let operation = read_operation(bytes)?;
         let action = match read_byte(bytes)? {
-            5 => {
+            tag @ (5 | 7) => {
                 let clean_start = read_bool(bytes)?;
                 let expiry = read_expiry(bytes)?;
                 let expected = if read_bool(bytes)? {
@@ -378,9 +382,11 @@ impl SessionLifecycle {
                 let now = read_u64(bytes)?;
                 let will = if read_bool(bytes)? {
                     let mut reader = crate::command::Reader { bytes };
-                    let value = crate::will::WillSpec::decode(&mut reader)?;
+                    let value = crate::will::WillSpec::decode(&mut reader, tag == 7)?;
                     *bytes = reader.bytes;
                     Some(value)
+                } else if tag == 7 {
+                    return Err(RecipeError::InvalidField("retained_will_required"));
                 } else {
                     None
                 };

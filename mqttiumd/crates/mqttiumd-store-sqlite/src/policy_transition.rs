@@ -146,7 +146,7 @@ fn check_schema(conn: &Connection) -> Result<(), PolicyMaintenanceError> {
     Ok(())
 }
 
-// Fixed queries for schema 11. Include the semantic schema and owner rows that
+// Fixed queries for the secure schema. Include the semantic schema and owner rows that
 // must stay fixed. Exclude only the two authority tables that can change. Do
 // not depend on page layout, checkpoints, query planner or row insertion order.
 const BUSINESS_ROWS: [(&str, &str); 16] = [
@@ -189,7 +189,7 @@ const BUSINESS_ROWS: [(&str, &str); 16] = [
 fn business_sha256(conn: &Connection) -> Result<[u8; 32], PolicyMaintenanceError> {
     let mut meter = reader::Meter::new(ReadBudget::SNAPSHOT);
     let mut hash = Sha256::new();
-    hash.update(b"mqttiumd/policy-business-state/schema11/v1\0");
+    hash.update(b"mqttiumd/policy-business-state/schema13/v1\0");
     for (name, sql) in BUSINESS_ROWS {
         hash.update(name.as_bytes());
         hash.update([0]);

@@ -169,7 +169,7 @@ class MessageExpiryFormatsAndScope(unittest.TestCase):
     def test_profile_is_explicit_and_does_not_increase_durable_quotas(self):
         profile = json.loads((ROOT / "contracts/v1/product-profile.json").read_text())
         self.assertEqual(self.contracts.check_value(profile), [])
-        expected = {"id": "tcp-will-pubsub-v1", "sqlite_schema_version": 10,
+        expected = {"id": "tcp-will-pubsub-v1", "sqlite_schema_version": 12,
             "message_expiry": True, "message_expiry_interval": {"minimum": 0, "maximum": 0xFFFF_FFFF},
             "message_expiry_batch": 4, "message_expiry_scan_ms": 100,
             "message_expiry_policy": "quarantine-on-unknown-origin", "message_expiry_time_unit": "nanoseconds",

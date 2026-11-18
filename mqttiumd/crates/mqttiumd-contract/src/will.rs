@@ -13,15 +13,17 @@ pub const MAX_WILL_PAYLOAD_BYTES: usize = 32_768;
 pub const MAX_WILL_INTENTS: usize = 256;
 pub const MAX_WILL_BYTES: u64 = 8 * 1024 * 1024;
 
-/// The supported profile has QoS1, RETAIN=0, delay=0 and no other properties.
+/// The supported profile has QoS1, delay=0 and no other properties.
 #[derive(Clone, PartialEq, Eq)]
 pub struct WillSpec {
+    pub retain: bool,
     pub topic: SharedBytes,
     pub payload: SharedBytes,
 }
 impl fmt::Debug for WillSpec {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("WillSpec")
+            .field("retain", &self.retain)
             .field("topic_bytes", &self.topic.len())
             .field("payload_bytes", &self.payload.len())
             .finish()
@@ -51,7 +53,7 @@ impl WillSpec {
         out.extend_from_slice(&(self.payload.len() as u32).to_be_bytes());
         out.extend_from_slice(self.payload.as_slice());
     }
-    pub(crate) fn decode(r: &mut Reader<'_>) -> Result<Self, RecipeError> {
+    pub(crate) fn decode(r: &mut Reader<'_>, retain: bool) -> Result<Self, RecipeError> {
         let n = usize::from(r.u16()?);
         if n > MAX_WILL_TOPIC_BYTES {
             return Err(RecipeError::InvalidField("will_topic"));
@@ -64,7 +66,11 @@ impl WillSpec {
         }
         let payload = SharedBytes::copy_from(r.take(n)?, MAX_WILL_PAYLOAD_BYTES)
             .map_err(|_| RecipeError::AllocationFailed)?;
-        let value = Self { topic, payload };
+        let value = Self {
+            retain,
+            topic,
+            payload,
+        };
         value.check()?;
         Ok(value)
     }
@@ -84,7 +90,8 @@ pub struct WillIntent {
     pub state: WillState,
 }
 
-/// Kind17: conditional consumption of one Pending intent and normal admission.
+/// Kind17 (nonretained) or kind18 (retained): conditional consumption of one
+/// Pending intent and atomic publication admission.
 /// No MQTT inbound Packet Identifier or fabricated exchange is required.
 #[derive(PartialEq, Eq, Debug)]
 pub struct WillPublication {
@@ -96,6 +103,8 @@ pub struct WillPublication {
     pub payload: PayloadRef,
     pub costs: Costs,
     pub targets: BoundedVec<Target>,
+    /// Present for a retained Will. Bit i preserves RETAIN on live target i.
+    pub live_retain: Option<u16>,
 }
 impl WillPublication {
     pub(crate) fn check(&self) -> Result<(), RecipeError> {
@@ -113,6 +122,12 @@ impl WillPublication {
         }
         if self.targets.len() > 16 {
             return Err(RecipeError::InvalidField("will_targets"));
+        }
+        if self
+            .live_retain
+            .is_some_and(|mask| u32::from(mask) >> self.targets.len() != 0)
+        {
+            return Err(RecipeError::InvalidField("will_live_retain"));
         }
         let mut last = None;
         for (index, target) in self.targets.as_slice().iter().enumerate() {
@@ -132,7 +147,7 @@ impl WillPublication {
         Ok(())
     }
     pub(crate) fn encode(&self, out: &mut Vec<u8>) {
-        out.push(17);
+        out.push(if self.live_retain.is_some() { 18 } else { 17 });
         out.extend_from_slice(&self.operation.to_be_bytes());
         out.extend_from_slice(&self.will.to_be_bytes());
         out.extend_from_slice(&self.publication.to_be_bytes());
@@ -157,11 +172,15 @@ impl WillPublication {
             out.push(target.effective_qos.to_wire());
             out.push(target.cause as u8);
         }
+        if let Some(mask) = self.live_retain {
+            out.extend_from_slice(&mask.to_be_bytes());
+        }
     }
     pub(crate) fn decode(
         r: &mut Reader<'_>,
         max_targets: usize,
         max_topic: usize,
+        retained: bool,
     ) -> Result<Self, RecipeError> {
         use crate::capacity::{ExchangeSlots, PayloadBytes, ReceiptSlots, References};
         let operation = r.operation()?;
@@ -221,6 +240,7 @@ impl WillPublication {
             payload,
             costs,
             targets,
+            live_retain: if retained { Some(r.u16()?) } else { None },
         })
     }
 }

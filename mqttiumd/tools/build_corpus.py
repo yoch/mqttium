@@ -3964,6 +3964,13 @@ will_open_snapshot["operations"].append(will_session_operation(40, will_open_rec
     "session_present": False, "expiry": "Never", "retired": None,
     "cancelled": {"inbound": 0, "deliveries": 0, "routes": 0}}))
 ok("store-snapshot-will-open.json", will_open_snapshot)
+retained_will_open = copy.deepcopy(will_open_snapshot)
+retained_will_open["wills"][0]["retain"] = True
+retained_will_open["operations"][-1]["recipe_hex"] = will_open_recipe[:78] + "07" + will_open_recipe[80:]
+ok("store-snapshot-retained-will-open.json", retained_will_open)
+bad("store-snapshot-retained-will-invalid-flag.json", "schema-violation", "/wills/0/retain",
+    "The Will RETAIN discriminator is a boolean in snapshot evidence.",
+    edited(retained_will_open, lambda v: v["wills"][0].update(retain=2)))
 will_end_recipe = will_prefix + scoped(41) + be(6, 1) + will_guard + be(1, 1) + be(200) + be(1, 1)
 will_pending_snapshot = copy.deepcopy(will_open_snapshot)
 will_pending_snapshot["wills"][0]["state"] = "Pending"
@@ -4004,9 +4011,13 @@ for index, (kind, details) in enumerate((
     event = env("mqttiumd.product-event", seq=str(index + 1), pid=1, kind=kind,
         operation=will_id, will=will_id, details=details)
     ok("product-" + kind.replace("_", "-") + ".json", event)
+    if kind == "will_admitted":
+        ok("product-retained-will-admitted.json", edited(event, lambda v: v["details"].update(retained=True)))
     bad("product-" + kind.replace("_", "-") + "-with-payload.json", "schema-violation", "/details",
         "Product Will events carry lengths and identities, never Will bytes.",
         edited(event, lambda v: v["details"].update(payload="offline")))
+ok("product-will-connect-deferred.json", env("mqttiumd.product-event", seq="1", pid=1,
+    kind="will_connect_deferred", connection="7", details={"authority": "durable_will_barrier"}))
 for point in ("will.admission.prepared", "will.admission.committed", "will.end.prepared", "will.end.committed"):
     ok("product-hook-" + point.replace(".", "-") + ".json", env("mqttiumd.product-event", seq="1", pid=1,
         kind="barrier_hit", operation=will_id, point=point,
@@ -4016,7 +4027,7 @@ ok("product-hook-work-read-before.json", env("mqttiumd.product-event", seq="1", 
 for field in ("will", "will_qos", "will_retain", "will_delay_interval", "will_message_expiry",
               "max_will_intents", "max_will_bytes", "max_will_topic_bytes", "max_will_payload_bytes"):
     bad("product-profile-wrong-" + field + ".json", "schema-violation", "/" + field,
-        "The profile declares only bounded nonretained QoS1 Will with zero delay and no Message Expiry.",
+        "The profile declares bounded QoS1 Will with zero delay and no Message Expiry.",
         {**product_profile, field: "unsupported"})
 
 

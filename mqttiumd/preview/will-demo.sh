@@ -153,7 +153,7 @@ def stop():
 def counts():
     with sqlite3.connect((data / 'broker.sqlite').as_uri() + '?mode=ro', uri=True) as db:
         require(db.execute('PRAGMA quick_check').fetchone()[0] == 'ok', 'packaged_will_sqlite_consistency')
-        require(db.execute('PRAGMA user_version').fetchone()[0] == (11 if pki else 10), 'packaged_will_wrong_schema')
+        require(db.execute('PRAGMA user_version').fetchone()[0] == (13 if pki else 12), 'packaged_will_wrong_schema')
         values = {name: db.execute(f'SELECT count(*) FROM {name}').fetchone()[0]
                   for name in ('sessions', 'routes', 'wills', 'retained', 'publications', 'payloads',
                                'obligations', 'outbound', 'inbound', 'operations')}

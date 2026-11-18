@@ -6,10 +6,10 @@
   "status": "Proposed",
   "scope": "product-system-tests",
   "partition_complete": false,
-  "description": "Implemented nonretained QoS1 Will with zero delay, exact attachment installation/cancellation, independent durable pending intention and idempotent normal admission. This subset is descriptive system evidence, not fixture-oracle qualification.",
-  "authority": "Durable Open commits the immutable Will occurrence before CONNACK; exact End decides cancellation or pending publication; kind17 consumes Pending atomically with admission. Peer removal, timers, absent results and current ClientID lookup grant no publication authority.",
+  "description": "The Proposed0034 zero-delay QoS1 Will machine with Proposed0037 retained admission. The registry describes system-test scope.",
+  "authority": "Durable Open commits the immutable Will before CONNACK. Exact End decides cancellation or pending publication. Kind17 and kind18 consume Pending atomically with admission.",
   "limitations": [
-    "Will QoS0/2, retained Will, nonzero delay, Message Expiry and other Will properties are explicitly unsupported.",
+    "Will QoS0/2, nonzero delay, Message Expiry and other Will properties beyond delay0 remain unsupported.",
     "A normal DISCONNECT observed only in volatile memory before cancellation commits can be lost with the process; recovery follows the surviving durable intention.",
     "Server failure can defer publication until restart. Capacity pressure retains a bounded Pending intention, without a universal publication-latency claim."
   ],
@@ -19,7 +19,7 @@
       "machine": "Will",
       "state_class": "Absent",
       "event_class": "Connect",
-      "guard": "Validated Will QoS1, nonretained, absent or zero delay and bounded immutable topic/payload are part of the exact Open recipe.",
+      "guard": "Validated Will QoS1, either Retain value, absent or zero delay and bounded topic/payload belong to the exact Open recipe.",
       "next_state_class": "OpenPending",
       "required_actions": [
         "PersistOpenWithWill"
@@ -136,7 +136,7 @@
       "machine": "Will",
       "state_class": "WillPending",
       "event_class": "CapacityAvailable",
-      "guard": "Freeze the complete eligible canonical fanout; persist one kind17 WillPublication for this exact Pending intention. A full budget retains intent without truncation.",
+      "guard": "Freeze the complete eligible canonical fanout and live RAP mask. Kind17 covers non-retained and kind18 retained intent. Capacity refusal preserves the intent.",
       "next_state_class": "AdmitPending",
       "required_actions": [
         "PersistNormalAtomicAdmission",
@@ -176,7 +176,7 @@
       "machine": "Will",
       "state_class": "AdmitPending",
       "event_class": "Committed",
-      "guard": "The transaction consumes the exact Pending intention, creates normal publication obligations and correlated result, then ordinary delivery drains independently of the source.",
+      "guard": "The transaction consumes the exact Pending intention, admits the live obligations, applies any retained change and writes the correlated result independently of the source session.",
       "next_state_class": "Queued",
       "required_actions": [
         "ConsumeIntentAtomically",
@@ -209,6 +209,26 @@
       ],
       "reception_groups": [
         "C",
+        "F"
+      ]
+    },
+    {
+      "id": "will.retained_barrier",
+      "machine": "Will",
+      "state_class": "WillPending",
+      "event_class": "Connect",
+      "guard": "An existing Will for the same ClientID remains in the durable inventory.",
+      "next_state_class": "WillPending",
+      "required_actions": [
+        "WaitForDurableWillBarrier",
+        "KeepOtherConnectionsProgressing"
+      ],
+      "forbidden_actions": [
+        "AcceptReplacementBeforeWillIsSettled",
+        "DropDeferredIntent"
+      ],
+      "reception_groups": [
+        "E",
         "F"
       ]
     }

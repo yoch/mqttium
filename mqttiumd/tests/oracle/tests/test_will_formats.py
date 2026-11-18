@@ -18,8 +18,8 @@ TOPIC = b"atelier/capteur-1/status"
 PAYLOAD = b"offline"
 
 
-def open_will(*, topic=TOPIC, payload=PAYLOAD, present=True):
-    value = (PREFIX + b"\x08" + scoped(8) + b"\x05\x00\x01\x01" + guard()
+def open_will(*, topic=TOPIC, payload=PAYLOAD, present=True, retain=False):
+    value = (PREFIX + b"\x08" + scoped(8) + bytes([7 if retain else 5, 0, 1, 1]) + guard()
              + be(9, 2) + b"capteur-1" + be(100) + bytes([present]))
     return value + (be(len(topic), 2) + topic + be(len(payload), 4) + payload if present else b"")
 
@@ -28,12 +28,13 @@ def end_will(*, publish=True, observed_at=100):
     return PREFIX + b"\x08" + scoped(9) + b"\x06" + guard() + b"\x01" + be(observed_at) + bytes([publish])
 
 
-def publication(*, topic=TOPIC, qos=1, cause=1, target=2, count=1, payload_length=7):
-    header = (PREFIX + b"\x11" + scoped(10) + scoped(8) + scoped(11) + be(1)
+def publication(*, topic=TOPIC, qos=1, cause=1, target=2, count=1, payload_length=7, mask=None):
+    header = (PREFIX + bytes([17 if mask is None else 18]) + scoped(10) + scoped(8) + scoped(11) + be(1)
               + be(len(topic), 2) + topic + scoped(12) + be(payload_length)
               + be(7) + be(count) + be(0) + be(1) + bytes([count]))
-    return header + b"".join(be(target + index) + be(1) + be(index, 4) + bytes([qos, cause])
-                             for index in range(count))
+    targets = b"".join(be(target + index) + be(1) + be(index, 4) + bytes([qos, cause])
+                       for index in range(count))
+    return header + targets + (be(mask, 2) if mask is not None else b"")
 
 
 class WillRecipes(unittest.TestCase):
@@ -67,11 +68,22 @@ class WillRecipes(unittest.TestCase):
         self.assertFalse(hasattr(decoded, "packet_id"))
         self.assertFalse(hasattr(decoded, "exchange_generation"))
 
-    def test_all_three_new_layouts_refuse_every_truncation_and_trailing_alias(self):
-        for valid in (open_will(), open_will(present=False), end_will(), publication()):
+    def test_will_layouts_refuse_every_truncation_and_trailing_alias(self):
+        for valid in (open_will(), open_will(present=False), end_will(), publication(),
+                      open_will(retain=True), publication(mask=1)):
             for data in [valid[:cut] for cut in range(len(valid))] + [valid + b"\x00"]:
                 with self.subTest(data=data.hex()), self.assertRaises(recipe.RecipeError):
                     recipe.decode(data)
+
+    def test_retained_layouts_use_separate_tags_and_keep_legacy_flags(self):
+        self.assertFalse(recipe.decode(open_will()).will.retain)
+        self.assertTrue(recipe.decode(open_will(retain=True)).will.retain)
+        self.assertIsNone(recipe.decode(publication()).live_retain)
+        self.assertEqual(recipe.decode(publication(mask=0, count=0)).live_retain, 0)
+        self.assertEqual(recipe.decode(publication(mask=1)).live_retain, 1)
+        for raw in (publication(mask=2), publication(mask=1, count=0), open_will(present=False, retain=True)):
+            with self.assertRaises(recipe.RecipeError):
+                recipe.decode(raw)
 
     def test_will_topic_payload_and_canonical_targets_are_bounded(self):
         for invalid in (

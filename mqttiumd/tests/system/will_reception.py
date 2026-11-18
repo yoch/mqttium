@@ -59,7 +59,7 @@ async def close_peers(values):
 
 class Sensor:
     """An actual child PID; the parent, not the client, causes transport loss."""
-    def __init__(self, kind, address, case, label, topic, observations, *, expiry=0xFFFFFFFF):
+    def __init__(self, kind, address, case, label, topic, observations, *, expiry=0xFFFFFFFF, retained=False):
         self.case, self.observations, self.label = case, observations, label
         self.ready = case / f'{label}.ready.json'
         self.finish = case / f'{label}.finish'
@@ -69,6 +69,8 @@ class Sensor:
                         '--client-id', label, '--topic', topic, '--expiry', str(expiry),
                         '--events', str(case / f'{label}.client.jsonl'), '--ready', str(self.ready),
                         '--finish', str(self.finish), '--result', str(self.result)]
+        if retained:
+            self.command.append('--retain')
         self.stdout = (case / f'{label}.stdout').open('xb')
         self.stderr = (case / f'{label}.stderr').open('xb')
         self.process = subprocess.Popen(self.command, stdout=self.stdout, stderr=self.stderr)
@@ -161,7 +163,7 @@ async def until_state(broker, predicate, code, *, timeout=5):
     raise ReceiptFailure(code)
 
 
-async def triggers(binary, case):
+async def triggers(binary, case, *, retained=False):
     """Independent TCP EOF/RST/KeepAlive/protocol and DISCONNECT witnesses."""
     broker = Broker(binary, case)
     clients, wires = [], []
@@ -178,7 +180,7 @@ async def triggers(binary, case):
             wire = WillWire(broker.address, broker.observations, 'trigger-' + name)
             wires.append(wire)
             await asyncio.to_thread(wire.will_connect, 'trigger-' + name, topic, payload,
-                                    expiry=0, keep_alive=1 if name == 'keep_alive' else 10)
+                                    expiry=0, keep_alive=1 if name == 'keep_alive' else 10, retain=retained)
             observed = {'case': name, 'connected_monotonic_ns': str(time.monotonic_ns()),
                         'requested_expiry': 0}
             if name == 'eof':
@@ -208,6 +210,10 @@ async def triggers(binary, case):
                 observed['received'] = received
                 observed['wire'] = assert_will_frame(frames[0], topic, payload)
                 state = await drained(broker)
+            if retained:
+                inventory = state['tables']['retained']
+                require(any(r['topic'] == topic.encode().hex() for r in inventory) == (name != 'disconnect00'),
+                        'retained_will_trigger_inventory', name)
             observed['completed_monotonic_ns'] = str(time.monotonic_ns())
             observed['counts'] = state['counts']
             rows.append(observed)
@@ -215,13 +221,12 @@ async def triggers(binary, case):
 
         # All refusals happen before establishment; none may arm a Will.
         refusals = []
-        for name, options in (('qos0', {'qos': 0}), ('qos2', {'qos': 2}),
-                              ('retained', {'retain': True}), ('delay1', {'delay': 1}),
+        for name, options in (('qos0', {'qos': 0}), ('qos2', {'qos': 2}), ('delay1', {'delay': 1}),
                               ('expiry', {'will_properties': b'\x02\0\0\0\x01'})):
             wire = WillWire(broker.address, broker.observations, 'unsupported-' + name)
             wires.append(wire)
             wire.send(will_connect_packet('unsupported-' + name, 'will/triggers/refused',
-                                          ('refused:' + name).encode(), **options))
+                                          ('refused:' + name).encode(), retain=retained, **options))
             await asyncio.to_thread(expect_rejection, wire, before_connect=True)
             wire.close()
             await dashboard.no_message(.08)
@@ -624,7 +629,7 @@ async def fanout_pressure(binary, case):
         broker.cleanup()
 
 
-async def no_local(binary, case):
+async def no_local(binary, case, *, retained=False):
     """No Local filters contributions, preserving an eligible QoS0 overlap."""
     broker = Broker(binary, case)
     clients, wires = [], []
@@ -640,7 +645,7 @@ async def no_local(binary, case):
             topic, payload = 'will/options/' + label + '/status', ('offline-' + label).encode()
             source = WillWire(broker.address, broker.observations, client_id)
             wires.append(source)
-            source.will_connect(client_id, topic, payload)
+            source.will_connect(client_id, topic, payload, retain=retained)
             values = [Subscription('will/options/' + label + '/#', 1, no_local=True)]
             if overlap:
                 values.append(Subscription(topic, 0, no_local=False))
@@ -686,7 +691,7 @@ async def no_local(binary, case):
             broker.cleanup()
 
 
-async def public_sensor(binary, case, sensor_kind, dashboard_kind):
+async def public_sensor(binary, case, sensor_kind, dashboard_kind, *, retained=False):
     """The first end-to-end milestone, with explicit client and wire facts."""
     broker = Broker(binary, case)
     clients, taps, sensors = [], [], []
@@ -699,7 +704,7 @@ async def public_sensor(binary, case, sensor_kind, dashboard_kind):
         topic = 'atelier/capteur-1/status'
         sensor_tap = PacketTap(broker.address, Observations(case / 'sensor.wire.jsonl'))
         taps.append(sensor_tap)
-        sensor = Sensor(sensor_kind, sensor_tap.address, case, 'capteur-1', topic, broker.observations)
+        sensor = Sensor(sensor_kind, sensor_tap.address, case, 'capteur-1', topic, broker.observations, retained=retained)
         sensors.append(sensor)
         sensor_ready = await sensor.wait_ready()
         online = await dashboard.receive(b'online', 1, False)
@@ -710,7 +715,7 @@ async def public_sensor(binary, case, sensor_kind, dashboard_kind):
         connect = [frame for frame in incoming if frame.kind == 0x10]
         require(len(connect) == 1, 'will_sensor_reconnected')
         observed_connect = decode_will_connect(connect[0])
-        require(observed_connect['will_qos'] == 1 and not observed_connect['will_retain']
+        require(observed_connect['will_qos'] == 1 and observed_connect['will_retain'] == retained
                 and observed_connect['will_delay_interval'] == 0, 'will_client_profile_mismatch')
         require(not any(frame.kind == 0xE0 for frame in incoming),
                 'will_sigkill_was_voluntary_disconnect')
@@ -721,13 +726,14 @@ async def public_sensor(binary, case, sensor_kind, dashboard_kind):
         new, new_tap = await peer(sensor_kind, broker, case, 'new-dashboard')
         clients.append((new, new_tap))
         await new.subscribe((Subscription(topic, 1),))
-        replay = await new.receive(b'online', 1, True)
-        require(len(new_tap.publications(b'online')) == 1 and not new_tap.publications(b'offline'),
-                'will_incorrectly_replaced_retained_online')
+        current, obsolete = (b'offline', b'online') if retained else (b'online', b'offline')
+        replay = await new.receive(current, 1, True)
+        require(len(new_tap.publications(current)) == 1 and not new_tap.publications(obsolete),
+                'will_wrong_retained_replay')
 
         normal_tap = PacketTap(broker.address, Observations(case / 'normal-sensor.wire.jsonl'))
         taps.append(normal_tap)
-        normal = Sensor(sensor_kind, normal_tap.address, case, 'normal-capteur', topic, broker.observations)
+        normal = Sensor(sensor_kind, normal_tap.address, case, 'normal-capteur', topic, broker.observations, retained=retained)
         sensors.append(normal)
         await normal.wait_ready()
         await dashboard.receive(b'online', 1, False)
@@ -752,7 +758,7 @@ async def public_sensor(binary, case, sensor_kind, dashboard_kind):
                 'dashboard_client': dashboard_kind, 'sensor_ready': sensor_ready,
                 'sensor_connect_observed': observed_connect, 'suback': suback,
                 'sigkill': stopped, 'normal_stop': normal_stopped, 'online': online,
-                'offline': offline, 'offline_wire': offline_wire, 'retained_online_replay': replay,
+                'offline': offline, 'offline_wire': offline_wire, 'retained_replay': replay,
                 'clients': client_results, 'durable_counts': state['counts'],
                 'broker_pid': broker.process.pid, 'broker_status': broker.process.returncode,
                 'scope': 'actual TCP processes and public clients; not oracle qualification'}

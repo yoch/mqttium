@@ -563,10 +563,11 @@ impl Recipe {
             return Err(RecipeError::UnknownFormat(format));
         }
         let recipe = match reader.u8()? {
-            17 => Self::WillPublication(crate::will::WillPublication::decode(
+            tag @ (17 | 18) => Self::WillPublication(crate::will::WillPublication::decode(
                 &mut reader,
                 max_targets,
                 max_topic_len,
+                tag == 18,
             )?),
             13 => Self::ExpiringPublication(ExpiringPublication::decode(
                 &mut reader,

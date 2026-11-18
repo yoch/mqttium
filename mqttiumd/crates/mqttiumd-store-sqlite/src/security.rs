@@ -4,7 +4,7 @@
 use super::{Connection, OpenError, SCHEMA_VERSION, params, reader};
 use std::collections::BTreeMap;
 
-pub const SECURE_SCHEMA_VERSION: i64 = 11;
+pub const SECURE_SCHEMA_VERSION: i64 = 13;
 const MAX_OWNERS: usize = 128;
 const MAX_CLIENT_BYTES: usize = 1024;
 const MAX_PRINCIPAL_BYTES: usize = 64;

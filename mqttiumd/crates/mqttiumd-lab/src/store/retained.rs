@@ -286,13 +286,18 @@ pub(super) fn install(
     topic: &[u8],
     publication: PublicationId,
     source: SessionId,
+    will_source: Option<&[u8]>,
 ) -> Guard<()> {
-    let client = state
-        .sessions
-        .get(&source)
-        .ok_or(RejectReason::PreconditionFailed)?
-        .client_id
-        .clone();
+    let client = if let Some(client) = will_source {
+        client.to_vec()
+    } else {
+        state
+            .sessions
+            .get(&source)
+            .ok_or(RejectReason::PreconditionFailed)?
+            .client_id
+            .clone()
+    };
     if client.is_empty() || client.contains(&0) || std::str::from_utf8(&client).is_err() {
         return Err(RejectReason::PreconditionFailed);
     }

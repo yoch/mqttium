@@ -108,7 +108,7 @@ This closes the former broker-startup row; it does not accept proposed ADRs.
 | Decision | State |
 | - | - |
 | D1, expiry against uncertain emission | Open; S0 excludes expiry |
-| T1, temporal guarantees of the Will | Product zero-delay QoS1/non-retained Will received under Proposed0034; nonzero delay and universal timing guarantees remain open |
+| T1, temporal guarantees of the Will | Product zero-delay QoS1 Will with both Retain values under Proposed0034 and Proposed0037. Nonzero delay and universal timing guarantees remain open |
 | Service targets of the real profiles | Not supplied; needed before G4, useful for the measurement of ADR 0008 |
 
 ## Product TCP: remaining scope
@@ -159,7 +159,7 @@ topics/1MiB, exact and wildcard replay, ordered RH, live RAP and ClientID No Loc
 Replay is frozen transactionally and drained by existing delivery machines.
 Old owed values remain charged under the existing128-reference/4MiB budgets;
 a complete subscription update may therefore be refused. This does not provide
-an unbounded state archive or format migration. Current schema10 refuses historical schemas. Product system tests do not qualify allP1/P2.
+an unbounded state archive or format migration. Current schemas 12 and 13 refuse historical schemas. Product system tests do not qualify allP1/P2.
 
 
 ## Message lifetime (Proposed0033)
@@ -179,13 +179,13 @@ The sweep has bounded work and one outstanding request; no expiry timer or row
 accumulates per historic connection/publication. Current SQLite10 has no general migration.
 
 
-## Will product scope (Proposed0034)
+## Will product scope (Proposed0034 and Proposed0037)
 
-Zero-delay non-retained QoS1 Will installation, cancellation, durable pending
+Zero-delay QoS1 Will installation with optional Retain, cancellation, durable pending
 admission, startup recovery and capacity deferral are implemented. Tests cover
 real sensor SIGKILL, normal disconnect suppression, source-session deletion and
 offline recipients. These system tests do not extend independent fixture
-qualification. Delayed/retained/other-QoS Wills and Will properties except delay0
+qualification. Delayed and other-QoS Wills and Will properties except delay0
 remain open. An uncommitted cancellation cannot be recovered after a crash;
 server failure can defer notification to restart. Pending intent reserves are
 bounded, so arbitrarily many blocked vanished clients are not promised. Will

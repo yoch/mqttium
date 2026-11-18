@@ -66,6 +66,15 @@ fn establish(
     seq: u64,
     expiry: SessionExpiry,
 ) -> SessionGuard {
+    establish_will(store, epoch, seq, expiry, false)
+}
+fn establish_will(
+    store: &mut impl DurableStore,
+    epoch: mqttiumd_contract::ids::RunEpoch,
+    seq: u64,
+    expiry: SessionExpiry,
+    retain: bool,
+) -> SessionGuard {
     let op = operation_id(epoch, seq);
     let result = store.apply(&command(
         op,
@@ -76,6 +85,7 @@ fn establish(
             expiry,
             now: 0,
             will: Some(WillSpec {
+                retain,
                 topic: bytes(b"p1/topic"),
                 payload: bytes(b"offline"),
             }),
@@ -97,6 +107,14 @@ fn publication(
     will: mqttiumd_contract::ids::OperationId,
     seq: u64,
 ) -> Command {
+    will_publication(world, will, seq, None)
+}
+fn will_publication(
+    world: &World<impl DurableStore>,
+    will: mqttiumd_contract::ids::OperationId,
+    seq: u64,
+    live_retain: Option<u16>,
+) -> Command {
     let op = operation_id(world.epoch, seq);
     let p = publication_id(world.epoch, seq);
     let mut targets = BoundedVec::with_capacity(2).unwrap();
@@ -116,6 +134,7 @@ fn publication(
     }
     Command {
         recipe: FrozenRecipe::freeze(Recipe::WillPublication(WillPublication {
+            live_retain,
             operation: op,
             will,
             publication: p,
@@ -132,7 +151,7 @@ fn publication(
             },
             costs: Costs {
                 payload_bytes: PayloadBytes::new(7),
-                references: References::new(2),
+                references: References::new(2 + u64::from(live_retain.is_some())),
                 exchange_slots: ExchangeSlots::ZERO,
                 receipt_slots: ReceiptSlots::new(1),
             },
@@ -141,6 +160,87 @@ fn publication(
         .unwrap(),
         payload: Some(bytes(b"offline")),
     }
+}
+fn retained_will_owned_after_finish_and_receipt_retirement(mut world: World<impl DurableStore>) {
+    let expiry = SessionExpiry::OnDisconnect;
+    let guard = establish_will(&mut world.store, world.epoch, 1, expiry, true);
+    let will = guard.opened_by.unwrap();
+    assert!(
+        world
+            .store
+            .apply(&command(
+                operation_id(world.epoch, 2),
+                SessionAction::EndWill {
+                    guard,
+                    expiry,
+                    observed_at: 0,
+                    publish: true,
+                }
+            ))
+            .committed_now
+    );
+    let pending = world.store.snapshot().unwrap();
+    assert!(!pending.sessions.contains_key(&guard.session));
+    assert!(pending.wills[&will].spec.retain);
+    let admission = will_publication(&world, will, 3, Some(0b10));
+    let result = world.store.apply(&admission);
+    assert!(
+        result.committed_now,
+        "retained_will_admission_failed_after_source_cleanup"
+    );
+    let state = world.store.snapshot().unwrap();
+    let retained = state.retained.get(b"p1/topic".as_slice()).unwrap();
+    assert_eq!(retained.publication, publication_id(world.epoch, 3));
+    assert_eq!(retained.producer_client_id, b"will-source");
+    assert!(state.wills.is_empty());
+    assert_eq!(state.accounts.references, References::new(3));
+    assert_eq!(
+        state
+            .obligations
+            .values()
+            .map(|obligation| obligation.retain)
+            .collect::<Vec<_>>(),
+        [false, true]
+    );
+    assert_eq!(world.store.apply(&admission).reply, result.reply);
+    assert_eq!(world.store.snapshot().unwrap(), state);
+    for session in [world.b, world.c] {
+        assert_eq!(
+            world.store.admin(AdminCommand::DeleteSession { session }),
+            Ok(AdminDone::SessionDeleted)
+        );
+    }
+    let collection = ReceiptCollection {
+        closure: ReceiptClosure {
+            origin: ReceiptOrigin::of(will),
+            through: mqttiumd_contract::ids::OperationSeq::new(3),
+            publication_through: mqttiumd_contract::ids::PublicationSeq::new(3),
+            payload_through: PayloadSeq::new(3),
+        },
+        limit: 128,
+    };
+    assert!(matches!(
+        world.store.collect_receipts(collection).unwrap(),
+        ReceiptCollectionReply::Applied { .. }
+    ));
+    let retained_only = world.store.snapshot().unwrap();
+    assert_eq!(retained_only.retained, state.retained);
+    assert_eq!(retained_only.accounts.references, References::new(1));
+    assert_eq!(accounts_match_what_is_held(&retained_only), Ok(()));
+    assert_eq!(
+        world.store.apply(&admission).reply,
+        StoreReply::Outcome(StoreOutcome::RetiredOutcomeUnavailable)
+    );
+    assert_eq!(world.store.snapshot().unwrap(), retained_only);
+}
+
+#[test]
+fn both_stores_keep_retained_will_after_source_and_delivery_cleanup() {
+    let directory = Directory::new();
+    retained_will_owned_after_finish_and_receipt_retirement(World::new(&|i, l| {
+        SqliteStore::create(&directory.db(), i, l).unwrap()
+    }));
+    retained_will_owned_after_finish_and_receipt_retirement(World::new(&MemoryStore::create));
 }
 fn lifecycle_and_independent_responsibilities(mut world: World<impl DurableStore>) {
     let guard = establish(
@@ -300,6 +400,7 @@ fn lifecycle_and_independent_responsibilities(mut world: World<impl DurableStore
         let operation = operation_id(world.epoch, seq);
         Command {
             recipe: FrozenRecipe::freeze(Recipe::WillPublication(WillPublication {
+                live_retain: None,
                 operation,
                 will: newer.opened_by.unwrap(),
                 publication: publication_id(world.epoch, pubseq),
@@ -435,6 +536,36 @@ fn invalid_will_state_is_typed_before_pending_selection() {
         Err(ReadError::InvalidData)
     );
 }
+
+#[test]
+fn invalid_will_retain_is_typed_even_when_only_armed() {
+    let directory = Directory::new();
+    let db = directory.db();
+    let mut world = World::new(&|i, l| SqliteStore::create(&db, i, l).unwrap());
+    establish_will(
+        &mut world.store,
+        world.epoch,
+        10,
+        SessionExpiry::Never,
+        true,
+    );
+    let sql = rusqlite::Connection::open(&db).unwrap();
+    sql.execute("UPDATE wills SET retain=2", []).unwrap();
+    assert_eq!(
+        sql.query_row("PRAGMA quick_check", [], |r| r.get::<_, String>(0))
+            .unwrap(),
+        "ok"
+    );
+    assert_eq!(world.store.snapshot(), Err(ReadError::InvalidData));
+    assert_eq!(
+        world.store.read_wills(None, 4, ReadBudget::PAGE),
+        Err(ReadError::InvalidData)
+    );
+    assert_eq!(
+        world.store.has_will_for_client(b"another"),
+        Err(ReadError::InvalidData)
+    );
+}
 #[test]
 fn will_page_checks_byte_budget_before_copy() {
     let mut s = MemoryStore::create(StoreIncarnation::new(1), fixture_limits());
@@ -480,6 +611,7 @@ fn canonical_pressure(mut store: impl DurableStore) {
                 expiry: SessionExpiry::OnDisconnect,
                 now: 0,
                 will: Some(WillSpec {
+                    retain: false,
                     topic: bytes(b"p1/example"),
                     payload: payload.clone(),
                 }),

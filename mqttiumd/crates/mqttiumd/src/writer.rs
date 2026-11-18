@@ -625,7 +625,7 @@ fn business_response(
                                 )),
                             ) => Some((
                                 "will_admitted",
-                                json!({"operation":operation(id),"will":operation(will),"details":{"publication":format!("{}/{}/{}/{}",publication.incarnation().get(),publication.epoch().get(),publication.owner().get(),publication.sequence().get()),"targets":value.targets.len(),"authority":"durable_admission_commit"}}),
+                                json!({"operation":operation(id),"will":operation(will),"details":{"publication":format!("{}/{}/{}/{}",publication.incarnation().get(),publication.epoch().get(),publication.owner().get(),publication.sequence().get()),"targets":value.targets.len(),"retained":value.live_retain.is_some(),"authority":"durable_admission_commit"}}),
                             )),
                             _ => None,
                         };
@@ -1543,6 +1543,7 @@ mod tests {
             )
         };
         let spec = WillSpec {
+            retain: false,
             topic: SharedBytes::copy_from(b"status", MAX_TOPIC).unwrap(),
             payload: SharedBytes::copy_from(b"SECRET-WILL", MAX_PAYLOAD).unwrap(),
         };
@@ -1767,6 +1768,7 @@ mod tests {
         let frozen = Command {
             recipe: FrozenRecipe::freeze(Recipe::WillPublication(
                 mqttiumd_contract::will::WillPublication {
+                    live_retain: None,
                     operation: operation(7),
                     will: operation(3),
                     publication,

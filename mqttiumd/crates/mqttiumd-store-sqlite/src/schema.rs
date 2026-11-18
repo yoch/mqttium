@@ -5,7 +5,7 @@
 
 /// `PRAGMA user_version` of the schema below. Any other version is
 /// refused before anything is written.
-pub const SCHEMA_VERSION: i64 = 10;
+pub const SCHEMA_VERSION: i64 = 12;
 
 /// The format named in `meta`.
 pub const FORMAT: &str = "mqttiumd-store-sqlite";
@@ -53,7 +53,8 @@ CREATE TABLE wills (
     state INTEGER NOT NULL,
     client_id BLOB NOT NULL,
     topic BLOB NOT NULL,
-    payload BLOB NOT NULL
+    payload BLOB NOT NULL,
+    retain INTEGER NOT NULL
 ) STRICT, WITHOUT ROWID;
 
 CREATE TABLE session_clock (

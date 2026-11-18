@@ -133,6 +133,7 @@ struct PendingWillConnect {
     connect: codec::Connect,
     previous: Option<ConnectionGeneration>,
     awaiting: bool,
+    reported_pending: bool,
     retry_at: Instant,
 }
 struct PendingSession {
@@ -1670,6 +1671,18 @@ impl Runtime<'_> {
                     }
                     waiting.awaiting = false;
                     if pending {
+                        if !waiting.reported_pending {
+                            self.events
+                                .emit(
+                                    "will_connect_deferred",
+                                    json!({
+                                        "connection":connection.get().to_string(),
+                                        "details":{"authority":"durable_will_barrier"}
+                                    }),
+                                )
+                                .map_err(event_failure)?;
+                            waiting.reported_pending = true;
+                        }
                         waiting.retry_at = Instant::now() + Duration::from_millis(100);
                     } else {
                         let waiting = self
@@ -2187,6 +2200,7 @@ impl Runtime<'_> {
                 connect,
                 previous: old.filter(|old| *old != generation),
                 awaiting: false,
+                reported_pending: false,
                 retry_at: Instant::now(),
             },
         );
@@ -4713,7 +4727,7 @@ fn run_inner(
                 "certificate_bytes":security::CERT_BYTES,"chain_bytes":security::CHAIN_BYTES,"chain_certificates":security::CHAIN_CERTS,
                 "tls_buffer_bytes":security::TLS_BUFFER_BYTES,"resumption":false,"early_data":false}})).map_err(event_failure)?;
         }
-        events.emit("will_capabilities",json!({"details":{"will":true,"will_qos":1,"will_retain":false,"will_delay_interval":0,"will_message_expiry":false,"max_will_intents":256,"max_will_bytes":8388608,"max_will_receipt_bytes":8388608}})).map_err(event_failure)?;
+        events.emit("will_capabilities",json!({"details":{"will":true,"will_qos":1,"will_retain":true,"will_delay_interval":0,"will_message_expiry":false,"max_will_intents":256,"max_will_bytes":8388608,"max_will_receipt_bytes":8388608}})).map_err(event_failure)?;
         events.emit("ready", readiness).map_err(event_failure)?;
         println!("mqttiumd ready {address} ({profile})");
         while !cancel.load(Ordering::Relaxed) {

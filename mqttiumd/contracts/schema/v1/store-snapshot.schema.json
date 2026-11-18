@@ -1105,6 +1105,10 @@
               "Pending"
             ]
           },
+          "retain": {
+            "description": "Omission in historical evidence denotes RETAIN=0.",
+            "type": "boolean"
+          },
           "topic_hex": {
             "allOf": [
               {

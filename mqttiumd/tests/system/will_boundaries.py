@@ -26,14 +26,15 @@ TOPIC = 'will/cut/status'
 TARGET = 'cut-dashboard'
 CUTS = ('open-prepared', 'open-committed', 'admission-prepared', 'admission-committed',
         'publish-observed', 'finish-committed')
+RESULTS = ('lost-end', 'held-end', 'lost-admission', 'held-admission')
 
 
 def will_commands(state):
-    """Independent stable kind17 header and causal identities; not a product parser."""
+    """Independent kind17/18 headers and causal identities."""
     result = []
     for row in state['tables']['operations']:
         raw = bytes.fromhex(row['recipe'])
-        if raw[:7] != b'MQDR\0\x01\x11':
+        if raw[:7] not in (b'MQDR\0\x01\x11', b'MQDR\0\x01\x12'):
             continue
         require(len(raw) >= 103 and raw[7:39].hex() == row['id'],
                 'will_canonical_receipt_identity_invalid')
@@ -43,7 +44,7 @@ def will_commands(state):
     return result
 
 
-def assert_cut_inventory(name, state):
+def assert_cut_inventory(name, state, *, retained=False):
     wills = state['tables']['wills']
     counts = state['counts']
     if name == 'open-prepared':
@@ -60,11 +61,14 @@ def assert_cut_inventory(name, state):
         if name == 'publish-observed':
             require(counts['outbound'] == 1, 'will_observed_publication_has_no_durable_claim')
     elif name == 'finish-committed':
-        require(not wills and all(counts[table] == 0 for table in
-                                  ('obligations', 'outbound', 'publications', 'payloads')),
+        require(not wills and counts['obligations'] == counts['outbound'] == 0
+                and counts['publications'] == counts['payloads'] == int(retained),
                 'will_finish_commit_not_terminal')
     else:
         raise ValueError('unknown Will cut')
+    if retained:
+        require(counts['retained'] == int(name in ('admission-committed', 'publish-observed', 'finish-committed'))
+                and all(row['retain'] == 1 for row in wills), 'retained_will_cut_was_not_atomic')
 
 
 async def fact(broker, kind, *, after=-1, predicate=lambda _row: True, timeout=15):
@@ -120,7 +124,7 @@ def receive_recovered(wire, payload, *, expected_claim=None, state=None):
     return value.observation()
 
 
-async def crash_cut(binary, case, name):
+async def crash_cut(binary, case, name, *, retained=False):
     setup = await seed(binary, case)
     points = {'open-prepared': 'session.open.prepared', 'open-committed': 'session.open.committed',
               'admission-prepared': 'will.admission.prepared',
@@ -138,9 +142,9 @@ async def crash_cut(binary, case, name):
             target.session_connect(TARGET, expected_present=True)
         source = WillWire(broker.address, broker.observations, 'cut-source')
         if name.startswith('open-'):
-            source.send(will_connect_packet('cut-source', TOPIC, payload, expiry=0))
+            source.send(will_connect_packet('cut-source', TOPIC, payload, expiry=0, retain=retained))
         else:
-            source.will_connect('cut-source', TOPIC, payload, expiry=0)
+            source.will_connect('cut-source', TOPIC, payload, expiry=0, retain=retained)
             source.close()
         if name in ('publish-observed', 'finish-committed'):
             publication = target.next_publication(timeout=8)
@@ -159,7 +163,7 @@ async def crash_cut(binary, case, name):
             # no positive CONNACK can be justified by an observed result yet.
             require(source.poll(.04) is None, 'will_connack_before_durable_open_result')
         state = durable(broker.db)
-        assert_cut_inventory(name, state)
+        assert_cut_inventory(name, state, retained=retained)
         commands = will_commands(state)
         require(len(commands) == (1 if name in ('admission-committed', 'publish-observed',
                                                'finish-committed') else 0),
@@ -194,8 +198,18 @@ async def crash_cut(binary, case, name):
             resumed.no_publication(.2, code='will_never_accepted_or_finished_was_resurrected')
         resumed.no_publication(.12, code='will_duplicate_obligation_after_recovery')
         final = await drained(restart)
-        require(final['counts']['wills'] == 0 and all(final['counts'][name] == 0
+        retained_count = int(retained and name != 'open-prepared')
+        require(final['counts']['wills'] == 0 and all(final['counts'][name] == retained_count
                 for name in ('publications', 'payloads')), 'will_cut_resources_not_reclaimed')
+        if retained_count:
+            current, = final['tables']['retained']
+            require(current['producer_client_id'] == b'cut-source'.hex() and final['counts']['sessions'] == 1,
+                    'retained_will_recovery_source_or_producer_changed')
+            require(expected_publication is None or current['publication'] == expected_publication,
+                    'retained_will_recovery_replaced_publication')
+            require(final['tables']['payloads'][0]['bytes'] == payload.hex()
+                    and int(final['tables']['payloads'][0]['refs'], 16) == 1,
+                    'retained_will_recovery_reference_mismatch')
         all_events = before_events + restart.events()
         admitted = [row for row in all_events if row['kind'] == 'will_admitted']
         require(len(admitted) <= 1, 'will_double_admission_after_recovery')
@@ -224,17 +238,17 @@ async def crash_cut(binary, case, name):
             restart.cleanup()
 
 
-async def lost_result(binary, case, kind, *, held):
+async def lost_result(binary, case, kind, *, held, retained=False):
     """A real engaged result remains one OperationId/canonical recipe through Resolve."""
     broker = Broker(binary, case, test_control=True)
-    source, target = None, None
+    source, target, replacement = None, None, None
     try:
         broker.ready()
         target = WillWire(broker.address, broker.observations, 'unknown-target')
         target.session_connect(TARGET, expected_present=False)
         target.subscribe_options(1, (Subscription('will/cut/#', 1),))
         source = WillWire(broker.address, broker.observations, 'unknown-source')
-        source.will_connect('unknown-source', TOPIC, ('will-unknown-' + kind).encode(), expiry=0)
+        source.will_connect('unknown-source', TOPIC, ('will-unknown-' + kind).encode(), expiry=0, retain=retained)
         file = broker.control / (('hold-' if held else 'drop-next-') + 'will-' + kind + '-result')
         file.touch(exist_ok=False)
         marker = max(int(event['seq']) for event in broker.events())
@@ -244,6 +258,9 @@ async def lost_result(binary, case, kind, *, held):
                           after=marker, predicate=lambda row: row.get('command_kind') == expected_kind)
         operation = operation_hex(lost['operation'])
         initial = durable(broker.db)
+        if retained and kind == 'admission':
+            require(initial['counts']['retained'] == 1, 'retained_will_lost_reply_without_value')
+            require(initial['counts']['wills'] == 0, 'retained_will_lost_reply_left_pending_intent')
         receipts = [row for row in initial['tables']['operations'] if row['id'] == operation]
         require(len(receipts) == 1, 'will_lost_result_was_not_durably_committed')
         canonical = receipts[0]['recipe']
@@ -251,7 +268,7 @@ async def lost_result(binary, case, kind, *, held):
                 'will_lost_result_not_committed_lifecycle_or_admission')
         target.send(b'\xc0\x00')
         target.wait(0xD0)
-        resolved_held = None
+        resolved_held, current = None, None
         if held:
             resolved_held = await fact(broker, 'store_result_held', after=int(lost['seq']),
                                        predicate=lambda row: row.get('operation') == lost['operation']
@@ -259,6 +276,13 @@ async def lost_result(binary, case, kind, *, held):
             interim = durable(broker.db)
             require([row['recipe'] for row in interim['tables']['operations']
                     if row['id'] == operation] == [canonical], 'will_unknown_resolution_changed_recipe')
+            if retained and kind == 'admission':
+                replacement = WillWire(broker.address, broker.observations, 'new-incarnation')
+                replacement.session_connect('unknown-source', expected_present=False, expiry=0)
+                replacement.publish(1, TOPIC, b'newer-online')
+                current, = durable(broker.db)['tables']['retained']
+                require(current['publication'] != initial['tables']['retained'][0]['publication'],
+                        'retained_will_newer_value_not_committed')
             file.unlink()
         resolved = await fact(broker, 'store_resolved', after=int(lost['seq']),
                               predicate=lambda row: row.get('operation') == lost['operation']
@@ -266,14 +290,18 @@ async def lost_result(binary, case, kind, *, held):
         value = target.next_publication(timeout=8)
         received = assert_will_frame(value, TOPIC, ('will-unknown-' + kind).encode())
         target.acknowledge(value)
+        if current is not None:
+            target.receive(b'newer-online', 1, False)
         target.no_publication(.15, code='will_duplicate_after_lost_result')
         final = await drained(broker)
         commands = will_commands(final)
         require(len(commands) == 1, 'will_resolution_created_second_admission')
         require([row['recipe'] for row in final['tables']['operations']
                 if row['id'] == operation] == [canonical], 'will_resolution_replaced_original_recipe')
-        require(final['counts']['wills'] == final['counts']['publications'] == final['counts']['payloads'] == 0,
+        require(final['counts']['wills'] == 0 and final['counts']['publications'] == final['counts']['payloads'] == int(retained),
                 'will_unknown_result_resources_not_reclaimed')
+        if current is not None:
+            require(final['tables']['retained'] == [current], 'retained_will_resolution_overwrote_newer_value')
         write_json(case / 'result-committed.sql.json', initial)
         write_json(case / 'final.sql.json', final)
         target.send(b'\xe0\x00')
@@ -285,7 +313,7 @@ async def lost_result(binary, case, kind, *, held):
                 'received': received, 'commands': commands, 'final_counts': final['counts'],
                 'broker_pid': broker.process.pid, 'broker_status': broker.process.returncode}
     finally:
-        for wire in (source, target):
+        for wire in (source, target, replacement):
             if wire:
                 wire.close()
         broker.cleanup()
@@ -305,13 +333,12 @@ async def main_async(arguments):
         require(head == arguments.binary_source_head, 'will_boundary_source_mismatch')
         if arguments.case == 'all' or arguments.case in CUTS:
             for name in CUTS if arguments.case == 'all' else (arguments.case,):
-                result['cases'].append(await crash_cut(arguments.binary.resolve(), arguments.out / name, name))
-        if arguments.case in ('all', 'results'):
-            for kind in ('end', 'admission'):
-                for held in (False, True):
-                    name = ('held-' if held else 'lost-') + kind
-                    result['cases'].append(await lost_result(arguments.binary.resolve(), arguments.out / name,
-                                                           kind, held=held))
+                result['cases'].append(await crash_cut(arguments.binary.resolve(), arguments.out / name, name, retained=arguments.retained))
+        for name in RESULTS:
+            if arguments.case in ('all', 'results', name):
+                disposition, kind = name.split('-')
+                result['cases'].append(await lost_result(arguments.binary.resolve(), arguments.out / name,
+                    kind, held=disposition == 'held', retained=arguments.retained))
         result['status'] = 'PASS'
         return 0
     except Exception as error:
@@ -328,7 +355,8 @@ def main():
     parser.add_argument('--binary', type=Path, required=True)
     parser.add_argument('--out', type=Path, required=True)
     parser.add_argument('--binary-source-head', required=True)
-    parser.add_argument('--case', choices=('all', 'results', *CUTS), default='all')
+    parser.add_argument('--case', choices=('all', 'results', *CUTS, *RESULTS), default='all')
+    parser.add_argument('--retained', action='store_true')
     return asyncio.run(main_async(parser.parse_args()))
 
 

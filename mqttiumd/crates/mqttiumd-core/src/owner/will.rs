@@ -173,7 +173,7 @@ impl Owner {
             Some(intent.client_id.as_slice()),
             intent.spec.topic.as_slice(),
             Qos::AtLeastOnce,
-            limits.max_targets,
+            limits.max_targets.min(16),
         ) {
             Ok(selected) => selected,
             Err(super::routing::Refusal::Capacity) => return Ok(defer(WillDeferredReason::Fanout)),
@@ -196,7 +196,11 @@ impl Owner {
             draw(&mut draft.counters.payload, PayloadSeq::checked_next)?,
         );
         let mut targets = BoundedVec::with_capacity(selected.len())?;
+        let mut retain_mask = 0u16;
         for (index, target) in selected.iter().enumerate() {
+            if target.rap {
+                retain_mask |= 1 << index;
+            }
             targets
                 .try_push(Target {
                     session: target.session,
@@ -223,11 +227,14 @@ impl Owner {
             },
             costs: Costs {
                 payload_bytes: length,
-                references: References::new(selected.len() as u64),
+                references: References::new(
+                    selected.len() as u64 + u64::from(intent.spec.retain && length.get() != 0),
+                ),
                 exchange_slots: ExchangeSlots::ZERO,
                 receipt_slots: ReceiptSlots::new(1),
             },
             targets,
+            live_retain: intent.spec.retain.then_some(retain_mask),
         });
         let in_flight =
             self.plan_submission(operation, recipe, Some(intent.spec.payload.clone()), draft)?;
@@ -488,6 +495,7 @@ mod tests {
             session: SessionId::new(99),
             client_id: bytes(b"capteur"),
             spec: WillSpec {
+                retain: false,
                 topic: bytes(b"atelier/capteur/status"),
                 payload: bytes(b"offline"),
             },

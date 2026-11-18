@@ -198,6 +198,7 @@ pub(super) fn publish(
     let failed = RejectReason::PreconditionFailed;
     let intent = state.wills.get(&value.will).ok_or(failed)?;
     if intent.state != WillState::Pending
+        || value.live_retain.is_some() != intent.spec.retain
         || value.topic != intent.spec.topic
         || payload != Some(&intent.spec.payload)
         || value.payload.length.get() != intent.spec.payload.len() as u64
@@ -205,25 +206,27 @@ pub(super) fn publish(
         return Err(failed);
     }
     let source_session = intent.session;
+    let source_client = intent.client_id.clone();
+    let retain = intent.spec.retain;
     state.stage_publication(
         Admission {
             expiry: None,
             operation: value.operation,
             request: None,
-            will: Some(value.will),
+            will_source: Some(source_client.as_slice()),
             publication: value.publication,
             source_session,
             source_revision: Revision::new(0),
             inbound: None,
             route_revision: value.route_revision,
             qos: Qos::AtLeastOnce,
-            retain: false,
+            retain,
             topic: &value.topic,
             payload: value.payload,
             costs: value.costs,
             targets: value.targets.as_slice(),
         },
-        None,
+        value.live_retain,
         payload,
     )?;
     state.wills.remove(&value.will).ok_or(failed)?;
@@ -237,14 +240,14 @@ pub(super) fn receipt_capacity(state: &DurableState, canonical: &[u8]) -> Result
     let bytes = state
         .operations
         .values()
-        .filter(|r| r.recipe.get(6) == Some(&8) && r.recipe.get(39) == Some(&5))
+        .filter(|r| r.recipe.get(6) == Some(&8) && matches!(r.recipe.get(39), Some(5 | 7)))
         .try_fold(0usize, |n, r| n.checked_add(r.recipe.len()))
         .ok_or(ReadError::LimitExceeded)?;
     const MAX_BYTES: usize = 8 * 1024 * 1024;
     if bytes > MAX_BYTES {
         return Err(ReadError::LimitExceeded);
     }
-    let is_open = canonical.get(6) == Some(&8) && canonical.get(39) == Some(&5);
+    let is_open = canonical.get(6) == Some(&8) && matches!(canonical.get(39), Some(5 | 7));
     Ok(!is_open
         || bytes
             .checked_add(canonical.len())

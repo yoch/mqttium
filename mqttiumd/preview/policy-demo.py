@@ -187,7 +187,7 @@ def run(binary: Path, out: Path):
                    "offline_publication_refused")
         before = inspect(db)
         inode = db.stat().st_dev, db.stat().st_ino
-        expect(before["schema"] == 11 and before["counts"]["obligations"] == 2
+        expect(before["schema"] == 13 and before["counts"]["obligations"] == 2
                and before["counts"]["retained"] == 1 and before["counts"]["routes"] == 1,
                "original_persistent_responsibilities_missing")
 

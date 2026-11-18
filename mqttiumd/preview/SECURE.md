@@ -5,18 +5,20 @@ the demonstration. First verify the archive member checksums, then run
 
 ```sh
 sha256sum -c SHA256SUMS
-./secure-demo.sh ./secure-demo-data
+python3 retained-will-demo.py ./presence-demo-data
 ```
 
-The demo creates short-lived credentials in a temporary private directory.
-It starts mqttiumd on loopback and waits for the dashboard's SUBACK and the
-sensor's CONNACK and PUBACK. The sensor publishes retained `online`. The
-dashboard receives `offline` in QoS 1 when only the sensor receives SIGKILL.
-It also exercises normal DISCONNECT, a foreign certificate claiming the
-sensor's ClientID, a forbidden wildcard, and an offline Will obligation
-recovered by restarting the broker on the same SQLite file. The demo stores
-the commands, process results and broker events in its data directory.
-Keep that directory separate from any permanent broker database.
+The demo creates temporary credentials and starts mqttiumd on loopback.
+The sensor publishes retained `online` without a dashboard. After SIGKILL,
+mqttiumd commits the retained Will `offline`. A new Mosquitto subscriber
+prints `atelier/capteur-1/status|offline|1|1`. The demo kills and restarts
+the broker on the same file, and a second new dashboard receives the same
+value. The returning sensor publishes `online` and disconnects normally.
+A new dashboard then sees `online|1|1`. Use a new demo directory for the
+SQLite file, process results and broker events.
+
+`./secure-demo.sh ./secure-demo-data` exercises the non-retained Will and
+the authorization refusals with its own database.
 
 ## Bring up a private broker
 
@@ -45,11 +47,15 @@ mosquitto_sub -V mqttv5 -h 127.0.0.1 -p 8883 --tls-version tlsv1.3 \
 
 mosquitto_pub -V mqttv5 -h 127.0.0.1 -p 8883 --tls-version tlsv1.3 \
   --cafile demo-pki/ca.crt --cert demo-pki/sensor.crt --key demo-pki/sensor.key \
-  -i capteur-1 -q 1 -r -t atelier/capteur-1/status -m online
+  -i capteur-1 -q 1 -r -d -l -t atelier/capteur-1/status \
+  --will-topic atelier/capteur-1/status --will-payload offline --will-qos 1 \
+  --will-retain -D will will-delay-interval 0
 ```
 
-Use the automated demo for the actual signal and Will scenario. The one-shot
-publisher above disconnects normally. A dashboard certificate using
+Enter `online` and wait for PUBACK. Kill the publisher process with SIGKILL
+to trigger the Will. Sending EOF at its stdin issues a normal MQTT DISCONNECT
+and cancels the Will. Use a fresh subscription after the loss to see RETAIN=1;
+live delivery follows the subscriber's RAP option. A dashboard certificate using
 `-i capteur-1` receives CONNACK `0x87`. An authenticated dashboard subscribing
 to `#` receives DISCONNECT `0x87`. The authorized subtree starts at `atelier`.
 
@@ -83,8 +89,9 @@ The trusted CA file supplies the trust anchors for client verification and
 for checking the server chain at startup. Clients also check the server name.
 Use a trustworthy system wall clock for X.509 dates.
 
-This secure profile uses SQLite schema 11. The historical loopback profile
-uses schema 10 and a different database. Use the
+This secure profile uses SQLite schema 13. The loopback profile uses schema
+12 and a different database. Older schemas, including 10 and 11, are refused
+without modification or migration. Use the
 [offline policy tool](POLICY.md) to add devices or expand grants while
 retaining the stored authority and work. Startup requires the exact committed
 authorization policy. This preview offers static

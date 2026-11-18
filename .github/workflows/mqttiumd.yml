@@ -655,6 +655,8 @@ jobs:
         run: tools/run_secure_reception.sh "$RUNNER_TEMP/secure-preview"
       - name: Monotone policy transition, backup recovery, atomic cuts and extracted onboarding
         run: tools/run_policy_transition_reception.sh "$RUNNER_TEMP/policy-transition" "$RUNNER_TEMP/secure-preview"
+      - name: Retained Will presence, ordering, crash cuts and mutations
+        run: tools/run_retained_will_reception.sh "$RUNNER_TEMP/retained-will" "$RUNNER_TEMP/secure-preview"
       - name: Publish the normal sealed archive
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -676,4 +678,11 @@ jobs:
         with:
           name: mqttiumd-policy-transition-${{ github.event.pull_request.head.sha || github.sha }}
           path: ${{ runner.temp }}/policy-transition
+          if-no-files-found: warn
+      - name: Preserve retained Will observations
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: mqttiumd-retained-will-${{ github.event.pull_request.head.sha || github.sha }}
+          path: ${{ runner.temp }}/retained-will
           if-no-files-found: warn

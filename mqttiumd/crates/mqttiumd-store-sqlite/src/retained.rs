@@ -336,13 +336,20 @@ pub(super) fn install(
     topic: &[u8],
     publication: PublicationId,
     source: SessionId,
+    will_source: Option<&[u8]>,
 ) -> Guard<()> {
-    let client = conn
-        .prepare_cached("SELECT client_id FROM sessions WHERE id=?1")?
-        .query_row([source.to_be_bytes().as_slice()], |row| {
-            reader::copy_blob(row, 0, MAX_CLIENT_ID_BYTES)
-        })?;
-    if client.is_empty() || client.contains(&0) || std::str::from_utf8(&client).is_err() {
+    let session_client;
+    let client = if let Some(client) = will_source {
+        client
+    } else {
+        session_client = conn
+            .prepare_cached("SELECT client_id FROM sessions WHERE id=?1")?
+            .query_row([source.to_be_bytes().as_slice()], |row| {
+                reader::copy_blob(row, 0, MAX_CLIENT_ID_BYTES)
+            })?;
+        &session_client
+    };
+    if client.is_empty() || client.contains(&0) || std::str::from_utf8(client).is_err() {
         return refused(RejectReason::PreconditionFailed);
     }
     conn.prepare_cached(

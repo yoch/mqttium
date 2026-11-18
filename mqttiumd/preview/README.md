@@ -86,8 +86,9 @@ request the Will. Shutdown or broker failure may defer it until the next start.
 Delay0 takeover publishes the old connection's Will before establishing its
 replacement; the new connection installs its own Will or explicitly none.
 
-The Will profile is **QoS1, non retained, delay absent/0, bounded exact topic
-and payload**. QoS0/2 Will, retained Will, nonzero Will Delay and every other
+The Will profile is **QoS1, optional Retain, delay absent/0, bounded exact topic
+and payload**. See the [retained presence demo over mTLS](SECURE.md).
+QoS0/2 Will, nonzero Will Delay and every other
 Will property (including Will Message Expiry) are explicitly refused. A pending
 Will remains durable during insufficient message capacity or excessive fanout;
 it is not silently truncated. Its admission can therefore be delayed. This

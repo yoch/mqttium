@@ -53,7 +53,7 @@ def build_pinned(out: Path, target: Path, root: Path, source: str) -> Path:
     shutil.copy2(binary, package / "mqttiumd")
     for name in ("README.md", "start.sh", "demo.sh", "expiry-demo.sh", "will-demo.sh",
                  "SECURE.md", "start-tls.sh", "secure-demo.sh", "demo-pki.py", "identities.example.json",
-                 "POLICY.md", "policy-demo.py", "identities.next.example.json"):
+                 "POLICY.md", "policy-demo.py", "identities.next.example.json", "retained-will-demo.py"):
         shutil.copy2(root / "preview" / name, package / name)
     (package / "NORMAL-FEATURES.txt").write_text(features)
     runtime = command("ldd", str(binary))
@@ -105,13 +105,13 @@ def build_pinned(out: Path, target: Path, root: Path, source: str) -> Path:
         "compiler": command("rustc", "-Vv"), "profile": "release", "features": [],
         "build_options": ["--release", "--locked", "--no-default-features", "-p", "mqttiumd"],
         "build_environment": {key: os.environ.get(key) for key in ("RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS", "CARGO_PROFILE_RELEASE_DEBUG", "CARGO_PROFILE_RELEASE_OPT_LEVEL", "CARGO_PROFILE_RELEASE_OVERFLOW_CHECKS")},
-        "sqlite_schema": 10, "instrumented": False,
-        "listener_profiles": {"loopback_cleartext": {"sqlite_schema": 10, "tls": False},
-            "private_mtls": {"sqlite_schema": 11, "tls_version": "TLS1.3",
+        "sqlite_schema": 12, "instrumented": False,
+        "listener_profiles": {"loopback_cleartext": {"sqlite_schema": 12, "tls": False},
+            "private_mtls": {"sqlite_schema": 13, "tls_version": "TLS1.3",
                 "client_certificate": "required", "tls_resumption": False, "early_data": False}},
-        "will_profile": {"qos": 1, "retain": False, "delay_interval": 0,
+        "will_profile": {"qos": 1, "retain": True, "delay_interval": 0,
                          "message_expiry": False, "intent_slots": 256, "payload_bytes": 8388608},
-        "offline_policy": {"plan_format": "mqttiumd.policy-plan.v1", "sqlite_schema": 11,
+        "offline_policy": {"plan_format": "mqttiumd.policy-plan.v1", "sqlite_schema": 13,
                            "scope": "monotone", "tool": "mqttiumd policy"},
         "binary_sha256": hashlib.sha256(binary.read_bytes()).hexdigest(),
         "runtime_dependencies": runtime.splitlines(),

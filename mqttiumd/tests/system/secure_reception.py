@@ -92,8 +92,9 @@ class Peer(MessageExpiryWire):
             self.observations.record_bytes("client_rx", data, label=self.label)
             self.frames.extend(self.decoder.feed(data))
 
-    def open(self, client_id, *, qos_window=8, expiry=INFINITE, will=None, clean=False, keep_alive=30, reason=0):
-        flags = int(clean) * 2 | (0x0c if will else 0)
+    def open(self, client_id, *, qos_window=8, expiry=INFINITE, will=None, will_retain=False,
+             clean=False, keep_alive=30, reason=0):
+        flags = int(clean) * 2 | ((0x0c | int(will_retain) * 0x20) if will else 0)
         props = b"\x11" + expiry.to_bytes(4, "big") + b"\x21" + qos_window.to_bytes(2, "big")
         body = b"\x00\x04MQTT\x05" + bytes([flags]) + keep_alive.to_bytes(2, "big")
         body += variable_integer(len(props)) + props + utf8(client_id)
@@ -141,7 +142,7 @@ def broker_with(binary, out, pki, *, db=None, label="broker", pauses=(), policy=
         ready = child.ready()["details"]
         require(ready["profile"] == ("mtls-will-pubsub-v1" if pki else "tcp-will-pubsub-v1"),
                 "requested_security_profile_not_ready")
-        require(ready["sqlite_schema"] == (11 if pki else 10), "wrong_security_schema")
+        require(ready["sqlite_schema"] == (13 if pki else 12), "wrong_security_schema")
         return child
     except BaseException:
         child.cleanup()
@@ -152,7 +153,7 @@ def state(broker):
     with sqlite3.connect(broker.db.as_uri() + "?mode=ro", uri=True) as sql:
         counts = {table: sql.execute(f"SELECT count(*) FROM {table}").fetchone()[0]
                   for table in ("sessions", "routes", "wills", "retained", "obligations", "outbound", "payloads", "operations")}
-        if sql.execute("PRAGMA user_version").fetchone()[0] == 11:
+        if sql.execute("PRAGMA user_version").fetchone()[0] == 13:
             counts["owners"] = sql.execute(
                 "SELECT CAST(s.client_id AS TEXT), hex(s.id), o.principal FROM sessions s "
                 "JOIN security_session_owners o ON o.session=s.id ORDER BY s.client_id"

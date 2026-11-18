@@ -116,7 +116,7 @@ struct Admission<'a> {
     expiry: Option<MessageExpiry>,
     operation: OperationId,
     request: Option<mqttiumd_contract::ids::RequestId>,
-    will: Option<OperationId>,
+    will_source: Option<&'a [u8]>,
     publication: PublicationId,
     source_session: SessionId,
     source_revision: Revision,
@@ -138,7 +138,7 @@ impl<'a> From<&'a AdmitPublication> for Admission<'a> {
             expiry: None,
             operation: a.operation,
             request: Some(a.request),
-            will: None,
+            will_source: None,
             publication: a.publication,
             source_session: a.source.session,
             source_revision: a.source.session_revision,
@@ -159,7 +159,7 @@ impl<'a> From<&'a mqttiumd_contract::retained::RetainedQos0> for Admission<'a> {
             expiry: None,
             operation: a.operation,
             request: Some(a.request),
-            will: None,
+            will_source: None,
             publication: a.publication,
             source_session: a.session,
             source_revision: a.session_revision,
@@ -917,7 +917,7 @@ fn stage_publication(
     {
         return refused(failed);
     }
-    if admit.will.is_none() {
+    if admit.will_source.is_none() {
         active_session(conn, admit.source_session, admit.source_revision)?;
     }
 
@@ -1072,6 +1072,7 @@ fn stage_publication(
             admit.topic.as_slice(),
             admit.publication,
             admit.source_session,
+            admit.will_source,
         )?;
     }
     discard_completed_publication(conn, &publication)?;

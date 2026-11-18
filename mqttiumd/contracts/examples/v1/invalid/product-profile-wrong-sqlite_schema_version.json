@@ -110,7 +110,7 @@
   "will_qos": [
     1
   ],
-  "will_retain": false,
+  "will_retain": true,
   "will_delay_interval": [
     0
   ],

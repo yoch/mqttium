@@ -29,6 +29,7 @@ TIMED_REPLAY_SUBSCRIPTIONS = 14
 MARK_DELIVERY_STARTED = 15
 EXPIRE_DELIVERY = 16
 WILL_PUBLICATION = 17
+RETAINED_WILL_PUBLICATION = 18
 MAX_RETAINED_REPLAYS = 256
 MAX_RETAINED_TARGETS = 16
 MAX_SESSION_CLIENT_BYTES = 1024
@@ -114,6 +115,7 @@ class WillPublication:
     payload_length: int
     costs: tuple
     targets: tuple
+    live_retain: int | None
 
     kind = "WillPublication"
 
@@ -305,6 +307,7 @@ class SessionOpenAt:
 class WillSpec:
     topic: bytes
     payload: bytes
+    retain: bool
 
 
 @dataclass(frozen=True)
@@ -409,7 +412,7 @@ class _Reader:
             raise RecipeError("message expiry deadline overflow")
         return value
 
-    def will_spec(self) -> WillSpec:
+    def will_spec(self, retain: bool) -> WillSpec:
         length = self.number(2)
         if not 1 <= length <= MAX_WILL_TOPIC_BYTES:
             raise RecipeError("invalid Will topic length")
@@ -419,7 +422,7 @@ class _Reader:
         length = self.number(4)
         if length > MAX_WILL_PAYLOAD_BYTES:
             raise RecipeError("invalid Will payload length")
-        return WillSpec(topic, self.take(length))
+        return WillSpec(topic, self.take(length), retain)
 
 
 def _valid_filter(topic: bytes) -> bool:
@@ -469,7 +472,7 @@ def decode(data: bytes, *, _target_limit: int | None = None):
     if reader.number(2) != FORMAT:
         raise RecipeError("unknown format")
     kind = reader.number(1)
-    if kind == WILL_PUBLICATION:
+    if kind in (WILL_PUBLICATION, RETAINED_WILL_PUBLICATION):
         operation, will, publication = reader.scoped(), reader.scoped(), reader.scoped()
         route_revision = reader.number(8)
         topic_length = reader.number(2)
@@ -488,8 +491,11 @@ def decode(data: bytes, *, _target_limit: int | None = None):
                        or target.cause != 1 for index, target in enumerate(targets))
                 or any(left.session >= right.session for left, right in zip(targets, targets[1:]))):
             raise RecipeError("invalid Will publication field")
+        live_retain = reader.number(2) if kind == RETAINED_WILL_PUBLICATION else None
+        if live_retain is not None and live_retain >> count:
+            raise RecipeError("invalid Will live RETAIN mask")
         recipe = WillPublication(operation, will, publication, route_revision, topic,
-                                 payload, length, costs, targets)
+                                 payload, length, costs, targets, live_retain)
     elif kind == EXPIRING_PUBLICATION:
         admission = _nested(reader, (ADMIT_PUBLICATION, RETAINED_PUBLICATION, RETAINED_QOS0))
         if isinstance(admission, Admit):
@@ -678,13 +684,15 @@ def decode(data: bytes, *, _target_limit: int | None = None):
             detached_operation = reader.scoped()
             deadline = reader.number(8) if reader.boolean() else None
             recipe = SessionExpire(operation, guard, detached_operation, deadline, reader.number(8))
-        elif action == 5:
+        elif action in (5, 7):
             clean_start = reader.boolean()
             expiry = reader.session_expiry()
             expected = reader.session_guard() if reader.boolean() else None
             client = reader.client_id()
             now = reader.number(8)
-            will = reader.will_spec() if reader.boolean() else None
+            will = reader.will_spec(action == 7) if reader.boolean() else None
+            if action == 7 and will is None:
+                raise RecipeError("retained Will descriptor is required")
             recipe = SessionOpenWillAt(operation, clean_start, expiry, expected, client, now, will)
         elif action == 6:
             guard = reader.session_guard()

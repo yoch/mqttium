@@ -4,10 +4,10 @@ The optional mTLS listener uses TLS 1.3, explicit client certificate pins,
 ClientID ownership and static topic grants. The legacy plaintext listener
 accepts loopback addresses only. For setup, see the [secure preview guide](../preview/SECURE.md)
 and [Proposed 0035](decisions/0035-private-mtls-profile.md). The secure
-SQLite profile uses schema 11 and a separate database from schema 10.
+SQLite profile uses schema 13 and a separate database from schema 12.
 The sections below describe the shared MQTT behavior and historical loopback profile.
 
-The product receives MQTT 5 QoS 0/1/2 publications, including durable retained values, Message Expiry and zero-delay non-retained QoS1 Wills, and delivers
+The product receives MQTT 5 QoS 0/1/2 publications, including durable retained values, Message Expiry and zero-delay QoS1 Wills with optional Retain, and delivers
 at QoS 0 or 1 to persistent exact and hierarchical subscriptions. Sessions and filters
 are durable. Initially non-retained QoS 0 publications use a bounded volatile path;
 QoS 1/2 admissions atomically create durable recipient obligations. This is
@@ -713,7 +713,7 @@ shared subscriptions, outgoing QoS 2, dynamic authentication or schema migration
 
 ## Zero-delay durable Will (Proposed0034)
 
-The normal preview supports CONNECT Will QoS1, RETAIN=0 and delay absent/zero.
+The normal preview supports CONNECT Will QoS1, both RETAIN values and delay absent/zero.
 Use `preview/will-demo.sh /tmp/mqttiumd-sensor-demo` with Mosquitto clients to
 observe retained `online`, a real sensor-process SIGKILL and non-retained
 `offline`. The package guide starts with these commands. The broker binds
@@ -745,17 +745,35 @@ Fanout or message-capacity pressure retains Pending state and emits a bounded
 continuation and100ms recovery scan run independently of ordinary notifications.
 No historical intention row remains after cancellation or admission.
 
-Schema10 refuses older formats before modification. Kind8 adds action5/6;
-historical canonical actions0–4 and recipe kinds1–16 remain unchanged. The
+The original Will uses kind 8 actions 5/6 and kind 17 for the admission. The
 standalone finite model and Will system tests are separate from the historically
 qualified K1/K2b/K3 fixture campaigns. Hex-encoded maximum-capacity Will snapshots
 may exceed the independent document reader's16MiB evidence budget: that reader
 refuses them; product bounded raw readers retain their32MiB limit.
 
-Will Message Expiry, QoS0/2 Will, retained Will, nonzero Will Delay and other Will
+Will Message Expiry, QoS0/2 Will, nonzero Will Delay and other Will
 properties are explicitly refused. Cancellation survives a crash only after its
 transaction commits; a parsed normal DISCONNECT followed by an earlier crash
 cannot leave recoverable proof of an uncommitted cancellation. Server shutdown
 or failure may defer Wills until restart. This is not a guarantee of notification
 before a server SIGKILL, power-loss certification, or complete MQTT compliance.
 The [secure preview guide](../preview/SECURE.md) exercises this Will behavior over mTLS.
+
+## Retained presence (Proposed0037)
+
+Run `python3 retained-will-demo.py ./presence-demo-data` from the extracted
+mTLS preview. A retained Will replaces the stored value without subscribers.
+An empty Will clears the value and is delivered live according to the same
+QoS and RAP rules as other retained publications. Fresh SUBSCRIBE replay uses
+the saved producer ClientID for No Local even after the source session ends.
+Already owed deliveries preserve their original payloads and QoS.
+
+Kind 8 action 7 installs the retained intent. Kind 18 admits it and appends a
+live RAP bitmap. Older canonical encodings are unchanged. The retained reference,
+live obligations, intent consumption and receipt have one commit boundary.
+Same-ClientID CONNECT waits on the durable Will barrier, including while the
+retained inventory or fanout is at capacity. The event `will_connect_deferred`
+identifies a waiting transport. A reconnect timeout can require another attempt.
+Existing and unrelated connections keep progressing. SQLite schemas 12 and
+13 reject older formats before modification. The [decision](decisions/0037-retained-will.md)
+describes the ordering and the bounded deferral.

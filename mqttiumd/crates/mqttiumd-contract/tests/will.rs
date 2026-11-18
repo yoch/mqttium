@@ -16,6 +16,7 @@ fn bytes(value: &[u8]) -> SharedBytes {
 #[test]
 fn will_open_end_and_publication_have_distinct_strict_roundtrips() {
     let spec = WillSpec {
+        retain: false,
         topic: bytes(b"atelier/capteur/status"),
         payload: bytes(b"offline"),
     };
@@ -46,6 +47,7 @@ fn will_open_end_and_publication_have_distinct_strict_roundtrips() {
         }),
     ];
     recipes.push(Recipe::WillPublication(WillPublication {
+        live_retain: None,
         operation: op(3),
         will: op(1),
         publication: PublicationId::new(
@@ -78,6 +80,35 @@ fn will_open_end_and_publication_have_distinct_strict_roundtrips() {
         recipe.encode_canonical(&mut raw).unwrap();
         assert_eq!(raw[6], if i == 2 { 17 } else { 8 });
         assert_eq!(Recipe::decode_canonical(&raw, 16, 1024).unwrap(), *recipe);
+        if i == 0 {
+            assert_eq!(raw[39], 5);
+            raw[39] = 7;
+            let retained = Recipe::decode_canonical(&raw, 16, 1024).unwrap();
+            assert!(
+                matches!(&retained, Recipe::SessionLifecycle(SessionLifecycle {
+                action: SessionAction::OpenWillAt { will: Some(value), .. }, ..
+            }) if value.retain)
+            );
+            let mut encoded = vec![];
+            retained.encode_canonical(&mut encoded).unwrap();
+            assert_eq!(raw, encoded);
+        } else if i == 2 {
+            raw[6] = 18;
+            raw.extend_from_slice(&[0, 0]);
+            let retained = Recipe::decode_canonical(&raw, 16, 1024).unwrap();
+            assert!(
+                matches!(&retained, Recipe::WillPublication(value) if value.live_retain == Some(0))
+            );
+            let mut encoded = vec![];
+            retained.encode_canonical(&mut encoded).unwrap();
+            assert_eq!(raw, encoded);
+            *raw.last_mut().unwrap() = 1;
+            assert_eq!(
+                Recipe::decode_canonical(&raw, 16, 1024),
+                Err(RecipeError::InvalidField("will_live_retain"))
+            );
+            *raw.last_mut().unwrap() = 0;
+        }
         for n in 0..raw.len() {
             assert!(Recipe::decode_canonical(&raw[..n], 16, 1024).is_err());
         }
@@ -99,6 +130,7 @@ fn invalid_will_is_rejected_before_encoding() {
     for topic in [b"".as_slice(), b"a/+", b"a/#", b"a\0b", b"\xff"] {
         assert!(
             WillSpec {
+                retain: false,
                 topic: bytes(topic),
                 payload: bytes(b"secret")
             }
@@ -109,6 +141,7 @@ fn invalid_will_is_rejected_before_encoding() {
     let payload = vec![1; MAX_WILL_PAYLOAD_BYTES + 1];
     assert!(
         WillSpec {
+            retain: false,
             topic: bytes(b"t"),
             payload: SharedBytes::copy_from(&payload, payload.len()).unwrap()
         }

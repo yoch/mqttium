@@ -82,7 +82,7 @@
   "session_clock_degraded_after_ms": 31000,
   "max_session_expiry_timers": 128,
   "session_expiry_batch": 4,
-  "sqlite_schema_version": 10,
+  "sqlite_schema_version": 12,
   "wildcard_subscriptions": true,
   "no_local": true,
   "shared_subscriptions": false,

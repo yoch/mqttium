@@ -28,17 +28,19 @@ class Will:
     topic: str
     payload: bytes = b'offline'
     delay: int | None = 0
+    retain: bool = False
 
     def __post_init__(self):
         if (not isinstance(self.topic, str) or not 0 < len(self.topic.encode()) <= 1024
                 or any(value in self.topic for value in ('\0', '+', '#'))
                 or not isinstance(self.payload, bytes) or len(self.payload) > 32768
+                or type(self.retain) is not bool
                 or not (self.delay is None or type(self.delay) is int and self.delay == 0)):
-            raise ValueError('non-retained QoS1 Will, exact topic, bounded payload and delay0 required')
+            raise ValueError('QoS1 Will, exact topic, bounded payload and delay0 required')
 
     def observation(self):
         return {'topic': self.topic, 'payload_sha256': hashlib.sha256(self.payload).hexdigest(),
-                'payload_bytes': len(self.payload), 'qos': 1, 'retain': False,
+                'payload_bytes': len(self.payload), 'qos': 1, 'retain': self.retain,
                 'will_delay_present': self.delay is not None, 'will_delay_interval': self.delay}
 
 
@@ -68,7 +70,7 @@ class MqttiumWill(MqttiumRetained):
                 max_unacknowledged_bytes=65536, max_write_queue_messages=32,
                 max_write_queue_bytes=65536, message_delivery='iterator', manual_ack=True,
                 max_iterator_messages=32, max_iterator_bytes=65536, connect_timeout=3,
-                will=PublishMessage(will.topic, will.payload, qos=1, retain=False,
+                will=PublishMessage(will.topic, will.payload, qos=1, retain=will.retain,
                                     properties=None if will.delay is None else
                                     Properties({'will_delay_interval': will.delay})))
 
@@ -95,7 +97,7 @@ class PahoWill(PahoRetained):
             if will.delay is not None:
                 properties = PahoProperties(PacketTypes.WILLMESSAGE)
                 properties.WillDelayInterval = will.delay
-            self.client.will_set(will.topic, will.payload, qos=1, retain=False, properties=properties)
+            self.client.will_set(will.topic, will.payload, qos=1, retain=will.retain, properties=properties)
             self.parameters['will'] = will.observation()
 
     async def open(self, expected=None):
@@ -110,7 +112,7 @@ class PahoWill(PahoRetained):
 
 async def sensor(arguments):
     constructor = MqttiumWill if arguments.client == 'mqttium' else PahoWill
-    will = Will(arguments.topic, b'offline', None if arguments.delay_absent else 0)
+    will = Will(arguments.topic, b'offline', None if arguments.delay_absent else 0, arguments.retain)
     client = constructor((arguments.host, arguments.port), arguments.client_id, will=will,
                          expiry=arguments.expiry, events_path=arguments.events)
     result = {'client': arguments.client, 'client_id': arguments.client_id, 'pid': os.getpid(),
@@ -152,6 +154,7 @@ def main():
     parser.add_argument('--topic', required=True)
     parser.add_argument('--expiry', type=int, default=INFINITE)
     parser.add_argument('--delay-absent', action='store_true')
+    parser.add_argument('--retain', action='store_true')
     for name in ('events', 'ready', 'finish', 'result'):
         parser.add_argument('--' + name, type=Path, required=True)
     args = parser.parse_args()

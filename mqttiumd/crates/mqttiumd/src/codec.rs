@@ -532,11 +532,14 @@ fn client_connect(body: &[u8], bounds: Bounds) -> Result<Packet, Error> {
     let expiry = SessionExpiry::from_wire(props.expiry.unwrap_or(0));
     let will_outside_profile = will_fields.as_ref().is_some_and(|(_, _, properties)| {
         ((flags >> 3) & 3) != 1
-            || flags & 0x20 != 0
             || properties.will_delay.is_some_and(|delay| delay != 0)
             || properties.unsupported
     });
-    if flags & !(2 | 0x0c) != 0 || expiry.is_none() || props.unsupported || will_outside_profile {
+    if flags & !(2 | 0x0c | 0x20) != 0
+        || expiry.is_none()
+        || props.unsupported
+        || will_outside_profile
+    {
         return Err(Error {
             peer_maximum,
             ..unsupported("ConnectOutsideProfile")
@@ -568,6 +571,7 @@ fn client_connect(body: &[u8], bounds: Bounds) -> Result<Packet, Error> {
     let will = will_fields
         .map(|(topic, payload, _)| {
             Ok(WillSpec {
+                retain: flags & 0x20 != 0,
                 topic: SharedBytes::copy_from(topic, bounds.max_topic.min(MAX_WILL_TOPIC_BYTES))
                     .map_err(|_| Error {
                         peer_maximum,
@@ -1401,7 +1405,7 @@ mod tests {
             &will_connect(
                 EXPIRY,
                 &[0x18, 0, 0, 0, 0],
-                0x0e,
+                0x2e,
                 b"atelier/sensor/status",
                 payload,
             ),
@@ -1411,6 +1415,7 @@ mod tests {
             panic!("CONNECT")
         };
         let will = value.will.unwrap();
+        assert!(will.retain);
         assert_eq!(will.topic.as_slice(), b"atelier/sensor/status");
         assert_eq!(will.payload.as_slice(), payload);
         let diagnostic = format!("{will:?}");
@@ -1424,7 +1429,7 @@ mod tests {
 
     #[test]
     fn will_profile_refusals_do_not_accept_ignored_properties() {
-        for flags in [0x04, 0x14, 0x2c] {
+        for flags in [0x04, 0x14, 0x24, 0x34] {
             kind(
                 decode(
                     0x10,

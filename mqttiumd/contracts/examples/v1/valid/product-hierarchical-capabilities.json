@@ -9,7 +9,7 @@
     "no_local": true,
     "shared_subscriptions": false,
     "subscription_identifiers": false,
-    "sqlite_schema": 10,
+    "sqlite_schema": 12,
     "profile": "tcp-will-pubsub-v1",
     "retained_available": true,
     "retained_topics": 32,

@@ -76,7 +76,7 @@ Output is one JSON document. Operational causes include `wrong_schema`,
 `non_monotone_policy_change`, `invalid_durable_state`, `capacity_exceeded`,
 `writer_alive`, `backup_failed` and `stale_plan`. `commit_unknown` and
 `readback_failed` require a fresh inspection before reporting success.
-The accepted format is secure schema 11 with the broker's existing inventory
+The accepted format is secure schema 13 with the broker's existing inventory
 budgets and a 128 MiB page-image limit for this offline operation.
 
 ## Restore

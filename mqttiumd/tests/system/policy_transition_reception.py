@@ -188,7 +188,7 @@ def normal_refusals(binary, case, root, pki, old, new):
         before = hashlib.sha256(clear.db.read_bytes()).hexdigest()
         bad_schema = Case(binary, root / "legacy", clear.db, case.old, case.new)
         wrong = bad_schema.expect("plan", "legacy", "wrong_schema")
-        require(wrong["schema_found"] == 10 and hashlib.sha256(clear.db.read_bytes()).hexdigest() == before,
+        require(wrong["schema_found"] == 12 and hashlib.sha256(clear.db.read_bytes()).hexdigest() == before,
                 "wrong_schema_touched_file")
         result["legacy"] = bad_schema.calls
     finally:

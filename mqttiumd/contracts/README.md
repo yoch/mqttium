@@ -710,3 +710,18 @@ and commit facts. The fixture-based qualifier explicitly excludes Will
 intentions/publications; this format support does not qualify Will semantics.
 Historical K1/K2b/K3 retain their exact profile, reconstruction requirements
 and source/oracle identities.
+
+### Retained Will (Proposed0037)
+
+Kind8 action7 has the body of action5 and requires the descriptor. It
+declares `WillSpec.retain`. Kind18 has the body of kind17 followed by a u16
+live RETAIN mask in big-endian order. Bit i is the frozen RAP decision for
+canonical target i. Unused bits are invalid. Kind17 and kind8 actions0–6
+keep their exact bytes. Retained Will admission and consumption of its intent
+share the transaction that adds the live obligations and retained reference.
+
+Snapshot `wills` entries can carry the boolean `retain`. Historical omission
+means false. `will_admitted` can report the boolean `retained` without topic
+or payload bytes. The separate loopback/mTLS SQLite profile versions are
+12/13. The independent reader decodes both new tags. Neither the new layout
+nor the system reception expands fixture-based qualification.
