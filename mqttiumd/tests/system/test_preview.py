@@ -29,7 +29,8 @@ class PreviewCommandTests(unittest.TestCase):
             root=Path(temporary)/"repo"/"mqttiumd"
             (root/"preview").mkdir(parents=True)
             for name in ("README.md", "start.sh", "demo.sh", "expiry-demo.sh", "will-demo.sh",
-                         "SECURE.md", "start-tls.sh", "secure-demo.sh", "demo-pki.py", "identities.example.json"):
+                         "SECURE.md", "start-tls.sh", "secure-demo.sh", "demo-pki.py", "identities.example.json",
+                         "POLICY.md", "policy-demo.py", "identities.next.example.json"):
                 (root/"preview"/name).write_text("fixture "+name)
             for name in ("LICENSE","NOTICE"):
                 (root.parent/name).write_text("license fixture")
@@ -54,7 +55,8 @@ class PreviewCommandTests(unittest.TestCase):
             with tarfile.open(archive) as packed:
                 names=packed.getnames()
                 self.assertTrue(any(name.endswith("/will-demo.sh") for name in names),"packaged_will_demo_missing")
-                for name in ("SECURE.md", "start-tls.sh", "secure-demo.sh", "demo-pki.py", "identities.example.json"):
+                for name in ("SECURE.md", "start-tls.sh", "secure-demo.sh", "demo-pki.py", "identities.example.json",
+                             "POLICY.md", "policy-demo.py", "identities.next.example.json"):
                     self.assertTrue(any(member.endswith("/" + name) for member in names), name)
                 info=next(item for item in packed.getmembers() if item.name.endswith("/BUILD.json"))
                 build=json.load(packed.extractfile(info))
@@ -67,6 +69,10 @@ class PreviewCommandTests(unittest.TestCase):
             self.assertEqual(build["will_profile"],{"qos":1,"retain":False,"delay_interval":0,"message_expiry":False,"intent_slots":256,"payload_bytes":8388608})
             self.assertEqual(build["features"],[])
             self.assertFalse(build["instrumented"])
+            self.assertEqual(build["offline_policy"], {
+                "plan_format": "mqttiumd.policy-plan.v1", "sqlite_schema": 11,
+                "scope": "monotone", "tool": "mqttiumd policy",
+            })
 
     def test_dependency_download_progress_cannot_prefix_metadata_json(self):
         output = command(sys.executable, "-c",

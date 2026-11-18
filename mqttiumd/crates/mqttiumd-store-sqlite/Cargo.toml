@@ -14,7 +14,8 @@ mqttiumd-store-api = { path = "../mqttiumd-store-api" }
 # `bundled` compiles the SQLite amalgamation pinned by libsqlite3-sys: the
 # same engine on every machine and in CI, whatever the system provides
 # (DEM-011). The binding holds the `unsafe`; this crate forbids it.
-rusqlite = { version = "=0.43.0", default-features = false, features = ["bundled", "cache"] }
+rusqlite = { version = "=0.43.0", default-features = false, features = ["bundled", "cache", "backup"] }
+sha2 = "=0.11.1"
 
 [lints]
 workspace = true

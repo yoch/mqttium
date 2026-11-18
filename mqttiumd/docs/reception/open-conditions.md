@@ -194,8 +194,14 @@ Proposed 0035 adds a private MQTT 5 listener using TLS 1.3 and mandatory
 client certificates. Durable ClientID ownership and immutable authorization
 policy bound session recovery. See [the secure preview guide](../../preview/SECURE.md).
 
+Proposed 0036 provides a read-only plan and a single-transaction offline apply
+for monotone authorization changes on schema 11. The tool preserves historic
+MQTT state and makes a verified standalone backup before changing authority.
+Grant removal and principal or ClientID transfer still need explicit
+reconciliation. See [the offline operator guide](../../preview/POLICY.md).
+
 Username/password, certificate and ACL reload, remote administration,
-automated rotation and revocation, tenant isolation, and offline migration
+automated rotation and revocation, tenant isolation, and restrictive policy changes
 remain separate. System reception reports finite service distributions for
 the verified environment. MQTT conformance and storage power-loss behavior
 retain their separate evidence requirements.

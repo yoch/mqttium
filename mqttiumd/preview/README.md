@@ -1,6 +1,7 @@
 # mqttiumd — MQTT 5 preview for private networks
 
 [Run the TLS 1.3 demonstration and provision two client identities](SECURE.md).
+[Add a sensor to an existing mTLS database with plan and apply](POLICY.md).
 The historical loopback demonstration is below.
 
 Extract on compatible Linux x86_64 with glibc (see `BUILD.json` and `RUNTIME.txt`).

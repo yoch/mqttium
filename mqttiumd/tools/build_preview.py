@@ -52,7 +52,8 @@ def build_pinned(out: Path, target: Path, root: Path, source: str) -> Path:
     package.mkdir()
     shutil.copy2(binary, package / "mqttiumd")
     for name in ("README.md", "start.sh", "demo.sh", "expiry-demo.sh", "will-demo.sh",
-                 "SECURE.md", "start-tls.sh", "secure-demo.sh", "demo-pki.py", "identities.example.json"):
+                 "SECURE.md", "start-tls.sh", "secure-demo.sh", "demo-pki.py", "identities.example.json",
+                 "POLICY.md", "policy-demo.py", "identities.next.example.json"):
         shutil.copy2(root / "preview" / name, package / name)
     (package / "NORMAL-FEATURES.txt").write_text(features)
     runtime = command("ldd", str(binary))
@@ -110,6 +111,8 @@ def build_pinned(out: Path, target: Path, root: Path, source: str) -> Path:
                 "client_certificate": "required", "tls_resumption": False, "early_data": False}},
         "will_profile": {"qos": 1, "retain": False, "delay_interval": 0,
                          "message_expiry": False, "intent_slots": 256, "payload_bytes": 8388608},
+        "offline_policy": {"plan_format": "mqttiumd.policy-plan.v1", "sqlite_schema": 11,
+                           "scope": "monotone", "tool": "mqttiumd policy"},
         "binary_sha256": hashlib.sha256(binary.read_bytes()).hexdigest(),
         "runtime_dependencies": runtime.splitlines(),
         "execution_verification": "Separate extraction receipt names this exact archive hash",

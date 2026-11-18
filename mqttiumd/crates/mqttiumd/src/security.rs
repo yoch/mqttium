@@ -12,7 +12,7 @@ use rustls::{
     CertificateError, DigitallySignedStruct, DistinguishedName, RootCertStore, ServerConfig,
     SignatureScheme,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fs::OpenOptions;
@@ -76,7 +76,7 @@ pub struct Security {
     pub policy: Arc<Policy>,
 }
 
-fn bounded_file(path: &Path, maximum: usize) -> Result<Vec<u8>, &'static str> {
+pub(crate) fn bounded_file(path: &Path, maximum: usize) -> Result<Vec<u8>, &'static str> {
     let file = OpenOptions::new()
         .read(true)
         .custom_flags(nix::libc::O_NONBLOCK)
@@ -100,7 +100,7 @@ fn fingerprint(cert: &CertificateDer<'_>) -> [u8; 32] {
     Sha256::digest(cert.as_ref()).into()
 }
 
-fn parse_fingerprint(value: &str) -> Result<[u8; 32], &'static str> {
+pub(crate) fn parse_fingerprint(value: &str) -> Result<[u8; 32], &'static str> {
     if value.len() != 64
         || !value
             .bytes()
@@ -132,14 +132,73 @@ fn within(candidate: &[u8], prefix: &str) -> bool {
         .is_some_and(|rest| rest.is_empty() || rest.first() == Some(&b'/'))
 }
 
+#[derive(Serialize)]
+pub(crate) struct PolicyChange<'a> {
+    kind: &'static str,
+    principal: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    value: Option<&'a str>,
+}
+
+#[derive(Default, Serialize)]
+pub(crate) struct PolicyChanges<'a> {
+    pub additions: Vec<PolicyChange<'a>>,
+    pub refusals: Vec<PolicyChange<'a>>,
+}
+
+impl<'a> PolicyChanges<'a> {
+    fn grants(&mut self, previous: &'a Identity, next: &'a Identity) {
+        for (old, new, removed, added) in [
+            (
+                &previous.publish,
+                &next.publish,
+                "publish_grant_reduced",
+                "publish_prefix_added",
+            ),
+            (
+                &previous.subscribe,
+                &next.subscribe,
+                "subscribe_grant_reduced",
+                "subscribe_prefix_added",
+            ),
+        ] {
+            for prefix in old {
+                if !new
+                    .iter()
+                    .any(|candidate| within(prefix.as_bytes(), candidate))
+                {
+                    self.refusals.push(PolicyChange {
+                        kind: removed,
+                        principal: &previous.name,
+                        value: Some(prefix),
+                    });
+                }
+            }
+            for prefix in new {
+                if old.binary_search(prefix).is_err() {
+                    self.additions.push(PolicyChange {
+                        kind: added,
+                        principal: &next.name,
+                        value: Some(prefix),
+                    });
+                }
+            }
+        }
+    }
+}
+
 impl Policy {
+    pub(crate) fn read(path: &Path) -> Result<Self, &'static str> {
+        Self::parse(&bounded_file(path, CONFIG_BYTES)?)
+    }
+
     fn parse(bytes: &[u8]) -> Result<Self, &'static str> {
         let mut config: Configuration =
             serde_json::from_slice(bytes).map_err(|_| "invalid_identities_json")?;
-        if config.version != 1
-            || config.principals.is_empty()
-            || config.principals.len() > MAX_PRINCIPALS
-        {
+        if config.principals.len() > MAX_PRINCIPALS {
+            return Err("policy_capacity_exceeded");
+        }
+        if config.version != 1 || config.principals.is_empty() {
             return Err("invalid_identity_count_or_version");
         }
         config
@@ -166,17 +225,21 @@ impl Policy {
             }
             previous = Some(&identity.name);
             for pin in &identity.certificates {
-                if pins.len() == MAX_PINS
-                    || pins
-                        .insert(parse_fingerprint(pin)?, Principal(index))
-                        .is_some()
+                if pins.len() == MAX_PINS {
+                    return Err("policy_capacity_exceeded");
+                }
+                if pins
+                    .insert(parse_fingerprint(pin)?, Principal(index))
+                    .is_some()
                 {
                     return Err("certificate_allowlist_conflict_or_budget");
                 }
             }
             for client in &identity.client_ids {
+                if owners.len() == MAX_CLIENT_IDS {
+                    return Err("policy_capacity_exceeded");
+                }
                 if !mqtt_text(client)
-                    || owners.len() == MAX_CLIENT_IDS
                     || owners
                         .insert(client.as_bytes().to_vec(), identity.name.clone())
                         .is_some()
@@ -204,12 +267,14 @@ impl Policy {
                 }
             }
             rules += identity.publish.len() + identity.subscribe.len();
-            if rules > MAX_RULES
-                || !identity
-                    .publish
-                    .iter()
-                    .chain(&identity.subscribe)
-                    .all(|p| literal_prefix(p))
+            if rules > MAX_RULES {
+                return Err("policy_capacity_exceeded");
+            }
+            if !identity
+                .publish
+                .iter()
+                .chain(&identity.subscribe)
+                .all(|p| literal_prefix(p))
             {
                 return Err("invalid_topic_prefix_or_rule_budget");
             }
@@ -226,6 +291,96 @@ impl Policy {
 
     pub fn storage(&self) -> &StoragePolicy {
         &self.storage
+    }
+
+    /// The previous pins are operator-supplied. Storage authenticates only
+    /// the authorization hash; this digest binds the plan to the stated pins.
+    pub(crate) fn credential_fingerprint(&self) -> [u8; 32] {
+        let mut hash = Sha256::new();
+        hash.update(b"mqttiumd/configured-certificate-pins/v1\0");
+        for (pin, principal) in self.by_cert.iter() {
+            let name = &self.rules[principal.0].name;
+            hash.update(pin);
+            hash.update([name.len() as u8]);
+            hash.update(name);
+        }
+        hash.finalize().into()
+    }
+
+    pub(crate) fn changes<'a>(&'a self, new: &'a Self) -> PolicyChanges<'a> {
+        let mut changes = PolicyChanges::default();
+        for previous in &self.rules {
+            match new
+                .rules
+                .binary_search_by(|next| next.name.cmp(&previous.name))
+            {
+                Ok(index) => changes.grants(previous, &new.rules[index]),
+                Err(_) => changes.refusals.push(PolicyChange {
+                    kind: "principal_removed",
+                    principal: &previous.name,
+                    value: None,
+                }),
+            }
+            for client in &previous.client_ids {
+                let kind = match new.storage.owners.get(client.as_bytes()) {
+                    None => "client_id_removed",
+                    Some(name) if name != &previous.name => "client_id_owner_changed",
+                    _ => continue,
+                };
+                changes.refusals.push(PolicyChange {
+                    kind,
+                    principal: &previous.name,
+                    value: Some(client),
+                });
+            }
+        }
+        for next in &new.rules {
+            if self
+                .rules
+                .binary_search_by(|previous| previous.name.cmp(&next.name))
+                .is_err()
+            {
+                changes.additions.push(PolicyChange {
+                    kind: "principal_added",
+                    principal: &next.name,
+                    value: None,
+                });
+                for (kind, prefixes) in [
+                    ("publish_prefix_added", &next.publish),
+                    ("subscribe_prefix_added", &next.subscribe),
+                ] {
+                    changes
+                        .additions
+                        .extend(prefixes.iter().map(|prefix| PolicyChange {
+                            kind,
+                            principal: &next.name,
+                            value: Some(prefix),
+                        }));
+                }
+            }
+            for client in &next.client_ids {
+                if !self.storage.owners.contains_key(client.as_bytes()) {
+                    changes.additions.push(PolicyChange {
+                        kind: "client_id_added",
+                        principal: &next.name,
+                        value: Some(client),
+                    });
+                }
+            }
+        }
+        for (pin, before) in self.by_cert.iter() {
+            let owner = &self.rules[before.0].name;
+            if let Some(after) = new.by_cert.get(pin)
+                && new.rules[after.0].name != *owner
+            {
+                changes.refusals.push(PolicyChange {
+                    kind: "certificate_pin_owner_changed",
+                    principal: owner,
+                    value: None,
+                });
+            }
+        }
+        changes
     }
 
     pub fn certificate(&self, leaf: &CertificateDer<'_>) -> Option<Principal> {
@@ -378,10 +533,7 @@ impl ClientCertVerifier for AllowedClients {
 
 impl Security {
     pub fn load(files: &TlsFiles) -> Result<Self, &'static str> {
-        let policy = Arc::new(Policy::parse(&bounded_file(
-            &files.identities,
-            CONFIG_BYTES,
-        )?)?);
+        let policy = Arc::new(Policy::read(&files.identities)?);
         let provider = Arc::new(rustls::crypto::ring::default_provider());
         let mut roots = RootCertStore::empty();
         for cert in certificates(&files.client_ca)? {
@@ -506,5 +658,35 @@ mod tests {
             Policy::parse(&serde_json::to_vec(&value).unwrap()),
             Err("client_id_conflict_or_budget")
         ));
+    }
+
+    #[test]
+    fn policy_inclusion_preserves_the_broker_level_relation() {
+        for (previous, candidate, allowed) in [
+            ("atelier/capteur-1", "atelier", true),
+            ("atelier/capteur-1", "atelier/capteur-10", false),
+            ("atelier/capteur-1", "atelier/capteur-1/command", false),
+            ("$SYS/node", "$SYS", true),
+            ("$SYS/node", "SYS", false),
+            ("café//étage", "café/", true),
+            ("café/étage", "café/", false),
+            ("café//étage", "cafe\u{301}/", false),
+        ] {
+            let mut config = configuration();
+            for field in ["publish", "subscribe"] {
+                config["principals"][0][field] = json!([previous]);
+            }
+            let old = Policy::parse(&serde_json::to_vec(&config).unwrap()).unwrap();
+            for field in ["publish", "subscribe"] {
+                config["principals"][0][field] = json!([candidate]);
+            }
+            let new = Policy::parse(&serde_json::to_vec(&config).unwrap()).unwrap();
+            let changes = old.changes(&new);
+            assert_eq!(
+                changes.refusals.len(),
+                if allowed { 0 } else { 2 },
+                "{previous}, {candidate}"
+            );
+        }
     }
 }

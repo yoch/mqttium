@@ -460,6 +460,7 @@ dependencies = [
  "mqttiumd-store-api",
  "rusqlite",
  "serde_json",
+ "sha2",
 ]
 
 [[package]]

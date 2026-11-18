@@ -82,14 +82,30 @@ impl StoragePolicy {
     }
 
     pub(super) fn verify(&self, conn: &Connection) -> Result<(), OpenError> {
-        self.validate()?;
         let read = conn.unchecked_transaction()?;
-        let same: bool = read.query_row(
-            "SELECT EXISTS(SELECT 1 FROM security_policy WHERE one=1 AND fingerprint=?1)",
-            [self.fingerprint.as_slice()],
-            |row| row.get(0),
-        )?;
-        if !same {
+        self.verify_in(&read)?;
+        read.commit()?;
+        Ok(())
+    }
+
+    pub(super) fn recorded_fingerprint(conn: &Connection) -> Result<[u8; 32], OpenError> {
+        let mut stmt = conn.prepare("SELECT one, fingerprint FROM security_policy LIMIT 2")?;
+        let mut rows = stmt.query([])?;
+        let row = rows.next()?.ok_or(OpenError::Corrupt)?;
+        let fingerprint = reader::borrow_blob(row, 1, 32)
+            .map_err(|fault| OpenError::Read(fault.read_error()))?
+            .try_into()
+            .map_err(|_| OpenError::Corrupt)?;
+        if row.get::<_, i64>(0)? != 1 || rows.next()?.is_some() {
+            return Err(OpenError::Corrupt);
+        }
+        Ok(fingerprint)
+    }
+
+    /// Verify the complete authority inside the caller's frozen snapshot.
+    pub(super) fn verify_in(&self, conn: &Connection) -> Result<(), OpenError> {
+        self.validate()?;
+        if Self::recorded_fingerprint(conn)? != self.fingerprint {
             return Err(OpenError::SecurityPolicyMismatch);
         }
         // Delimit the exact installed trigger definitions. The SQLite schema
@@ -111,7 +127,7 @@ impl StoragePolicy {
             let prefix = format!("CREATE TRIGGER {ddl}");
             let begin = CREATE.find(&prefix).ok_or(OpenError::Corrupt)?;
             let end = CREATE[begin..].find("\nEND;").ok_or(OpenError::Corrupt)? + 4;
-            let trigger_exists: bool = read.query_row(
+            let trigger_exists: bool = conn.query_row(
                 "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='trigger' AND name=?1 AND sql=?2)",
                 params![name, &CREATE[begin..begin + end]], |row| row.get(0))?;
             if !trigger_exists {
@@ -119,12 +135,12 @@ impl StoragePolicy {
             }
         }
         {
-            let mut statement = read.prepare(
+            let mut statement = conn.prepare(
                 "SELECT client_id, principal FROM security_client_owners ORDER BY client_id LIMIT 129",
             )?;
             let mut rows = statement.query([])?;
             for (badged_id, badged_owner) in &self.owners {
-                let row = rows.next()?.ok_or(OpenError::SecurityPolicyMismatch)?;
+                let row = rows.next()?.ok_or(OpenError::Corrupt)?;
                 let id = reader::borrow_blob(row, 0, MAX_CLIENT_BYTES)
                     .map_err(|e| OpenError::Read(e.read_error()))?;
                 let owner = match row.get_ref(1)? {
@@ -136,17 +152,17 @@ impl StoragePolicy {
                     _ => return Err(OpenError::Corrupt),
                 };
                 if id != badged_id.as_slice() || owner != badged_owner.as_bytes() {
-                    return Err(OpenError::SecurityPolicyMismatch);
+                    return Err(OpenError::Corrupt);
                 }
             }
             if rows.next()?.is_some() {
-                return Err(OpenError::SecurityPolicyMismatch);
+                return Err(OpenError::Corrupt);
             }
         }
         // Limit the inventory before joining. Every live session has exactly
         // one durable owner and termination reclaims that row atomically.
         for table in ["sessions", "security_session_owners"] {
-            let count: i64 = read.query_row(
+            let count: i64 = conn.query_row(
                 &format!("SELECT count(*) FROM (SELECT 1 FROM {table} LIMIT 129)"),
                 [],
                 |row| row.get(0),
@@ -157,7 +173,7 @@ impl StoragePolicy {
                 ));
             }
         }
-        let inconsistent: bool = read.query_row(
+        let inconsistent: bool = conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM sessions s LEFT JOIN security_session_owners o ON s.id=o.session
                LEFT JOIN security_client_owners c ON s.client_id=c.client_id
                WHERE c.principal IS NULL OR o.principal IS NULL OR c.principal != o.principal)
@@ -166,7 +182,6 @@ impl StoragePolicy {
         if inconsistent {
             return Err(OpenError::Corrupt);
         }
-        read.commit()?;
         Ok(())
     }
 }

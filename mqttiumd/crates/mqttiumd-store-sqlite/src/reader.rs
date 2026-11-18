@@ -166,7 +166,7 @@ impl Meter {
 
     /// Count every selected column without copying it. SQL scalar cells cost
     /// eight bytes; nullable cells cost zero when absent.
-    fn row(&mut self, row: &Row<'_>, fields: &[(usize, usize)]) -> Result<(), Fault> {
+    pub(super) fn row(&mut self, row: &Row<'_>, fields: &[(usize, usize)]) -> Result<(), Fault> {
         let mut bytes = 128usize;
         for index in 0..row.as_ref().column_count() {
             let size = match row.get_ref(index)? {

@@ -47,6 +47,7 @@
 
 mod codec;
 mod message_expiry;
+mod policy_transition;
 mod pubsub;
 mod reader;
 mod receipts;
@@ -104,6 +105,9 @@ use codec::{
     session_state_code, u64_blob, usize_blob,
 };
 
+pub use policy_transition::{
+    PolicyInventory, PolicyMaintenanceError, PolicyTransition, PolicyTransitionPoint,
+};
 pub use schema::{FORMAT, SCHEMA_VERSION};
 pub use security::{SECURE_SCHEMA_VERSION, StoragePolicy};
 

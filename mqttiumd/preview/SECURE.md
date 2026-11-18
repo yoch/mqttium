@@ -84,9 +84,10 @@ for checking the server chain at startup. Clients also check the server name.
 Use a trustworthy system wall clock for X.509 dates.
 
 This secure profile uses SQLite schema 11. The historical loopback profile
-uses schema 10 and a different database. Changes to principal names, ClientIDs
-or grants make the secure database refuse startup. Coordinate policy changes
-with an explicit offline data transition. This preview offers static
+uses schema 10 and a different database. Use the
+[offline policy tool](POLICY.md) to add devices or expand grants while
+retaining the stored authority and work. Startup requires the exact committed
+authorization policy. This preview offers static
 configuration only. Username/password, dynamic ACLs, automatic rotation,
 revocation feeds, remote administration and tenant isolation are separate.
 The acceptance scope is a bounded private-network preview on Linux x86_64.

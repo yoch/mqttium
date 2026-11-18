@@ -5,9 +5,6 @@ use mqttiumd::{
     writer::Hooks,
 };
 use std::path::PathBuf;
-fn arguments() -> Result<Config, &'static str> {
-    parse_arguments(std::env::args().skip(1))
-}
 fn parse_arguments(mut args: impl Iterator<Item = String>) -> Result<Config, &'static str> {
     let mut db = None;
     let mut listen = "127.0.0.1:1883".parse().map_err(|_| "listen")?;
@@ -110,7 +107,11 @@ fn parse_arguments(mut args: impl Iterator<Item = String>) -> Result<Config, &'s
 }
 
 fn main() {
-    let config = match arguments() {
+    let mut args = std::env::args().skip(1).peekable();
+    if args.peek().is_some_and(|arg| arg == "policy") {
+        std::process::exit(mqttiumd::policy_transition::run(args.skip(1)));
+    }
+    let config = match parse_arguments(args) {
         Ok(c) => c,
         Err(e) => {
             eprintln!(

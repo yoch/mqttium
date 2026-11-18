@@ -28,18 +28,14 @@ CASES = [
 ]
 
 
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("out", type=Path)
-    parser.add_argument("--target", type=Path, required=True)
-    args = parser.parse_args()
+def receive(out, target, cases, driver, extra=()):
     root = Path(__file__).resolve().parents[2]
-    out, target = args.out.resolve(), args.target.resolve()
+    out, target = out.resolve(), target.resolve()
     out.mkdir(parents=True, exist_ok=False)
     source = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=root, text=True).strip()
     env = {**os.environ, "CARGO_INCREMENTAL": "0", "CARGO_PROFILE_DEV_DEBUG": "0"}
     outcomes = []
-    for mode, reason, location, before, after in CASES:
+    for mode, reason, location, before, after in cases:
         with tempfile.TemporaryDirectory(prefix="mqttiumd-secure-mutant-") as temp:
             tree = Path(temp) / "source"
             subprocess.run(["git", "worktree", "add", "--detach", str(tree), source],
@@ -60,8 +56,8 @@ def main():
                                     "--target-dir", str(target)], cwd=tree / "mqttiumd", check=True, env=env,
                                    timeout=300, stdout=log, stderr=subprocess.STDOUT)
                 digest = hashlib.sha256(binary.read_bytes()).hexdigest()
-                command = [sys.executable, str(root / "mqttiumd/tests/system/secure_reception.py"),
-                           "--mode", mode, "--binary", str(binary), "--out", str(out / mode)]
+                command = [sys.executable, str(root / "mqttiumd/tests/system" / driver),
+                           "--mode", mode, "--binary", str(binary), "--out", str(out / mode), *extra]
                 with (out / f"{mode}.run.log").open("wb") as log:
                     result = subprocess.run(command, cwd=root / "mqttiumd", env=env,
                                             stdout=log, stderr=subprocess.STDOUT, timeout=45)
@@ -78,6 +74,14 @@ def main():
                                check=True, capture_output=True, timeout=60)
     (out / "receipt.json").write_text(json.dumps({"status": "PASS", "source_sha": source,
                                                 "mutants": outcomes}, indent=2) + "\n")
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("out", type=Path)
+    parser.add_argument("--target", type=Path, required=True)
+    args = parser.parse_args()
+    receive(args.out, args.target, CASES, "secure_reception.py")
 
 
 if __name__ == "__main__":
