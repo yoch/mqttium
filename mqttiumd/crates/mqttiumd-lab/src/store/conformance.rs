@@ -1047,7 +1047,7 @@ pub fn accounts_match_what_is_held(state: &DurableState) -> Result<(), &'static 
                 .map(|payload| count(payload.bytes.len()))
                 .sum(),
         ),
-        references: References::new(count(state.obligations.len())),
+        references: References::new(count(state.obligations.len() + state.retained.len())),
         exchange_slots: ExchangeSlots::new(count(state.inbound.len() + state.outbound.len())),
         receipt_slots: ReceiptSlots::new(count(state.operations.len() + state.fences.len())),
     };
