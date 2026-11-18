@@ -68,7 +68,7 @@ def command(argv, calls, *, data=None):
 
 
 @contextmanager
-def broker(binary, db, out, credentials, policy, label, calls):
+def broker(binary, db, out, credentials, policy, label, calls, *, crash=False):
     events = out / f"{label}.events.jsonl"
     argv = [binary, "--listen", "127.0.0.1:0", "--db", db, "--events", events,
             "--tls-cert", credentials / "server.crt", "--tls-key", credentials / "server.key",
@@ -76,6 +76,7 @@ def broker(binary, db, out, credentials, policy, label, calls):
     record = {"argv": [str(arg) for arg in argv]}
     calls.append(record)
     with subprocess.Popen(argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) as child:
+        record["pid"] = child.pid
         try:
             deadline = time.monotonic() + 8
             while time.monotonic() < deadline:
@@ -95,13 +96,16 @@ def broker(binary, db, out, credentials, policy, label, calls):
             raise ValueError("broker_not_ready")
         finally:
             if child.poll() is None:
-                child.terminate()
+                if crash:
+                    child.kill()
+                else:
+                    child.terminate()
             try:
                 record["exit"] = child.wait(timeout=8)
             except subprocess.TimeoutExpired:
                 child.kill()
                 record["exit"] = child.wait(timeout=3)
-            expect(record["exit"] == 0, "broker_shutdown_failed")
+            expect(record["exit"] == (-9 if crash else 0), "broker_shutdown_failed")
 
 
 def mqtt_session(port, credentials, device, client_id):
