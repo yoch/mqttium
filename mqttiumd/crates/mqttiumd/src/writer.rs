@@ -265,7 +265,7 @@ impl Hooks {
         )
     }
     #[cfg(feature = "test-hooks")]
-    fn barrier_fields(
+    pub(crate) fn barrier_fields(
         &self,
         point: &'static str,
         fields: serde_json::Value,
@@ -324,6 +324,28 @@ impl Writer {
         cancel: Arc<AtomicBool>,
         clock: Arc<dyn SessionClock>,
     ) -> Result<Self, Failure> {
+        Self::spawn_bound(path, events, hooks, cancel, clock, None)
+    }
+
+    pub(crate) fn spawn_secured(
+        path: PathBuf,
+        events: Events,
+        hooks: Hooks,
+        cancel: Arc<AtomicBool>,
+        policy: mqttiumd_store_sqlite::StoragePolicy,
+    ) -> Result<Self, Failure> {
+        let clock = Arc::new(SystemClock::new().map_err(|error| Failure::plain(error.code()))?);
+        Self::spawn_bound(path, events, hooks, cancel, clock, Some(policy))
+    }
+
+    fn spawn_bound(
+        path: PathBuf,
+        events: Events,
+        hooks: Hooks,
+        cancel: Arc<AtomicBool>,
+        clock: Arc<dyn SessionClock>,
+        policy: Option<mqttiumd_store_sqlite::StoragePolicy>,
+    ) -> Result<Self, Failure> {
         let _ = &hooks;
         let (tx, rx) = mpsc::sync_channel(QUEUE);
         let (rtx, rrx) = mpsc::sync_channel(64);
@@ -333,7 +355,7 @@ impl Writer {
         let handle = thread::Builder::new()
             .name("sqlite-writer".into())
             .spawn(move || {
-                let (mut store, boot) = match bootstrap_with_clock(&path, clock) {
+                let (mut store, boot) = match bootstrap_bound(&path, clock, policy.as_ref()) {
                     Ok(value) => value,
                     Err(error) => {
                         let _ = btx.send(Err(error));
@@ -540,6 +562,14 @@ fn business_response(
                         }
                     }
                     let applied = store.apply(&command);
+                    if kind == "WillAdmission" && applied.committed_now
+                        && matches!(applied.reply, StoreReply::Outcome(mqttiumd_contract::outcome::StoreOutcome::Committed(mqttiumd_contract::outcome::CommitFacts::WillPublished { .. })))
+                        && let Some(ns) = crate::events::monotonic_ns()
+                        && events.emit("will_commit_observed", json!({"operation":operation(id),
+                            "details":{"monotonic_ns":ns.to_string(),"authority":"sqlite_commit_return"}})).is_err()
+                    {
+                        cancel.store(true,Ordering::Relaxed);
+                    }
                     #[cfg(feature = "test-hooks")]
                     {
                         let _ = store.set_kill_hook(None);
@@ -1256,23 +1286,45 @@ fn bootstrap(path: &Path) -> Result<(SqliteStore, Boot), Failure> {
     bootstrap_with_clock(path, clock)
 }
 
+#[cfg(test)]
 fn bootstrap_with_clock(
     path: &Path,
     clock: Arc<dyn SessionClock>,
+) -> Result<(SqliteStore, Boot), Failure> {
+    bootstrap_bound(path, clock, None)
+}
+
+fn bootstrap_bound(
+    path: &Path,
+    clock: Arc<dyn SessionClock>,
+    policy: Option<&mqttiumd_store_sqlite::StoragePolicy>,
 ) -> Result<(SqliteStore, Boot), Failure> {
     // Existing files, including empty/truncated files, are never silently initialised.
     let mut store = if path
         .try_exists()
         .map_err(|e| Failure::read(io_cause(e.kind()), ReadPhase::Open))?
     {
-        SqliteStore::open(path)
+        match policy {
+            Some(policy) => SqliteStore::open_secured(path, policy),
+            None => SqliteStore::open(path),
+        }
     } else {
         let mut random = [0u8; 8];
         getrandom::fill(&mut random).map_err(|_| Failure::plain("random_unavailable"))?;
         let raw = u64::from_be_bytes(random).max(1);
-        SqliteStore::create(path, StoreIncarnation::new(raw), limits())
+        let incarnation = StoreIncarnation::new(raw);
+        match policy {
+            Some(policy) => SqliteStore::create_secured(path, incarnation, limits(), policy),
+            None => SqliteStore::create(path, incarnation, limits()),
+        }
     }
-    .map_err(|e| Failure::read(e.read_error(), ReadPhase::Open))?;
+    .map_err(|e| {
+        if matches!(e, mqttiumd_store_sqlite::OpenError::SecurityPolicyMismatch) {
+            Failure::plain("security_policy_mismatch")
+        } else {
+            Failure::read(e.read_error(), ReadPhase::Open)
+        }
+    })?;
     let state = store
         .snapshot()
         .map_err(|e| Failure::read(e, ReadPhase::Snapshot))?;

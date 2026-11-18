@@ -52,6 +52,7 @@ mod reader;
 mod receipts;
 mod retained;
 mod schema;
+mod security;
 mod sessions;
 mod will;
 
@@ -104,6 +105,7 @@ use codec::{
 };
 
 pub use schema::{FORMAT, SCHEMA_VERSION};
+pub use security::{SECURE_SCHEMA_VERSION, StoragePolicy};
 
 #[derive(Clone, Copy)]
 struct Admission<'a> {
@@ -280,6 +282,8 @@ pub enum OpenError {
     /// The schema version of the file is not this store's: an older or a
     /// future format, refused before anything is written.
     SchemaVersion(i64),
+    /// The configured owner registry or authorization rules differ from disk.
+    SecurityPolicyMismatch,
     /// The file names another format, or a durable value does not decode.
     Corrupt,
     /// A bounded semantic read refused the file without exposing its value.
@@ -1511,6 +1515,29 @@ impl SqliteStore {
         incarnation: StoreIncarnation,
         limits: Limits,
     ) -> Result<Self, OpenError> {
+        Self::create_with_policy(path, incarnation, limits, None)
+    }
+
+    /// Creates a new authenticated data set with an immutable owner registry.
+    pub fn create_secured(
+        path: &Path,
+        incarnation: StoreIncarnation,
+        limits: Limits,
+        policy: &StoragePolicy,
+    ) -> Result<Self, OpenError> {
+        Self::create_with_policy(path, incarnation, limits, Some(policy))
+    }
+
+    fn create_with_policy(
+        path: &Path,
+        incarnation: StoreIncarnation,
+        limits: Limits,
+        policy: Option<&StoragePolicy>,
+    ) -> Result<Self, OpenError> {
+        let expected = security::version(policy);
+        if let Some(policy) = policy {
+            policy.validate()?;
+        }
         let lock = writer_lock(path)?;
         let mut conn = connect(path)?;
         let tables: i64 =
@@ -1541,15 +1568,28 @@ impl SqliteStore {
             params![FORMAT, u64_blob(0).as_slice()],
         )?;
         write_meta(&tx, &meta).map_err(|_| OpenError::Corrupt)?;
-        tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+        if let Some(policy) = policy {
+            policy.install(&tx)?;
+        }
+        tx.pragma_update(None, "user_version", expected)?;
         tx.commit()?;
-        Self::verified(lock, conn)
+        Self::verified(lock, conn, expected)
     }
 
     /// Opens an existing data set: its schema version is checked before
     /// anything is written, then the settings are set and read back, and
     /// its durable values are decoded.
     pub fn open(path: &Path) -> Result<Self, OpenError> {
+        Self::open_with_policy(path, None)
+    }
+
+    /// Opens a secured file only when the complete authorization policy matches.
+    pub fn open_secured(path: &Path, policy: &StoragePolicy) -> Result<Self, OpenError> {
+        Self::open_with_policy(path, Some(policy))
+    }
+
+    fn open_with_policy(path: &Path, policy: Option<&StoragePolicy>) -> Result<Self, OpenError> {
+        let expected = security::version(policy);
         let lock = writer_lock(path)?;
         {
             let probe = Connection::open_with_flags(
@@ -1557,8 +1597,11 @@ impl SqliteStore {
                 OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
             )?;
             let version: i64 = probe.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-            if version != SCHEMA_VERSION {
+            if version != expected {
                 return Err(OpenError::SchemaVersion(version));
+            }
+            if let Some(policy) = policy {
+                policy.verify(&probe)?;
             }
         }
         let conn = Connection::open_with_flags(
@@ -1567,10 +1610,10 @@ impl SqliteStore {
         )?;
         conn.busy_timeout(std::time::Duration::ZERO)?;
         let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-        if version != SCHEMA_VERSION {
+        if version != expected {
             return Err(OpenError::SchemaVersion(version));
         }
-        Self::verified(lock, conn)
+        Self::verified(lock, conn, expected)
     }
 
     /// Reads the durable state of the file at `path` without the writer,
@@ -1612,7 +1655,7 @@ impl SqliteStore {
 
     // Parameters drop in reverse order on an early error: close/checkpoint
     // SQLite before releasing the lease, as the fields of a live store do.
-    fn verified(lock: WriterLease, conn: Connection) -> Result<Self, OpenError> {
+    fn verified(lock: WriterLease, conn: Connection, expected: i64) -> Result<Self, OpenError> {
         let settings = settle(&conn)?;
         // Before an epoch is opened: every page of the file is checked,
         // not only those opening reads.
@@ -1620,7 +1663,7 @@ impl SqliteStore {
         if report != ["ok"] {
             return Err(OpenError::Integrity(report.join("\n")));
         }
-        if settings.user_version != SCHEMA_VERSION {
+        if settings.user_version != expected {
             return Err(OpenError::SchemaVersion(settings.user_version));
         }
         read_meta(&conn).map_err(|fault| OpenError::Read(fault.read_error()))?;

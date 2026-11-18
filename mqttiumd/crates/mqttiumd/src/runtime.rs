@@ -5,6 +5,7 @@ use crate::{
     events::{Events, operation},
     net,
     receiving::Terminal,
+    security::{self, Security, TlsFiles},
     writer::{ControlRequest, ControlResponse, Failure, Hooks, Request, Response, Session, Writer},
 };
 use mqttiumd_contract::capacity::{BoundedVec, PayloadBytes, Resource, WakeCondition, WorkUnits};
@@ -92,6 +93,7 @@ pub struct Config {
     pub listen: SocketAddr,
     pub events: PathBuf,
     pub hooks: Hooks,
+    pub tls: Option<TlsFiles>,
 }
 struct Peer {
     io: net::Connection,
@@ -158,6 +160,7 @@ struct AppliedSessionChange {
     change: SessionChange,
 }
 struct Runtime<'a> {
+    security: Option<Security>,
     message_expiry_request: Option<(MessageTime, Option<PublicationId>)>,
     message_expiry_retry: bool,
     message_expiry_retry_attempts: u8,
@@ -476,16 +479,29 @@ impl Runtime<'_> {
             .and_then(|peers| peers.checked_mul(2))
             .and_then(|future| future.checked_add(self.closing_inputs.len()))
             .is_some_and(|required| required <= CLOSING_INPUTS);
-        if self.peers.len() + self.retiring.len() >= CONNECTIONS
+        let code = if self.peers.len() + self.retiring.len() >= CONNECTIONS
             || !close_reserved
             || self.session_requests.len() >= CONNECTIONS
         {
+            Some("connection_limit")
+        } else if self.security.is_some()
+            && self
+                .peers
+                .values()
+                .map(|peer| &peer.io)
+                .chain(self.retiring.iter())
+                .filter(|io| io.is_authenticating())
+                .count()
+                >= security::MAX_UNAUTHENTICATED
+        {
+            Some("tls_handshake_limit")
+        } else {
+            None
+        };
+        if let Some(code) = code {
             let _ = stream.shutdown(std::net::Shutdown::Both);
             self.events
-                .emit(
-                    "connection_refused",
-                    json!({"details":{"code":"connection_limit"}}),
-                )
+                .emit("connection_refused", json!({"details":{"code":code}}))
                 .map_err(event_failure)?;
             return Ok(false);
         }
@@ -493,8 +509,18 @@ impl Runtime<'_> {
             .generation
             .checked_next()
             .map_err(|_| Failure::plain("generation_exhausted"))?;
-        let io = net::spawn_with_clock(stream, self.clock.clone())
-            .map_err(|_| Failure::plain("socket_spawn"))?;
+        let io = match &self.security {
+            Some(security) => net::spawn_tls(
+                stream,
+                security.tls.clone(),
+                security.policy.clone(),
+                self.clock.clone(),
+                #[cfg(feature = "test-hooks")]
+                (self.hooks.clone(), self.events.clone()),
+            ),
+            None => net::spawn_with_clock(stream, self.clock.clone()),
+        }
+        .map_err(|_| Failure::plain("socket_spawn"))?;
         let sendbuf = io.send_buffer_bytes();
         self.peers.insert(
             self.generation,
@@ -601,6 +627,11 @@ impl Runtime<'_> {
         code: &'static str,
     ) -> Result<(), Failure> {
         if let Some(peer) = self.peers.remove(&generation) {
+            let observed_monotonic_ns = peer
+                .io
+                .terminal_observed_ns()
+                .or_else(crate::events::monotonic_ns)
+                .map(|ns| ns.to_string());
             self.session_cardinality_dirty = true;
             self.will_connects.remove(&generation);
             #[cfg(feature = "test-hooks")]
@@ -689,7 +720,8 @@ impl Runtime<'_> {
             self.events
                 .emit(
                     "connection_closed",
-                    json!({"connection":generation.get().to_string(),"details":{"code":code}}),
+                    json!({"connection":generation.get().to_string(),"details":{"code":code,
+                        "observed_monotonic_ns":observed_monotonic_ns}}),
                 )
                 .map_err(event_failure)?;
             self.queue(Input::ConnectionClosed {
@@ -2052,6 +2084,36 @@ impl Runtime<'_> {
         generation: ConnectionGeneration,
         connect: codec::Connect,
     ) -> Result<(), Failure> {
+        if let Some(security) = &self.security {
+            let principal = self
+                .peers
+                .get(&generation)
+                .and_then(|peer| peer.io.principal());
+            if principal.is_none_or(|principal| {
+                !security
+                    .policy
+                    .allows_client(principal, connect.client_id.as_slice())
+            }) {
+                return self.authorization_refusal(
+                    generation,
+                    "client_id",
+                    Some(connect.max_packet_size as usize),
+                );
+            }
+            if let Some(will) = &connect.will
+                && principal.is_none_or(|principal| {
+                    !security
+                        .policy
+                        .allows_publish(principal, will.topic.as_slice())
+                })
+            {
+                return self.authorization_refusal(
+                    generation,
+                    "will",
+                    Some(connect.max_packet_size as usize),
+                );
+            }
+        }
         self.events.emit("connect_validated",json!({"connection":generation.get().to_string(),"details":{"keep_alive":connect.keep_alive,"max_packet_size":connect.max_packet_size,"receive_maximum":connect.receive_maximum,"topic_alias_maximum":connect.topic_alias_maximum,"request_problem_information":connect.request_problem_information,"clean_start":connect.clean_start,"expiry":expiry_json(connect.expiry)}})).map_err(event_failure)?;
         if let Some(p) = self.peers.get_mut(&generation) {
             if p.connected || p.pending {
@@ -2194,6 +2256,44 @@ impl Runtime<'_> {
         self.packet_at(generation, first, body, observed)
     }
 
+    fn authorization_refusal(
+        &mut self,
+        generation: ConnectionGeneration,
+        stage: &'static str,
+        before_connack: Option<usize>,
+    ) -> Result<(), Failure> {
+        self.events
+            .emit(
+                "authorization_refused",
+                json!({"connection":generation.get().to_string(),
+            "details":{"stage":stage,"reason":0x87}}),
+            )
+            .map_err(event_failure)?;
+        if let Some(peer) = self.peers.get_mut(&generation) {
+            let bytes = if before_connack.is_some() {
+                codec::session_refusal(0x87)
+                    .map_err(|_| Failure::plain("connack_authorization_reason"))?
+            } else {
+                codec::disconnect_reason(0x87)
+            };
+            if bytes.len() <= before_connack.unwrap_or(peer.max_packet)
+                && peer
+                    .io
+                    .outgoing
+                    .try_send(net::Write {
+                        correlation: None,
+                        bytes,
+                        expiry: None,
+                    })
+                    .is_ok()
+            {
+                peer.closing = Some(("not_authorized", Instant::now()));
+                return Ok(());
+            }
+        }
+        self.close(generation, "not_authorized")
+    }
+
     fn packet_at(
         &mut self,
         generation: ConnectionGeneration,
@@ -2240,6 +2340,22 @@ impl Runtime<'_> {
                 return self.close(generation, "packet_refused");
             }
         };
+        if let (Some(security), Packet::Core(packet) | Packet::TimedPublish { packet, .. }) =
+            (&self.security, &decoded)
+            && self
+                .peers
+                .get(&generation)
+                .and_then(|peer| peer.io.principal())
+                .is_none_or(|principal| !security.policy.allows_packet(principal, packet))
+        {
+            let stage = match packet {
+                InboundPacket::Publish { .. } => "publish",
+                InboundPacket::Subscribe { .. } => "subscribe",
+                InboundPacket::Unsubscribe { .. } => "unsubscribe",
+                _ => return self.close(generation, "tls_principal_missing"),
+            };
+            return self.authorization_refusal(generation, stage, None);
+        }
         let decoded = match decoded {
             Packet::TimedPublish {
                 mut packet,
@@ -2515,6 +2631,7 @@ impl Runtime<'_> {
         self.pump_will_connects()?;
         let keys: Vec<_> = self.peers.keys().copied().collect();
         for generation in keys {
+            let mut tls_close = None;
             self.wire_progress(generation)?;
             self.retry_deferred_publish(generation)?;
             for _ in 0..4 {
@@ -2532,6 +2649,11 @@ impl Runtime<'_> {
                     None => break,
                 };
                 match incoming {
+                    Ok(net::Incoming::Authenticated { elapsed }) => {
+                        self.events.emit("tls_authenticated", json!({"connection":generation.get().to_string(),
+                            "details":{"version":"TLS1.3","handshake_us":elapsed.as_micros() as u64}}))
+                            .map_err(event_failure)?;
+                    }
                     Ok(net::Incoming::Packet {
                         first,
                         body,
@@ -2549,24 +2671,45 @@ impl Runtime<'_> {
                         self.packet_at(generation, first, body, observed)?
                     }
                     Ok(net::Incoming::Closed { code }) => {
+                        if self
+                            .peers
+                            .get(&generation)
+                            .is_some_and(|peer| peer.io.is_tls())
+                        {
+                            tls_close = Some(code);
+                            break;
+                        }
                         self.drain_inputs()?;
                         self.close(generation, code)?;
                         break;
                     }
                     Err(TryRecvError::Empty) => break,
                     Err(TryRecvError::Disconnected) => {
-                        self.drain_inputs()?;
                         let code = self
                             .peers
                             .get(&generation)
                             .and_then(|p| p.io.terminal_reason())
                             .unwrap_or("reader_closed");
+                        if self
+                            .peers
+                            .get(&generation)
+                            .is_some_and(|peer| peer.io.is_tls())
+                        {
+                            tls_close = Some(code);
+                            break;
+                        }
+                        self.drain_inputs()?;
                         self.close(generation, code)?;
                         break;
                     }
                 }
             }
-            for _ in 0..8 {
+            let receipt_limit = if tls_close.is_some() {
+                net::WRITTEN_SLOTS
+            } else {
+                8
+            };
+            for _ in 0..receipt_limit {
                 let written = match self.peers.get(&generation) {
                     Some(p) => p.io.written.try_recv(),
                     None => break,
@@ -2679,10 +2822,16 @@ impl Runtime<'_> {
                     }
                     Err(TryRecvError::Empty) => break,
                     Err(TryRecvError::Disconnected) => {
-                        self.close(generation, "writer_closed")?;
+                        if tls_close.is_none() {
+                            self.close(generation, "writer_closed")?;
+                        }
                         break;
                     }
                 }
+            }
+            if let Some(code) = tls_close {
+                self.drain_inputs()?;
+                self.close(generation, code)?;
             }
             if let Some(p) = self.peers.get(&generation) {
                 let expired = if let Some((code, since)) = p.closing
@@ -4134,23 +4283,45 @@ fn nz(v: u32) -> NonZeroU32 {
 
 pub fn run(config: Config) -> Result<(), Failure> {
     let events = Events::open(&config.events).map_err(event_failure)?;
+    let security = match &config.tls {
+        Some(files) => Security::load(files).map(Some).map_err(Failure::plain),
+        None if config.listen.ip().is_loopback() => Ok(None),
+        None => Err(Failure::plain("cleartext_requires_loopback")),
+    };
+    let security = match security {
+        Ok(security) => security,
+        Err(failure) => {
+            let _ = events.emit("startup_or_runtime_refused", failure.fields());
+            return Err(failure);
+        }
+    };
     let cancel = Arc::new(AtomicBool::new(false));
     let signal = cancel.clone();
     ctrlc::set_handler(move || signal.store(true, Ordering::Relaxed))
         .map_err(|_| Failure::plain("signal_handler"))?;
     events.emit("starting",json!({"details":{"test_hooks":cfg!(feature="test-hooks"),"sqlite_kill_points":mqttiumd_store_sqlite::KILL_POINTS_ENABLED}})).map_err(event_failure)?;
-    let mut writer = Writer::spawn(
-        config.db,
-        events.clone(),
-        config.hooks.clone(),
-        cancel.clone(),
-    )?;
+    let mut writer = match &security {
+        Some(security) => Writer::spawn_secured(
+            config.db,
+            events.clone(),
+            config.hooks.clone(),
+            cancel.clone(),
+            security.policy.storage().clone(),
+        ),
+        None => Writer::spawn(
+            config.db,
+            events.clone(),
+            config.hooks.clone(),
+            cancel.clone(),
+        ),
+    }?;
     let result = run_inner(
         &config.listen,
         config.hooks,
         &events,
         cancel.clone(),
         &mut writer,
+        security,
     );
     if let Err(failure) = &result {
         let _ = events.emit("startup_or_runtime_refused", failure.fields());
@@ -4219,6 +4390,7 @@ fn run_inner(
     events: &Events,
     cancel: Arc<AtomicBool>,
     writer: &mut Writer,
+    security: Option<Security>,
 ) -> Result<(), Failure> {
     let _ = &hooks;
     let boot = writer
@@ -4273,6 +4445,7 @@ fn run_inner(
         })
         .collect();
     let mut runtime = Runtime {
+        security,
         message_expiry_request: None,
         message_expiry_retry: false,
         message_expiry_retry_attempts: 0,
@@ -4507,12 +4680,22 @@ fn run_inner(
             .local_addr()
             .map_err(|_| Failure::plain("listen_address"))?;
         check_startup_cancel(&cancel)?;
-        let readiness = json!({"details":{"address":address.to_string(),"epoch":epoch.get().to_string(),"incarnation":incarnation.get().to_string(),"max_connections":16,"max_sessions":128,"max_packet_bytes":65536,"max_client_id_bytes":1024,"max_topic_bytes":1024,"max_payload_bytes":32768,"receive_maximum":8,"max_exchange_slots":128,"input_slots":4,"output_slots":4,"writer_slots":32,"commands_in_flight":16,"max_timers":512,"receipt_slots":8192,"partial_packet_ms":5000,"connect_ms":3000,"write_ms":250,"remembered_connections":8,"max_subscriptions":128,"max_targets":16,"outgoing_per_connection":8,"outgoing_metadata":128,"outgoing_packet_identifier_max":65535,"outgoing_packet_identifier_probe_limit":129,"outgoing_payload_bytes":4194304,"work_page_items":8,"work_scan_ms":100,"wildcard_subscriptions":true,"no_local":true,"shared_subscriptions":false,"subscription_identifiers":false,"sqlite_schema":10,"retained_available":true,"retained_topics":32,"retained_bytes":1048576,"max_replay_candidates":256,"profile":"tcp-will-pubsub-v1"}});
+        let profile = if runtime.security.is_some() {
+            "mtls-will-pubsub-v1"
+        } else {
+            "tcp-will-pubsub-v1"
+        };
+        let readiness = json!({"details":{"address":address.to_string(),"epoch":epoch.get().to_string(),"incarnation":incarnation.get().to_string(),"max_connections":16,"max_sessions":128,"max_packet_bytes":65536,"max_client_id_bytes":1024,"max_topic_bytes":1024,"max_payload_bytes":32768,"receive_maximum":8,"max_exchange_slots":128,"input_slots":4,"output_slots":4,"writer_slots":32,"commands_in_flight":16,"max_timers":512,"receipt_slots":8192,"partial_packet_ms":5000,"connect_ms":3000,"write_ms":250,"remembered_connections":8,"max_subscriptions":128,"max_targets":16,"outgoing_per_connection":8,"outgoing_metadata":128,"outgoing_packet_identifier_max":65535,"outgoing_packet_identifier_probe_limit":129,"outgoing_payload_bytes":4194304,"work_page_items":8,"work_scan_ms":100,"wildcard_subscriptions":true,"no_local":true,"shared_subscriptions":false,"subscription_identifiers":false,"sqlite_schema":sqlite.user_version,"retained_available":true,"retained_topics":32,"retained_bytes":1048576,"max_replay_candidates":256,"profile":profile}});
+        if let Some(security) = &runtime.security {
+            events.emit("tls_profile", json!({"details":{"version":"TLS1.3","client_certificate":"required",
+                "policy_sha256":hex_domain(security.policy.storage().fingerprint),"max_handshakes":security::MAX_UNAUTHENTICATED,
+                "handshake_ms":security::HANDSHAKE_TIMEOUT.as_millis() as u64,"handshake_bytes":security::HANDSHAKE_BYTES,
+                "certificate_bytes":security::CERT_BYTES,"chain_bytes":security::CHAIN_BYTES,"chain_certificates":security::CHAIN_CERTS,
+                "tls_buffer_bytes":security::TLS_BUFFER_BYTES,"resumption":false,"early_data":false}})).map_err(event_failure)?;
+        }
         events.emit("will_capabilities",json!({"details":{"will":true,"will_qos":1,"will_retain":false,"will_delay_interval":0,"will_message_expiry":false,"max_will_intents":256,"max_will_bytes":8388608,"max_will_receipt_bytes":8388608}})).map_err(event_failure)?;
         events.emit("ready", readiness).map_err(event_failure)?;
-        println!(
-            "mqttiumd ready {address} (local MQTT 5 retained pub/sub with Message Expiry and durable Will)"
-        );
+        println!("mqttiumd ready {address} ({profile})");
         while !cancel.load(Ordering::Relaxed) {
             for _ in 0..4 {
                 match listener.accept() {

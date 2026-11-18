@@ -4,7 +4,7 @@ use std::io::{self, Read, Write as _};
 use std::net::{Shutdown, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TrySendError};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -14,7 +14,10 @@ use mqttiumd_contract::message_expiry::{
 };
 
 use crate::codec::{self, ErrorKind};
+use crate::security::{Policy, Principal};
 use crate::session_time::{SessionClock, SystemClock, TimeError};
+
+mod tls;
 
 pub const INPUT_SLOTS: usize = 4;
 pub const OUTPUT_SLOTS: usize = 4;
@@ -33,6 +36,9 @@ const WRITE_TIMEOUT: Duration = Duration::from_millis(250);
 
 #[derive(Debug)]
 pub enum Incoming {
+    Authenticated {
+        elapsed: Duration,
+    },
     Packet {
         first: u8,
         body: Vec<u8>,
@@ -91,11 +97,17 @@ pub struct WireProgress {
 #[derive(Clone)]
 struct Control {
     cancelled: Arc<AtomicBool>,
-    terminal: Arc<Mutex<Option<&'static str>>>,
+    terminal: Arc<Mutex<Option<Terminal>>>,
     #[cfg(test)]
     pause_progress: Arc<AtomicBool>,
     #[cfg(test)]
     progress_waiting: Arc<AtomicBool>,
+}
+
+#[derive(Clone, Copy)]
+struct Terminal {
+    code: &'static str,
+    observed_ns: Option<u64>,
 }
 
 impl Control {
@@ -105,7 +117,10 @@ impl Control {
 
     fn record(&self, code: &'static str) {
         if let Ok(mut terminal) = self.terminal.lock() {
-            terminal.get_or_insert(code);
+            terminal.get_or_insert_with(|| Terminal {
+                code,
+                observed_ns: crate::events::monotonic_ns(),
+            });
         }
     }
 
@@ -129,6 +144,7 @@ pub struct Connection {
     reader: Option<JoinHandle<()>>,
     writer: Option<JoinHandle<()>>,
     send_buffer: usize,
+    principal: Option<Arc<OnceLock<Principal>>>,
 }
 
 pub fn spawn(stream: TcpStream) -> io::Result<Connection> {
@@ -198,10 +214,82 @@ pub fn spawn_with_clock(stream: TcpStream, clock: Arc<dyn SessionClock>) -> io::
         reader: Some(reader),
         writer: Some(writer),
         send_buffer,
+        principal: None,
+    })
+}
+
+pub(crate) fn spawn_tls(
+    stream: TcpStream,
+    config: Arc<rustls::ServerConfig>,
+    policy: Arc<Policy>,
+    clock: Arc<dyn SessionClock>,
+    #[cfg(feature = "test-hooks")] trace: (crate::writer::Hooks, crate::events::Events),
+) -> io::Result<Connection> {
+    stream.set_nodelay(true)?;
+    stream.set_nonblocking(true)?;
+    let socket = socket2::SockRef::from(&stream);
+    socket.set_send_buffer_size(4096)?;
+    let send_buffer = socket.send_buffer_size()?;
+    let (input_tx, incoming) = mpsc::sync_channel(INPUT_SLOTS);
+    let (outgoing, output_rx) = mpsc::sync_channel(OUTPUT_SLOTS);
+    let (written_tx, written) = mpsc::sync_channel(WRITTEN_SLOTS);
+    let (progress_tx, wire_progress) = mpsc::sync_channel(WIRE_PROGRESS_SLOTS);
+    let control = Control {
+        cancelled: Arc::new(AtomicBool::new(false)),
+        terminal: Arc::new(Mutex::new(None)),
+        #[cfg(test)]
+        pause_progress: Arc::new(AtomicBool::new(false)),
+        #[cfg(test)]
+        progress_waiting: Arc::new(AtomicBool::new(false)),
+    };
+    let principal = Arc::new(OnceLock::new());
+    let state = rustls::ServerConnection::new(config).map_err(io::Error::other)?;
+    let task = tls::Task {
+        stream: stream.try_clone()?,
+        state,
+        clock,
+        control: control.clone(),
+        principal: principal.clone(),
+        policy,
+        input: input_tx,
+        output: output_rx,
+        written: written_tx,
+        progress: progress_tx,
+        #[cfg(feature = "test-hooks")]
+        trace,
+    };
+    let handle = thread::Builder::new()
+        .name("mqttiumd-tls".into())
+        .spawn(move || task.run())?;
+    Ok(Connection {
+        incoming,
+        outgoing,
+        written,
+        wire_progress,
+        stream,
+        control,
+        reader: Some(handle),
+        writer: None,
+        send_buffer,
+        principal: Some(principal),
     })
 }
 
 impl Connection {
+    pub fn is_tls(&self) -> bool {
+        self.principal.is_some()
+    }
+
+    pub fn is_authenticating(&self) -> bool {
+        self.principal
+            .as_ref()
+            .is_some_and(|slot| slot.get().is_none())
+    }
+
+    pub fn principal(&self) -> Option<Principal> {
+        self.principal.as_ref()?.get().copied()
+    }
+
     #[cfg(test)]
     pub fn pause_wire_progress(&self, pause: bool) {
         self.control.pause_progress.store(pause, Ordering::Release);
@@ -236,7 +324,21 @@ impl Connection {
     }
 
     pub fn terminal_reason(&self) -> Option<&'static str> {
-        self.control.terminal.lock().ok().and_then(|reason| *reason)
+        self.control
+            .terminal
+            .lock()
+            .ok()
+            .and_then(|reason| *reason)
+            .map(|end| end.code)
+    }
+
+    pub fn terminal_observed_ns(&self) -> Option<u64> {
+        self.control
+            .terminal
+            .lock()
+            .ok()
+            .and_then(|reason| *reason)?
+            .observed_ns
     }
 
     pub fn send_buffer_bytes(&self) -> usize {

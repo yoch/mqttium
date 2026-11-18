@@ -89,6 +89,7 @@ fn with_runtime_clock_hooks(
     )
     .unwrap();
     let mut runtime = Runtime {
+        security: None,
         message_expiry_request: None,
         message_expiry_retry: false,
         message_expiry_retry_attempts: 0,
@@ -1881,6 +1882,7 @@ fn cancelled_startup_never_announces_ready_and_releases_its_opened_epoch() {
         &events,
         cancel,
         &mut writer,
+        None,
     );
     finish_startup_writer(&mut writer);
     let store = mqttiumd_store_sqlite::SqliteStore::open(&path)
@@ -1933,6 +1935,7 @@ fn established_typed_startup_failure_takes_precedence_over_cancellation() {
         &events,
         cancel,
         &mut writer,
+        None,
     );
     finish_startup_writer(&mut writer);
     assert!(
@@ -1995,6 +1998,7 @@ fn cancellation_during_unacknowledged_registration_never_announces_ready() {
             &events,
             cancel.clone(),
             &mut writer,
+            None,
         );
         (result, watcher.join().unwrap())
     });

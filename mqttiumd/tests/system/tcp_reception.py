@@ -29,7 +29,8 @@ from tcp_probe import (
 
 class Broker:
     def __init__(self, binary: Path, case: Path, *, db: Path | None = None,
-                 label: str = "broker", pauses: tuple[str, ...] = (), test_control: bool = False):
+                 label: str = "broker", pauses: tuple[str, ...] = (), test_control: bool = False,
+                 extra_args: tuple[str, ...] = ()):
         case.mkdir(parents=True, exist_ok=True)
         self.binary = binary.resolve()
         self.case = case
@@ -44,6 +45,7 @@ class Broker:
             command += ["--test-control", str(self.control)]
         if pauses:
             command += ["--test-pause", ",".join(pauses)]
+        command.extend(extra_args)
         self.stdout_path = case / f"{label}.stdout"
         self.stderr_path = case / f"{label}.stderr"
         self.stdout = self.stdout_path.open("wb")

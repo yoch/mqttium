@@ -1,6 +1,7 @@
 //! Experimental durable hierarchical MQTT 5 TCP broker.
 use mqttiumd::{
     runtime::{Config, run},
+    security::TlsFiles,
     writer::Hooks,
 };
 use std::path::PathBuf;
@@ -12,12 +13,17 @@ fn parse_arguments(mut args: impl Iterator<Item = String>) -> Result<Config, &'s
     let mut listen = "127.0.0.1:1883".parse().map_err(|_| "listen")?;
     let mut events = None;
     let mut hooks = Hooks::default();
+    let (mut cert, mut key, mut client_ca, mut identities) = (None, None, None, None);
     while let Some(arg) = args.next() {
         let value = args.next().ok_or("missing argument value")?;
         match arg.as_str() {
             "--db" => db = Some(PathBuf::from(value)),
             "--listen" => listen = value.parse().map_err(|_| "invalid listen address")?,
             "--events" => events = Some(PathBuf::from(value)),
+            "--tls-cert" if cert.is_none() => cert = Some(PathBuf::from(value)),
+            "--tls-key" if key.is_none() => key = Some(PathBuf::from(value)),
+            "--client-ca" if client_ca.is_none() => client_ca = Some(PathBuf::from(value)),
+            "--identities" if identities.is_none() => identities = Some(PathBuf::from(value)),
             "--test-control" if cfg!(feature = "test-hooks") => {
                 hooks.directory = Some(PathBuf::from(value))
             }
@@ -49,6 +55,8 @@ fn parse_arguments(mut args: impl Iterator<Item = String>) -> Result<Config, &'s
                         "receipt.close.prepared",
                         "receipt.close.committed",
                         "work.read.before",
+                        "tls.frame.sealed",
+                        "tls.frame.first_bytes",
                         "will.admission.prepared",
                         "will.admission.committed",
                         "will.end.prepared",
@@ -88,6 +96,16 @@ fn parse_arguments(mut args: impl Iterator<Item = String>) -> Result<Config, &'s
         listen,
         events: events.ok_or("--events is required")?,
         hooks,
+        tls: match (cert, key, client_ca, identities) {
+            (None, None, None, None) => None,
+            (Some(cert), Some(key), Some(client_ca), Some(identities)) => Some(TlsFiles {
+                cert,
+                key,
+                client_ca,
+                identities,
+            }),
+            _ => return Err("TLS requires --tls-cert, --tls-key, --client-ca and --identities"),
+        },
     })
 }
 
@@ -96,7 +114,7 @@ fn main() {
         Ok(c) => c,
         Err(e) => {
             eprintln!(
-                "mqttiumd: {e}\nusage: mqttiumd --db PATH --listen 127.0.0.1:1883 --events NEW_JSONL_PATH"
+                "mqttiumd: {e}\nusage: mqttiumd --db PATH --listen ADDRESS --events NEW_JSONL_PATH [--tls-cert PATH --tls-key PATH --client-ca PATH --identities PATH]"
             );
             std::process::exit(2);
         }

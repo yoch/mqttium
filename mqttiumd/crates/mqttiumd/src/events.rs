@@ -6,6 +6,15 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+/// Same Linux monotonic clock as the independent client measurements.
+pub(crate) fn monotonic_ns() -> Option<u64> {
+    let now = nix::time::clock_gettime(nix::time::ClockId::CLOCK_MONOTONIC).ok()?;
+    u64::try_from(now.tv_sec())
+        .ok()?
+        .checked_mul(1_000_000_000)?
+        .checked_add(u64::try_from(now.tv_nsec()).ok()?)
+}
+
 const MAX_RECORD: usize = 2048;
 const MAX_LOG: usize = 16 * 1024 * 1024;
 #[derive(Clone)]

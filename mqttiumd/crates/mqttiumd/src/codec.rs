@@ -261,7 +261,7 @@ impl<'a> Cursor<'a> {
     }
 }
 
-fn utf8(bytes: &[u8]) -> Result<(), Error> {
+pub(crate) fn utf8(bytes: &[u8]) -> Result<(), Error> {
     let text = std::str::from_utf8(bytes).map_err(|_| malformed("InvalidUtf8"))?;
     // MQTT forbids NUL; the experimental profile also rejects the disallowed
     // controls and noncharacters of MQTT 5 section 1.5.4. BOM is preserved.
@@ -277,7 +277,7 @@ fn utf8(bytes: &[u8]) -> Result<(), Error> {
     Ok(())
 }
 
-fn topic(bytes: &[u8]) -> Result<(), Error> {
+pub(crate) fn topic(bytes: &[u8]) -> Result<(), Error> {
     if bytes.is_empty() || bytes.iter().any(|b| matches!(b, b'+' | b'#')) {
         return Err(Error {
             reason: 0x90,
@@ -695,7 +695,7 @@ fn disconnect(body: &[u8]) -> Result<Packet, Error> {
 
 /// A refused establishment has no session key and never advertises SP1.
 pub fn session_refusal(reason: u8) -> Result<Vec<u8>, Error> {
-    if !matches!(reason, 0x80 | 0x82 | 0x83 | 0x89 | 0x97) {
+    if !matches!(reason, 0x80 | 0x82 | 0x83 | 0x87 | 0x89 | 0x97) {
         return Err(protocol("InvalidConnackRefusal"));
     }
     Ok(vec![0x20, 3, 0, reason, 0])

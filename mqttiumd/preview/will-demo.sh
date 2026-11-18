@@ -2,12 +2,13 @@
 # Run only the packaged executable and public Mosquitto clients on localhost.
 set -eu
 preview_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-exec python3 - "$preview_dir" "${1:-$PWD/will-demo-data}" <<'PY'
+exec python3 - "$preview_dir" "${1:-$PWD/will-demo-data}" "${2:-}" <<'PY'
 import errno, hashlib, json, os, pathlib, platform, pty, shutil
 import signal, sqlite3, subprocess, sys, time
 
 package = pathlib.Path(sys.argv[1]).resolve()
 data = pathlib.Path(sys.argv[2]).resolve()
+pki = pathlib.Path(sys.argv[3]).resolve() if sys.argv[3] else None
 data.mkdir(parents=True, exist_ok=True)
 if (data / 'broker.sqlite').exists():
     raise SystemExit('Use a new demo directory; an existing database is never reset.')
@@ -17,6 +18,7 @@ if not 1 <= port <= 65535:
 build = json.loads((package / 'BUILD.json').read_text())
 result = {
     'format': 'mqttiumd.packaged-will-demo', 'status': 'RUNNING',
+    'transport': 'mtls-tls13' if pki else 'loopback-cleartext',
     'source_sha': build['source_sha'], 'binary_sha256': hashlib.sha256((package / 'mqttiumd').read_bytes()).hexdigest(),
     'binary_features': build['features'], 'instrumented': build['instrumented'],
     'build_platform': build['platform'], 'build_machine': build['machine'],
@@ -126,11 +128,16 @@ def events():
 
 def start():
     global broker
+    launcher = [str(package / ('start-tls.sh' if pki else 'start.sh')), str(data)]
+    if pki:
+        launcher.append(str(pki))
     broker = spawn(f'broker-{sum(c["row"]["name"].startswith("broker-") for c in children)}',
-                   [str(package / 'start.sh'), str(data)],
+                   launcher,
                    env=dict(os.environ, MQTTIUMD_LISTEN=f'127.0.0.1:{port}'))
     ready = wait_for(lambda: next((e for e in events() if e.get('kind') == 'ready'), None),
                      'packaged_will_broker_not_ready')
+    if pki:
+        require(ready['details']['profile'] == 'mtls-will-pubsub-v1', 'packaged_will_tls_profile_missing')
     result['observations'].append({'case': 'broker-ready', 'pid': broker['process'].pid,
                                    'ready': ready, 'events': [str(p) for p in event_files()]})
 
@@ -146,11 +153,14 @@ def stop():
 def counts():
     with sqlite3.connect((data / 'broker.sqlite').as_uri() + '?mode=ro', uri=True) as db:
         require(db.execute('PRAGMA quick_check').fetchone()[0] == 'ok', 'packaged_will_sqlite_consistency')
-        require(db.execute('PRAGMA user_version').fetchone()[0] == 10, 'packaged_will_wrong_schema')
+        require(db.execute('PRAGMA user_version').fetchone()[0] == (11 if pki else 10), 'packaged_will_wrong_schema')
         values = {name: db.execute(f'SELECT count(*) FROM {name}').fetchone()[0]
                   for name in ('sessions', 'routes', 'wills', 'retained', 'publications', 'payloads',
                                'obligations', 'outbound', 'inbound', 'operations')}
         values['will_states'] = dict(db.execute('SELECT state,count(*) FROM wills GROUP BY state'))
+        if pki:
+            values['session_owners'] = list(db.execute('SELECT hex(s.id), o.principal FROM sessions s '
+                'JOIN security_session_owners o ON s.id=o.session ORDER BY s.id'))
         return values
 
 
@@ -158,16 +168,24 @@ common = ['-V', 'mqttv5', '-h', '127.0.0.1', '-p', str(port), '-k', '10']
 status_topic = 'atelier/capteur-1/status'
 
 
+def tls_args(identity):
+    if pki is None:
+        return []
+    return ['--tls-version', 'tlsv1.3', '--cafile', str(pki / 'ca.crt'),
+            '--cert', str(pki / f'{identity}.crt'), '--key', str(pki / f'{identity}.key')]
+
+
 def dashboard(name):
-    child = spawn(name, [clients['mosquitto_sub'], *common, '-d', '-c', '-x', '4294967295',
-                        '-i', 'will-demo-dashboard', '-q', '1', '-t', 'atelier/+/status',
+    child = spawn(name, [clients['mosquitto_sub'], *common, *tls_args('dashboard'), '-d', '-c', '-x', '4294967295',
+                        '-i', 'dashboard' if pki else 'will-demo-dashboard', '-q', '1', '-t', 'atelier/+/status',
                         '-F', '%t|%p|%q|%r'])
     wait_for(lambda: 'received suback' in output(child).lower(), 'packaged_will_dashboard_no_suback')
     return child
 
 
 def sensor(name, client_id, will_payload):
-    child = spawn(name, [clients['mosquitto_pub'], *common, '-d', '-l', '-i', client_id,
+    identity = ['-i', 'capteur-1', '-c', '-x', '4294967295'] if pki else ['-i', client_id]
+    child = spawn(name, [clients['mosquitto_pub'], *common, *tls_args('sensor'), '-d', '-l', *identity,
                         '-q', '1', '-r', '-t', status_topic,
                         '--will-topic', status_topic, '--will-payload', will_payload,
                         '--will-qos', '1', '-D', 'will', 'will-delay-interval', '0'], stdin=True)
@@ -210,6 +228,29 @@ try:
     wait_for(lambda: lines(observer, 'online'), 'packaged_will_online_not_received')
     installed = counts()
     require(installed['wills'] == 1, 'packaged_will_not_durably_installed')
+    if pki:
+        require({owner for _, owner in installed['session_owners']} == {'sensor-1', 'dashboard'},
+                'packaged_will_session_owner_missing')
+        attack = [clients['mosquitto_pub'], *common, *tls_args('dashboard'), '-d', '-i', 'capteur-1',
+                  '-q', '1', '-t', status_topic, '-m', 'forbidden']
+        result['commands'].append(attack)
+        refused = subprocess.run(attack, capture_output=True, text=True, timeout=8)
+        require(refused.returncode != 0 and 'not authorized' in (refused.stdout + refused.stderr).lower(),
+                'packaged_will_foreign_client_id_not_refused')
+        require(first['process'].poll() is None and counts()['session_owners'] == installed['session_owners'],
+                'packaged_will_hostile_takeover_changed_session')
+        result['observations'].append({'case': 'foreign-client-id-refused', 'exit': refused.returncode,
+                                       'client': refused.stdout + refused.stderr})
+        denied = spawn('wildcard-refused', [clients['mosquitto_sub'], *common, *tls_args('dashboard'),
+                       '-d', '-i', 'dashboard-check', '-q', '1', '-t', '#'])
+        refused_event = wait_for(lambda: next((event for event in events()
+            if event['kind'] == 'authorization_refused' and event['details']['stage'] == 'subscribe'), None),
+            'packaged_will_wildcard_refusal_missing')
+        require(counts()['routes'] == installed['routes'], 'packaged_will_forbidden_route_created')
+        if denied['process'].poll() is None:
+            denied['process'].send_signal(signal.SIGINT)
+        denied['row']['status'] = denied['process'].wait(timeout=8)
+        result['observations'].append({'case': 'wildcard-refused', 'broker_event': refused_event})
     terminate_sensor(first)
     wait_for(lambda: lines(observer, 'offline'), 'packaged_will_offline_not_received')
     wait_for(lambda: counts()['wills'] == 0 and counts()['obligations'] == 0,
@@ -250,7 +291,8 @@ try:
     result['observations'].append({'case': 'offline-responsibility-restart', 'before': before,
                                   'after': counts(), 'received_offline_pending': len(lines(recovered, 'offline-pending'))})
 
-    argv = [clients['mosquitto_sub'], *common, '-i', 'will-demo-retained-check', '-q', '1',
+    argv = [clients['mosquitto_sub'], *common, *tls_args('dashboard'), '-i',
+            'dashboard-check' if pki else 'will-demo-retained-check', '-q', '1',
             '-t', status_topic, '-C', '1', '-W', '5', '-F', '%t|%p|%q|%r']
     result['commands'].append(argv)
     retained = subprocess.run(argv, capture_output=True, text=True, timeout=8)

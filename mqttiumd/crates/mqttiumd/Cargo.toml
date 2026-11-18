@@ -1,6 +1,6 @@
 [package]
 name = "mqttiumd"
-description = "Experimental MQTT 5 durable incoming QoS 2 TCP broker"
+description = "Experimental MQTT 5 durable broker for private networks"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -17,6 +17,11 @@ socket2 = "=0.6.0"
 ctrlc = { version = "=3.4.7", features = ["termination"] }
 getrandom = "=0.3.4"
 nix = { version = "=0.30.1", features = ["time"] }
+rustls = { version = "=0.23.46", default-features = false, features = ["std", "ring"] }
+rustls-pemfile = "=2.2.0"
+serde = { version = "1", features = ["derive"] }
+sha2 = "=0.11.1"
+zeroize = "=1.9.2"
 
 [features]
 default = []
