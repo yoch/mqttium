@@ -29,6 +29,11 @@ def copy_pilot_files(root: Path, package: Path) -> None:
     (package / "preview").mkdir()
     for name in ("demo-pki.py", "policy-demo.py"):
         shutil.copy2(root / "preview" / name, package / "preview" / name)
+    # The receipt helper validates its source-pinned control window at import.
+    # Keep that bounded public configuration beside the copied normal probes.
+    (package / "contracts/v1").mkdir(parents=True, exist_ok=True)
+    shutil.copy2(root / "contracts/v1/product-profile.json",
+                 package / "contracts/v1/product-profile.json")
     # Ship the existing normal socket helpers used by charged restoration.
     # Follow only local Python imports, without copying proof laboratories.
     modules = ["policy_transition_reception"]
