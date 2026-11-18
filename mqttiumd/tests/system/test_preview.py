@@ -30,7 +30,7 @@ class PreviewCommandTests(unittest.TestCase):
             (root/"preview").mkdir(parents=True)
             for name in ("README.md", "start.sh", "demo.sh", "expiry-demo.sh", "will-demo.sh",
                          "SECURE.md", "start-tls.sh", "secure-demo.sh", "demo-pki.py", "identities.example.json",
-                         "POLICY.md", "policy-demo.py", "identities.next.example.json", "retained-will-demo.py", "PILOT.md", "FORWARD.md", "SPLIT.md"):
+                         "POLICY.md", "policy-demo.py", "identities.next.example.json", "retained-will-demo.py", "PILOT.md", "FORWARD.md", "SPLIT.md", "SITE.md"):
                 (root/"preview"/name).write_text("fixture "+name)
             (root/"docs/pilot").mkdir(parents=True)
             (root/"docs/pilot/decision.md").write_text("identified qualification fixture\n")
@@ -41,6 +41,8 @@ class PreviewCommandTests(unittest.TestCase):
             (root/"tools/run_prepilot_reception.sh").write_text("#!/bin/sh\nexit 0\n")
             (root/"tools/run_forward_reception.sh").write_text("#!/bin/sh\nexit 0\n")
             (root/"tools/run_split_reception.sh").write_text("#!/bin/sh\nexit 0\n")
+            (root/"tools/run_site_reception.sh").write_text("#!/bin/sh\nexit 0\n")
+            (root/"preview/pilot/operate.py").write_text("# packaged site supervisor\n")
             (root/"tests/system").mkdir(parents=True)
             (root/"tests/system/policy_transition_reception.py").write_text("from normal_helper import recovery\n")
             (root/"tests/system/normal_helper.py").write_text("recovery = True\n")
@@ -73,7 +75,7 @@ class PreviewCommandTests(unittest.TestCase):
                              "POLICY.md", "policy-demo.py", "identities.next.example.json", "retained-will-demo.py"):
                     self.assertTrue(any(member.endswith("/" + name) for member in names), name)
                 for name in ("PILOT.md", "run-qualification.sh", "pilot/load.py", "FORWARD.md",
-                             "run-forward-reception.sh", "pilot/forward_client.py", "SPLIT.md", "run-split-reception.sh",
+                             "run-forward-reception.sh", "pilot/forward_client.py", "SPLIT.md", "run-split-reception.sh", "SITE.md", "run-site-reception.sh", "pilot/operate.py",
                              "tests/system/policy_transition_reception.py", "tests/system/normal_helper.py",
                              "preview/demo-pki.py", "preview/policy-demo.py", "qualification/decision.md",
                              "contracts/v1/product-profile.json"):

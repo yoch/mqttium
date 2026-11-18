@@ -12,22 +12,29 @@ import re
 import subprocess
 
 
-def openssl(*args: str | Path) -> bytes:
+def openssl(*args: str | Path | int) -> bytes:
     return subprocess.run(
         ["openssl", *(str(arg) for arg in args)],
         check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=15,
     ).stdout
 
 
+def demo_days() -> int:
+    days = int(os.environ.get("MQTTIUMD_DEMO_PKI_DAYS", "2"))
+    if not 2 <= days <= 7:
+        raise ValueError("demo certificate lifetime must be between two and seven days")
+    return days
+
+
 def ca(root: Path, name: str) -> None:
     openssl("req", "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:P-256",
-            "-nodes", "-days", "2", "-subj", f"/CN={name}",
+            "-nodes", "-days", demo_days(), "-subj", f"/CN={name}",
             "-addext", "basicConstraints=critical,CA:TRUE,pathlen:0",
             "-addext", "keyUsage=critical,keyCertSign,cRLSign",
             "-keyout", root / f"{name}.key", "-out", root / f"{name}.crt")
 
 
-def issue(root: Path, name: str, usage: str, *, issuer: str = "ca", san: str | None = None, days: int = 2) -> str:
+def issue(root: Path, name: str, usage: str, *, issuer: str = "ca", san: str | None = None, days: int | None = None) -> str:
     key, csr, cert = (root / f"{name}.{suffix}" for suffix in ("key", "csr", "crt"))
     extensions = root / f"{name}.ext"
     extensions.write_text("basicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature\n"
@@ -35,7 +42,7 @@ def issue(root: Path, name: str, usage: str, *, issuer: str = "ca", san: str | N
     openssl("req", "-new", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:P-256",
             "-nodes", "-subj", f"/CN={name}", "-keyout", key, "-out", csr)
     openssl("x509", "-req", "-in", csr, "-CA", root / f"{issuer}.crt",
-            "-CAkey", root / f"{issuer}.key", "-CAcreateserial", "-days", str(days),
+            "-CAkey", root / f"{issuer}.key", "-CAcreateserial", "-days", demo_days() if days is None else days,
             "-extfile", extensions, "-out", cert)
     csr.unlink()
     extensions.unlink()
@@ -78,4 +85,4 @@ if __name__ == "__main__":
     parser.add_argument("--host", default="127.0.0.1")
     args = parser.parse_args()
     generate(args.directory, args.host)
-    print(f"Created demonstration credentials in {args.directory} (two days)")
+    print(f"Created demonstration credentials in {args.directory} ({demo_days()} days)")

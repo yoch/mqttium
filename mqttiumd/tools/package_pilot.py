@@ -96,6 +96,22 @@ def package(args):
             }
             metadata["forward_decision"] = metadata.get("decision")
             metadata["decision"] = metadata["split_application"]["decision"]
+        site = sealed / "qualification/site-results.json"
+        if site.is_file():
+            received = json.loads(site.read_text())
+            expected = received["component_sha256"]
+            if received["broker_binary_sha256"] != args.binary_sha256 or any(
+                Path(name).name != name or digest(sealed / "pilot" / name) != expected[name] for name in expected
+            ):
+                raise ValueError("site_evidence_component_mismatch")
+            metadata["private_site"] = {
+                "measured_source_sha": received["application_source"],
+                "components": expected,
+                "decision": "qualification/site-decision.md",
+                "results": "qualification/site-results.json",
+            }
+            metadata["split_decision"] = metadata["decision"]
+            metadata["decision"] = metadata["private_site"]["decision"]
         (sealed / "PACKAGE.json").write_text(json.dumps(metadata, indent=2) + "\n")
         sums = [f"{digest(f)}  {f.relative_to(sealed)}" for f in sorted(sealed.rglob("*"))
                 if f.is_file() and f.name != "SHA256SUMS"]
