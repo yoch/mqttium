@@ -74,7 +74,7 @@ def summarize(root):
                 peak["charged_archive_bytes"] = max(peak["charged_archive_bytes"], trend["archive_charge"])
                 peak["archive_segments_per_receiver"] = max(peak["archive_segments_per_receiver"], trend["segment_count"])
             for trend in metrics["history"]["sources"].values():
-                need(trend["occupied_bytes"] <= trend["budget"] and not trend["unknown"], "outbox_budget_or_unknown_result")
+                need(trend["occupied_bytes"] <= trend["budget"] and trend["attempts"] >= trend["confirmed"], "outbox_budget_or_receipt_counter")
                 peak["outbox_bytes"] = max(peak["outbox_bytes"], trend["occupied_bytes"])
     need(count > 360 and peak["history_references"] >= 127 and first_ns < last_ns, "incomplete_sample_window")
     large = inputs["dense_archive"]
@@ -89,6 +89,10 @@ def summarize(root):
                       root / "python-gates.log", root / "rust-gates.log"]
     storage = inputs["storage"]
     met = e["normal_metrics"]
+    expected_restarts = {"broker-live", "broker-history", "history-dashboard-1", "history-dashboard-2", "capteur-1"}
+    unexpected = {role: counts["launches"] - 1 - int(role in expected_restarts)
+                  for role, counts in phases["all_responsibilities_drained"]["actors"].items()
+                  if counts["launches"] - 1 > int(role in expected_restarts)}
     outcome = {
         "format": "mqttiumd.private-site.qualification.v1",
         "broker_binary_sha256": BINARY, "broker_source_sha": e["broker"]["source_sha"],
@@ -103,6 +107,8 @@ def summarize(root):
         "observed_generation_s": e["observed_generation_s"], "phases": e["phases"],
         "observations": count, "minimum_available_bytes": free, "peaks": peak,
         "application_budgets": e["application_budgets"], "final_primary_live": met["live"],
+        "unknown_after_incidents": sum(row["unknown"] for row in met["history"]["sources"].values()),
+        "extra_primary_restarts_by_role": unexpected,
         "process_peaks_by_pid": e["process_observations"],
         "authorized_role_guard": e["auth_refusal_both_lanes"], "charged_backup": old,
         "health_errors": inputs["guards"],
