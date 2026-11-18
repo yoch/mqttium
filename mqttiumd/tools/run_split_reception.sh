@@ -28,6 +28,7 @@ else:
     print(json.loads((package / "BUILD.json").read_text())["source_sha"])
 PYTHON
 )
+"$python" "$package/pilot/split_site_check.py" "$out/launchers"
 "$python" "$package/pilot/split_reception.py" "$out/short" --short --catchup-limit 60 --application-source "$application_source"
 "$python" "$package/pilot/segment_reception.py" "$out/segments"
 "$python" "$package/pilot/split_incidents.py" "$out/incidents"
