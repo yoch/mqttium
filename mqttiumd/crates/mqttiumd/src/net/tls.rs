@@ -171,11 +171,24 @@ fn frame_ciphertext(tls: &mut ServerConnection, bytes: &[u8]) -> Result<Vec<u8>,
     {
         return Err("tls_application_buffer");
     }
-    tls.write_tls(&mut BoundedCiphertext {
+    let mut sink = BoundedCiphertext {
         bytes: &mut ciphertext,
         limit: expected,
-    })
-    .map_err(|_| "tls_application_encode")?;
+    };
+    // The default Write::write_vectored accepts only its first nonempty
+    // slice. Each pass therefore extracts one record, within this bound.
+    for _ in 0..bytes.len().div_ceil(RECORD_BODY) {
+        if !tls.wants_write() {
+            break;
+        }
+        if tls
+            .write_tls(&mut sink)
+            .map_err(|_| "tls_application_encode")?
+            == 0
+        {
+            return Err("tls_application_encode");
+        }
+    }
     if tls.wants_write() || ciphertext.len() != expected {
         return Err("tls_application_boundary");
     }

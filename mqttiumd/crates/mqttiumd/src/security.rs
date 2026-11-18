@@ -296,8 +296,8 @@ fn certificates(path: &Path) -> Result<Vec<CertificateDer<'static>>, &'static st
 }
 
 fn private_key(path: &Path) -> Result<PrivateKeyDer<'static>, &'static str> {
-    // The PEM buffer and DER key are wiped on drop. Keep this material out of
-    // Debug, product events, process arguments and reception archives.
+    // Wipe the source PEM buffer on drop. The TLS provider owns the decoded
+    // signing key. Logs and evidence carry neither representation.
     let bytes = zeroize::Zeroizing::new(bounded_file(path, 16 * 1024)?);
     let mut input = Cursor::new(bytes.as_slice());
     let key = match rustls_pemfile::read_one(&mut input).map_err(|_| "invalid_private_key")? {
