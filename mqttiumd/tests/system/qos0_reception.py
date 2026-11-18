@@ -454,6 +454,17 @@ def mixed_fanout(binary: Path, case: Path) -> dict:
         broker.cleanup()
 
 
+def capacity_fixture_limit(db_path: Path, limit: bytes) -> bytes:
+    try:
+        writer_available(db_path)
+    except BlockingIOError:
+        raise ReceiptFailure("capacity_fixture_writer_active") from None
+    with sqlite3.connect(db_path, timeout=.25) as db:
+        original = db.execute("SELECT limit_references FROM meta").fetchone()[0]
+        db.execute("UPDATE meta SET limit_references=?", (limit,))
+        return original
+
+
 def atomic_capacity(binary: Path, case: Path) -> dict:
     broker = Broker(binary, case)
     original = None
@@ -467,9 +478,7 @@ def atomic_capacity(binary: Path, case: Path) -> dict:
             zero.subscribe(1, [(topic, 0)], expected=(0,))
             one.subscribe(1, [(topic, 1)])
             before = durable(broker.db)
-            with sqlite3.connect(broker.db, timeout=.25) as db:
-                original = db.execute("SELECT limit_references FROM meta").fetchone()[0]
-                db.execute("UPDATE meta SET limit_references=?", ((1).to_bytes(8, "big"),))
+            original = capacity_fixture_limit(broker.db, (1).to_bytes(8, "big"))
             rejected = publish(broker, case, "capacity-rejected", "mqttium", topic, b"no-partial-fanout", 1, "rejected")
             require(any(e["kind"] == "publication_rejected" and e.get("reason_code") == 0x97
                         for e in rejected["result"]["events"]), "mixed_capacity_wrong_refusal")
@@ -479,8 +488,7 @@ def atomic_capacity(binary: Path, case: Path) -> dict:
                 require(after["tables"][name] == before["tables"][name], "mixed_capacity_partial_admission", name)
             zero.no_publication(.15, code="mixed_capacity_early_qos0")
             one.no_publication(.15, code="mixed_capacity_early_qos1")
-            with sqlite3.connect(broker.db, timeout=.25) as db:
-                db.execute("UPDATE meta SET limit_references=?", (original,))
+            capacity_fixture_limit(broker.db, original)
             original = None
             accepted = publish(broker, case, "capacity-accepted", "paho", topic, b"capacity-restored", 2)
             zm, om = zero.next_publication(), one.next_publication()
