@@ -15,7 +15,7 @@ It listens on `127.0.0.1:1883`; `MQTTIUMD_LISTEN` overrides the address.
 `./data/broker.sqlite` survives restarts; every start creates fresh logs.
 **Schema10 only:** older databases are refused without modification. Keep an
 old installation's data separately; there is no automatic migration or reset.
-This preview has no TLS or authentication. Keep it on localhost.
+This launcher uses the plaintext loopback profile. Use the secure guide for mTLS.
 
 ## A sensor disappears: online → SIGKILL → offline
 
@@ -224,7 +224,7 @@ own retained reference without destroying such deliveries. Will intentions have 
 reserve of256 slots and8MiB payload bytes (maximum32768 bytes each). No
 per-client historical Will row is kept after cancellation or admission.
 
-This is a trusted-local-machine preview, with **no TLS or authentication**.
+This section describes the trusted-local-machine loopback profile.
 Will variants outside the profile above, shared subscriptions, Subscription Identifiers, outgoing
 QoS2, MQTT3.1.1 and schema migration are unsupported. Finite session expiry uses
 a conservative logical clock when time-domain continuity cannot be established;

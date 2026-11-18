@@ -203,7 +203,7 @@ packets reset the 1.5-times-Keep-Alive deadline; fragments do not. Keep Alive 0
 disables that MQTT timer, not partial-packet/write deadlines. PINGREQ passes
 through the core and produces PINGRESP.
 
-authentication, shared subscriptions,
+MQTT Username/Password, Enhanced Authentication, shared subscriptions,
 subscription identifiers, topic aliases, PUBLISH properties and outgoing
 QoS 2 are not implemented. No Local, Retain As Published and valid Retain
 Handling values are accepted and durably preserved per subscription. No Local
@@ -503,7 +503,7 @@ These are finite system tests. Existing K1/K2b/K3 qualifications and proof/model
 limits stay separate; no new path automatically qualifies all P1/P2. ADRs
 0024/0025/0026/0027/0028 retain Proposed status and guard partitions stay incomplete.
 Legacy epoch-zero/session collection, indefinite operation, outgoing QoS 2,
-shared delivery, authentication, deployment
+shared delivery, runtime management of authorization policy, deployment
 security and performance remain separate. Process SIGKILL is not a power-loss
 or universal storage guarantee.
 
@@ -663,7 +663,7 @@ lost results, compiled negative controls and a standalone extracted-archive
 demo. These are product system tests, separate from the existing qualifying
 K1/K2b/K3 fixture scope. The package's `demo.sh` executes the short Mosquitto
 publish-before-dashboard, restart, replace and empty-retained-clear guide.
-TLS/authentication, shared subscriptions, Subscription
+TLS/MQTT Username/Password, Enhanced Authentication, shared subscriptions, Subscription
 Identifiers, outgoing QoS2, MQTT3.1.1 and general migration remain unsupported.
 
 ## Message Expiry (Proposed0033)
@@ -708,7 +708,7 @@ remain. Correlated lifecycle/receipt controls retain independent lanes.
 Run `tools/run_message_expiry_reception.sh /tmp/message-expiry-reception` from
 this directory. Its new tests are system evidence, not extension of historical
 K1/K2b/K3 independent-oracle qualification. Message Expiry does not implement
-shared subscriptions, outgoingQoS2, authentication or schema migration.
+shared subscriptions, outgoing QoS 2, dynamic authentication or schema migration.
 
 
 ## Zero-delay durable Will (Proposed0034)
@@ -717,7 +717,7 @@ The normal preview supports CONNECT Will QoS1, RETAIN=0 and delay absent/zero.
 Use `preview/will-demo.sh /tmp/mqttiumd-sensor-demo` with Mosquitto clients to
 observe retained `online`, a real sensor-process SIGKILL and non-retained
 `offline`. The package guide starts with these commands. The broker binds
-localhost by default; this unauthenticated preview is not a deployment profile.
+localhost by default. The authenticated listener has a separate configuration and storage profile.
 
 OpenWillAt installs the exact attachment's immutable Will before known Open
 allows CONNACK. Normal DISCONNECT0 cancels it durably; DISCONNECT4 requests it.
@@ -758,5 +758,4 @@ transaction commits; a parsed normal DISCONNECT followed by an earlier crash
 cannot leave recoverable proof of an uncommitted cancellation. Server shutdown
 or failure may defer Wills until restart. This is not a guarantee of notification
 before a server SIGKILL, power-loss certification, or complete MQTT compliance.
-The next functional increment is a local TLS/authentication deployment profile
-with measured service targets, not an expansion of the Will profile here.
+The [secure preview guide](../preview/SECURE.md) exercises this Will behavior over mTLS.

@@ -2632,6 +2632,10 @@ impl Runtime<'_> {
         self.pump_will_connects()?;
         let keys: Vec<_> = self.peers.keys().copied().collect();
         for generation in keys {
+            let tls = self
+                .peers
+                .get(&generation)
+                .is_some_and(|peer| peer.io.is_tls());
             let mut tls_close = None;
             self.wire_progress(generation)?;
             self.retry_deferred_publish(generation)?;
@@ -2672,11 +2676,7 @@ impl Runtime<'_> {
                         self.packet_at(generation, first, body, observed)?
                     }
                     Ok(net::Incoming::Closed { code }) => {
-                        if self
-                            .peers
-                            .get(&generation)
-                            .is_some_and(|peer| peer.io.is_tls())
-                        {
+                        if tls {
                             tls_close = Some(code);
                             break;
                         }
@@ -2691,11 +2691,7 @@ impl Runtime<'_> {
                             .get(&generation)
                             .and_then(|p| p.io.terminal_reason())
                             .unwrap_or("reader_closed");
-                        if self
-                            .peers
-                            .get(&generation)
-                            .is_some_and(|peer| peer.io.is_tls())
-                        {
+                        if tls {
                             tls_close = Some(code);
                             break;
                         }
@@ -2705,11 +2701,7 @@ impl Runtime<'_> {
                     }
                 }
             }
-            let receipt_limit = if tls_close.is_some() {
-                net::WRITTEN_SLOTS
-            } else {
-                8
-            };
+            let receipt_limit = if tls { net::WRITTEN_SLOTS } else { 8 };
             for _ in 0..receipt_limit {
                 let written = match self.peers.get(&generation) {
                     Some(p) => p.io.written.try_recv(),
@@ -2806,7 +2798,11 @@ impl Runtime<'_> {
                         } else if let Some((code, _)) =
                             self.peers.get(&generation).and_then(|p| p.closing)
                         {
-                            self.close(generation, code)?;
+                            if tls {
+                                tls_close = Some(code);
+                            } else {
+                                self.close(generation, code)?;
+                            }
                         }
                     }
                     Ok(net::Written::Failed { correlation, code }) => {
@@ -2818,12 +2814,22 @@ impl Runtime<'_> {
                                 progress: FrameProgress::Failed,
                             })?;
                         }
-                        self.close(generation, code)?;
-                        break;
+                        if tls {
+                            tls_close.get_or_insert(code);
+                        } else {
+                            self.close(generation, code)?;
+                            break;
+                        }
                     }
                     Err(TryRecvError::Empty) => break,
                     Err(TryRecvError::Disconnected) => {
-                        if tls_close.is_none() {
+                        if tls {
+                            let reason = self
+                                .peers
+                                .get(&generation)
+                                .and_then(|peer| peer.io.terminal_reason());
+                            tls_close.get_or_insert(reason.unwrap_or("writer_closed"));
+                        } else {
                             self.close(generation, "writer_closed")?;
                         }
                         break;
@@ -2831,7 +2837,20 @@ impl Runtime<'_> {
                 }
             }
             if let Some(code) = tls_close {
+                // The two queue observations may race even though they come
+                // from one TLS task. Apply the frame facts while the exact
+                // generation still owns its exchange.
                 self.drain_inputs()?;
+                if let Some(peer) = self.peers.get_mut(&generation)
+                    && self.terminal_inputs.iter().any(|input| matches!(input,
+                        Input::FrameResult { connection, .. } | Input::Qos0EmitRefused { connection, .. }
+                            if connection.generation == generation))
+                {
+                    let (_, since) = peer.closing.get_or_insert((code, Instant::now()));
+                    if since.elapsed() < Duration::from_millis(300) {
+                        continue;
+                    }
+                }
                 self.close(generation, code)?;
             }
             if let Some(p) = self.peers.get(&generation) {

@@ -28,7 +28,8 @@ class PreviewCommandTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root=Path(temporary)/"repo"/"mqttiumd"
             (root/"preview").mkdir(parents=True)
-            for name in ("README.md","start.sh","demo.sh","expiry-demo.sh","will-demo.sh"):
+            for name in ("README.md", "start.sh", "demo.sh", "expiry-demo.sh", "will-demo.sh",
+                         "SECURE.md", "start-tls.sh", "secure-demo.sh", "demo-pki.py", "identities.example.json"):
                 (root/"preview"/name).write_text("fixture "+name)
             for name in ("LICENSE","NOTICE"):
                 (root.parent/name).write_text("license fixture")
@@ -53,9 +54,16 @@ class PreviewCommandTests(unittest.TestCase):
             with tarfile.open(archive) as packed:
                 names=packed.getnames()
                 self.assertTrue(any(name.endswith("/will-demo.sh") for name in names),"packaged_will_demo_missing")
+                for name in ("SECURE.md", "start-tls.sh", "secure-demo.sh", "demo-pki.py", "identities.example.json"):
+                    self.assertTrue(any(member.endswith("/" + name) for member in names), name)
                 info=next(item for item in packed.getmembers() if item.name.endswith("/BUILD.json"))
                 build=json.load(packed.extractfile(info))
             self.assertEqual(build["sqlite_schema"],10,"will_schema_not_named")
+            self.assertEqual(build["listener_profiles"]["loopback_cleartext"], {"sqlite_schema": 10, "tls": False})
+            self.assertEqual(build["listener_profiles"]["private_mtls"], {
+                "sqlite_schema": 11, "tls_version": "TLS1.3", "client_certificate": "required",
+                "tls_resumption": False, "early_data": False,
+            })
             self.assertEqual(build["will_profile"],{"qos":1,"retain":False,"delay_interval":0,"message_expiry":False,"intent_slots":256,"payload_bytes":8388608})
             self.assertEqual(build["features"],[])
             self.assertFalse(build["instrumented"])
