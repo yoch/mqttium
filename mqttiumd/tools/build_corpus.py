@@ -4036,6 +4036,19 @@ bad("product-will-detached-infinite-has-deadline.json", "schema-violation", "/de
     "Infinite detachment has no finite deadline; legacy null remains readable.",
     edited(will_detached_diagnostic,lambda value:value["details"].update(deadline="1")))
 
+# Security observations record a decision and generation without confidential
+# credential bytes or the denied identity, topic, or filter.
+secure_denial = env("mqttiumd.product-event", seq="1", pid=1, kind="authorization_refused",
+                   connection="1", details={"stage":"subscribe","reason":135})
+ok("product-secure-authorization-refused.json", secure_denial)
+bad("product-secure-denial-leaks-topic.json", "schema-violation", "/details",
+    "A denied filter is not included in a security diagnostic.",
+    edited(secure_denial, lambda value:value["details"].update(filter="private/#")))
+for point, sent in (("tls.frame.sealed", 0), ("tls.frame.first_bytes", 3)):
+    ok("product-hook-" + point.replace(".", "-") + ".json", env("mqttiumd.product-event", seq="1", pid=1,
+        kind="barrier_hit", point=point, connection="1",
+        details={"effect":"1/0/26","ciphertext_bytes_sent":sent}))
+
 
 dump(EX / "index.json", env("mqttiumd.example-index", valid=valid, invalid=invalid))
 

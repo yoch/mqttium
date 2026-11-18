@@ -51,7 +51,8 @@ def build_pinned(out: Path, target: Path, root: Path, source: str) -> Path:
     package = out / f"mqttiumd-preview-{source[:8]}-{platform.machine()}-linux"
     package.mkdir()
     shutil.copy2(binary, package / "mqttiumd")
-    for name in ("README.md", "start.sh", "demo.sh", "expiry-demo.sh", "will-demo.sh"):
+    for name in ("README.md", "start.sh", "demo.sh", "expiry-demo.sh", "will-demo.sh",
+                 "SECURE.md", "start-tls.sh", "secure-demo.sh", "demo-pki.py", "identities.example.json"):
         shutil.copy2(root / "preview" / name, package / name)
     (package / "NORMAL-FEATURES.txt").write_text(features)
     runtime = command("ldd", str(binary))
@@ -104,6 +105,9 @@ def build_pinned(out: Path, target: Path, root: Path, source: str) -> Path:
         "build_options": ["--release", "--locked", "--no-default-features", "-p", "mqttiumd"],
         "build_environment": {key: os.environ.get(key) for key in ("RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS", "CARGO_PROFILE_RELEASE_DEBUG", "CARGO_PROFILE_RELEASE_OPT_LEVEL", "CARGO_PROFILE_RELEASE_OVERFLOW_CHECKS")},
         "sqlite_schema": 10, "instrumented": False,
+        "listener_profiles": {"loopback_cleartext": {"sqlite_schema": 10, "tls": False},
+            "private_mtls": {"sqlite_schema": 11, "tls_version": "TLS1.3",
+                "client_certificate": "required", "tls_resumption": False, "early_data": False}},
         "will_profile": {"qos": 1, "retain": False, "delay_interval": 0,
                          "message_expiry": False, "intent_slots": 256, "payload_bytes": 8388608},
         "binary_sha256": hashlib.sha256(binary.read_bytes()).hexdigest(),

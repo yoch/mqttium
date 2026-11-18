@@ -92,6 +92,32 @@ impl StoragePolicy {
         if !same {
             return Err(OpenError::SecurityPolicyMismatch);
         }
+        // Delimit the exact installed trigger definitions. The SQLite schema
+        // catalog strips the trailing semicolon from each CREATE statement.
+        for (name, ddl) in [
+            (
+                "secure_session_insert",
+                "secure_session_insert AFTER INSERT",
+            ),
+            (
+                "secure_session_delete",
+                "secure_session_delete AFTER DELETE",
+            ),
+            (
+                "secure_session_identity",
+                "secure_session_identity BEFORE UPDATE",
+            ),
+        ] {
+            let prefix = format!("CREATE TRIGGER {ddl}");
+            let begin = CREATE.find(&prefix).ok_or(OpenError::Corrupt)?;
+            let end = CREATE[begin..].find("\nEND;").ok_or(OpenError::Corrupt)? + 4;
+            let trigger_exists: bool = read.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='trigger' AND name=?1 AND sql=?2)",
+                params![name, &CREATE[begin..begin + end]], |row| row.get(0))?;
+            if !trigger_exists {
+                return Err(OpenError::Corrupt);
+            }
+        }
         {
             let mut statement = read.prepare(
                 "SELECT client_id, principal FROM security_client_owners ORDER BY client_id LIMIT 129",

@@ -99,7 +99,9 @@
         "will.admission.committed",
         "will.end.prepared",
         "will.end.committed",
-        "work.read.before"
+        "work.read.before",
+        "tls.frame.sealed",
+        "tls.frame.first_bytes"
       ]
     },
     "command_kind": {
@@ -1239,6 +1241,198 @@
               },
               "authority": {
                 "const": "durable_admission_commit"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": [
+          "kind"
+        ],
+        "properties": {
+          "kind": {
+            "const": "tls_profile"
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "details"
+        ],
+        "properties": {
+          "details": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "version",
+              "client_certificate",
+              "policy_sha256",
+              "max_handshakes",
+              "handshake_ms",
+              "handshake_bytes",
+              "certificate_bytes",
+              "chain_bytes",
+              "chain_certificates",
+              "tls_buffer_bytes",
+              "resumption",
+              "early_data"
+            ],
+            "properties": {
+              "version": {
+                "const": "TLS1.3"
+              },
+              "client_certificate": {
+                "const": "required"
+              },
+              "policy_sha256": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{64}$"
+              },
+              "max_handshakes": {
+                "const": 8
+              },
+              "handshake_ms": {
+                "const": 2000
+              },
+              "handshake_bytes": {
+                "const": 65536
+              },
+              "certificate_bytes": {
+                "const": 8192
+              },
+              "chain_bytes": {
+                "const": 32768
+              },
+              "chain_certificates": {
+                "const": 4
+              },
+              "tls_buffer_bytes": {
+                "const": 98304
+              },
+              "resumption": {
+                "const": false
+              },
+              "early_data": {
+                "const": false
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": [
+          "kind"
+        ],
+        "properties": {
+          "kind": {
+            "const": "tls_authenticated"
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "connection",
+          "details"
+        ],
+        "properties": {
+          "details": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "version",
+              "handshake_us"
+            ],
+            "properties": {
+              "version": {
+                "const": "TLS1.3"
+              },
+              "handshake_us": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 2000000
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": [
+          "kind"
+        ],
+        "properties": {
+          "kind": {
+            "const": "authorization_refused"
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "connection",
+          "details"
+        ],
+        "properties": {
+          "details": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "stage",
+              "reason"
+            ],
+            "properties": {
+              "stage": {
+                "enum": [
+                  "client_id",
+                  "will",
+                  "publish",
+                  "subscribe",
+                  "unsubscribe"
+                ]
+              },
+              "reason": {
+                "const": 135
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": [
+          "kind"
+        ],
+        "properties": {
+          "kind": {
+            "const": "will_commit_observed"
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "operation",
+          "details"
+        ],
+        "properties": {
+          "details": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "monotonic_ns",
+              "authority"
+            ],
+            "properties": {
+              "monotonic_ns": {
+                "$ref": "primitives.schema.json#/$defs/u64"
+              },
+              "authority": {
+                "const": "sqlite_commit_return"
               }
             }
           }

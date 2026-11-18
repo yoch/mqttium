@@ -1,4 +1,11 @@
-# Local MQTT 5 preview with durable Will and Message Expiry
+# MQTT 5 preview for private networks
+
+The optional mTLS listener uses TLS 1.3, explicit client certificate pins,
+ClientID ownership and static topic grants. The legacy plaintext listener
+accepts loopback addresses only. For setup, see the [secure preview guide](../preview/SECURE.md)
+and [Proposed 0035](decisions/0035-private-mtls-profile.md). The secure
+SQLite profile uses schema 11 and a separate database from schema 10.
+The sections below describe the shared MQTT behavior and historical loopback profile.
 
 The product receives MQTT 5 QoS 0/1/2 publications, including durable retained values, Message Expiry and zero-delay non-retained QoS1 Wills, and delivers
 at QoS 0 or 1 to persistent exact and hierarchical subscriptions. Sessions and filters

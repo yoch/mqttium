@@ -1,4 +1,7 @@
-# mqttiumd — local MQTT5 sensor disappearance notifications
+# mqttiumd — MQTT 5 preview for private networks
+
+[Run the TLS 1.3 demonstration and provision two client identities](SECURE.md).
+The historical loopback demonstration is below.
 
 Extract on compatible Linux x86_64 with glibc (see `BUILD.json` and `RUNTIME.txt`).
 The normal executable needs neither Rust, Git nor the laboratory. Start on the

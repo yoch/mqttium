@@ -717,12 +717,13 @@ impl Runtime<'_> {
                 .retain(|(connection, _), _| connection.generation != generation);
             peer.io.close();
             self.retiring.push(peer.io);
+            let mut fields =
+                json!({"connection":generation.get().to_string(),"details":{"code":code}});
+            if let Some(ns) = observed_monotonic_ns {
+                fields["details"]["observed_monotonic_ns"] = json!(ns);
+            }
             self.events
-                .emit(
-                    "connection_closed",
-                    json!({"connection":generation.get().to_string(),"details":{"code":code,
-                        "observed_monotonic_ns":observed_monotonic_ns}}),
-                )
+                .emit("connection_closed", fields)
                 .map_err(event_failure)?;
             self.queue(Input::ConnectionClosed {
                 connection: generation,

@@ -320,6 +320,10 @@ impl Task {
         {
             return Err("tls_handshake_profile");
         }
+        let elapsed = start.elapsed();
+        if elapsed >= HANDSHAKE_TIMEOUT {
+            return Err("tls_handshake_deadline");
+        }
         let principal = self
             .state
             .peer_certificates()
@@ -330,9 +334,7 @@ impl Task {
             .set(principal)
             .map_err(|_| "tls_duplicate_authentication")?;
         self.input
-            .try_send(Incoming::Authenticated {
-                elapsed: start.elapsed(),
-            })
+            .try_send(Incoming::Authenticated { elapsed })
             .map_err(|_| "tls_authentication_receipt")?;
         Ok(())
     }

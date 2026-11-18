@@ -191,5 +191,12 @@ remain open. An uncommitted cancellation cannot be recovered after a crash;
 server failure can defer notification to restart. Pending intent reserves are
 bounded, so arbitrarily many blocked vanished clients are not promised. Will
 receipt/inventory retention is bounded and old schema formats are refused.
-TLS, authentication and measurable local deployment service targets are the next
-separate increment; no unauthenticated remote deployment is received here.
+Proposed 0035 adds a private MQTT 5 listener using TLS 1.3 and mandatory
+client certificates. Durable ClientID ownership and immutable authorization
+policy bound session recovery. See [the secure preview guide](../../preview/SECURE.md).
+
+Username/password, certificate and ACL reload, remote administration,
+automated rotation and revocation, tenant isolation, and offline migration
+remain separate. System reception reports finite service distributions for
+the verified environment. MQTT conformance and storage power-loss behavior
+retain their separate evidence requirements.

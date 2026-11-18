@@ -438,3 +438,73 @@ impl rustls::time_provider::TimeProvider for CertificateClock {
         certificate_time()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn configuration() -> serde_json::Value {
+        json!({"version":1,"principals":[{
+            "name":"reader","certificates":["ab".repeat(32)],"client_ids":["scope-reader"],
+            "publish":[],"subscribe":["atelier/capteur-1","$SYS/node","café/"]
+        }]})
+    }
+
+    #[test]
+    fn filter_coverage_uses_literal_mqtt_levels() {
+        let policy = Policy::parse(&serde_json::to_vec(&configuration()).unwrap()).unwrap();
+        for filter in [
+            "atelier/capteur-1",
+            "atelier/capteur-1/+/#",
+            "atelier/capteur-1//+",
+            "$SYS/node/#",
+            "café//+",
+        ] {
+            assert!(
+                policy.allows_filter(Principal(0), filter.as_bytes()),
+                "{filter}"
+            );
+        }
+        for filter in [
+            "#",
+            "+/node/#",
+            "atelier/+/status",
+            "atelier/capteur-10/#",
+            "atelier/Capteur-1/#",
+            "$SYS/#",
+            "café/#",
+            "cafe\u{301}//+",
+        ] {
+            assert!(
+                !policy.allows_filter(Principal(0), filter.as_bytes()),
+                "{filter}"
+            );
+        }
+        assert!(!policy.allows_publish(Principal(0), b"atelier/capteur-1"));
+    }
+
+    #[test]
+    fn credential_rotation_and_rule_order_preserve_policy_authority() {
+        let mut value = configuration();
+        let before = Policy::parse(&serde_json::to_vec(&value).unwrap()).unwrap();
+        value["principals"][0]["certificates"] = json!(["01".repeat(32), "02".repeat(32)]);
+        value["principals"][0]["subscribe"]
+            .as_array_mut()
+            .unwrap()
+            .reverse();
+        let after = Policy::parse(&serde_json::to_vec(&value).unwrap()).unwrap();
+        assert_eq!(before.storage.fingerprint, after.storage.fingerprint);
+        value["principals"][0]["subscribe"] = json!(["atelier"]);
+        let changed = Policy::parse(&serde_json::to_vec(&value).unwrap()).unwrap();
+        assert_ne!(before.storage.fingerprint, changed.storage.fingerprint);
+        let mut foreign = value["principals"][0].clone();
+        foreign["name"] = json!("another-principal");
+        foreign["certificates"] = json!(["cd".repeat(32)]);
+        value["principals"].as_array_mut().unwrap().push(foreign);
+        assert!(matches!(
+            Policy::parse(&serde_json::to_vec(&value).unwrap()),
+            Err("client_id_conflict_or_budget")
+        ));
+    }
+}

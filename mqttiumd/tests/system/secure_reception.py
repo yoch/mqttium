@@ -111,8 +111,8 @@ class Peer(MessageExpiryWire):
     def deny(self, frame, code):
         self.send(frame)
         answer = self.poll(3)
-        require(answer is not None and answer.kind == 0xe0 and answer.body[:1] == b"\x87",
-                code, repr(answer))
+        require(answer is not None, "authorization_reply_missing")
+        require(answer.kind == 0xe0 and answer.body[:1] == b"\x87", code, repr(answer))
 
     def ping(self):
         self.send(b"\xc0\x00")
@@ -367,6 +367,31 @@ def authority(binary, out, pki, original_policy):
     finally:
         if restarted:
             restarted.cleanup()
+        broker.cleanup()
+
+
+def tls_close_notify(binary, out, pki):
+    broker = broker_with(binary, out, pki)
+    try:
+        with Peer(broker, "close-notify-target", client_context(pki, "dashboard")) as dashboard, Peer(
+            broker, "close-notify-source", client_context(pki)
+        ) as sensor:
+            dashboard.open("dashboard")
+            dashboard.subscribe(1, [("atelier/#", 1)])
+            sensor.open("capteur-1", will=(STATUS, b"tls-close-notify"), expiry=0)
+            before = latest(broker)
+            try:
+                raw = sensor.socket.unwrap()
+                raw.close()
+            except (ssl.SSLError, ConnectionError):
+                # The peer's close_notify is sent by unwrap. The event below,
+                # rather than a local unwrap result, establishes its receipt.
+                pass
+            closed = closed_with(broker, before, "tls_close_notify")
+            message = dashboard.message(b"tls-close-notify")
+            require(message.qos == 1, "tls_close_notify_lost_will")
+            return {"closed": closed, "will_qos": message.qos}
+    finally:
         broker.cleanup()
 
 
@@ -687,7 +712,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", required=True, type=Path)
     parser.add_argument("--out", required=True, type=Path)
-    parser.add_argument("--mode", choices=("normal", "hooks", "measurement", "client-id", "wildcard", "seal"), default="normal")
+    parser.add_argument("--mode", choices=("normal", "hooks", "measurement", "chain", "client-id", "wildcard", "seal"), default="normal")
     args = parser.parse_args()
     binary, out = args.binary.resolve(), args.out.resolve()
     out.mkdir(parents=True, exist_ok=False)
@@ -707,6 +732,7 @@ def main():
                              ("certificates", invalid_certificates, ()),
                              ("clients", public_clients, ()),
                              ("authority", authority, (policy,)),
+                             ("tls-close-notify", tls_close_notify, ()),
                              ("resources", capacity_and_flow, ())]
                     for label, operation, rest in cases:
                         receipt["groups"][label] = operation(binary, out / label, pki, *rest)
@@ -730,6 +756,8 @@ def main():
                             owner.ping()
                     finally:
                         broker.cleanup()
+                elif mode == "chain":
+                    receipt["groups"]["certificates"] = invalid_certificates(binary, out / "chain", pki)
                 elif mode == "wildcard":
                     broker = broker_with(binary, out / "wildcard", pki)
                     try:

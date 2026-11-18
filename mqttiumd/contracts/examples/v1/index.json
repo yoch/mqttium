@@ -193,7 +193,10 @@
     "contracts/examples/v1/valid/product-hook-will-end-committed.json",
     "contracts/examples/v1/valid/product-hook-work-read-before.json",
     "contracts/examples/v1/valid/product-will-detached-infinite-diagnostic.json",
-    "contracts/examples/v1/valid/product-will-detached-finite-diagnostic.json"
+    "contracts/examples/v1/valid/product-will-detached-finite-diagnostic.json",
+    "contracts/examples/v1/valid/product-secure-authorization-refused.json",
+    "contracts/examples/v1/valid/product-hook-tls-frame-sealed.json",
+    "contracts/examples/v1/valid/product-hook-tls-frame-first_bytes.json"
   ],
   "invalid": [
     {
@@ -2763,6 +2766,12 @@
       "code": "schema-violation",
       "pointer": "/details/deadline",
       "why": "Infinite detachment has no finite deadline; legacy null remains readable."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/product-secure-denial-leaks-topic.json",
+      "code": "schema-violation",
+      "pointer": "/details",
+      "why": "A denied filter is not included in a security diagnostic."
     }
   ]
 }
