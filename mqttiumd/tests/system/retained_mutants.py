@@ -72,7 +72,7 @@ RELEASE_REMUTATE = '''    // Mutation: an old PUBREL wrongly restores its origin
     charge(meta, Accounts { references: References::new(1), ..Accounts::default() })?;
     retained::install(conn, &topic,
         PublicationId::from_be_slice(&publication).map_err(|_| Abort::Fault)?,
-        SessionId::new(blob_u64(&source)?))?;
+        SessionId::new(blob_u64(&source)?), None)?;
     conn.prepare_cached("DELETE FROM inbound WHERE session = ?1 AND packet_id = ?2")?'''
 WORK_JOIN = 'LEFT JOIN payloads y ON y.id=p.payload LEFT JOIN outbound c'
 WORK_CURRENT = ('LEFT JOIN payloads y ON y.id=CASE WHEN p.retained_version IS NOT NULL '
