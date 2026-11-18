@@ -30,8 +30,15 @@ class PreviewCommandTests(unittest.TestCase):
             (root/"preview").mkdir(parents=True)
             for name in ("README.md", "start.sh", "demo.sh", "expiry-demo.sh", "will-demo.sh",
                          "SECURE.md", "start-tls.sh", "secure-demo.sh", "demo-pki.py", "identities.example.json",
-                         "POLICY.md", "policy-demo.py", "identities.next.example.json", "retained-will-demo.py"):
+                         "POLICY.md", "policy-demo.py", "identities.next.example.json", "retained-will-demo.py", "PILOT.md"):
                 (root/"preview"/name).write_text("fixture "+name)
+            (root/"preview/pilot").mkdir()
+            (root/"preview/pilot/load.py").write_text("# normal pilot fixture\n")
+            (root/"tools").mkdir()
+            (root/"tools/run_prepilot_reception.sh").write_text("#!/bin/sh\nexit 0\n")
+            (root/"tests/system").mkdir(parents=True)
+            (root/"tests/system/policy_transition_reception.py").write_text("from normal_helper import recovery\n")
+            (root/"tests/system/normal_helper.py").write_text("recovery = True\n")
             for name in ("LICENSE","NOTICE"):
                 (root.parent/name).write_text("license fixture")
             product=root/"crates"/"mqttiumd"
@@ -58,6 +65,10 @@ class PreviewCommandTests(unittest.TestCase):
                 for name in ("SECURE.md", "start-tls.sh", "secure-demo.sh", "demo-pki.py", "identities.example.json",
                              "POLICY.md", "policy-demo.py", "identities.next.example.json", "retained-will-demo.py"):
                     self.assertTrue(any(member.endswith("/" + name) for member in names), name)
+                for name in ("PILOT.md", "run-qualification.sh", "pilot/load.py",
+                             "tests/system/policy_transition_reception.py", "tests/system/normal_helper.py"):
+                    self.assertTrue(any(member.endswith("/"+name) for member in names),
+                                    "packaged_pilot_dependency_missing: "+name)
                 info=next(item for item in packed.getmembers() if item.name.endswith("/BUILD.json"))
                 build=json.load(packed.extractfile(info))
             self.assertEqual(build["sqlite_schema"],12,"will_schema_not_named")

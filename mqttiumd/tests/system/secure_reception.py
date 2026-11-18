@@ -612,7 +612,7 @@ def distribution(series):
             "over_1000ms": [i for i, value in enumerate(series) if value >= 1000]}
 
 
-def measure(binary, out, pki):
+def measure(binary, out, pki, *, retained=False):
     broker = broker_with(binary, out, pki)
     sensor_context = client_context(pki) if pki else None
     dashboard_context = client_context(pki, "dashboard") if pki else None
@@ -627,10 +627,10 @@ def measure(binary, out, pki):
                 will_payload = f"offline:{n}".encode()
                 live_payload = f"online:{n}".encode()
                 with Peer(broker, f"latency-source-{n}", sensor_context) as sensor:
-                    sensor.open("capteur-1", expiry=0, will=(STATUS, will_payload))
+                    sensor.open("capteur-1", expiry=0, will=(STATUS, will_payload), will_retain=retained)
                     connack = time.monotonic_ns()
                     start = time.monotonic_ns()
-                    sensor.publish(STATUS, live_payload)
+                    sensor.publish(STATUS, live_payload, retain=retained)
                     acknowledged = time.monotonic_ns()
                     dashboard.message(live_payload)
                     sample = {"seq": n, "tcp_tls_connack_ms": (connack - sensor.begin)/1e6,
@@ -692,7 +692,7 @@ def measure(binary, out, pki):
         distributions = {name: distribution([row[name] for row in samples]) for name in
                          ("tcp_tls_connack_ms", "handshake_to_connack_ms", "qos1_ms", "end_to_commit_ms", "commit_to_notification_ms")}
         return {"transport": "TLS1.3-mTLS" if pki else "loopback-cleartext",
-                "samples": samples, "distribution": distributions, "concurrent_connections": 4,
+                "retained_presence": retained, "samples": samples, "distribution": distributions, "concurrent_connections": 4,
                 "parallel_samples": parallel, "parallel_distribution": {
                     name: distribution([row[name] for row in parallel]) for name in ("tcp_tls_connack_ms", "qos1_ms")},
                 "keep_alive": keepalive, "initial": initial, "final_process": end_resources, "final_store": final,
@@ -729,7 +729,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", required=True, type=Path)
     parser.add_argument("--out", required=True, type=Path)
-    parser.add_argument("--mode", choices=("normal", "hooks", "measurement", "chain", "client-id", "wildcard", "seal"), default="normal")
+    parser.add_argument("--mode", choices=("normal", "hooks", "measurement", "measurement-retained", "chain", "client-id", "wildcard", "seal"), default="normal")
     args = parser.parse_args()
     binary, out = args.binary.resolve(), args.out.resolve()
     out.mkdir(parents=True, exist_ok=False)
@@ -757,12 +757,12 @@ def main():
                 elif mode in ("hooks", "seal"):
                     receipt["groups"]["expiry"] = deadlines(binary, out / "expiry", pki,
                                                              only="unstarted" if mode == "seal" else None)
-                elif mode == "measurement":
+                elif mode in ("measurement", "measurement-retained"):
                     receipt["conditions"] = {"cpu_count": os.cpu_count(), "load_before": os.getloadavg(),
                         "cpu_quota": cpu_quota(),
                         "workload": "100 sequential + 24 connections across four independent workers per mode"}
                     for label, mode_pki in (("tls", pki), ("cleartext", None)):
-                        receipt["groups"][label] = measure(binary, out / label, mode_pki)
+                        receipt["groups"][label] = measure(binary, out / label, mode_pki, retained=mode == "measurement-retained")
                 elif mode == "client-id":
                     broker = broker_with(binary, out / "client-id", pki)
                     try:
