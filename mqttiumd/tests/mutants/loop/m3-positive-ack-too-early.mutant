@@ -12,7 +12,7 @@ index 07c0c686..cc47c61f 100644
          let recipe = FrozenRecipe::freeze(recipe).map_err(|error| match error {
              RecipeError::AllocationFailed => Stop::from(AllocationFailed),
              _ => IMPOSSIBLE,
-@@ -1631,10 +1634,27 @@ impl Owner {
+@@ -1631,10 +1634,28 @@ impl Owner {
              command: Command { recipe, payload },
          })?;
          let deadline = draw(&mut draft.counters.deadline, DeadlineToken::checked_next)?;
@@ -31,6 +31,7 @@ index 07c0c686..cc47c61f 100644
 +            Some((connection, packet_id)) => draft.emit(Effect::EmitFrame {
 +                connection,
 +                publish_order: None,
++                pubrel: None,
 +                frame: OutboundFrame::Pubrec {
 +                    packet_id,
 +                    reason: AckReason::Success,

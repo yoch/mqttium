@@ -232,7 +232,7 @@ async def filter_edges(binary, case):
         # SUBSCRIBE mixed results remain in request order.
         subscriber.send(subscribe_packet(212,(Subscription('valid/#',2),Subscription('$share/group/a',1),Subscription('valid/+',0))))
         _,reasons=decode_filter_ack(subscriber.wait(0x90,212))
-        require(reasons==(1,0x9e,0),'wildcard_filter_results_reordered')
+        require(reasons==(2,0x9e,0),'wildcard_filter_results_reordered',repr(reasons))
         subscriber.unsubscribe(213,['valid/#','valid/+'])
         subscriber.close();subscriber=None;source.close();source=None
         broker.stop()

@@ -30,7 +30,7 @@ class PublicWildcardOptions(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(header, 0x82)
             self.assertEqual(options_from_body(body),
                              [('atelier/#', 5), ('atelier/+/temperature', 40), ('$SYS/#', 18)])
-            writer.write(b'\x90\x06' + body[:2] + b'\x00\x01\x00\x01')
+            writer.write(b'\x90\x06' + body[:2] + b'\x00\x01\x00\x02')
             await writer.drain()
             header, body = await read_packet(reader)
             self.assertEqual(header, 0xA2)

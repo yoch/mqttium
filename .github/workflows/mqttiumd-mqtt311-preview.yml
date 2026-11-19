@@ -62,10 +62,42 @@ jobs:
             ${{ runner.temp }}/mqtt311-build/*.tar.gz.sha256
             ${{ runner.temp }}/mqtt311-build/preview_archive.py
           if-no-files-found: error
-      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
-        with:
-          artifact-ids: ${{ steps.upload.outputs.artifact-id }}
-          path: ${{ runner.temp }}/mqtt311-downloaded
+      - name: Download the published ZIP by ID and verify its digest
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ARTIFACT_ID: ${{ steps.upload.outputs.artifact-id }}
+          ZIP_SHA256: ${{ steps.upload.outputs.artifact-digest }}
+          ARCHIVE_NAME: ${{ steps.build.outputs.archive }}
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/mqtt311-downloaded"
+          mkdir "$out"
+          archive="$out/artifact.zip"
+          found=false
+          for delay in 0 2 4 8 16; do
+            sleep "$delay"
+            if timeout 30s gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$ARTIFACT_ID/zip" > "$archive" 2> "$out/download.log"; then
+              found=true
+              break
+            fi
+          done
+          if [[ "$found" != true ]]; then
+            echo "Published artifact $ARTIFACT_ID was unavailable after bounded retries" >&2
+            exit 1
+          fi
+          printf '%s  %s\n' "${ZIP_SHA256#sha256:}" "$archive" | sha256sum -c -
+          python3 - "$archive" "$ARCHIVE_NAME" <<'PY'
+          from pathlib import Path
+          import shutil
+          import sys
+          import zipfile
+
+          archive, name = Path(sys.argv[1]), sys.argv[2]
+          assert Path(name).name == name and name.endswith(".tar.gz")
+          with zipfile.ZipFile(archive) as uploaded, uploaded.open(name) as source:
+              with archive.with_name(name).open("xb") as destination:
+                  shutil.copyfileobj(source, destination)
+          PY
       - name: Run the independently verified download with the reference clients
         env:
           ARCHIVE_NAME: ${{ steps.build.outputs.archive }}

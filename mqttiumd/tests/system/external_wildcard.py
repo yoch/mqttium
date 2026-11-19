@@ -113,7 +113,7 @@ class MqttiumPeer(MqttiumSession):
             retain_handling=value.retain_handling)) for value in values], timeout=TIMEOUT)
         self.log.record('suback', packet_id=ack.mid, reasons=list(ack.reason_codes),
                         subscriptions=[asdict(value) for value in values])
-        require(ack.reason_codes == tuple(min(value.qos, 1) for value in values),
+        require(ack.reason_codes == tuple(value.qos for value in values),
                 'wildcard_public_subscription_refused')
         return ack.mid
 
@@ -191,7 +191,7 @@ class PahoPeer(PahoSession):
         require(code == self.mqtt.MQTT_ERR_SUCCESS, 'paho_wildcard_subscribe_submission')
         actual, reasons = await asyncio.to_thread(self._get, self.subacks)
         self.log.record('subscription_options', subscriptions=[asdict(value) for value in values])
-        require(actual == identifier and reasons == tuple(min(value.qos, 1) for value in values),
+        require(actual == identifier and reasons == tuple(value.qos for value in values),
                 'wildcard_public_subscription_refused')
         return identifier
 

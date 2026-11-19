@@ -927,7 +927,7 @@ def main() -> int:
     require(args.case is None or args.case in {name for name, _ in cases}, "unknown_case")
     result = {"format": "mqttiumd.pubsub-system-reception", "schema_version": 1,
               "qualification": "system-test-only", "mode": args.mode,
-              "scope": "exact persistent subscriptions; incoming QoS 1/2 to outgoing QoS 1",
+              "scope": "exact persistent subscriptions; incoming and outgoing QoS 1/2",
               "binary": {"path": str(args.binary.resolve()),
                          "sha256": hashlib.sha256(args.binary.read_bytes()).hexdigest()}, "cases": []}
     try:

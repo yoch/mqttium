@@ -8,4 +8,4 @@
 +        if false && route.options.no_local() && source == Some(target_session.client_id.as_slice()) {
              continue;
          }
-         let effective = route.max_qos.min(qos).min(Qos::AtLeastOnce);
+         let effective = route.max_qos.min(qos);
