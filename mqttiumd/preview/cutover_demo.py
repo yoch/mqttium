@@ -251,6 +251,81 @@ def inspect_source_refusals(d, tool, conf, bindings, site, source, result):
     d.require(source.read_bytes() == contents, "source_refusal_changed_original")
 
 
+def retained_in_store(d, db):
+    return d.query(db, """SELECT p.qos,b.bytes FROM retained r
+        JOIN publications p ON p.id=r.publication JOIN payloads b ON b.id=p.payload
+        WHERE r.topic=?""", (STATE.encode(),))
+
+
+def try_reopen(d, tool, plan, out, pki, port, label):
+    log = out / (label + ".log")
+    with d.process([sys.executable, tool, "start", plan], log) as child:
+        d.wait_for(lambda: child.poll() is not None or "mqttiumd ready " in log.read_text(),
+                   "missing_store_neither_refused_nor_started")
+        if child.poll() is None:
+            with closing(d.Wire311(pki, port, "dashboard")) as wire:
+                d.acl_connect(wire, 4)
+                wire.send(0xe0)
+            return {"mtls_connected": True}
+        output = log.read_text()
+        try:
+            response = json.loads(output)
+        except ValueError:
+            response = {"diagnostics": [], "output": output}
+        return {"exit_status": child.returncode, "response": response, "mtls_connected": False}
+
+
+def partial_restore(d, out, pki, tool, conf, bindings, data, reopen, port, record):
+    db = data / "broker.sqlite"
+    d.require(retained_in_store(d, db) == [(1, b"candidate-state")], "retained_missing_before_partial_restore")
+    original = d.sha(db)
+    parked = out / "parked-candidate"
+    parked.mkdir(mode=0o700)
+    for file in sorted(data.glob("broker.sqlite*")):
+        file.rename(parked / file.name)
+    logs = {path.name for path in data.iterdir()}
+    result = {"retained_before": "candidate-state", "stored_qos": 1, "database_before_sha256": original,
+              "reopen_plan": str(reopen), "trials": {}}
+    try:
+        for label, code in (("missing", "candidate_database_missing"), ("empty", "candidate_database_empty")):
+            if label == "empty":
+                db.touch(exist_ok=False)
+            rc, preview = verify_config(d, tool, conf, bindings, data, after_stop=True)
+            outcome = try_reopen(d, tool, reopen, out, pki, port, "reopen-with-" + label)
+            result["trials"][label] = {"check_exit_status": rc, "decision": preview["decision"]["status"],
+                                       "diagnostics": preview["diagnostics"], "start": outcome}
+            expected_files = logs | ({db.name} if label == "empty" else set())
+            result["trials"][label]["unchanged"] = (
+                {path.name for path in data.iterdir()} == expected_files
+                and (label != "empty" or db.stat().st_size == 0))
+            if outcome["mtls_connected"]:
+                result["trials"][label]["retained_after_unexpected_start"] = len(retained_in_store(d, db))
+            unintended = out / ("unintended-" + label)
+            unintended.mkdir()
+            for file in data.glob("broker.sqlite*"):
+                file.rename(unintended / file.name)
+    finally:
+        for file in sorted(parked.iterdir()):
+            d.require(not (data / file.name).exists(), "partial_restore_would_overwrite_candidate_file")
+            file.rename(data / file.name)
+        save_plan(out, "partial-restore", result)
+    for label, code in (("missing", "candidate_database_missing"), ("empty", "candidate_database_empty")):
+        trial = result["trials"][label]
+        d.require(trial["check_exit_status"] == 2 and trial["decision"] == "blocked"
+                  and any(row.get("code") == code for row in trial["diagnostics"])
+                  and not trial["start"]["mtls_connected"], "partial_restore_did_not_refuse:" + code)
+        d.require(trial["unchanged"] and trial["start"]["exit_status"] == 2
+                  and any(row.get("code") == code for row in trial["start"]["response"]["diagnostics"]),
+                  "start_did_not_refuse_before_touching_files:" + code)
+    d.require(d.sha(db) == original, "restored_bytes_differ")
+    with checked_service(d, out, reopen, data, "restored-candidate", record):
+        restored = observation(d, port, pki, [STATE], [])["received"]
+        d.require(restored == [[STATE, "candidate-state", 1]], "restored_candidate_lost_retained_on_wire")
+    result.update(status="PASS", restored_wire=restored)
+    record["cutover"]["partial_restore"] = result
+    save_plan(out, "partial-restore", result)
+
+
 def demonstrate_drain(d, out, pki, reference, tool, port, record):
     site = out / "drain-site"
     conf, bindings = prepare(site, pki, port)
@@ -427,6 +502,7 @@ def exercise_cutover(d, out, pki, reference, record, clients):
         result["candidate_after_rollback"] = observation(d, port, pki, [STATE], [])
         d.require(result["candidate_after_rollback"]["received"] == [[STATE, "candidate-state", 1]],
                   "candidate_lost_trial_state")
+    partial_restore(d, out, pki, tool, conf, bindings, data, reopen, port, record)
     result.update(original_database_sha256_during_trial=original_digest,
                   candidate_database_sha256_during_rollback=candidate_digest, status="PASS")
     inspect_source_refusals(d, tool, conf, bindings, site, source_db, result)
