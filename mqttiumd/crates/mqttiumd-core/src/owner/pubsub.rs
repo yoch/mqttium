@@ -1,4 +1,4 @@
-//! Hierarchical subscriptions and outgoing QoS 1 under the same owner authority.
+//! Hierarchical subscriptions and outgoing QoS 1/2 under the same owner authority.
 use super::*;
 use crate::contract::command::{
     ClaimDelivery, ConsumeDelivery, ExpireDelivery, FinishDelivery, MarkDeliveryStarted,
@@ -82,6 +82,8 @@ pub(super) struct Delivery {
     payload: Option<SharedBytes>,
     phase: Phase,
     claim_result: Option<Finished>,
+    /// Send quota reserved for a PUBLISH on this generation. Its PUBREL
+    /// retains this reservation through PUBCOMP. A resumed PUBREL has none.
     window: Option<ConnectionGeneration>,
     frame: Option<(EffectId, ConnectionKey)>,
     local_write_completed: bool,
@@ -95,6 +97,10 @@ pub(super) struct Delivery {
 }
 
 impl Delivery {
+    fn awaits_pubcomp(&self) -> bool {
+        self.claim.is_some_and(|claim| claim.await_pubcomp)
+    }
+
     fn waiting_to_send(&self, generation: ConnectionGeneration, now: Option<MessageTime>) -> bool {
         if self.retired || !self.expiry_allows_send(now) {
             return false;
@@ -107,13 +113,21 @@ impl Delivery {
             | Phase::StartRetry
             | Phase::ExpireRetry
             | Phase::Qos0Writing(_) => false,
-            Phase::AwaitPuback => {
-                self.window != Some(generation)
-                    || self
-                        .frame
-                        .is_none_or(|(_, key)| key.generation != generation)
-            }
+            Phase::AwaitPuback => self
+                .frame
+                .is_none_or(|(_, key)| key.generation != generation),
             Phase::Queued | Phase::ClaimPending(_) | Phase::ConsumePending(_, _) => true,
+        }
+    }
+
+    fn ready_to_send(&self, generation: ConnectionGeneration, room: bool) -> bool {
+        match self.phase {
+            Phase::Queued => self.payload.is_some() && (room || self.qos == Qos::AtMostOnce),
+            Phase::AwaitPuback => {
+                self.awaits_pubcomp()
+                    || (self.payload.is_some() && (room || self.window == Some(generation)))
+            }
+            _ => false,
         }
     }
     fn expiry_allows_send(&self, now: Option<MessageTime>) -> bool {
@@ -506,6 +520,44 @@ impl State {
             .filter(|d| d.window == Some(generation))
             .count()
     }
+
+    fn next_send(
+        &self,
+        session: SessionId,
+        generation: ConnectionGeneration,
+        now: Option<MessageTime>,
+        room: bool,
+    ) -> Option<(usize, &Delivery)> {
+        let mut publish: Option<(usize, &Delivery)> = None;
+        let mut pubrel: Option<(usize, &Delivery)> = None;
+        for (index, delivery) in self.deliveries.as_slice().iter().enumerate() {
+            if delivery.target != session || !delivery.waiting_to_send(generation, now) {
+                continue;
+            }
+            let first = if delivery.awaits_pubcomp() {
+                &mut pubrel
+            } else {
+                &mut publish
+            };
+            if first.is_none_or(|(_, previous)| delivery.id < previous.id) {
+                *first = Some((index, delivery));
+            }
+        }
+        // Keep PUBLISH order even when the first claim is unresolved. PUBREL
+        // can pass that barrier, since it completes an earlier PUBLISH and
+        // is exempt from the new connection's PUBLISH quota (MQTT 5 §4.9).
+        match (publish, pubrel) {
+            (Some((_, p)), Some((_, r)))
+                if p.id < r.id
+                    && (p.ready_to_send(generation, room)
+                        || (room && p.phase == Phase::AwaitPuback)) =>
+            {
+                publish
+            }
+            (_, Some(_)) => pubrel,
+            _ => publish,
+        }
+    }
     fn loaded_bytes(&self) -> Option<u64> {
         self.deliveries.as_slice().iter().try_fold(0u64, |sum, d| {
             sum.checked_add(d.payload.as_ref().map_or(0, |p| p.len() as u64))
@@ -655,29 +707,18 @@ impl Owner {
         };
         let settings = self.pubsub.connections.as_slice()[index];
         let room = self.pubsub.active(generation) < usize::from(settings.receive_maximum);
-        let next = self
-            .pubsub
-            .deliveries
-            .as_slice()
-            .iter()
-            .filter(|d| d.target == session && d.waiting_to_send(generation, self.message_now))
-            .min_by_key(|d| d.id);
-        if let Some(delivery) = next {
-            match delivery.phase {
-                Phase::ClaimPending(_) | Phase::ConsumePending(_, _) => return false,
-                Phase::Queued
-                    if (room || delivery.qos == Qos::AtMostOnce) && delivery.payload.is_some() =>
-                {
-                    return true;
-                }
-                Phase::AwaitPuback
-                    if (delivery.payload.is_some()
-                        || delivery.claim.is_some_and(|c| c.await_pubcomp))
-                        && (room || delivery.window == Some(generation)) =>
-                {
-                    return true;
-                }
-                _ => {}
+        if let Some((_, delivery)) =
+            self.pubsub
+                .next_send(session, generation, self.message_now, room)
+        {
+            if delivery.ready_to_send(generation, room) {
+                return true;
+            }
+            if matches!(
+                delivery.phase,
+                Phase::ClaimPending(_) | Phase::ConsumePending(_, _)
+            ) {
+                return false;
             }
         }
         room && settings.loading.is_none() && (settings.after.is_some() || settings.rescan_needed)
@@ -1376,7 +1417,6 @@ impl Owner {
                 let (frame, sent) = delivery.frame?;
                 (delivery.target == connection.session
                     && eligible(delivery, claim)
-                    && delivery.window == Some(connection.generation)
                     && sent == connection
                     && claim.packet_id == packet_id)
                     .then_some(PubackTarget {
@@ -1875,12 +1915,7 @@ impl Owner {
         let room = self.pubsub.active(generation) < usize::from(settings.receive_maximum);
         let next = self
             .pubsub
-            .deliveries
-            .as_slice()
-            .iter()
-            .enumerate()
-            .filter(|(_, d)| d.target == session && d.waiting_to_send(generation, self.message_now))
-            .min_by_key(|(_, d)| d.id);
+            .next_send(session, generation, self.message_now, room);
         if let Some((_, d)) = next
             && matches!(
                 d.phase,
@@ -1893,8 +1928,7 @@ impl Owner {
         }
         if let Some((slot, d)) = next
             && d.phase == Phase::AwaitPuback
-            && (d.payload.is_some() || d.claim.is_some_and(|c| c.await_pubcomp))
-            && (room || d.window == Some(generation))
+            && d.ready_to_send(generation, room)
         {
             let emission = self.plan_delivery_emit(d, draft)?;
             if let Some((effect, connection)) = emission {
@@ -2131,20 +2165,6 @@ impl Owner {
         else {
             return Ok(None);
         };
-        if delivery.window != Some(generation)
-            && self.pubsub.active(generation) >= usize::from(settings.receive_maximum)
-        {
-            return Ok(None);
-        }
-        if self.pubsub.deliveries.as_slice().iter().any(|earlier| {
-            earlier.target == delivery.target
-                && earlier.id < delivery.id
-                && earlier.waiting_to_send(generation, self.message_now)
-        }) {
-            // This also protects a claim result delivered after takeover:
-            // restored earlier exchanges are replayed before newer ones.
-            return Ok(None);
-        }
         let Some(claim) = delivery.claim else {
             return Ok(None);
         };
@@ -2162,6 +2182,20 @@ impl Owner {
                 pubrel: Some((delivery.id, claim.operation)),
             })?;
             return Ok(Some((effect, connection)));
+        }
+        if delivery.window != Some(generation)
+            && self.pubsub.active(generation) >= usize::from(settings.receive_maximum)
+        {
+            return Ok(None);
+        }
+        if self.pubsub.deliveries.as_slice().iter().any(|earlier| {
+            earlier.target == delivery.target
+                && earlier.id < delivery.id
+                && earlier.waiting_to_send(generation, self.message_now)
+        }) {
+            // This also protects a claim result delivered after takeover:
+            // restored earlier exchanges are replayed before newer ones.
+            return Ok(None);
         }
         let (Some(topic), Some(payload)) = (&delivery.topic, &delivery.payload) else {
             return Ok(None);
@@ -3066,7 +3100,9 @@ impl Owner {
                     .as_mut_slice()
                     .get_mut(slot)
                     .ok_or(stale)?;
-                d.window = Some(connection.generation);
+                if !d.awaits_pubcomp() {
+                    d.window = Some(connection.generation);
+                }
                 if d.frame.is_some() {
                     d.certain_never_started = false;
                 }
@@ -3651,10 +3687,10 @@ mod tests {
                     OperationSeq::new(seq),
                 )
             });
-            for index in 0..2 {
+            for (index, (packet_id, operation)) in ids.into_iter().zip(operations).enumerate() {
                 let claim = DeliveryClaim {
-                    operation: operations[index],
-                    packet_id: ids[index],
+                    operation,
+                    packet_id,
                     started: false,
                     await_pubcomp: index == pubrel_index,
                 };
@@ -3672,15 +3708,15 @@ mod tests {
                     item.payload = Some(bytes(b"payload"));
                 }
             }
-            for index in 0..2 {
+            for (index, (expected_id, expected_claim)) in
+                ids.into_iter().zip(operations).enumerate()
+            {
                 assert!(
                     owner.has_ready_work(TARGET),
                     "replay blocked before frame {index} with PUBREL at {pubrel_index}"
                 );
                 let frames = apply(&mut owner, Input::WorkAvailable { session: TARGET });
-                let expected_id = ids[index];
                 let expected_delivery = delivery(index as u32);
-                let expected_claim = operations[index];
                 if index == pubrel_index {
                     assert!(matches!(&frames[..], [(_, Effect::EmitFrame {
                         frame: OutboundFrame::Pubrel { packet_id },

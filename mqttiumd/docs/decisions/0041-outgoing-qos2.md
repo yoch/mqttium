@@ -11,8 +11,12 @@ SUBACK remains fenced by the subscription transaction.
 Under ACK-004 a claim persists the exact delivery and Packet Identifier
 before PUBLISH. A positive PUBREC prepares PUBREL in a separate guarded
 transaction for that same claim. Only its known commit authorizes PUBREL.
-The claim, obligation and window entry remain occupied through this
-transition and through an unknown finish. After a known finish, the
+The claim and obligation remain occupied through this transition and through
+an unknown finish. A PUBLISH sent on the current connection reserves one slot
+until finish. On reconnection MQTT 5 §§3.3.4 and 4.9 apply Receive Maximum
+to each retransmitted PUBLISH. A recovered PUBREL keeps its original claim
+and identifier and can be sent even with a full PUBLISH window. Its PUBCOMP
+releases only resources held by that delivery. After a known finish, the
 Packet Identifier can be allocated to another delivery.
 
 Recovery sends PUBLISH with DUP=1 for an unfinished first leg and sends
