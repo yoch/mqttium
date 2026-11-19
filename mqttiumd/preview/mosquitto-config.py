@@ -25,6 +25,7 @@ BINARY = Path(__file__).resolve().with_name("mqttiumd")
 NAME = re.compile(r"[A-Za-z0-9_.-]{1,64}\Z")
 LIMIT = 256 * 1024
 CANDIDATE_MARKER = ".mqttiumd-cutover"
+INITIALIZING_MARKER = ".mqttiumd-cutover-initializing"
 PLAN_FORMAT = "mqttiumd.mosquitto-cutover.v2"
 
 
@@ -251,10 +252,11 @@ def openssl(*args, data, fds=()):
 
 
 class DestinationError(ValueError):
-    def __init__(self, path, code, message):
+    def __init__(self, path, code, message, phase=None):
         super().__init__(message)
         self.path = path
         self.code = code
+        self.phase = phase
 
     def diagnostic(self):
         return dict(file=str(self.path), line=None, directive="data", status="blocking",
@@ -273,7 +275,7 @@ def lstat_if_present(path):
 
 
 def validate_destination(data, conf):
-    """Return whether this path needs its first marker. This function only reads."""
+    """Classify a fresh or initialized destination without writing to it."""
     parent = data.parent
     try:
         parent_info = lstat_if_present(parent)
@@ -285,19 +287,24 @@ def validate_destination(data, conf):
         if info is None:
             if not os.access(parent, os.W_OK | os.X_OK, effective_ids=True):
                 raise DestinationError(parent, "destination_parent_unwritable", "destination parent must be writable")
-            return True
+            return "first_creation"
         if not stat.S_ISDIR(info.st_mode):
             raise DestinationError(data, "destination_occupied", "candidate path must be a directory")
         if info.st_uid != os.geteuid() or info.st_mode & 0o077 or not os.access(
                 data, os.R_OK | os.W_OK | os.X_OK, effective_ids=True):
             raise DestinationError(data, "destination_not_private", "candidate storage requires an operator-owned private directory")
         marker = data / CANDIDATE_MARKER
+        initializing = data / INITIALIZING_MARKER
+        if lstat_if_present(initializing) is not None:
+            raise DestinationError(initializing, "candidate_initialization_interrupted",
+                                   "initialization is incomplete. Investigate before using another destination",
+                                   "initialization_interrupted")
         owner = lstat_if_present(marker)
         if owner is None:
             with os.scandir(data) as entries:
                 if next(entries, None) is not None:
                     raise DestinationError(data, "destination_occupied", "first start requires an empty dedicated candidate directory")
-            return True
+            return "first_creation"
         if (not stat.S_ISREG(owner.st_mode) or owner.st_nlink != 1
                 or read_file(marker, 8192) != marker_bytes(conf)):
             raise DestinationError(marker, "destination_marker_mismatch", "candidate directory belongs to another cutover")
@@ -306,7 +313,13 @@ def validate_destination(data, conf):
             artifact = lstat_if_present(path)
             if artifact is not None and (not stat.S_ISREG(artifact.st_mode) or artifact.st_nlink != 1):
                 raise DestinationError(path, "destination_linked_or_non_regular", "candidate database files must be regular files with one link")
-        return False
+            if not suffix and artifact is None:
+                raise DestinationError(path, "candidate_database_missing",
+                                       "restore the candidate database before reopening this site", "reopening")
+            if not suffix and artifact.st_size == 0:
+                raise DestinationError(path, "candidate_database_empty",
+                                       "restore a nonempty candidate database before reopening this site", "reopening")
+        return "reopening"
     except DestinationError:
         raise
     except (OSError, ValueError) as exc:
@@ -350,8 +363,9 @@ def compile_plan(conf, mapping, data, stack, *, after_stop):
         if data.is_relative_to(original) or original.is_relative_to(data):
             report.reject(conf, origins["persistence_location"], "persistence_location", "separate storage directories required")
     try:
-        validate_destination(data, conf)
+        destination = validate_destination(data, conf)
     except DestinationError as exc:
+        destination = exc.phase
         report.rows.append(exc.diagnostic())
     descriptors, principals = {}, []
     for key in ("cafile", "certfile", "keyfile"):
@@ -411,7 +425,7 @@ def compile_plan(conf, mapping, data, stack, *, after_stop):
                 "data": str(data), "after_stop": after_stop}, source_version="2.0.21", binary_sha256=binary_sha256,
                 source_hashes=report.hashes, effective={"source": values, "identities": policy,
                 "database": str(data / "broker.sqlite"), "journal_mode": "WAL", "synchronous": "FULL"},
-                inventory=inventory, decision=decide(report, inventory, after_stop),
+                destination_phase=destination, inventory=inventory, decision=decide(report, inventory, after_stop),
                 diagnostics=report.rows, status="blocked" if report.blocked() else "compatible")
     plan["plan_sha256"] = digest(encoding(plan))
     return plan, descriptors
@@ -422,6 +436,32 @@ def plan_input(plan):
     # comparison. The timestamp of this tool's read naturally changes.
     inventory = {key: value for key, value in plan["inventory"].items() if key != "captured_at"}
     return {**{key: value for key, value in plan.items() if key != "plan_sha256"}, "inventory": inventory}
+
+
+def sync_directory(path):
+    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def initialize_candidate(data, conf, db, fds):
+    pending = data / INITIALIZING_MARKER
+    with pending.open("xb") as output:
+        output.write(marker_bytes(conf))
+        output.flush()
+        os.fsync(output.fileno())
+    sync_directory(data)
+    sync_directory(data.parent)
+    keys = ("certfile", "keyfile", "cafile", "identities")
+    inherited = [fds[key] for key in keys]
+    result = subprocess.run([BINARY, "initialize-secure-db", db, *map(fdpath, inherited)],
+                            pass_fds=inherited, capture_output=True, timeout=30)
+    if result.returncode:
+        raise DestinationError(pending, "candidate_initialization_failed", result.stderr.decode(errors="replace"))
+    pending.replace(data / CANDIDATE_MARKER)
+    sync_directory(data)
 
 
 def main():
@@ -466,16 +506,17 @@ def main():
             data.mkdir(mode=0o700)
         except FileExistsError:
             pass
-        if validate_destination(data, conf):
-            with (data / CANDIDATE_MARKER).open("xb") as output:
-                output.write(marker_bytes(conf))
-                output.flush()
-                os.fsync(output.fileno())
         db = data / "broker.sqlite"
+        phase = validate_destination(data, conf)
+        if phase != plan["destination_phase"]:
+            raise DestinationError(data, "destination_changed", "recheck the changed candidate directory")
+        if phase == "first_creation":
+            initialize_candidate(data, conf, db, fds)
+            validate_destination(data, conf)
         log = Path(tempfile.mkdtemp(prefix="run.", dir=data)) / "events.jsonl"
         for fd in fds.values():
             os.set_inheritable(fd, True)
-        os.execv(BINARY, [str(BINARY), "--db", str(db), "--events", str(log),
+        os.execv(BINARY, [str(BINARY), "--existing-db", str(db), "--events", str(log),
                           "--listen", plan["effective"]["source"]["listener"],
                           "--tls-cert", fdpath(fds["certfile"]), "--tls-key", fdpath(fds["keyfile"]),
                           "--client-ca", fdpath(fds["cafile"]), "--identities", fdpath(fds["identities"])])

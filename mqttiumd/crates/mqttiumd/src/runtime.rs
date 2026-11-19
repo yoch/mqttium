@@ -90,6 +90,7 @@ const MUTANT_REBIND_OBSERVED_PUBACK: bool = false;
 
 pub struct Config {
     pub db: PathBuf,
+    pub require_existing_db: bool,
     pub listen: SocketAddr,
     pub events: PathBuf,
     pub hooks: Hooks,
@@ -4628,21 +4629,16 @@ pub fn run(config: Config) -> Result<(), Failure> {
     ctrlc::set_handler(move || signal.store(true, Ordering::Relaxed))
         .map_err(|_| Failure::plain("signal_handler"))?;
     events.emit("starting",json!({"details":{"test_hooks":cfg!(feature="test-hooks"),"sqlite_kill_points":mqttiumd_store_sqlite::KILL_POINTS_ENABLED}})).map_err(event_failure)?;
-    let mut writer = match &security {
-        Some(security) => Writer::spawn_secured(
-            config.db,
-            events.clone(),
-            config.hooks.clone(),
-            cancel.clone(),
-            security.policy.storage().clone(),
-        ),
-        None => Writer::spawn(
-            config.db,
-            events.clone(),
-            config.hooks.clone(),
-            cancel.clone(),
-        ),
-    }?;
+    let mut writer = Writer::spawn_configured(
+        config.db,
+        events.clone(),
+        config.hooks.clone(),
+        cancel.clone(),
+        security
+            .as_ref()
+            .map(|security| security.policy.storage().clone()),
+        config.require_existing_db,
+    )?;
     let result = run_inner(
         &config.listen,
         config.hooks,

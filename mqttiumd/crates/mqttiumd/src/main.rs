@@ -1,12 +1,13 @@
 //! Experimental durable hierarchical MQTT TCP broker.
 use mqttiumd::{
     runtime::{Config, run},
-    security::TlsFiles,
-    writer::Hooks,
+    security::{Security, TlsFiles},
+    writer::{self, Hooks},
 };
 use std::path::PathBuf;
 fn parse_arguments(mut args: impl Iterator<Item = String>) -> Result<Config, &'static str> {
     let mut db = None;
+    let mut require_existing_db = false;
     let mut listen = "127.0.0.1:1883".parse().map_err(|_| "listen")?;
     let mut events = None;
     let mut hooks = Hooks::default();
@@ -14,7 +15,11 @@ fn parse_arguments(mut args: impl Iterator<Item = String>) -> Result<Config, &'s
     while let Some(arg) = args.next() {
         let value = args.next().ok_or("missing argument value")?;
         match arg.as_str() {
-            "--db" => db = Some(PathBuf::from(value)),
+            "--db" if !require_existing_db => db = Some(PathBuf::from(value)),
+            "--existing-db" if db.is_none() => {
+                db = Some(PathBuf::from(value));
+                require_existing_db = true;
+            }
             "--listen" => listen = value.parse().map_err(|_| "invalid listen address")?,
             "--events" => events = Some(PathBuf::from(value)),
             "--tls-cert" if cert.is_none() => cert = Some(PathBuf::from(value)),
@@ -89,7 +94,8 @@ fn parse_arguments(mut args: impl Iterator<Item = String>) -> Result<Config, &'s
         return Err("test control must be an existing directory");
     }
     Ok(Config {
-        db: db.ok_or("--db is required")?,
+        db: db.ok_or("--db or --existing-db is required")?,
+        require_existing_db,
         listen,
         events: events.ok_or("--events is required")?,
         hooks,
@@ -108,6 +114,27 @@ fn parse_arguments(mut args: impl Iterator<Item = String>) -> Result<Config, &'s
 
 fn main() {
     let mut args = std::env::args().skip(1).peekable();
+    if args.peek().is_some_and(|arg| arg == "initialize-secure-db") {
+        let paths = args.skip(1).map(PathBuf::from).collect::<Vec<_>>();
+        let [db, cert, key, client_ca, identities] = paths.as_slice() else {
+            eprintln!("usage: mqttiumd initialize-secure-db DB CERT KEY CLIENT_CA IDENTITIES");
+            std::process::exit(2);
+        };
+        let files = TlsFiles {
+            cert: cert.clone(),
+            key: key.clone(),
+            client_ca: client_ca.clone(),
+            identities: identities.clone(),
+        };
+        let result = Security::load(&files)
+            .map_err(writer::Failure::plain)
+            .and_then(|security| writer::initialize_secured(db, security.policy.storage()));
+        if let Err(error) = result {
+            eprintln!("{}", error.fields());
+            std::process::exit(2);
+        }
+        return;
+    }
     if args.peek().is_some_and(|arg| arg == "check-security") {
         let paths = args.skip(1).map(PathBuf::from).collect::<Vec<_>>();
         let [cert, key, client_ca, identities] = paths.as_slice() else {
@@ -120,7 +147,7 @@ fn main() {
             client_ca: client_ca.clone(),
             identities: identities.clone(),
         };
-        if let Err(reason) = mqttiumd::security::Security::load(&files) {
+        if let Err(reason) = Security::load(&files) {
             eprintln!("mqttiumd refused: {reason}");
             std::process::exit(2);
         }
@@ -133,7 +160,7 @@ fn main() {
         Ok(c) => c,
         Err(e) => {
             eprintln!(
-                "mqttiumd: {e}\nusage: mqttiumd --db PATH --listen ADDRESS --events NEW_JSONL_PATH [--tls-cert PATH --tls-key PATH --client-ca PATH --identities PATH]"
+                "mqttiumd: {e}\nusage: mqttiumd (--db PATH | --existing-db PATH) --listen ADDRESS --events NEW_JSONL_PATH [--tls-cert PATH --tls-key PATH --client-ca PATH --identities PATH]"
             );
             std::process::exit(2);
         }

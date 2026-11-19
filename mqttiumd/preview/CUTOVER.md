@@ -112,9 +112,21 @@ stored messages once and read queued or active exchange counts separately.
 With persistence disabled, the inventory says `disabled` and leaves counts
 unknown. Pause and drain the running service before confirming shutdown.
 When starting, the checker compares the new snapshot and validation results
-to the plan. A directory already initialized by this cutover can reopen its
-own SQLite store. Run the check again for any plan generated with an earlier
-package.
+to the plan. A fresh directory is classified as `first_creation`. The
+launcher records initialization, then creates the secure schema with no
+listener. It durably replaces the initialization marker before it starts
+the broker. An interrupted initialization leaves
+`.mqttiumd-cutover-initializing` and a blocking decision. Keep that
+directory for inspection and choose a separate empty destination if the
+verified initialization never served clients.
+
+A directory with the original `.mqttiumd-cutover` marker is treated as
+`reopening`. Keep a complete SQLite backup. If the main file is missing
+or empty, restore a coherent copy of the candidate database before
+rechecking. The native broker opens the existing database without SQLite's
+create flag. An original valid database and marker can be opened with the
+new package. Generate a new plan after the first start or when changing
+packages.
 
 ## Supported inputs and observable differences
 
@@ -165,3 +177,8 @@ retained topic remain. `mosquitto-drained-after-stop.json` records the
 decision after shutdown. The original and candidate service logs are
 separate. Keep the plans private as they contain local paths and the site's
 authorization configuration.
+
+`partial-restore.json` records the missing and zero-byte database refusals
+and the original retained QoS 1 publication recovered on the wire after
+restoring the database. The reception also cuts initialization after
+schema creation and removes the database immediately before native reopen.

@@ -293,6 +293,7 @@ def partial_restore(d, out, pki, tool, conf, bindings, data, reopen, port, recor
             rc, preview = verify_config(d, tool, conf, bindings, data, after_stop=True)
             outcome = try_reopen(d, tool, reopen, out, pki, port, "reopen-with-" + label)
             result["trials"][label] = {"check_exit_status": rc, "decision": preview["decision"]["status"],
+                                       "destination_phase": preview.get("destination_phase"),
                                        "diagnostics": preview["diagnostics"], "start": outcome}
             expected_files = logs | ({db.name} if label == "empty" else set())
             result["trials"][label]["unchanged"] = (
@@ -312,6 +313,7 @@ def partial_restore(d, out, pki, tool, conf, bindings, data, reopen, port, recor
     for label, code in (("missing", "candidate_database_missing"), ("empty", "candidate_database_empty")):
         trial = result["trials"][label]
         d.require(trial["check_exit_status"] == 2 and trial["decision"] == "blocked"
+                  and trial["destination_phase"] == "reopening"
                   and any(row.get("code") == code for row in trial["diagnostics"])
                   and not trial["start"]["mtls_connected"], "partial_restore_did_not_refuse:" + code)
         d.require(trial["unchanged"] and trial["start"]["exit_status"] == 2
@@ -324,6 +326,67 @@ def partial_restore(d, out, pki, tool, conf, bindings, data, reopen, port, recor
     result.update(status="PASS", restored_wire=restored)
     record["cutover"]["partial_restore"] = result
     save_plan(out, "partial-restore", result)
+
+
+def run_with_boundary(d, tool, plan, control):
+    driver = ("import os, runpy, signal, subprocess, sys\n"
+              + control + "\n"
+              "sys.argv = sys.argv[1:]\n"
+              "sys.path.insert(0, os.path.dirname(sys.argv[0]))\n"
+              "runpy.run_path(sys.argv[0], run_name='__main__')\n")
+    return subprocess.run([sys.executable, "-c", driver, tool, "start", plan],
+                          capture_output=True, timeout=d.TIMEOUT, text=True)
+
+
+def interrupted_initialization(d, out, tool, conf, bindings, source, port):
+    data = out / "interrupted-candidate"
+    prepared = inventory_plan(d, tool, conf, bindings, data, source, decision="ready", after_stop=True)
+    d.require(prepared["destination_phase"] == "first_creation", "fresh_candidate_not_distinguished")
+    plan = save_plan(out, "checked-first-creation", prepared)
+    control = """
+native_run = subprocess.run
+def interrupt(argv, **options):
+    result = native_run(argv, **options)
+    if argv[1] == 'initialize-secure-db' and result.returncode == 0:
+        os.kill(os.getpid(), signal.SIGKILL)
+    return result
+subprocess.run = interrupt
+"""
+    killed = run_with_boundary(d, tool, plan, control)
+    d.require(killed.returncode == -signal.SIGKILL and (data / "broker.sqlite").stat().st_size > 0
+              and not list(data.glob("run.*")), "interruption_did_not_cut_after_schema_before_launch")
+    rc, preview = verify_config(d, tool, conf, bindings, data, after_stop=True)
+    refused = blocked_start(d, tool, plan)
+    d.require(rc == 2 and preview["destination_phase"] == "initialization_interrupted"
+              and any(row.get("code") == "candidate_initialization_interrupted" for row in refused["diagnostics"])
+              and not list(data.glob("run.*")), "interrupted_initialization_was_automatically_reopened")
+    with socket.socket() as check:
+        d.require(check.connect_ex((d.HOST, port)) != 0, "interrupted_initialization_opened_listener")
+    return {"kill_exit_status": killed.returncode, "first_phase": prepared["destination_phase"],
+            "interrupted_phase": preview["destination_phase"], "start": refused}
+
+
+def late_database_loss(d, tool, reopen, data, port):
+    # Move the real main file after the launcher's final destination check,
+    # immediately before the native executable receives --existing-db.
+    db = data / "broker.sqlite"
+    control = """
+native_exec = os.execv
+def cut(path, argv):
+    db = argv[argv.index('--existing-db') + 1]
+    os.rename(db, db + '.late-loss')
+    native_exec(path, argv)
+os.execv = cut
+"""
+    rejected = run_with_boundary(d, tool, reopen, control)
+    parked = db.with_suffix(".sqlite.late-loss")
+    d.require(rejected.returncode == 2 and "existing_database_missing" in rejected.stderr
+              and parked.is_file() and not db.exists(), "native_reopen_created_missing_database")
+    with socket.socket() as check:
+        d.require(check.connect_ex((d.HOST, port)) != 0, "native_reopen_bound_listener")
+    parked.rename(db)
+    return {"exit_status": rejected.returncode, "diagnostic": rejected.stderr.strip(),
+            "listener_opened": False, "restored_sha256": d.sha(db)}
 
 
 def demonstrate_drain(d, out, pki, reference, tool, port, record):
@@ -503,6 +566,8 @@ def exercise_cutover(d, out, pki, reference, record, clients):
         d.require(result["candidate_after_rollback"]["received"] == [[STATE, "candidate-state", 1]],
                   "candidate_lost_trial_state")
     partial_restore(d, out, pki, tool, conf, bindings, data, reopen, port, record)
+    result["interrupted_initialization"] = interrupted_initialization(d, out, tool, conf, bindings, source_db, port)
+    result["late_database_loss"] = late_database_loss(d, tool, reopen, data, port)
     result.update(original_database_sha256_during_trial=original_digest,
                   candidate_database_sha256_during_rollback=candidate_digest, status="PASS")
     inspect_source_refusals(d, tool, conf, bindings, site, source_db, result)

@@ -325,18 +325,19 @@ impl Writer {
         cancel: Arc<AtomicBool>,
         clock: Arc<dyn SessionClock>,
     ) -> Result<Self, Failure> {
-        Self::spawn_bound(path, events, hooks, cancel, clock, None)
+        Self::spawn_bound(path, events, hooks, cancel, clock, None, false)
     }
 
-    pub(crate) fn spawn_secured(
+    pub(crate) fn spawn_configured(
         path: PathBuf,
         events: Events,
         hooks: Hooks,
         cancel: Arc<AtomicBool>,
-        policy: mqttiumd_store_sqlite::StoragePolicy,
+        policy: Option<mqttiumd_store_sqlite::StoragePolicy>,
+        require_existing: bool,
     ) -> Result<Self, Failure> {
         let clock = Arc::new(SystemClock::new().map_err(|error| Failure::plain(error.code()))?);
-        Self::spawn_bound(path, events, hooks, cancel, clock, Some(policy))
+        Self::spawn_bound(path, events, hooks, cancel, clock, policy, require_existing)
     }
 
     fn spawn_bound(
@@ -346,6 +347,7 @@ impl Writer {
         cancel: Arc<AtomicBool>,
         clock: Arc<dyn SessionClock>,
         policy: Option<mqttiumd_store_sqlite::StoragePolicy>,
+        require_existing: bool,
     ) -> Result<Self, Failure> {
         let _ = &hooks;
         let (tx, rx) = mpsc::sync_channel(QUEUE);
@@ -356,7 +358,7 @@ impl Writer {
         let handle = thread::Builder::new()
             .name("sqlite-writer".into())
             .spawn(move || {
-                let (mut store, boot) = match bootstrap_bound(&path, clock, policy.as_ref()) {
+                let (mut store, boot) = match bootstrap_bound(&path, clock, policy.as_ref(), require_existing) {
                     Ok(value) => value,
                     Err(error) => {
                         let _ = btx.send(Err(error));
@@ -1292,13 +1294,53 @@ fn bootstrap_with_clock(
     path: &Path,
     clock: Arc<dyn SessionClock>,
 ) -> Result<(SqliteStore, Boot), Failure> {
-    bootstrap_bound(path, clock, None)
+    bootstrap_bound(path, clock, None, false)
+}
+
+fn create_store(
+    path: &Path,
+    policy: Option<&mqttiumd_store_sqlite::StoragePolicy>,
+) -> Result<SqliteStore, Failure> {
+    let mut random = [0u8; 8];
+    getrandom::fill(&mut random).map_err(|_| Failure::plain("random_unavailable"))?;
+    let incarnation = StoreIncarnation::new(u64::from_be_bytes(random).max(1));
+    match policy {
+        Some(policy) => SqliteStore::create_secured(path, incarnation, limits(), policy),
+        None => SqliteStore::create(path, incarnation, limits()),
+    }
+    .map_err(database_open_error)
+}
+
+fn database_open_error(error: mqttiumd_store_sqlite::OpenError) -> Failure {
+    if matches!(
+        error,
+        mqttiumd_store_sqlite::OpenError::SecurityPolicyMismatch
+    ) {
+        Failure::plain("security_policy_mismatch")
+    } else {
+        Failure::read(error.read_error(), ReadPhase::Open)
+    }
+}
+
+/// Creates the durable secure schema without opening an epoch or listener.
+pub fn initialize_secured(
+    path: &Path,
+    policy: &mqttiumd_store_sqlite::StoragePolicy,
+) -> Result<(), Failure> {
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|error| Failure::read(io_cause(error.kind()), ReadPhase::Open))?;
+    drop(create_store(path, Some(policy))?);
+    Ok(())
 }
 
 fn bootstrap_bound(
     path: &Path,
     clock: Arc<dyn SessionClock>,
     policy: Option<&mqttiumd_store_sqlite::StoragePolicy>,
+    require_existing: bool,
 ) -> Result<(SqliteStore, Boot), Failure> {
     // Existing files, including empty/truncated files, are never silently initialised.
     let mut store = if path
@@ -1309,23 +1351,12 @@ fn bootstrap_bound(
             Some(policy) => SqliteStore::open_secured(path, policy),
             None => SqliteStore::open(path),
         }
+        .map_err(database_open_error)?
+    } else if require_existing {
+        return Err(Failure::plain("existing_database_missing"));
     } else {
-        let mut random = [0u8; 8];
-        getrandom::fill(&mut random).map_err(|_| Failure::plain("random_unavailable"))?;
-        let raw = u64::from_be_bytes(random).max(1);
-        let incarnation = StoreIncarnation::new(raw);
-        match policy {
-            Some(policy) => SqliteStore::create_secured(path, incarnation, limits(), policy),
-            None => SqliteStore::create(path, incarnation, limits()),
-        }
-    }
-    .map_err(|e| {
-        if matches!(e, mqttiumd_store_sqlite::OpenError::SecurityPolicyMismatch) {
-            Failure::plain("security_policy_mismatch")
-        } else {
-            Failure::read(e.read_error(), ReadPhase::Open)
-        }
-    })?;
+        create_store(path, policy)?
+    };
     let state = store
         .snapshot()
         .map_err(|e| Failure::read(e, ReadPhase::Snapshot))?;

@@ -33,3 +33,10 @@ drained. The final decision binds the plan to a shutdown save and the
 operator's stop confirmation. The source bytes and configuration are checked
 again before opening the candidate. Existing cutover directory markers keep
 their original representation and can reopen their own SQLite database.
+First creation reserves a durable initialization marker and installs the
+secure schema offline. Only after successful initialization does the
+launcher publish the original-format marker and start the broker with an
+existing-database requirement. An incomplete marker, missing database or
+zero-byte database blocks reuse. An incomplete directory can be inspected
+and kept intact while an operator selects a fresh destination. A valid
+existing site is opened without SQLite's create flag.
