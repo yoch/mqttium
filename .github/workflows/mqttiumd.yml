@@ -736,25 +736,12 @@ jobs:
             PYTHON=python "$pilot/run-split-reception.sh" "$RUNNER_TEMP/pilot-split" "$pilot"
             PYTHON=python "$pilot/run-site-reception.sh" "$RUNNER_TEMP/pilot-site" "$pilot"
           done
-      - name: Record per-event LIVE timing on the same worker
-        if: success() || (failure() && steps.operator_reception.outcome == 'failure')
+      - name: Recompute per-event LIVE timing from the original short split run
+        if: always() && steps.operator_reception.outcome != 'skipped'
         continue-on-error: true
         run: |
-          set -euo pipefail
-          site="$RUNNER_TEMP/pilot-site/site/result.json"
-          test -f "$site" || exit 0
-          python - "$site" <<'PY' || exit 0
-          import json
-          import sys
-          from pathlib import Path
-
-          result = json.loads(Path(sys.argv[1]).read_text())
-          sys.exit(not (result["status"] == "PASS" or result.get("failure") == "live_slo_during_history_pressure"))
-          PY
-          set -- "$RUNNER_TEMP/pilot-package/"*.tar.gz
-          read -r digest filename < "$1.sha256"
-          test "$filename" = "$(basename "$1")"
-          python tools/measure_pilot_live.py "$1" --sha256 "$digest" --out "$RUNNER_TEMP/pilot-site/live-timing"
+          python tools/diagnose_split_live.py "$RUNNER_TEMP/pilot-split/short" \
+            --out "$RUNNER_TEMP/pilot-short-live-timing"
       - name: Publish the sealed pilot archive
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -775,5 +762,6 @@ jobs:
             ${{ runner.temp }}/pilot-restore
             ${{ runner.temp }}/pilot-forward
             ${{ runner.temp }}/pilot-split
+            ${{ runner.temp }}/pilot-short-live-timing
             ${{ runner.temp }}/pilot-site
           if-no-files-found: warn
