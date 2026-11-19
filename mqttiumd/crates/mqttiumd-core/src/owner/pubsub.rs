@@ -3631,6 +3631,109 @@ mod tests {
     }
 
     #[test]
+    fn resumed_qos2_pubrel_is_independent_of_the_reduced_publish_window() {
+        for pubrel_index in [1, 0] {
+            let mut owner = world();
+            owner.pubsub.connections.as_mut_slice()[0].receive_maximum = 1;
+            let key = ConnectionKey {
+                session: TARGET,
+                generation: CONNECTION,
+            };
+            let ids = [
+                OutboundPacketId::new(1).unwrap(),
+                OutboundPacketId::new(2).unwrap(),
+            ];
+            let operations = [100, 101].map(|seq| {
+                OperationId::new(
+                    StoreIncarnation::new(1),
+                    RunEpoch::new(1),
+                    LogicalOwnerId::new(4),
+                    OperationSeq::new(seq),
+                )
+            });
+            for index in 0..2 {
+                let claim = DeliveryClaim {
+                    operation: operations[index],
+                    packet_id: ids[index],
+                    started: false,
+                    await_pubcomp: index == pubrel_index,
+                };
+                owner
+                    .add_outbound_fact(
+                        delivery(index as u32),
+                        TARGET,
+                        Revision::new(1),
+                        (Qos::ExactlyOnce, Some(claim), None, false),
+                    )
+                    .unwrap();
+                if index != pubrel_index {
+                    let item = &mut owner.pubsub.deliveries.as_mut_slice()[index];
+                    item.topic = Some(bytes(b"topic"));
+                    item.payload = Some(bytes(b"payload"));
+                }
+            }
+            for index in 0..2 {
+                assert!(
+                    owner.has_ready_work(TARGET),
+                    "replay blocked before frame {index} with PUBREL at {pubrel_index}"
+                );
+                let frames = apply(&mut owner, Input::WorkAvailable { session: TARGET });
+                let expected_id = ids[index];
+                let expected_delivery = delivery(index as u32);
+                let expected_claim = operations[index];
+                if index == pubrel_index {
+                    assert!(matches!(&frames[..], [(_, Effect::EmitFrame {
+                        frame: OutboundFrame::Pubrel { packet_id },
+                        pubrel: Some((delivery, claim)), ..
+                    })] if (*packet_id, *delivery, *claim) == (expected_id, expected_delivery, expected_claim)));
+                } else {
+                    assert!(matches!(&frames[..], [(_, Effect::EmitPublish {
+                        packet_id, delivery, claim, qos: Qos::ExactlyOnce, dup: true, ..
+                    })] if (*packet_id, *delivery, *claim) == (expected_id, expected_delivery, expected_claim)));
+                }
+            }
+            assert_eq!(owner.pubsub.active(CONNECTION), 1);
+            assert_eq!(owner.pubsub.free_packet_id(TARGET, 2), None);
+            let ack = |owner: &mut Owner, kind, packet_id| {
+                let target = owner.qos2_ack_target(key, packet_id, kind);
+                assert!(target.is_some());
+                let effects = apply(
+                    owner,
+                    Input::ObservedQos2Ack {
+                        connection: key,
+                        kind,
+                        packet_id,
+                        reason: 0,
+                        target,
+                    },
+                );
+                let (effect, Effect::Persist { command }) = &effects[0] else {
+                    panic!("durable outgoing acknowledgment")
+                };
+                assert!(known(owner, *effect, command).is_empty());
+            };
+            ack(&mut owner, Qos2Ack::Pubcomp, ids[pubrel_index]);
+            assert_eq!(owner.pubsub.active(CONNECTION), 1);
+            assert_eq!(
+                owner.pubsub.free_packet_id(TARGET, 2),
+                Some(ids[pubrel_index])
+            );
+            let pending_publish = ids[1 - pubrel_index];
+            ack(&mut owner, Qos2Ack::Pubrec, pending_publish);
+            assert!(
+                matches!(&apply(&mut owner, Input::WorkAvailable { session: TARGET })[..],
+                [(_, Effect::EmitFrame { frame: OutboundFrame::Pubrel { packet_id }, .. })]
+                if *packet_id == pending_publish)
+            );
+            assert_eq!(owner.pubsub.active(CONNECTION), 1);
+            ack(&mut owner, Qos2Ack::Pubcomp, pending_publish);
+            assert_eq!(owner.pubsub.active(CONNECTION), 0);
+            assert!(owner.pubsub.deliveries.is_empty());
+            assert_eq!(owner.pubsub.free_packet_id(TARGET, 2), Some(ids[0]));
+        }
+    }
+
+    #[test]
     fn an_applied_finish_reuses_a_free_identifier_after_the_historical_ceiling() {
         let mut owner = world();
         // The committed red fixture positioned the old cursor at 65535.

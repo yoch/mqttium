@@ -124,7 +124,7 @@ def build_pinned(out: Path, target: Path, root: Path, source: str, *,
         copy_restart_files(package, packager)
     elif mqtt311:
         shutil.copy2(root / "preview/MQTT311.md", package / "README.md")
-        for name in ("start-tls.sh", "demo-pki.py", "mqtt311-demo.py", "build-mosquitto-reference.sh"):
+        for name in ("start-tls.sh", "demo-pki.py", "mqtt311-demo.py", "build-mosquitto-reference.sh", "rm-pubrel-probe.py"):
             shutil.copy2(root / "preview" / name, package / name)
         (package / "requirements.txt").write_text("mqttium==1.3.0\npaho-mqtt==2.1.0\n")
     else:

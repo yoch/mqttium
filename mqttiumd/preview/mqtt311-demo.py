@@ -45,8 +45,8 @@ def sha(path):
         return hashlib.file_digest(file, "sha256").hexdigest()
 
 
-def wait_for(probe, failure):
-    deadline = monotonic() + TIMEOUT
+def wait_for(probe, failure, *, timeout=TIMEOUT):
+    deadline = monotonic() + timeout
     while monotonic() < deadline:
         if value := probe():
             return value
@@ -78,10 +78,10 @@ def process(command, output, *, broker=False, env=None):
 
 
 @contextmanager
-def launch_broker(out, pki, name, data, record, *, killed=False):
+def launch_broker(out, pki, name, data, record, *, killed=False, package=PACKAGE):
     logs = data / "logs"
     previous = set(logs.glob("run.*/events.jsonl"))
-    command = [PACKAGE / "start-tls.sh", data, pki]
+    command = [package / "start-tls.sh", data, pki]
     stream = None
     try:
         with process(command, out / f"{name}.log", broker=not killed,
@@ -979,6 +979,88 @@ def outgoing_receive_maximum(record, out, pki):
     record["outgoing_qos2_receive_maximum"] = outcomes
 
 
+def reduced_receive_maximum(record, out, pki, *, package=PACKAGE):
+    # Both deliveries belong to the same persistent subscription. B has
+    # reached PUBREL before the cut, while A still awaits PUBREC.
+    trials = record["reduced_receive_maximum"] = {}
+    for order in (("A", "B"), ("B", "A")):
+        name = "reduced-window-" + "".join(order)
+        topic = f"{TOPIC}/{name}"
+        data = out / f"{name}-data"
+        db = data / "broker.sqlite"
+        ids = {}
+        with launch_broker(out, pki, f"{name}-cut", data, record, killed=True, package=package) as (port, _):
+            with closing(Wire311(pki, port, "dashboard")) as sub:
+                acl_connect(sub, 5, persistent=True, receive_maximum=2)
+                grant_qos2(sub, 5, topic)
+                for letter in order:
+                    wire_publish(port, pki, 5, topic, letter.encode())
+                    ids[letter] = decode_delivery(sub.receive(), 5, topic, letter.encode(), 2)
+                    if letter == "B":
+                        sub.send(0x50, ids[letter])
+                        sub.expect(0x62, ids[letter])
+                durable = outbound_state(db)
+                require([row[2:5] for row in durable] == [
+                    (2, 1 if letter == "A" else 2, int.from_bytes(ids[letter], "big"))
+                    for letter in order
+                ] and ids["A"] != ids["B"], "reduced_window_wrong_phase_before_cut")
+                os.kill(record["starts"][-1]["pid"], signal.SIGKILL)
+        require(outbound_state(db) == durable, "reduced_window_cut_changed_obligations")
+
+        with launch_broker(out, pki, f"{name}-resume", data, record, package=package) as (port, stream):
+            require(record["starts"][-2]["sqlite"] == record["starts"][-1]["sqlite"], "reduced_window_changed_db")
+            with closing(Wire311(pki, port, "dashboard")) as sub:
+                acl_connect(sub, 5, persistent=True, resume=True, receive_maximum=1)
+
+                def observe(letter):
+                    frame = sub.receive()
+                    if letter == "A":
+                        require(decode_delivery(frame, 5, topic, b"A", 2, dup=True) == ids[letter],
+                                "reduced_window_publish_changed_identifier")
+                    else:
+                        require(frame == (0x62, ids[letter]), "reduced_window_expected_pubrel")
+                    return f"{frame[0]:02x}:{ids[letter].hex()}"
+
+                def finish(letter):
+                    if letter == "A":
+                        sub.send(0x50, ids[letter])
+                        sub.expect(0x62, ids[letter])
+                    sub.send(0x70, ids[letter])
+                    wait_for(lambda: all(row[4] != int.from_bytes(ids[letter], "big") for row in outbound_state(db)),
+                             "reduced_window_finish_did_not_commit")
+
+                first, second = order
+                frames = [observe(first)]
+                kind = "PUBREL" if second == "B" else "PUBLISH"
+                try:
+                    wait_for(lambda: any(row["kind"] == "frame_written"
+                                         and row["details"]["packet_kind"] == kind
+                                         and row["details"]["packet_id"] == int.from_bytes(ids[second], "big")
+                                         for row in events(stream)), "second_replay_waited_for_ack", timeout=1.5)
+                except TimeoutError:
+                    # Positive evidence on the baseline: PING still works,
+                    # and the withheld frame follows completion of the first.
+                    sub.send(0xc0)
+                    sub.expect(0xd0, b"")
+                    require(outbound_state(db) == durable, "reduced_window_changed_before_ack")
+                    finish(first)
+                    frames.append(observe(second))
+                    finish(second)
+                    before_ack = False
+                else:
+                    frames.append(observe(second))
+                    require(outbound_state(db) == durable, "reduced_window_allocated_new_claim")
+                    finish("B")
+                    finish("A")
+                    before_ack = True
+                require(outbound_state(db) == [], "reduced_window_did_not_drain")
+                sub.send(0xe0)
+        trials[name] = {"initial_receive_maximum": 2, "resumed_receive_maximum": 1, "session_present": True,
+                        "before_cut": durable, "frames": frames, "second_frame_before_ack": before_ack,
+                        "obligations_after_completion": 0}
+    return all(case["second_frame_before_ack"] for case in trials.values())
+
+
 def capacity(record, pki, port, stream, db):
     topic = f"{TOPIC}/capacity"
     with closing(Wire311(pki, port, "dashboard")) as sub:
@@ -1103,6 +1185,7 @@ def exercise(out, pki, reference, record):
     qos2_recovery(record, out, pki)
     outgoing_crashes(record, out, pki)
     outgoing_receive_maximum(record, out, pki)
+    require(reduced_receive_maximum(record, out, pki), "replay_depended_on_an_ack_from_the_reduced_window")
     with launch_broker(out, pki, "capacity", out / "capacity-data", record) as (port, stream):
         capacity(record, pki, port, stream, out / "capacity-data/broker.sqlite")
 
