@@ -1,6 +1,6 @@
 use mqttiumd::codec::{self, Bounds, Packet, Version::V311};
 use mqttiumd_contract::ids::{InboundPacketId, OutboundPacketId};
-use mqttiumd_contract::packet::{InboundPacket, OutboundFrame, PubackReason, Qos};
+use mqttiumd_contract::packet::{AckReason, InboundPacket, OutboundFrame, PubackReason, Qos};
 use mqttiumd_contract::pubsub::FilterResults;
 use mqttiumd_contract::session::SessionExpiry;
 
@@ -95,7 +95,81 @@ fn legacy_publish_keeps_binary_payload_and_has_no_properties() {
         assert_eq!(&encoded.bytes[..2], &[header, body.len() as u8]);
         assert_eq!(&encoded.bytes[2..], body);
     }
-    assert!(codec::decode_for(V311, 0x34, b"\0\x01t\0\x07payload", BOUNDS).is_err());
+}
+
+#[test]
+fn legacy_qos2_uses_only_the_packet_identifier_in_acknowledgements() {
+    let mid = InboundPacketId::new(7).unwrap();
+    for (header, duplicate) in [(0x34, false), (0x3c, true)] {
+        let Packet::Core(InboundPacket::Publish {
+            packet_id: Some(packet_id),
+            payload,
+            qos: Qos::ExactlyOnce,
+            dup,
+            expiry: None,
+            ..
+        }) = codec::decode_for(V311, header, b"\0\x01t\0\x07\0\xff", BOUNDS).unwrap()
+        else {
+            panic!("expected legacy QoS 2 PUBLISH");
+        };
+        assert_eq!(
+            (packet_id, dup, payload.as_slice()),
+            (mid, duplicate, &[0, 255][..])
+        );
+    }
+    assert!(codec::decode_for(V311, 0x34, b"\0\x01t\0\0payload", BOUNDS).is_err());
+    assert!(matches!(
+        codec::decode_for(V311, 0x62, &[0, 7], BOUNDS),
+        Ok(Packet::Core(InboundPacket::Pubrel { packet_id })) if packet_id == mid
+    ));
+    for (header, body) in [
+        (0x62, &[0, 0][..]),
+        (0x62, &[7]),
+        (0x62, &[0, 7, 0]),
+        (0x62, &[0, 7, 0, 0]),
+        (0x6a, &[0, 7]),
+    ] {
+        assert!(codec::decode_for(V311, header, body, BOUNDS).is_err());
+    }
+    assert_eq!(
+        codec::encode_for(
+            V311,
+            OutboundFrame::Pubrec {
+                packet_id: mid,
+                reason: AckReason::Success
+            }
+        )
+        .unwrap(),
+        [0x50, 2, 0, 7]
+    );
+    for reason in [AckReason::Success, AckReason::PacketIdentifierNotFound] {
+        assert_eq!(
+            codec::encode_for(
+                V311,
+                OutboundFrame::Pubcomp {
+                    packet_id: mid,
+                    reason
+                }
+            )
+            .unwrap(),
+            [0x70, 2, 0, 7]
+        );
+    }
+    for reason in [
+        AckReason::QuotaExceeded,
+        AckReason::ImplementationSpecificError,
+    ] {
+        assert!(
+            codec::encode_for(
+                V311,
+                OutboundFrame::Pubrec {
+                    packet_id: mid,
+                    reason
+                }
+            )
+            .is_err()
+        );
+    }
 }
 
 #[test]
