@@ -97,7 +97,7 @@ async def _mqttium(action, host, port, client_id, *, filters=(), count=1, qos=1,
                    expected_session_present=None, subscribe=True, wait_timeout=5,
                    receive_maximum=8, maximum_packet_size=65536,
                    topic='reception/pubsub', payload=b'pubsub',
-                   expected_granted_qos=None, expected_delivery_qos=1):
+                   expected_granted_qos=None, expected_delivery_qos=1, disconnect_release=None):
     filters = tuple(filters)
     _check(filters, count, qos, wait_timeout, ack_policy, receive_maximum, maximum_packet_size)
     granted = _expected_qoses(qos, expected_granted_qos, expected_delivery_qos)
@@ -186,6 +186,9 @@ async def _mqttium(action, host, port, client_id, *, filters=(), count=1, qos=1,
                         observations.record('ack_release_observed', packet_id=message.mid)
                     await client.ack(message)
                     observations.record('manual_ack_submitted', packet_id=message.mid, qos=int(message.qos))
+                if disconnect_release is not None:
+                    while not Path(disconnect_release).exists():
+                        await asyncio.sleep(.005)
     except SubscribeError as error:
         result['status'] = 'rejected'
         row = {'packet_id': error.result.mid, 'filters': list(filters),
@@ -236,7 +239,7 @@ def _paho(action, host, port, client_id, *, filters=(), count=1, qos=1,
           expected_session_present=None, subscribe=True, wait_timeout=5,
           receive_maximum=8, maximum_packet_size=65536,
           topic='reception/pubsub', payload=b'pubsub',
-          expected_granted_qos=None, expected_delivery_qos=1):
+          expected_granted_qos=None, expected_delivery_qos=1, disconnect_release=None):
     import paho.mqtt.client as mqtt
     from paho.mqtt.packettypes import PacketTypes
     from paho.mqtt.properties import Properties as PahoProperties
@@ -388,6 +391,11 @@ def _paho(action, host, port, client_id, *, filters=(), count=1, qos=1,
                 if client.ack(message.mid, message.qos) != mqtt.MQTT_ERR_SUCCESS:
                     raise RuntimeError('manual acknowledgement submission refused')
                 observations.record('manual_ack_submitted', packet_id=message.mid, qos=message.qos)
+            if disconnect_release is not None:
+                while not Path(disconnect_release).exists():
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError('disconnect release')
+                    time.sleep(.005)
     except (TimeoutError, queue.Empty):
         result['status'] = 'timeout'
         observations.record('timeout', phase=action)
@@ -436,6 +444,7 @@ def main():
     parser.add_argument('--resume-without-subscribe', action='store_true')
     parser.add_argument('--hold-acks', action='store_true')
     parser.add_argument('--release-acks', type=Path)
+    parser.add_argument('--disconnect-release', type=Path)
     parser.add_argument('--wait-timeout', type=float, default=5)
     parser.add_argument('--receive-maximum', type=int, default=8)
     parser.add_argument('--maximum-packet-size', type=int, default=65536)
@@ -450,7 +459,7 @@ def main():
                    ack_policy='hold' if args.hold_acks else 'immediate', ack_release=args.release_acks,
                    wait_timeout=args.wait_timeout, receive_maximum=args.receive_maximum,
                    maximum_packet_size=args.maximum_packet_size, topic=args.topic, payload=args.payload.encode(),
-                   expected_granted_qos=args.expected_granted_qos,
+                   expected_granted_qos=args.expected_granted_qos, disconnect_release=args.disconnect_release,
                    expected_delivery_qos=None if args.allow_mixed_delivery_qos else args.expected_delivery_qos)
     result = asyncio.run(_mqttium(args.action, args.host, args.port, args.client_id, **options)) \
         if args.client == 'mqttium' else _paho(args.action, args.host, args.port, args.client_id, **options)

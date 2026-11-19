@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Finite reception of exact persistent subscriptions and outgoing QoS 1.
+"""Finite reception of exact persistent subscriptions and outgoing QoS 1/2.
 
 The public clients, raw pilot and independent SQLite reader establish concrete
 system behavior. This is not an extension of the fixture oracle's qualifying
@@ -43,7 +43,8 @@ class Client:
                  action: str, *, filters: tuple[str, ...] = (), count: int = 1,
                  topic: str = "reception/pubsub", payload: bytes = b"pubsub", qos: int = 1,
                  present: bool | None = None, resume: bool = False, client_id: str | None = None,
-                 hold: bool = False, release: Path | None = None, delivery_qos: int = 1):
+                 hold: bool = False, release: Path | None = None, delivery_qos: int = 1,
+                 disconnect_release: Path | None = None):
         self.broker = broker
         self.events = case / f"{name}.client.jsonl"
         self.stdout_path = case / f"{name}.client.stdout"
@@ -69,6 +70,8 @@ class Client:
             self.command += ["--hold-acks"]
         if release:
             self.command += ["--release-acks", str(release)]
+        if disconnect_release:
+            self.command += ["--disconnect-release", str(disconnect_release)]
         self.process = subprocess.Popen(self.command, stdout=self.stdout, stderr=self.stderr)
         self.done = False
         broker.observations.record("external_client_started", pid=self.process.pid,
@@ -195,12 +198,18 @@ def nominal(binary: Path, case: Path) -> dict:
         for index, (receiving, publishing, qos) in enumerate((("paho", "mqttium", 1), ("mqttium", "paho", 2))):
             topic = f"reception/external/{index}"
             payload = f"external-{publishing}-to-{receiving}".encode()
+            release = case / f"external-{receiving}-disconnect"
             subscriber = Client(broker, case, f"external-{receiving}-subscriber", receiving,
-                                "receive", filters=(topic,), count=1, present=False, qos=2, delivery_qos=qos)
+                                "receive", filters=(topic,), count=1, present=False, qos=2,
+                                delivery_qos=qos, disconnect_release=release)
             clients.append(subscriber)
             subscriber.wait_event("subscription_ready")
             receipts.append(publisher(broker, case, f"external-{publishing}-publisher", publishing,
                                       topic, payload, qos))
+            subscriber.wait_event("manual_ack_submitted")
+            # Acknowledging in the client API can precede PUBREL and PUBCOMP.
+            until(lambda: not obligations(durable(broker.db)), "external_delivery_not_finished")
+            release.touch()
             result = subscriber.collect()
             messages = result["result"]["messages"]
             require(len(messages) == 1 and messages[0]["topic"] == topic

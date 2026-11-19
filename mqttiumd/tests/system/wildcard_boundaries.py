@@ -121,7 +121,7 @@ def subscription_recipe(raw: bytes, identity: str, *, require_options: bool = Fa
         options = inner[at + 1] if inner[6] == 9 else 0
         length_at = at + width - 2
         length = int.from_bytes(inner[length_at:length_at + 2], "big")
-        require(granted in (0, 1, 2) and not options & 0xC3 and (options >> 4) & 3 != 3
+        require(granted in (0, 1, 2, 3) and not options & 0xC3 and (options >> 4) & 3 != 3
                 and (granted != 0 or options == 0) and 1 <= length <= 1024,
                 "subscription_canonical_filter_invalid")
         at += width + length

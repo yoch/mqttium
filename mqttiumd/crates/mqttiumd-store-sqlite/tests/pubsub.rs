@@ -308,9 +308,9 @@ fn work_validates_unclaimed_discriminants_before_selecting_qos_or_cursor() {
 }
 
 #[test]
-fn work_distinguishes_valid_other_qos_from_an_invalid_discriminant() {
-    for qos in [0, 2] {
-        let path = fresh_path("other-valid-work");
+fn work_selects_pending_qos0_and_qos2() {
+    for (wire, qos) in [(0, Qos::AtMostOnce), (2, Qos::ExactlyOnce)] {
+        let path = fresh_path("valid-work-qos");
         let mut world = World::new(&|incarnation, limits| {
             SqliteStore::create(&path, incarnation, limits).unwrap()
         });
@@ -320,18 +320,11 @@ fn work_distinguishes_valid_other_qos_from_an_invalid_discriminant() {
                 .apply(&world.admission(1, 7, b"payload", &[world.b]))
                 .committed_now
         );
-        corrupt(&path, &format!("UPDATE obligations SET qos={qos}"));
+        corrupt(&path, &format!("UPDATE obligations SET qos={wire}"));
         let page = world.store.read_work(world.b, None, 8).unwrap();
-        if qos == 0 {
-            assert_eq!(page.items.len(), 1);
-            assert_eq!(page.items.as_slice()[0].qos, Qos::AtMostOnce);
-            assert!(page.items.as_slice()[0].claim.is_none());
-        } else {
-            assert!(
-                page.items.is_empty(),
-                "valid QoS2 belongs to another work path in this profile"
-            );
-        }
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(page.items.as_slice()[0].qos, qos);
+        assert!(page.items.as_slice()[0].claim.is_none());
     }
 }
 

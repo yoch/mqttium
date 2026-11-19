@@ -143,7 +143,7 @@ fn physically_healthy_expiry_corruption_refuses_before_selection() {
     for sql in [
         "UPDATE publications SET expiry_tick=x'ffffffffffffffff',expiry_interval=1",
         "UPDATE publications SET expiry_domain=zeroblob(32)",
-        "UPDATE outbound SET started=1; UPDATE obligations SET qos=2",
+        "UPDATE outbound SET started=1; UPDATE obligations SET phase=2",
     ] {
         let (path, store, target) = prepared_file();
         let raw = rusqlite::Connection::open(&path).unwrap();

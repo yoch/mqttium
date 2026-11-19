@@ -240,7 +240,7 @@ def observed_levels(stream, since, expected):
     return observed
 
 
-async def mosquitto_to_mqttium(port, stream, clients, pki, qos, granted=1):
+async def mosquitto_to_mqttium(port, stream, clients, pki, db, qos, granted=1):
     before = len(events(stream))
     topic = f"{TOPIC}/to-v5-qos{qos}-grant{granted}"
     payload = f"3.1.1 QoS {qos} publisher to MQTT 5 subscriber"
@@ -257,14 +257,18 @@ async def mosquitto_to_mqttium(port, stream, clients, pki, qos, granted=1):
                 await reader.aclose()
         require((message.topic, message.payload, int(message.qos), message.retain)
                 == (topic, payload.encode(), min(qos, granted), False), "mqttium_received_different_qos_topic_or_payload")
+        if qos:
+            await asyncio.to_thread(wait_for, lambda: deliveries(db, topic) == [],
+                                    "mqttium_subscriber_delivery_did_not_finish")
     return {"topic": topic, "payload": payload, "qos": int(message.qos), "publisher": published,
             "published_qos": qos, "requested_qos": granted, "granted_qos": granted,
+            "delivery_finished": True,
             "protocols": observed_levels(stream, before, [5, 4])}
 
 
-async def interop(record, port, stream, clients, pki):
-    record["mqtt311_to_v5"] = await mosquitto_to_mqttium(port, stream, clients, pki, 1)
-    record["mqtt311_qos2_to_v5"] = await mosquitto_to_mqttium(port, stream, clients, pki, 2)
+async def interop(record, port, stream, clients, pki, db):
+    record["mqtt311_to_v5"] = await mosquitto_to_mqttium(port, stream, clients, pki, db, 1)
+    record["mqtt311_qos2_to_v5"] = await mosquitto_to_mqttium(port, stream, clients, pki, db, 2)
 
     before = len(events(stream))
     topic = f"{TOPIC}/from-v5"
@@ -299,10 +303,11 @@ async def interop(record, port, stream, clients, pki):
                     require(sent.is_done() and sent.exception() is None, "mqttium_qos2_publish_failed")
                     published = {"packet_id": sent.mid}
             received = mosquitto_result(subscriber, topic, payload, qos=qos, granted=2)
+        wait_for(lambda: deliveries(db, topic) == [], "mosquitto_subscriber_delivery_did_not_finish")
         outgoing[name] = {"topic": topic, "payload": payload, "published_qos": qos,
-                          "publisher": published, "subscriber": received,
+                          "publisher": published, "subscriber": received, "delivery_finished": True,
                           "protocols": observed_levels(stream, boundary, [4, publisher_level])}
-    outgoing["legacy-to-mqtt5-qos2"] = await mosquitto_to_mqttium(port, stream, clients, pki, 2, granted=2)
+    outgoing["legacy-to-mqtt5-qos2"] = await mosquitto_to_mqttium(port, stream, clients, pki, db, 2, granted=2)
     record["outgoing_qos2_interop"] = outgoing
 
 
@@ -1087,7 +1092,7 @@ def exercise(out, pki, reference, record):
             require(current["subscriber"]["received"] == original["subscriber"]["received"], "wire_comparison_mismatch")
             current["protocols"] = observed_levels(stream, before, [4, 4])
             record["mqttiumd_exchanges"].append(current)
-        asyncio.run(interop(record, port, stream, clients, pki))
+        asyncio.run(interop(record, port, stream, clients, pki, db))
         wire_exchange(record, pki, port)
         durable_before(record, pki, port, stream, clients, db)
     with launch_broker(out, pki, "start-2", data, record) as (port, _):

@@ -153,6 +153,7 @@ class ExternalPubsubTests(unittest.IsolatedAsyncioTestCase):
                 async with ScriptedBroker(script) as broker:
                     result = await call(kind, 'receive', '127.0.0.1', broker.port, f'{kind}-receiver',
                                         filters=('reception/exact', 'reception/second'), qos=2,
+                                        expected_granted_qos=1,
                                         expected_session_present=False)
                 self.assertEqual(result['status'], 'success', result)
                 self.assertEqual(result['subscriptions'][0]['reason_codes'], [1, 1])
