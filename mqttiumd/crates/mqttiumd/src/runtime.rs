@@ -21,9 +21,7 @@ use mqttiumd_contract::ids::{
 use mqttiumd_contract::message_expiry::{MessageExpiry, MessageTime};
 use mqttiumd_contract::outcome::{CommitFacts, StoreOutcome, StoreReply};
 use mqttiumd_contract::packet::{InboundPacket, OutboundFrame};
-use mqttiumd_contract::pubsub::{
-    FilterResults, MAX_FILTERS, PubackTarget, Qos0DropReason, Qos0Origin,
-};
+use mqttiumd_contract::pubsub::{PubackTarget, Qos0DropReason, Qos0Origin};
 use mqttiumd_contract::receipts::{
     ClosedReceiptCollection, ClosedReceiptReply, ReceiptCollectionReply,
 };
@@ -2200,7 +2198,6 @@ impl Runtime<'_> {
                     generation,
                     "client_id",
                     Some(connect.max_packet_size as usize),
-                    None,
                 );
             }
             if let Some(will) = &connect.will
@@ -2214,7 +2211,6 @@ impl Runtime<'_> {
                     generation,
                     "will",
                     Some(connect.max_packet_size as usize),
-                    None,
                 );
             }
         }
@@ -2388,7 +2384,6 @@ impl Runtime<'_> {
         generation: ConnectionGeneration,
         stage: &'static str,
         before_connack: Option<usize>,
-        packet: Option<&InboundPacket>,
     ) -> Result<(), Failure> {
         self.events
             .emit(
@@ -2399,33 +2394,6 @@ impl Runtime<'_> {
             .map_err(event_failure)?;
         if let Some(peer) = self.peers.get_mut(&generation) {
             let version = peer.version.unwrap_or_default();
-            if version == Version::V311
-                && peer.connected
-                && let Some(InboundPacket::Subscribe { packet_id, filters }) = packet
-            {
-                let results = FilterResults::new(&[0x80; MAX_FILTERS][..filters.len()])
-                    .map_err(|_| Failure::plain("subscription_refusal_size"))?;
-                let bytes = codec::encode_for(
-                    version,
-                    OutboundFrame::Suback {
-                        packet_id: *packet_id,
-                        results,
-                    },
-                )
-                .map_err(|_| Failure::plain("subscription_refusal_codec"))?;
-                if peer
-                    .io
-                    .outgoing
-                    .try_send(net::Write {
-                        correlation: None,
-                        bytes,
-                        expiry: None,
-                    })
-                    .is_ok()
-                {
-                    return Ok(());
-                }
-            }
             let bytes = if before_connack.is_some() {
                 Some(
                     codec::session_refusal_for(version, 0x87)
@@ -2470,7 +2438,8 @@ impl Runtime<'_> {
         if first >> 4 == 1 && version.is_some() {
             return self.close(generation, "second_connect");
         }
-        let decoded = match codec::decode_for(version.unwrap_or_default(), first, &body, BOUNDS) {
+        let mut decoded = match codec::decode_for(version.unwrap_or_default(), first, &body, BOUNDS)
+        {
             Ok(v) => v,
             Err(error) => {
                 let error = self
@@ -2513,20 +2482,46 @@ impl Runtime<'_> {
             }
         };
         if let (Some(security), Packet::Core(packet) | Packet::TimedPublish { packet, .. }) =
-            (&self.security, &decoded)
-            && self
+            (&self.security, &mut decoded)
+        {
+            let Some(principal) = self
                 .peers
                 .get(&generation)
                 .and_then(|peer| peer.io.principal())
-                .is_none_or(|principal| !security.policy.allows_packet(principal, packet))
-        {
-            let stage = match packet {
-                InboundPacket::Publish { .. } => "publish",
-                InboundPacket::Subscribe { .. } => "subscribe",
-                InboundPacket::Unsubscribe { .. } => "unsubscribe",
-                _ => return self.close(generation, "tls_principal_missing"),
+            else {
+                return self.close(generation, "tls_principal_missing");
             };
-            return self.authorization_refusal(generation, stage, None, Some(packet));
+            if let InboundPacket::Subscribe {
+                filters, denied, ..
+            } = packet
+            {
+                for (index, filter) in filters.as_slice().iter().enumerate() {
+                    if !security
+                        .policy
+                        .allows_filter(principal, filter.filter.as_slice())
+                    {
+                        *denied |= 1 << index;
+                    }
+                }
+                if *denied != 0 {
+                    self.events
+                        .emit(
+                            "authorization_refused",
+                            json!({
+                                "connection":generation.get().to_string(),
+                                "details":{"stage":"subscribe","reason":0x87}
+                            }),
+                        )
+                        .map_err(event_failure)?;
+                }
+            } else if !security.policy.allows_packet(principal, packet) {
+                let stage = if matches!(packet, InboundPacket::Publish { .. }) {
+                    "publish"
+                } else {
+                    "unsubscribe"
+                };
+                return self.authorization_refusal(generation, stage, None);
+            }
         }
         let decoded = match decoded {
             Packet::TimedPublish {

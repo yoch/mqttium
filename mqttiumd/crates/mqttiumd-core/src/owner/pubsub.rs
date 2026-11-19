@@ -1533,8 +1533,15 @@ impl Owner {
         let mut codes = [0u8; MAX_FILTERS];
         let mut len = 0usize;
         match packet {
-            InboundPacket::Subscribe { filters, .. } => {
+            InboundPacket::Subscribe {
+                filters, denied, ..
+            } => {
                 for item in filters.as_slice() {
+                    if denied & (1 << len) != 0 {
+                        codes[len] = 0x87;
+                        len += 1;
+                        continue;
+                    }
                     let allowed = crate::contract::topic::valid_filter(item.filter.as_slice());
                     codes[len] = if allowed {
                         item.qos.min(Qos::AtLeastOnce).to_wire()
@@ -4386,6 +4393,7 @@ mod tests {
             connection: CONNECTION,
             ingress_order: 1,
             packet: InboundPacket::Subscribe {
+                denied: 0,
                 packet_id: InboundPacketId::new(3).unwrap(),
                 filters: crate::contract::pubsub::FilterList::copy_from(&[
                     crate::contract::pubsub::SubscriptionFilter {

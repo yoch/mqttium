@@ -869,6 +869,7 @@ fn subscribe(
         Ok(Packet::Core(InboundPacket::Subscribe {
             packet_id,
             filters: FilterList::copy_from(&filters).map_err(|_| oversized("TooManyFilters"))?,
+            denied: 0,
         }))
     }
 }

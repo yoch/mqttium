@@ -284,6 +284,13 @@ def policy_refusal(binary, out, pki, db, policy, *, code):
     return {"code": code, "exit": refused.returncode, "database_sha256": before, "command": command}
 
 
+def refuse_overbroad_subscription(peer):
+    peer.send(subscribe_packet(1, [("#", 1)]))
+    ack = peer.expect(0x90)
+    require(ack.body == b"\0\x01\0\x87", "overbroad_subscription_accepted")
+    peer.ping()
+
+
 def authority(binary, out, pki, original_policy):
     broker = broker_with(binary, out, pki)
     restarted = None
@@ -312,8 +319,7 @@ def authority(binary, out, pki, original_policy):
         before = observed(broker, lambda: (lambda row: row if row["obligations"] == 2
             and row["wills"] == 0 else None)(state(broker)), "offline_will_obligations_missing")
 
-        # Negative topic operations are a full packet refusal before any route
-        # or admission, including packet IDs/QoS that otherwise commit.
+        # Refused topic operations leave routes and publications unchanged.
         for qos in (0, 1, 2):
             with Peer(broker, f"forbidden-publish-{qos}", sensor_context) as peer:
                 require(peer.open("capteur-1"), "unexpected_topic_test_session_loss")
@@ -321,7 +327,7 @@ def authority(binary, out, pki, original_policy):
                           "forbidden_publication_not_refused")
         with Peer(broker, "forbidden-subscribe", dashboard_context) as peer:
             require(peer.open("dashboard-check") is False, "unexpected_dashboard_check_resume")
-            peer.deny(subscribe_packet(1, [("atelier/+/status", 1), ("#", 1)]), "overbroad_subscription_accepted")
+            refuse_overbroad_subscription(peer)
         with Peer(broker, "forbidden-unsubscribe", sensor_context) as peer:
             peer.open("capteur-1")
             peer.deny(unsubscribe_packet(1, ["atelier/#"]), "overbroad_unsubscribe_accepted")
@@ -780,7 +786,7 @@ def main():
                     try:
                         with Peer(broker, "dashboard", client_context(pki, "dashboard")) as dashboard:
                             dashboard.open("dashboard")
-                            dashboard.deny(subscribe_packet(1, [("#", 1)]), "overbroad_subscription_accepted")
+                            refuse_overbroad_subscription(dashboard)
                     finally:
                         broker.cleanup()
         finally:

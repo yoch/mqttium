@@ -113,6 +113,9 @@ pub enum InboundPacket {
     Subscribe {
         packet_id: InboundPacketId,
         filters: FilterList<SubscriptionFilter>,
+        /// Authorization facts attached by the transport adapter. Bit i
+        /// denies filter i; the wire decoder starts with an empty mask.
+        denied: u8,
     },
     Unsubscribe {
         packet_id: InboundPacketId,

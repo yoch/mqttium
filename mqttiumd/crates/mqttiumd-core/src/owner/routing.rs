@@ -616,6 +616,7 @@ mod tests {
             connection: ConnectionGeneration::new(generation),
             ingress_order: 1,
             packet: InboundPacket::Subscribe {
+                denied: 0,
                 packet_id: InboundPacketId::new(packet_id).unwrap(),
                 filters: crate::contract::pubsub::FilterList::copy_from(&filters).unwrap(),
             },

@@ -7075,6 +7075,7 @@ mod tests {
             connection: ConnectionGeneration::new(connection),
             ingress_order: 1,
             packet: InboundPacket::Subscribe {
+                denied: 0,
                 packet_id: packet_id(packet),
                 filters: FilterList::copy_from(&[SubscriptionFilter {
                     options: crate::contract::pubsub::SubscriptionOptions::DEFAULT,

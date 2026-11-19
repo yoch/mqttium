@@ -401,7 +401,7 @@ impl Policy {
             .any(|prefix| within(topic, prefix))
     }
 
-    fn allows_filter(&self, principal: Principal, filter: &[u8]) -> bool {
+    pub fn allows_filter(&self, principal: Principal, filter: &[u8]) -> bool {
         self.rules[principal.0]
             .subscribe
             .iter()
