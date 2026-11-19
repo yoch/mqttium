@@ -519,6 +519,67 @@ def subscription_authorization(record, out, pki):
     record["subscription_authorization"] = results
 
 
+def subscription_capacity(record, out, pki, levels=(4, 5)):
+    prefix = "atelier/capacity"
+    seeded = [(f"{prefix}/{i:03}", 1) for i in range(127)]
+    first, second = f"{prefix}/first", f"{prefix}/second"
+    replacement = seeded[0][0]
+
+    def subscribe(wire, level, number, filters):
+        mid = number.to_bytes(2, "big")
+        props = b"\0" if level == 5 else b""
+        wire.send(0x82, mid + props + b"".join(field(name) + bytes([qos]) for name, qos in filters))
+        header, body = wire.receive()
+        require(header == 0x90 and body.startswith(mid + props), "capacity_suback_header")
+        return list(body[len(mid + props):])
+
+    def committed_before_suback(stream, boundary, number):
+        rows = wait_for(lambda: [row for row in events(stream)[boundary:]
+                                 if row["kind"] == "frame_queued"
+                                 and row["details"]["packet_kind"] == "SUBACK"
+                                 and row["details"]["packet_id"] == number], "capacity_suback_trace")
+        ack, = rows
+        commit, = [row for row in events(stream)[boundary:]
+                   if row["kind"] == "store_result" and row["command_kind"] == "Subscriptions"
+                   and row["details"]["committed_now"]]
+        require(int(commit["seq"]) < int(ack["seq"]), "capacity_suback_preceded_commit")
+        return [commit["seq"], ack["seq"]]
+
+    result = record.setdefault("subscription_capacity", {})
+    for level in levels:
+        refusal, quota = (0x80, 0x80) if level == 4 else (0x87, 0x97)
+        data = out / f"routes-{level}-data"
+        db = data / "broker.sqlite"
+        with launch_broker(out, pki, f"routes-{level}-start", data, record) as (port, stream):
+            with closing(Wire311(pki, port, "dashboard")) as sub:
+                acl_connect(sub, level, persistent=True)
+                for start in range(0, len(seeded), 8):
+                    batch = seeded[start:start + 8]
+                    require(subscribe(sub, level, start + 1, batch) == [1] * len(batch), "capacity_seed")
+                require(query(db, "SELECT count(*) FROM routes") == [(127,)], "capacity_fixture_not_at_limit")
+                boundary = len(events(stream))
+                added = subscribe(sub, level, 200, [(first, 1), (second, 1)])
+                require(added == [1, quota], f"ordered_subscription_capacity_v{level}_got_{bytes(added).hex()}")
+                added_order = committed_before_suback(stream, boundary, 200)
+                boundary = len(events(stream))
+                replaced = subscribe(sub, level, 201, [("outside/policy", 1), (second, 1), (replacement, 0)])
+                require(replaced == [refusal, quota, 0], "replacement_at_full_capacity")
+                replacement_order = committed_before_suback(stream, boundary, 201)
+                sub.send(0xe0)
+        expected = sorted([(name.encode(), 0 if name == replacement else qos) for name, qos in seeded]
+                          + [(first.encode(), 1)])
+        with launch_broker(out, pki, f"routes-{level}-resume", data, record) as (port, _):
+            require(record["starts"][-2]["sqlite"] == record["starts"][-1]["sqlite"], "capacity_restart_changed_db")
+            with closing(Wire311(pki, port, "dashboard")) as sub:
+                acl_connect(sub, level, persistent=True, resume=True)
+                require(query(db, "SELECT topic,qos FROM routes ORDER BY topic") == expected,
+                        "capacity_recovered_routes_differ")
+                sub.send(0xe0)
+        result[str(level)] = {"after_127": added, "at_full": replaced, "routes_recovered": len(expected),
+                              "replaced": replacement, "refused": second,
+                              "commit_and_suback": [added_order, replacement_order]}
+
+
 def durable_before(record, pki, port, stream, clients, db):
     trials = [("dashboard", False, f"{TOPIC}/persistent"), ("dashboard-check", True, f"{TOPIC}/clean")]
     for name, clean, topic in trials:
@@ -811,6 +872,7 @@ def exercise(out, pki, reference, record):
         durable_after(record, pki, port, db)
         asyncio.run(inherited_retain(record, pki, port, db))
     subscription_authorization(record, out, pki)
+    subscription_capacity(record, out, pki)
     qos2_recovery(record, out, pki)
     with launch_broker(out, pki, "capacity", out / "capacity-data", record) as (port, stream):
         capacity(record, pki, port, stream, out / "capacity-data/broker.sqlite")
