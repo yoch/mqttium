@@ -13,6 +13,7 @@ from pathlib import Path
 import platform
 from queue import Queue
 import re
+import shutil
 import signal
 import socket
 import sqlite3
@@ -400,6 +401,108 @@ def deliveries(db, topic):
     """, (topic.encode(),))
 
 
+def acl_connect(wire, level, *, persistent=False, resume=False):
+    clean = not resume and (level == 5 or not persistent)
+    properties = b""
+    if level == 5:
+        properties = b"\x05\x11\xff\xff\xff\xff" if persistent else b"\0"
+    wire.send(0x10, field("MQTT") + bytes([level, 2 if clean else 0, 0, 30])
+              + properties + field("dashboard"))
+    hello = wire.receive()
+    require(hello is not None and hello[0] == 0x20 and hello[1][:2] == bytes([int(resume), 0]),
+            "acl_dashboard_connack")
+    if level == 4:
+        require(len(hello[1]) == 2, "properties_in_legacy_connack")
+
+
+def acl_delivery(wire, level, topic, payload):
+    frame = wire.receive()
+    prefix = field(topic)
+    require(frame is not None and frame[0] == 0x32 and frame[1].startswith(prefix), "acl_delivery_topic_or_qos")
+    mid = frame[1][len(prefix):len(prefix) + 2]
+    properties = b"\0" if level == 5 else b""
+    require(int.from_bytes(mid, "big") > 0 and frame[1] == prefix + mid + properties + payload,
+            "acl_delivery_payload")
+    wire.send(0x40, mid)
+    wire.send(0xc0)
+    wire.expect(0xd0, b"")
+
+
+def acl_publish(pki, port, payload):
+    with closing(Wire311(pki, port, "sensor")) as pub:
+        pub.connect("capteur-1")
+        pub.expect(0x20, b"\0\0")
+        for mid, topic in enumerate(("atelier/a", "autre/a"), 1):
+            pub.publish(topic, payload, mid)
+            pub.expect(0x40, mid.to_bytes(2, "big"))
+        pub.send(0xe0)
+
+
+def subscription_authorization(record, out, pki):
+    # Keep the dashboard policy and certificates identical to the template.
+    # Let the sensor publish both exact topics to make the denied route observable.
+    pki = Path(shutil.copytree(pki, pki.with_name("acl-pki")))
+    identities = pki / "identities.json"
+    policy = json.loads(identities.read_text())
+    next(rule for rule in policy["principals"] if rule["name"] == "sensor-1")["publish"].extend(("atelier/a", "autre/a"))
+    identities.write_text(json.dumps(policy))
+    results = {}
+    for level, refusal in ((4, 0x80), (5, 0x87)):
+        data = out / f"acl-{level}-data"
+        db = data / "broker.sqlite"
+        cases = [(("atelier/a",), [1]), (("autre/a",), [refusal]),
+                 (("atelier/a", "autre/a"), [1, refusal]), (("autre/a", "atelier/a"), [refusal, 1])]
+        props = b"\0" if level == 5 else b""
+        rows = []
+        with launch_broker(out, pki, f"acl-{level}-start", data, record) as (port, stream):
+            for count, (filters, codes) in enumerate(cases, 1):
+                persistent = count == len(cases)
+                with closing(Wire311(pki, port, "dashboard")) as sub:
+                    acl_connect(sub, level, persistent=persistent)
+                    before = len(events(stream))
+                    mid = count.to_bytes(2, "big")
+                    sub.send(0x82, mid + props + b"".join(field(topic) + b"\x01" for topic in filters))
+                    sub.expect(0x90, mid + props + bytes(codes))
+                    observed = events(stream)[before:]
+                    commits = [row for row in observed if row["kind"] == "store_result"
+                               and row["command_kind"] == "Subscriptions" and row["details"]["committed_now"]]
+                    commit = None
+                    if 1 in codes:
+                        commit, = commits
+                        ack, = [row for row in observed if row["kind"] == "frame_queued"
+                                and row["details"]["packet_kind"] == "SUBACK" and row["details"]["packet_id"] == count]
+                        require(int(commit["seq"]) < int(ack["seq"]), "acl_suback_preceded_commit")
+                    else:
+                        require(not commits, "denied_only_subscription_reached_storage")
+                    routes = query(db, "SELECT topic,qos FROM routes ORDER BY topic")
+                    require(routes == ([(b"atelier/a", 1)] if 1 in codes else []), "acl_durable_route_differed")
+                    rows.append({"filters": filters, "suback_codes": codes, "commit": commit})
+                    if persistent:
+                        acl_publish(pki, port, b"allowed-live")
+                        acl_delivery(sub, level, "atelier/a", b"allowed-live")
+                    sub.send(0xe0)
+                if not persistent:
+                    wait_for(lambda: query(db, "SELECT id FROM sessions WHERE client_id=?", (b"dashboard",)) == [],
+                             "ephemeral_acl_session_not_removed")
+            generation = observed_levels(stream, 0, [level] * len(cases) + [4])[len(cases) - 1]["connection"]
+            wait_for(lambda: any(row["kind"] == "connection_closed" and row["connection"] == generation
+                                 for row in events(stream)), "acl_dashboard_not_offline")
+            acl_publish(pki, port, b"allowed-after-restart")
+            require(deliveries(db, "atelier/a") == [(b"dashboard", b"atelier/a", b"allowed-after-restart", 1)]
+                    and not deliveries(db, "autre/a"), "acl_wrong_offline_work")
+        with launch_broker(out, pki, f"acl-{level}-resume", data, record) as (port, _):
+            require(record["starts"][-2]["sqlite"] == record["starts"][-1]["sqlite"], "acl_restart_changed_database")
+            with closing(Wire311(pki, port, "dashboard")) as sub:
+                acl_connect(sub, level, persistent=True, resume=True)
+                acl_delivery(sub, level, "atelier/a", b"allowed-after-restart")
+                require(query(db, "SELECT topic,qos FROM routes ORDER BY topic") == [(b"atelier/a", 1)],
+                        "acl_restart_restored_denied_route")
+                sub.send(0xe0)
+        results[str(level)] = {"cases": rows, "live": "allowed-live", "recovered": "allowed-after-restart",
+                               "permitted_route": "atelier/a", "session_present": True}
+    record["subscription_authorization"] = results
+
+
 def durable_before(record, pki, port, stream, clients, db):
     trials = [("dashboard", False, f"{TOPIC}/persistent"), ("dashboard-check", True, f"{TOPIC}/clean")]
     for name, clean, topic in trials:
@@ -541,6 +644,7 @@ def exercise(out, pki, reference, record):
     with launch_broker(out, pki, "start-2", data, record) as (port, _):
         durable_after(record, pki, port, db)
         asyncio.run(inherited_retain(record, pki, port, db))
+    subscription_authorization(record, out, pki)
     with launch_broker(out, pki, "capacity", out / "capacity-data", record) as (port, stream):
         capacity(record, pki, port, stream, out / "capacity-data/broker.sqlite")
 
