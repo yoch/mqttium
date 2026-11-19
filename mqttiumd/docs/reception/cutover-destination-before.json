@@ -1,0 +1,21 @@
+{
+  "archive_sha256": "414246a6c6b5fa6bdc68589a5dbf6255c26b3d60a1664e7b54bf55fdba8d9b0c",
+  "binary_sha256": "820ff0839b3ceeff63ed5f03bd7d088f8d5f4d0a159b0d90a84b16c4fc826869",
+  "source": "63f7524af10b71f5b44a8cabde659001a96f93c1",
+  "destination_preflight": {
+    "destination_occupied": {
+      "exit_status": 0,
+      "status": "compatible",
+      "diagnostics": [],
+      "original_service_pingresp": true
+    },
+    "destination_parent_missing": {
+      "exit_status": 0,
+      "status": "compatible",
+      "diagnostics": [],
+      "original_service_pingresp": true
+    }
+  },
+  "status": "FAIL",
+  "failure": "destination_preflight_expected_refusals:destination_occupied,destination_parent_missing"
+}

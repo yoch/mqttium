@@ -136,6 +136,39 @@ def verify_config(d, tool, conf, bindings, data):
     return result.returncode, json.loads(result.stdout)
 
 
+def check_destinations(d, tool, conf, bindings, site, pki, port, result):
+    occupied = site / "occupied"
+    occupied.mkdir(mode=0o700)
+    sentinel = occupied / "operator-file"
+    sentinel.write_bytes(b"leave this file alone")
+    absent = site / "absent-parent"
+    tests = [(occupied, "destination_occupied"),
+             (absent / "candidate", "destination_parent_missing")]
+    trials = result["destination_preflight"] = {}
+    source = site / "mosquitto-data/mosquitto.db"
+    original = d.sha(source) if source.exists() else None
+    with closing(d.Wire311(pki, port, "dashboard")) as wire:
+        d.acl_connect(wire, 4)
+        for destination, fault in tests:
+            rc, plan = verify_config(d, tool, conf, bindings, destination)
+            wire.send(0xc0)
+            wire.expect(0xd0, b"")
+            trials[fault] = {
+                "exit_status": rc,
+                "status": plan["status"],
+                "diagnostics": [row for row in plan["diagnostics"] if row["status"] == "blocking"],
+                "original_service_pingresp": True,
+            }
+        wire.send(0xe0)
+    d.require((d.sha(source) if source.exists() else None) == original,
+              "destination_checks_changed_source_store")
+    d.require(list(occupied.iterdir()) == [sentinel] and sentinel.read_bytes() == b"leave this file alone"
+              and not absent.exists(), "destination_checks_changed_candidate_storage")
+    bad = [fault for fault, observed in trials.items() if observed["exit_status"] != 2
+           or not any(row.get("code") == fault for row in observed["diagnostics"])]
+    d.require(not bad, "destination_preflight_expected_refusals:" + ",".join(bad))
+
+
 def exercise_cutover(d, out, pki, reference, record, clients):
     site = out / "switch"
     with socket.socket() as reserved:
@@ -181,6 +214,7 @@ def exercise_cutover(d, out, pki, reference, record, clients):
     conf.write_text(conf_text)
     d.require(not data.exists(), "offline_diagnostics_touched_data")
     with d.reference_service(conf, reference, out / "mosquitto-original.log"):
+        check_destinations(d, tool, conf, bindings, site, pki, port, result)
         result["mosquitto_qos2"] = qos2(d, clients, port, "original")
         result["mosquitto_acl"] = compare_acl(d, pki, port, True)
         publish_sequence(d, port, pki, [(STATE, "original-state", True)])
