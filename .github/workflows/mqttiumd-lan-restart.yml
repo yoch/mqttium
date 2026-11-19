@@ -1,0 +1,93 @@
+name: mqttiumd ARM64 LAN restart
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/mqttiumd-lan-restart.yml"
+      - "mqttiumd/preview/lan/**"
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: mqttiumd-lan-restart-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  kit:
+    name: Publish the kit with the frozen ARM preview
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 10
+    outputs:
+      artifact: ${{ steps.upload.outputs.artifact-id }}
+      archive: ${{ steps.seal.outputs.archive }}
+      sha256: ${{ steps.seal.outputs.sha256 }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+      - name: Preserve and seal the published broker artifact
+        id: seal
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          source_sha=$(git rev-parse HEAD)
+          name="mqttiumd-lan-kit-${source_sha:0:8}-linux-aarch64"
+          root="$RUNNER_TEMP/kit-stage"
+          publish="$RUNNER_TEMP/kit-artifact"
+          mkdir -p "$root/$name" "$publish"
+          cp mqttiumd/preview/lan/{README.md,lan_restart.py,check_receipts.py,requirements.txt,rehearse.sh,Dockerfile} "$root/$name/"
+          gh api repos/yoch/mqttium/actions/artifacts/14509792520/zip > "$root/$name/broker-aarch64.zip"
+          printf '%s  %s\n' 0c25d0b4a2c6252aaac01dfdfa3defa84f87c8d51470d0f224e80666f9907d45 \
+            "$root/$name/broker-aarch64.zip" | sha256sum -c -
+          printf '%s\n' "$source_sha" > "$root/$name/KIT-SOURCE"
+          tar -czf "$publish/$name.tar.gz" -C "$root" "$name"
+          (cd "$publish" && sha256sum "$name.tar.gz" > "$name.tar.gz.sha256")
+          printf 'archive=%s.tar.gz\nsha256=%s\n' "$name" "$(cut -d ' ' -f1 "$publish/$name.tar.gz.sha256")" >> "$GITHUB_OUTPUT"
+          cat "$publish/$name.tar.gz.sha256" >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload the operator kit
+        id: upload
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: mqttiumd-lan-kit-linux-aarch64
+          path: ${{ runner.temp }}/kit-artifact/*
+          if-no-files-found: error
+
+  rehearse:
+    name: Rehearse the downloaded kit in two ARM64 network namespaces
+    runs-on: ubuntu-24.04-arm
+    needs: kit
+    timeout-minutes: 15
+    env:
+      ARCHIVE: ${{ needs.kit.outputs.archive }}
+      KIT_SHA256: ${{ needs.kit.outputs.sha256 }}
+      KIT_SOURCE: ${{ github.event.pull_request.head.sha }}
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          artifact-ids: ${{ needs.kit.outputs.artifact }}
+          path: ${{ runner.temp }}/downloaded
+      - name: Verify the kit externally and rehearse the two roles
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = aarch64
+          mkdir "$RUNNER_TEMP/kit-extracted"
+          printf '%s  %s\n' "$KIT_SHA256" "$RUNNER_TEMP/downloaded/$ARCHIVE" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/downloaded/$ARCHIVE" -C "$RUNNER_TEMP/kit-extracted"
+          kit="$RUNNER_TEMP/kit-extracted/${ARCHIVE%.tar.gz}"
+          test "$(cat "$kit/KIT-SOURCE")" = "$KIT_SOURCE"
+          bash "$kit/rehearse.sh" "$RUNNER_TEMP/lan-rehearsal" "gh-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          evidence="$RUNNER_TEMP/lan-rehearsal/evidence"
+          printf '%s  %s\n' "$KIT_SHA256" "$ARCHIVE" > "$evidence/kit.sha256"
+          printf '%s\n' "$KIT_SOURCE" > "$evidence/kit-source.txt"
+          (cd "$evidence" && sha256sum -- * > ../EVIDENCE.sha256 && mv ../EVIDENCE.sha256 .)
+      - name: Publish paired receipts, namespace evidence and broker events
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: mqttiumd-lan-restart-receipts-aarch64
+          path: ${{ runner.temp }}/lan-rehearsal/evidence/
+          if-no-files-found: warn
