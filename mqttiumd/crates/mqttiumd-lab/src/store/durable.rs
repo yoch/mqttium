@@ -2428,6 +2428,7 @@ impl DurableStore for MemoryStore {
                     target: record.target,
                     target_revision: record.target_revision,
                     qos: record.qos,
+                    cause: record.cause,
                     retain: record.retain,
                     expiry: publication.expiry,
                     topic: SharedBytes::copy_from(&publication.topic, state.limits.max_topic_bytes)

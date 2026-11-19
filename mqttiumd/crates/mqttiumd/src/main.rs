@@ -1,4 +1,4 @@
-//! Experimental durable hierarchical MQTT 5 TCP broker.
+//! Experimental durable hierarchical MQTT TCP broker.
 use mqttiumd::{
     runtime::{Config, run},
     security::TlsFiles,

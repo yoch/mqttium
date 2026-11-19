@@ -1,4 +1,5 @@
 //! Bounded subscription and outgoing QoS 1 data (ADR 0025).
+use crate::command::DeliveryCause;
 use crate::ids::{
     ConnectionKey, DeliveryId, EffectId, OperationId, OutboundPacketId, Revision, SessionId,
 };
@@ -162,6 +163,7 @@ pub struct WorkItem {
     pub target: SessionId,
     pub target_revision: Revision,
     pub qos: Qos,
+    pub cause: DeliveryCause,
     pub retain: bool,
     pub expiry: Option<crate::message_expiry::MessageExpiry>,
     pub topic: SharedBytes,

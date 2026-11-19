@@ -1,4 +1,4 @@
-# MQTT 5 preview for private networks
+# MQTT preview for private networks
 
 The optional mTLS listener uses TLS 1.3, explicit client certificate pins,
 ClientID ownership and static topic grants. The legacy plaintext listener
@@ -6,6 +6,12 @@ accepts loopback addresses only. For setup, see the [secure preview guide](../pr
 and [Proposed 0035](decisions/0035-private-mtls-profile.md). The secure
 SQLite profile uses schema 13 and a separate database from schema 12.
 The sections below describe the shared MQTT behavior and historical loopback profile.
+
+The same listener accepts MQTT 3.1.1 and MQTT 5. The
+[interoperability preview](../preview/MQTT311.md) shows ordinary Mosquitto clients
+using the default MQTT version and the shared routing across both versions.
+The adapter retains the protocol level for each transport generation.
+[Proposed 0038](decisions/0038-mqtt311-wire-profile.md) specifies the level-4 profile.
 
 The product receives MQTT 5 QoS 0/1/2 publications, including durable retained values, Message Expiry and zero-delay QoS1 Wills with optional Retain, and delivers
 at QoS 0 or 1 to persistent exact and hierarchical subscriptions. Sessions and filters
@@ -137,8 +143,10 @@ policy. Sleeping after automatic acknowledgement is not proof of held work.
 
 ## Accepted profile
 
-CONNECT requires MQTT 5 and an explicit nonempty UTF-8 ClientID. Both Clean
-Start values are supported. Session Expiry Interval may be absent (zero) or any u32 value: zero, finite
+CONNECT requires an explicit nonempty UTF-8 ClientID. In MQTT 3.1.1, Clean Session 1
+creates a fresh session that expires on disconnect. Clean Session 0 opens or
+resumes an indefinitely persistent session. In MQTT 5, both Clean Start values
+are supported. Session Expiry Interval may be absent (zero) or any u32 value: zero, finite
 1..0xfffffffe, or `0xffffffff` (infinity).
 The existing command-line pub/sub helpers request infinity explicitly.
 
@@ -663,8 +671,9 @@ lost results, compiled negative controls and a standalone extracted-archive
 demo. These are product system tests, separate from the existing qualifying
 K1/K2b/K3 fixture scope. The package's `demo.sh` executes the short Mosquitto
 publish-before-dashboard, restart, replace and empty-retained-clear guide.
-TLS/MQTT Username/Password, Enhanced Authentication, shared subscriptions, Subscription
-Identifiers, outgoing QoS2, MQTT3.1.1 and general migration remain unsupported.
+The retained reception here covers MQTT 5. Username/Password, Enhanced
+Authentication, shared subscriptions, Subscription Identifiers, outgoing QoS 2
+and general migration remain outside the profile.
 
 ## Message Expiry (Proposed0033)
 

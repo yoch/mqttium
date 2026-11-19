@@ -63,8 +63,8 @@ pub struct Write {
 #[derive(Clone, Copy, Debug)]
 pub struct WriteExpiry {
     pub expiry: MessageExpiry,
-    /// Offset of the four value bytes supplied by the publication encoder.
-    pub value_offset: usize,
+    /// MQTT 5 has four bytes to update. Legacy writes still check the deadline.
+    pub value_offset: Option<usize>,
     /// An existing exchange may finish after its original message lifetime.
     pub started: bool,
 }
@@ -516,11 +516,17 @@ fn prepare_expiry(
     expiry: WriteExpiry,
     clock: &dyn SessionClock,
 ) -> Result<(), WriteFailure> {
-    let value_end = expiry
+    let field = expiry
         .value_offset
-        .checked_add(4)
-        .filter(|end| *end <= bytes.len())
-        .ok_or(WriteFailure::Failed("output_expiry_offset"))?;
+        .map(|at| {
+            let end = at
+                .checked_add(4)
+                .ok_or(WriteFailure::Failed("output_expiry_offset"))?;
+            bytes
+                .get_mut(at..end)
+                .ok_or(WriteFailure::Failed("output_expiry_offset"))
+        })
+        .transpose()?;
     let state = clock
         .read()
         .ok()
@@ -546,7 +552,9 @@ fn prepare_expiry(
             ));
         }
     };
-    bytes[expiry.value_offset..value_end].copy_from_slice(&remaining.to_be_bytes());
+    if let Some(field) = field {
+        field.copy_from_slice(&remaining.to_be_bytes());
+    }
     Ok(())
 }
 
@@ -806,7 +814,7 @@ mod tests {
                     },
                     interval: 2,
                 },
-                value_offset: encoded.expiry_value_offset.unwrap(),
+                value_offset: encoded.expiry_value_offset,
                 started: false,
             },
         )
@@ -925,7 +933,7 @@ mod tests {
         let mut bytes = encoded.bytes;
         assert_eq!(bytes[0] & 1, 1, "retained fixture must preserve RETAIN");
         let expiry = WriteExpiry {
-            value_offset: encoded.expiry_value_offset.unwrap(),
+            value_offset: encoded.expiry_value_offset,
             ..expiry
         };
         let clock = FakeClock::new(reading(expiry.expiry.deadline().unwrap()));
@@ -977,16 +985,16 @@ mod tests {
         assert_eq!(starts.get(), 1);
         assert_eq!(observed, bytes);
         assert_eq!(
-            &bytes[expiry.value_offset..expiry.value_offset + 4],
+            &bytes[expiry.value_offset.unwrap()..expiry.value_offset.unwrap() + 4],
             &1u32.to_be_bytes()
         );
         assert_eq!(
-            &bytes[..expiry.value_offset],
-            &original[..expiry.value_offset]
+            &bytes[..expiry.value_offset.unwrap()],
+            &original[..expiry.value_offset.unwrap()]
         );
         assert_eq!(
-            &bytes[expiry.value_offset + 4..],
-            &original[expiry.value_offset + 4..]
+            &bytes[expiry.value_offset.unwrap() + 4..],
+            &original[expiry.value_offset.unwrap() + 4..]
         );
     }
 
@@ -1037,7 +1045,10 @@ mod tests {
                     &control(),
                     &clock,
                     |part, _| {
-                        assert_eq!(&part[expiry.value_offset..expiry.value_offset + 4], &[0; 4]);
+                        assert_eq!(
+                            &part[expiry.value_offset.unwrap()..expiry.value_offset.unwrap() + 4],
+                            &[0; 4]
+                        );
                         Ok(part.len())
                     },
                     || {
@@ -1052,9 +1063,26 @@ mod tests {
     }
 
     #[test]
+    fn expiry_without_a_property_still_gates_a_legacy_write() {
+        let (_, mut expiry) = timed_frame();
+        expiry.value_offset = None;
+        let clock = FakeClock::new(reading(100));
+        let frame = b"\x30\x05\x00\x01t\0\xff";
+        let mut bytes = frame.to_vec();
+        assert_eq!(prepare_expiry(&mut bytes, expiry, &clock), Ok(()));
+        assert_eq!(bytes, frame);
+        clock.set(reading(expiry.expiry.deadline().unwrap()));
+        assert_eq!(
+            prepare_expiry(&mut bytes, expiry, &clock),
+            Err(WriteFailure::NotStarted(MessageExpiryBlock::Expired)),
+        );
+        assert_eq!(bytes, frame);
+    }
+
+    #[test]
     fn a_bad_expiry_value_offset_closes_without_touching_socket_bytes() {
         let (mut bytes, mut expiry) = timed_frame();
-        expiry.value_offset = usize::MAX;
+        expiry.value_offset = Some(usize::MAX);
         assert_eq!(
             write_attempts(
                 &mut bytes,
@@ -1153,7 +1181,7 @@ mod tests {
             Some(2),
         )
         .unwrap();
-        expiry.value_offset = encoded.expiry_value_offset.unwrap();
+        expiry.value_offset = encoded.expiry_value_offset;
         let bytes = encoded.bytes;
         let expected = bytes.clone();
         connection

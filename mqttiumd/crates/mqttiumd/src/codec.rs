@@ -1,10 +1,36 @@
-//! Bounded MQTT5 framing and validation for the documented product profile.
+//! Bounded MQTT framing and validation for the documented product profiles.
 
 use mqttiumd_contract::ids::{InboundPacketId, OutboundPacketId};
-use mqttiumd_contract::packet::{AckReason, InboundPacket, OutboundFrame, Qos, SharedBytes};
+use mqttiumd_contract::packet::{
+    AckReason, InboundPacket, OutboundFrame, PubackReason, Qos, SharedBytes,
+};
 use mqttiumd_contract::pubsub::{FilterList, MAX_FILTERS, SubscriptionFilter, SubscriptionOptions};
 use mqttiumd_contract::session::SessionExpiry;
 use mqttiumd_contract::will::{MAX_WILL_PAYLOAD_BYTES, MAX_WILL_TOPIC_BYTES, WillSpec};
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Version {
+    V311 = 4,
+    #[default]
+    V5 = 5,
+}
+
+impl Version {
+    pub const fn level(self) -> u8 {
+        self as u8
+    }
+}
+
+/// The common protocol name identifies the CONNECT envelope. A level other
+/// than 4 or 5 uses the legacy Unsupported Protocol Version return code.
+pub fn connect_response_version(body: &[u8]) -> Option<Version> {
+    let level = *body.strip_prefix(b"\0\x04MQTT")?.first()?;
+    Some(if level == 5 {
+        Version::V5
+    } else {
+        Version::V311
+    })
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Bounds {
@@ -24,6 +50,7 @@ pub struct Header {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Connect {
+    pub version: Version,
     pub will: Option<WillSpec>,
     pub client_id: SharedBytes,
     pub clean_start: bool,
@@ -486,25 +513,33 @@ fn client_connect(body: &[u8], bounds: Bounds) -> Result<Packet, Error> {
     if input.string()? != b"MQTT" {
         return Err(malformed("InvalidProtocolName"));
     }
-    if input.byte()? != 5 {
-        return Err(Error {
-            reason: 0x84,
-            ..unsupported("UnsupportedProtocolVersion")
-        });
-    }
+    let version = match input.byte()? {
+        4 => Version::V311,
+        5 => Version::V5,
+        _ => {
+            return Err(Error {
+                reason: 0x84,
+                peer_maximum: Some(u32::MAX),
+                ..unsupported("UnsupportedProtocolVersion")
+            });
+        }
+    };
     let flags = input.byte()?;
     if flags & 1 != 0 {
         return Err(malformed("ReservedConnectFlag"));
+    }
+    if version == Version::V311 && flags & 0xc0 == 0x40 {
+        return Err(malformed("PasswordWithoutUsername"));
     }
     let will = flags & 4 != 0;
     if (!will && flags & 0x38 != 0) || (will && (flags >> 3) & 3 == 3) {
         return Err(protocol("InvalidWillFlags"));
     }
     let keep_alive = input.u16()?;
-    let props = properties(&mut input, Context::Connect)?;
+    let props = versioned_properties(version, &mut input, Context::Connect)?;
     let client_id = input.string()?;
     let will_fields = if will {
-        let will_properties = properties(&mut input, Context::Will)?;
+        let will_properties = versioned_properties(version, &mut input, Context::Will)?;
         let will_topic = input.string()?;
         topic(will_topic)?;
         let will_payload = input.binary()?;
@@ -529,7 +564,19 @@ fn client_connect(body: &[u8], bounds: Bounds) -> Result<Packet, Error> {
             ..unsupported("ExplicitClientIdRequired")
         });
     }
-    let expiry = SessionExpiry::from_wire(props.expiry.unwrap_or(0));
+    let clean_start = flags & 2 != 0;
+    let expiry = if version == Version::V311 && !clean_start {
+        Some(SessionExpiry::Never)
+    } else {
+        SessionExpiry::from_wire(props.expiry.unwrap_or(0))
+    };
+    if version == Version::V311 && flags & 0xc0 != 0 {
+        return Err(Error {
+            reason: 0x86,
+            peer_maximum,
+            ..unsupported("CredentialsOutsideProfile")
+        });
+    }
     let will_outside_profile = will_fields.as_ref().is_some_and(|(_, _, properties)| {
         ((flags >> 3) & 3) != 1
             || properties.will_delay.is_some_and(|delay| delay != 0)
@@ -566,6 +613,7 @@ fn client_connect(body: &[u8], bounds: Bounds) -> Result<Packet, Error> {
     }
     let client_id = SharedBytes::copy_from(client_id, bounds.max_client_id).map_err(|_| Error {
         peer_maximum,
+        reason: if version == Version::V311 { 0x85 } else { 0x95 },
         ..oversized("ClientIdTooLarge")
     })?;
     let will = will_fields
@@ -589,9 +637,10 @@ fn client_connect(body: &[u8], bounds: Bounds) -> Result<Packet, Error> {
         })
         .transpose()?;
     Ok(Packet::Connect(Connect {
+        version,
         will,
         client_id,
-        clean_start: flags & 2 != 0,
+        clean_start,
         expiry: expiry.ok_or_else(|| unsupported("SessionExpiryOutsideProfile"))?,
         keep_alive,
         max_packet_size: props.max_packet.unwrap_or(u32::MAX),
@@ -605,16 +654,31 @@ fn identifier(input: &mut Cursor<'_>) -> Result<InboundPacketId, Error> {
     InboundPacketId::new(input.u16()?).ok_or_else(|| protocol("ZeroPacketIdentifier"))
 }
 
-fn publish(first: u8, body: &[u8], bounds: Bounds) -> Result<Packet, Error> {
+fn versioned_properties(
+    version: Version,
+    input: &mut Cursor<'_>,
+    context: Context,
+) -> Result<Properties, Error> {
+    if version == Version::V5 {
+        properties(input, context)
+    } else {
+        Ok(Properties::default())
+    }
+}
+
+fn publish(version: Version, first: u8, body: &[u8], bounds: Bounds) -> Result<Packet, Error> {
     let mut input = Cursor::new(body);
     let topic_bytes = input.string()?;
     let qos = Qos::from_wire((first >> 1) & 3).ok_or_else(|| malformed("InvalidQos"))?;
+    if version == Version::V311 && qos == Qos::ExactlyOnce {
+        return Err(unsupported("Qos2OutsideLegacyProfile"));
+    }
     let packet_id = if qos == Qos::AtMostOnce {
         None
     } else {
         Some(identifier(&mut input)?)
     };
-    let props = properties(&mut input, Context::Publish)?;
+    let props = versioned_properties(version, &mut input, Context::Publish)?;
     topic(topic_bytes)?;
     let payload = input.take(body.len() - input.at)?;
     if props.unsupported {
@@ -699,10 +763,28 @@ fn disconnect(body: &[u8]) -> Result<Packet, Error> {
 
 /// A refused establishment has no session key and never advertises SP1.
 pub fn session_refusal(reason: u8) -> Result<Vec<u8>, Error> {
+    session_refusal_for(Version::V5, reason)
+}
+
+pub fn session_refusal_for(version: Version, reason: u8) -> Result<Vec<u8>, Error> {
     if !matches!(reason, 0x80 | 0x82 | 0x83 | 0x87 | 0x89 | 0x97) {
         return Err(protocol("InvalidConnackRefusal"));
     }
-    Ok(vec![0x20, 3, 0, reason, 0])
+    Ok(match version {
+        Version::V5 => vec![0x20, 3, 0, reason, 0],
+        Version::V311 => legacy_connack_refusal(reason),
+    })
+}
+
+fn legacy_connack_refusal(reason: u8) -> Vec<u8> {
+    let code = match reason {
+        0x84 => 1, // Unacceptable protocol version.
+        0x85 => 2, // Identifier rejected.
+        0x86 => 4, // Bad username or password.
+        0x87 => 5, // Not authorized.
+        _ => 3,    // Server unavailable.
+    };
+    vec![0x20, 2, 0, code]
 }
 
 /// The lifecycle runtime uses this bounded control frame before physical close.
@@ -710,10 +792,16 @@ pub fn disconnect_reason(reason: u8) -> Vec<u8> {
     vec![0xe0, 2, reason, 0]
 }
 
-fn subscribe(body: &[u8], unsubscribe: bool, bounds: Bounds) -> Result<Packet, Error> {
+fn subscribe(
+    version: Version,
+    body: &[u8],
+    unsubscribe: bool,
+    bounds: Bounds,
+) -> Result<Packet, Error> {
     let mut input = Cursor::new(body);
     let packet_id = identifier(&mut input)?;
-    let props = properties(
+    let props = versioned_properties(
+        version,
         &mut input,
         if unsubscribe {
             Context::Unsubscribe
@@ -739,7 +827,8 @@ fn subscribe(body: &[u8], unsubscribe: bool, bounds: Bounds) -> Result<Packet, E
         let mut subscription_options = SubscriptionOptions::DEFAULT;
         if !unsubscribe {
             let options = input.byte()?;
-            if options & 0xc0 != 0
+            if (version == Version::V311 && options & !3 != 0)
+                || options & 0xc0 != 0
                 || options & 3 == 3
                 || (options >> 4) & 3 == 3
                 || (shared && options & 4 != 0)
@@ -784,10 +873,17 @@ fn subscribe(body: &[u8], unsubscribe: bool, bounds: Bounds) -> Result<Packet, E
     }
 }
 
-fn puback(body: &[u8]) -> Result<Packet, Error> {
+fn puback(version: Version, body: &[u8]) -> Result<Packet, Error> {
     let mut input = Cursor::new(body);
     let packet_id =
         OutboundPacketId::new(input.u16()?).ok_or_else(|| protocol("ZeroPacketIdentifier"))?;
+    if version == Version::V311 {
+        input.end()?;
+        return Ok(Packet::Core(InboundPacket::Puback {
+            packet_id,
+            reason: 0,
+        }));
+    }
     let reason = if input.is_empty() { 0 } else { input.byte()? };
     if !matches!(
         reason,
@@ -805,6 +901,15 @@ fn puback(body: &[u8]) -> Result<Packet, Error> {
 /// Decode a complete packet body. No application-owned bytes are copied
 /// until field and profile validation have completed.
 pub fn decode(first: u8, body: &[u8], bounds: Bounds) -> Result<Packet, Error> {
+    decode_for(Version::V5, first, body, bounds)
+}
+
+pub fn decode_for(
+    version: Version,
+    first: u8,
+    body: &[u8],
+    bounds: Bounds,
+) -> Result<Packet, Error> {
     flags(first)?;
     if body.len() > 268_435_455 {
         return Err(oversized("PacketTooLarge"));
@@ -827,15 +932,16 @@ pub fn decode(first: u8, body: &[u8], bounds: Bounds) -> Result<Packet, Error> {
     }
     match first >> 4 {
         1 => client_connect(body, bounds),
-        3 => publish(first, body, bounds),
-        4 => puback(body),
-        6 => pubrel(body),
-        8 => subscribe(body, false, bounds),
-        10 => subscribe(body, true, bounds),
+        3 => publish(version, first, body, bounds),
+        4 => puback(version, body),
+        6 if version == Version::V5 => pubrel(body),
+        8 => subscribe(version, body, false, bounds),
+        10 => subscribe(version, body, true, bounds),
         12 if body.is_empty() => Ok(Packet::Core(InboundPacket::Pingreq)),
         12 => Err(malformed("PingreqPayload")),
+        14 if version == Version::V311 && !body.is_empty() => Err(malformed("DisconnectPayload")),
         14 => disconnect(body),
-        15 => {
+        15 if version == Version::V5 => {
             let mut input = Cursor::new(body);
             let reason = if input.is_empty() { 0 } else { input.byte()? };
             if !matches!(reason, 0 | 0x18 | 0x19) {
@@ -942,6 +1048,53 @@ pub fn encode(frame: OutboundFrame) -> Result<Vec<u8>, Error> {
     }
 }
 
+pub fn encode_for(version: Version, frame: OutboundFrame) -> Result<Vec<u8>, Error> {
+    if version == Version::V5 {
+        return encode(frame);
+    }
+    match frame {
+        OutboundFrame::Connack { session_present } => {
+            Ok(vec![0x20, 2, u8::from(session_present), 0])
+        }
+        OutboundFrame::Puback {
+            reason: PubackReason::Success,
+            ..
+        }
+        | OutboundFrame::Pingresp => encode(frame),
+        OutboundFrame::Suback { packet_id, results } => {
+            let codes = results
+                .as_slice()
+                .filter(|codes| !codes.is_empty())
+                .ok_or_else(|| protocol("InvalidFilterResults"))?;
+            let [high, low] = packet_id.get().to_be_bytes();
+            let mut bytes = vec![0x90, (2 + codes.len()) as u8, high, low];
+            bytes.extend(
+                codes
+                    .iter()
+                    .map(|&code| if code <= 2 { code } else { 0x80 }),
+            );
+            Ok(bytes)
+        }
+        OutboundFrame::Unsuback { packet_id, results }
+            if results.as_slice().is_some_and(|codes| {
+                !codes.is_empty() && codes.iter().all(|code| matches!(code, 0 | 0x11))
+            }) =>
+        {
+            let [high, low] = packet_id.get().to_be_bytes();
+            Ok(vec![0xb0, 2, high, low])
+        }
+        _ => Err(unsupported("AckNotEncodableInMqtt311")),
+    }
+}
+
+pub fn refusal_for(version: Version, error: Error, before_connack: bool) -> Option<Vec<u8>> {
+    match version {
+        Version::V5 => Some(refusal(error, before_connack)),
+        Version::V311 if before_connack => Some(legacy_connack_refusal(error.reason)),
+        Version::V311 => None,
+    }
+}
+
 pub fn refusal(error: Error, before_connack: bool) -> Vec<u8> {
     let reason = if error.reason >= 0x80 {
         error.reason
@@ -996,7 +1149,17 @@ pub fn encode_qos0_expiring(
     retain: bool,
     remaining: Option<u32>,
 ) -> Result<EncodedPublish, Error> {
-    encode_publication(None, topic, payload, false, retain, remaining)
+    encode_qos0_for(Version::V5, topic, payload, retain, remaining)
+}
+
+pub fn encode_qos0_for(
+    version: Version,
+    topic: &SharedBytes,
+    payload: &SharedBytes,
+    retain: bool,
+    remaining: Option<u32>,
+) -> Result<EncodedPublish, Error> {
+    encode_publication(version, None, topic, payload, false, retain, remaining)
 }
 
 #[cfg(any(test, feature = "test-hooks"))]
@@ -1027,10 +1190,39 @@ pub fn encode_publish_expiring(
     retain: bool,
     remaining: Option<u32>,
 ) -> Result<EncodedPublish, Error> {
-    encode_publication(Some(packet_id), topic_name, payload, dup, retain, remaining)
+    encode_publish_for(
+        Version::V5,
+        packet_id,
+        topic_name,
+        payload,
+        dup,
+        retain,
+        remaining,
+    )
+}
+
+pub fn encode_publish_for(
+    version: Version,
+    packet_id: OutboundPacketId,
+    topic_name: &SharedBytes,
+    payload: &SharedBytes,
+    dup: bool,
+    retain: bool,
+    remaining: Option<u32>,
+) -> Result<EncodedPublish, Error> {
+    encode_publication(
+        version,
+        Some(packet_id),
+        topic_name,
+        payload,
+        dup,
+        retain,
+        remaining,
+    )
 }
 
 fn encode_publication(
+    version: Version,
     packet_id: Option<OutboundPacketId>,
     topic_name: &SharedBytes,
     payload: &SharedBytes,
@@ -1042,10 +1234,19 @@ fn encode_publication(
     if topic_name.len() > 1024 || payload.len() > 32768 {
         return Err(oversized("OutgoingFieldTooLarge"));
     }
+    let remaining = if version == Version::V5 {
+        remaining
+    } else {
+        None
+    };
     let body = topic_name
         .len()
         .checked_add(payload.len())
-        .and_then(|n| n.checked_add(if packet_id.is_some() { 5 } else { 3 }))
+        .and_then(|n| {
+            n.checked_add(
+                2 + if packet_id.is_some() { 2 } else { 0 } + usize::from(version == Version::V5),
+            )
+        })
         .and_then(|n| n.checked_add(if remaining.is_some() { 5 } else { 0 }))
         .ok_or_else(|| oversized("PacketTooLarge"))?;
     let length_bytes = if body < 128 {
@@ -1093,7 +1294,9 @@ fn encode_publication(
         bytes.extend_from_slice(&remaining.to_be_bytes());
         Some(offset)
     } else {
-        bytes.push(0);
+        if version == Version::V5 {
+            bytes.push(0);
+        }
         None
     };
     bytes.extend_from_slice(payload.as_slice());

@@ -7109,6 +7109,7 @@ mod tests {
 
     fn work_item(index: u32) -> crate::contract::pubsub::WorkItem {
         crate::contract::pubsub::WorkItem {
+            cause: DeliveryCause::LiveExact,
             expiry: None,
             retain: false,
             delivery: DeliveryId {

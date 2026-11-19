@@ -1,7 +1,7 @@
 //! One bounded owner reactor, independent socket tasks and a single SQLite writer.
 use crate::session_time::{SessionClock, logical_now};
 use crate::{
-    codec::{self, Bounds, Packet},
+    codec::{self, Bounds, Packet, Version},
     events::{Events, operation},
     net,
     receiving::Terminal,
@@ -9,7 +9,7 @@ use crate::{
     writer::{ControlRequest, ControlResponse, Failure, Hooks, Request, Response, Session, Writer},
 };
 use mqttiumd_contract::capacity::{BoundedVec, PayloadBytes, Resource, WakeCondition, WorkUnits};
-use mqttiumd_contract::command::Recipe;
+use mqttiumd_contract::command::{DeliveryCause, Recipe};
 use mqttiumd_contract::effects::{
     CloseReason, Effect, EffectSink, FrameProgress, Input, OwnedEffect, OwnerAuthority,
     RecoveredFact, SubmitBlock, SubmitResult,
@@ -21,7 +21,9 @@ use mqttiumd_contract::ids::{
 use mqttiumd_contract::message_expiry::{MessageExpiry, MessageTime};
 use mqttiumd_contract::outcome::{CommitFacts, StoreOutcome, StoreReply};
 use mqttiumd_contract::packet::{InboundPacket, OutboundFrame};
-use mqttiumd_contract::pubsub::{PubackTarget, Qos0DropReason, Qos0Origin};
+use mqttiumd_contract::pubsub::{
+    FilterResults, MAX_FILTERS, PubackTarget, Qos0DropReason, Qos0Origin,
+};
 use mqttiumd_contract::receipts::{
     ClosedReceiptCollection, ClosedReceiptReply, ReceiptCollectionReply,
 };
@@ -100,6 +102,7 @@ struct Peer {
     created: Instant,
     last_packet: Instant,
     connected: bool,
+    version: Option<Version>,
     session: Option<SessionId>,
     opened_by: Option<OperationId>,
     will_managed: bool,
@@ -532,6 +535,7 @@ impl Runtime<'_> {
                 created: Instant::now(),
                 last_packet: Instant::now(),
                 connected: false,
+                version: None,
                 session: None,
                 opened_by: None,
                 will_managed: false,
@@ -2176,6 +2180,12 @@ impl Runtime<'_> {
         generation: ConnectionGeneration,
         connect: codec::Connect,
     ) -> Result<(), Failure> {
+        if let Some(peer) = self.peers.get_mut(&generation) {
+            if peer.version.is_some() {
+                return self.close(generation, "second_connect");
+            }
+            peer.version = Some(connect.version);
+        }
         if let Some(security) = &self.security {
             let principal = self
                 .peers
@@ -2190,6 +2200,7 @@ impl Runtime<'_> {
                     generation,
                     "client_id",
                     Some(connect.max_packet_size as usize),
+                    None,
                 );
             }
             if let Some(will) = &connect.will
@@ -2203,10 +2214,11 @@ impl Runtime<'_> {
                     generation,
                     "will",
                     Some(connect.max_packet_size as usize),
+                    None,
                 );
             }
         }
-        self.events.emit("connect_validated",json!({"connection":generation.get().to_string(),"details":{"keep_alive":connect.keep_alive,"max_packet_size":connect.max_packet_size,"receive_maximum":connect.receive_maximum,"topic_alias_maximum":connect.topic_alias_maximum,"request_problem_information":connect.request_problem_information,"clean_start":connect.clean_start,"expiry":expiry_json(connect.expiry)}})).map_err(event_failure)?;
+        self.events.emit("connect_validated",json!({"connection":generation.get().to_string(),"details":{"protocol_level":connect.version.level(),"keep_alive":connect.keep_alive,"max_packet_size":connect.max_packet_size,"receive_maximum":connect.receive_maximum,"topic_alias_maximum":connect.topic_alias_maximum,"request_problem_information":connect.request_problem_information,"clean_start":connect.clean_start,"expiry":expiry_json(connect.expiry)}})).map_err(event_failure)?;
         if let Some(p) = self.peers.get_mut(&generation) {
             if p.connected || p.pending {
                 return self.close(generation, "second_connect");
@@ -2272,6 +2284,9 @@ impl Runtime<'_> {
     fn start_takeover(&mut self, old: ConnectionGeneration) -> Result<(), Failure> {
         // The old transport closes before the new Will/Open can be accepted.
         if let Some(peer) = self.peers.get_mut(&old) {
+            if peer.version == Some(Version::V311) {
+                return self.close(old, "session_taken_over");
+            }
             let bytes = codec::disconnect_reason(0x8e);
             if peer
                 .io
@@ -2373,6 +2388,7 @@ impl Runtime<'_> {
         generation: ConnectionGeneration,
         stage: &'static str,
         before_connack: Option<usize>,
+        packet: Option<&InboundPacket>,
     ) -> Result<(), Failure> {
         self.events
             .emit(
@@ -2382,13 +2398,46 @@ impl Runtime<'_> {
             )
             .map_err(event_failure)?;
         if let Some(peer) = self.peers.get_mut(&generation) {
+            let version = peer.version.unwrap_or_default();
+            if version == Version::V311
+                && peer.connected
+                && let Some(InboundPacket::Subscribe { packet_id, filters }) = packet
+            {
+                let results = FilterResults::new(&[0x80; MAX_FILTERS][..filters.len()])
+                    .map_err(|_| Failure::plain("subscription_refusal_size"))?;
+                let bytes = codec::encode_for(
+                    version,
+                    OutboundFrame::Suback {
+                        packet_id: *packet_id,
+                        results,
+                    },
+                )
+                .map_err(|_| Failure::plain("subscription_refusal_codec"))?;
+                if peer
+                    .io
+                    .outgoing
+                    .try_send(net::Write {
+                        correlation: None,
+                        bytes,
+                        expiry: None,
+                    })
+                    .is_ok()
+                {
+                    return Ok(());
+                }
+            }
             let bytes = if before_connack.is_some() {
-                codec::session_refusal(0x87)
-                    .map_err(|_| Failure::plain("connack_authorization_reason"))?
+                Some(
+                    codec::session_refusal_for(version, 0x87)
+                        .map_err(|_| Failure::plain("connack_authorization_reason"))?,
+                )
+            } else if version == Version::V5 {
+                Some(codec::disconnect_reason(0x87))
             } else {
-                codec::disconnect_reason(0x87)
+                None
             };
-            if bytes.len() <= before_connack.unwrap_or(peer.max_packet)
+            if let Some(bytes) = bytes
+                && bytes.len() <= before_connack.unwrap_or(peer.max_packet)
                 && peer
                     .io
                     .outgoing
@@ -2417,7 +2466,11 @@ impl Runtime<'_> {
             return Ok(());
         }
         self.wire_progress(generation)?;
-        let decoded = match codec::decode(first, &body, BOUNDS) {
+        let version = self.peers.get(&generation).and_then(|peer| peer.version);
+        if first >> 4 == 1 && version.is_some() {
+            return self.close(generation, "second_connect");
+        }
+        let decoded = match codec::decode_for(version.unwrap_or_default(), first, &body, BOUNDS) {
             Ok(v) => v,
             Err(error) => {
                 let error = self
@@ -2432,21 +2485,28 @@ impl Runtime<'_> {
                     } else {
                         error.peer_maximum()
                     };
-                    if let Some(cap) = cap {
-                        let bytes = codec::refusal(error, !p.connected);
-                        if bytes.len() <= cap as usize
-                            && p.io
-                                .outgoing
-                                .try_send(net::Write {
-                                    expiry: None,
-                                    correlation: None,
-                                    bytes,
-                                })
-                                .is_ok()
-                        {
-                            p.closing = Some(("packet_refused", Instant::now()));
-                            return Ok(());
-                        }
+                    let response_version = version
+                        .or_else(|| {
+                            (first >> 4 == 1)
+                                .then(|| codec::connect_response_version(&body))
+                                .flatten()
+                        })
+                        .unwrap_or_default();
+                    if let Some(cap) = cap
+                        && let Some(bytes) =
+                            codec::refusal_for(response_version, error, !p.connected)
+                        && bytes.len() <= cap as usize
+                        && p.io
+                            .outgoing
+                            .try_send(net::Write {
+                                expiry: None,
+                                correlation: None,
+                                bytes,
+                            })
+                            .is_ok()
+                    {
+                        p.closing = Some(("packet_refused", Instant::now()));
+                        return Ok(());
                     }
                 }
                 return self.close(generation, "packet_refused");
@@ -2466,7 +2526,7 @@ impl Runtime<'_> {
                 InboundPacket::Unsubscribe { .. } => "unsubscribe",
                 _ => return self.close(generation, "tls_principal_missing"),
             };
-            return self.authorization_refusal(generation, stage, None);
+            return self.authorization_refusal(generation, stage, None, Some(packet));
         }
         let decoded = match decoded {
             Packet::TimedPublish {
@@ -3593,7 +3653,10 @@ impl EffectSink for Sink<'_> {
                 let generation = *connection;
                 let reason = *reason;
                 if let Some(peer) = self.peers.get_mut(&generation) {
-                    let bytes = match codec::session_refusal(reason) {
+                    let bytes = match codec::session_refusal_for(
+                        peer.version.unwrap_or_default(),
+                        reason,
+                    ) {
                         Ok(bytes) => bytes,
                         Err(_) => {
                             self.error = Some(Failure::plain("invalid_session_refusal"));
@@ -3635,6 +3698,7 @@ impl EffectSink for Sink<'_> {
                 expiry,
                 connection,
                 origin,
+                cause,
                 retain,
                 topic,
                 payload,
@@ -3673,20 +3737,21 @@ impl EffectSink for Sink<'_> {
                     p.closing.is_none()
                         && self.bindings.get(&connection.session) == Some(&generation)
                 }) {
-                    match codec::encode_qos0_expiring(
+                    let version = peer.version.unwrap_or_default();
+                    match codec::encode_qos0_for(
+                        version,
                         topic,
                         payload,
-                        *retain,
+                        *retain
+                            && (version == Version::V5 || *cause == DeliveryCause::RetainedReplay),
                         expiry.map(|value| value.interval),
                     ) {
                         Ok(encoded) if encoded.bytes.len() <= peer.max_packet => {
-                            let write_expiry = (*expiry).zip(encoded.expiry_value_offset).map(
-                                |(expiry, value_offset)| net::WriteExpiry {
-                                    expiry,
-                                    value_offset,
-                                    started: false,
-                                },
-                            );
+                            let write_expiry = expiry.map(|expiry| net::WriteExpiry {
+                                expiry,
+                                value_offset: encoded.expiry_value_offset,
+                                started: false,
+                            });
                             let bytes = encoded.bytes;
                             #[cfg(feature = "test-hooks")]
                             let duplicate = if MUTANT_REPLAY_QOS0
@@ -3969,8 +4034,23 @@ impl EffectSink for Sink<'_> {
                     });
                     return SubmitResult::Accepted;
                 };
-                let bytes = match codec::encode(frame) {
+                let bytes = match codec::encode_for(peer.version.unwrap_or_default(), frame) {
                     Ok(bytes) if bytes.len() <= peer.max_packet => bytes,
+                    Err(error) if error.code() == "AckNotEncodableInMqtt311" => {
+                        let code = if matches!(
+                            frame,
+                            OutboundFrame::Puback {
+                                reason: mqttiumd_contract::packet::PubackReason::QuotaExceeded,
+                                ..
+                            }
+                        ) {
+                            "capacity_exceeded"
+                        } else {
+                            "failure_without_wire_ack"
+                        };
+                        self.close.push((generation, code));
+                        return refused(effect, SubmitBlock::Closed);
+                    }
                     _ => {
                         self.close.push((generation, "outgoing_queue_full"));
                         return refused(effect, SubmitBlock::Closed);
@@ -4033,7 +4113,7 @@ impl EffectSink for Sink<'_> {
                 {
                     if peer.closing.is_some() {
                         flushing = true;
-                    } else {
+                    } else if peer.version != Some(Version::V311) {
                         let bytes = codec::disconnect_reason(0x8e);
                         if bytes.len() <= peer.max_packet
                             && peer
@@ -4156,6 +4236,7 @@ impl EffectSink for Sink<'_> {
                 started,
                 connection,
                 delivery,
+                cause,
                 packet_id,
                 claim,
                 topic,
@@ -4209,7 +4290,11 @@ impl EffectSink for Sink<'_> {
                     });
                     return SubmitResult::Accepted;
                 };
-                let encoded = match codec::encode_publish_expiring(
+                let version = peer.version.unwrap_or_default();
+                let retain =
+                    retain && (version == Version::V5 || *cause == DeliveryCause::RetainedReplay);
+                let encoded = match codec::encode_publish_for(
+                    version,
                     packet_id,
                     topic,
                     payload,
@@ -4223,14 +4308,11 @@ impl EffectSink for Sink<'_> {
                         return refused(effect, SubmitBlock::Closed);
                     }
                 };
-                let write_expiry =
-                    (*expiry)
-                        .zip(encoded.expiry_value_offset)
-                        .map(|(expiry, value_offset)| net::WriteExpiry {
-                            expiry,
-                            value_offset,
-                            started: *started,
-                        });
+                let write_expiry = expiry.map(|expiry| net::WriteExpiry {
+                    expiry,
+                    value_offset: encoded.expiry_value_offset,
+                    started: *started,
+                });
                 let bytes = encoded.bytes;
                 let binding_key = (connection, packet_id);
                 let binding = PubackTarget {

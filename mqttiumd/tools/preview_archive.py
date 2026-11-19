@@ -20,6 +20,7 @@ import tarfile
 MIB = 1024**2
 ELF_MACHINES = {62: "x86_64", 183: "aarch64"}
 RESTART_FORMAT = "mqttiumd.durable-restart.preview.v1"
+MQTT311_FORMAT = "mqttiumd.mqtt311.preview.v1"
 RESTART_SPACE = 128 * MIB
 
 
@@ -110,11 +111,13 @@ def archive_metadata(package, root):
             or build["profile"] != "release" or build["instrumented"] is not False or build["features"] != []
             or build["build_options"] != ["--release", "--locked", "--no-default-features", "-p", "mqttiumd"]):
         raise ValueError("archive_binary_identity_mismatch")
-    if seal["format"] == RESTART_FORMAT:
+    if seal["format"] in (RESTART_FORMAT, MQTT311_FORMAT):
         if (build["elf"]["machine"] != machine or seal["machine"] != machine
                 or seal["reception"]["binary_sha256"] != fingerprint
                 or seal["reception"]["status"] != "separate_receipt"):
             raise ValueError("archive_reception_identity_mismatch")
+        if seal["format"] == MQTT311_FORMAT and build.get("mqtt_protocol_levels") != [4, 5]:
+            raise ValueError("archive_mqtt_protocol_profile_mismatch")
     elif seal["format"] != "mqttiumd.prepilot.package.v1":
         raise ValueError("unsupported_preview_format")
     return build, seal

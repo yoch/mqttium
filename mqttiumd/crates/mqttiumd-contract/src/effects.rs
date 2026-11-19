@@ -412,6 +412,7 @@ pub enum Effect {
     EmitQos0 {
         connection: ConnectionKey,
         origin: Qos0Origin,
+        cause: crate::command::DeliveryCause,
         retain: bool,
         expiry: Option<MessageExpiry>,
         topic: SharedBytes,
@@ -437,6 +438,7 @@ pub enum Effect {
     EmitPublish {
         connection: ConnectionKey,
         delivery: DeliveryId,
+        cause: crate::command::DeliveryCause,
         packet_id: OutboundPacketId,
         claim: OperationId,
         topic: SharedBytes,

@@ -13,7 +13,7 @@ import subprocess
 import tarfile
 import tempfile
 
-from preview_archive import RESTART_FORMAT, digest, elf_record
+from preview_archive import MQTT311_FORMAT, RESTART_FORMAT, digest, elf_record
 
 
 def command(*args: str, cwd: Path | None = None) -> str:
@@ -62,7 +62,7 @@ def copy_pilot_files(root: Path, package: Path) -> None:
                 modules.extend(alias.name for alias in node.names)
 
 
-def build(out: Path, target: Path) -> Path:
+def build(out: Path, target: Path, *, mqtt311: bool = False) -> Path:
     caller = Path(__file__).resolve().parents[2]
     if out.exists():
         raise ValueError("output directory must be new")
@@ -75,7 +75,7 @@ def build(out: Path, target: Path) -> Path:
         pin = Path(temporary) / "source"
         command("git", "worktree", "add", "--detach", str(pin), source, cwd=caller)
         try:
-            return build_pinned(out, target, pin / "mqttiumd", source)
+            return build_pinned(out, target, pin / "mqttiumd", source, mqtt311=mqtt311)
         finally:
             command("git", "worktree", "remove", "--force", str(pin), cwd=caller)
 
@@ -93,7 +93,7 @@ def copy_restart_files(package: Path, packager: Path) -> None:
 
 
 def build_pinned(out: Path, target: Path, root: Path, source: str, *,
-                 restart_packager: tuple[Path, str] | None = None) -> Path:
+                 restart_packager: tuple[Path, str] | None = None, mqtt311: bool = False) -> Path:
     repo = root.parent
     out.mkdir(parents=True)
     env = dict(os.environ, CARGO_INCREMENTAL="0")
@@ -108,17 +108,25 @@ def build_pinned(out: Path, target: Path, root: Path, source: str, *,
     binary = target / "release/mqttiumd"
     machine = platform.machine()
     name = f"mqttiumd-preview-{source[:8]}-{machine}-linux"
-    if restart_packager:
-        packager, revision = restart_packager
+    if restart_packager or mqtt311:
+        packager, revision = restart_packager or (root, source)
         elf = elf_record(binary)
         if platform.system() != "Linux" or elf["machine"] != machine:
-            raise ValueError("restart_preview_requires_native_build")
-        name = f"mqttiumd-restart-preview-{source[:8]}-{revision[:8]}-{machine}-linux"
+            raise ValueError("preview_requires_native_linux_build")
+        if mqtt311:
+            name = f"mqttiumd-mqtt311-preview-{source[:8]}-{machine}-linux"
+        else:
+            name = f"mqttiumd-restart-preview-{source[:8]}-{revision[:8]}-{machine}-linux"
     package = out / name
     package.mkdir()
     shutil.copy2(binary, package / "mqttiumd")
     if restart_packager:
         copy_restart_files(package, packager)
+    elif mqtt311:
+        shutil.copy2(root / "preview/MQTT311.md", package / "README.md")
+        for name in ("start-tls.sh", "demo-pki.py", "mqtt311-demo.py", "build-mosquitto-reference.sh"):
+            shutil.copy2(root / "preview" / name, package / name)
+        (package / "requirements.txt").write_text("mqttium==1.3.0\npaho-mqtt==2.1.0\n")
     else:
         for name in ("README.md", "start.sh", "demo.sh", "expiry-demo.sh", "will-demo.sh",
                      "SECURE.md", "start-tls.sh", "secure-demo.sh", "demo-pki.py", "identities.example.json",
@@ -188,15 +196,18 @@ def build_pinned(out: Path, target: Path, root: Path, source: str, *,
         "execution_verification": "Separate extraction receipt names this exact archive hash",
         "execution_receipt": "See the separately identified archive extraction smoke and Will/Message Expiry/retained receptions.",
     }
-    if restart_packager:
+    if restart_packager or mqtt311:
         build_record["elf"] = elf
         build_record["lockfile_sha256"] = digest(root / "Cargo.lock")
-        build_record["execution_receipt"] = "Separate mTLS durable restart receipt for this archive"
+        scope = "loopback mTLS MQTT 3.1.1 and MQTT 5 interoperability" if mqtt311 else "one loopback mTLS restart"
+        build_record["execution_receipt"] = f"Separate reception for this archive covering {scope}"
+        if mqtt311:
+            build_record["mqtt_protocol_levels"] = [4, 5]
         seal = {
-            "format": RESTART_FORMAT, "machine": machine,
+            "format": MQTT311_FORMAT if mqtt311 else RESTART_FORMAT, "machine": machine,
             "broker_source_sha": source,
             "broker_binary_sha256": build_record["binary_sha256"], "package_source_sha": revision,
-            "reception": {"status": "separate_receipt", "scope": "one loopback mTLS restart",
+            "reception": {"status": "separate_receipt", "scope": scope,
                           "binary_sha256": build_record["binary_sha256"]},
         }
         (package / "PACKAGE.json").write_text(json.dumps(seal, indent=2) + "\n")
@@ -220,11 +231,14 @@ def main() -> None:
     parser.add_argument("--target-dir", type=Path, required=True)
     parser.add_argument("--restart-broker-root", type=Path, help="mqttiumd directory of a clean pinned checkout")
     parser.add_argument("--broker-source", help="exact broker commit for the restart preview")
+    parser.add_argument("--mqtt311", action="store_true", help="practical MQTT 3.1.1 and MQTT 5 preview")
     args = parser.parse_args()
     if (args.restart_broker_root is None) != (args.broker_source is None):
         parser.error("the restart preview needs both the broker checkout and its commit")
+    if args.mqtt311 and args.restart_broker_root is not None:
+        parser.error("choose either the MQTT 3.1.1 preview or the pinned restart preview")
     if args.restart_broker_root is None:
-        print(build(args.out.resolve(), args.target_dir.resolve()))
+        print(build(args.out.resolve(), args.target_dir.resolve(), mqtt311=args.mqtt311))
         return
     packager = Path(__file__).resolve().parents[1]
     broker_root = args.restart_broker_root.resolve()

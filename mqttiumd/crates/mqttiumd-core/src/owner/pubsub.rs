@@ -72,6 +72,7 @@ pub(super) struct Delivery {
     target: SessionId,
     revision: Revision,
     qos: Qos,
+    cause: DeliveryCause,
     retain: bool,
     expiry: Option<MessageExpiry>,
     claim: Option<DeliveryClaim>,
@@ -159,6 +160,7 @@ impl Delivery {
             target,
             revision,
             qos,
+            cause: DeliveryCause::LiveExact,
             retain: false,
             expiry: None,
             claim,
@@ -1128,6 +1130,7 @@ impl Owner {
         let effect = draft.emit(Effect::EmitQos0 {
             connection,
             origin: v.origin,
+            cause: DeliveryCause::LiveExact,
             retain: false,
             topic: v.topic.clone(),
             payload: v.payload.clone(),
@@ -1854,6 +1857,7 @@ impl Owner {
                 || item.topic.len() as u64 > u64::from(limits.max_topic_bytes)
                 || item.payload.len() as u64 > limits.max_payload_bytes.get()
                 || item.qos == Qos::ExactlyOnce
+                || (item.cause == DeliveryCause::RetainedReplay && !item.retain)
                 || (item.claim.is_some() && item.qos != Qos::AtLeastOnce)
                 || self.check_message_expiry(item.expiry).is_err()
                 || item
@@ -1890,7 +1894,8 @@ impl Owner {
                     || known.revision != item.target_revision
                     || known.qos != item.qos
                     || known.expiry != item.expiry
-                    || (known.topic.is_some() && known.retain != item.retain)
+                    || (known.topic.is_some()
+                        && (known.retain != item.retain || known.cause != item.cause))
                     || known
                         .topic
                         .as_ref()
@@ -2007,6 +2012,7 @@ impl Owner {
         let effect = draft.emit(Effect::EmitPublish {
             connection,
             delivery: delivery.id,
+            cause: delivery.cause,
             packet_id: claim.packet_id,
             claim: claim.operation,
             topic: topic.clone(),
@@ -2225,6 +2231,7 @@ impl Owner {
                             draft.emit(Effect::EmitQos0 {
                                 connection,
                                 origin,
+                                cause: d.cause,
                                 retain: d.retain,
                                 topic: topic.clone(),
                                 payload: payload.clone(),
@@ -2773,6 +2780,7 @@ impl Owner {
                         if let Some(i) = self.pubsub.delivery(item.delivery) {
                             let d = &mut self.pubsub.deliveries.as_mut_slice()[i];
                             if d.topic.is_none() {
+                                d.cause = item.cause;
                                 d.retain = item.retain;
                                 d.topic = Some(item.topic.clone());
                                 d.payload = Some(item.payload.clone());
@@ -2786,6 +2794,7 @@ impl Owner {
                                 item.claim,
                             );
                             d.expiry = item.expiry;
+                            d.cause = item.cause;
                             d.retain = item.retain;
                             d.topic = Some(item.topic.clone());
                             d.payload = Some(item.payload.clone());
@@ -4554,6 +4563,7 @@ mod tests {
                     })
                     .unwrap();
                 let item = WorkItem {
+                    cause: DeliveryCause::RetainedReplay,
                     expiry: None,
                     delivery: delivery(0),
                     target: TARGET,
@@ -4611,6 +4621,7 @@ mod tests {
             .unwrap();
         let held = &owner.pubsub.deliveries.as_slice()[0];
         let changed = WorkItem {
+            cause: DeliveryCause::LiveExact,
             expiry: None,
             delivery: held.id,
             target: held.target,
@@ -5370,6 +5381,7 @@ mod tests {
         // A frozen page produced before the sweep also carries its original
         // expiry. It cannot reacquire cache/payload capacity after the TTL.
         let stale = WorkItem {
+            cause: DeliveryCause::LiveExact,
             delivery: delivery(0),
             target: TARGET,
             target_revision: Revision::new(1),
@@ -5597,6 +5609,7 @@ mod tests {
             .find_map(|(id, e)| matches!(e, Effect::LoadWork { .. }).then_some(*id))
             .unwrap();
         let item = WorkItem {
+            cause: DeliveryCause::LiveExact,
             delivery: delivery(0),
             target: TARGET,
             target_revision: Revision::new(1),
@@ -5992,6 +6005,7 @@ mod tests {
                     .find_map(|(id, e)| matches!(e, Effect::LoadWork { .. }).then_some(*id))
                     .unwrap();
                 let item = WorkItem {
+                    cause: DeliveryCause::LiveExact,
                     delivery: delivery(0),
                     target: TARGET,
                     target_revision: Revision::new(1),

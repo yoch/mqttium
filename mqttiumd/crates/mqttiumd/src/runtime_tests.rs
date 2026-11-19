@@ -241,6 +241,7 @@ fn peer(runtime: &mut Runtime<'_>) -> (ConnectionGeneration, TcpStream) {
             created: Instant::now(),
             last_packet: Instant::now(),
             connected: false,
+            version: None,
             session: None,
             opened_by: None,
             will_managed: false,
@@ -264,6 +265,7 @@ fn peer(runtime: &mut Runtime<'_>) -> (ConnectionGeneration, TcpStream) {
 
 fn connect_packet(client: &[u8]) -> codec::Connect {
     codec::Connect {
+        version: codec::Version::V5,
         will: None,
         client_id: SharedBytes::copy_from(client, BOUNDS.max_client_id).unwrap(),
         clean_start: false,

@@ -416,12 +416,23 @@ impl Task {
         if encoded.offset == 0
             && let Some(expiry) = encoded.frame.expiry
         {
-            let position = expiry.value_offset;
-            let prior: [u8; 4] = encoded.frame.bytes[position..position + 4]
-                .try_into()
-                .map_err(|_| "output_expiry_offset")?;
+            let prior = expiry
+                .value_offset
+                .map(|at| {
+                    let end = at.checked_add(4).ok_or("output_expiry_offset")?;
+                    let bytes: [u8; 4] = encoded
+                        .frame
+                        .bytes
+                        .get(at..end)
+                        .ok_or("output_expiry_offset")?
+                        .try_into()
+                        .map_err(|_| "output_expiry_offset")?;
+                    Ok((at..end, bytes))
+                })
+                .transpose()?;
             match prepare_expiry(&mut encoded.frame.bytes, expiry, self.clock.as_ref()) {
-                Ok(()) if encoded.frame.bytes[position..position + 4] == prior => {}
+                Ok(())
+                    if prior.is_none_or(|(range, bytes)| encoded.frame.bytes[range] == bytes) => {}
                 Ok(()) => return Err("tls_expiry_value_aged"),
                 Err(WriteFailure::NotStarted(reason)) => {
                     if !report(
