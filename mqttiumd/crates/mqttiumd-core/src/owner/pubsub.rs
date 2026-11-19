@@ -1536,30 +1536,49 @@ impl Owner {
             InboundPacket::Subscribe {
                 filters, denied, ..
             } => {
+                let mut remaining = self.routes.capacity() - self.routes.len();
                 for item in filters.as_slice() {
                     if denied & (1 << len) != 0 {
                         codes[len] = 0x87;
                         len += 1;
                         continue;
                     }
-                    let allowed = crate::contract::topic::valid_filter(item.filter.as_slice());
-                    codes[len] = if allowed {
-                        item.qos.min(Qos::AtLeastOnce).to_wire()
-                    } else if item.filter.as_slice().starts_with(b"$share/") {
-                        0x9e
-                    } else {
-                        0x8f
-                    };
-                    len += 1;
-                    if allowed {
-                        changes
-                            .try_push(GrantedSubscriptionChange {
-                                topic: item.filter.clone(),
-                                granted: Some(item.qos.min(Qos::AtLeastOnce)),
-                                options: item.options,
-                            })
-                            .map_err(|_| IMPOSSIBLE)?;
+                    if !crate::contract::topic::valid_filter(item.filter.as_slice()) {
+                        codes[len] = if item.filter.as_slice().starts_with(b"$share/") {
+                            0x9e
+                        } else {
+                            0x8f
+                        };
+                        len += 1;
+                        continue;
                     }
+                    let replacing = changes
+                        .as_slice()
+                        .iter()
+                        .any(|c: &GrantedSubscriptionChange| c.topic == item.filter)
+                        || self
+                            .routes
+                            .as_slice()
+                            .iter()
+                            .any(|r| r.target == session && r.topic == item.filter);
+                    if !replacing {
+                        if remaining == 0 {
+                            codes[len] = 0x97;
+                            len += 1;
+                            continue;
+                        }
+                        remaining -= 1;
+                    }
+                    let granted = item.qos.min(Qos::AtLeastOnce);
+                    codes[len] = granted.to_wire();
+                    len += 1;
+                    changes
+                        .try_push(GrantedSubscriptionChange {
+                            topic: item.filter.clone(),
+                            granted: Some(granted),
+                            options: item.options,
+                        })
+                        .map_err(|_| IMPOSSIBLE)?;
                 }
             }
             InboundPacket::Unsubscribe { filters, .. } => {
