@@ -724,6 +724,7 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends openssl mosquitto-clients
       - name: Extract, restart and receive the sealed executable
+        id: operator_reception
         run: |
           set -- "$RUNNER_TEMP/pilot-package/"*.tar.gz
           python tools/check_preview.py "$1" "$RUNNER_TEMP/pilot-smoke"
@@ -735,6 +736,25 @@ jobs:
             PYTHON=python "$pilot/run-split-reception.sh" "$RUNNER_TEMP/pilot-split" "$pilot"
             PYTHON=python "$pilot/run-site-reception.sh" "$RUNNER_TEMP/pilot-site" "$pilot"
           done
+      - name: Record per-event LIVE timing on the same worker
+        if: success() || (failure() && steps.operator_reception.outcome == 'failure')
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          site="$RUNNER_TEMP/pilot-site/site/result.json"
+          test -f "$site" || exit 0
+          python - "$site" <<'PY' || exit 0
+          import json
+          import sys
+          from pathlib import Path
+
+          result = json.loads(Path(sys.argv[1]).read_text())
+          sys.exit(not (result["status"] == "PASS" or result.get("failure") == "live_slo_during_history_pressure"))
+          PY
+          set -- "$RUNNER_TEMP/pilot-package/"*.tar.gz
+          read -r digest filename < "$1.sha256"
+          test "$filename" = "$(basename "$1")"
+          python tools/measure_pilot_live.py "$1" --sha256 "$digest" --out "$RUNNER_TEMP/pilot-site/live-timing"
       - name: Publish the sealed pilot archive
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
