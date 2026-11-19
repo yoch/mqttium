@@ -23,7 +23,7 @@ use crate::ids::{
 };
 use crate::message_expiry::{ExpiredDelivery, MessageExpiry, MessageExpiryBlock, MessageTime};
 use crate::outcome::{EpochGrant, Knowledge, StoreReply};
-use crate::packet::{InboundPacket, OutboundFrame, Qos, SharedBytes};
+use crate::packet::{InboundPacket, OutboundFrame, Qos, Qos2Ack, SharedBytes};
 use crate::pubsub::{DeliveryClaim, PubackTarget, Qos0DropReason, Qos0Origin, WorkItem};
 
 /// Durable phase of an inbound QoS 2 exchange.
@@ -337,6 +337,14 @@ pub enum Input {
         reason: u8,
         target: Option<PubackTarget>,
     },
+    /// Same immutable occurrence association as PUBACK, scoped to the QoS 2 leg.
+    ObservedQos2Ack {
+        connection: ConnectionKey,
+        kind: Qos2Ack,
+        packet_id: OutboundPacketId,
+        reason: u8,
+        target: Option<PubackTarget>,
+    },
     /// The store's answer to one effect, for one operation.
     StoreResult {
         effect: EffectId,
@@ -439,6 +447,7 @@ pub enum Effect {
         connection: ConnectionKey,
         delivery: DeliveryId,
         cause: crate::command::DeliveryCause,
+        qos: Qos,
         packet_id: OutboundPacketId,
         claim: OperationId,
         topic: SharedBytes,
@@ -456,6 +465,8 @@ pub enum Effect {
         /// making the ACK eligible. Never inferred later from a reusable
         /// Packet Identifier. None for frames without a current PUBLISH.
         publish_order: Option<u64>,
+        /// Identity to bind when the first PUBREL of a generation is queued.
+        pubrel: Option<(DeliveryId, OperationId)>,
     },
     /// Close the designated connection.
     CloseConnection {

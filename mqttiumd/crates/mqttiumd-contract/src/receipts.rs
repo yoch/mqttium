@@ -147,6 +147,7 @@ impl ReceiptClass {
             | Recipe::ExpireDelivery(_)
             | Recipe::ClaimDelivery(_)
             | Recipe::FinishDelivery(_)
+            | Recipe::PreparePubrel(_)
             | Recipe::ConsumeDelivery(_) => Self::Control,
         }
     }

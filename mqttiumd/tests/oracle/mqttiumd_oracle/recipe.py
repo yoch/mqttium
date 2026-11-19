@@ -30,6 +30,7 @@ MARK_DELIVERY_STARTED = 15
 EXPIRE_DELIVERY = 16
 WILL_PUBLICATION = 17
 RETAINED_WILL_PUBLICATION = 18
+PREPARE_PUBREL = 19
 MAX_RETAINED_REPLAYS = 256
 MAX_RETAINED_TARGETS = 16
 MAX_SESSION_CLIENT_BYTES = 1024
@@ -248,6 +249,11 @@ class TimedReplaySubscriptions:
 @dataclass(frozen=True)
 class MarkDeliveryStarted(Finish):
     kind = "MarkDeliveryStarted"
+
+
+@dataclass(frozen=True)
+class PreparePubrel(Finish):
+    kind = "PreparePubrel"
 
 
 @dataclass(frozen=True)
@@ -606,7 +612,7 @@ def decode(data: bytes, *, _target_limit: int | None = None):
                     valid_topic = False
                 else:
                     valid_topic = bool(topic) and not any(byte in topic for byte in (0, 35, 43))
-            if (subscribe not in ((0, 1) if kind == CHANGE_SUBSCRIPTIONS else (0, 1, 2))
+            if (subscribe not in ((0, 1) if kind == CHANGE_SUBSCRIPTIONS else (0, 1, 2, 3))
                     or not valid_topic or options & 0xc3 or (options >> 4) & 3 == 3
                     or subscribe == 0 and options != 0):
                 raise RecipeError("invalid subscription filter or options")
@@ -616,7 +622,7 @@ def decode(data: bytes, *, _target_limit: int | None = None):
             raise RecipeError("noncanonical subscription options")
         cls = Subscriptions if kind == CHANGE_SUBSCRIPTIONS else UpdateSubscriptions
         recipe = cls(operation, session, revision, route_revision, tuple(changes))
-    elif kind in (CLAIM_DELIVERY, FINISH_DELIVERY, MARK_DELIVERY_STARTED, EXPIRE_DELIVERY):
+    elif kind in (CLAIM_DELIVERY, FINISH_DELIVERY, MARK_DELIVERY_STARTED, EXPIRE_DELIVERY, PREPARE_PUBREL):
         fields = (reader.scoped(), reader.scoped(), reader.number(4),
                   reader.number(8), reader.number(8), reader.number(2))
         if fields[-1] == 0:
@@ -625,6 +631,8 @@ def decode(data: bytes, *, _target_limit: int | None = None):
             recipe = Claim(*fields)
         elif kind == MARK_DELIVERY_STARTED:
             recipe = MarkDeliveryStarted(*fields, reader.scoped())
+        elif kind == PREPARE_PUBREL:
+            recipe = PreparePubrel(*fields, reader.scoped())
         else:
             finish = Finish(*fields, reader.scoped())
             if kind == FINISH_DELIVERY:

@@ -2417,6 +2417,14 @@ claimed_snapshot["outbound"] = [{**OUTBOUND_SLOT, "packet_id": 5,
                                  "claim_operation_id": claim_operation["operation_id"]}]
 claimed_snapshot["account"]["used"].update(exchange_slots="2", receipt_slots="2")
 ok("store-snapshot-delivery-claim-receipt.json", claimed_snapshot)
+pubrel_snapshot = copy.deepcopy(claimed_snapshot)
+pubrel_snapshot["obligations"][0].update(effective_qos=2, phase="AwaitPubcomp")
+pubrel_snapshot["outbound"][0]["phase"] = "AwaitPubcomp"
+pubrel_snapshot["operations"].append(product_operation(27, 19, delivery_body + scoped(21), {
+    **claim_operation["decision"]["facts"], "kind": "DeliveryPubrelReady",
+}))
+pubrel_snapshot["account"]["used"]["receipt_slots"] = "3"
+ok("store-snapshot-qos2-pubrel-ready.json", pubrel_snapshot)
 finished_snapshot = copy.deepcopy(claimed_snapshot)
 finished_snapshot["operations"].append(product_operation(22, 5, delivery_body + scoped(21), {
     **claim_operation["decision"]["facts"], "kind": "DeliveryFinished",

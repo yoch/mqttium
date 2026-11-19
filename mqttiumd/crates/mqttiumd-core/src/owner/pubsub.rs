@@ -5,6 +5,7 @@ use crate::contract::command::{
     UpdateSubscriptions,
 };
 use crate::contract::ids::{ContinuationId, OutboundPacketId};
+use crate::contract::packet::Qos2Ack;
 use crate::contract::pubsub::{
     DeliveryClaim, FilterResults, GrantedSubscriptionChange, MAX_FILTERS, PubackTarget,
     Qos0DropReason, Qos0Origin, VolatilePublicationId, WORK_PAGE_LIMIT, WorkItem,
@@ -58,6 +59,7 @@ enum Phase {
     ClaimPending(InFlight),
     AwaitPuback,
     FinishPending(InFlight),
+    PubrelPending(InFlight),
     StartPending(InFlight),
     ExpirePending(InFlight),
     StartRetry,
@@ -88,6 +90,7 @@ pub(super) struct Delivery {
     /// can turn an exact first-frame NotStarted observation into deletion.
     certain_never_started: bool,
     early_puback: bool,
+    early_pubrec: Option<u8>,
     retired: bool,
 }
 
@@ -98,6 +101,7 @@ impl Delivery {
         }
         match self.phase {
             Phase::FinishPending(_)
+            | Phase::PubrelPending(_)
             | Phase::StartPending(_)
             | Phase::ExpirePending(_)
             | Phase::StartRetry
@@ -113,7 +117,8 @@ impl Delivery {
         }
     }
     fn expiry_allows_send(&self, now: Option<MessageTime>) -> bool {
-        self.claim.is_some_and(|claim| claim.started)
+        self.claim
+            .is_some_and(|claim| claim.started || claim.await_pubcomp)
             || self.expiry.is_none_or(|expiry| {
                 now.is_some_and(|now| matches!(expiry.state(now), Ok(ExpiryState::Fresh { .. })))
             })
@@ -123,7 +128,8 @@ impl Delivery {
             && match self.phase {
                 Phase::StartRetry => true,
                 Phase::AwaitPuback
-                    if self.early_puback && self.claim.is_some_and(|claim| claim.started) =>
+                    if self.early_pubrec.is_some()
+                        || (self.early_puback && self.claim.is_some_and(|claim| claim.started)) =>
                 {
                     true
                 }
@@ -131,6 +137,7 @@ impl Delivery {
                     self.certain_never_started
                         && self.frame.is_none()
                         && !self.early_puback
+                        && self.early_pubrec.is_none()
                         && self.expiry.is_some_and(|expiry| {
                             now.is_some_and(|now| expiry.state(now) == Ok(ExpiryState::Expired))
                         })
@@ -142,6 +149,7 @@ impl Delivery {
         match self.phase {
             Phase::ClaimPending(f)
             | Phase::FinishPending(f)
+            | Phase::PubrelPending(f)
             | Phase::StartPending(f)
             | Phase::ExpirePending(f)
             | Phase::ConsumePending(f, _) => Some(f),
@@ -178,6 +186,7 @@ impl Delivery {
             may_have_started: claim.is_some(),
             certain_never_started: claim.is_none(),
             early_puback: false,
+            early_pubrec: None,
             retired: false,
         }
     }
@@ -283,6 +292,14 @@ pub(super) enum Change {
         slot: usize,
         in_flight: InFlight,
     },
+    PreparePubrel {
+        slot: usize,
+        in_flight: InFlight,
+    },
+    PubrelReady {
+        slot: usize,
+        finished: Finished,
+    },
     Finished {
         slot: usize,
         finished: Finished,
@@ -303,6 +320,10 @@ pub(super) enum Change {
     },
     PubackObserved {
         slot: usize,
+    },
+    PubrecObserved {
+        slot: usize,
+        reason: u8,
     },
     Start {
         slot: usize,
@@ -412,12 +433,14 @@ impl State {
         let new = matches!(
             input,
             Input::ObservedPuback { .. }
+                | Input::ObservedQos2Ack { .. }
                 | Input::ConnectionSettings { .. }
                 | Input::WorkPage { .. }
                 | Input::Packet {
                     packet: InboundPacket::Subscribe { .. }
                         | InboundPacket::Unsubscribe { .. }
-                        | InboundPacket::Puback { .. },
+                        | InboundPacket::Puback { .. }
+                        | InboundPacket::Qos2Ack { .. },
                     ..
                 }
         );
@@ -648,7 +671,8 @@ impl Owner {
                     return true;
                 }
                 Phase::AwaitPuback
-                    if delivery.payload.is_some()
+                    if (delivery.payload.is_some()
+                        || delivery.claim.is_some_and(|c| c.await_pubcomp))
                         && (room || delivery.window == Some(generation)) =>
                 {
                     return true;
@@ -1306,6 +1330,40 @@ impl Owner {
         connection: ConnectionKey,
         packet_id: OutboundPacketId,
     ) -> Option<PubackTarget> {
+        self.outgoing_ack_target(connection, packet_id, |delivery, _| {
+            delivery.qos == Qos::AtLeastOnce
+                && matches!(
+                    delivery.phase,
+                    Phase::AwaitPuback | Phase::StartPending(_) | Phase::StartRetry
+                )
+        })
+    }
+
+    #[must_use]
+    pub fn qos2_ack_target(
+        &self,
+        connection: ConnectionKey,
+        packet_id: OutboundPacketId,
+        kind: Qos2Ack,
+    ) -> Option<PubackTarget> {
+        self.outgoing_ack_target(connection, packet_id, |delivery, claim| {
+            delivery.qos == Qos::ExactlyOnce
+                && match kind {
+                    Qos2Ack::Pubrec => matches!(
+                        delivery.phase,
+                        Phase::AwaitPuback | Phase::StartPending(_) | Phase::StartRetry
+                    ),
+                    Qos2Ack::Pubcomp => claim.await_pubcomp && delivery.phase == Phase::AwaitPuback,
+                }
+        })
+    }
+
+    fn outgoing_ack_target(
+        &self,
+        connection: ConnectionKey,
+        packet_id: OutboundPacketId,
+        eligible: impl Fn(&Delivery, DeliveryClaim) -> bool,
+    ) -> Option<PubackTarget> {
         if self.connection_of(connection.session) != Some(connection.generation) {
             return None;
         }
@@ -1317,11 +1375,7 @@ impl Owner {
                 let claim = delivery.claim?;
                 let (frame, sent) = delivery.frame?;
                 (delivery.target == connection.session
-                    && delivery.qos == Qos::AtLeastOnce
-                    && matches!(
-                        delivery.phase,
-                        Phase::AwaitPuback | Phase::StartPending(_) | Phase::StartRetry
-                    )
+                    && eligible(delivery, claim)
                     && delivery.window == Some(connection.generation)
                     && sent == connection
                     && claim.packet_id == packet_id)
@@ -1331,6 +1385,76 @@ impl Owner {
                         frame,
                     })
             })
+    }
+
+    pub(super) fn plan_observed_qos2_ack(
+        &self,
+        connection: ConnectionKey,
+        kind: Qos2Ack,
+        packet_id: OutboundPacketId,
+        reason: u8,
+        target: Option<PubackTarget>,
+        draft: &mut Draft,
+    ) -> Result<super::Change, Stop> {
+        if self.connection_of(connection.session) != Some(connection.generation) {
+            return Ok(super::Change::Nothing);
+        }
+        if !kind.accepts(reason) {
+            return Self::plan_close(
+                connection.generation,
+                self.session_of(connection.generation),
+                CloseReason::ProtocolError,
+                draft,
+            );
+        }
+        let Some(target) = target else {
+            return Ok(super::Change::Nothing);
+        };
+        if self.qos2_ack_target(connection, packet_id, kind) != Some(target) {
+            return Ok(super::Change::Nothing);
+        }
+        let slot = self.pubsub.delivery(target.delivery).ok_or(IMPOSSIBLE)?;
+        let delivery = &self.pubsub.deliveries.as_slice()[slot];
+        if kind == Qos2Ack::Pubrec {
+            if delivery.claim.is_some_and(|c| c.await_pubcomp) {
+                if reason < 0x80 {
+                    draft.frame(connection, OutboundFrame::Pubrel { packet_id })?;
+                }
+                return Ok(super::Change::Nothing);
+            }
+            if matches!(delivery.phase, Phase::StartPending(_) | Phase::StartRetry) {
+                return if delivery.early_pubrec.is_none() {
+                    Ok(changed(Change::PubrecObserved { slot, reason }))
+                } else {
+                    Ok(super::Change::Nothing)
+                };
+            }
+            return Ok(changed(self.after_pubrec(slot, delivery, reason, draft)?));
+        }
+        let operation = self.operation(draft)?;
+        let recipe = Recipe::FinishDelivery(self.finish_recipe(delivery, operation)?);
+        let in_flight = self.plan_submission(operation, recipe, None, draft)?;
+        Ok(changed(Change::Finish { slot, in_flight }))
+    }
+
+    fn after_pubrec(
+        &self,
+        slot: usize,
+        delivery: &Delivery,
+        reason: u8,
+        draft: &mut Draft,
+    ) -> Result<Change, Stop> {
+        let operation = self.operation(draft)?;
+        let guarded = self.finish_recipe(delivery, operation)?;
+        // A negative PUBREC terminates the exchange without sending PUBREL.
+        if reason >= 0x80 {
+            let in_flight =
+                self.plan_submission(operation, Recipe::FinishDelivery(guarded), None, draft)?;
+            return Ok(Change::Finish { slot, in_flight });
+        }
+        let in_flight =
+            self.plan_submission(operation, Recipe::PreparePubrel(guarded), None, draft)?;
+        Ok(Change::PreparePubrel { slot, in_flight })
     }
 
     pub(super) fn plan_observed_puback(
@@ -1399,6 +1523,21 @@ impl Owner {
                 *packet_id,
                 *reason,
                 self.puback_target(key, *packet_id),
+                draft,
+            );
+        }
+        if let InboundPacket::Qos2Ack {
+            kind,
+            packet_id,
+            reason,
+        } = packet
+        {
+            return self.plan_observed_qos2_ack(
+                key,
+                *kind,
+                *packet_id,
+                *reason,
+                self.qos2_ack_target(key, *packet_id, *kind),
                 draft,
             );
         }
@@ -1569,7 +1708,7 @@ impl Owner {
                         }
                         remaining -= 1;
                     }
-                    let granted = item.qos.min(Qos::AtLeastOnce);
+                    let granted = item.qos;
                     codes[len] = granted.to_wire();
                     len += 1;
                     changes
@@ -1698,6 +1837,8 @@ impl Owner {
                 slot,
                 in_flight: self.submit_start(d, draft)?,
             }
+        } else if let Some(reason) = d.early_pubrec {
+            self.after_pubrec(slot, d, reason, draft)?
         } else if d.early_puback && d.claim.is_some_and(|claim| claim.started) {
             let operation = self.operation(draft)?;
             let in_flight = self.plan_submission(
@@ -1752,7 +1893,7 @@ impl Owner {
         }
         if let Some((slot, d)) = next
             && d.phase == Phase::AwaitPuback
-            && d.payload.is_some()
+            && (d.payload.is_some() || d.claim.is_some_and(|c| c.await_pubcomp))
             && (room || d.window == Some(generation))
         {
             let emission = self.plan_delivery_emit(d, draft)?;
@@ -1803,6 +1944,7 @@ impl Owner {
                 operation,
                 packet_id,
                 started: false,
+                await_pubcomp: false,
             };
             let recipe = Recipe::ClaimDelivery(ClaimDelivery {
                 operation,
@@ -1882,13 +2024,11 @@ impl Owner {
                 || item.target_revision != target.revision
                 || item.topic.len() as u64 > u64::from(limits.max_topic_bytes)
                 || item.payload.len() as u64 > limits.max_payload_bytes.get()
-                || item.qos == Qos::ExactlyOnce
                 || (item.cause == DeliveryCause::RetainedReplay && !item.retain)
-                || (item.claim.is_some() && item.qos != Qos::AtLeastOnce)
                 || self.check_message_expiry(item.expiry).is_err()
                 || item
                     .claim
-                    .is_some_and(|claim| claim.started && item.expiry.is_none())
+                    .is_some_and(|claim| !claim.valid_for(item.qos, item.expiry.is_some()))
             {
                 return Err(IMPOSSIBLE);
             }
@@ -2005,9 +2145,25 @@ impl Owner {
             // restored earlier exchanges are replayed before newer ones.
             return Ok(None);
         }
-        let (Some(topic), Some(payload), Some(claim)) =
-            (&delivery.topic, &delivery.payload, delivery.claim)
-        else {
+        let Some(claim) = delivery.claim else {
+            return Ok(None);
+        };
+        let connection = ConnectionKey {
+            session: delivery.target,
+            generation,
+        };
+        if claim.await_pubcomp {
+            let effect = draft.emit(Effect::EmitFrame {
+                connection,
+                frame: OutboundFrame::Pubrel {
+                    packet_id: claim.packet_id,
+                },
+                publish_order: None,
+                pubrel: Some((delivery.id, claim.operation)),
+            })?;
+            return Ok(Some((effect, connection)));
+        }
+        let (Some(topic), Some(payload)) = (&delivery.topic, &delivery.payload) else {
             return Ok(None);
         };
         let body = topic
@@ -2031,14 +2187,11 @@ impl Owner {
             draft.close(generation, CloseReason::CapacityExceeded)?;
             return Ok(None);
         }
-        let connection = ConnectionKey {
-            session: delivery.target,
-            generation,
-        };
         let effect = draft.emit(Effect::EmitPublish {
             connection,
             delivery: delivery.id,
             cause: delivery.cause,
+            qos: delivery.qos,
             packet_id: claim.packet_id,
             claim: claim.operation,
             topic: topic.clone(),
@@ -2123,6 +2276,31 @@ impl Owner {
                     })));
                 }
                 let (slot, d) = delivery.ok_or(IMPOSSIBLE)?;
+                if matches!(d.phase, Phase::PubrelPending(_)) {
+                    let claim = d.claim.ok_or(IMPOSSIBLE)?;
+                    if facts
+                        != (CommitFacts::DeliveryPubrelReady {
+                            delivery: d.id,
+                            target: d.target,
+                            packet_id: claim.packet_id,
+                            claim: claim.operation,
+                        })
+                    {
+                        return Err(Stop::Fatal(CoreFault::ContradictoryOutcome { operation }));
+                    }
+                    let change = if d.retired {
+                        Change::Finished {
+                            slot,
+                            finished: done,
+                        }
+                    } else {
+                        Change::PubrelReady {
+                            slot,
+                            finished: done,
+                        }
+                    };
+                    return Ok(Some(changed(change)));
+                }
                 if matches!(d.phase, Phase::StartPending(_) | Phase::ExpirePending(_)) {
                     let claim = d.claim.ok_or(IMPOSSIBLE)?;
                     let expected = if matches!(d.phase, Phase::StartPending(_)) {
@@ -2543,7 +2721,9 @@ impl Owner {
             FrameProgress::Started
                 if d.expiry.is_some()
                     && d.phase == Phase::AwaitPuback
-                    && !d.claim.is_some_and(|claim| claim.started) =>
+                    && !d
+                        .claim
+                        .is_some_and(|claim| claim.started || claim.await_pubcomp) =>
             {
                 Change::Start {
                     slot,
@@ -2621,7 +2801,7 @@ impl Owner {
                 || claim.is_some()
                     && other.is_some_and(|c| Some(c.operation) == claim.map(|c| c.operation))
         };
-        (claim.is_none()||qos==Qos::AtLeastOnce)&&session_ok&&self.pubsub.deliveries.len()+same.len()<self.pubsub.deliveries.capacity()
+        claim.is_none_or(|claim| claim.valid_for(qos, expiry.is_some()))&&session_ok&&self.pubsub.deliveries.len()+same.len()<self.pubsub.deliveries.capacity()
             &&claim.is_none_or(|c|c.operation.incarnation()==self.incarnation&&c.operation.epoch()<self.epoch)
             &&!self.pubsub.deliveries.as_slice().iter().any(|d|conflict(d.id,d.target,d.claim))
             &&!same.iter().any(|f|matches!(f,RecoveredFact::OutboundDelivery{delivery:id,target:to,claim:other,..}if conflict(*id,*to,*other)))
@@ -2895,12 +3075,37 @@ impl Owner {
                 d.local_write_completed = false;
             }
             Change::Finish { slot, in_flight } => {
-                self.pubsub
+                let d = self
+                    .pubsub
                     .deliveries
                     .as_mut_slice()
                     .get_mut(slot)
-                    .ok_or(stale)?
-                    .phase = Phase::FinishPending(in_flight)
+                    .ok_or(stale)?;
+                d.early_pubrec = None;
+                d.phase = Phase::FinishPending(in_flight);
+            }
+            Change::PreparePubrel { slot, in_flight } => {
+                let d = self
+                    .pubsub
+                    .deliveries
+                    .as_mut_slice()
+                    .get_mut(slot)
+                    .ok_or(stale)?;
+                d.early_pubrec = None;
+                d.phase = Phase::PubrelPending(in_flight);
+            }
+            Change::PubrelReady { slot, finished } => {
+                let d = self
+                    .pubsub
+                    .deliveries
+                    .as_mut_slice()
+                    .get_mut(slot)
+                    .ok_or(stale)?;
+                d.claim.as_mut().ok_or(stale)?.await_pubcomp = true;
+                d.phase = Phase::AwaitPuback;
+                d.frame = None;
+                d.certain_never_started = false;
+                remember(&mut self.finished, finished)?;
             }
             Change::Finished { slot, finished } => {
                 let d = self
@@ -2971,6 +3176,7 @@ impl Owner {
                     match &mut d.phase {
                         Phase::ClaimPending(f)
                         | Phase::FinishPending(f)
+                        | Phase::PubrelPending(f)
                         | Phase::StartPending(f)
                         | Phase::ExpirePending(f)
                         | Phase::ConsumePending(f, _) => f,
@@ -2990,6 +3196,14 @@ impl Owner {
                     .get_mut(slot)
                     .ok_or(stale)?
                     .early_puback = true;
+            }
+            Change::PubrecObserved { slot, reason } => {
+                self.pubsub
+                    .deliveries
+                    .as_mut_slice()
+                    .get_mut(slot)
+                    .ok_or(stale)?
+                    .early_pubrec = Some(reason);
             }
             Change::Start { slot, in_flight } => {
                 let d = self
@@ -3277,6 +3491,12 @@ mod tests {
                 packet_id: c.packet_id,
                 claim: c.claim,
             },
+            Recipe::PreparePubrel(c) => CommitFacts::DeliveryPubrelReady {
+                delivery: c.delivery,
+                target: c.target,
+                packet_id: c.packet_id,
+                claim: c.claim,
+            },
             Recipe::ExpireDelivery(c) => CommitFacts::DeliveryExpired {
                 delivery: c.finish.delivery,
                 target: c.finish.target,
@@ -3297,6 +3517,117 @@ mod tests {
                 reply: StoreReply::Outcome(StoreOutcome::Committed(facts)),
             },
         )
+    }
+
+    #[test]
+    fn qos2_keeps_window_and_identifier_until_pubcomp_finish_is_known() {
+        let mut owner = world();
+        owner.pubsub.connections.as_mut_slice()[0].receive_maximum = 1;
+        queued(&mut owner, 0);
+        owner.pubsub.deliveries.as_mut_slice()[0].qos = Qos::ExactlyOnce;
+        queued(&mut owner, 1);
+        let key = ConnectionKey {
+            session: TARGET,
+            generation: CONNECTION,
+        };
+        let send_ack = |owner: &mut Owner, kind, packet_id| {
+            let target = owner.qos2_ack_target(key, packet_id, kind);
+            apply(
+                owner,
+                Input::ObservedQos2Ack {
+                    connection: key,
+                    kind,
+                    packet_id,
+                    reason: 0,
+                    target,
+                },
+            )
+        };
+        let claim = apply(&mut owner, Input::WorkAvailable { session: TARGET });
+        let (effect, Effect::Persist { command }) = &claim[0] else {
+            panic!("claim submission")
+        };
+        let publish = known(&mut owner, *effect, command);
+        let Effect::EmitPublish {
+            packet_id,
+            qos: Qos::ExactlyOnce,
+            ..
+        } = publish[0].1
+        else {
+            panic!("QoS 2 PUBLISH")
+        };
+        let prepared = send_ack(&mut owner, Qos2Ack::Pubrec, packet_id);
+        let (effect, Effect::Persist { command }) = &prepared[0] else {
+            panic!("prepare submission")
+        };
+        assert!(matches!(command.recipe.get(), Recipe::PreparePubrel(_)));
+        let unknown = apply(
+            &mut owner,
+            Input::StoreResult {
+                effect: *effect,
+                operation: command.recipe.operation(),
+                reply: StoreReply::Outcome(StoreOutcome::PendingOrUnknown),
+            },
+        );
+        assert!(unknown.is_empty() && send_ack(&mut owner, Qos2Ack::Pubrec, packet_id).is_empty());
+        assert!(
+            apply(&mut owner, Input::WorkAvailable { session: TARGET }).is_empty(),
+            "qos2_pubrel_before_commit"
+        );
+        assert_eq!(owner.pubsub.free_packet_id(TARGET, 1), None);
+        assert!(known(&mut owner, *effect, command).is_empty());
+        let release = apply(&mut owner, Input::WorkAvailable { session: TARGET });
+        assert!(matches!(release[0].1, Effect::EmitFrame {
+            frame: OutboundFrame::Pubrel { packet_id: observed }, ..
+        } if observed == packet_id));
+        assert!(
+            apply(&mut owner, Input::WorkAvailable { session: TARGET }).is_empty(),
+            "qos2_receive_maximum_released_before_pubcomp"
+        );
+        let finished = send_ack(&mut owner, Qos2Ack::Pubcomp, packet_id);
+        let (effect, Effect::Persist { command }) = &finished[0] else {
+            panic!("finish submission")
+        };
+        assert_eq!(owner.pubsub.free_packet_id(TARGET, 1), None);
+        assert!(apply(&mut owner, Input::WorkAvailable { session: TARGET }).is_empty());
+        assert!(known(&mut owner, *effect, command).is_empty());
+        assert_eq!(owner.pubsub.free_packet_id(TARGET, 1), Some(packet_id));
+    }
+
+    #[test]
+    fn recovered_qos2_phase_selects_pubrel_even_with_publish_bytes_available() {
+        let mut owner = world();
+        let packet_id = OutboundPacketId::new(1).unwrap();
+        let prior = OperationId::new(
+            StoreIncarnation::new(1),
+            RunEpoch::new(1),
+            LogicalOwnerId::new(4),
+            OperationSeq::new(100),
+        );
+        let claim = DeliveryClaim {
+            operation: prior,
+            packet_id,
+            started: false,
+            await_pubcomp: true,
+        };
+        owner
+            .add_outbound_fact(
+                delivery(0),
+                TARGET,
+                Revision::new(1),
+                (Qos::ExactlyOnce, Some(claim), None, false),
+            )
+            .unwrap();
+        let item = &mut owner.pubsub.deliveries.as_mut_slice()[0];
+        item.topic = Some(bytes(b"topic"));
+        item.payload = Some(bytes(b"payload"));
+        let frames = apply(&mut owner, Input::WorkAvailable { session: TARGET });
+        assert!(
+            matches!(&frames[..], [(_, Effect::EmitFrame {
+            frame: OutboundFrame::Pubrel { packet_id: observed }, ..
+        })] if *observed == packet_id),
+            "qos2_recovery_replayed_publish_instead_of_pubrel"
+        );
     }
 
     #[test]
@@ -3511,6 +3842,7 @@ mod tests {
         for raw in 1..=4 {
             let claim = DeliveryClaim {
                 started: false,
+                await_pubcomp: false,
                 operation: operation(u64::from(raw)),
                 packet_id: OutboundPacketId::new(raw).unwrap(),
             };
@@ -5111,6 +5443,7 @@ mod tests {
                 operation: operation(100),
                 packet_id: OutboundPacketId::new(1).unwrap(),
                 started: false,
+                await_pubcomp: false,
             });
             d.phase = Phase::AwaitPuback;
             d.certain_never_started = false;
@@ -6009,6 +6342,7 @@ mod tests {
                     ),
                     packet_id: OutboundPacketId::new(1).unwrap(),
                     started,
+                    await_pubcomp: false,
                 };
                 let fact = RecoveredFact::OutboundDelivery {
                     delivery: delivery(0),

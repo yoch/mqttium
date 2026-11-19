@@ -85,6 +85,7 @@ pub fn recipe_kind(recipe: &Recipe) -> &'static str {
         },
         Recipe::TimedReplaySubscriptions(_) => "Subscriptions",
         Recipe::MarkDeliveryStarted(_) => "DeliveryStarted",
+        Recipe::PreparePubrel(_) => "DeliveryPubrelReady",
         Recipe::ExpireDelivery(_) => "MessageExpire",
         Recipe::RetainedPublication(_) | Recipe::AdmitPublication(_) => "Admission",
         Recipe::RetainedQos0(_) => "RetainedQoS0",
@@ -1338,18 +1339,6 @@ fn bootstrap_bound(
         .ok_or_else(|| Failure::read(ReadError::LimitExceeded, ReadPhase::Snapshot))?;
     if route_count > 128 {
         return Err(Failure::read(ReadError::LimitExceeded, ReadPhase::Snapshot));
-    }
-    if state
-        .routes
-        .values()
-        .flatten()
-        .any(|t| t.qos == mqttiumd_contract::packet::Qos::ExactlyOnce)
-        || state
-            .obligations
-            .values()
-            .any(|o| o.qos == mqttiumd_contract::packet::Qos::ExactlyOnce)
-    {
-        return Err(Failure::plain("durable_profile_mismatch"));
     }
     // Establish the logical domain before new-epoch cleanup derives any
     // deadline. A new domain keeps only committed progress; existing detached

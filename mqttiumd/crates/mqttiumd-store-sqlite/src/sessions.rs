@@ -252,13 +252,15 @@ pub(super) fn erase(
             let target_revision = Revision::new(blob_u64(reader::borrow_blob(row, 2, 8)?)?);
             let qos = code_qos(row.get(3)?)?;
             code_cause(row.get(4)?)?;
-            code_obligation_phase(row.get(5)?)?;
+            let await_pubcomp =
+                code_obligation_phase(row.get(5)?)? == ObligationPhase::AwaitPubcomp;
             if target_revision != revision {
                 return Err(broken);
             }
             let packet: Option<i64> = row.get(6)?;
             if let Some(packet) = packet {
-                if qos != Qos::AtLeastOnce
+                if qos == Qos::AtMostOnce
+                    || (await_pubcomp && qos != Qos::ExactlyOnce)
                     || u16::try_from(packet)
                         .ok()
                         .and_then(OutboundPacketId::new)
@@ -274,6 +276,8 @@ pub(super) fn erase(
                 {
                     return Err(broken);
                 }
+            } else if await_pubcomp {
+                return Err(broken);
             }
             ended.push((publication, index));
         }

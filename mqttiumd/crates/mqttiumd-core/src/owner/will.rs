@@ -1006,6 +1006,7 @@ mod tests {
                         },
                         frame: OutboundFrame::Pingresp,
                         publish_order: None,
+                        pubrel: None,
                     },
                 ),
             )

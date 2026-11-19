@@ -606,6 +606,7 @@ impl Draft {
             connection,
             frame,
             publish_order: None,
+            pubrel: None,
         })
         .map(|_| ())
     }
@@ -622,6 +623,7 @@ impl Draft {
             connection,
             frame,
             publish_order,
+            pubrel: None,
         })
     }
 
@@ -1377,6 +1379,15 @@ impl Owner {
                 reason,
                 target,
             } => self.plan_observed_puback(*connection, *packet_id, *reason, *target, draft),
+            Input::ObservedQos2Ack {
+                connection,
+                kind,
+                packet_id,
+                reason,
+                target,
+            } => {
+                self.plan_observed_qos2_ack(*connection, *kind, *packet_id, *reason, *target, draft)
+            }
             Input::Packet {
                 connection,
                 ingress_order,
@@ -1611,6 +1622,7 @@ impl Owner {
         match packet {
             InboundPacket::Subscribe { .. }
             | InboundPacket::Unsubscribe { .. }
+            | InboundPacket::Qos2Ack { .. }
             | InboundPacket::Puback { .. } => {
                 self.plan_pubsub_packet(index, connection, packet, draft)
             }
@@ -3270,6 +3282,7 @@ mod tests {
                     ..
                 } => "EmitPubcompNotFound",
                 OutboundFrame::Pubcomp { .. } => "EmitPubcompRefusal",
+                OutboundFrame::Pubrel { .. } => "EmitPubrel",
             },
         }
     }
@@ -3401,6 +3414,7 @@ mod tests {
                 Recipe::ExpiringPublication(_)
                 | Recipe::TimedReplaySubscriptions(_)
                 | Recipe::MarkDeliveryStarted(_)
+                | Recipe::PreparePubrel(_)
                 | Recipe::ExpireDelivery(_)
                 | Recipe::ChangeSubscriptions(_)
                 | Recipe::UpdateSubscriptions(_)
@@ -3446,6 +3460,7 @@ mod tests {
                 | CommitFacts::DeliveryConsumed { .. }
                 | CommitFacts::SubscriptionsChanged { .. }
                 | CommitFacts::DeliveryStarted { .. }
+                | CommitFacts::DeliveryPubrelReady { .. }
                 | CommitFacts::DeliveryExpired { .. }
                 | CommitFacts::DeliveryClaimed { .. }
                 | CommitFacts::DeliveryFinished { .. } => RejectReason::PreconditionFailed,
@@ -4223,6 +4238,7 @@ mod tests {
                     session_present: true,
                 },
                 publish_order: None,
+                pubrel: None,
             }
         );
         assert_eq!(effects.len(), 1);
@@ -4414,6 +4430,7 @@ mod tests {
                     session_present: false,
                 },
                 publish_order: None,
+                pubrel: None,
             }
         );
         assert_eq!(world.owner.sessions.len(), 1);
@@ -4757,6 +4774,7 @@ mod tests {
                     reason: PubackReason::Success
                 },
                 publish_order: Some(order),
+                pubrel: None,
             }
         );
         effects.remove(0)
@@ -4868,6 +4886,7 @@ mod tests {
                         reason
                     },
                     publish_order: Some(1),
+                    pubrel: None,
                 }
             );
             assert_eq!(used(&world), (4, 1));
@@ -4987,6 +5006,7 @@ mod tests {
                     reason: PubackReason::Success
                 },
                 publish_order: Some(0),
+                pubrel: None,
             }
         );
         world.applied(written(&ack));
@@ -5166,6 +5186,7 @@ mod tests {
             },
             frame,
             publish_order,
+            pubrel: None,
         }
     }
 
@@ -7954,6 +7975,7 @@ mod tests {
         let mut item = work_item(0);
         let claim = crate::contract::pubsub::DeliveryClaim {
             started: false,
+            await_pubcomp: false,
             operation: OperationId::new(
                 StoreIncarnation::new(INCARNATION),
                 RunEpoch::new(EPOCH - 1),
@@ -8072,7 +8094,7 @@ mod tests {
             world.applied(committed(&change));
             let ack = world.drain();
             assert!(
-                matches!(&ack[0].1,Effect::EmitFrame {frame:OutboundFrame::Suback {results,..},..}if results.as_slice()==Some(&[1,1][..]))
+                matches!(&ack[0].1,Effect::EmitFrame {frame:OutboundFrame::Suback {results,..},..}if results.as_slice()==Some(&[qos.to_wire(),qos.to_wire()][..]))
             );
             assert_eq!(
                 world
@@ -8082,7 +8104,7 @@ mod tests {
                     .iter()
                     .filter(|r| r.topic == bytes(b"fresh")
                         && r.target == SessionId::new(PRODUCER)
-                        && r.max_qos == Qos::AtLeastOnce)
+                        && r.max_qos == qos)
                     .count(),
                 1,
                 "replacement never duplicates the route"
@@ -8459,6 +8481,7 @@ mod tests {
         };
         old_item.claim = Some(crate::contract::pubsub::DeliveryClaim {
             started: false,
+            await_pubcomp: false,
             operation: claim,
             packet_id,
         });
@@ -8545,6 +8568,7 @@ mod tests {
         let mut b = work_item(1);
         let claim = crate::contract::pubsub::DeliveryClaim {
             started: false,
+            await_pubcomp: false,
             operation: OperationId::new(
                 StoreIncarnation::new(INCARNATION),
                 RunEpoch::new(EPOCH - 1),

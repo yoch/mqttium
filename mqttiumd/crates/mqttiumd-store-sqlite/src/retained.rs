@@ -470,7 +470,7 @@ pub(super) fn subscribe(
                     reader::copy_blob(row, 3, meta.limits.max_topic_bytes)?,
                 ))
             })?;
-        let qos = code_qos(row.1)?.min(granted).min(Qos::AtLeastOnce);
+        let qos = code_qos(row.1)?.min(granted);
         conn.prepare_cached("INSERT INTO publications(id,operation,source,qos,retain,payload,retained_version,expiry_domain,expiry_tick,expiry_interval,topic) SELECT ?1,?2,?3,?4,1,?5,?6,expiry_domain,expiry_tick,expiry_interval,?7 FROM publications WHERE id=?6")?.execute(params![publication.to_be_bytes().as_slice(),update.operation.to_be_bytes().as_slice(),row.0,row.1,row.2,version.to_be_bytes().as_slice(),row.3])?;
         conn.prepare_cached("INSERT INTO obligations(publication,idx,target,target_revision,qos,cause,phase,retain) VALUES(?1,0,?2,?3,?4,2,1,1)")?.execute(params![publication.to_be_bytes().as_slice(),update.session.to_be_bytes().as_slice(),update.session_revision.to_be_bytes().as_slice(),qos_code(qos)])?;
         let refs: Vec<u8> = conn

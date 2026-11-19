@@ -190,7 +190,7 @@ class PubsubWire(Wire):
         self.send(subscribe_packet(identifier, filters))
         mid, reasons = decode_filter_ack(self.wait(0x90, identifier))
         require(mid == identifier and len(reasons) == len(filters), "suback_request_mismatch")
-        require(reasons == (expected if expected is not None else tuple(min(qos, 1) for _, qos in filters)),
+        require(reasons == (expected if expected is not None else tuple(qos for _, qos in filters)),
                 "unexpected_suback_reasons", repr(reasons))
         self.observations.record("suback", label=self.label, packet_id=mid, reasons=list(reasons))
         return reasons

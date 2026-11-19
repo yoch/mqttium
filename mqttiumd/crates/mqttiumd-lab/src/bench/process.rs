@@ -190,6 +190,7 @@ fn ack_reason(frame: OutboundFrame) -> Option<&'static str> {
         OutboundFrame::Connack { .. }
         | OutboundFrame::Pingresp
         | OutboundFrame::Suback { .. }
+        | OutboundFrame::Pubrel { .. }
         | OutboundFrame::Unsuback { .. } => return None,
         OutboundFrame::Puback { reason, .. } => {
             return Some(match reason {

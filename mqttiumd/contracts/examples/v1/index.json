@@ -74,6 +74,7 @@
     "contracts/examples/v1/valid/store-snapshot-outbound-claim.json",
     "contracts/examples/v1/valid/store-snapshot-subscription-receipt.json",
     "contracts/examples/v1/valid/store-snapshot-delivery-claim-receipt.json",
+    "contracts/examples/v1/valid/store-snapshot-qos2-pubrel-ready.json",
     "contracts/examples/v1/valid/store-snapshot-delivery-finish-receipt.json",
     "contracts/examples/v1/valid/store-snapshot-subscription-qos0-receipt.json",
     "contracts/examples/v1/valid/store-snapshot-delivery-consume-receipt.json",

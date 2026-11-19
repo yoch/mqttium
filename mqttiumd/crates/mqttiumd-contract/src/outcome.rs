@@ -49,6 +49,12 @@ pub enum CommitFacts {
         packet_id: OutboundPacketId,
         claim: OperationId,
     },
+    DeliveryPubrelReady {
+        delivery: DeliveryId,
+        target: SessionId,
+        packet_id: OutboundPacketId,
+        claim: OperationId,
+    },
     DeliveryExpired {
         delivery: DeliveryId,
         target: SessionId,

@@ -370,6 +370,10 @@ pub mod transport {
             }
             OutboundFrame::Pubrec { packet_id, reason } => ack(0x50, packet_id, reason),
             OutboundFrame::Pubcomp { packet_id, reason } => ack(0x70, packet_id, reason),
+            OutboundFrame::Pubrel { packet_id } => {
+                let [high, low] = packet_id.get().to_be_bytes();
+                Ok(vec![0x62, 2, high, low])
+            }
         }
     }
 
@@ -396,6 +400,7 @@ pub mod transport {
             OutboundFrame::Connack { .. } => (Kind::Connack, None),
             OutboundFrame::Pubrec { packet_id, .. } => (Kind::Pubrec, Some(packet_id.get())),
             OutboundFrame::Pubcomp { packet_id, .. } => (Kind::Pubcomp, Some(packet_id.get())),
+            OutboundFrame::Pubrel { packet_id } => (Kind::Pubrel, Some(packet_id.get())),
         }
     }
 }

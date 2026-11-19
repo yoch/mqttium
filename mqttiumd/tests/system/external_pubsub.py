@@ -78,18 +78,18 @@ def _subscription_event(row):
 
 
 def effective_qos(published_qos: int, granted_qos: int) -> int:
-    """The six cells of this receipt's explicitly bounded delivery profile."""
-    if published_qos not in (0, 1, 2) or granted_qos not in (0, 1):
-        raise ValueError('published QoS 0/1/2 and granted QoS 0/1 required')
+    """MQTT matches the smaller of the published QoS and the grant."""
+    if published_qos not in (0, 1, 2) or granted_qos not in (0, 1, 2):
+        raise ValueError('published and granted QoS must be 0, 1 or 2')
     return min(published_qos, granted_qos)
 
 
 def _expected_qoses(requested, granted, delivery):
-    if granted is not None and granted not in (0, 1):
-        raise ValueError('expected granted QoS must be 0 or 1')
-    if delivery is not None and delivery not in (0, 1):
-        raise ValueError('expected delivery QoS must be 0, 1 or None for mixed delivery')
-    return min(requested, 1) if granted is None else granted
+    if granted is not None and granted not in (0, 1, 2):
+        raise ValueError('expected granted QoS must be 0, 1 or 2')
+    if delivery is not None and delivery not in (0, 1, 2):
+        raise ValueError('expected delivery QoS must be 0, 1, 2 or None for mixed delivery')
+    return requested if granted is None else granted
 
 
 async def _mqttium(action, host, port, client_id, *, filters=(), count=1, qos=1,
@@ -169,7 +169,7 @@ async def _mqttium(action, host, port, client_id, *, filters=(), count=1, qos=1,
                     row = _message(message)
                     result['messages'].append(row)
                     observations.record('message', **row)
-                    if int(message.qos) not in (0, 1) or (expected_delivery_qos is not None
+                    if int(message.qos) not in (0, 1, 2) or (expected_delivery_qos is not None
                                                         and int(message.qos) != expected_delivery_qos):
                         raise AssertionError('unexpected outgoing QoS')
                     if not int(message.qos):
@@ -185,7 +185,7 @@ async def _mqttium(action, host, port, client_id, *, filters=(), count=1, qos=1,
                             await asyncio.sleep(.005)
                         observations.record('ack_release_observed', packet_id=message.mid)
                     await client.ack(message)
-                    observations.record('manual_ack_submitted', packet_id=message.mid, qos=1)
+                    observations.record('manual_ack_submitted', packet_id=message.mid, qos=int(message.qos))
     except SubscribeError as error:
         result['status'] = 'rejected'
         row = {'packet_id': error.result.mid, 'filters': list(filters),
@@ -368,7 +368,7 @@ def _paho(action, host, port, client_id, *, filters=(), count=1, qos=1,
                 row = _message(message)
                 result['messages'].append(row)
                 observations.record('message', **row)
-                if message.qos not in (0, 1) or (expected_delivery_qos is not None
+                if message.qos not in (0, 1, 2) or (expected_delivery_qos is not None
                                                and message.qos != expected_delivery_qos):
                     raise AssertionError('unexpected outgoing QoS')
                 if message.qos == 0:
@@ -387,7 +387,7 @@ def _paho(action, host, port, client_id, *, filters=(), count=1, qos=1,
                     observations.record('ack_release_observed', packet_id=message.mid)
                 if client.ack(message.mid, message.qos) != mqtt.MQTT_ERR_SUCCESS:
                     raise RuntimeError('manual acknowledgement submission refused')
-                observations.record('manual_ack_submitted', packet_id=message.mid, qos=1)
+                observations.record('manual_ack_submitted', packet_id=message.mid, qos=message.qos)
     except (TimeoutError, queue.Empty):
         result['status'] = 'timeout'
         observations.record('timeout', phase=action)
@@ -439,9 +439,9 @@ def main():
     parser.add_argument('--wait-timeout', type=float, default=5)
     parser.add_argument('--receive-maximum', type=int, default=8)
     parser.add_argument('--maximum-packet-size', type=int, default=65536)
-    parser.add_argument('--expected-granted-qos', type=int, choices=(0, 1))
+    parser.add_argument('--expected-granted-qos', type=int, choices=(0, 1, 2))
     expected = parser.add_mutually_exclusive_group()
-    expected.add_argument('--expected-delivery-qos', type=int, choices=(0, 1), default=1)
+    expected.add_argument('--expected-delivery-qos', type=int, choices=(0, 1, 2), default=1)
     expected.add_argument('--allow-mixed-delivery-qos', action='store_true')
     args = parser.parse_args()
     options = dict(filters=args.filter, count=args.count, qos=args.qos,

@@ -55,9 +55,9 @@ async def call(kind, action, host, port, client_id, **options):
 
 class ExternalPubsubTests(unittest.IsolatedAsyncioTestCase):
     def test_effective_qos_matrix_keeps_published_and_subscription_qos_distinct(self):
-        self.assertEqual([[clients.effective_qos(published, granted) for granted in (0, 1)]
-                          for published in (0, 1, 2)], [[0, 0], [0, 1], [0, 1]])
-        for published, granted in ((3, 1), (1, 2)):
+        self.assertEqual([[clients.effective_qos(published, granted) for granted in (0, 1, 2)]
+                          for published in (0, 1, 2)], [[0, 0, 0], [0, 1, 1], [0, 1, 2]])
+        for published, granted in ((3, 1), (1, 3)):
             with self.assertRaises(ValueError):
                 clients.effective_qos(published, granted)
 

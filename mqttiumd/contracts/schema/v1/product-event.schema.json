@@ -120,6 +120,7 @@
         "SessionLifecycle",
         "RetainedQoS0",
         "DeliveryStarted",
+        "DeliveryPubrelReady",
         "MessageExpire",
         "MessageExpiry",
         "WillPublication",

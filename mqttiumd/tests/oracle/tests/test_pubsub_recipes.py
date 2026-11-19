@@ -57,16 +57,28 @@ class ProductRecipes(unittest.TestCase):
 
     def test_qos_grants_have_a_new_kind_without_reinterpreting_legacy_kind3(self):
         prefix = b"MQDR\x00\x01\x07" + scoped(24) + be(2) + be(1) + be(3)
-        data = prefix + b"\x03\x01\x00\x01a\x02\x00\x01b\x00\x00\x01c"
+        data = prefix + b"\x04\x01\x00\x01a\x02\x00\x01b\x00\x00\x01c\x03\x00\x01d"
         found = recipe.decode(data)
         self.assertEqual(found.kind, "UpdateSubscriptions")
         self.assertEqual([(change.topic, change.granted) for change in found.changes],
-                         [(b"a", 0), (b"b", 1), (b"c", None)])
+                         [(b"a", 0), (b"b", 1), (b"c", None), (b"d", 2)])
         old = recipe.decode(self.canonical("subscription"))
         self.assertEqual(old.kind, "ChangeSubscriptions")
         self.assertEqual(old.changes, (recipe.SubscriptionChange(b"p1/example", True),))
-        for invalid in (prefix + b"\x01\x03\x00\x01a", data[:-1], data + b"\x00"):
+        for invalid in (prefix + b"\x01\x04\x00\x01a", data[:-1], data + b"\x00"):
             with self.subTest(data=invalid.hex()), self.assertRaises(recipe.RecipeError):
+                recipe.decode(invalid)
+
+    def test_prepare_pubrel_preserves_the_claim_and_has_its_own_kind(self):
+        snapshot = ROOT / "contracts/examples/v1/valid/store-snapshot-qos2-pubrel-ready.json"
+        row = json.loads(snapshot.read_text())["operations"][-1]
+        data = bytes.fromhex(row["recipe_hex"])
+        found = recipe.decode(data)
+        self.assertIsInstance(found, recipe.PreparePubrel)
+        self.assertEqual(found.claim, (1, 1, 0, 21))
+        self.assertEqual((found.target, found.packet_id), (2, 5))
+        for invalid in (data[:-1], data + b"\x00"):
+            with self.assertRaises(recipe.RecipeError):
                 recipe.decode(invalid)
 
     def test_consumption_has_no_packet_identifier_or_claim(self):

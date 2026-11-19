@@ -321,11 +321,12 @@ pub struct PayloadRecord {
     pub references: u64,
 }
 
-/// Durable phase of an obligation. A QoS 0 consumption or guarded QoS 1
-/// finish removes it atomically; local network progress alone never does.
+/// Durable phase of an obligation. A guarded terminal operation removes it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ObligationPhase {
     Pending,
+    /// A claimed QoS 2 delivery must send PUBREL and await PUBCOMP.
+    AwaitPubcomp,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -345,7 +346,7 @@ pub struct InboundRecord {
     pub phase: InboundPhase,
 }
 
-/// A durable outgoing QoS 1 intent. Its claim operation also guards slot reuse.
+/// A durable outgoing intent. Its claim operation also guards slot reuse.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct OutboundRecord {
     pub target: SessionId,
@@ -358,7 +359,7 @@ pub struct OutboundRecord {
 
 /// One coherent live key page, ordered by DeliveryId, with the admitted QoS
 /// preserved independently of later subscription changes. A new scan starts
-/// at None. Current work paths select QoS 0/1; valid QoS 2 remains distinct.
+/// at None.
 #[derive(PartialEq, Eq, Debug)]
 pub struct WorkPage {
     pub items: BoundedVec<WorkItem>,

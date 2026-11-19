@@ -148,6 +148,7 @@ pub enum WorkKind {
     ChangeSubscriptions,
     ClaimDelivery,
     FinishDelivery,
+    PreparePubrel,
     ConsumeDelivery,
     UpdateSubscriptions,
     SessionLifecycle,
@@ -173,6 +174,7 @@ impl WorkKind {
             Self::ChangeSubscriptions => "ChangeSubscriptions",
             Self::ClaimDelivery => "ClaimDelivery",
             Self::FinishDelivery => "FinishDelivery",
+            Self::PreparePubrel => "PreparePubrel",
             Self::ConsumeDelivery => "ConsumeDelivery",
             Self::UpdateSubscriptions => "UpdateSubscriptions",
             Self::SessionLifecycle => "SessionLifecycle",
@@ -531,6 +533,9 @@ fn describe(work: &Work) -> (WorkKind, Option<OperationId>, Source) {
             Recipe::ClaimDelivery(claim) => (WorkKind::ClaimDelivery, Some(claim.operation), None),
             Recipe::FinishDelivery(finish) => {
                 (WorkKind::FinishDelivery, Some(finish.operation), None)
+            }
+            Recipe::PreparePubrel(delivery) => {
+                (WorkKind::PreparePubrel, Some(delivery.operation), None)
             }
             Recipe::ConsumeDelivery(consume) => {
                 (WorkKind::ConsumeDelivery, Some(consume.operation), None)

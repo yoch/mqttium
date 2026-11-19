@@ -20,7 +20,7 @@ use mqttiumd_contract::ids::{
 };
 use mqttiumd_contract::message_expiry::{MessageExpiry, MessageTime};
 use mqttiumd_contract::outcome::{CommitFacts, StoreOutcome, StoreReply};
-use mqttiumd_contract::packet::{InboundPacket, OutboundFrame};
+use mqttiumd_contract::packet::{InboundPacket, OutboundFrame, Qos2Ack};
 use mqttiumd_contract::pubsub::{PubackTarget, Qos0DropReason, Qos0Origin};
 use mqttiumd_contract::receipts::{
     ClosedReceiptCollection, ClosedReceiptReply, ReceiptCollectionReply,
@@ -1281,7 +1281,7 @@ impl Runtime<'_> {
                     }
                 }
                 Input::Packet {
-                    packet: InboundPacket::Puback { .. },
+                    packet: InboundPacket::Puback { .. } | InboundPacket::Qos2Ack { .. },
                     ..
                 } => return Err(Failure::plain("uncorrelated_puback_input")),
                 Input::Packet {
@@ -1606,6 +1606,8 @@ impl Runtime<'_> {
         self.outgoing_bindings
             .retain(|(connection, packet_id), target| {
                 owner.puback_target(*connection, *packet_id) == Some(*target)
+                    || owner.qos2_ack_target(*connection, *packet_id, Qos2Ack::Pubrec)
+                        == Some(*target)
             });
     }
     fn schedule_maintenance(&mut self) {
@@ -2098,7 +2100,8 @@ impl Runtime<'_> {
                     })),
                 ..
             } => Some((*session, false)),
-            Input::ObservedPuback { connection, .. } => Some((connection.session, false)),
+            Input::ObservedPuback { connection, .. }
+            | Input::ObservedQos2Ack { connection, .. } => Some((connection.session, false)),
             Input::FrameResult { connection, .. } | Input::Qos0EmitRefused { connection, .. } => {
                 Some((connection.session, false))
             }
@@ -2760,6 +2763,33 @@ impl Runtime<'_> {
                     }
                     return self.queue(Input::ObservedPuback {
                         connection,
+                        packet_id,
+                        reason,
+                        target,
+                    });
+                }
+                if let InboundPacket::Qos2Ack {
+                    kind,
+                    packet_id,
+                    reason,
+                } = packet
+                {
+                    let session = self
+                        .peers
+                        .get(&generation)
+                        .and_then(|peer| peer.session)
+                        .ok_or_else(|| Failure::plain("qos2_ack_session_unconfirmed"))?;
+                    let connection = ConnectionKey {
+                        session,
+                        generation,
+                    };
+                    let target = self
+                        .outgoing_bindings
+                        .get(&(connection, packet_id))
+                        .copied();
+                    return self.queue(Input::ObservedQos2Ack {
+                        connection,
+                        kind,
                         packet_id,
                         reason,
                         target,
@@ -3992,9 +4022,32 @@ impl EffectSink for Sink<'_> {
                 connection,
                 frame,
                 publish_order,
+                pubrel,
             } => {
                 let (connection, frame) = (*connection, *frame);
                 let receive_serial = *publish_order;
+                let binding = match (*pubrel, frame) {
+                    (Some((delivery, claim)), OutboundFrame::Pubrel { packet_id }) => {
+                        let key = (connection, packet_id);
+                        if self.outgoing_bindings.len() >= OUTGOING_BINDINGS {
+                            return refused(effect, SubmitBlock::InFlightLimit);
+                        }
+                        if self.outgoing_bindings.contains_key(&key) {
+                            self.error = Some(Failure::plain("pubrel_binding_conflict"));
+                            return refused(effect, SubmitBlock::InFlightLimit);
+                        }
+                        Some((
+                            key,
+                            PubackTarget {
+                                delivery,
+                                claim,
+                                frame: id,
+                            },
+                        ))
+                    }
+                    (None, _) => None,
+                    (Some(_), _) => unreachable!("only PUBREL binds an outgoing occurrence here"),
+                };
                 let terminal = match frame {
                     OutboundFrame::Puback { .. } => Some(Terminal::Puback),
                     OutboundFrame::Pubcomp { .. } => Some(Terminal::Pubcomp),
@@ -4061,6 +4114,9 @@ impl EffectSink for Sink<'_> {
                     bytes,
                 }) {
                     Ok(()) => {
+                        if let Some((key, target)) = binding {
+                            self.outgoing_bindings.insert(key, target);
+                        }
                         if kind == "CONNACK" {
                             // Pipeline processing starts only after the core's
                             // CONNACK occupies the ordered socket output queue.
@@ -4236,6 +4292,7 @@ impl EffectSink for Sink<'_> {
                 connection,
                 delivery,
                 cause,
+                qos,
                 packet_id,
                 claim,
                 topic,
@@ -4292,9 +4349,9 @@ impl EffectSink for Sink<'_> {
                 let version = peer.version.unwrap_or_default();
                 let retain =
                     retain && (version == Version::V5 || *cause == DeliveryCause::RetainedReplay);
-                let encoded = match codec::encode_publish_for(
+                let encoded = match codec::encode_delivery_for(
                     version,
-                    packet_id,
+                    (packet_id, *qos),
                     topic,
                     payload,
                     dup,
@@ -4368,7 +4425,9 @@ impl EffectSink for Sink<'_> {
 fn input_connection(input: &Input) -> Option<ConnectionGeneration> {
     match input {
         Input::Packet { connection, .. } => Some(*connection),
-        Input::ObservedPuback { connection, .. } => Some(connection.generation),
+        Input::ObservedPuback { connection, .. } | Input::ObservedQos2Ack { connection, .. } => {
+            Some(connection.generation)
+        }
         _ => None,
     }
 }
@@ -4394,6 +4453,7 @@ fn frame_info(frame: OutboundFrame) -> (&'static str, Option<u16>) {
         OutboundFrame::Puback { packet_id, .. } => ("PUBACK", Some(packet_id.get())),
         OutboundFrame::Pubrec { packet_id, .. } => ("PUBREC", Some(packet_id.get())),
         OutboundFrame::Pubcomp { packet_id, .. } => ("PUBCOMP", Some(packet_id.get())),
+        OutboundFrame::Pubrel { packet_id } => ("PUBREL", Some(packet_id.get())),
         OutboundFrame::Suback { packet_id, .. } => ("SUBACK", Some(packet_id.get())),
         OutboundFrame::Unsuback { packet_id, .. } => ("UNSUBACK", Some(packet_id.get())),
     }

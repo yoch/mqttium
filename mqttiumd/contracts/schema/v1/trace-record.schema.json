@@ -2024,6 +2024,9 @@
                       },
                       "started": {
                         "type": "boolean"
+                      },
+                      "await_pubcomp": {
+                        "const": true
                       }
                     }
                   }
@@ -2047,9 +2050,7 @@
                   ],
                   "properties": {
                     "qos": {
-                      "not": {
-                        "const": 1
-                      }
+                      "const": 0
                     }
                   }
                 },

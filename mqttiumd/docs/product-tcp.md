@@ -14,25 +14,26 @@ The adapter retains the protocol level for each transport generation.
 [Proposed 0038](decisions/0038-mqtt311-wire-profile.md) specifies the level-4
 profile. [Proposed 0040](decisions/0040-mqtt311-incoming-qos2.md) adds incoming
 QoS 2 with the same durable admission and replay state as MQTT 5.
+[Proposed 0041](decisions/0041-outgoing-qos2.md) describes the outbound exchanges.
 
 The product receives QoS 0/1/2 publications on both protocol levels, including
 durable retained values and zero-delay QoS 1 Wills with optional Retain.
 MQTT 5 supports Message Expiry. The broker delivers
-at QoS 0 or 1 to persistent exact and hierarchical subscriptions. Sessions and filters
+at QoS 0, 1 or 2 to persistent exact and hierarchical subscriptions. Sessions and filters
 are durable. Initially non-retained QoS 0 publications use a bounded volatile path;
 QoS 1/2 admissions atomically create durable recipient obligations. This is
 an experimental subset, not complete MQTT conformance, a Mosquitto replacement,
-or reception of all P1/P2 behavior. Outgoing QoS 2 remains outside it.
+or reception of all P1/P2 behavior.
 
 Effective delivery QoS is the minimum of the published and granted QoS:
 
-| Published QoS | Granted subscription 0 | Granted subscription 1 |
-| - | - | - |
-| 0 | Outgoing 0 | Outgoing 0 |
-| 1 | Outgoing 0 | Outgoing 1 |
-| 2 | Outgoing 0 | Outgoing 1 |
+| Published QoS | Granted subscription 0 | Granted subscription 1 | Granted subscription 2 |
+| - | - | - | - |
+| 0 | Outgoing 0 | Outgoing 0 | Outgoing 0 |
+| 1 | Outgoing 0 | Outgoing 1 | Outgoing 1 |
+| 2 | Outgoing 0 | Outgoing 1 | Outgoing 2 |
 
-A request for subscription QoS 2 grants QoS 1. Replacing a filter changes
+Replacing a filter changes
 future matching decisions, not the QoS of an existing obligation.
 
 ## Downloadable local preview
@@ -210,21 +211,21 @@ These helpers use the public APIs. The reception command
 waits for the broker's known lifecycle result and independent durable cleanup.
 
 The profile accepts ordinary and retained QoS 0/1/2 PUBLISH, PUBREL, hierarchical SUBSCRIBE and
-UNSUBSCRIBE, recipient PUBACK, PINGREQ and ordinary DISCONNECT. Completed valid
+UNSUBSCRIBE, recipient PUBACK/PUBREC/PUBCOMP, PINGREQ and ordinary DISCONNECT. Completed valid
 packets reset the 1.5-times-Keep-Alive deadline; fragments do not. Keep Alive 0
 disables that MQTT timer, not partial-packet/write deadlines. PINGREQ passes
 through the core and produces PINGRESP.
 
 MQTT Username/Password, Enhanced Authentication, shared subscriptions,
-subscription identifiers, topic aliases, PUBLISH properties and outgoing
-QoS 2 are not implemented. No Local, Retain As Published and valid Retain
+subscription identifiers and topic aliases are outside this profile. No Local,
+Retain As Published and valid Retain
 Handling values are accepted and durably preserved per subscription. No Local
 removes only its own matching contribution before aggregation. RAP is combined across eligible live contributions; retained replay always sets
 RETAIN1. RH is evaluated per ordered filter occurrence as described below. Subscription properties remain outside the profile.
 Malformed options are distinguished from well-formed unsupported options.
 
 Necessary CONNECT properties are validated. Peer Maximum Packet Size constrains
-every output. Peer Receive Maximum constrains QoS 1 output in addition to the
+every output. Peer Receive Maximum constrains QoS 1 and QoS 2 output in addition to the
 local limit; QoS 0 neither consumes nor returns receive-window credit in either
 direction. Topic Alias Maximum and Request Problem Information are checked;
 no alias or diagnostic string is emitted. CONNACK advertises Receive Maximum 8,
@@ -278,7 +279,7 @@ reconcile knowledge but do not authorize output on a retired connection.
 
 ## Filters, ordering and initially QoS 0
 
-SUBSCRIBE grants QoS 0 for a request of 0 and QoS 1 for requests of 1 or 2.
+SUBSCRIBE grants the requested QoS 0, 1 or 2 to an eligible filter.
 Unsupported shared/wildcard filters are refused per filter, with results in
 request order. The durable SessionId/revision owns the subscription. Replacement
 of the same session/filter, including 0→1 and 1→0, is atomic without duplicate
@@ -514,7 +515,7 @@ are labeled rather than presented as ordinary product configuration changes.
 These are finite system tests. Existing K1/K2b/K3 qualifications and proof/model
 limits stay separate; no new path automatically qualifies all P1/P2. ADRs
 0024/0025/0026/0027/0028 retain Proposed status and guard partitions stay incomplete.
-Legacy epoch-zero/session collection, indefinite operation, outgoing QoS 2,
+Legacy epoch-zero/session collection, indefinite operation,
 shared delivery, runtime management of authorization policy, deployment
 security and performance remain separate. Process SIGKILL is not a power-loss
 or universal storage guarantee.
@@ -676,7 +677,7 @@ demo. These are product system tests, separate from the existing qualifying
 K1/K2b/K3 fixture scope. The package's `demo.sh` executes the short Mosquitto
 publish-before-dashboard, restart, replace and empty-retained-clear guide.
 The retained reception here covers MQTT 5. Username/Password, Enhanced
-Authentication, shared subscriptions, Subscription Identifiers, outgoing QoS 2
+Authentication, shared subscriptions, Subscription Identifiers
 and general migration remain outside the profile.
 
 ## Message Expiry (Proposed0033)
@@ -721,7 +722,7 @@ remain. Correlated lifecycle/receipt controls retain independent lanes.
 Run `tools/run_message_expiry_reception.sh /tmp/message-expiry-reception` from
 this directory. Its new tests are system evidence, not extension of historical
 K1/K2b/K3 independent-oracle qualification. Message Expiry does not implement
-shared subscriptions, outgoing QoS 2, dynamic authentication or schema migration.
+shared subscriptions, dynamic authentication or schema migration.
 
 
 ## Zero-delay durable Will (Proposed0034)

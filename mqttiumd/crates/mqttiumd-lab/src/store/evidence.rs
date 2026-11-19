@@ -238,6 +238,12 @@ fn facts(facts: CommitFacts) -> Value {
             packet_id,
             claim,
         }
+        | CommitFacts::DeliveryPubrelReady {
+            delivery,
+            target,
+            packet_id,
+            claim,
+        }
         | CommitFacts::DeliveryExpired {
             delivery,
             target,
@@ -247,6 +253,7 @@ fn facts(facts: CommitFacts) -> Value {
             "kind": match facts {
                 CommitFacts::DeliveryClaimed { .. } => "DeliveryClaimed",
                 CommitFacts::DeliveryStarted { .. } => "DeliveryStarted",
+                CommitFacts::DeliveryPubrelReady { .. } => "DeliveryPubrelReady",
                 CommitFacts::DeliveryExpired { .. } => "DeliveryExpired",
                 _ => "DeliveryFinished",
             },
@@ -410,6 +417,7 @@ pub fn snapshot(state: &DurableState, context: SnapshotContext<'_>) -> Value {
                 "effective_qos": qos(record.qos),
                 "phase": match record.phase {
                     ObligationPhase::Pending => "Queued",
+                    ObligationPhase::AwaitPubcomp => "AwaitPubcomp",
                 },
             });
             if record.retain {
@@ -442,7 +450,11 @@ pub fn snapshot(state: &DurableState, context: SnapshotContext<'_>) -> Value {
                 "target_revision": decimal(record.target_revision.get()),
                 "packet_id": record.packet_id.get(),
                 "claim_operation_id": operation_id(record.claim),
-                "phase": "AwaitPuback",
+                "phase": match state.obligations.get(delivery) {
+                    Some(obligation) if obligation.phase == ObligationPhase::AwaitPubcomp => "AwaitPubcomp",
+                    Some(obligation) if obligation.qos == Qos::ExactlyOnce => "AwaitPubrec",
+                    _ => "AwaitPuback",
+                },
                 "emission": "MayHaveStarted",
             });
             if record.started {
@@ -622,6 +634,7 @@ pub fn recovered_fact(fact: &RecoveredFact) -> Value {
                 "claim": claim.map(|claim| {
                     let mut value = json!({ "operation_id": operation_id(claim.operation), "packet_id": claim.packet_id.get() });
                     if claim.started { value["started"] = json!(true); }
+                    if claim.await_pubcomp { value["await_pubcomp"] = json!(true); }
                     value
                 }),
             });
@@ -951,6 +964,7 @@ impl<'a> TraceWriter<'a> {
                     | WorkKind::ChangeSubscriptions
                     | WorkKind::ClaimDelivery
                     | WorkKind::FinishDelivery
+                    | WorkKind::PreparePubrel
                     | WorkKind::ConsumeDelivery
                     | WorkKind::UpdateSubscriptions
                     | WorkKind::SessionLifecycle => self.record(

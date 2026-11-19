@@ -3000,6 +3000,7 @@ pub fn outgoing_work_is_bounded_and_independent_of_notifications<S: DurableStore
     };
     let claim = DeliveryClaim {
         started: false,
+        await_pubcomp: false,
         operation: operation_id(world.epoch, 20),
         packet_id: OutboundPacketId::new(7).unwrap(),
     };

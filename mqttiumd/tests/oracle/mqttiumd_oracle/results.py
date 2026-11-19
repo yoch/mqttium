@@ -242,7 +242,7 @@ def _scope_unmet(contracts, scenario_path, trace_path):
         for operation in snapshot["operations"]:
             recipe = bytes.fromhex(operation["recipe_hex"])
             if recipe[:6] == b"MQDR\x00\x01" and len(recipe) >= 7:
-                unsupported |= recipe[6] in (3, 4, 5, 7, 9)
+                unsupported |= recipe[6] in (3, 4, 5, 7, 9, 19)
                 qos0_delivery |= recipe[6] == 6
                 session_lifecycle |= recipe[6] == 8
                 retained |= recipe[6] in (10, 11, 12)
@@ -256,7 +256,7 @@ def _scope_unmet(contracts, scenario_path, trace_path):
                 non_qos2 |= isinstance(decoded, recipes.Admit) and decoded.qos != 2
             facts = operation["decision"].get("facts", {})
             unsupported |= facts.get("kind") in {
-                "SubscriptionsChanged", "DeliveryClaimed", "DeliveryFinished"
+                "SubscriptionsChanged", "DeliveryClaimed", "DeliveryFinished", "DeliveryPubrelReady"
             }
             qos0_delivery |= facts.get("kind") == "DeliveryConsumed"
             session_lifecycle |= facts.get("kind") == "SessionLifecycle"
@@ -266,7 +266,7 @@ def _scope_unmet(contracts, scenario_path, trace_path):
     for record in run.trace.records:
         payload = record.payload
         unsupported |= payload.get("command_kind") in {
-            "ChangeSubscriptions", "UpdateSubscriptions", "ClaimDelivery", "FinishDelivery"
+            "ChangeSubscriptions", "UpdateSubscriptions", "ClaimDelivery", "FinishDelivery", "PreparePubrel"
         }
         qos0_delivery |= payload.get("command_kind") == "ConsumeDelivery"
         session_lifecycle |= payload.get("command_kind") == "SessionLifecycle"

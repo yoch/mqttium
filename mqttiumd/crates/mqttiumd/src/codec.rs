@@ -2,7 +2,7 @@
 
 use mqttiumd_contract::ids::{InboundPacketId, OutboundPacketId};
 use mqttiumd_contract::packet::{
-    AckReason, InboundPacket, OutboundFrame, PubackReason, Qos, SharedBytes,
+    AckReason, InboundPacket, OutboundFrame, PubackReason, Qos, Qos2Ack, SharedBytes,
 };
 use mqttiumd_contract::pubsub::{FilterList, MAX_FILTERS, SubscriptionFilter, SubscriptionOptions};
 use mqttiumd_contract::session::SessionExpiry;
@@ -900,6 +900,29 @@ fn puback(version: Version, body: &[u8]) -> Result<Packet, Error> {
     Ok(Packet::Core(InboundPacket::Puback { packet_id, reason }))
 }
 
+fn qos2_ack(version: Version, kind: Qos2Ack, body: &[u8]) -> Result<Packet, Error> {
+    let mut input = Cursor::new(body);
+    let packet_id =
+        OutboundPacketId::new(input.u16()?).ok_or_else(|| protocol("ZeroPacketIdentifier"))?;
+    let reason = if version == Version::V311 || input.is_empty() {
+        0
+    } else {
+        input.byte()?
+    };
+    if !kind.accepts(reason) {
+        return Err(protocol("InvalidQos2AckReason"));
+    }
+    if version == Version::V5 && !input.is_empty() {
+        properties(&mut input, Context::Acknowledge)?;
+    }
+    input.end()?;
+    Ok(Packet::Core(InboundPacket::Qos2Ack {
+        kind,
+        packet_id,
+        reason,
+    }))
+}
+
 /// Decode a complete packet body. No application-owned bytes are copied
 /// until field and profile validation have completed.
 pub fn decode(first: u8, body: &[u8], bounds: Bounds) -> Result<Packet, Error> {
@@ -936,7 +959,9 @@ pub fn decode_for(
         1 => client_connect(body, bounds),
         3 => publish(version, first, body, bounds),
         4 => puback(version, body),
+        5 => qos2_ack(version, Qos2Ack::Pubrec, body),
         6 => pubrel(version, body),
+        7 => qos2_ack(version, Qos2Ack::Pubcomp, body),
         8 => subscribe(version, body, false, bounds),
         10 => subscribe(version, body, true, bounds),
         12 if body.is_empty() => Ok(Packet::Core(InboundPacket::Pingreq)),
@@ -1046,6 +1071,10 @@ pub fn encode(frame: OutboundFrame) -> Result<Vec<u8>, Error> {
         ]),
         OutboundFrame::Pubrec { packet_id, reason } => ack(0x50, packet_id, reason),
         OutboundFrame::Pubcomp { packet_id, reason } => ack(0x70, packet_id, reason),
+        OutboundFrame::Pubrel { packet_id } => {
+            let [high, low] = packet_id.get().to_be_bytes();
+            Ok(vec![0x62, 2, high, low])
+        }
         OutboundFrame::Pingresp => Ok(vec![0xd0, 0]),
     }
 }
@@ -1070,6 +1099,7 @@ pub fn encode_for(version: Version, frame: OutboundFrame) -> Result<Vec<u8>, Err
             reason: AckReason::Success,
             ..
         }
+        | OutboundFrame::Pubrel { .. }
         | OutboundFrame::Pingresp => encode(frame),
         OutboundFrame::Pubcomp {
             packet_id,
@@ -1228,9 +1258,29 @@ pub fn encode_publish_for(
     retain: bool,
     remaining: Option<u32>,
 ) -> Result<EncodedPublish, Error> {
+    encode_delivery_for(
+        version,
+        (packet_id, Qos::AtLeastOnce),
+        topic_name,
+        payload,
+        dup,
+        retain,
+        remaining,
+    )
+}
+
+pub(crate) fn encode_delivery_for(
+    version: Version,
+    packet: (OutboundPacketId, Qos),
+    topic_name: &SharedBytes,
+    payload: &SharedBytes,
+    dup: bool,
+    retain: bool,
+    remaining: Option<u32>,
+) -> Result<EncodedPublish, Error> {
     encode_publication(
         version,
-        Some(packet_id),
+        Some(packet),
         topic_name,
         payload,
         dup,
@@ -1241,7 +1291,7 @@ pub fn encode_publish_for(
 
 fn encode_publication(
     version: Version,
-    packet_id: Option<OutboundPacketId>,
+    packet: Option<(OutboundPacketId, Qos)>,
     topic_name: &SharedBytes,
     payload: &SharedBytes,
     dup: bool,
@@ -1262,7 +1312,7 @@ fn encode_publication(
         .checked_add(payload.len())
         .and_then(|n| {
             n.checked_add(
-                2 + if packet_id.is_some() { 2 } else { 0 } + usize::from(version == Version::V5),
+                2 + if packet.is_some() { 2 } else { 0 } + usize::from(version == Version::V5),
             )
         })
         .and_then(|n| n.checked_add(if remaining.is_some() { 5 } else { 0 }))
@@ -1283,8 +1333,8 @@ fn encode_publication(
         .try_reserve_exact(total)
         .map_err(|_| protocol("OutgoingAllocationFailed"))?;
     bytes.push(
-        (if packet_id.is_some() {
-            0x32 | if dup { 8 } else { 0 }
+        (if let Some((_, qos)) = packet {
+            0x30 | (qos.to_wire() << 1) | if dup { 8 } else { 0 }
         } else {
             0x30
         }) | u8::from(retain),
@@ -1303,7 +1353,7 @@ fn encode_publication(
     }
     bytes.extend_from_slice(&(topic_name.len() as u16).to_be_bytes());
     bytes.extend_from_slice(topic_name.as_slice());
-    if let Some(packet_id) = packet_id {
+    if let Some((packet_id, _)) = packet {
         bytes.extend_from_slice(&packet_id.get().to_be_bytes());
     }
     let expiry_value_offset = if let Some(remaining) = remaining {

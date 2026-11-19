@@ -390,20 +390,32 @@ fn delivery_claim(
         return Err(ReadError::InvalidData);
     }
     let Some(claim) = state.outbound.get(&delivery) else {
-        return Ok(None);
+        return if record.phase == ObligationPhase::Pending {
+            Ok(None)
+        } else {
+            Err(ReadError::InvalidData)
+        };
     };
     if claim.target != record.target
         || claim.target_revision != record.target_revision
-        || record.qos != Qos::AtLeastOnce
         || claim.claim.incarnation() != state.ledger.incarnation()
     {
         return Err(ReadError::InvalidData);
     }
-    Ok(Some(DeliveryClaim {
+    let claim = DeliveryClaim {
         operation: claim.claim,
         packet_id: claim.packet_id,
         started: claim.started,
-    }))
+        await_pubcomp: record.phase == ObligationPhase::AwaitPubcomp,
+    };
+    let timed = state
+        .publications
+        .get(&delivery.publication)
+        .is_some_and(|p| p.expiry.is_some());
+    if !claim.valid_for(record.qos, timed) {
+        return Err(ReadError::InvalidData);
+    }
+    Ok(Some(claim))
 }
 
 fn check_inventory_bound(state: &DurableState) -> Result<(), ReadError> {
@@ -526,7 +538,6 @@ fn check_delivery_metadata(
     if (record.retain && !publication.retain)
         || (record.cause == mqttiumd_contract::command::DeliveryCause::RetainedReplay
             && (!record.retain
-                || !matches!(record.qos, Qos::AtMostOnce | Qos::AtLeastOnce)
                 || publication.retained_version.is_none()
                 || publication.retained_version == Some(delivery.publication)))
         || (record.cause == mqttiumd_contract::command::DeliveryCause::LiveExact
@@ -699,6 +710,7 @@ trait Staging {
     ) -> Guard<CommitFacts>;
     fn stage_claim(&mut self, command: &ClaimDelivery) -> Guard<CommitFacts>;
     fn stage_finish(&mut self, command: &FinishDelivery) -> Guard<CommitFacts>;
+    fn stage_pubrel(&mut self, command: &FinishDelivery) -> Guard<CommitFacts>;
     fn stage_started(&mut self, command: &MarkDeliveryStarted) -> Guard<CommitFacts>;
     fn stage_expired(&mut self, command: &ExpireDelivery) -> Guard<CommitFacts>;
     fn stage_consume(&mut self, command: &ConsumeDelivery) -> Guard<CommitFacts>;
@@ -1035,9 +1047,6 @@ impl Staging for DurableState {
                 return Err(failed);
             }
             if let Some(qos) = granted {
-                if !matches!(qos, Qos::AtMostOnce | Qos::AtLeastOnce) {
-                    return Err(failed);
-                }
                 let targets = self.routes.entry(topic.as_slice().to_vec()).or_default();
                 if let Some(target) = targets.iter_mut().find(|target| target.session == session) {
                     target.qos = qos;
@@ -1083,7 +1092,8 @@ impl Staging for DurableState {
         let record = self.obligations.get(&command.delivery).ok_or(failed)?;
         if record.target != command.target
             || record.target_revision != command.target_revision
-            || record.qos != Qos::AtLeastOnce
+            || record.qos == Qos::AtMostOnce
+            || record.phase != ObligationPhase::Pending
             || self.outbound.contains_key(&command.delivery)
             || self
                 .outbound
@@ -1149,6 +1159,13 @@ impl Staging for DurableState {
         {
             return Err(failed);
         }
+        if self
+            .obligations
+            .get(&command.delivery)
+            .is_none_or(|record| record.phase != ObligationPhase::Pending)
+        {
+            return Err(failed);
+        }
         let slot = self.outbound.get_mut(&command.delivery).ok_or(failed)?;
         if slot.target != command.target
             || slot.target_revision != command.target_revision
@@ -1167,6 +1184,31 @@ impl Staging for DurableState {
         })
     }
 
+    fn stage_pubrel(&mut self, command: &FinishDelivery) -> Guard<CommitFacts> {
+        let failed = RejectReason::PreconditionFailed;
+        self.active_session(command.target, command.target_revision)?;
+        let slot = self.outbound.get(&command.delivery).ok_or(failed)?;
+        if slot.target != command.target
+            || slot.target_revision != command.target_revision
+            || slot.packet_id != command.packet_id
+            || slot.claim != command.claim
+        {
+            return Err(failed);
+        }
+        let record = self.obligations.get_mut(&command.delivery).ok_or(failed)?;
+        if record.qos != Qos::ExactlyOnce || record.phase != ObligationPhase::Pending {
+            return Err(failed);
+        }
+        record.phase = ObligationPhase::AwaitPubcomp;
+        self.charge(Accounts::RECEIPT)?;
+        Ok(CommitFacts::DeliveryPubrelReady {
+            delivery: command.delivery,
+            target: command.target,
+            packet_id: command.packet_id,
+            claim: command.claim,
+        })
+    }
+
     fn stage_expired(&mut self, command: &ExpireDelivery) -> Guard<CommitFacts> {
         let failed = RejectReason::PreconditionFailed;
         check_message_observation(self, command.observed).map_err(|_| failed)?;
@@ -1176,6 +1218,10 @@ impl Staging for DurableState {
             .get(&command.finish.delivery.publication)
             .ok_or(failed)?;
         if slot.started
+            || self
+                .obligations
+                .get(&command.finish.delivery)
+                .is_none_or(|record| record.phase != ObligationPhase::Pending)
             || publication.expiry != Some(command.expiry)
             || command.expiry.state(command.observed) != Ok(ExpiryState::Expired)
         {
@@ -2236,6 +2282,7 @@ impl DurableStore for MemoryStore {
             Recipe::ChangeSubscriptions(command) => staged.stage_subscriptions(command),
             Recipe::ClaimDelivery(command) => staged.stage_claim(command),
             Recipe::FinishDelivery(command) => staged.stage_finish(command),
+            Recipe::PreparePubrel(command) => staged.stage_pubrel(command),
             Recipe::ConsumeDelivery(command) => staged.stage_consume(command),
             Recipe::UpdateSubscriptions(command) => staged.stage_updates(command),
             Recipe::SessionLifecycle(command) => staged.stage_session(command),
@@ -2394,10 +2441,7 @@ impl DurableStore for MemoryStore {
             BoundedVec::with_capacity(limit).map_err(|_| ReadError::AllocationFailed)?;
         let mut more = false;
         for (delivery, record) in &state.obligations {
-            if after.is_some_and(|after| *delivery <= after)
-                || record.target != session
-                || !matches!(record.qos, Qos::AtMostOnce | Qos::AtLeastOnce)
-            {
+            if after.is_some_and(|after| *delivery <= after) || record.target != session {
                 continue;
             }
             if items.len() == limit {

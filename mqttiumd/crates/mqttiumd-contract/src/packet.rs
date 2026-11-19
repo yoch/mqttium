@@ -126,6 +126,31 @@ pub enum InboundPacket {
         packet_id: OutboundPacketId,
         reason: u8,
     },
+    /// Acknowledgement of a broker-originated QoS 2 exchange.
+    Qos2Ack {
+        kind: Qos2Ack,
+        packet_id: OutboundPacketId,
+        reason: u8,
+    },
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Qos2Ack {
+    Pubrec,
+    Pubcomp,
+}
+
+impl Qos2Ack {
+    #[must_use]
+    pub const fn accepts(self, reason: u8) -> bool {
+        match self {
+            Self::Pubrec => matches!(
+                reason,
+                0 | 0x10 | 0x80 | 0x83 | 0x87 | 0x90 | 0x91 | 0x97 | 0x99
+            ),
+            Self::Pubcomp => matches!(reason, 0 | 0x92),
+        }
+    }
 }
 
 /// Outcome carried by a PUBREC or PUBCOMP of the subset.
@@ -229,6 +254,9 @@ pub enum OutboundFrame {
     Pubcomp {
         packet_id: InboundPacketId,
         reason: AckReason,
+    },
+    Pubrel {
+        packet_id: OutboundPacketId,
     },
 }
 

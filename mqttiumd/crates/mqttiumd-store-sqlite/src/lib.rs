@@ -87,10 +87,10 @@ use mqttiumd_contract::packet::{Qos, SharedBytes};
 use mqttiumd_store_api::{
     Accounts, AdminCommand, AdminDone, AdminRefused, Applied, Decision, Durability, DurableState,
     DurableStore, InboundRecord, Limits, MAX_CLIENT_ID_BYTES, MAX_RECOVERY_INVENTORY_ROWS,
-    MessageExpirySweep, ObligationRecord, OperationRecord, OutboundRecord, PayloadRecord,
-    PublicationRecord, ReadBudget, ReadError, RecoveryCursor, RecoveryPage, RecoveryRefused,
-    Resolved, RetainedRecord, RouteTarget, SessionClockAnchor, SessionClockReading, SessionRecord,
-    SessionState, WorkPage,
+    MessageExpirySweep, ObligationPhase, ObligationRecord, OperationRecord, OutboundRecord,
+    PayloadRecord, PublicationRecord, ReadBudget, ReadError, RecoveryCursor, RecoveryPage,
+    RecoveryRefused, Resolved, RetainedRecord, RouteTarget, SessionClockAnchor,
+    SessionClockReading, SessionRecord, SessionState, WorkPage,
 };
 
 use mqttiumd_contract::receipts::{
@@ -636,7 +636,7 @@ impl DecisionColumns {
                 self.reason.ok_or(Corrupt)?,
                 self.resource,
             )?)),
-            4..=12 => Ok(Decision::Committed(pubsub::decode_facts(
+            4..=13 => Ok(Decision::Committed(pubsub::decode_facts(
                 self.decision,
                 self.facts.as_deref().ok_or(Corrupt)?,
             )?)),
@@ -2168,7 +2168,7 @@ impl SqliteStore {
             },
         )?;
         section(
-            "SELECT o.publication,o.idx,o.target,o.target_revision,c.packet_id,c.claim,c.target,c.target_revision,o.qos,s.revision,s.state,p.expiry_domain,p.expiry_tick,p.expiry_interval,c.started FROM obligations o LEFT JOIN publications p ON p.id=o.publication LEFT JOIN outbound c ON c.publication=o.publication AND c.idx=o.idx LEFT JOIN sessions s ON s.id=o.target WHERE ?1=?1 AND ?2=?2 ORDER BY o.publication,o.idx",
+            "SELECT o.publication,o.idx,o.target,o.target_revision,c.packet_id,c.claim,c.target,c.target_revision,o.qos,s.revision,s.state,p.expiry_domain,p.expiry_tick,p.expiry_interval,c.started,o.phase FROM obligations o LEFT JOIN publications p ON p.id=o.publication LEFT JOIN outbound c ON c.publication=o.publication AND c.idx=o.idx LEFT JOIN sessions s ON s.id=o.target WHERE ?1=?1 AND ?2=?2 ORDER BY o.publication,o.idx",
             &mut out,
             &mut position,
             &mut |row| {
@@ -2188,14 +2188,17 @@ impl SqliteStore {
                     return Err(Fault::Corrupt);
                 }
                 let qos = code_qos(row.get(8)?)?;
+                let expiry = message_expiry::decode(row, 11)?;
+                let await_pubcomp =
+                    code_obligation_phase(row.get(15)?)? == ObligationPhase::AwaitPubcomp;
                 let claim = match row.get_ref(4)? {
+                    rusqlite::types::ValueRef::Null if await_pubcomp => return Err(Fault::Corrupt),
                     rusqlite::types::ValueRef::Null => None,
                     _ => {
                         let operation =
                             OperationId::from_be_slice(reader::borrow_blob(row, 5, 32)?)
                                 .map_err(|_| Fault::Corrupt)?;
                         if operation.incarnation() != incarnation
-                            || qos != Qos::AtLeastOnce
                             || reader::borrow_blob(row, 6, 8)? != target.to_be_bytes()
                             || blob_u64(reader::borrow_blob(row, 7, 8)?)? != target_revision.get()
                         {
@@ -2204,6 +2207,7 @@ impl SqliteStore {
                         Some(mqttiumd_contract::pubsub::DeliveryClaim {
                             operation,
                             started: message_expiry::started(row, 14)?,
+                            await_pubcomp,
                             packet_id: u16::try_from(row.get::<_, i64>(4)?)
                                 .ok()
                                 .and_then(OutboundPacketId::new)
@@ -2211,12 +2215,15 @@ impl SqliteStore {
                         })
                     }
                 };
+                if claim.is_some_and(|claim| !claim.valid_for(qos, expiry.is_some())) {
+                    return Err(Fault::Corrupt);
+                }
                 Ok(Ok(RecoveredFact::OutboundDelivery {
                     delivery,
                     target,
                     target_revision,
                     qos,
-                    expiry: message_expiry::decode(row, 11)?,
+                    expiry,
                     started: claim.is_some_and(|c| c.started),
                     claim,
                 }))
@@ -2476,7 +2483,6 @@ fn read_snapshot(conn: &Connection, budget: ReadBudget) -> Result<DurableState, 
             if (record.retain && !publication.retain)
                 || (record.cause == mqttiumd_contract::command::DeliveryCause::RetainedReplay
                     && (!record.retain
-                        || !matches!(record.qos, Qos::AtMostOnce | Qos::AtLeastOnce)
                         || publication.retained_version.is_none()
                         || publication.retained_version == Some(delivery.publication)))
                 || (record.cause == mqttiumd_contract::command::DeliveryCause::LiveExact
@@ -2518,7 +2524,7 @@ fn read_snapshot(conn: &Connection, budget: ReadBudget) -> Result<DurableState, 
                     .is_some_and(|obligation: &ObligationRecord| {
                         obligation.target == target
                             && obligation.target_revision == target_revision
-                            && obligation.qos == Qos::AtLeastOnce
+                            && obligation.qos != Qos::AtMostOnce
                     })
                     || claim.incarnation() != meta.ledger.incarnation()
                 {
@@ -2526,6 +2532,15 @@ fn read_snapshot(conn: &Connection, budget: ReadBudget) -> Result<DurableState, 
                 }
                 outbound.insert(delivery, record);
             }
+        }
+        if obligations
+            .iter()
+            .any(|(delivery, obligation): (&DeliveryId, &ObligationRecord)| {
+                obligation.phase == ObligationPhase::AwaitPubcomp
+                    && (obligation.qos != Qos::ExactlyOnce || !outbound.contains_key(delivery))
+            })
+        {
+            return Err(Fault::Corrupt);
         }
         let mut inbound = BTreeMap::new();
         {
@@ -2832,6 +2847,7 @@ impl DurableStore for SqliteStore {
                 Recipe::ChangeSubscriptions(command) => pubsub::subscriptions(conn, meta, command)?,
                 Recipe::ClaimDelivery(command) => pubsub::claim(conn, meta, command)?,
                 Recipe::FinishDelivery(command) => pubsub::finish(conn, meta, command)?,
+                Recipe::PreparePubrel(command) => pubsub::prepare_pubrel(conn, meta, command)?,
                 Recipe::ConsumeDelivery(command) => pubsub::consume(conn, meta, command)?,
                 Recipe::UpdateSubscriptions(command) => pubsub::updates(conn, meta, command)?,
                 Recipe::SessionLifecycle(command) => sessions::stage(conn, meta, command)?,

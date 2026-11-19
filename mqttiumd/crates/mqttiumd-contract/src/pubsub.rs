@@ -134,7 +134,7 @@ impl Qos0DropReason {
     }
 }
 
-/// Durable intent that a QoS 1 delivery may have begun. It is not proof of
+/// Durable intent that a QoS 1 or 2 delivery may have begun. It is not proof of
 /// socket write or peer receipt. Its operation is also its slot generation.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct DeliveryClaim {
@@ -142,6 +142,17 @@ pub struct DeliveryClaim {
     pub packet_id: OutboundPacketId,
     /// A durable positive-byte observation; false after recovery is uncertain.
     pub started: bool,
+    /// Positive PUBREC committed. The next transmission is PUBREL.
+    pub await_pubcomp: bool,
+}
+
+impl DeliveryClaim {
+    #[must_use]
+    pub const fn valid_for(self, qos: Qos, timed: bool) -> bool {
+        !matches!(qos, Qos::AtMostOnce)
+            && (!self.await_pubcomp || matches!(qos, Qos::ExactlyOnce))
+            && (!self.started || timed)
+    }
 }
 
 /// An immutable association of a validated PUBACK observation with one

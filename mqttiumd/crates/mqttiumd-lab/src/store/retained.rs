@@ -396,7 +396,7 @@ pub(super) fn subscribe(
             ),
         );
         let mut source = state.publications.get(&version).ok_or(failed)?.clone();
-        let qos = source.qos.min(granted).min(Qos::AtLeastOnce);
+        let qos = source.qos.min(granted);
         source.operation = update.operation;
         source.retained_version = Some(version);
         source.retain = true;

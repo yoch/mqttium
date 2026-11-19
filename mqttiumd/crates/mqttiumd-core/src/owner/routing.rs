@@ -81,7 +81,7 @@ pub(super) fn select_client(
         if route.options.no_local() && source == Some(target_session.client_id.as_slice()) {
             continue;
         }
-        let effective = route.max_qos.min(qos).min(Qos::AtLeastOnce);
+        let effective = route.max_qos.min(qos);
         if let Some(held) = selected.items[..selected.count]
             .iter_mut()
             .flatten()
@@ -661,7 +661,7 @@ mod tests {
             panic!("subscription recipe")
         };
         assert_eq!(recipe.changes.len(), 2);
-        assert_eq!(recipe.changes.as_slice()[0].granted, Some(Qos::AtLeastOnce));
+        assert_eq!(recipe.changes.as_slice()[0].granted, Some(Qos::ExactlyOnce));
         assert_eq!(recipe.changes.as_slice()[1].granted, Some(Qos::AtMostOnce));
         assert_eq!(recipe.changes.as_slice()[1].options, options);
         assert_eq!(owner.routes.as_slice(), core::slice::from_ref(&initial));
@@ -690,7 +690,7 @@ mod tests {
             }),
         );
         assert!(
-            matches!(effects.as_slice(),[(_,Effect::EmitFrame {frame:OutboundFrame::Suback {results,..},..})] if results.as_slice()==Some(&[1,0][..]))
+            matches!(effects.as_slice(),[(_,Effect::EmitFrame {frame:OutboundFrame::Suback {results,..},..})] if results.as_slice()==Some(&[2,0][..]))
         );
         assert_eq!(
             owner.routes.len(),

@@ -12,6 +12,7 @@ PUBREC, PUBREL and PUBCOMP carry only a nonzero two-byte Packet
 Identifier at level 4. PUBREL requires fixed flags 0b0010, including
 on repetition. An unknown or already completed PUBREL gets PUBCOMP
 with its Packet Identifier. Outgoing deliveries remain QoS 0 or 1.
+The later outbound profile is specified in [Proposed 0041](0041-outgoing-qos2.md).
 
 A positive PUBREC follows the admission commit for the publication,
 recipient obligations and AwaitPubrel marker. Recipient delivery can

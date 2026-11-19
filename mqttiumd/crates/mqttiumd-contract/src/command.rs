@@ -280,6 +280,8 @@ pub enum Recipe {
     ChangeSubscriptions(ChangeSubscriptions),
     ClaimDelivery(ClaimDelivery),
     FinishDelivery(FinishDelivery),
+    /// Record a positive PUBREC against the exact claim before sending PUBREL.
+    PreparePubrel(FinishDelivery),
     ConsumeDelivery(ConsumeDelivery),
     UpdateSubscriptions(UpdateSubscriptions),
 }
@@ -387,7 +389,7 @@ impl Recipe {
             Self::ReleaseInbound(release) => release.operation,
             Self::ChangeSubscriptions(change) => change.operation,
             Self::ClaimDelivery(claim) => claim.operation,
-            Self::FinishDelivery(finish) => finish.operation,
+            Self::FinishDelivery(finish) | Self::PreparePubrel(finish) => finish.operation,
             Self::ConsumeDelivery(consume) => consume.operation,
             Self::UpdateSubscriptions(change) => change.operation,
         }
@@ -425,7 +427,10 @@ impl Recipe {
                 }
                 Ok(())
             }
-            Self::ClaimDelivery(_) | Self::FinishDelivery(_) | Self::ConsumeDelivery(_) => Ok(()),
+            Self::ClaimDelivery(_)
+            | Self::FinishDelivery(_)
+            | Self::PreparePubrel(_)
+            | Self::ConsumeDelivery(_) => Ok(()),
             Self::AdmitPublication(admit) => admit.check_retained(),
             Self::ReleaseInbound(release) => {
                 if release.exchange.session != release.source_session {
@@ -518,8 +523,12 @@ impl Recipe {
                     claim.packet_id,
                 );
             }
-            Self::FinishDelivery(finish) => {
-                out.push(KIND_FINISH_DELIVERY);
+            Self::FinishDelivery(finish) | Self::PreparePubrel(finish) => {
+                out.push(if matches!(self, Self::PreparePubrel(_)) {
+                    19
+                } else {
+                    KIND_FINISH_DELIVERY
+                });
                 encode_delivery(
                     out,
                     finish.operation,
@@ -647,6 +656,7 @@ impl Recipe {
                         0 => None,
                         1 => Some(Qos::AtMostOnce),
                         2 => Some(Qos::AtLeastOnce),
+                        3 => Some(Qos::ExactlyOnce),
                         _ => return Err(RecipeError::InvalidField("granted_qos")),
                     };
                     let options = if kind == KIND_SUBSCRIPTION_OPTIONS {
@@ -729,18 +739,23 @@ impl Recipe {
                     packet_id,
                 })
             }
-            KIND_FINISH_DELIVERY => {
+            kind @ (KIND_FINISH_DELIVERY | 19) => {
                 let (operation, delivery, target, target_revision, packet_id) =
                     reader.delivery()?;
                 let claim = reader.operation()?;
-                Self::FinishDelivery(FinishDelivery {
+                let delivery = FinishDelivery {
                     operation,
                     delivery,
                     target,
                     target_revision,
                     packet_id,
                     claim,
-                })
+                };
+                if kind == 19 {
+                    Self::PreparePubrel(delivery)
+                } else {
+                    Self::FinishDelivery(delivery)
+                }
             }
             KIND_ADMIT_PUBLICATION => {
                 let operation = reader.operation()?;
@@ -1044,9 +1059,6 @@ impl UpdateSubscriptions {
             return Err(RecipeError::InvalidField("subscription_count"));
         }
         for entry in self.changes.as_slice() {
-            if entry.granted == Some(Qos::ExactlyOnce) {
-                return Err(RecipeError::InvalidField("granted_qos"));
-            }
             if !crate::topic::valid_filter(entry.topic.as_slice()) {
                 return Err(RecipeError::InvalidField("topic_filter"));
             }
@@ -1083,9 +1095,7 @@ impl UpdateSubscriptions {
                 None => 0,
                 Some(Qos::AtMostOnce) => 1,
                 Some(Qos::AtLeastOnce) => 2,
-                Some(Qos::ExactlyOnce) => {
-                    return Err(RecipeError::InvalidField("granted_qos"));
-                }
+                Some(Qos::ExactlyOnce) => 3,
             });
             if with_options {
                 out.push(entry.options.bits());

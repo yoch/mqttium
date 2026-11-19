@@ -103,7 +103,7 @@ pub(super) fn validate(conn: &Connection, target: Option<SessionId>) -> Result<(
         decode(row, 0)?;
     }
     let invalid: bool = conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM outbound c LEFT JOIN obligations o ON o.publication=c.publication AND o.idx=c.idx WHERE (?1 IS NULL OR c.target=?1) AND (typeof(c.started)!='integer' OR c.started NOT IN (0,1) OR o.publication IS NULL OR o.target!=c.target OR o.target_revision!=c.target_revision OR o.qos!=1 OR o.cause NOT IN (1,2)) LIMIT 1)",
+        "SELECT EXISTS(SELECT 1 FROM outbound c LEFT JOIN obligations o ON o.publication=c.publication AND o.idx=c.idx WHERE (?1 IS NULL OR c.target=?1) AND (typeof(c.started)!='integer' OR c.started NOT IN (0,1) OR o.publication IS NULL OR o.target!=c.target OR o.target_revision!=c.target_revision OR o.qos NOT IN (1,2) OR (o.phase=2 AND o.qos!=2) OR o.cause NOT IN (1,2)) LIMIT 1)",
         [target.as_ref().map(|b| b.as_slice())], |row| row.get(0),
     )?;
     if invalid {
@@ -195,7 +195,7 @@ fn candidate(
         let revision = blob_u64(reader::borrow_blob(row, 2, 8)?)?;
         let qos = code_qos(row.get(3)?)?;
         let cause = code_cause(row.get(4)?)?;
-        code_obligation_phase(row.get(5)?)?;
+        let await_pubcomp = code_obligation_phase(row.get(5)?)? == ObligationPhase::AwaitPubcomp;
         let kept_retain = match row.get::<_, i64>(6)? {
             0 => false,
             1 => true,
@@ -204,10 +204,7 @@ fn candidate(
         if (kept_retain && !retain)
             || (cause == mqttiumd_contract::command::DeliveryCause::LiveExact && version.is_some())
             || (cause == mqttiumd_contract::command::DeliveryCause::RetainedReplay
-                && (!kept_retain
-                    || !matches!(qos, Qos::AtMostOnce | Qos::AtLeastOnce)
-                    || version.is_none()
-                    || version == Some(id)))
+                && (!kept_retain || version.is_none() || version == Some(id)))
             || code_session_state(row.get(13)?)? != SessionState::Active
             || blob_u64(reader::borrow_blob(row, 12, 8)?)? != revision
         {
@@ -220,7 +217,8 @@ fn candidate(
                 .ok_or(Fault::Corrupt)?;
             let claim = OperationId::from_be_slice(reader::borrow_blob(row, 10, 32)?)
                 .map_err(|_| Fault::Corrupt)?;
-            if qos != Qos::AtLeastOnce
+            if qos == Qos::AtMostOnce
+                || (await_pubcomp && qos != Qos::ExactlyOnce)
                 || claim.incarnation() != meta.ledger.incarnation()
                 || reader::borrow_blob(row, 7, 8)? != target.to_be_bytes()
                 || blob_u64(reader::borrow_blob(row, 8, 8)?)? != revision
@@ -229,7 +227,8 @@ fn candidate(
             }
             let _ = packet;
             started(row, 11)?;
-        } else if !matches!(row.get_ref(7)?, rusqlite::types::ValueRef::Null)
+        } else if await_pubcomp
+            || !matches!(row.get_ref(7)?, rusqlite::types::ValueRef::Null)
             || !matches!(row.get_ref(8)?, rusqlite::types::ValueRef::Null)
             || !matches!(row.get_ref(10)?, rusqlite::types::ValueRef::Null)
             || !matches!(row.get_ref(11)?, rusqlite::types::ValueRef::Null)

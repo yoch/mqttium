@@ -43,7 +43,7 @@ class Client:
                  action: str, *, filters: tuple[str, ...] = (), count: int = 1,
                  topic: str = "reception/pubsub", payload: bytes = b"pubsub", qos: int = 1,
                  present: bool | None = None, resume: bool = False, client_id: str | None = None,
-                 hold: bool = False, release: Path | None = None):
+                 hold: bool = False, release: Path | None = None, delivery_qos: int = 1):
         self.broker = broker
         self.events = case / f"{name}.client.jsonl"
         self.stdout_path = case / f"{name}.client.stdout"
@@ -59,6 +59,8 @@ class Client:
             self.command += ["--filter", value]
         if action == "publish":
             self.command += ["--topic", topic, "--payload", payload.decode()]
+        if action == "receive":
+            self.command += ["--expected-delivery-qos", str(delivery_qos)]
         if present is not None:
             self.command += ["--expected-session-present", str(int(present))]
         if resume:
@@ -194,7 +196,7 @@ def nominal(binary: Path, case: Path) -> dict:
             topic = f"reception/external/{index}"
             payload = f"external-{publishing}-to-{receiving}".encode()
             subscriber = Client(broker, case, f"external-{receiving}-subscriber", receiving,
-                                "receive", filters=(topic,), count=1, present=False, qos=2)
+                                "receive", filters=(topic,), count=1, present=False, qos=2, delivery_qos=qos)
             clients.append(subscriber)
             subscriber.wait_event("subscription_ready")
             receipts.append(publisher(broker, case, f"external-{publishing}-publisher", publishing,
@@ -202,9 +204,9 @@ def nominal(binary: Path, case: Path) -> dict:
             result = subscriber.collect()
             messages = result["result"]["messages"]
             require(len(messages) == 1 and messages[0]["topic"] == topic
-                    and messages[0]["payload_hex"] == payload.hex() and messages[0]["qos"] == 1,
+                    and messages[0]["payload_hex"] == payload.hex() and messages[0]["qos"] == qos,
                     "external_subscriber_wrong_message")
-            require(result["result"]["subscriptions"][0]["reason_codes"] == [1], "requested_qos2_not_granted_qos1")
+            require(result["result"]["subscriptions"][0]["reason_codes"] == [2], "requested_qos2_not_granted")
             receipts.append(result)
         with PubsubWire(broker.address, broker.observations, "exact-neighbor") as subscriber:
             subscriber.connect("exact-neighbor", session_present=False)
@@ -219,7 +221,7 @@ def nominal(binary: Path, case: Path) -> dict:
         writer_available(broker.db)
         return {"criterion": "A", "status": "PASS", "clients": receipts,
                 "both_public_client_directions": True, "incoming_qos": [1, 2],
-                "outgoing_qos": 1, "neighbor_did_not_match": True,
+                "outgoing_qos": [1, 2], "neighbor_did_not_match": True,
                 "admissions": len(state["admissions"])}
     finally:
         for client in clients:
@@ -626,7 +628,7 @@ def filter_lifecycle(binary: Path, case: Path) -> dict:
             target = session_key(state, "filter-owner")
             matches = [row for row in state["tables"]["routes"]
                        if row["topic"] == topic.encode().hex() and row["session"] == target]
-            require(len(matches) == 1 and matches[0]["qos"] == 1, "resubscribe_duplicated_or_misgranted")
+            require(len(matches) == 1 and matches[0]["qos"] == 2, "resubscribe_duplicated_or_misgranted")
         published = publisher(broker, case, "filter-publisher-a", "mqttium", topic, b"owed-before-unsubscribe")
         pending = durable(broker.db)
         require(len(obligations(pending, target)) == 1, "offline_obligation_missing")
@@ -664,18 +666,18 @@ def filter_result_order(binary: Path, case: Path) -> dict:
                                                   ("reception/qos0-granted", 0),
                                                   ("reception/wildcard/+", 1)]))
             mid, reasons = decode_filter_ack(subscriber.wait(0x90, 17))
-            require(mid == 17 and len(reasons) == 3 and reasons[0] == 1
+            require(mid == 17 and len(reasons) == 3 and reasons[0] == 2
                     and reasons[1] == 0 and reasons[2] == 1,
                     "subscription_results_out_of_order_or_unsupported_granted", repr(reasons))
             state = durable(broker.db)
             routes = state["tables"]["routes"]
             granted = {row["topic"]:row["qos"] for row in routes}
-            require(granted == {b"reception/allowed".hex():1,b"reception/qos0-granted".hex():0,b"reception/wildcard/+".hex():1}, "granted_filter_not_durable")
+            require(granted == {b"reception/allowed".hex():2,b"reception/qos0-granted".hex():0,b"reception/wildcard/+".hex():1}, "granted_filter_not_durable")
             subscriber.unsubscribe(18, ["reception/allowed", "reception/qos0-granted", "reception/wildcard/+", "reception/not-subscribed"])
         require(durable(broker.db)["counts"]["routes"] == 0, "unsubscribe_not_durable")
         broker.stop()
         return {"criterion": "F-filter-results", "status": "PASS", "ordered_reason_codes": list(reasons),
-                "qos2_granted_qos1": True, "qos0_granted": True, "wildcard_granted": True}
+                "qos2_granted": True, "qos0_granted": True, "wildcard_granted": True}
     finally:
         broker.cleanup()
 

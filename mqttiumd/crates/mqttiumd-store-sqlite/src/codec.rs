@@ -110,12 +110,14 @@ pub const fn code_cause(code: i64) -> Result<DeliveryCause, Corrupt> {
 pub const fn obligation_phase_code(phase: ObligationPhase) -> i64 {
     match phase {
         ObligationPhase::Pending => 1,
+        ObligationPhase::AwaitPubcomp => 2,
     }
 }
 
 pub const fn code_obligation_phase(code: i64) -> Result<ObligationPhase, Corrupt> {
     match code {
         1 => Ok(ObligationPhase::Pending),
+        2 => Ok(ObligationPhase::AwaitPubcomp),
         _ => Err(Corrupt),
     }
 }

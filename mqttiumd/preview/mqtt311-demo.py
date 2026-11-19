@@ -78,13 +78,13 @@ def process(command, output, *, broker=False, env=None):
 
 
 @contextmanager
-def launch_broker(out, pki, name, data, record):
+def launch_broker(out, pki, name, data, record, *, killed=False):
     logs = data / "logs"
     previous = set(logs.glob("run.*/events.jsonl"))
     command = [PACKAGE / "start-tls.sh", data, pki]
     stream = None
     try:
-        with process(command, out / f"{name}.log", broker=True,
+        with process(command, out / f"{name}.log", broker=not killed,
                      env=dict(os.environ, MQTTIUMD_LISTEN=f"{HOST}:0")) as child:
             def ready():
                 require(child.poll() is None, "packaged_broker_exited_from_startup")
@@ -103,6 +103,10 @@ def launch_broker(out, pki, name, data, record):
             record["starts"].append({"name": name, "pid": child.pid, "port": int(port),
                                      "binary_sha256": binary, "sqlite": [db.st_dev, db.st_ino]})
             yield int(port), stream
+            if killed:
+                status = child.wait(timeout=TIMEOUT)
+                require(status == -signal.SIGKILL, "broker_kill_not_verified")
+                record["starts"][-1]["exit_status"] = status
     finally:
         if stream is not None:
             (out / f"{name}.jsonl").write_bytes(stream.read_bytes())
@@ -180,25 +184,40 @@ class Mosquitto:
         return {"argv": args, "packet_id": int(frames[0][1]), "debug": result.stdout.splitlines()}
 
     @contextmanager
-    def subscribe(self, port, topic, name, *, explicit=False):
-        args = self.command("sub", port, topic, explicit=explicit) + ["-C", "1", "-W", "15", "-F", "%q %r %t %p"]
+    def subscribe(self, port, topic, name, *, explicit=False, qos=1):
+        args = self.command("sub", port, topic, explicit=explicit, qos=qos) + ["-C", "1", "-W", "15", "-F", "%q %r %t %p"]
         log = self.out / f"{name}.log"
         with process(["stdbuf", "-oL", "-eL", *args], log, env=self.env) as child:
             def granted():
                 require(child.poll() is None, "mosquitto_subscriber_exited_before_suback")
-                return any(re.fullmatch(r"Subscribed \(mid: \d+\): 1", line)
+                return any(re.fullmatch(rf"Subscribed \(mid: \d+\): {qos}", line)
                            for line in log.read_text().splitlines())
 
-            wait_for(granted, "mosquitto_subscriber_did_not_observe_qos1_suback")
+            wait_for(granted, f"mosquitto_subscriber_did_not_observe_qos{qos}_suback")
             yield child, log, args
 
 
-def mosquitto_result(subscriber, topic, payload):
+def mosquitto_result(subscriber, topic, payload, *, qos=1, granted=1):
     child, log, args = subscriber
     require(child.wait(timeout=TIMEOUT) == 0, "mosquitto_subscriber_failed")
-    line = f"1 0 {topic} {payload}"
-    require(log.read_text().splitlines().count(line) == 1, "mosquitto_received_different_qos_topic_or_payload")
-    return {"argv": args, "received": line, "qos": 1, "retain": False}
+    line = f"{qos} 0 {topic} {payload}"
+    debug = log.read_text()
+    require(debug.splitlines().count(line) == 1, "mosquitto_received_different_qos_topic_or_payload")
+    result = {"argv": args, "received": line, "qos": qos, "retain": False,
+              "requested_qos": int(args[args.index("-q") + 1]), "granted_qos": granted}
+    if qos == 2:
+        patterns = [
+            r"received PUBLISH \(d0, q2, r0, m(\d+),",
+            r"sending PUBREC \(m(\d+), rc0\)",
+            r"received PUBREL \(Mid: (\d+)\)",
+            r"sending PUBCOMP \(m(\d+)\)",
+        ]
+        frames = [re.search(pattern, debug) for pattern in patterns]
+        require(all(frames) and len({match[1] for match in frames}) == 1
+                and [match.start() for match in frames] == sorted(match.start() for match in frames),
+                "mosquitto_subscriber_qos2_handshake_incomplete")
+        result.update(packet_id=int(frames[0][1]), debug=debug.splitlines())
+    return result
 
 
 def exchange(clients, port, *, explicit, name):
@@ -221,14 +240,14 @@ def observed_levels(stream, since, expected):
     return observed
 
 
-async def mosquitto_to_mqttium(port, stream, clients, pki, qos):
+async def mosquitto_to_mqttium(port, stream, clients, pki, qos, granted=1):
     before = len(events(stream))
-    topic = f"{TOPIC}/to-v5-qos{qos}"
+    topic = f"{TOPIC}/to-v5-qos{qos}-grant{granted}"
     payload = f"3.1.1 QoS {qos} publisher to MQTT 5 subscriber"
     async with AsyncClient("dashboard", protocol=MQTTProtocolVersion.MQTTv5, clean_start=True) as subscriber:
         await subscriber.connect(HOST, port, ssl=tls(pki, "dashboard"), timeout=TIMEOUT)
-        suback = await subscriber.subscribe(topic, qos=1, timeout=TIMEOUT)
-        require(list(suback.reason_codes) == [1], "mqttium_suback_did_not_grant_qos1")
+        suback = await subscriber.subscribe(topic, qos=granted, timeout=TIMEOUT)
+        require(list(suback.reason_codes) == [granted], "mqttium_suback_did_not_grant_requested_qos")
         async with asyncio.timeout(TIMEOUT):
             reader = subscriber.messages()
             try:
@@ -237,8 +256,9 @@ async def mosquitto_to_mqttium(port, stream, clients, pki, qos):
             finally:
                 await reader.aclose()
         require((message.topic, message.payload, int(message.qos), message.retain)
-                == (topic, payload.encode(), 1, False), "mqttium_received_different_qos_topic_or_payload")
+                == (topic, payload.encode(), min(qos, granted), False), "mqttium_received_different_qos_topic_or_payload")
     return {"topic": topic, "payload": payload, "qos": int(message.qos), "publisher": published,
+            "published_qos": qos, "requested_qos": granted, "granted_qos": granted,
             "protocols": observed_levels(stream, before, [5, 4])}
 
 
@@ -258,6 +278,32 @@ async def interop(record, port, stream, clients, pki):
         received = mosquitto_result(subscriber, topic, payload)
     record["mqtt5_to_v311"] = {"topic": topic, "payload": payload, "qos": 1, "mqttium_puback": sent.mid,
                               "subscriber": received, "protocols": observed_levels(stream, before, [4, 5])}
+
+    cases = (
+        ("both-legacy-qos2", 2, 4),
+        ("mqtt5-to-legacy-qos2", 2, 5),
+        ("qos1-to-grant2", 1, 4),
+    )
+    outgoing = {}
+    for name, qos, publisher_level in cases:
+        boundary = len(events(stream))
+        topic, payload = f"{TOPIC}/{name}", f"mqttiumd delivery {name}"
+        with clients.subscribe(port, topic, name, qos=2) as subscriber:
+            if publisher_level == 4:
+                published = clients.publish(port, topic, payload, qos=qos)
+            else:
+                async with AsyncClient("capteur-1", protocol=MQTTProtocolVersion.MQTTv5, clean_start=True) as publisher:
+                    await publisher.connect(HOST, port, ssl=tls(pki, "sensor"), timeout=TIMEOUT)
+                    sent = await publisher.publish(topic, payload.encode(), qos=qos, timeout=TIMEOUT)
+                    await sent.wait(timeout=TIMEOUT)
+                    require(sent.is_done() and sent.exception() is None, "mqttium_qos2_publish_failed")
+                    published = {"packet_id": sent.mid}
+            received = mosquitto_result(subscriber, topic, payload, qos=qos, granted=2)
+        outgoing[name] = {"topic": topic, "payload": payload, "published_qos": qos,
+                          "publisher": published, "subscriber": received,
+                          "protocols": observed_levels(stream, boundary, [4, publisher_level])}
+    outgoing["legacy-to-mqtt5-qos2"] = await mosquitto_to_mqttium(port, stream, clients, pki, 2, granted=2)
+    record["outgoing_qos2_interop"] = outgoing
 
 
 def field(value):
@@ -417,13 +463,16 @@ def deliveries(db, topic):
     """, (topic.encode(),))
 
 
-def acl_connect(wire, level, *, persistent=False, resume=False):
+def acl_connect(wire, level, *, persistent=False, resume=False, client_id="dashboard", receive_maximum=None):
     clean = not resume and (level == 5 or not persistent)
     properties = b""
     if level == 5:
-        properties = b"\x05\x11\xff\xff\xff\xff" if persistent else b"\0"
+        body = b"\x11\xff\xff\xff\xff" if persistent else b""
+        if receive_maximum is not None:
+            body += b"\x21" + receive_maximum.to_bytes(2, "big")
+        properties = bytes([len(body)]) + body
     wire.send(0x10, field("MQTT") + bytes([level, 2 if clean else 0, 0, 30])
-              + properties + field("dashboard"))
+              + properties + field(client_id))
     hello = wire.receive()
     require(hello is not None and hello[0] == 0x20 and hello[1][:2] == bytes([int(resume), 0]),
             "acl_dashboard_connack")
@@ -752,6 +801,179 @@ def qos2_recovery(record, out, pki):
                               "original_admissions": 1, "replays_admitted": 0, "fresh_admissions": 1}
 
 
+def grant_qos2(wire, level, topic):
+    props = b"\0" if level == 5 else b""
+    wire.send(0x82, b"\0\x01" + props + field(topic) + b"\x02")
+    wire.expect(0x90, b"\0\x01" + props + b"\x02")
+
+
+def wire_publish(port, pki, level, topic, payload, *, qos=2, expiry=None):
+    with closing(Wire311(pki, port, "sensor")) as pub:
+        acl_connect(pub, level, client_id="capteur-1")
+        mid = b"\0\x09"
+        props = b"" if level == 4 else b"\0"
+        if expiry is not None:
+            require(level == 5, "expiry_requires_mqtt5")
+            props = b"\x05\x02" + expiry.to_bytes(4, "big")
+        pub.send(0x30 | (qos << 1), field(topic) + mid + props + payload)
+        if qos == 2:
+            pub.expect(0x50, mid)
+            pub.send(0x62, mid)
+            pub.expect(0x70, mid)
+        else:
+            pub.expect(0x40, mid)
+        pub.send(0xe0)
+
+
+def decode_delivery(frame, level, topic, payload, qos, *, dup=False):
+    expected = 0x30 | qos << 1 | (8 if dup else 0)
+    require(frame is not None and frame[0] == expected,
+            f"expected_delivery_{expected:02x}_got_{frame!r}")
+    _, body = frame
+    prefix = field(topic)
+    require(body.startswith(prefix), "outgoing_qos2_topic_mismatch")
+    mid = body[len(prefix):len(prefix) + 2]
+    require(len(mid) == 2 and mid != b"\0\0", "invalid_outgoing_packet_id")
+    remainder = body[len(prefix) + 2:]
+    if level == 5:
+        require(remainder and remainder[0] < 128, "invalid_probe_publication_properties")
+        remainder = remainder[1 + remainder[0]:]
+    require(remainder == payload, "outgoing_qos2_payload_mismatch")
+    return mid
+
+
+def outbound_state(db):
+    return query(db, """
+        SELECT hex(o.publication), o.idx, o.qos, o.phase, c.packet_id, hex(c.claim), c.started
+        FROM obligations o LEFT JOIN outbound c USING(publication,idx)
+        ORDER BY o.publication,o.idx
+    """)
+
+
+def finish_recipient(wire, db, stream, mid):
+    boundary = len(events(stream))
+    wire.send(0x70, mid)
+    wait_for(lambda: outbound_state(db) == [], "pubcomp_did_not_finish_delivery")
+    return wait_for(lambda: next((row for row in events(stream)[boundary:]
+                                 if row["kind"] == "store_result" and row["command_kind"] == "Finish"
+                                 and row["details"]["committed_now"]), None), "missing_pubcomp_commit")
+
+
+def outgoing_crashes(record, out, pki):
+    trials = {}
+    for level in (4, 5):
+        for withheld, phase in (("PUBREC", 1), ("PUBCOMP", 2)):
+            name = f"outgoing-{level}-{withheld.lower()}"
+            data = out / f"{name}-data"
+            db = data / "broker.sqlite"
+            topic = f"{TOPIC}/{name}"
+            payload = b"one persistent QoS 2 delivery"
+            first_commit = None
+            with launch_broker(out, pki, f"{name}-cut", data, record, killed=True) as (port, stream):
+                with closing(Wire311(pki, port, "dashboard")) as sub:
+                    acl_connect(sub, level, persistent=True)
+                    grant_qos2(sub, level, topic)
+                    wire_publish(port, pki, level, topic, payload)
+                    mid = decode_delivery(sub.receive(), level, topic, payload, 2)
+                    begun, = outbound_state(db)
+                    require(begun[2:5] == (2, 1, int.from_bytes(mid, "big")), "qos2_claim_not_durable_before_publish")
+                    if phase == 2:
+                        boundary = len(events(stream))
+                        sub.send(0x50, mid)
+                        sub.expect(0x62, mid)
+                        first_commit = wait_for(lambda: next((row for row in events(stream)[boundary:]
+                            if row["kind"] == "store_result" and row["command_kind"] == "DeliveryPubrelReady"
+                            and row["details"]["committed_now"]), None), "pubrel_commit_missing")
+                        queued = wait_for(lambda: next((row for row in events(stream)[boundary:]
+                            if row["kind"] == "frame_queued" and row["details"]["packet_kind"] == "PUBREL"), None),
+                            "pubrel_queue_missing")
+                        require(int(first_commit["seq"]) < int(queued["seq"]), "pubrel_queued_before_commit")
+                    durable, = outbound_state(db)
+                    require(durable[:3] == begun[:3] and durable[3] == phase and durable[4:] == begun[4:],
+                            "qos2_wrong_durable_phase_at_crash")
+                    os.kill(record["starts"][-1]["pid"], signal.SIGKILL)
+            require(outbound_state(db) == [durable], "qos2_obligation_changed_at_crash")
+            with launch_broker(out, pki, f"{name}-restart", data, record) as (port, stream):
+                require(record["starts"][-2]["sqlite"] == record["starts"][-1]["sqlite"], "qos2_restart_changed_file")
+                with closing(Wire311(pki, port, "dashboard")) as sub:
+                    acl_connect(sub, level, persistent=True, resume=True)
+                    first = sub.receive()
+                    if phase == 1:
+                        require(decode_delivery(first, level, topic, payload, 2, dup=True) == mid,
+                                "qos2_publish_replay_changed_id")
+                        require(outbound_state(db) == [durable], "qos2_replay_created_an_obligation")
+                        sub.send(0x50, mid)
+                        sub.expect(0x62, mid)
+                    else:
+                        require(first == (0x62, mid), f"qos2_replay_pubrel_required_got_{first!r}")
+                        require(outbound_state(db) == [durable], "qos2_replay_created_an_obligation")
+                    terminal = finish_recipient(sub, db, stream, mid)
+                    new_payload = b"new delivery after the durable finish"
+                    wire_publish(port, pki, level, topic, new_payload)
+                    fresh = decode_delivery(sub.receive(), level, topic, new_payload, 2)
+                    next_row, = outbound_state(db)
+                    require(fresh == mid and next_row[0] != durable[0] and next_row[5] != durable[5],
+                            "qos2_packet_id_not_reused_for_new_occurrence")
+                    sub.send(0x50, fresh)
+                    sub.expect(0x62, fresh)
+                    finish_recipient(sub, db, stream, fresh)
+                    sub.send(0xe0)
+            trials[name] = {"protocol_level": level, "withheld": withheld, "before_kill": durable,
+                            "generation_restarted": True, "session_present": True,
+                            "first_frame": {"header": f"{first[0]:02x}", "body": first[1].hex()},
+                            "same_obligation": True, "pubrel_commit": first_commit,
+                            "finish_commit": terminal, "obligations_after_pubcomp": 0,
+                            "new_packet_id": int.from_bytes(fresh, "big")}
+    record["outgoing_qos2_crashes"] = trials
+
+
+def outgoing_receive_maximum(record, out, pki):
+    data = out / "outgoing-window-data"
+    db = data / "broker.sqlite"
+    outcomes = {}
+    with launch_broker(out, pki, "outgoing-window", data, record) as (port, stream):
+        for mode in ("positive_expired", "negative"):
+            topic = f"{TOPIC}/window/{mode}"
+            with closing(Wire311(pki, port, "dashboard")) as sub:
+                acl_connect(sub, 5, receive_maximum=1)
+                grant_qos2(sub, 5, topic)
+                expiry = 2 if mode == "positive_expired" else None
+                wire_publish(port, pki, 5, topic, b"holds the window", expiry=expiry)
+                first = sub.receive()
+                mid = decode_delivery(first, 5, topic, b"holds the window", 2)
+                if expiry is not None:
+                    started = monotonic()
+                    wait_for(lambda: outbound_state(db)[0][6] == 1, "expiry_started_marker_missing")
+                wire_publish(port, pki, 5, topic, b"waiting QoS 1", qos=1)
+                states = outbound_state(db)
+                require(len(states) == 2 and states[0][4] is not None and states[1][4] is None,
+                        "receive_maximum_not_one_before_pubrec")
+                if mode == "positive_expired":
+                    sleep(max(0, started + expiry + 0.1 - monotonic()))
+                    require(outbound_state(db) == states, "expired_started_qos2_was_discarded")
+                    sub.send(0x50, mid)
+                    sub.expect(0x62, mid)
+                    sub.send(0xc0)
+                    require(sub.receive() == (0xd0, b""), "receive_maximum_released_before_pubcomp")
+                    ready, still_waiting = outbound_state(db)
+                    require(ready[3] == 2 and ready[4] == int.from_bytes(mid, "big") and still_waiting[4] is None,
+                            "receive_maximum_released_before_pubcomp")
+                    sub.send(0x70, mid)
+                else:
+                    sub.send(0x50, mid + b"\x80")
+                next_frame = sub.receive()
+                next_mid = decode_delivery(next_frame, 5, topic, b"waiting QoS 1", 1)
+                require(next_mid == mid, "receive_window_released_without_packet_id")
+                sub.send(0x40, next_mid)
+                wait_for(lambda: outbound_state(db) == [], "receive_maximum_queued_delivery_did_not_finish")
+                sub.send(0xe0)
+            outcomes[mode] = {"maximum": 1, "packet_id": int.from_bytes(mid, "big"),
+                              "pubrec_reason": 0 if expiry is not None else 0x80,
+                              "expired_after_publish": expiry is not None, "pubrel": expiry is not None,
+                              "waiting_publish_qos": 1, "obligations_after_completion": 0}
+    record["outgoing_qos2_receive_maximum"] = outcomes
+
+
 def capacity(record, pki, port, stream, db):
     topic = f"{TOPIC}/capacity"
     with closing(Wire311(pki, port, "dashboard")) as sub:
@@ -874,6 +1096,8 @@ def exercise(out, pki, reference, record):
     subscription_authorization(record, out, pki)
     subscription_capacity(record, out, pki)
     qos2_recovery(record, out, pki)
+    outgoing_crashes(record, out, pki)
+    outgoing_receive_maximum(record, out, pki)
     with launch_broker(out, pki, "capacity", out / "capacity-data", record) as (port, stream):
         capacity(record, pki, port, stream, out / "capacity-data/broker.sqlite")
 

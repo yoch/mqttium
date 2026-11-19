@@ -273,6 +273,7 @@
                             "SessionLifecycle",
                             "RetainedQos0Stored",
                             "DeliveryStarted",
+                            "DeliveryPubrelReady",
                             "DeliveryExpired",
                             "WillPublished"
                           ]
@@ -546,7 +547,7 @@
                             ],
                             "properties": {
                               "kind": {
-                                "const": "DeliveryStarted"
+                                "enum": ["DeliveryStarted", "DeliveryPubrelReady"]
                               }
                             }
                           },
@@ -562,7 +563,7 @@
                             ],
                             "properties": {
                               "kind": {
-                                "const": "DeliveryStarted"
+                                "enum": ["DeliveryStarted", "DeliveryPubrelReady"]
                               },
                               "delivery_id": {
                                 "$ref": "primitives.schema.json#/$defs/delivery_id"
@@ -868,7 +869,8 @@
           },
           "phase": {
             "enum": [
-              "Queued"
+              "Queued",
+              "AwaitPubcomp"
             ]
           },
           "retain": {
@@ -989,7 +991,7 @@
       }
     },
     "outbound": {
-      "description": "Durable outgoing QoS1 claims. MayHaveStarted is an intent; only started=true records a positive-byte observation. An unmarked recovered claim remains uncertain. Absent started means false.",
+      "description": "Durable outgoing QoS 1 and QoS 2 claims. AwaitPubcomp selects PUBREL after a committed PUBREC. Absent started means false and does not prove a PUBLISH was unsent.",
       "type": "array",
       "maxItems": 65536,
       "items": {
@@ -1021,7 +1023,7 @@
             "$ref": "primitives.schema.json#/$defs/operation_id"
           },
           "phase": {
-            "const": "AwaitPuback"
+            "enum": ["AwaitPuback", "AwaitPubrec", "AwaitPubcomp"]
           },
           "emission": {
             "const": "MayHaveStarted"
