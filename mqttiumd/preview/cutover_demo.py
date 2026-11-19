@@ -169,6 +169,29 @@ def check_destinations(d, tool, conf, bindings, site, pki, port, result):
     d.require(not bad, "destination_preflight_expected_refusals:" + ",".join(bad))
 
 
+def check_sealing(d, tool, conf, bindings, data):
+    controls = {
+        "python_memfd_absent": "del os.memfd_create",
+        "kernel_memfd_unavailable": "os.memfd_create = unavailable",
+    }
+    findings = {}
+    for name, control in controls.items():
+        driver = ("import errno, os, runpy, sys\n"
+                  "def unavailable(*args):\n    raise OSError(errno.ENOSYS, 'memfd')\n"
+                  + control + "\n"
+                  "sys.argv = sys.argv[1:]\n"
+                  "sys.path.insert(0, os.path.dirname(sys.argv[0]))\n"
+                  "runpy.run_path(sys.argv[0], run_name='__main__')\n")
+        checked = subprocess.run([sys.executable, "-c", driver, tool, "check", conf, bindings, data],
+                                 capture_output=True, timeout=d.TIMEOUT)
+        report = json.loads(checked.stdout)
+        refused = [row for row in report["diagnostics"] if row.get("code") == "sealing_unavailable"]
+        d.require(checked.returncode == 2 and report["status"] == "blocked"
+                  and len(refused) == 1 and not data.exists(), "sealing_fallback_or_missing_diagnostic:" + name)
+        findings[name] = refused[0]
+    return findings
+
+
 def exercise_cutover(d, out, pki, reference, record, clients):
     site = out / "switch"
     with socket.socket() as reserved:
@@ -182,6 +205,19 @@ def exercise_cutover(d, out, pki, reference, record, clients):
     plan.write_text(json.dumps(effective, indent=2) + "\n")
     result = record["cutover"] = {"address": effective["effective"]["source"]["listener"],
                                   "plan_sha256": effective["plan_sha256"]}
+    result["sealing_controls"] = check_sealing(d, tool, conf, bindings, data)
+    data.mkdir(mode=0o700)
+    sentinel = data / "operator-file"
+    sentinel.write_bytes(b"created after check")
+    refused = subprocess.run([sys.executable, tool, "start", plan], capture_output=True, timeout=d.TIMEOUT)
+    d.require(refused.returncode == 2 and list(data.iterdir()) == [sentinel]
+              and sentinel.read_bytes() == b"created after check", "start_changed_destination_after_check")
+    diagnostics = json.loads(refused.stderr)["diagnostics"]
+    d.require(any(row.get("code") == "destination_occupied" for row in diagnostics),
+              "start_did_not_recheck_destination")
+    result["destination_changed_after_check"] = diagnostics
+    sentinel.unlink()
+    data.rmdir()
     wrong = site / "wrong-bindings.txt"
     wrong.write_text(bindings.read_text().replace("sensor.crt", "dashboard.crt"))
     rc, mismatch = verify_config(d, tool, conf, wrong, data)

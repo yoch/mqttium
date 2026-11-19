@@ -2,7 +2,6 @@
 """Check one Mosquitto 2.0.21 mTLS listener, then start it from the checked plan."""
 import argparse
 from contextlib import ExitStack
-import fcntl
 import hashlib
 import ipaddress
 import json
@@ -14,10 +13,16 @@ import subprocess
 import sys
 import tempfile
 
+try:
+    import fcntl
+except ImportError:
+    fcntl = None
+
 
 BINARY = Path(__file__).resolve().with_name("mqttiumd")
 NAME = re.compile(r"[A-Za-z0-9_.-]{1,64}\Z")
 LIMIT = 256 * 1024
+CANDIDATE_MARKER = ".mqttiumd-cutover"
 
 
 def read_file(path, limit):
@@ -38,15 +43,24 @@ def digest(data):
     return hashlib.sha256(data).hexdigest()
 
 
+class SealingUnavailable(Exception):
+    pass
+
+
 def private_input(stack, data):
-    fd = os.memfd_create("mqttiumd-checked-input", os.MFD_CLOEXEC | os.MFD_ALLOW_SEALING)
-    file = stack.enter_context(os.fdopen(fd, "w+b"))
-    file.write(data)
-    file.flush()
-    file.seek(0)
-    fcntl.fcntl(fd, fcntl.F_ADD_SEALS,
-                fcntl.F_SEAL_WRITE | fcntl.F_SEAL_SHRINK | fcntl.F_SEAL_GROW | fcntl.F_SEAL_SEAL)
-    return fd
+    try:
+        seals = fcntl.F_SEAL_WRITE | fcntl.F_SEAL_SHRINK | fcntl.F_SEAL_GROW | fcntl.F_SEAL_SEAL
+        fd = os.memfd_create("mqttiumd-checked-input", os.MFD_CLOEXEC | os.MFD_ALLOW_SEALING)
+        file = stack.enter_context(os.fdopen(fd, "w+b"))
+        file.write(data)
+        file.flush()
+        file.seek(0)
+        fcntl.fcntl(fd, fcntl.F_ADD_SEALS, seals)
+        if fcntl.fcntl(fd, fcntl.F_GET_SEALS) & seals != seals or not os.access(fdpath(fd), os.R_OK):
+            raise SealingUnavailable("the sealed memory file must be readable through Linux procfs")
+        return fd
+    except (AttributeError, NotImplementedError, OSError) as exc:
+        raise SealingUnavailable("Linux memfd, file seals and procfs are required: " + str(exc)) from exc
 
 
 def fdpath(fd):
@@ -65,8 +79,10 @@ class Report:
         self.rows = []
         self.hashes = {}
 
-    def row(self, path, line, directive, status, effect):
+    def row(self, path, line, directive, status, effect, *, code=None):
         row = dict(file=str(path), line=line, directive=directive, status=status, effect=effect)
+        if code is not None:
+            row["code"] = code
         self.rows.append(row)
 
     def source(self, path):
@@ -231,6 +247,68 @@ def openssl(*args, data, fds=()):
     return result.stdout
 
 
+class DestinationError(ValueError):
+    def __init__(self, path, code, message):
+        super().__init__(message)
+        self.path = path
+        self.code = code
+
+    def diagnostic(self):
+        return dict(file=str(self.path), line=None, directive="data", status="blocking",
+                    code=self.code, effect=str(self))
+
+
+def marker_bytes(conf):
+    return encoding({"profile": "mqttiumd.mosquitto-cutover.v1", "source_configuration": str(conf)})
+
+
+def lstat_if_present(path):
+    try:
+        return path.lstat()
+    except FileNotFoundError:
+        return None
+
+
+def validate_destination(data, conf):
+    """Return whether this path needs its first marker. This function only reads."""
+    parent = data.parent
+    try:
+        parent_info = lstat_if_present(parent)
+        if parent_info is None:
+            raise DestinationError(parent, "destination_parent_missing", "create the parent directory before cutover")
+        if not stat.S_ISDIR(parent_info.st_mode):
+            raise DestinationError(parent, "destination_parent_invalid", "destination parent must be a directory")
+        info = lstat_if_present(data)
+        if info is None:
+            if not os.access(parent, os.W_OK | os.X_OK, effective_ids=True):
+                raise DestinationError(parent, "destination_parent_unwritable", "destination parent must be writable")
+            return True
+        if not stat.S_ISDIR(info.st_mode):
+            raise DestinationError(data, "destination_occupied", "candidate path must be a directory")
+        if info.st_uid != os.geteuid() or info.st_mode & 0o077 or not os.access(
+                data, os.R_OK | os.W_OK | os.X_OK, effective_ids=True):
+            raise DestinationError(data, "destination_not_private", "candidate storage requires an operator-owned private directory")
+        marker = data / CANDIDATE_MARKER
+        owner = lstat_if_present(marker)
+        if owner is None:
+            if next(data.iterdir(), None) is not None:
+                raise DestinationError(data, "destination_occupied", "first start requires an empty dedicated candidate directory")
+            return True
+        if (not stat.S_ISREG(owner.st_mode) or owner.st_nlink != 1
+                or read_file(marker, 8192) != marker_bytes(conf)):
+            raise DestinationError(marker, "destination_marker_mismatch", "candidate directory belongs to another cutover")
+        for suffix in ("", "-wal", "-shm", "-journal", ".writer-lock"):
+            path = data / ("broker.sqlite" + suffix)
+            artifact = lstat_if_present(path)
+            if artifact is not None and (not stat.S_ISREG(artifact.st_mode) or artifact.st_nlink != 1):
+                raise DestinationError(path, "destination_linked_or_non_regular", "candidate database files must be regular files with one link")
+        return False
+    except DestinationError:
+        raise
+    except (OSError, ValueError) as exc:
+        raise DestinationError(data, "destination_unreadable", str(exc)) from exc
+
+
 def compile_plan(conf, mapping, data, stack):
     report = Report()
     values, origins = listener(conf, report)
@@ -240,6 +318,10 @@ def compile_plan(conf, mapping, data, stack):
         original = Path(values["persistence_location"])
         if data.is_relative_to(original) or original.is_relative_to(data):
             report.reject(conf, origins["persistence_location"], "persistence_location", "separate storage directories required")
+    try:
+        validate_destination(data, conf)
+    except DestinationError as exc:
+        report.rows.append(exc.diagnostic())
     descriptors, principals = {}, []
     for key in ("cafile", "certfile", "keyfile"):
         if key in values:
@@ -248,6 +330,9 @@ def compile_plan(conf, mapping, data, stack):
                 descriptors[key] = private_input(stack, material)
                 if key != "keyfile":
                     report.hashes[values[key]] = digest(material)
+            except SealingUnavailable as exc:
+                report.row(conf, origins[key], "sealing", "blocking", str(exc), code="sealing_unavailable")
+                break
             except (OSError, ValueError) as exc:
                 report.reject(conf, origins[key], key, str(exc))
     if not report.blocked():
@@ -276,7 +361,11 @@ def compile_plan(conf, mapping, data, stack):
         except (OSError, ValueError, subprocess.TimeoutExpired) as exc:
             report.reject(conf, origins["certfile"], "certfile", str(exc))
     if not report.blocked():
-        descriptors["identities"] = private_input(stack, encoding(policy))
+        try:
+            descriptors["identities"] = private_input(stack, encoding(policy))
+        except SealingUnavailable as exc:
+            report.row(mapping, None, "sealing", "blocking", str(exc), code="sealing_unavailable")
+    if not report.blocked():
         native = [descriptors[k] for k in ("certfile", "keyfile", "cafile", "identities")]
         check = subprocess.run([BINARY, "check-security", *map(fdpath, native)], pass_fds=native,
                                capture_output=True, timeout=10)
@@ -321,26 +410,16 @@ def main():
         if saved != plan or plan["status"] != "compatible":
             print(json.dumps(dict(error="blocked_or_changed_plan", diagnostics=plan["diagnostics"])), file=sys.stderr)
             return 2
-        data.mkdir(mode=0o700, exist_ok=True)
-        if data.stat().st_uid != os.getuid() or data.stat().st_mode & 0o077:
-            raise ValueError("candidate storage requires an operator-owned private directory")
-        marker = data / ".mqttiumd-cutover"
-        expected = encoding({"profile": plan["format"], "source_configuration": str(conf)})
-        if marker.exists():
-            if marker.is_symlink() or read_file(marker, 8192) != expected:
-                raise ValueError("candidate directory belongs to another cutover")
-        else:
-            if any(data.iterdir()):
-                raise ValueError("first start requires an empty dedicated candidate directory")
-            with marker.open("xb") as output:
-                output.write(expected)
+        try:
+            data.mkdir(mode=0o700)
+        except FileExistsError:
+            pass
+        if validate_destination(data, conf):
+            with (data / CANDIDATE_MARKER).open("xb") as output:
+                output.write(marker_bytes(conf))
                 output.flush()
                 os.fsync(output.fileno())
         db = data / "broker.sqlite"
-        for suffix in ("", "-wal", "-shm", ".writer-lock"):
-            path = Path(str(db) + suffix)
-            if path.is_symlink() or (path.exists() and (not path.is_file() or path.stat().st_nlink != 1)):
-                raise ValueError("candidate storage contains a linked or non-regular database file")
         log = Path(tempfile.mkdtemp(prefix="run.", dir=data)) / "events.jsonl"
         for fd in fds.values():
             os.set_inheritable(fd, True)
@@ -353,5 +432,8 @@ def main():
 if __name__ == "__main__":
     try:
         sys.exit(main())
+    except DestinationError as error:
+        print(json.dumps(dict(error="destination_blocked", diagnostics=[error.diagnostic()])), file=sys.stderr)
+        sys.exit(2)
     except (OSError, ValueError, KeyError, TypeError, subprocess.TimeoutExpired) as error:
         sys.exit(f"cutover refused: {error}")
