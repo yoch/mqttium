@@ -19,8 +19,11 @@ import socket
 import sqlite3
 import ssl
 import subprocess
+import sys
 from tempfile import TemporaryDirectory
 from time import monotonic, sleep
+
+from mosquitto_example import reference_config
 
 from mqttium import MQTTProtocolVersion
 from mqttium.api import AsyncClient, Properties, SubscribeOptions
@@ -113,26 +116,26 @@ def launch_broker(out, pki, name, data, record, *, killed=False, package=PACKAGE
 
 
 @contextmanager
-def launch_reference(out, pki, source):
-    with socket.socket() as reservation:
-        reservation.bind((HOST, 0))
-        port = reservation.getsockname()[1]
-    acl = out / "reference.acl"
-    acl.write_text("user sensor\ntopic write atelier/capteur-1/#\nuser dashboard\ntopic read atelier/#\n")
-    config = out / "reference.conf"
-    config.write_text("\n".join([
-        f"listener {port} {HOST}", "persistence false", "allow_anonymous false",
-        "require_certificate true", "use_identity_as_username true", "tls_version tlsv1.3",
-        f"acl_file {acl}", f"cafile {pki / 'ca.crt'}", f"certfile {pki / 'server.crt'}",
-        f"keyfile {pki / 'server.key'}", "log_type all", "",
-    ]))
-    log = out / "reference.log"
+def reference_service(config, source, log):
     with process([source / "src/mosquitto", "-c", config], log, broker=True) as child:
         def ready():
             require(child.poll() is None, "reference_exited_from_startup")
             return f"mosquitto version {REFERENCE} running" in log.read_text()
 
         wait_for(ready, "reference_not_ready")
+        yield child
+
+
+@contextmanager
+def launch_reference(out, pki, source):
+    with socket.socket() as reservation:
+        reservation.bind((HOST, 0))
+        port = reservation.getsockname()[1]
+    acl = out / "reference.acl"
+    acl.write_text("user sensor\ntopic write atelier/capteur-1/#\nuser dashboard\ntopic read atelier/#\n")
+    config, log = out / "reference.conf", out / "reference.log"
+    reference_config(config, acl, pki, port)
+    with reference_service(config, source, log):
         yield port, log
 
 
@@ -1144,13 +1147,18 @@ def normalized_arguments(exchange_record):
     return [normalized(exchange_record[role]["argv"]) for role in ("publisher", "subscriber")]
 
 
-def exercise(out, pki, reference, record):
+def exercise(out, pki, reference, record, *, cutover_only=False):
     clients = Mosquitto(out, pki, reference)
     reference_hash = sha(reference.parent / f"mosquitto-{REFERENCE}.tar.gz")
     require(reference_hash == REFERENCE_SHA256, "reference_source_archive_digest_mismatch")
     record["reference"] = {"version": REFERENCE, "binary_sha256": sha(reference / "src/mosquitto"),
                            "source_archive_sha256": reference_hash, "exchanges": [],
                            "clients": {role: sha(reference / f"client/mosquitto_{role}") for role in ("pub", "sub")}}
+    from cutover_demo import exercise_cutover
+
+    exercise_cutover(sys.modules[__name__], out, pki, reference, record, clients)
+    if cutover_only:
+        return
     with launch_reference(out, pki, reference) as (port, reference_log):
         for explicit in (False, True):
             before = len(reference_log.read_text().splitlines())
@@ -1185,7 +1193,13 @@ def exercise(out, pki, reference, record):
     qos2_recovery(record, out, pki)
     outgoing_crashes(record, out, pki)
     outgoing_receive_maximum(record, out, pki)
-    require(reduced_receive_maximum(record, out, pki), "replay_depended_on_an_ack_from_the_reduced_window")
+    resumed = reduced_receive_maximum(record, out, pki)
+    receipt = {key: record[key] for key in
+               ("machine", "broker_source_sha", "binary_sha256", "archive_sha256", "reduced_receive_maximum")}
+    receipt.update(format="mqttiumd.reduced-receive-maximum.v1", status="PASS" if resumed else "FAIL",
+                   starts=[entry for entry in record["starts"] if entry["name"].startswith("reduced-window-")])
+    (out / "apres.json").write_text(json.dumps(receipt, indent=2) + "\n")
+    require(resumed, "replay_depended_on_an_ack_from_the_reduced_window")
     with launch_broker(out, pki, "capacity", out / "capacity-data", record) as (port, stream):
         capacity(record, pki, port, stream, out / "capacity-data/broker.sqlite")
 
@@ -1196,6 +1210,7 @@ def main():
     cli.add_argument("out", type=Path)
     cli.add_argument("reference", type=Path, help="Mosquitto 2.0.21 source and binaries from build-mosquitto-reference.sh")
     cli.add_argument("archive_sha256", help="digest recorded by the external archive verifier")
+    cli.add_argument("--cutover-only", action="store_true", help="run the operator switch and rollback only")
     args = cli.parse_args()
     out, reference = args.out.resolve(), args.reference.resolve()
     out.mkdir(mode=0o700)
@@ -1214,7 +1229,7 @@ def main():
         with TemporaryDirectory(prefix="mqttiumd-311-") as scratch:
             pki = Path(scratch) / "pki"
             subprocess.run(["python3", PACKAGE / "demo-pki.py", pki], check=True, timeout=30)
-            exercise(out, pki, reference, record)
+            exercise(out, pki, reference, record, cutover_only=args.cutover_only)
     except BaseException as error:
         record.update(status="FAIL", error=f"{type(error).__name__}: {error}")
         raise

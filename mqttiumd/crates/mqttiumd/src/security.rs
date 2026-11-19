@@ -63,6 +63,10 @@ struct Identity {
     client_ids: Vec<String>,
     publish: Vec<String>,
     subscribe: Vec<String>,
+    #[serde(default)]
+    publish_exact: Vec<String>,
+    #[serde(default)]
+    subscribe_exact: Vec<String>,
 }
 
 pub struct Policy {
@@ -148,18 +152,24 @@ pub(crate) struct PolicyChanges<'a> {
 
 impl<'a> PolicyChanges<'a> {
     fn grants(&mut self, previous: &'a Identity, next: &'a Identity) {
-        for (old, new, removed, added) in [
+        for (old, new, exact_old, exact_new, removed, added, exact_added) in [
             (
                 &previous.publish,
                 &next.publish,
+                &previous.publish_exact,
+                &next.publish_exact,
                 "publish_grant_reduced",
                 "publish_prefix_added",
+                "publish_exact_added",
             ),
             (
                 &previous.subscribe,
                 &next.subscribe,
+                &previous.subscribe_exact,
+                &next.subscribe_exact,
                 "subscribe_grant_reduced",
                 "subscribe_prefix_added",
+                "subscribe_exact_added",
             ),
         ] {
             for prefix in old {
@@ -171,6 +181,26 @@ impl<'a> PolicyChanges<'a> {
                         kind: removed,
                         principal: &previous.name,
                         value: Some(prefix),
+                    });
+                }
+            }
+            for topic in exact_old {
+                if exact_new.binary_search(topic).is_err()
+                    && !new.iter().any(|prefix| within(topic.as_bytes(), prefix))
+                {
+                    self.refusals.push(PolicyChange {
+                        kind: removed,
+                        principal: &previous.name,
+                        value: Some(topic),
+                    });
+                }
+            }
+            for topic in exact_new {
+                if exact_old.binary_search(topic).is_err() {
+                    self.additions.push(PolicyChange {
+                        kind: exact_added,
+                        principal: &next.name,
+                        value: Some(topic),
                     });
                 }
             }
@@ -207,7 +237,15 @@ impl Policy {
         let mut pins = BTreeMap::new();
         let mut owners = BTreeMap::new();
         let mut hash = Sha256::new();
-        hash.update(b"mqttiumd/static-segment-prefix-policy/v1\0");
+        let has_exact = config
+            .principals
+            .iter()
+            .any(|p| !p.publish_exact.is_empty() || !p.subscribe_exact.is_empty());
+        if has_exact {
+            hash.update(b"mqttiumd/static-topic-policy/v2\0");
+        } else {
+            hash.update(b"mqttiumd/static-segment-prefix-policy/v1\0");
+        }
         let mut rules = 0;
         let mut previous: Option<&str> = None;
         for (index, identity) in config.principals.iter_mut().enumerate() {
@@ -255,7 +293,13 @@ impl Policy {
                 &mut identity.client_ids,
                 &mut identity.publish,
                 &mut identity.subscribe,
-            ] {
+            ]
+            .into_iter()
+            .chain(
+                [&mut identity.publish_exact, &mut identity.subscribe_exact]
+                    .into_iter()
+                    .filter(|_| has_exact),
+            ) {
                 field.sort_unstable();
                 if field.windows(2).any(|pair| pair[0] == pair[1]) {
                     return Err("duplicate_policy_rule");
@@ -266,7 +310,10 @@ impl Policy {
                     hash.update(value);
                 }
             }
-            rules += identity.publish.len() + identity.subscribe.len();
+            rules += identity.publish.len()
+                + identity.subscribe.len()
+                + identity.publish_exact.len()
+                + identity.subscribe_exact.len();
             if rules > MAX_RULES {
                 return Err("policy_capacity_exceeded");
             }
@@ -274,6 +321,8 @@ impl Policy {
                 .publish
                 .iter()
                 .chain(&identity.subscribe)
+                .chain(&identity.publish_exact)
+                .chain(&identity.subscribe_exact)
                 .all(|p| literal_prefix(p))
             {
                 return Err("invalid_topic_prefix_or_rule_budget");
@@ -348,6 +397,8 @@ impl Policy {
                 for (kind, prefixes) in [
                     ("publish_prefix_added", &next.publish),
                     ("subscribe_prefix_added", &next.subscribe),
+                    ("publish_exact_added", &next.publish_exact),
+                    ("subscribe_exact_added", &next.subscribe_exact),
                 ] {
                     changes
                         .additions
@@ -395,17 +446,21 @@ impl Policy {
     }
 
     pub fn allows_publish(&self, principal: Principal, topic: &[u8]) -> bool {
-        self.rules[principal.0]
-            .publish
-            .iter()
-            .any(|prefix| within(topic, prefix))
+        let rules = &self.rules[principal.0];
+        rules.publish.iter().any(|prefix| within(topic, prefix))
+            || rules
+                .publish_exact
+                .binary_search_by(|rule| rule.as_bytes().cmp(topic))
+                .is_ok()
     }
 
     pub fn allows_filter(&self, principal: Principal, filter: &[u8]) -> bool {
-        self.rules[principal.0]
-            .subscribe
-            .iter()
-            .any(|prefix| within(filter, prefix))
+        let rules = &self.rules[principal.0];
+        rules.subscribe.iter().any(|prefix| within(filter, prefix))
+            || rules
+                .subscribe_exact
+                .binary_search_by(|rule| rule.as_bytes().cmp(filter))
+                .is_ok()
     }
 
     pub fn allows_packet(&self, principal: Principal, packet: &InboundPacket) -> bool {
@@ -658,6 +713,53 @@ mod tests {
             Policy::parse(&serde_json::to_vec(&value).unwrap()),
             Err("client_id_conflict_or_budget")
         ));
+    }
+
+    #[test]
+    fn exact_rights_survive_rotation_and_cannot_be_widened_implicitly() {
+        let parse = |config: &serde_json::Value| {
+            Policy::parse(&serde_json::to_vec(config).unwrap()).unwrap()
+        };
+        let mut config = configuration();
+        config["principals"][0]["subscribe"] = json!([]);
+        let empty = parse(&config);
+        config["principals"][0]["subscribe_exact"] = json!([]);
+        assert_eq!(
+            parse(&config).storage.fingerprint,
+            empty.storage.fingerprint
+        );
+        for field in ["publish_exact", "subscribe_exact"] {
+            config["principals"][0][field] = json!(["atelier/a"]);
+        }
+        let exact = parse(&config);
+        assert!(exact.allows_publish(Principal(0), b"atelier/a"));
+        assert!(exact.allows_filter(Principal(0), b"atelier/a"));
+        for denied in [
+            b"atelier/a/enfant".as_slice(),
+            b"atelier/a/",
+            b"atelier/a/#",
+            b"atelier/+",
+        ] {
+            assert!(!exact.allows_publish(Principal(0), denied));
+            assert!(!exact.allows_filter(Principal(0), denied));
+        }
+        config["principals"][0]["certificates"] = json!(["cd".repeat(32)]);
+        assert_eq!(
+            parse(&config).storage.fingerprint,
+            exact.storage.fingerprint
+        );
+        for (prefix, literal) in [
+            ("publish", "publish_exact"),
+            ("subscribe", "subscribe_exact"),
+        ] {
+            config["principals"][0][prefix] = json!(["atelier/a"]);
+            config["principals"][0][literal] = json!([]);
+        }
+        let subtree = parse(&config);
+        assert_ne!(exact.storage.fingerprint, subtree.storage.fingerprint);
+        assert!(exact.changes(&subtree).refusals.is_empty());
+        assert_eq!(subtree.changes(&exact).refusals.len(), 2);
+        assert_eq!(exact.changes(&empty).refusals.len(), 2);
     }
 
     #[test]

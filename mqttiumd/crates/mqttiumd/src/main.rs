@@ -108,6 +108,24 @@ fn parse_arguments(mut args: impl Iterator<Item = String>) -> Result<Config, &'s
 
 fn main() {
     let mut args = std::env::args().skip(1).peekable();
+    if args.peek().is_some_and(|arg| arg == "check-security") {
+        let paths = args.skip(1).map(PathBuf::from).collect::<Vec<_>>();
+        let [cert, key, client_ca, identities] = paths.as_slice() else {
+            eprintln!("usage: mqttiumd check-security CERT KEY CLIENT_CA IDENTITIES");
+            std::process::exit(2);
+        };
+        let files = TlsFiles {
+            cert: cert.clone(),
+            key: key.clone(),
+            client_ca: client_ca.clone(),
+            identities: identities.clone(),
+        };
+        if let Err(reason) = mqttiumd::security::Security::load(&files) {
+            eprintln!("mqttiumd refused: {reason}");
+            std::process::exit(2);
+        }
+        return;
+    }
     if args.peek().is_some_and(|arg| arg == "policy") {
         std::process::exit(mqttiumd::policy_transition::run(args.skip(1)));
     }

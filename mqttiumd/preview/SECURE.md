@@ -57,7 +57,7 @@ to trigger the Will. Sending EOF at its stdin issues a normal MQTT DISCONNECT
 and cancels the Will. Use a fresh subscription after the loss to see RETAIN=1;
 live delivery follows the subscriber's RAP option. A dashboard certificate using
 `-i capteur-1` receives CONNACK `0x87`. An authenticated dashboard subscribing
-to `#` receives DISCONNECT `0x87`. The authorized subtree starts at `atelier`.
+to `#` receives a SUBACK refusal `0x87` for that filter. The authorized subtree starts at `atelier`.
 
 For an explicitly configured private address, generate credentials for the DNS
 name or IP that clients will verify and set `MQTTIUMD_LISTEN` to the chosen
@@ -79,8 +79,12 @@ that exact topic and its descendants. A subscription such as
 `atelier/capteur-1/+/#` stays inside the grant. `atelier/+/#` and
 `atelier/capteur-10/#` fall outside it. Exact levels preserve case, UTF-8,
 empty levels and the leading dollar sign. An empty permission list denies that
-operation. A denied packet that contains multiple filters leaves every filter
-unchanged. A Will requires publish permission on its topic.
+operation. Optional `publish_exact` and `subscribe_exact` lists grant a single
+literal topic each. A mixed SUBSCRIBE returns one result per filter in request
+order. Authorized entries consume capacity in order and commit before the
+positive SUBACK. A denied entry receives `0x87` in MQTT 5 or `0x80` in
+MQTT 3.1.1. Existing authorized filters remain usable on that connection.
+A Will requires publish permission on its topic.
 
 Restart with revised certificate pins to rotate a principal's certificate.
 Keeping the same name, ClientIDs and topic grants preserves its sessions.

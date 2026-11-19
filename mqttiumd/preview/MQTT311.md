@@ -36,6 +36,11 @@ QoS 2, sends PUBREC, receives PUBREL and sends PUBCOMP. Mosquitto 2.0.21 also ac
 `-V mqttv311` to request the same version explicitly. A local
 `mosquitto_pub` or `mosquitto_sub` configuration can change defaults.
 
+## Switch an existing Mosquitto listener
+
+The package includes an offline checker and an executable same-address trial
+with a return to the original Mosquitto store. See [Operator cutover](CUTOVER.md).
+
 ## Sessions and limits
 
 MQTT 3.1.1 `Clean Session=0` uses a stable ClientID and an indefinitely
@@ -81,3 +86,9 @@ before a success ACK. Broker event streams are retained alongside it.
 The outgoing crash cases hold PUBREC or PUBCOMP, kill the broker, reopen the
 same SQLite file and record the first frame. Use this candidate to reopen
 databases that contain outgoing QoS 2 state.
+
+The native receipt also includes `apres.json` for both orders of QoS 2 session
+recovery with Receive Maximum reduced from two to one. To run that exchange
+alone with fresh credentials and a temporary database from the extracted
+package, run `.venv/bin/python rm-pubrel-probe.py . --receipt apres.json`.
+The receipt file must be new.
