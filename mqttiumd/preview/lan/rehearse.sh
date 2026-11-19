@@ -65,3 +65,4 @@ collect
 test "$(cat "$evidence/peer.exit")" = 0
 test "$(cat "$evidence/broker.exit")" = 0
 python3 "$kit/check_receipts.py" "$evidence" "$broker_ip" "$peer_ip"
+python3 "$kit/test_check_receipts.py" "$evidence" "$broker_ip" "$peer_ip"

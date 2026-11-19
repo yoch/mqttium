@@ -77,6 +77,17 @@ publication IDs read before release. The peer receipt records the granted
 SUBACK, mqttium PUBACK, resumed CONNACK, and refusal with CONNACK reason
 `0x87` for a valid sensor certificate requesting `dashboard`.
 
+Run the current checker on the folder containing the four collected files.
+Pass the private IP of each machine. An ARM64 broker and an x86_64 Linux
+peer can use the role receipts from the sealed `01d23635` kit.
+
+```sh
+python3 check_receipts.py ./evidence 192.168.1.25 192.168.1.26 --mode field
+```
+
+The checker recomputes the PUBACK target from the broker stream and writes
+`field.json` with the reported hosts and the correlated exchanges.
+
 The broker command stops its broker when the trial ends. For another trial,
 choose a new private site and campaign at preparation. Keep the old receipts
 and logs separately from the credentials.

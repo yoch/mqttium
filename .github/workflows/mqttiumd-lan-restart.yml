@@ -39,7 +39,7 @@ jobs:
           root="$RUNNER_TEMP/kit-stage"
           publish="$RUNNER_TEMP/kit-artifact"
           mkdir -p "$root/$name" "$publish"
-          cp mqttiumd/preview/lan/{README.md,lan_restart.py,check_receipts.py,requirements.txt,rehearse.sh,Dockerfile} "$root/$name/"
+          cp mqttiumd/preview/lan/{README.md,lan_restart.py,check_receipts.py,test_check_receipts.py,requirements.txt,rehearse.sh,Dockerfile} "$root/$name/"
           gh api repos/yoch/mqttium/actions/artifacts/14509792520/zip > "$root/$name/broker-aarch64.zip"
           printf '%s  %s\n' 0c25d0b4a2c6252aaac01dfdfa3defa84f87c8d51470d0f224e80666f9907d45 \
             "$root/$name/broker-aarch64.zip" | sha256sum -c -
