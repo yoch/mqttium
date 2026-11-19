@@ -14,19 +14,34 @@ mosquitto -c ./site/mosquitto.conf
 In another terminal, check the inputs while Mosquitto is serving. Inspect
 the effective address, storage, principal names, leaf fingerprints, ClientIDs
 and exact/subtree grants in the JSON. Each source directive has a file and
-one-based line. Exit status zero authorizes attempting this specific plan.
+one-based line. The check reports a missing destination parent or occupied
+candidate directory before any interruption. It leaves both stores intact.
 
 ```sh
-python3 mosquitto-config.py check site/mosquitto.conf site/bindings.txt site/candidate > checked.json
-python3 -m json.tool checked.json
+python3 mosquitto-config.py check site/mosquitto.conf site/bindings.txt site/candidate > preview.json
+python3 -m json.tool preview.json
 ```
 
-After inspecting the plan, stop the original foreground Mosquitto with Ctrl-C
-and wait for exit. Run the following command, on the same host and address.
+For the initial demo, use Mosquitto's SIGUSR1 save with the PID of the
+running demo process and wait for the `mosquitto.db` file before checking.
+On subsequent checks the last save may already be present. A running
+broker may have admitted work since that save.
+
+Pause publishers and drain outgoing and incoming exchanges before the
+switch. Stop the original foreground Mosquitto with Ctrl-C and wait for a
+successful shutdown save. Check again with `--after-stop`. This flag is the
+operator's confirmation of the stop and of the absence of state transfer.
+Inspect `decision.status` and start with the plan marked `ready`.
 
 ```sh
+python3 mosquitto-config.py check site/mosquitto.conf site/bindings.txt site/candidate --after-stop > checked.json
 python3 mosquitto-config.py start checked.json
 ```
+
+Allow an interruption from source shutdown until candidate startup and
+client reconnect. Recreate required subscriptions on mqttiumd. Republish
+required retained values from their application source. Preserve the
+original MQTT state for rollback.
 
 Use the same two commands before and after the switch. From fresh Mosquitto
 2.0.21 client settings, the subscriber prints
@@ -67,6 +82,40 @@ number. The secure schema is 13. A matching number alone does not establish
 downgrade compatibility. Never point an older executable at the trial store
 to implement rollback.
 
+## Read the inventory and decision
+
+With persistence enabled, the checker opens the published `mosquitto.db`
+once and takes a bounded, immutable copy in memory. Mosquitto 2.0.21
+publishes each save by renaming the completed file. The report includes the
+declared broker release, database format, SHA-256 of the saved bytes, file
+mtime in Unix nanoseconds and UTC capture time. A clean shutdown marker is
+checked for the final plan. The marker describes a saved file and can
+outlive a subsequent broker start, so the operator confirms shutdown.
+Missing, unreadable, unsupported or damaged files receive distinct statuses
+and require investigation before the check can authorize a start.
+
+The supported reader covers Mosquitto persistence format 6 with the
+little-endian 64-bit layouts used by the received brokers. It reads at most
+64 MiB and 200,000 records. It publishes counts, units and pending counts
+for explicitly declared ClientIDs. Payloads, credentials and unknown
+ClientIDs are omitted from the report. A stored message may be referenced
+by multiple clients, or both by a client and by a retained topic. Count
+stored messages once and read queued or active exchange counts separately.
+
+| Decision | Operator action |
+|---|---|
+| `blocked` | Resolve the named configuration, destination or source inventory obstacle. Exit status 2 is accompanied by JSON. |
+| `drain_required` | Keep Mosquitto serving, reconnect the affected clients, complete their acknowledged exchanges and save again. A switch now would strand these references at the source. |
+| `recheck_after_stop` | The saved inventory shows no pending exchange. Confirm a clean stop, then check the final snapshot. The preview alone cannot start mqttiumd. |
+| `ready` | Review the counts staying at Mosquitto and use this checked plan. Any change to the configuration or saved database requires a new check. |
+
+With persistence disabled, the inventory says `disabled` and leaves counts
+unknown. Pause and drain the running service before confirming shutdown.
+When starting, the checker compares the new snapshot and validation results
+to the plan. A directory already initialized by this cutover can reopen its
+own SQLite store. Run the check again for any plan generated with an earlier
+package.
+
 ## Supported inputs and observable differences
 
 The bindings file declares `mosquitto_version 2.0.21` and one
@@ -91,9 +140,10 @@ Use explicit absolute file paths and single spaces in these small source
 files. Includes, plugins, passwords, dynamic ACL patterns, arbitrary wildcard
 grants, multiple listeners, system topics and unrecognized directives block
 the check. The initial candidate directory must be fresh, private and
-separate from the original store. Changed source bytes invalidate the plan.
+separate from the original store. Its parent must already exist.
 The launcher reruns checks and passes the verified TLS/policy inputs to the
-broker through sealed Linux memory files.
+broker through sealed Linux memory files. Missing Python or kernel support
+for sealing is reported as a blocker in the check.
 
 ## Replay the complete switch
 
@@ -104,8 +154,14 @@ run the acceptance from the extracted package.
 .venv/bin/python mqtt311-demo.py ./switch-reception ./reference/mosquitto-2.0.21 VERIFIED_TAR_SHA256 --cutover-only
 ```
 
-`switch-reception/mqtt311.json` records the actual client arguments, SUBACKs,
-delivered topics, negative responses, native broker hash and both retained
-values on reopening each store. The original and candidate service logs are
-separate. Keep the verification plan private as it includes local paths and
-the site's authorization configuration.
+`switch-reception/mqtt311.json` records the actual client arguments, wire
+results, both stores on reopening and the hash of the executed broker.
+`checked-mosquitto.json` is a favorable plan after a clean stop.
+`mosquitto-drain-required.json` shows one stored message shared by one
+queued delivery to `dashboard` and one retained topic. The next capture
+shows one in-flight reference before PUBACK. After PUBACK both delivery
+counts are zero, while the session, subscription, stored message and
+retained topic remain. `mosquitto-drained-after-stop.json` records the
+decision after shutdown. The original and candidate service logs are
+separate. Keep the plans private as they contain local paths and the site's
+authorization configuration.

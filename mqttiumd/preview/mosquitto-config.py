@@ -13,6 +13,8 @@ import subprocess
 import sys
 import tempfile
 
+from mosquitto_inventory import DELIVERY_COUNTS, read_inventory
+
 try:
     import fcntl
 except ImportError:
@@ -23,6 +25,7 @@ BINARY = Path(__file__).resolve().with_name("mqttiumd")
 NAME = re.compile(r"[A-Za-z0-9_.-]{1,64}\Z")
 LIMIT = 256 * 1024
 CANDIDATE_MARKER = ".mqttiumd-cutover"
+PLAN_FORMAT = "mqttiumd.mosquitto-cutover.v2"
 
 
 def read_file(path, limit):
@@ -291,8 +294,9 @@ def validate_destination(data, conf):
         marker = data / CANDIDATE_MARKER
         owner = lstat_if_present(marker)
         if owner is None:
-            if next(data.iterdir(), None) is not None:
-                raise DestinationError(data, "destination_occupied", "first start requires an empty dedicated candidate directory")
+            with os.scandir(data) as entries:
+                if next(entries, None) is not None:
+                    raise DestinationError(data, "destination_occupied", "first start requires an empty dedicated candidate directory")
             return True
         if (not stat.S_ISREG(owner.st_mode) or owner.st_nlink != 1
                 or read_file(marker, 8192) != marker_bytes(conf)):
@@ -309,7 +313,34 @@ def validate_destination(data, conf):
         raise DestinationError(data, "destination_unreadable", str(exc)) from exc
 
 
-def compile_plan(conf, mapping, data, stack):
+def source_inventory(values, names):
+    persistence = values.get("persistence")
+    if persistence == "false":
+        return {"status": "disabled", "detail": "source persistence is disabled"}
+    if persistence != "true" or not {"persistence_location", "persistence_file"} <= values.keys():
+        return {"status": "unconfigured", "detail": "source persistence location is unresolved"}
+    source = Path(values["persistence_location"]) / values["persistence_file"]
+    return read_inventory(source, {client for _, _, ids in names.values() for client in ids})
+
+
+def decide(report, inventory, after_stop):
+    counts = inventory.get("counts")
+    pending = sum(counts[key] for key in DELIVERY_COUNTS) if counts is not None else None
+    if report.blocked():
+        status, reason = "blocked", "configuration_or_destination"
+    elif inventory["status"] not in ("captured", "disabled"):
+        status, reason = "blocked", "source_inventory_unavailable"
+    elif pending:
+        status, reason = "drain_required", "pending_source_exchanges"
+    elif not after_stop or (inventory["status"] == "captured" and inventory["saved_on"] != "clean_shutdown"):
+        status, reason = "recheck_after_stop", "clean_stop_and_final_check_required"
+    else:
+        status, reason = "ready", "no_captured_pending_exchange" if counts is not None else "source_persistence_disabled"
+    return dict(status=status, reason=reason, pending_references=pending,
+                source_state_transferred=False, counts_remaining_at_source=counts)
+
+
+def compile_plan(conf, mapping, data, stack, *, after_stop):
     report = Report()
     values, origins = listener(conf, report)
     names = bindings(mapping, report)
@@ -375,13 +406,22 @@ def compile_plan(conf, mapping, data, stack):
             report.reject(conf, origins[key], key, reason)
     with BINARY.open("rb") as executable:
         binary_sha256 = hashlib.file_digest(executable, "sha256").hexdigest()
-    plan = dict(format="mqttiumd.mosquitto-cutover.v1", inputs={"config": str(conf), "bindings": str(mapping),
-                "data": str(data)}, source_version="2.0.21", binary_sha256=binary_sha256,
+    inventory = source_inventory(values, names)
+    plan = dict(format=PLAN_FORMAT, inputs={"config": str(conf), "bindings": str(mapping),
+                "data": str(data), "after_stop": after_stop}, source_version="2.0.21", binary_sha256=binary_sha256,
                 source_hashes=report.hashes, effective={"source": values, "identities": policy,
                 "database": str(data / "broker.sqlite"), "journal_mode": "WAL", "synchronous": "FULL"},
+                inventory=inventory, decision=decide(report, inventory, after_stop),
                 diagnostics=report.rows, status="blocked" if report.blocked() else "compatible")
     plan["plan_sha256"] = digest(encoding(plan))
     return plan, descriptors
+
+
+def plan_input(plan):
+    # Keep the digest of the actual persistence bytes and their mtime in the
+    # comparison. The timestamp of this tool's read naturally changes.
+    inventory = {key: value for key, value in plan["inventory"].items() if key != "captured_at"}
+    return {**{key: value for key, value in plan.items() if key != "plan_sha256"}, "inventory": inventory}
 
 
 def main():
@@ -390,6 +430,8 @@ def main():
     check = sub.add_parser("check", help="write the effective plan to stdout without opening a listener or database")
     for name in ("config", "bindings", "data"):
         check.add_argument(name, type=Path)
+    check.add_argument("--after-stop", action="store_true",
+                       help="acknowledge the original broker has stopped cleanly and source state stays there")
     start = sub.add_parser("start", help="recheck the plan and run the packaged broker in the foreground")
     start.add_argument("plan", type=Path)
     args = cli.parse_args()
@@ -398,17 +440,27 @@ def main():
         saved = None
         if args.operation == "start":
             saved = json.loads(read_file(args.plan, 4 << 20))
+            if (saved.get("format") != PLAN_FORMAT or saved.get("plan_sha256") != digest(
+                    encoding({key: value for key, value in saved.items() if key != "plan_sha256"}))):
+                print(json.dumps({"error": "incompatible_or_damaged_plan", "action": "run check again"}), file=sys.stderr)
+                return 2
             inputs = saved["inputs"]
             paths = [Path(inputs[k]) for k in ("config", "bindings", "data")]
+            after_stop = inputs["after_stop"]
+            if type(after_stop) is not bool:
+                raise ValueError("invalid after-stop confirmation")
         else:
             paths = [args.config, args.bindings, args.data]
+            after_stop = args.after_stop
         conf, mapping, data = (path.resolve() for path in paths)
-        plan, fds = compile_plan(conf, mapping, data, stack)
+        plan, fds = compile_plan(conf, mapping, data, stack, after_stop=after_stop)
+        decision = plan["decision"]["status"]
         if args.operation == "check":
             print(json.dumps(plan, indent=2))
-            return 0 if plan["status"] == "compatible" else 2
-        if saved != plan or plan["status"] != "compatible":
-            print(json.dumps(dict(error="blocked_or_changed_plan", diagnostics=plan["diagnostics"])), file=sys.stderr)
+            return 0 if decision == "ready" or (decision == "recheck_after_stop" and not after_stop) else 2
+        if decision != "ready" or plan_input(saved) != plan_input(plan):
+            code = "source_snapshot_changed" if saved["inventory"].get("sha256") != plan["inventory"].get("sha256") else "blocked_or_changed_plan"
+            print(json.dumps(dict(error=code, decision=plan["decision"], diagnostics=plan["diagnostics"])), file=sys.stderr)
             return 2
         try:
             data.mkdir(mode=0o700)
@@ -435,5 +487,6 @@ if __name__ == "__main__":
     except DestinationError as error:
         print(json.dumps(dict(error="destination_blocked", diagnostics=[error.diagnostic()])), file=sys.stderr)
         sys.exit(2)
-    except (OSError, ValueError, KeyError, TypeError, subprocess.TimeoutExpired) as error:
-        sys.exit(f"cutover refused: {error}")
+    except (OSError, ValueError, KeyError, TypeError, AttributeError, subprocess.TimeoutExpired) as error:
+        print(json.dumps(dict(error="cutover_refused", detail=str(error))), file=sys.stderr)
+        sys.exit(2)

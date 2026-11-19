@@ -3,6 +3,7 @@ import asyncio
 from contextlib import closing, contextmanager
 import json
 from pathlib import Path
+import signal
 import socket
 import subprocess
 import sys
@@ -129,11 +130,44 @@ def checked_service(d, out, plan, data, name, record):
     (out / (name + ".jsonl")).write_bytes(log.read_bytes())
 
 
-def verify_config(d, tool, conf, bindings, data):
+def verify_config(d, tool, conf, bindings, data, *, after_stop=False):
     command = [sys.executable, tool, "check", conf, bindings, data]
+    if after_stop:
+        command.append("--after-stop")
     result = subprocess.run(command, capture_output=True, timeout=d.TIMEOUT)
     d.require(result.stdout, "checker did not produce a plan: " + result.stderr.decode(errors="replace"))
     return result.returncode, json.loads(result.stdout)
+
+
+def save_plan(out, name, plan):
+    path = out / (name + ".json")
+    path.write_text(json.dumps(plan, indent=2) + "\n")
+    return path
+
+
+def blocked_start(d, tool, plan):
+    refused = subprocess.run([sys.executable, tool, "start", plan], capture_output=True, timeout=d.TIMEOUT)
+    d.require(refused.returncode == 2, "unexpected_start_result:" + refused.stderr.decode(errors="replace"))
+    return json.loads(refused.stderr)
+
+
+def save_source(d, process, source):
+    before = source.stat().st_ino if source.exists() else None
+    process.send_signal(signal.SIGUSR1)
+    d.wait_for(lambda: source.exists() and source.stat().st_ino != before,
+               "mosquitto_did_not_publish_manual_save")
+
+
+def inventory_plan(d, tool, conf, bindings, data, source, *, decision, after_stop=False):
+    rc, plan = verify_config(d, tool, conf, bindings, data, after_stop=after_stop)
+    expected_rc = 0 if decision in ("ready", "recheck_after_stop") else 2
+    d.require(rc == expected_rc and plan["status"] == "compatible"
+              and plan["decision"]["status"] == decision, "unexpected_cutover_decision:" + repr(plan["decision"]))
+    inventory = plan["inventory"]
+    d.require(inventory["status"] == "captured" and inventory["database_version"] == 6
+              and inventory["sha256"] == d.sha(source) and inventory["captured_at"],
+              "source_snapshot_identity")
+    return plan
 
 
 def check_destinations(d, tool, conf, bindings, site, pki, port, result):
@@ -192,32 +226,110 @@ def check_sealing(d, tool, conf, bindings, data):
     return findings
 
 
+def inspect_source_refusals(d, tool, conf, bindings, site, source, result):
+    contents = source.read_bytes()
+    outcomes = result["source_refusals"] = {}
+    for expected in ("unknown_format", "unreadable", "invalid_format"):
+        directory = site / expected
+        directory.mkdir()
+        copy = directory / source.name
+        if expected == "unreadable":
+            copy.mkdir()
+        elif expected == "unknown_format":
+            copy.write_bytes(contents[:19] + (7).to_bytes(4, "big") + contents[23:])
+        else:
+            copy.write_bytes(contents[:-1])
+        fixture = site / (expected + ".conf")
+        fixture.write_text(conf.read_text().replace(str(source.parent) + "/", str(directory) + "/"))
+        data = site / (expected + "-candidate")
+        rc, plan = verify_config(d, tool, fixture, bindings, data, after_stop=True)
+        inventory = plan["inventory"]
+        d.require(rc == 2 and inventory["status"] == expected and "counts" not in inventory
+                  and plan["decision"]["reason"] == "source_inventory_unavailable"
+                  and not data.exists(), "source_refusal_did_not_block:" + expected)
+        outcomes[expected] = inventory
+    d.require(source.read_bytes() == contents, "source_refusal_changed_original")
+
+
+def demonstrate_drain(d, out, pki, reference, tool, port, record):
+    site = out / "drain-site"
+    conf, bindings = prepare(site, pki, port)
+    db, data = site / "mosquitto-data/mosquitto.db", site / "candidate"
+    payload = "retained-and-owed"
+    counts = {
+        "persistent_sessions": 1, "subscriptions": 1, "stored_messages": 1,
+        "stored_payload_bytes": len(payload.encode()), "retained_values": 1,
+        "incoming_queued": 0, "incoming_inflight": 0,
+    }
+    with d.reference_service(conf, reference, out / "mosquitto-drain.log") as original:
+        with closing(d.Wire311(pki, port, "dashboard")) as sub:
+            d.acl_connect(sub, 4, persistent=True)
+            d.require(subscribe(d, sub, [STATE]) == [1], "drain_site_suback")
+            sub.send(0xe0)
+        # Prove the disconnect reached Mosquitto before the publisher sends.
+        log = out / "mosquitto-drain.log"
+        d.wait_for(lambda: "Client dashboard disconnected" in log.read_text(), "drain_site_dashboard_still_online")
+        publish_sequence(d, port, pki, [(STATE, payload, True)])
+        save_source(d, original, db)
+        queued = inventory_plan(d, tool, conf, bindings, data, db, decision="drain_required")
+        d.require(queued["inventory"]["counts"] == dict(counts, outgoing_queued=1, outgoing_inflight=0)
+                  and queued["inventory"]["pending_by_declared_client"] == {"dashboard": {"outgoing_queued": 1}}
+                  and not data.exists(), "source_queue_or_shared_store_count")
+        pending = save_plan(out, "mosquitto-drain-required", queued)
+        d.require(blocked_start(d, tool, pending)["decision"]["status"] == "drain_required"
+                  and not data.exists(), "start_ignored_source_queue")
+        with closing(d.Wire311(pki, port, "dashboard")) as sub:
+            d.acl_connect(sub, 4, persistent=True, resume=True)
+            packet = d.decode_delivery(sub.receive(), 4, STATE, payload.encode(), 1)
+            save_source(d, original, db)
+            inflight = inventory_plan(d, tool, conf, bindings, data, db, decision="drain_required")
+            d.require(inflight["inventory"]["counts"] == dict(counts, outgoing_queued=0, outgoing_inflight=1),
+                      "source_inflight_not_distinguished_from_queue")
+            save_plan(out, "mosquitto-inflight", inflight)
+            sub.send(0x40, packet)
+            sub.send(0xc0)
+            sub.expect(0xd0, b"")
+            sub.send(0xe0)
+        save_source(d, original, db)
+        drained = inventory_plan(d, tool, conf, bindings, data, db, decision="recheck_after_stop")
+        d.require(drained["inventory"]["counts"] == dict(counts, outgoing_queued=0, outgoing_inflight=0),
+                  "source_ack_did_not_drain_exactly_one_reference")
+        save_plan(out, "mosquitto-drained-in-service", drained)
+    ready = inventory_plan(d, tool, conf, bindings, data, db, decision="ready", after_stop=True)
+    d.require(ready["inventory"]["counts"] == drained["inventory"]["counts"], "source_stop_changed_drained_totals")
+    plan = save_plan(out, "mosquitto-drained-after-stop", ready)
+    original_sha = d.sha(db)
+    with checked_service(d, out, plan, data, "drained-site-start", record):
+        d.require(observation(d, port, pki, [STATE], [])["received"] == [], "drained_site_imported_retained")
+    d.require(d.sha(db) == original_sha, "drained_site_candidate_modified_source")
+    with d.reference_service(conf, reference, out / "mosquitto-drained-rollback.log"):
+        replay = observation(d, port, pki, [STATE], [])["received"]
+        d.require(replay == [[STATE, payload, 1]], "drained_retained_missing_on_return")
+    record["cutover"]["drain_site"] = {
+        "queued": queued["decision"], "inflight": inflight["decision"], "after_ack": drained["decision"],
+        "after_stop": ready["decision"], "original_db_sha256_during_trial": original_sha,
+        "delivery": {"topic": STATE, "payload": payload, "packet_id": int.from_bytes(packet, "big"),
+                     "session_present": True, "puback": True},
+        "retained_after_return": replay,
+    }
+
+
 def exercise_cutover(d, out, pki, reference, record, clients):
     site = out / "switch"
     with socket.socket() as reserved:
         reserved.bind((d.HOST, 0))
         port = reserved.getsockname()[1]
     conf, bindings = prepare(site, pki, port)
-    data, plan = site / "candidate", out / "checked-mosquitto.json"
+    data = site / "candidate"
+    source_db = site / "mosquitto-data/mosquitto.db"
     tool = d.PACKAGE / "mosquitto-config.py"
-    rc, effective = verify_config(d, tool, conf, bindings, data)
-    d.require(rc == 0 and effective["status"] == "compatible" and not data.exists(), "offline_configuration_check")
-    plan.write_text(json.dumps(effective, indent=2) + "\n")
-    result = record["cutover"] = {"address": effective["effective"]["source"]["listener"],
-                                  "plan_sha256": effective["plan_sha256"]}
+    rc, absent = verify_config(d, tool, conf, bindings, data)
+    d.require(rc == 2 and absent["status"] == "compatible" and absent["inventory"]["status"] == "absent"
+              and absent["decision"]["reason"] == "source_inventory_unavailable"
+              and not data.exists() and not source_db.exists(), "missing_source_was_treated_as_empty")
+    result = record["cutover"] = {"address": absent["effective"]["source"]["listener"],
+                                  "source_absent": absent["inventory"]}
     result["sealing_controls"] = check_sealing(d, tool, conf, bindings, data)
-    data.mkdir(mode=0o700)
-    sentinel = data / "operator-file"
-    sentinel.write_bytes(b"created after check")
-    refused = subprocess.run([sys.executable, tool, "start", plan], capture_output=True, timeout=d.TIMEOUT)
-    d.require(refused.returncode == 2 and list(data.iterdir()) == [sentinel]
-              and sentinel.read_bytes() == b"created after check", "start_changed_destination_after_check")
-    diagnostics = json.loads(refused.stderr)["diagnostics"]
-    d.require(any(row.get("code") == "destination_occupied" for row in diagnostics),
-              "start_did_not_recheck_destination")
-    result["destination_changed_after_check"] = diagnostics
-    sentinel.unlink()
-    data.rmdir()
     wrong = site / "wrong-bindings.txt"
     wrong.write_text(bindings.read_text().replace("sensor.crt", "dashboard.crt"))
     rc, mismatch = verify_config(d, tool, conf, wrong, data)
@@ -233,31 +345,56 @@ def exercise_cutover(d, out, pki, reference, record, clients):
     d.require(rc == 2 and len(rejects) == 1 and rejects[0]["file"] == str(bad)
               and rejects[0]["line"] == len(conf_text.splitlines()) + 1, "unknown_directive_provenance")
     result["unknown_directive"] = rejects[0]
+    with d.reference_service(conf, reference, out / "mosquitto-original.log") as original:
+        result["mosquitto_qos2"] = qos2(d, clients, port, "original")
+        result["mosquitto_acl"] = compare_acl(d, pki, port, True)
+        publish_sequence(d, port, pki, [(STATE, "original-state", True)])
+        d.require(observation(d, port, pki, [STATE], [])["received"] == [[STATE, "original-state", 1]],
+                  "original_state_not_committed")
+        save_source(d, original, source_db)
+        check_destinations(d, tool, conf, bindings, site, pki, port, result)
+        before = inventory_plan(d, tool, conf, bindings, data, source_db, decision="recheck_after_stop")
+        d.require(before["inventory"]["saved_on"] == "autosave_or_manual_save", "wrong_running_capture_boundary")
+        provisional = save_plan(out, "provisional-mosquitto", before)
+        d.require(blocked_start(d, tool, provisional)["decision"]["status"] == "recheck_after_stop"
+                  and not data.exists(), "provisional_plan_started_candidate")
+        rc, stale_save = verify_config(d, tool, conf, bindings, data, after_stop=True)
+        d.require(rc == 2 and stale_save["decision"]["status"] == "recheck_after_stop", "autosave_authorized_start")
+    prepared = inventory_plan(d, tool, conf, bindings, data, source_db, decision="ready", after_stop=True)
+    original_digest = d.sha(source_db)
+    d.require(prepared["inventory"]["saved_on"] == "clean_shutdown" and original_digest != before["inventory"]["sha256"]
+              and prepared["inventory"]["counts"]["retained_values"] == 1, "final_save_did_not_capture_source")
+    plan = save_plan(out, "checked-mosquitto", prepared)
+    result["plan_sha256"] = prepared["plan_sha256"]
+    result["final_decision"] = prepared["decision"]
+    result["running_source"] = before["inventory"]
+    result["stopped_source"] = prepared["inventory"]
+
+    data.mkdir(mode=0o700)
+    sentinel = data / "operator-file"
+    sentinel.write_bytes(b"created after check")
+    diagnostics = blocked_start(d, tool, plan)["diagnostics"]
+    d.require(list(data.iterdir()) == [sentinel] and sentinel.read_bytes() == b"created after check",
+              "start_changed_destination_after_check")
+    d.require(any(row.get("code") == "destination_occupied" for row in diagnostics),
+              "start_did_not_recheck_destination")
+    result["destination_changed_after_check"] = diagnostics
+    sentinel.unlink()
+    data.rmdir()
     acl = site / "access.acl"
     original_acl = acl.read_text()
     acl.write_text(original_acl + "pattern read %u/#\n")
-    refused = subprocess.run([sys.executable, tool, "start", plan], capture_output=True, timeout=d.TIMEOUT)
-    d.require(refused.returncode == 2 and not data.exists(), "changed_acl_opened_candidate")
-    blocked = [r for r in json.loads(refused.stderr)["diagnostics"] if r["status"] == "blocking"]
+    blocked = [r for r in blocked_start(d, tool, plan)["diagnostics"] if r["status"] == "blocking"]
     d.require(len(blocked) == 1 and blocked[0]["file"] == str(acl)
               and blocked[0]["line"] == len(original_acl.splitlines()) + 1, "ambiguous_acl_provenance")
     result["changed_acl"] = blocked[0]
     acl.write_text(original_acl)
     # A compatible edit also requires the operator to issue a new plan.
     conf.write_text(conf_text + "# changed since verification\n")
-    stale = subprocess.run([sys.executable, tool, "start", plan], capture_output=True, timeout=d.TIMEOUT)
-    d.require(stale.returncode == 2 and not data.exists(), "stale_compatible_plan_started")
+    d.require(blocked_start(d, tool, plan)["decision"]["status"] == "ready"
+              and not data.exists(), "stale_compatible_plan_started")
     conf.write_text(conf_text)
     d.require(not data.exists(), "offline_diagnostics_touched_data")
-    with d.reference_service(conf, reference, out / "mosquitto-original.log"):
-        check_destinations(d, tool, conf, bindings, site, pki, port, result)
-        result["mosquitto_qos2"] = qos2(d, clients, port, "original")
-        result["mosquitto_acl"] = compare_acl(d, pki, port, True)
-        publish_sequence(d, port, pki, [(STATE, "original-state", True)])
-        d.require(observation(d, port, pki, [STATE], [])["received"] == [[STATE, "original-state", 1]],
-                  "original_state_not_committed")
-    source_db = site / "mosquitto-data/mosquitto.db"
-    original_digest = d.sha(source_db)
     with checked_service(d, out, plan, data, "checked-start", record) as log:
         d.require(record["starts"][-1]["port"] == port, "cutover_changed_listener")
         result["mqttiumd_qos2"] = qos2(d, clients, port, "candidate")
@@ -276,10 +413,21 @@ def exercise_cutover(d, out, pki, reference, record, clients):
         result["original_after_rollback"] = observation(d, port, pki, [STATE], [])
         d.require(result["original_after_rollback"]["received"] == [[STATE, "original-state", 1]],
                   "rollback_did_not_recover_original_state")
+        publish_sequence(d, port, pki, [(ROOT + "/rollback", "source-only", True)])
     d.require(d.sha(data / "broker.sqlite") == candidate_digest, "rollback_modified_candidate_store")
-    with checked_service(d, out, plan, data, "checked-restart", record):
+    refused = blocked_start(d, tool, plan)
+    d.require(refused["error"] == "source_snapshot_changed" and d.sha(data / "broker.sqlite") == candidate_digest,
+              "old_source_snapshot_allowed_restart")
+    result["stale_source_snapshot"] = refused["error"]
+    updated = inventory_plan(d, tool, conf, bindings, data, source_db, decision="ready", after_stop=True)
+    reopen = save_plan(out, "checked-mosquitto-reopen", updated)
+    with checked_service(d, out, reopen, data, "checked-restart", record):
+        d.require(record["starts"][-2]["sqlite"] == record["starts"][-1]["sqlite"],
+                  "candidate_restart_switched_database")
         result["candidate_after_rollback"] = observation(d, port, pki, [STATE], [])
         d.require(result["candidate_after_rollback"]["received"] == [[STATE, "candidate-state", 1]],
                   "candidate_lost_trial_state")
     result.update(original_database_sha256_during_trial=original_digest,
                   candidate_database_sha256_during_rollback=candidate_digest, status="PASS")
+    inspect_source_refusals(d, tool, conf, bindings, site, source_db, result)
+    demonstrate_drain(d, out, pki, reference, tool, port, record)

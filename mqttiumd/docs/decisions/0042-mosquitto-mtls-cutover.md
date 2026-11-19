@@ -25,3 +25,11 @@ Each broker retains a private, independent store across the same-address
 handoff. The procedure provides service rollback with the original stored
 state. Application reconciliation governs messages produced during the trial.
 The demonstration and wire comparisons are in preview/CUTOVER.md.
+
+For MIG-001/005/006, plan format v2 inventories the original Mosquitto
+persistence snapshot. The reader distinguishes message records from
+client and retained references. Pending source exchanges block start until
+drained. The final decision binds the plan to a shutdown save and the
+operator's stop confirmation. The source bytes and configuration are checked
+again before opening the candidate. Existing cutover directory markers keep
+their original representation and can reopen their own SQLite database.
