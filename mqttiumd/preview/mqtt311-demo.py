@@ -149,22 +149,35 @@ class Mosquitto:
         self.env = {"LC_ALL": "C", "HOME": str(home), "XDG_CONFIG_HOME": str(home),
                     "PATH": os.defpath, "LD_LIBRARY_PATH": str(source / "lib")}
 
-    def command(self, role, port, topic, *, explicit=False):
+    def command(self, role, port, topic, *, explicit=False, qos=1):
         publisher = role == "pub"
         cert, client_id = ("sensor", "capteur-1") if publisher else ("dashboard", "dashboard")
         command = [str(self.source / "client" / f"mosquitto_{role}"), "-h", HOST, "-p", str(port),
                    "--tls-version", "tlsv1.3", "--cafile", str(self.pki / "ca.crt"),
                    "--cert", str(self.pki / f"{cert}.crt"), "--key", str(self.pki / f"{cert}.key"),
-                   "-i", client_id, "-d", "-q", "1", "-t", topic]
+                   "-i", client_id, "-d", "-q", str(qos), "-t", topic]
         if explicit:
             command += ["-V", "mqttv311"]
         return command
 
-    def publish(self, port, topic, payload, *, explicit=False):
-        args = self.command("pub", port, topic, explicit=explicit) + ["-m", payload]
+    def publish(self, port, topic, payload, *, explicit=False, qos=1):
+        args = self.command("pub", port, topic, explicit=explicit, qos=qos) + ["-m", payload]
         result = subprocess.run(args, env=self.env, text=True, capture_output=True, check=True, timeout=TIMEOUT)
-        require("received PUBACK" in result.stdout, "mosquitto_publisher_did_not_observe_puback")
-        return {"argv": args, "puback": result.stdout.splitlines()}
+        if qos == 1:
+            require("received PUBACK" in result.stdout, "mosquitto_publisher_did_not_observe_puback")
+            return {"argv": args, "puback": result.stdout.splitlines()}
+        patterns = [
+            r"sending PUBLISH \(d0, q2, r0, m(\d+),",
+            r"received PUBREC \(Mid: (\d+)\)",
+            r"sending PUBREL \(m(\d+)\)",
+            r"received PUBCOMP \(Mid: (\d+), RC:0\)",
+        ]
+        frames = [re.search(pattern, result.stdout) for pattern in patterns]
+        require(all(frames), "mosquitto_qos2_handshake_incomplete")
+        require(len({match[1] for match in frames}) == 1
+                and [match.start() for match in frames] == sorted(match.start() for match in frames),
+                "mosquitto_qos2_handshake_order_or_identifier_mismatch")
+        return {"argv": args, "packet_id": int(frames[0][1]), "debug": result.stdout.splitlines()}
 
     @contextmanager
     def subscribe(self, port, topic, name, *, explicit=False):
@@ -208,10 +221,10 @@ def observed_levels(stream, since, expected):
     return observed
 
 
-async def interop(record, port, stream, clients, pki):
+async def mosquitto_to_mqttium(port, stream, clients, pki, qos):
     before = len(events(stream))
-    topic = f"{TOPIC}/to-v5"
-    payload = "3.1.1 publisher to MQTT 5 subscriber"
+    topic = f"{TOPIC}/to-v5-qos{qos}"
+    payload = f"3.1.1 QoS {qos} publisher to MQTT 5 subscriber"
     async with AsyncClient("dashboard", protocol=MQTTProtocolVersion.MQTTv5, clean_start=True) as subscriber:
         await subscriber.connect(HOST, port, ssl=tls(pki, "dashboard"), timeout=TIMEOUT)
         suback = await subscriber.subscribe(topic, qos=1, timeout=TIMEOUT)
@@ -219,14 +232,19 @@ async def interop(record, port, stream, clients, pki):
         async with asyncio.timeout(TIMEOUT):
             reader = subscriber.messages()
             try:
-                published = await asyncio.to_thread(clients.publish, port, topic, payload)
+                published = await asyncio.to_thread(clients.publish, port, topic, payload, qos=qos)
                 message = await anext(reader)
             finally:
                 await reader.aclose()
         require((message.topic, message.payload, int(message.qos), message.retain)
                 == (topic, payload.encode(), 1, False), "mqttium_received_different_qos_topic_or_payload")
-    record["mqtt311_to_v5"] = {"topic": topic, "payload": payload, "qos": int(message.qos), "publisher": published,
-                              "protocols": observed_levels(stream, before, [5, 4])}
+    return {"topic": topic, "payload": payload, "qos": int(message.qos), "publisher": published,
+            "protocols": observed_levels(stream, before, [5, 4])}
+
+
+async def interop(record, port, stream, clients, pki):
+    record["mqtt311_to_v5"] = await mosquitto_to_mqttium(port, stream, clients, pki, 1)
+    record["mqtt311_qos2_to_v5"] = await mosquitto_to_mqttium(port, stream, clients, pki, 2)
 
     before = len(events(stream))
     topic = f"{TOPIC}/from-v5"
@@ -301,6 +319,9 @@ class Wire311:
         self.send(0x30 if mid is None else 0x32,
                   field(topic) + (mid.to_bytes(2, "big") if mid is not None else b"") + payload)
 
+    def publish_qos2(self, topic, payload, mid, *, duplicate=False):
+        self.send(0x3c if duplicate else 0x34, field(topic) + mid.to_bytes(2, "big") + payload)
+
 
 def wire_exchange(record, pki, port):
     topic = f"{TOPIC}/qos0"
@@ -324,14 +345,9 @@ def wire_exchange(record, pki, port):
         sub.expect(0xb0, b"\0\x02")
         sub.send(0xe0)
         pub.send(0xe0)
-    with closing(Wire311(pki, port, "sensor")) as qos2:
-        qos2.connect("capteur-1")
-        qos2.expect(0x20, b"\0\0")
-        qos2.send(0x34, field(topic) + b"\0\x07qos2-outside-profile")
-        require(qos2.receive() is None, "qos2_received_a_legacy_acknowledgement")
     record["wire"] = {"foreign_connack": "20020005", "denied_suback": "9003000180", "qos0_topic": topic,
                       "qos0_payload_hex": payload.hex(), "unsuback": "b0020002", "pingresp": "d000",
-                      "disconnect": "e000", "qos2_publish_response": "EOF"}
+                      "disconnect": "e000"}
 
 
 async def inherited_retain(record, pki, port, db):
@@ -549,6 +565,132 @@ def durable_after(record, pki, port, db):
                          "clean": {"session_present": False, "next_frame": "PINGRESP", "offline_obligations": 0}}
 
 
+def admission_commits(rows):
+    return [row for row in rows if row["kind"] == "store_result" and row["command_kind"] == "Admission"
+            and row["details"]["committed_now"] and row["details"]["wrote"]]
+
+
+def qos2_marker(db, mid, topic, payload):
+    rows = query(db, """
+        SELECT hex(i.session), i.packet_id, hex(i.exchange), hex(i.publication), i.phase, p.qos, y.bytes
+        FROM inbound i JOIN sessions s ON i.session=s.id
+        JOIN publications p ON p.id=i.publication LEFT JOIN payloads y ON y.id=p.payload
+        WHERE s.client_id=? AND i.packet_id=? AND p.topic=? AND p.source=i.session
+    """, (b"capteur-1", mid, topic.encode()))
+    require(len(rows) == 1, "persistent_qos2_marker_missing")
+    marker, = rows
+    require(marker[1] == mid and marker[4:] == (1, 2, payload), "invalid_persistent_qos2_marker")
+    return dict(zip(("session", "packet_id", "exchange", "publication", "await_pubrel", "qos", "payload_hex"),
+                    (*marker[:-1], payload.hex() if payload is not None else None), strict=True))
+
+
+def written_ack(stream, since, kind, mid):
+    return wait_for(lambda: next((row for row in events(stream)[since:]
+                                 if row["kind"] == "frame_written" and row["details"]["packet_kind"] == kind
+                                 and row["details"]["packet_id"] == mid), None), f"{kind.lower()}_not_written")
+
+
+def received_qos1(wire, topic, payload):
+    header, body = wire.receive()
+    prefix = field(topic)
+    require(header == 0x32 and body.startswith(prefix) and body[len(prefix) + 2:] == payload,
+            "qos2_recipient_delivery_did_not_match")
+    return body[len(prefix):len(prefix) + 2]
+
+
+def qos2_recovery(record, out, pki):
+    data = out / "qos2-data"
+    db = data / "broker.sqlite"
+    topic, mid = f"{TOPIC}/restart-qos2", 37
+    identifier = mid.to_bytes(2, "big")
+    original, fresh = b"admitted-before-pubrel", b"new-publish-after-pubcomp"
+    wire = {"pubrec": (b"\x50\x02" + identifier).hex(), "pubrel": (b"\x62\x02" + identifier).hex(),
+            "pubcomp": (b"\x70\x02" + identifier).hex()}
+    stages, start = [], len(record["starts"])
+
+    with launch_broker(out, pki, "qos2-pubrec", data, record) as (port, stream):
+        with closing(Wire311(pki, port, "dashboard")) as sub, closing(Wire311(pki, port, "sensor")) as pub:
+            sub.connect("dashboard", clean=False)
+            sub.expect(0x20, b"\0\0")
+            sub.subscribe(topic)
+            pub.connect("capteur-1", clean=False)
+            pub.expect(0x20, b"\0\0")
+            before = len(events(stream))
+            pub.publish_qos2(topic, original, mid)
+            # Leave the publisher's PUBREC unread and never send PUBREL at this stage.
+            ack = written_ack(stream, before, "PUBREC", mid)
+            phase = events(stream)[before:]
+            admission, = admission_commits(phase)
+            queued, = [row for row in phase if row["kind"] == "frame_queued"
+                       and row["details"]["packet_kind"] == "PUBREC" and row["details"]["packet_id"] == mid]
+            require(int(admission["seq"]) < int(queued["seq"]) < int(ack["seq"]),
+                    "qos2_pubrec_preceded_durable_admission")
+            marker = qos2_marker(db, mid, topic, original)
+            require(deliveries(db, topic) == [(b"dashboard", topic.encode(), original, 1)],
+                    "qos2_obligation_missing_at_pubrec")
+            outgoing = received_qos1(sub, topic, original)
+            sub.send(0x40, outgoing)
+            wait_for(lambda: deliveries(db, topic) == [], "qos2_delivery_did_not_finish_before_pubrel")
+            # The final recipient releases the payload bytes. The inbound marker
+            # retains its publication identity and can still answer a replay.
+            pending = dict(marker, payload_hex=None)
+            require(qos2_marker(db, mid, topic, None) == pending, "qos2_marker_lost_before_pubrel")
+            stages.append({"loss": "publisher_closed_without_reading_pubrec", "marker": marker,
+                           "admission": admission, "pubrec_queued": queued, "pubrec_written": ack,
+                           "recipient_qos": 1, "recipient_mid": int.from_bytes(outgoing, "big"),
+                           "recipient_finished_before_pubrel": True})
+
+    with launch_broker(out, pki, "qos2-pubcomp", data, record) as (port, stream):
+        with closing(Wire311(pki, port, "sensor")) as pub:
+            pub.connect("capteur-1", clean=False)
+            pub.expect(0x20, b"\1\0")
+            before = len(events(stream))
+            pub.publish_qos2(topic, original, mid, duplicate=True)
+            pub.expect(0x50, identifier)
+            require(qos2_marker(db, mid, topic, None) == pending,
+                    "duplicate_publish_changed_the_recovered_exchange")
+            require(deliveries(db, topic) == [], "duplicate_publish_recreated_recipient_work")
+            pub.send(0x62, identifier)
+            ack = written_ack(stream, before, "PUBCOMP", mid)
+            require(query(db, "SELECT packet_id FROM inbound") == [], "pubcomp_with_unfinished_exchange")
+            require(admission_commits(events(stream)[before:]) == [], "duplicate_publish_or_pubrel_admitted_again")
+            stages.append({"session_present": True, "duplicate_publish": "3c", "wire_pubrec": wire["pubrec"],
+                           "loss": "publisher_closed_without_reading_pubcomp", "pubcomp_written": ack,
+                           "durable_admissions": 0, "inbound_after_pubcomp": 0, "marker_before_pubrel": pending})
+
+    with launch_broker(out, pki, "qos2-reuse", data, record) as (port, stream):
+        with closing(Wire311(pki, port, "sensor")) as pub:
+            pub.connect("capteur-1", clean=False)
+            pub.expect(0x20, b"\1\0")
+            before = len(events(stream))
+            pub.send(0x62, identifier)
+            pub.expect(0x70, identifier)
+            require(admission_commits(events(stream)[before:]) == [] and deliveries(db, topic) == [],
+                    "duplicate_pubrel_created_an_admission")
+
+            pub.publish_qos2(topic, fresh, mid)
+            pub.expect(0x50, identifier)
+            second = qos2_marker(db, mid, topic, fresh)
+            require(second["session"] == marker["session"] and second["exchange"] != marker["exchange"]
+                    and second["publication"] != marker["publication"], "reused_qos2_id_did_not_create_new_exchange")
+            require(deliveries(db, topic) == [(b"dashboard", topic.encode(), fresh, 1)],
+                    "reused_qos2_id_did_not_admit_new_payload")
+            pub.send(0x62, identifier)
+            pub.expect(0x70, identifier)
+            require(query(db, "SELECT packet_id FROM inbound") == [], "new_exchange_did_not_terminate")
+            created, = admission_commits(events(stream)[before:])
+            stages.append({"session_present": True, "duplicate_pubrel": wire["pubrel"], "wire_pubcomp": wire["pubcomp"],
+                           "reused_packet_id": mid, "new_marker": second, "new_admission": created})
+        with closing(Wire311(pki, port, "dashboard")) as sub:
+            sub.connect("dashboard", clean=False)
+            sub.expect(0x20, b"\1\0")
+            sub.send(0x40, received_qos1(sub, topic, fresh))
+            wait_for(lambda: deliveries(db, topic) == [], "new_qos2_obligation_did_not_finish")
+    require(len({tuple(row["sqlite"]) for row in record["starts"][start:]}) == 1, "qos2_restart_changed_sqlite")
+    record["qos2_recovery"] = {"topic": topic, "wire": wire, "packet_id": mid, "stages": stages,
+                              "original_admissions": 1, "replays_admitted": 0, "fresh_admissions": 1}
+
+
 def capacity(record, pki, port, stream, db):
     topic = f"{TOPIC}/capacity"
     with closing(Wire311(pki, port, "dashboard")) as sub:
@@ -569,8 +711,7 @@ def capacity(record, pki, port, stream, db):
         require(deliveries(db, topic) == [(b"dashboard", topic.encode(), b"committed-first", 1)],
                 "first_ack_without_protected_offline_obligation")
         window = events(stream)[before:]
-        commit, = [row for row in window if row["kind"] == "store_result" and row["command_kind"] == "Admission"
-                   and row["details"]["committed_now"] and row["details"]["wrote"]]
+        commit, = admission_commits(window)
         ack, = [row for row in window if row["kind"] == "frame_queued" and row["details"]["packet_kind"] == "PUBACK"]
         require(int(commit["seq"]) < int(ack["seq"]) and ack["details"]["packet_id"] == 1,
                 "first_puback_preceded_commit")
@@ -591,11 +732,36 @@ def capacity(record, pki, port, stream, db):
     last = events(stream)[boundary:]
     require(not any(row["kind"] == "frame_queued" and row["connection"] == terminal["connection"]
                     and row["details"]["packet_kind"] == "PUBACK" for row in last), "puback_queued_for_refused_publish")
-    require(len(deliveries(db, topic)) == mid - 1 and mid > 2, "refused_publication_changed_durable_obligations")
+    require(mid == 129, f"expected_128_pubacks_before_close_at_129_got_{mid - 1}")
+    accepted = sorted([b"committed-first", *(f"capacity-{i}".encode() for i in range(2, 129))])
+    require(sorted(row[2] for row in deliveries(db, topic)) == accepted, "capacity_changed_durable_obligations")
     record["capacity"] = {"positive_pubacks": mid - 1, "refused_packet_id": mid, "wire_after_refused_publish": "EOF",
                           "disconnect": terminal, "refused_puback_queued": False, "first_commit": commit,
                           "first_wire_puback": "40020001", "first_puback_queued": ack,
                           "durable_obligations": mid - 1, "topic": topic}
+
+    def durable_work():
+        return [query(db, f"SELECT * FROM {name} ORDER BY 1, 2")
+                for name in ("inbound", "publications", "obligations", "payloads")]
+
+    with closing(Wire311(pki, port, "sensor")) as pub:
+        pub.connect("capteur-1", clean=False)
+        pub.expect(0x20, b"\0\0")
+        before, durable = len(events(stream)), durable_work()
+        pub.publish_qos2(topic, b"quota-refused-qos2", 7)
+        require(pub.receive() is None, "saturated_qos2_connection_sent_a_wire_ack")
+        refused = wait_for(lambda: next((row for row in events(stream)[before:]
+                                         if row["kind"] == "connection_closed"
+                                         and row["details"]["code"] == "capacity_exceeded"), None),
+                           "qos2_capacity_disconnect_missing")
+        trace = events(stream)[before:]
+        require(not any(row["kind"] == "frame_queued" and row["connection"] == refused["connection"]
+                        and row["details"]["packet_kind"] == "PUBREC" for row in trace),
+                "qos2_pubrec_queued_for_refused_publish")
+        require(admission_commits(trace) == [] and durable_work() == durable,
+                "qos2_refusal_partially_changed_durable_work")
+    record["qos2_capacity"] = {"packet_id": 7, "wire": "EOF", "disconnect": refused,
+                               "pubrec_queued": False, "durable_work_unchanged": True}
 
 
 def normalized_arguments(exchange_record):
@@ -645,6 +811,7 @@ def exercise(out, pki, reference, record):
         durable_after(record, pki, port, db)
         asyncio.run(inherited_retain(record, pki, port, db))
     subscription_authorization(record, out, pki)
+    qos2_recovery(record, out, pki)
     with launch_broker(out, pki, "capacity", out / "capacity-data", record) as (port, stream):
         capacity(record, pki, port, stream, out / "capacity-data/broker.sqlite")
 

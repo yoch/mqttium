@@ -32,7 +32,8 @@ The first level-4 profile includes QoS 0/1 PUBLISH, PUBACK, SUBSCRIBE,
 UNSUBSCRIBE, PING, normal DISCONNECT, retained and the existing QoS 1 Will
 profile. A requested subscription QoS 2 can be reduced to QoS 1. QoS 2
 PUBLISH is outside the level-4 profile. The level-5 incoming QoS 2 path
-continues to use its existing durable handshake.
+continues to use its existing durable handshake. The next level-4 profile
+extends it in [Proposed 0040](0040-mqtt311-incoming-qos2.md).
 
 The extracted preview reception compares the same Mosquitto 2.0.21 clients
 against a pinned Mosquitto broker and the candidate over mTLS. The candidate

@@ -2687,7 +2687,8 @@ impl Runtime<'_> {
                         return Ok(());
                     }
                     let bytes = vec![0xe0, 2, 0x93, 0];
-                    if bytes.len() <= p.max_packet
+                    if p.version != Some(codec::Version::V311)
+                        && bytes.len() <= p.max_packet
                         && p.io
                             .outgoing
                             .try_send(net::Write {
@@ -4036,6 +4037,9 @@ impl EffectSink for Sink<'_> {
                             frame,
                             OutboundFrame::Puback {
                                 reason: mqttiumd_contract::packet::PubackReason::QuotaExceeded,
+                                ..
+                            } | OutboundFrame::Pubrec {
+                                reason: mqttiumd_contract::packet::AckReason::QuotaExceeded,
                                 ..
                             }
                         ) {

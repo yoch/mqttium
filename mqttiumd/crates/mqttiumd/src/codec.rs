@@ -670,9 +670,6 @@ fn publish(version: Version, first: u8, body: &[u8], bounds: Bounds) -> Result<P
     let mut input = Cursor::new(body);
     let topic_bytes = input.string()?;
     let qos = Qos::from_wire((first >> 1) & 3).ok_or_else(|| malformed("InvalidQos"))?;
-    if version == Version::V311 && qos == Qos::ExactlyOnce {
-        return Err(unsupported("Qos2OutsideLegacyProfile"));
-    }
     let packet_id = if qos == Qos::AtMostOnce {
         None
     } else {
@@ -710,9 +707,13 @@ fn publish(version: Version, first: u8, body: &[u8], bounds: Bounds) -> Result<P
     })
 }
 
-fn pubrel(body: &[u8]) -> Result<Packet, Error> {
+fn pubrel(version: Version, body: &[u8]) -> Result<Packet, Error> {
     let mut input = Cursor::new(body);
     let packet_id = identifier(&mut input)?;
+    if version == Version::V311 {
+        input.end()?;
+        return Ok(Packet::Core(InboundPacket::Pubrel { packet_id }));
+    }
     let reason = if input.is_empty() { 0 } else { input.byte()? };
     if !matches!(reason, 0 | 0x92) {
         return Err(protocol("InvalidPubrelReason"));
@@ -935,7 +936,7 @@ pub fn decode_for(
         1 => client_connect(body, bounds),
         3 => publish(version, first, body, bounds),
         4 => puback(version, body),
-        6 if version == Version::V5 => pubrel(body),
+        6 => pubrel(version, body),
         8 => subscribe(version, body, false, bounds),
         10 => subscribe(version, body, true, bounds),
         12 if body.is_empty() => Ok(Packet::Core(InboundPacket::Pingreq)),
@@ -1061,7 +1062,23 @@ pub fn encode_for(version: Version, frame: OutboundFrame) -> Result<Vec<u8>, Err
             reason: PubackReason::Success,
             ..
         }
+        | OutboundFrame::Pubrec {
+            reason: AckReason::Success,
+            ..
+        }
+        | OutboundFrame::Pubcomp {
+            reason: AckReason::Success,
+            ..
+        }
         | OutboundFrame::Pingresp => encode(frame),
+        OutboundFrame::Pubcomp {
+            packet_id,
+            reason: AckReason::PacketIdentifierNotFound,
+        } => {
+            // MQTT 3.1.1 ends a replayed PUBREL with the same identifier.
+            let [high, low] = packet_id.get().to_be_bytes();
+            Ok(vec![0x70, 2, high, low])
+        }
         OutboundFrame::Suback { packet_id, results } => {
             let codes = results
                 .as_slice()

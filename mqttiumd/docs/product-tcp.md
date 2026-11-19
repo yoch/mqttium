@@ -11,9 +11,13 @@ The same listener accepts MQTT 3.1.1 and MQTT 5. The
 [interoperability preview](../preview/MQTT311.md) shows ordinary Mosquitto clients
 using the default MQTT version and the shared routing across both versions.
 The adapter retains the protocol level for each transport generation.
-[Proposed 0038](decisions/0038-mqtt311-wire-profile.md) specifies the level-4 profile.
+[Proposed 0038](decisions/0038-mqtt311-wire-profile.md) specifies the level-4
+profile. [Proposed 0040](decisions/0040-mqtt311-incoming-qos2.md) adds incoming
+QoS 2 with the same durable admission and replay state as MQTT 5.
 
-The product receives MQTT 5 QoS 0/1/2 publications, including durable retained values, Message Expiry and zero-delay QoS1 Wills with optional Retain, and delivers
+The product receives QoS 0/1/2 publications on both protocol levels, including
+durable retained values and zero-delay QoS 1 Wills with optional Retain.
+MQTT 5 supports Message Expiry. The broker delivers
 at QoS 0 or 1 to persistent exact and hierarchical subscriptions. Sessions and filters
 are durable. Initially non-retained QoS 0 publications use a bounded volatile path;
 QoS 1/2 admissions atomically create durable recipient obligations. This is

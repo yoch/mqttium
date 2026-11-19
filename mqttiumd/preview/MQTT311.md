@@ -28,10 +28,11 @@ In a third terminal, publish to the matching topic.
 ```sh
 mosquitto_pub -h 127.0.0.1 -p 8883 --tls-version tlsv1.3 \
   --cafile demo-pki/ca.crt --cert demo-pki/sensor.crt --key demo-pki/sensor.key \
-  -i capteur-1 -d -q 1 -t atelier/capteur-1/mqtt311/demo -m 'mqttiumd MQTT 3.1.1'
+  -i capteur-1 -d -q 2 -t atelier/capteur-1/mqtt311/demo -m 'mqttiumd MQTT 3.1.1 QoS 2'
 ```
 
-The subscriber prints `mqttiumd MQTT 3.1.1`. Mosquitto 2.0.21 also accepts
+The publisher prints the QoS 2 exchange through PUBCOMP. The subscriber
+receives `mqttiumd MQTT 3.1.1 QoS 2` at QoS 1. Mosquitto 2.0.21 also accepts
 `-V mqttv311` to request the same version explicitly. A local
 `mosquitto_pub` or `mosquitto_sub` configuration can change defaults.
 
@@ -45,20 +46,25 @@ restart and reconnect. `Clean Session=1` creates a fresh ephemeral session.
 Restart with the same data directory and authorized identities to resume.
 
 Both MQTT versions use the same listener, routing and durable SQLite writer.
-The 3.1.1 profile covers QoS 0/1 PUBLISH and subscription grants, retained
+The 3.1.1 profile accepts incoming QoS 0/1/2 PUBLISH and grants QoS 0/1
+subscriptions. It supports retained
 messages, QoS 1 Will, explicit ClientIDs, SUBSCRIBE, UNSUBSCRIBE, PING and
 normal DISCONNECT. A QoS 2 subscription request can be granted QoS 1.
-Incoming QoS 2 PUBLISH and non-QoS-1 Will are outside this 3.1.1 profile.
-A refused publication closes the 3.1.1 connection before PUBACK when the
-failure has no wire encoding. The broker requires the configured client
-certificate and its authorized ClientID and topic policy.
+For QoS 2, admission and the recipient obligations commit before PUBREC.
+A persistent publisher can repeat PUBLISH after a lost PUBREC and repeat
+PUBREL after a lost PUBCOMP. Those repetitions finish the same exchange.
+A refused publication closes the 3.1.1 connection before PUBACK or PUBREC
+when the failure has no wire encoding. Outgoing QoS 2 and Will QoS 0/2
+remain outside the profile. The broker requires the configured client
+certificate and its authorized ClientID and topic policy. A mixed SUBSCRIBE
+reports the authorization and grant separately for each filter.
 
 ## Replay the receipt
 
 Build the pinned Mosquitto 2.0.21 reference with a C toolchain and OpenSSL
 headers. The same clients and certificates are used for the reference and
 mqttiumd. The standalone receipt uses the extracted normal broker, ordinary
-clients and a small exact-wire witness for the capacity boundary.
+clients and an exact-wire witness for restart, QoS 2 replay and capacity.
 
 ```sh
 sh build-mosquitto-reference.sh ./reference
@@ -68,6 +74,7 @@ python3 -m venv .venv
 ```
 
 Replace `VERIFIED_TAR_SHA256` with the digest checked during extraction. The
-JSON receipt identifies the executed broker and protocols, positive PUBACK
-ordering, offline QoS 1 restart, a clean-session control and the observed
-capacity refusal. Broker event streams are retained alongside it.
+JSON receipt identifies the executed broker and protocols. It records mixed
+SUBACK codes, offline delivery after restart, commit ordering for PUBACK
+and PUBREC, the publisher's QoS 2 recovery state, and capacity refusal
+before a success ACK. Broker event streams are retained alongside it.
