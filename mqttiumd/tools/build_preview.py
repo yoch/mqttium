@@ -13,6 +13,8 @@ import subprocess
 import tarfile
 import tempfile
 
+from preview_archive import RESTART_FORMAT, digest, elf_record
+
 
 def command(*args: str, cwd: Path | None = None) -> str:
     return subprocess.check_output(args, cwd=cwd, text=True, stderr=subprocess.PIPE)
@@ -78,7 +80,20 @@ def build(out: Path, target: Path) -> Path:
             command("git", "worktree", "remove", "--force", str(pin), cwd=caller)
 
 
-def build_pinned(out: Path, target: Path, root: Path, source: str) -> Path:
+def copy_restart_files(package: Path, packager: Path) -> None:
+    preview = packager / "preview"
+    shutil.copy2(preview / "DURABLE-RESTART.md", package / "README.md")
+    for name in ("start-tls.sh", "demo-pki.py", "run-durable-restart.sh"):
+        shutil.copy2(preview / name, package / name)
+    pilot = package / "pilot"
+    pilot.mkdir()
+    for name in ("common.py", "durable_restart.py"):
+        shutil.copy2(preview / "pilot" / name, pilot / name)
+    (package / "requirements.txt").write_text("mqttium==1.3.0\npaho-mqtt==2.1.0\n")
+
+
+def build_pinned(out: Path, target: Path, root: Path, source: str, *,
+                 restart_packager: tuple[Path, str] | None = None) -> Path:
     repo = root.parent
     out.mkdir(parents=True)
     env = dict(os.environ, CARGO_INCREMENTAL="0")
@@ -91,14 +106,25 @@ def build_pinned(out: Path, target: Path, root: Path, source: str) -> Path:
                             "--no-default-features", "--target-dir", str(target)],
                        cwd=root, env=env, stdout=log, stderr=subprocess.STDOUT, check=True)
     binary = target / "release/mqttiumd"
-    package = out / f"mqttiumd-preview-{source[:8]}-{platform.machine()}-linux"
+    machine = platform.machine()
+    name = f"mqttiumd-preview-{source[:8]}-{machine}-linux"
+    if restart_packager:
+        packager, revision = restart_packager
+        elf = elf_record(binary)
+        if platform.system() != "Linux" or elf["machine"] != machine:
+            raise ValueError("restart_preview_requires_native_build")
+        name = f"mqttiumd-restart-preview-{source[:8]}-{revision[:8]}-{machine}-linux"
+    package = out / name
     package.mkdir()
     shutil.copy2(binary, package / "mqttiumd")
-    for name in ("README.md", "start.sh", "demo.sh", "expiry-demo.sh", "will-demo.sh",
-                 "SECURE.md", "start-tls.sh", "secure-demo.sh", "demo-pki.py", "identities.example.json",
-                 "POLICY.md", "policy-demo.py", "identities.next.example.json", "retained-will-demo.py"):
-        shutil.copy2(root / "preview" / name, package / name)
-    copy_pilot_files(root, package)
+    if restart_packager:
+        copy_restart_files(package, packager)
+    else:
+        for name in ("README.md", "start.sh", "demo.sh", "expiry-demo.sh", "will-demo.sh",
+                     "SECURE.md", "start-tls.sh", "secure-demo.sh", "demo-pki.py", "identities.example.json",
+                     "POLICY.md", "policy-demo.py", "identities.next.example.json", "retained-will-demo.py"):
+            shutil.copy2(root / "preview" / name, package / name)
+        copy_pilot_files(root, package)
     (package / "NORMAL-FEATURES.txt").write_text(features)
     runtime = command("ldd", str(binary))
     if "not found" in runtime:
@@ -157,11 +183,23 @@ def build_pinned(out: Path, target: Path, root: Path, source: str) -> Path:
                          "message_expiry": False, "intent_slots": 256, "payload_bytes": 8388608},
         "offline_policy": {"plan_format": "mqttiumd.policy-plan.v1", "sqlite_schema": 13,
                            "scope": "monotone", "tool": "mqttiumd policy"},
-        "binary_sha256": hashlib.sha256(binary.read_bytes()).hexdigest(),
+        "binary_sha256": digest(binary),
         "runtime_dependencies": runtime.splitlines(),
         "execution_verification": "Separate extraction receipt names this exact archive hash",
         "execution_receipt": "See the separately identified archive extraction smoke and Will/Message Expiry/retained receptions.",
     }
+    if restart_packager:
+        build_record["elf"] = elf
+        build_record["lockfile_sha256"] = digest(root / "Cargo.lock")
+        build_record["execution_receipt"] = "Separate mTLS durable restart receipt for this archive"
+        seal = {
+            "format": RESTART_FORMAT, "machine": machine,
+            "broker_source_sha": source,
+            "broker_binary_sha256": build_record["binary_sha256"], "package_source_sha": revision,
+            "reception": {"status": "separate_receipt", "scope": "one loopback mTLS restart",
+                          "binary_sha256": build_record["binary_sha256"]},
+        }
+        (package / "PACKAGE.json").write_text(json.dumps(seal, indent=2) + "\n")
     (package / "BUILD.json").write_text(json.dumps(build_record, indent=2) + "\n")
     sums = []
     for f in sorted(package.rglob("*")):
@@ -171,8 +209,8 @@ def build_pinned(out: Path, target: Path, root: Path, source: str) -> Path:
     archive = out / f"{package.name}.tar.gz"
     with tarfile.open(archive, "w:gz") as tar:
         tar.add(package, arcname=package.name)
-    digest = hashlib.sha256(archive.read_bytes()).hexdigest()
-    archive.with_name(archive.name + ".sha256").write_text(f"{digest}  {archive.name}\n")
+    artifact_hash = digest(archive)
+    archive.with_name(archive.name + ".sha256").write_text(f"{artifact_hash}  {archive.name}\n")
     return archive
 
 
@@ -180,8 +218,25 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("out", type=Path)
     parser.add_argument("--target-dir", type=Path, required=True)
+    parser.add_argument("--restart-broker-root", type=Path, help="mqttiumd directory of a clean pinned checkout")
+    parser.add_argument("--broker-source", help="exact broker commit for the restart preview")
     args = parser.parse_args()
-    print(build(args.out.resolve(), args.target_dir.resolve()))
+    if (args.restart_broker_root is None) != (args.broker_source is None):
+        parser.error("the restart preview needs both the broker checkout and its commit")
+    if args.restart_broker_root is None:
+        print(build(args.out.resolve(), args.target_dir.resolve()))
+        return
+    packager = Path(__file__).resolve().parents[1]
+    broker_root = args.restart_broker_root.resolve()
+    for path in (packager, broker_root):
+        if command("git", "status", "--porcelain", cwd=path).strip():
+            raise ValueError("restart_preview_requires_clean_checkouts")
+    source = command("git", "rev-parse", "HEAD", cwd=broker_root).strip()
+    if source != args.broker_source:
+        raise ValueError("restart_broker_checkout_mismatch")
+    revision = command("git", "rev-parse", "HEAD", cwd=packager).strip()
+    print(build_pinned(args.out.resolve(), args.target_dir.resolve(), broker_root, source,
+                       restart_packager=(packager, revision)))
 
 
 if __name__ == "__main__":

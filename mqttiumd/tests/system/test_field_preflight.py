@@ -17,7 +17,8 @@ import field_preflight as preflight
 
 class FieldPreflightTests(unittest.TestCase):
     def test_native_arm_runner_cannot_pass_for_the_sealed_x86_release(self):
-        args = argparse.Namespace(archive=Path("frozen.tar.gz"), data_root=Path("data"), backup_root=Path("backup"),
+        args = argparse.Namespace(archive=Path("frozen.tar.gz"), archive_sha256=None,
+                                  data_root=Path("data"), backup_root=Path("backup"),
                                   restore_root=None, overhead_gib=4, write_assessment=None,
                                   lan_address=None, credentials=None, smart=False)
         host = {"os": "Linux", "machine": "aarch64", "glibc": ["glibc", "2.43"],
@@ -25,7 +26,7 @@ class FieldPreflightTests(unittest.TestCase):
         volume = {"device": "0:27", "filesystem": "overlay", "disk": None, "mount_options": [],
                   "available_bytes": 128 * preflight.GIB, "available_inodes": 1_000_000, "private_writable": True}
         with (patch.object(preflight, "host_record", return_value=host),
-              patch.object(preflight, "package_record", return_value={"elf_machine": "x86_64"}),
+              patch.object(preflight, "package_record", return_value={"elf_machine": "x86_64", "minimum_glibc_symbols": "2.34"}),
               patch.object(preflight, "block_inventory", return_value=[]),
               patch.object(preflight, "volume", return_value=volume)):
             result = preflight.assess(args)

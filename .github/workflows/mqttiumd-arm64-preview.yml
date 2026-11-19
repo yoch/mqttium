@@ -1,0 +1,173 @@
+name: mqttiumd ARM64 restart preview
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/mqttiumd-arm64-preview.yml"
+      - "mqttiumd/**"
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: mqttiumd-arm64-preview-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+env:
+  BROKER_SOURCE: 51be4079f7ee42f46500e993315eddc971f0a8d4
+
+jobs:
+  build:
+    name: Build and seal the native ARM64 broker
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 20
+    outputs:
+      archive: ${{ steps.publish-record.outputs.archive }}
+      sha256: ${{ steps.publish-record.outputs.sha256 }}
+      artifact: ${{ steps.upload.outputs.artifact-id }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          path: packaging
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ env.BROKER_SOURCE }}
+          path: broker
+          persist-credentials: false
+      - name: Build the frozen Rust source with its pinned toolchain
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = aarch64
+          unset RUSTFLAGS CARGO_ENCODED_RUSTFLAGS CARGO_PROFILE_RELEASE_DEBUG CARGO_PROFILE_RELEASE_OPT_LEVEL
+          unset CARGO_PROFILE_RELEASE_OVERFLOW_CHECKS CARGO_BUILD_TARGET
+          cd broker/mqttiumd
+          channel="$(sed -n 's/^channel = "\(.*\)"$/\1/p' rust-toolchain.toml)"
+          rustup toolchain install "$channel" --profile minimal --component rustfmt --component clippy
+          output="$RUNNER_TEMP/restart-build"
+          if ! python3 "$GITHUB_WORKSPACE/packaging/mqttiumd/tools/build_preview.py" "$output" \
+              --target-dir "$RUNNER_TEMP/broker-target" --restart-broker-root "$PWD" \
+              --broker-source "$BROKER_SOURCE"; then
+            if test -f "$output/build.log"; then tail -80 "$output/build.log"; fi
+            exit 1
+          fi
+      - name: Record the checksum outside the TAR
+        id: publish-record
+        run: |
+          set -euo pipefail
+          release="$RUNNER_TEMP/restart-build"
+          cp packaging/mqttiumd/tools/preview_archive.py "$release/preview_archive.py"
+          set -- "$release"/mqttiumd-restart-preview-*-aarch64-linux.tar.gz
+          test "$#" -eq 1
+          test -f "$1"
+          printf 'archive=%s\n' "$(basename "$1")" >> "$GITHUB_OUTPUT"
+          sha256sum "$1"
+          printf 'sha256=%s\n' "$(sha256sum "$1" | cut -d ' ' -f1)" >> "$GITHUB_OUTPUT"
+      - name: Publish the TAR and standalone verifier
+        id: upload
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: mqttiumd-restart-preview-linux-aarch64
+          path: |
+            ${{ runner.temp }}/restart-build/*.tar.gz
+            ${{ runner.temp }}/restart-build/*.tar.gz.sha256
+            ${{ runner.temp }}/restart-build/preview_archive.py
+          if-no-files-found: error
+
+  restart:
+    name: Receive the downloaded ARM64 TAR over loopback mTLS
+    runs-on: ubuntu-24.04-arm
+    needs: build
+    timeout-minutes: 12
+    env:
+      ARCHIVE_NAME: ${{ needs.build.outputs.archive }}
+      EXPECTED_TAR_SHA256: ${{ needs.build.outputs.sha256 }}
+      PACKAGING_SOURCE: ${{ github.event.pull_request.head.sha }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          artifact-ids: ${{ needs.build.outputs.artifact }}
+          path: ${{ runner.temp }}/downloaded-arm
+      - name: Fetch the frozen x86_64 archive for the architecture control
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          repository: yoch/mqttium
+          run-id: 44426277613
+          artifact-ids: 14485370226
+          github-token: ${{ github.token }}
+          path: ${{ runner.temp }}/downloaded-x86
+      - name: Verify external TAR checksum, architecture and extracted bytes
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = aarch64
+          mkdir "$RUNNER_TEMP/restart-evidence"
+          cmp mqttiumd/tools/preview_archive.py "$RUNNER_TEMP/downloaded-arm/preview_archive.py"
+          python3 mqttiumd/tools/preview_archive.py "$RUNNER_TEMP/downloaded-arm/$ARCHIVE_NAME" \
+            --sha256 "$EXPECTED_TAR_SHA256" --out "$RUNNER_TEMP/restart-observation"
+      - name: Exercise architecture and altered archive refusals
+        run: |
+          set -euo pipefail
+          verifier=mqttiumd/tools/preview_archive.py
+          evidence="$RUNNER_TEMP/restart-evidence"
+          x86="$RUNNER_TEMP/downloaded-x86/mqttiumd-prepilot-51be4079-91e53652-x86_64-linux.tar.gz"
+          if python3 "$verifier" "$x86" --sha256 8ea28eda6be48e1ddfe07c623b51deff43d658ee7ac5d8b3edef012ac6f957a2 \
+              --out "$RUNNER_TEMP/rejected-x86" > "$evidence/x86-refusal.json"; then
+            exit 1
+          fi
+          cp "$RUNNER_TEMP/downloaded-arm/$ARCHIVE_NAME" "$RUNNER_TEMP/altered.tar.gz"
+          printf 'altered\n' >> "$RUNNER_TEMP/altered.tar.gz"
+          if python3 "$verifier" "$RUNNER_TEMP/altered.tar.gz" --sha256 "$EXPECTED_TAR_SHA256" \
+              --out "$RUNNER_TEMP/rejected-altered" > "$evidence/altered-refusal.json"; then
+            exit 1
+          fi
+          python3 - "$RUNNER_TEMP" <<'PY'
+          import json
+          from pathlib import Path
+          import sys
+          root = Path(sys.argv[1])
+          for name, reason in (("x86", "native_architecture_mismatch"), ("altered", "archive_sha256_mismatch")):
+              assert json.loads((root / "restart-evidence" / f"{name}-refusal.json").read_text()) == {
+                  "status": "REFUSED", "reason": reason,
+              }
+              assert not (root / f"rejected-{name}").exists()
+          PY
+      - name: Run the extracted launcher and check receipt provenance
+        run: |
+          set -euo pipefail
+          observation="$RUNNER_TEMP/restart-observation"
+          package="$observation/${ARCHIVE_NAME%.tar.gz}"
+          python3 -m venv "$RUNNER_TEMP/client-env"
+          python="$RUNNER_TEMP/client-env/bin/python"
+          "$python" -m pip install --disable-pip-version-check -r "$package/requirements.txt"
+          PYTHON="$python" "$package/run-durable-restart.sh" "$observation/receipt" "$EXPECTED_TAR_SHA256"
+          "$python" - "$observation" <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import sys
+          observation = Path(sys.argv[1])
+          preflight = json.loads((observation / "preflight.json").read_text())
+          receipt = json.loads((observation / "receipt/restart.json").read_text())
+          assert receipt["status"] == "PASS" and preflight["machine"] == receipt["machine"] == "aarch64"
+          assert receipt["archive_sha256"] == preflight["archive_sha256"] == os.environ["EXPECTED_TAR_SHA256"]
+          assert receipt["broker_source_sha"] == preflight["broker_source_sha"] == os.environ["BROKER_SOURCE"]
+          assert receipt["package_source_sha"] == preflight["package_source_sha"] == os.environ["PACKAGING_SOURCE"]
+          assert receipt["binary_sha256"] == preflight["binary_sha256"] == receipt["starts"][0]["binary_sha256"] == receipt["starts"][1]["binary_sha256"]
+          PY
+      - name: Publish the restart receipt and negative controls
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: mqttiumd-durable-restart-receipt-aarch64
+          path: |
+            ${{ runner.temp }}/restart-evidence/*.json
+            ${{ runner.temp }}/restart-observation/preflight.json
+            ${{ runner.temp }}/restart-observation/receipt/restart.json
+            ${{ runner.temp }}/restart-observation/receipt/broker-*.log
+          if-no-files-found: warn

@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
-"""Read-only field preflight for the sealed x86_64 private-site candidate."""
+"""Read-only field preflight for verified Linux previews."""
 from __future__ import annotations
 
 import argparse
-import hashlib
 import importlib.metadata
 import ipaddress
 import json
@@ -18,6 +17,8 @@ import stat
 import subprocess
 import tarfile
 import time
+
+from preview_archive import RESTART_FORMAT, archive_metadata, checked_archive
 
 
 GIB = 1024**3
@@ -56,26 +57,18 @@ def output_json(result):
         return None
 
 
-def package_record(archive):
-    info = archive.stat()
-    if not stat.S_ISREG(info.st_mode) or not 0 < info.st_size <= 128 * MIB:
-        raise ValueError("archive_must_be_a_bounded_regular_file")
-    with archive.open("rb") as source:
-        if hashlib.file_digest(source, "sha256").hexdigest() != ARCHIVE:
-            raise ValueError("archive_sha256_mismatch")
-        source.seek(0)
-        with tarfile.open(fileobj=source, mode="r:gz") as package:
-            seal = json.load(package.extractfile(f"{ROOT}/PACKAGE.json"))
-            build = json.load(package.extractfile(f"{ROOT}/BUILD.json"))
-            with package.extractfile(f"{ROOT}/mqttiumd") as executable:
-                header = executable.read(20)
-                executable.seek(0)
-                measured = hashlib.file_digest(executable, "sha256").hexdigest()
-    if (header[:6] != b"\x7fELF\x02\x01" or int.from_bytes(header[18:20], "little") != 62
-            or build["source_sha"] != BROKER_SOURCE or build["binary_sha256"] != BINARY or measured != BINARY
-            or seal["broker_binary_sha256"] != BINARY or seal["package_source_sha"] != PACKAGE_SOURCE
-            or seal["private_site"]["measured_source_sha"] != SITE_SOURCE
-            or build["instrumented"] is not False or build["features"] != []):
+def package_record(archive, expected_sha256=ARCHIVE):
+    with checked_archive(archive, expected_sha256) as (package, root, _):
+        build, seal = archive_metadata(package, root)
+    if seal["format"] == RESTART_FORMAT:
+        if build["source_sha"] != BROKER_SOURCE:
+            raise ValueError("unexpected_restart_broker_source")
+        return {"archive_sha256": expected_sha256, "binary_sha256": build["binary_sha256"],
+                "broker_source": build["source_sha"], "package_source": seal["package_source_sha"],
+                "elf_machine": build["machine"], **build["elf"], "scope": "durable_restart"}
+    if (expected_sha256 != ARCHIVE or root != ROOT or build["source_sha"] != BROKER_SOURCE
+            or build["binary_sha256"] != BINARY or seal["package_source_sha"] != PACKAGE_SOURCE
+            or seal["private_site"]["measured_source_sha"] != SITE_SOURCE):
         raise ValueError("unexpected_sealed_binary_or_application")
     return {"archive_sha256": ARCHIVE, "binary_sha256": BINARY, "broker_source": BROKER_SOURCE,
             "package_source": PACKAGE_SOURCE, "site_source": SITE_SOURCE, "elf_machine": "x86_64",
@@ -260,15 +253,20 @@ def assess(args):
     errors = []
     host = host_record()
     try:
-        package = package_record(args.archive)
+        package = package_record(args.archive, args.archive_sha256 or ARCHIVE)
     except (ValueError, KeyError, tarfile.TarError, OSError) as error:
         package = None
         errors.append({"code": "sealed_package_unverified", "detail": type(error).__name__})
-    if host["os"] != "Linux" or host["machine"] != "x86_64":
-        errors.append({"code": "native_architecture_mismatch"})
-    libc, version = host["glibc"]
-    if libc != "glibc" or not re.fullmatch(r"\d+(\.\d+)+", version) or tuple(map(int, version.split("."))) < (2, 34):
-        errors.append({"code": "glibc_below_or_unknown_required_symbols"})
+    if package is not None:
+        if host["os"] != "Linux" or host["machine"] != package["elf_machine"]:
+            errors.append({"code": "native_architecture_mismatch"})
+        libc, version = host["glibc"]
+        minimum = tuple(map(int, package["minimum_glibc_symbols"].split(".")))
+        if (libc != "glibc" or not re.fullmatch(r"\d+(\.\d+)+", version)
+                or tuple(map(int, version.split("."))) < minimum):
+            errors.append({"code": "glibc_below_or_unknown_required_symbols"})
+        if package.get("scope") == "durable_restart":
+            errors.append({"code": "full_site_receipt_not_present"})
     if host["uid"] == 0:
         errors.append({"code": "requires_unprivileged_service_account"})
     if host["paho"] != "2.1.0":
@@ -334,6 +332,7 @@ def assess(args):
 def main():
     cli = argparse.ArgumentParser(description=__doc__)
     cli.add_argument("--archive", required=True, type=Path)
+    cli.add_argument("--archive-sha256", help="verified digest for a separately received restart preview")
     cli.add_argument("--data-root", required=True, type=Path)
     cli.add_argument("--backup-root", required=True, type=Path)
     cli.add_argument("--restore-root", type=Path, help="defaults to backup-root")
