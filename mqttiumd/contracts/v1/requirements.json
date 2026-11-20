@@ -73,6 +73,11 @@
       "decision": "0009",
       "path": "docs/decisions/0009-owner-authority.md",
       "sha256": "9df1bf2b547bcbc02bdbf9ce58057a09ecd981bb1a3c3f87b42a2153c1f8b8fc"
+    },
+    {
+      "decision": "0044",
+      "path": "docs/decisions/0044-reactor-runtime-and-evidence-tiers.md",
+      "sha256": "c16a5ecc81dbb1c860669f1c27b02bbc8cd07534c9be266b2492c80a2f109825"
     }
   ],
   "entries": [

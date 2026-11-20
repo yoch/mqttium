@@ -51,3 +51,4 @@ What each record leaves open is tracked in
 | [0034](0034-durable-will.md) | Proposed | Durable zero-delay QoS1 Will and source-independent intentions | Product and bounded system reception |
 | [0035](0035-private-mtls-profile.md) | Proposed | TLS 1.3, durable ClientID ownership and topic grants | Product |
 | [0036](0036-offline-monotone-policy.md) | Proposed | Offline inventory, checked backup and atomic monotone authority transition | Product and SQLite |
+| [0044](0044-reactor-runtime-and-evidence-tiers.md) | Accepted | Target profile of version 0.1, readiness-driven reactor runtime without `async` (departs from ARC-021), two evidence tiers, frozen receptions | Runtime lots |

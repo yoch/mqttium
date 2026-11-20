@@ -1,14 +1,9 @@
 name: mqttiumd reactor A/B
 
+# Frozen by mqttiumd ADR 0044: historical evidence of the bounded preview,
+# run on demand only. See mqttiumd/docs/reports/0026-frozen-receptions.md.
 on:
-  pull_request:
-    types: [synchronize]
-    paths:
-      - ".github/workflows/mqttiumd-progression-ab.yml"
-      - "mqttiumd/tools/run_progression_ab.py"
-      - "mqttiumd/tools/progression_witness.py"
-      - "mqttiumd/tools/bounded-batch.mutant"
-      - "mqttiumd/tools/load_client.c"
+  workflow_dispatch:
 
 permissions:
   contents: read

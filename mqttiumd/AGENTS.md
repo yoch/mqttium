@@ -186,6 +186,31 @@ python tools/check_schemas.py
 9. **Every reader is bounded.** Sizes are computed with checked arithmetic
    and compared to a budget before anything is allocated or enumerated.
 
+## Evidence tiers (ADR 0044)
+
+| Tier | Paths | Regime |
+| - | - | - |
+| Core | `contracts/`, `crates/mqttiumd-contract/`, `crates/mqttiumd-core/`, `crates/mqttiumd-store-api/`, `crates/mqttiumd-store-sqlite/`, the deterministic store in `crates/mqttiumd-lab/`, `tests/oracle/`, `tests/scenarios/`, `proofs/` | Everything in this guide |
+| Runtime | `crates/mqttiumd/`, `tests/compat/`, the runtime models under `models/`, load tools | Test first; differential scenarios against the pinned Mosquitto; TLA+ models of the thread and queue protocol with mutant configurations; property tests of the codec; load measurements with their commands. No sealed reception per increment |
+
+A runtime change that alters a public type, a durable encoding or an
+injection point of the core tier follows the core regime. The product
+tests run in both configurations:
+
+```bash
+cargo test -p mqttiumd --locked
+cargo test -p mqttiumd --features test-hooks --locked
+```
+
+The system receptions under `tests/system/`, the `tools/run_*_reception.sh`
+scripts, `preview/` and the pilot kits are frozen evidence of the
+executable built from `51be4079` (report 0026). They run on demand
+(`mqttiumd-frozen-receptions.yml`) and are not repaired when the runtime or
+a limit changes; cover the behaviour with a runtime test or a compatibility
+scenario first. The distributed executable is built with
+`cargo build -p mqttiumd --profile dist --locked`; `[profile.release]` is
+the profile the run manifests record and stays unchanged.
+
 ## Roles and file ownership
 
 One lot per branch. A lot touches only its own paths. The lots of the

@@ -1,10 +1,9 @@
 name: mqttiumd ARM64 restart preview
 
+# Frozen by mqttiumd ADR 0044: historical evidence of the bounded preview,
+# run on demand only. See mqttiumd/docs/reports/0026-frozen-receptions.md.
 on:
-  pull_request:
-    paths:
-      - ".github/workflows/mqttiumd-arm64-preview.yml"
-      - "mqttiumd/**"
+  workflow_dispatch:
 
 permissions:
   contents: read
