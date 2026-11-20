@@ -1537,6 +1537,215 @@ fn a_temporarily_full_output_retries_the_same_durable_publish_without_closing() 
 }
 
 #[test]
+fn a_slow_transport_holds_its_acks_while_an_independent_exchange_progresses() {
+    for reverse in [false, true] {
+        with_runtime(128, |runtime, _| {
+            let first = peer(runtime);
+            let second = peer(runtime);
+            let ((slow, mut receiver_a), (independent, mut receiver_b)) = if reverse {
+                (second, first)
+            } else {
+                (first, second)
+            };
+            for (id, name, client) in [
+                (slow, b"slow".as_slice(), &mut receiver_a),
+                (independent, b"independent".as_slice(), &mut receiver_b),
+            ] {
+                runtime.connect(id, connect_packet(name)).unwrap();
+                until(runtime, |r| {
+                    r.session_requests.is_empty() && r.frames.is_empty()
+                });
+                assert_eq!(read_frame(client).0, 0x20);
+            }
+            runtime
+                .packet(independent, 0x82, vec![0, 1, 0, 0, 1, b't', 1])
+                .unwrap();
+            until(runtime, |r| {
+                r.frames.values().all(|frame| frame.kind != "SUBACK")
+                    && r.inflight.is_empty()
+                    && r.inputs.is_empty()
+            });
+            assert_eq!(read_frame(&mut receiver_b).0, 0x90);
+
+            let (blocked, held) = std::sync::mpsc::sync_channel(net::OUTPUT_SLOTS);
+            for _ in 0..net::OUTPUT_SLOTS {
+                blocked
+                    .try_send(net::Write {
+                        expiry: None,
+                        correlation: None,
+                        bytes: vec![0xd0, 0],
+                    })
+                    .unwrap();
+            }
+            let original = std::mem::replace(
+                &mut runtime.peers.get_mut(&slow).unwrap().io.outgoing,
+                blocked,
+            );
+            for mid in [1, 2] {
+                let mut body = publish_body(mid);
+                body[2] = b'a';
+                runtime.packet(slow, 0x32, body).unwrap();
+            }
+            let pending = |r: &Runtime<'_>| {
+                r.owner
+                    .outbox()
+                    .unwrap()
+                    .pending()
+                    .filter_map(|effect| match effect.effect() {
+                        Effect::EmitFrame {
+                            connection,
+                            frame: OutboundFrame::Puback { packet_id, .. },
+                            ..
+                        } if connection.generation == slow => Some((effect.id(), packet_id.get())),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+            };
+            until(runtime, |r| {
+                !r.peers.contains_key(&slow) || pending(r).len() == 2
+            });
+            assert!(
+                runtime.peers.contains_key(&slow),
+                "temporary_ack_backpressure_closed_connection"
+            );
+            let before = pending(runtime);
+            assert_eq!(
+                before.iter().map(|(_, mid)| *mid).collect::<Vec<_>>(),
+                [1, 2]
+            );
+
+            runtime.packet(independent, 0x32, publish_body(7)).unwrap();
+            until(runtime, |r| {
+                r.frames.values().any(|frame| {
+                    frame.connection.generation == independent && frame.kind == "PUBLISH"
+                })
+            });
+            let frames = [read_frame(&mut receiver_b), read_frame(&mut receiver_b)];
+            assert!(
+                frames
+                    .iter()
+                    .any(|(first, body)| *first == 0x40 && body[..2] == [0, 7])
+            );
+            assert!(frames.iter().any(|(first, body)| *first == 0x32
+                && body[..3] == [0, 1, b't']
+                && body.last() == Some(&b'v')));
+            assert_eq!(
+                pending(runtime),
+                before,
+                "slow connection must still own both ordered frames"
+            );
+            assert_eq!(held.try_iter().count(), net::OUTPUT_SLOTS);
+            runtime.peers.get_mut(&slow).unwrap().io.outgoing = original;
+            runtime.dispatch().unwrap();
+            for mid in [1, 2] {
+                let (first, body) = read_frame(&mut receiver_a);
+                assert_eq!((first, &body[..2]), (0x40, &[0, mid][..]));
+            }
+            assert!(pending(runtime).is_empty());
+        });
+    }
+}
+
+fn fill_ordinary_inputs(runtime: &mut Runtime<'_>, generation: ConnectionGeneration) {
+    let count = (0..=INPUTS)
+        .take_while(|order| {
+            runtime
+                .queue(Input::Packet {
+                    connection: generation,
+                    ingress_order: 100 + *order as u64,
+                    packet: InboundPacket::Pingreq,
+                })
+                .is_ok()
+        })
+        .count();
+    assert!(count > 0 && count <= INPUTS);
+}
+
+#[test]
+fn a_full_input_lane_leaves_the_next_socket_packet_in_its_bounded_channel() {
+    with_runtime(128, |runtime, _| {
+        let (generation, mut client) = peer(runtime);
+        runtime
+            .connect(generation, connect_packet(b"pressure-input"))
+            .unwrap();
+        until(runtime, |r| {
+            r.session_requests.is_empty() && r.frames.is_empty()
+        });
+        assert_eq!(read_frame(&mut client).0, 0x20);
+        let (producer, consumer) = std::sync::mpsc::sync_channel(net::INPUT_SLOTS);
+        producer
+            .try_send(net::Incoming::Packet {
+                first: 0xc0,
+                body: vec![],
+                observed: Ok(runtime.message_now().unwrap()),
+            })
+            .unwrap();
+        let original = std::mem::replace(
+            &mut runtime.peers.get_mut(&generation).unwrap().io.incoming,
+            consumer,
+        );
+        fill_ordinary_inputs(runtime, generation);
+        let ingress = runtime.peers[&generation].ingress;
+        let result = runtime.connections();
+        assert!(
+            result.is_ok(),
+            "full_input_consumed_socket_packet: {result:?}"
+        );
+        assert_eq!(runtime.peers[&generation].ingress, ingress);
+        runtime.inputs.pop_front().unwrap();
+        runtime.inputs.pop_front().unwrap();
+        runtime.connections().unwrap();
+        assert_eq!(runtime.peers[&generation].ingress, ingress + 1);
+        runtime.connections().unwrap();
+        assert_eq!(runtime.peers[&generation].ingress, ingress + 1);
+        runtime.peers.get_mut(&generation).unwrap().io.incoming = original;
+    });
+}
+
+#[test]
+fn a_full_ordinary_lane_still_collects_an_authentic_writer_reply() {
+    with_runtime(128, |runtime, _| {
+        let (generation, mut client) = peer(runtime);
+        runtime
+            .connect(generation, connect_packet(b"pressure-result"))
+            .unwrap();
+        until(runtime, |r| {
+            r.session_requests.is_empty()
+                && r.frames.is_empty()
+                && r.work_reads.is_empty()
+                && r.inputs.is_empty()
+        });
+        assert_eq!(read_frame(&mut client).0, 0x20);
+        runtime.packet(generation, 0x32, publish_body(1)).unwrap();
+        runtime.drain_inputs().unwrap();
+        let response = runtime
+            .writer
+            .receiver
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        assert!(matches!(
+            &response,
+            Response::Store {
+                reply: StoreReply::Outcome(StoreOutcome::Committed(
+                    CommitFacts::PublicationAdmitted { .. }
+                )),
+                ..
+            }
+        ));
+        let (producer, consumer) = std::sync::mpsc::sync_channel(1);
+        producer.try_send(response).unwrap();
+        let original = std::mem::replace(&mut runtime.writer.receiver, consumer);
+        fill_ordinary_inputs(runtime, generation);
+        runtime.writer_results().unwrap();
+        runtime.writer.receiver = original;
+        assert!(
+            runtime.inflight.is_empty(),
+            "full_ordinary_input_delayed_already_committed_writer_reply"
+        );
+    });
+}
+
+#[test]
 fn a_saturated_four_slot_output_retains_the_committed_puback_until_terminal_failure() {
     with_runtime(4, |runtime, directory| {
         let (generation, mut client) = peer(runtime);
