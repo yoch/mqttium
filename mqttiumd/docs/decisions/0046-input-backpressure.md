@@ -76,6 +76,11 @@ be told what was written, and that is a fault, not pressure.
 - The observation time of a held packet is still the instant its last
   byte left the socket. A packet that waits is older when the core sees
   it; an expiry computed from it is earlier, never later.
+- Keep Alive measures the silence of the peer, not the broker's delay
+  in looking at what it sent: while a packet the task framed has not been
+  taken by the core, the Keep Alive of its connection does not expire.
+  Without this a peer whose PINGREQ waits behind a full lane would be
+  closed for a silence that is the broker's.
 - A peer that sends faster than the broker serves it now waits. QoS 0
   publications towards a saturated subscriber are still dropped and
   counted; this record changes nothing for output.

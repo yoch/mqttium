@@ -3128,7 +3128,13 @@ impl Runtime<'_> {
                             body,
                             observed,
                         }),
-                        None => p.io.incoming.try_recv(),
+                        None => {
+                            let incoming = p.io.incoming.try_recv();
+                            if matches!(incoming, Ok(net::Incoming::Packet { .. })) {
+                                p.io.packet_taken();
+                            }
+                            incoming
+                        }
                     },
                     None => break,
                 };
@@ -3230,6 +3236,9 @@ impl Runtime<'_> {
                 } else if p.keep_alive != 0
                     && p.last_packet.elapsed()
                         > Duration::from_millis(u64::from(p.keep_alive) * 1500)
+                    // Keep Alive measures the silence of the peer. A packet
+                    // it sent and the core has not taken yet is not silence.
+                    && !p.io.has_unread_input()
                 {
                     Some("keep_alive")
                 } else {

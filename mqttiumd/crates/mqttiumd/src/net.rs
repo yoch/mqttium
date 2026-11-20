@@ -10,7 +10,7 @@ use std::io::{self, Read, Write as _};
 use std::net::{Shutdown, TcpStream};
 use std::ops::Deref;
 use std::os::fd::{AsRawFd, RawFd};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, SendError, SyncSender, TryRecvError, TrySendError};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -196,6 +196,10 @@ struct Control {
     cancelled: Arc<AtomicBool>,
     terminal: Arc<Mutex<Option<Terminal>>>,
     wake: Wake,
+    /// Packets the task framed, and packets the core took from the lane.
+    /// Their difference is input the broker holds and has not looked at.
+    parsed: Arc<AtomicU64>,
+    taken: Arc<AtomicU64>,
     #[cfg(test)]
     pause_progress: Arc<AtomicBool>,
     #[cfg(test)]
@@ -214,6 +218,8 @@ impl Control {
             cancelled: Arc::new(AtomicBool::new(false)),
             terminal: Arc::new(Mutex::new(None)),
             wake,
+            parsed: Arc::new(AtomicU64::new(0)),
+            taken: Arc::new(AtomicU64::new(0)),
             #[cfg(test)]
             pause_progress: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
@@ -248,8 +254,8 @@ impl Control {
 
 /// The owner polls these bounded queues. Closing cancels the task
 /// immediately; the owner then observes its end with `join_finished`,
-/// without waiting on a socket in its turn. A queue-full terminal code is
-/// retained independently of the full input queue.
+/// without waiting on a socket in its turn. The terminal reason is kept
+/// outside the lanes, so it is readable when they are full.
 pub struct Connection {
     pub incoming: Inbound<Incoming>,
     pub outgoing: Outbound,
@@ -290,6 +296,7 @@ fn open(stream: &TcpStream, wake: Wake) -> io::Result<(Lanes, Connection)> {
     let (outgoing, output) = mpsc::sync_channel(OUTPUT_SLOTS);
     let (written_tx, written) = lane(WRITTEN_SLOTS, &wake);
     let (progress, wire_progress) = lane(WIRE_PROGRESS_SLOTS, &wake);
+    let control = Control::new(wake);
     let connection = Connection {
         incoming: Inbound {
             receiver: incoming,
@@ -308,7 +315,7 @@ fn open(stream: &TcpStream, wake: Wake) -> io::Result<(Lanes, Connection)> {
             link: Some(link.clone()),
         },
         stream: stream.try_clone()?,
-        control: Control::new(wake),
+        control: control.clone(),
         link: link.clone(),
         send_buffer,
         principal: None,
@@ -319,6 +326,7 @@ fn open(stream: &TcpStream, wake: Wake) -> io::Result<(Lanes, Connection)> {
         written: written_tx,
         progress,
         link,
+        parsed: control.parsed.clone(),
         held: None,
         reports: VecDeque::new(),
         stalled: None,
@@ -407,6 +415,20 @@ impl Connection {
         self.control.progress_waiting.load(Ordering::Acquire)
     }
 
+    /// The core took one packet of this connection from its input lane.
+    pub fn packet_taken(&self) {
+        self.control.taken.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The task framed a packet the core has not taken yet. The peer sent
+    /// it; the broker is the one that has not looked.
+    pub fn has_unread_input(&self) -> bool {
+        let parsed = self.control.parsed.load(Ordering::Relaxed);
+        let taken = self.control.taken.load(Ordering::Relaxed);
+        // A lane a test fed by hand counts takes without framed packets.
+        parsed.wrapping_sub(taken).cast_signed() > 0
+    }
+
     pub fn close(&self) {
         self.control.stop(&self.stream, "cancelled");
         self.link.notify();
@@ -473,6 +495,7 @@ struct Lanes {
     written: Tx<Written>,
     progress: Tx<WireProgress>,
     link: Arc<Link>,
+    parsed: Arc<AtomicU64>,
     held: Option<Incoming>,
     /// Receipts in publication order. At most three per frame, and no frame
     /// is taken while one is pending.
@@ -505,6 +528,7 @@ impl Lanes {
     /// previous one first.
     fn hold(&mut self, incoming: Incoming) {
         debug_assert!(self.held.is_none());
+        self.parsed.fetch_add(1, Ordering::Relaxed);
         self.held = Some(incoming);
     }
 
@@ -1122,13 +1146,7 @@ mod tests {
     }
 
     fn control() -> Control {
-        Control {
-            cancelled: Arc::new(AtomicBool::new(false)),
-            terminal: Arc::new(Mutex::new(None)),
-            wake: Wake::new(),
-            pause_progress: Arc::new(AtomicBool::new(false)),
-            progress_waiting: Arc::new(AtomicBool::new(false)),
-        }
+        Control::new(Wake::new())
     }
 
     fn reading(tick: u64) -> SessionClockReading {
