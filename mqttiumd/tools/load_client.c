@@ -32,7 +32,7 @@ struct peer {
 	struct run *run;
 	struct mosquitto *mqtt;
 	char topic[40];
-	unsigned pair, pending;
+	unsigned pair, pending, disconnects;
 	bool publisher, connected, subscribed, failed;
 	uint32_t *pending_by_mid;
 };
@@ -88,6 +88,7 @@ static void disconnected(struct mosquitto *mqtt, void *context, int reason,
 	struct peer *peer = context;
 	if(!peer->failed) {
 		peer->run->disconnects++;
+		peer->disconnects++;
 	}
 	peer->failed = true;
 	peer->connected = false;
@@ -256,14 +257,24 @@ int main(int argc, char **argv)
 		perror("ignoring SIGPIPE");
 		return 2;
 	}
-	if(argc != 9 || strlen(argv[2]) >= 4000) {
-		fprintf(stderr, "usage: load-client PORT PKI PAIRS QOS RATE DURATION_MS PAYLOAD_BYTES CSV\n");
+	if((argc != 9 && argc != 13) || strlen(argv[2]) >= 4000) {
+		fprintf(stderr, "usage: load-client PORT PKI PAIRS QOS RATE DURATION_MS PAYLOAD_BYTES CSV"
+			" [IDLE_MS DRAIN_MS NEXT_RATE NEXT_DURATION_MS]\n");
 		return 2;
 	}
 	int port = (int)number(argv[1], 1, 65535);
 	unsigned rate = number(argv[5], 0, MAX_EVENTS);
 	unsigned duration = number(argv[6], 100, 60000);
-	uint64_t count = (uint64_t)rate * duration / 1000;
+	unsigned idle_ms = argc == 13 ? number(argv[9], 50, 10000) : 50;
+	unsigned drain_ms = argc == 13 ? number(argv[10], 0, 10000) : (rate ? 500 : 0);
+	unsigned next_rate = argc == 13 ? number(argv[11], 0, MAX_EVENTS) : 0;
+	unsigned next_duration = argc == 13 ? number(argv[12], 0, 60000) : 0;
+	if((next_rate == 0) != (next_duration == 0)) {
+		fprintf(stderr, "next rate and duration must both be present or both zero\n");
+		return 2;
+	}
+	uint64_t first_count = (uint64_t)rate * duration / 1000;
+	uint64_t count = first_count + (uint64_t)next_rate * next_duration / 1000;
 	if(count > MAX_EVENTS) {
 		fprintf(stderr, "too many scheduled events in one case\n");
 		return 2;
@@ -292,21 +303,31 @@ int main(int argc, char **argv)
 		connect_peer(peer, argv[2], port);
 	}
 
-	uint64_t start = now_ns() + SECOND / 20;
-	uint64_t end = start + (uint64_t)duration * 1000000;
-	uint64_t stop = end + (rate ? SECOND / 2 : 0);
+	uint64_t idle_start = now_ns();
+	uint64_t start = idle_start + (uint64_t)idle_ms * 1000000;
+	uint64_t transition = start + (uint64_t)duration * 1000000;
+	uint64_t end = transition + (uint64_t)next_duration * 1000000;
+	uint64_t stop = end + (uint64_t)drain_ms * 1000000;
 	for(unsigned i = 0; i < run.count; i++) {
-		run.events[i].scheduled = start + (uint64_t)i * SECOND / rate;
+		run.events[i].scheduled = i < first_count
+			? start + (uint64_t)i * SECOND / rate
+			: transition + (i - first_count) * SECOND / next_rate;
 		run.events[i].ack_reason = -1;
 	}
-	printf("{\"start_ns\":%" PRIu64 ",\"end_ns\":%" PRIu64 ",\"stop_ns\":%" PRIu64 "}\n", start, end, stop);
+	printf("{\"idle_start_ns\":%" PRIu64 ",\"start_ns\":%" PRIu64 ",\"switch_ns\":%" PRIu64
+		",\"end_ns\":%" PRIu64 ",\"stop_ns\":%" PRIu64 "}\n", idle_start, start, transition, end, stop);
 	fflush(stdout);
-	unsigned next = 0;
+	unsigned next = 0, attempted = 0;
 	uint64_t misc = start;
 	for(uint64_t now = now_ns(); now < stop; now = now_ns()) {
+		// An offered slot that missed its phase stays visible as unsent.
+		if(now >= transition && next < first_count) {
+			next = (unsigned)first_count;
+		}
 		for(unsigned batch = 0; batch < 32 && next < run.count && run.events[next].scheduled <= now && now < end; batch++) {
 			publish(&peers[run.pairs + next % run.pairs], next);
 			next++;
+			attempted++;
 		}
 		if(now >= misc) {
 			for(unsigned i = 0; i < run.pairs * 2; i++) {
@@ -337,8 +358,13 @@ int main(int argc, char **argv)
 		perror("closing observations");
 		return 2;
 	}
-	printf("{\"attempted_schedule_slots\":%u,\"invalid\":%u,\"unmapped_ack\":%u,\"disconnects\":%u}\n",
-			next, run.invalid, run.stray_ack, run.disconnects);
+	printf("{\"attempted_schedule_slots\":%u,\"invalid\":%u,\"unmapped_ack\":%u,\"disconnects\":%u,\"disconnects_by_pair\":[",
+			attempted, run.invalid, run.stray_ack, run.disconnects);
+	for(unsigned i = 0; i < run.pairs; i++) {
+		printf("%s{\"subscriber\":%u,\"publisher\":%u}", i ? "," : "",
+				peers[i].disconnects, peers[run.pairs + i].disconnects);
+	}
+	puts("]}");
 	for(unsigned i = 0; i < 2 * run.pairs; i++) {
 		mosquitto_disconnect(peers[i].mqtt);
 		mosquitto_destroy(peers[i].mqtt);

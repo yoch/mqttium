@@ -1,0 +1,88 @@
+name: mqttiumd reactor A/B
+
+on:
+  pull_request:
+    types: [synchronize]
+    paths:
+      - ".github/workflows/mqttiumd-progression-ab.yml"
+      - "mqttiumd/tools/run_progression_ab.py"
+      - "mqttiumd/tools/progression_witness.py"
+      - "mqttiumd/tools/bounded-batch.mutant"
+      - "mqttiumd/tools/load_client.c"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mqttiumd-progression-ab-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  compare:
+    name: Compare release brokers on one persistent runner volume
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 2
+          persist-credentials: false
+      - id: changes
+        name: Check that this push changes the comparison
+        run: |
+          set -euo pipefail
+          if git diff-tree --no-commit-id --name-only -r HEAD | +            grep -E '^(\.github/workflows/mqttiumd-progression-ab\.yml|mqttiumd/tools/(run_progression_ab\.py|progression_witness\.py|bounded-batch\.mutant|load_client\.c))$' > /dev/null; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Install the pinned compiler
+        if: steps.changes.outputs.run == 'true'
+        run: |
+          channel=$(sed -n 's/^channel = "\(.*\)"$/\1/p' mqttiumd/rust-toolchain.toml)
+          rustup toolchain install "$channel" --profile minimal
+      - id: study
+        name: Build both releases and retain every repetition
+        if: steps.changes.outputs.run == 'true'
+        run: |
+          set -euo pipefail
+          base=$(git rev-parse HEAD^)
+          output="$RUNNER_TEMP/progression-ab"
+          python3 mqttiumd/tools/run_progression_ab.py "$RUNNER_TEMP" "$output" --base "$base"
+          jq -r '"eligible=" + (.eligible|tostring)' "$output/verdict.json" >> "$GITHUB_OUTPUT"
+          jq '{eligible,qos0_pairs,recovery,failures}' "$output/verdict.json" >> "$GITHUB_STEP_SUMMARY"
+      - name: Publish both build identities and the full receipts
+        if: always() && steps.changes.outputs.run == 'true'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: mqttiumd-progression-ab-${{ github.event.pull_request.head.sha }}
+          path: ${{ runner.temp }}/progression-ab
+          if-no-files-found: error
+      - name: Publish the downloadable comparison summary
+        if: always() && steps.changes.outputs.run == 'true'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: mqttiumd-progression-summary-${{ github.event.pull_request.head.sha }}
+          path: |
+            ${{ runner.temp }}/progression-ab/manifest.json
+            ${{ runner.temp }}/progression-ab/verdict.json
+            ${{ runner.temp }}/progression-ab/trials.json
+            ${{ runner.temp }}/progression-ab/*.log
+          if-no-files-found: warn
+      - name: Seal B for a target SSD trial
+        if: steps.study.outputs.eligible == 'true'
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          artifact=mqttiumd-experimental-bounded-batch-linux-x86_64.tar.gz
+          tar -czf "$artifact" -C progression-ab mqttiumd-B manifest.json verdict.json
+          sha256sum "$artifact" > "$artifact.sha256"
+      - name: Publish B for a target SSD trial
+        if: steps.study.outputs.eligible == 'true'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: mqttiumd-experimental-bounded-batch-linux-x86_64
+          path: |
+            ${{ runner.temp }}/mqttiumd-experimental-bounded-batch-linux-x86_64.tar.gz
+            ${{ runner.temp }}/mqttiumd-experimental-bounded-batch-linux-x86_64.tar.gz.sha256
+          if-no-files-found: error

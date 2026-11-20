@@ -1,0 +1,215 @@
+--- a/mqttiumd/crates/mqttiumd/src/runtime.rs
++++ b/mqttiumd/crates/mqttiumd/src/runtime.rs
+@@ -50,6 +50,7 @@
+ const IN_FLIGHT: usize = 16;
+ const TIMERS: usize = 512;
+ const INPUTS: usize = 128;
++const READY_CONTINUATIONS_PER_TURN: usize = 8;
+ // One FIFO with reserved capacity for accepted writer requests and due deadlines.
+ const WRITER_INPUTS: usize = crate::writer::QUEUE;
+ const DEADLINE_INPUTS: usize = 4;
+@@ -212,6 +213,9 @@
+     next_session_request: u64,
+     generation: ConnectionGeneration,
+     peer_cursor: usize,
++    continuation_budget: usize,
++    extra_continuations_applied: u64,
++    maximum_continuations_taken: usize,
+     inputs: VecDeque<Input>,
+     control_inputs: VecDeque<Input>,
+     closing_inputs: VecDeque<Input>,
+@@ -1236,48 +1240,73 @@
+         let mut closing_budget = self.closing_inputs.len().min(CONNECTIONS);
+         let mut terminal_budget = self.terminal_inputs.len().min(CONNECTIONS);
+         let mut expiry_budget = self.expiry_inputs.len().min(4);
+-        for _ in 0..(self.inputs.len()
++        let planned = (self.inputs.len()
+             + self.control_inputs.len()
+             + closing_budget
+             + terminal_budget
+             + expiry_budget
+             + usize::from(self.message_expiry_input.is_some()))
+-        .min(64)
+-        {
+-            let control = if control_budget > 0 {
+-                self.control_inputs.pop_front()
++        .min(64);
++        for turn in 0..planned + self.continuation_budget {
++            let extra = turn >= planned;
++            let next = if extra {
++                if self.continuation_budget == 0
++                    || !matches!(self.inputs.front(), Some(Input::Continue { .. }))
++                    || self
++                        .owner
++                        .outbox()
++                        .is_none_or(|outbox| outbox.free_slots() == 0)
++                    || !self.control_inputs.is_empty()
++                    || !self.closing_inputs.is_empty()
++                    || !self.terminal_inputs.is_empty()
++                    || !self.expiry_inputs.is_empty()
++                    || self.message_expiry_input.is_some()
++                {
++                    break;
++                }
++                // Take the slot before applying and dispatching. A synchronous
++                // close can re-enter drain_inputs, using the same turn budget.
++                self.continuation_budget -= 1;
++                self.maximum_continuations_taken = self
++                    .maximum_continuations_taken
++                    .max(READY_CONTINUATIONS_PER_TURN - self.continuation_budget);
++                self.inputs.pop_front()
+             } else {
+-                None
++                let control = if control_budget > 0 {
++                    self.control_inputs.pop_front()
++                } else {
++                    None
++                };
++                control
++                    .inspect(|_| control_budget -= 1)
++                    .or_else(|| {
++                        if closing_budget > 0 {
++                            closing_budget -= 1;
++                            self.pop_closing_input()
++                        } else {
++                            None
++                        }
++                    })
++                    .or_else(|| {
++                        if terminal_budget > 0 {
++                            terminal_budget -= 1;
++                            self.terminal_inputs.pop_front()
++                        } else {
++                            None
++                        }
++                    })
++                    .or_else(|| {
++                        if expiry_budget > 0 {
++                            expiry_budget -= 1;
++                            self.expiry_inputs.pop_front()
++                        } else {
++                            None
++                        }
++                    })
++                    .or_else(|| self.message_expiry_input.take())
++                    .or_else(|| self.inputs.pop_front())
+             };
+-            let Some(input) = control
+-                .inspect(|_| control_budget -= 1)
+-                .or_else(|| {
+-                    if closing_budget > 0 {
+-                        closing_budget -= 1;
+-                        self.pop_closing_input()
+-                    } else {
+-                        None
+-                    }
+-                })
+-                .or_else(|| {
+-                    if terminal_budget > 0 {
+-                        terminal_budget -= 1;
+-                        self.terminal_inputs.pop_front()
+-                    } else {
+-                        None
+-                    }
+-                })
+-                .or_else(|| {
+-                    if expiry_budget > 0 {
+-                        expiry_budget -= 1;
+-                        self.expiry_inputs.pop_front()
+-                    } else {
+-                        None
+-                    }
+-                })
+-                .or_else(|| self.message_expiry_input.take())
+-                .or_else(|| self.inputs.pop_front())
+-            else {
++            let Some(input) = next else {
+                 break;
+             };
+             if let Some(connection) = business_connection(&input)
+@@ -1609,6 +1638,12 @@
+                 }
+             }
+             if applied {
++                if extra {
++                    self.extra_continuations_applied = self
++                        .extra_continuations_applied
++                        .checked_add(1)
++                        .ok_or_else(|| Failure::plain("continuation_counter_exhausted"))?;
++                }
+                 self.session_cardinality_dirty = true;
+                 self.prune_outgoing_bindings();
+                 // A terminal result is consumed only after the exact input was
+@@ -1618,6 +1653,9 @@
+                     .retain(|token, _| self.owner.deadline_is_live(*token));
+             }
+             self.dispatch()?;
++            if extra && !applied {
++                break;
++            }
+             if applied
+                 && let Some(operation) = lifecycle_result
+                 && !self.owner.lifecycle_operation_is_live(operation)
+@@ -4927,6 +4965,9 @@
+         next_session_request: 0,
+         generation: ConnectionGeneration::new(0),
+         peer_cursor: 0,
++        continuation_budget: 0,
++        extra_continuations_applied: 0,
++        maximum_continuations_taken: 0,
+         inputs: VecDeque::new(),
+         control_inputs: VecDeque::new(),
+         closing_inputs: VecDeque::new(),
+@@ -5149,6 +5190,7 @@
+         events.emit("ready", readiness).map_err(event_failure)?;
+         println!("mqttiumd ready {address} ({profile})");
+         while !cancel.load(Ordering::Relaxed) {
++            runtime.continuation_budget = READY_CONTINUATIONS_PER_TURN;
+             for _ in 0..4 {
+                 match listener.accept() {
+                     Ok((stream, _)) => {
+@@ -5173,6 +5215,7 @@
+         Ok(())
+     })();
+     cancel.store(true, Ordering::Relaxed);
++    runtime.continuation_budget = 0;
+     // A typed startup/read failure remains authoritative and performs no
+     // further durable writes. A normal stop finishes safe zero-expiry ends.
+     let session_result = if result.is_ok() {
+@@ -5194,7 +5237,23 @@
+             socket_result = Err(Failure::plain("socket_shutdown_deadline"));
+         }
+     }
+-    result.and(session_result).and(socket_result)
++    let batch_report = runtime
++        .events
++        .emit(
++            "continuation_batch",
++            json!({
++                "details": {
++                    "budget_per_outer_turn": READY_CONTINUATIONS_PER_TURN,
++                    "extra_inputs_applied": runtime.extra_continuations_applied.to_string(),
++                    "maximum_slots_taken_in_outer_turn": runtime.maximum_continuations_taken
++                }
++            }),
++        )
++        .map_err(event_failure);
++    result
++        .and(session_result)
++        .and(socket_result)
++        .and(batch_report)
+ }
+
+ #[cfg(test)]
+--- a/mqttiumd/crates/mqttiumd/src/runtime_tests.rs
++++ b/mqttiumd/crates/mqttiumd/src/runtime_tests.rs
+@@ -120,6 +120,9 @@
+         next_session_request: 0,
+         generation: ConnectionGeneration::new(0),
+         peer_cursor: 0,
++        continuation_budget: 0,
++        extra_continuations_applied: 0,
++        maximum_continuations_taken: 0,
+         inputs: VecDeque::new(),
+         control_inputs: VecDeque::new(),
+         closing_inputs: VecDeque::new(),
