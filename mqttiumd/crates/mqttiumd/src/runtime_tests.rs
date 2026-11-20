@@ -712,7 +712,7 @@ fn expiring_received_puback_disconnect_preserves_exact_durable_finish() {
             genuine_started,
             "actual positive socket write receipt must precede Complete"
         );
-        runtime.peers.get_mut(&subscriber).unwrap().io.written = held_rx;
+        runtime.peers.get_mut(&subscriber).unwrap().io.written = held_rx.into();
         let before =
             mqttiumd_store_sqlite::SqliteStore::inspect(&path.join("store.sqlite")).unwrap();
         assert_eq!(before.outbound[&target.delivery].claim, target.claim);
@@ -1443,7 +1443,7 @@ fn finish_retained_durable_publish(close_before_enqueue: bool) {
         }
         let original = std::mem::replace(
             &mut runtime.peers.get_mut(&target).unwrap().io.outgoing,
-            blocked,
+            blocked.into(),
         );
         runtime.packet(source, 0x32, publish_body(1)).unwrap();
         until(runtime, |r| {
@@ -1651,7 +1651,7 @@ fn a_slow_transport_holds_its_acks_while_an_independent_exchange_progresses() {
             }
             let original = std::mem::replace(
                 &mut runtime.peers.get_mut(&slow).unwrap().io.outgoing,
-                blocked,
+                blocked.into(),
             );
             for mid in [1, 2] {
                 let mut body = publish_body(mid);
@@ -1695,7 +1695,7 @@ fn a_slow_transport_holds_its_acks_while_an_independent_exchange_progresses() {
                 .unwrap();
             let original_input = std::mem::replace(
                 &mut runtime.peers.get_mut(&slow).unwrap().io.incoming,
-                held_packet,
+                held_packet.into(),
             );
             let ingress = runtime.peers[&slow].ingress;
 
@@ -1776,7 +1776,7 @@ fn a_full_input_lane_leaves_the_next_socket_packet_in_its_bounded_channel() {
             .unwrap();
         let original = std::mem::replace(
             &mut runtime.peers.get_mut(&generation).unwrap().io.incoming,
-            consumer,
+            consumer.into(),
         );
         fill_ordinary_inputs(runtime, generation);
         let ingress = runtime.peers[&generation].ingress;
@@ -1867,7 +1867,7 @@ fn a_saturated_four_slot_output_retains_the_committed_puback_until_terminal_fail
         }
         let original = std::mem::replace(
             &mut runtime.peers.get_mut(&generation).unwrap().io.outgoing,
-            blocked,
+            blocked.into(),
         );
         let deadline = Instant::now() + Duration::from_secs(1);
         while !runtime.inflight.is_empty() && Instant::now() < deadline {
@@ -5116,7 +5116,7 @@ fn tls_terminal_writer_cannot_discard_an_already_decoded_normal_disconnect() {
         for fact in facts {
             sender.send(fact).unwrap();
         }
-        runtime.peers.get_mut(&generation).unwrap().io.incoming = lane;
+        runtime.peers.get_mut(&generation).unwrap().io.incoming = lane.into();
         let forwarding = thread::spawn(move || {
             for fact in tail {
                 if sender.send(fact).is_err() {
@@ -5241,7 +5241,7 @@ fn blocked_output_and_full_input_preserve_independent_work_and_reconnect_credit(
             }
             let _old_sender = std::mem::replace(
                 &mut runtime.peers.get_mut(&slow).unwrap().io.outgoing,
-                blocked,
+                blocked.into(),
             );
             for id in [1, 2] {
                 let mut body = publish_body(id);

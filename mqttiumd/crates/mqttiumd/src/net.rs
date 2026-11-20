@@ -1,11 +1,18 @@
 //! Bounded socket tasks for the product adapter. No durable operation runs here.
+//!
+//! A connection is one non-blocking task driven by a reactor thread
+//! (ADR 0044). The core keeps the same four bounded lanes it always had;
+//! their handles tell the reactor when the core published a frame or took
+//! a value from a lane the task had found full.
 
+use std::collections::VecDeque;
 use std::io::{self, Read, Write as _};
 use std::net::{Shutdown, TcpStream};
+use std::ops::Deref;
+use std::os::fd::{AsRawFd, RawFd};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TrySendError};
+use std::sync::mpsc::{self, Receiver, SendError, SyncSender, TryRecvError, TrySendError};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use mqttiumd_contract::ids::{ConnectionKey, EffectId};
@@ -18,7 +25,10 @@ use crate::security::{Policy, Principal};
 use crate::session_time::{SessionClock, SystemClock, TimeError};
 use crate::wake::Wake;
 
+pub(crate) mod reactor;
 mod tls;
+
+use reactor::{Driven, Link, Reactors, Turn};
 
 pub const INPUT_SLOTS: usize = 4;
 pub const OUTPUT_SLOTS: usize = 4;
@@ -29,11 +39,16 @@ pub const WRITTEN_SLOTS: usize = 2 * (OUTPUT_SLOTS + 1) + 8;
 // Four queued writes, one active write and eight terminal receipts. Wire
 // progress is an independent bounded lane, not the core's receipt lane.
 const WIRE_PROGRESS_SLOTS: usize = OUTPUT_SLOTS + 1 + 8;
+#[cfg(test)]
 const POLL: Duration = Duration::from_millis(20);
 const INPUT_WAIT: Duration = Duration::from_millis(100);
 const RESULT_WAIT: Duration = Duration::from_millis(100);
 const PARTIAL_PACKET_TIMEOUT: Duration = Duration::from_secs(5);
 const WRITE_TIMEOUT: Duration = Duration::from_millis(250);
+/// Bytes one plain connection may hold between a socket read and its parser.
+const READ_BUFFER: usize = 4096;
+/// Packets or frames one turn may move before other tasks are served.
+const BURST: usize = 32;
 
 #[derive(Debug)]
 pub enum Incoming {
@@ -101,6 +116,82 @@ fn lane<T>(slots: usize, wake: &Wake) -> (Tx<T>, Receiver<T>) {
     crate::wake::signalled(slots, wake)
 }
 
+/// The core's end of a lane a task publishes into. Taking a value tells
+/// the reactor when the task had found the lane full.
+pub struct Inbound<T> {
+    receiver: Receiver<T>,
+    link: Option<Arc<Link>>,
+}
+
+impl<T> Inbound<T> {
+    pub fn try_recv(&self) -> Result<T, TryRecvError> {
+        let value = self.receiver.try_recv();
+        if value.is_ok()
+            && let Some(link) = &self.link
+        {
+            link.consumed();
+        }
+        value
+    }
+}
+
+impl<T> Deref for Inbound<T> {
+    type Target = Receiver<T>;
+
+    fn deref(&self) -> &Receiver<T> {
+        &self.receiver
+    }
+}
+
+/// A lane no task feeds: its values were published by the holder of the
+/// sending half.
+impl<T> From<Receiver<T>> for Inbound<T> {
+    fn from(receiver: Receiver<T>) -> Self {
+        Self {
+            receiver,
+            link: None,
+        }
+    }
+}
+
+/// The core's end of the frame lane. A published frame runs the task.
+pub struct Outbound {
+    sender: SyncSender<Write>,
+    link: Option<Arc<Link>>,
+}
+
+// Both methods keep the contract of the standard sender: a refused frame
+// comes back intact inside the error.
+#[expect(clippy::result_large_err, reason = "the refused frame is handed back")]
+impl Outbound {
+    pub fn try_send(&self, frame: Write) -> Result<(), TrySendError<Write>> {
+        let result = self.sender.try_send(frame);
+        if result.is_ok()
+            && let Some(link) = &self.link
+        {
+            link.notify();
+        }
+        result
+    }
+
+    pub fn send(&self, frame: Write) -> Result<(), SendError<Write>> {
+        let result = self.sender.send(frame);
+        if result.is_ok()
+            && let Some(link) = &self.link
+        {
+            link.notify();
+        }
+        result
+    }
+}
+
+/// A lane no task drains.
+impl From<SyncSender<Write>> for Outbound {
+    fn from(sender: SyncSender<Write>) -> Self {
+        Self { sender, link: None }
+    }
+}
+
 #[derive(Clone)]
 struct Control {
     cancelled: Arc<AtomicBool>,
@@ -119,6 +210,18 @@ struct Terminal {
 }
 
 impl Control {
+    fn new(wake: Wake) -> Self {
+        Self {
+            cancelled: Arc::new(AtomicBool::new(false)),
+            terminal: Arc::new(Mutex::new(None)),
+            wake,
+            #[cfg(test)]
+            pause_progress: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            progress_waiting: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
     fn is_cancelled(&self) -> bool {
         self.cancelled.load(Ordering::Acquire)
     }
@@ -141,18 +244,18 @@ impl Control {
     }
 }
 
-/// The owner polls these bounded queues. Closing cancels both tasks immediately;
-/// it then reaps them with `join_finished`, without waiting on a socket in its turn.
-/// A queue-full terminal code is retained independently of the full input queue.
+/// The owner polls these bounded queues. Closing cancels the task
+/// immediately; the owner then observes its end with `join_finished`,
+/// without waiting on a socket in its turn. A queue-full terminal code is
+/// retained independently of the full input queue.
 pub struct Connection {
-    pub incoming: Receiver<Incoming>,
-    pub outgoing: SyncSender<Write>,
-    pub written: Receiver<Written>,
-    pub wire_progress: Receiver<WireProgress>,
+    pub incoming: Inbound<Incoming>,
+    pub outgoing: Outbound,
+    pub written: Inbound<Written>,
+    pub wire_progress: Inbound<WireProgress>,
     stream: TcpStream,
     control: Control,
-    reader: Option<JoinHandle<()>>,
-    writer: Option<JoinHandle<()>>,
+    link: Arc<Link>,
     send_buffer: usize,
     principal: Option<Arc<OnceLock<Principal>>>,
 }
@@ -166,76 +269,78 @@ pub fn spawn_with_clock(stream: TcpStream, clock: Arc<dyn SessionClock>) -> io::
     spawn_with_wake(stream, clock, Wake::new())
 }
 
-/// `wake` is signalled whenever a task publishes towards the core.
+/// The lanes of one connection and the socket settings both transports share.
+fn open(stream: &TcpStream, wake: Wake) -> io::Result<(Lanes, Connection)> {
+    stream.set_nodelay(true)?;
+    stream.set_nonblocking(true)?;
+    let socket = socket2::SockRef::from(stream);
+    socket.set_send_buffer_size(4096)?;
+    let send_buffer = socket.send_buffer_size()?;
+    let link = Reactors::shared().link(wake.clone());
+    let (input, incoming) = lane(INPUT_SLOTS, &wake);
+    let (outgoing, output) = mpsc::sync_channel(OUTPUT_SLOTS);
+    let (written_tx, written) = lane(WRITTEN_SLOTS, &wake);
+    let (progress, wire_progress) = lane(WIRE_PROGRESS_SLOTS, &wake);
+    let connection = Connection {
+        incoming: Inbound {
+            receiver: incoming,
+            link: Some(link.clone()),
+        },
+        outgoing: Outbound {
+            sender: outgoing,
+            link: Some(link.clone()),
+        },
+        written: Inbound {
+            receiver: written,
+            link: Some(link.clone()),
+        },
+        wire_progress: Inbound {
+            receiver: wire_progress,
+            link: Some(link.clone()),
+        },
+        stream: stream.try_clone()?,
+        control: Control::new(wake),
+        link: link.clone(),
+        send_buffer,
+        principal: None,
+    };
+    let lanes = Lanes {
+        input,
+        output,
+        written: written_tx,
+        progress,
+        link,
+        held: None,
+        reports: VecDeque::new(),
+        stalled: None,
+    };
+    Ok((lanes, connection))
+}
+
+/// `wake` is signalled whenever the task publishes towards the core.
 pub fn spawn_with_wake(
     stream: TcpStream,
     clock: Arc<dyn SessionClock>,
     wake: Wake,
 ) -> io::Result<Connection> {
-    stream.set_nodelay(true)?;
-    stream.set_read_timeout(Some(POLL))?;
-    let socket = socket2::SockRef::from(&stream);
-    socket.set_send_buffer_size(4096)?;
-    let send_buffer = socket.send_buffer_size()?;
-    let input_stream = stream.try_clone()?;
-    let output_stream = stream.try_clone()?;
-    let (input_tx, incoming) = lane(INPUT_SLOTS, &wake);
-    let (outgoing, output_rx) = mpsc::sync_channel(OUTPUT_SLOTS);
-    let (written_tx, written) = lane(WRITTEN_SLOTS, &wake);
-    let (progress_tx, wire_progress) = lane(WIRE_PROGRESS_SLOTS, &wake);
-    let control = Control {
-        cancelled: Arc::new(AtomicBool::new(false)),
-        terminal: Arc::new(Mutex::new(None)),
-        wake,
+    let (lanes, connection) = open(&stream, wake)?;
+    let task = Task {
+        source: Buffered {
+            stream,
+            bytes: vec![0; READ_BUFFER].into_boxed_slice(),
+            start: 0,
+            end: 0,
+        },
+        parser: Parser::default(),
+        clock,
+        control: connection.control.clone(),
+        lanes,
+        active: None,
         #[cfg(test)]
-        pause_progress: Arc::new(AtomicBool::new(false)),
-        #[cfg(test)]
-        progress_waiting: Arc::new(AtomicBool::new(false)),
+        paused: None,
     };
-    let reader_control = control.clone();
-    let reader_clock = clock.clone();
-    let reader = thread::Builder::new()
-        .name("mqttiumd-reader".into())
-        .spawn(move || {
-            read_packets(
-                input_stream,
-                input_tx,
-                reader_control,
-                reader_clock.as_ref(),
-            );
-        })?;
-    let writer_control = control.clone();
-    let writer = match thread::Builder::new()
-        .name("mqttiumd-socket-writer".into())
-        .spawn(move || {
-            write_frames(
-                output_stream,
-                output_rx,
-                written_tx,
-                progress_tx,
-                writer_control,
-                clock.as_ref(),
-            );
-        }) {
-        Ok(writer) => writer,
-        Err(error) => {
-            control.stop(&stream, "task_spawn_failed");
-            let _ = reader.join();
-            return Err(error);
-        }
-    };
-    Ok(Connection {
-        incoming,
-        outgoing,
-        written,
-        wire_progress,
-        stream,
-        control,
-        reader: Some(reader),
-        writer: Some(writer),
-        send_buffer,
-        principal: None,
-    })
+    Reactors::shared().register(&connection.link, Box::new(task));
+    Ok(connection)
 }
 
 pub(crate) fn spawn_tls(
@@ -246,55 +351,26 @@ pub(crate) fn spawn_tls(
     wake: Wake,
     #[cfg(feature = "test-hooks")] trace: (crate::writer::Hooks, crate::events::Events),
 ) -> io::Result<Connection> {
-    stream.set_nodelay(true)?;
-    stream.set_nonblocking(true)?;
-    let socket = socket2::SockRef::from(&stream);
-    socket.set_send_buffer_size(4096)?;
-    let send_buffer = socket.send_buffer_size()?;
-    let (input_tx, incoming) = lane(INPUT_SLOTS, &wake);
-    let (outgoing, output_rx) = mpsc::sync_channel(OUTPUT_SLOTS);
-    let (written_tx, written) = lane(WRITTEN_SLOTS, &wake);
-    let (progress_tx, wire_progress) = lane(WIRE_PROGRESS_SLOTS, &wake);
-    let control = Control {
-        cancelled: Arc::new(AtomicBool::new(false)),
-        terminal: Arc::new(Mutex::new(None)),
-        wake,
-        #[cfg(test)]
-        pause_progress: Arc::new(AtomicBool::new(false)),
-        #[cfg(test)]
-        progress_waiting: Arc::new(AtomicBool::new(false)),
-    };
+    let (lanes, mut connection) = open(&stream, wake)?;
     let principal = Arc::new(OnceLock::new());
     let state = rustls::ServerConnection::new(config).map_err(io::Error::other)?;
-    let task = tls::Task {
-        stream: stream.try_clone()?,
+    let mut task = tls::Task {
+        stream,
         state,
         clock,
-        control: control.clone(),
+        control: connection.control.clone(),
         principal: principal.clone(),
         policy,
-        input: input_tx,
-        output: output_rx,
-        written: written_tx,
-        progress: progress_tx,
+        lanes,
+        machine: tls::Machine::new(),
         #[cfg(feature = "test-hooks")]
         trace,
     };
-    let handle = thread::Builder::new()
-        .name("mqttiumd-tls".into())
-        .spawn(move || task.run())?;
-    Ok(Connection {
-        incoming,
-        outgoing,
-        written,
-        wire_progress,
-        stream,
-        control,
-        reader: Some(handle),
-        writer: None,
-        send_buffer,
-        principal: Some(principal),
-    })
+    task.state
+        .set_buffer_limit(Some(crate::security::TLS_BUFFER_BYTES));
+    connection.principal = Some(principal);
+    Reactors::shared().register(&connection.link, Box::new(task));
+    Ok(connection)
 }
 
 impl Connection {
@@ -321,28 +397,20 @@ impl Connection {
     pub fn wire_progress_is_waiting(&self) -> bool {
         self.control.progress_waiting.load(Ordering::Acquire)
     }
+
     pub fn close(&self) {
         self.control.stop(&self.stream, "cancelled");
+        self.link.notify();
     }
 
+    /// The task published its terminal facts and left its reactor.
     pub fn is_finished(&self) -> bool {
-        self.reader.as_ref().is_none_or(JoinHandle::is_finished)
-            && self.writer.as_ref().is_none_or(JoinHandle::is_finished)
+        self.link.is_finished()
     }
 
-    /// Joins only after both tasks have ended, returning false while they run.
+    /// Returns false while the task runs. Nothing is left to reap after it.
     pub fn join_finished(&mut self) -> bool {
-        if !self.is_finished() {
-            return false;
-        }
-        for handle in [&mut self.reader, &mut self.writer] {
-            if let Some(handle) = handle.take()
-                && handle.join().is_err()
-            {
-                self.control.record("task_panicked");
-            }
-        }
-        true
+        self.is_finished()
     }
 
     pub fn terminal_reason(&self) -> Option<&'static str> {
@@ -381,87 +449,299 @@ fn retryable(error: &io::Error) -> bool {
     )
 }
 
-/// Reads within the current packet's absolute budget. An idle connection has
-/// no packet deadline: the runtime separately owns CONNECT and Keep Alive.
-fn read_part(
-    stream: &mut TcpStream,
-    buffer: &mut [u8],
-    started: &mut Option<Instant>,
-    control: &Control,
-) -> Result<(), &'static str> {
-    let mut offset = 0;
-    while offset < buffer.len() {
-        if control.is_cancelled() {
-            return Err("cancelled");
-        }
-        if started.is_some_and(|instant| instant.elapsed() >= PARTIAL_PACKET_TIMEOUT) {
-            return Err("partial_packet_timeout");
-        }
-        match stream.read(&mut buffer[offset..]) {
-            Ok(0) => {
-                return Err(if started.is_none() {
-                    "eof"
-                } else {
-                    "truncated_packet"
-                });
-            }
-            Ok(count) => {
-                started.get_or_insert_with(Instant::now);
-                if started.is_some_and(|instant| instant.elapsed() >= PARTIAL_PACKET_TIMEOUT) {
-                    return Err("partial_packet_timeout");
+enum Report {
+    Written(Written),
+    Progress(WireProgress),
+}
+
+/// The task's end of the four lanes. Nothing here blocks: a value a full
+/// lane refused is held with the instant of its first refusal, and the
+/// task is run again when the core takes a value or at the next tick.
+struct Lanes {
+    input: Tx<Incoming>,
+    output: Receiver<Write>,
+    written: Tx<Written>,
+    progress: Tx<WireProgress>,
+    link: Arc<Link>,
+    held: Option<(Incoming, Instant)>,
+    /// Receipts in publication order. At most three per frame, and no frame
+    /// is taken while one is pending.
+    reports: VecDeque<Report>,
+    stalled: Option<Instant>,
+}
+
+/// Offers a value to a lane without waiting. A refused value comes back;
+/// `Err` means the consumer is gone. The consumer that takes a value after
+/// the mark runs the task; the second attempt covers one that took it just
+/// before.
+fn publish<T>(lane: &Tx<T>, link: &Link, mut value: T) -> Result<Option<T>, ()> {
+    for attempt in 0..2 {
+        match lane.try_send(value) {
+            Ok(()) => return Ok(None),
+            Err(TrySendError::Disconnected(_)) => return Err(()),
+            Err(TrySendError::Full(refused)) => {
+                value = refused;
+                if attempt == 0 {
+                    link.owe();
                 }
-                offset += count;
             }
-            Err(error) if retryable(&error) => {}
+        }
+    }
+    Ok(Some(value))
+}
+
+impl Lanes {
+    /// Holds a complete packet for the input lane. The caller delivers the
+    /// previous one first.
+    fn hold(&mut self, incoming: Incoming) {
+        debug_assert!(self.held.is_none());
+        self.held = Some((incoming, Instant::now()));
+    }
+
+    /// Publishes the held packet. Returns whether the lane is free again.
+    fn deliver(&mut self) -> Result<bool, &'static str> {
+        let Some((incoming, since)) = self.held.take() else {
+            return Ok(true);
+        };
+        let Some(refused) =
+            publish(&self.input, &self.link, incoming).map_err(|()| "input_consumer_closed")?
+        else {
+            return Ok(true);
+        };
+        if since.elapsed() >= INPUT_WAIT {
+            // The cause remains in Control even when the queue is full.
+            return Err("input_queue_full");
+        }
+        self.held = Some((refused, since));
+        Ok(false)
+    }
+
+    fn report(&mut self, result: Written) {
+        self.reports.push_back(Report::Written(result));
+    }
+
+    fn wire_progress(&mut self, progress: WireProgress) {
+        self.reports.push_back(Report::Progress(progress));
+    }
+
+    /// Publishes pending receipts in order. Returns whether one left.
+    fn flush(&mut self) -> Result<bool, &'static str> {
+        let mut moved = false;
+        while let Some(report) = self.reports.pop_front() {
+            let (refused, code) = match report {
+                Report::Written(result) => (
+                    publish(&self.written, &self.link, result)
+                        .map_err(|()| "write_result_queue_full")?
+                        .map(Report::Written),
+                    "write_result_queue_full",
+                ),
+                Report::Progress(progress) => (
+                    publish(&self.progress, &self.link, progress)
+                        .map_err(|()| "wire_progress_unavailable")?
+                        .map(Report::Progress),
+                    "wire_progress_unavailable",
+                ),
+            };
+            let Some(refused) = refused else {
+                moved = true;
+                self.stalled = None;
+                continue;
+            };
+            self.reports.push_front(refused);
+            if self.stalled.get_or_insert_with(Instant::now).elapsed() >= RESULT_WAIT {
+                return Err(code);
+            }
+            break;
+        }
+        Ok(moved)
+    }
+
+    /// The next frame to write, once every earlier receipt was published.
+    fn next_frame(&mut self) -> Result<Option<Write>, &'static str> {
+        if !self.reports.is_empty() {
+            return Ok(None);
+        }
+        match self.output.try_recv() {
+            Ok(frame) => Ok(Some(frame)),
+            Err(TryRecvError::Empty) => Ok(None),
+            Err(TryRecvError::Disconnected) => Err("output_producer_closed"),
+        }
+    }
+
+    /// A value waits for room in a lane: the task holds a deadline.
+    fn pending(&self) -> bool {
+        self.held.is_some() || !self.reports.is_empty()
+    }
+
+    /// Publishes the terminal facts without waiting. The frame in progress
+    /// and every accepted frame left in the bounded queue get an explicit
+    /// failed receipt. Their bytes may not have been attempted; none is
+    /// called certainly rejected.
+    fn finish(mut self, code: &'static str, active: Option<Write>) {
+        for report in self.reports.drain(..) {
+            let published = match report {
+                Report::Written(result) => self.written.try_send(result).is_ok(),
+                Report::Progress(progress) => self.progress.try_send(progress).is_ok(),
+            };
+            if !published {
+                break;
+            }
+        }
+        for frame in active.into_iter().chain(self.output.try_iter()) {
+            if self
+                .written
+                .try_send(Written::Failed {
+                    correlation: frame.correlation,
+                    code,
+                })
+                .is_err()
+            {
+                break;
+            }
+        }
+        let _ = self.input.try_send(Incoming::Closed { code });
+    }
+}
+
+/// Where a parser takes its bytes. Zero means none is available now; the
+/// end of the stream is an error named by the source.
+trait Source {
+    fn pull(&mut self, into: &mut [u8], partial: bool) -> Result<usize, &'static str>;
+}
+
+/// A plain socket behind a small read buffer.
+struct Buffered {
+    stream: TcpStream,
+    bytes: Box<[u8]>,
+    start: usize,
+    end: usize,
+}
+
+/// One read of a non-blocking socket. Zero means nothing is available now.
+fn read_some(
+    stream: &mut TcpStream,
+    into: &mut [u8],
+    partial: bool,
+) -> Result<usize, &'static str> {
+    loop {
+        match stream.read(into) {
+            Ok(0) => {
+                return Err(if partial { "truncated_packet" } else { "eof" });
+            }
+            Ok(count) => return Ok(count),
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) if retryable(&error) => return Ok(0),
             Err(_) => return Err("read_io"),
         }
     }
-    Ok(())
 }
 
-fn next_packet(
-    stream: &mut TcpStream,
-    control: &Control,
-    clock: &dyn SessionClock,
-    previous: &mut Option<MessageTime>,
-) -> Result<Incoming, &'static str> {
-    let mut prefix = [0; 5];
-    let mut length = 0;
-    let mut started = None;
-    let header = loop {
-        if length == prefix.len() {
-            return Err("malformed_header");
-        }
-        read_part(
-            stream,
-            &mut prefix[length..length + 1],
-            &mut started,
-            control,
-        )?;
-        length += 1;
-        match codec::header(&prefix[..length], MAX_PACKET_BYTES) {
-            Ok(Some(header)) => break header,
-            Ok(None) => {}
-            Err(error) => {
-                return Err(if error.kind() == ErrorKind::Oversized {
-                    "packet_too_large"
-                } else {
-                    "malformed_header"
-                });
+impl Source for Buffered {
+    fn pull(&mut self, into: &mut [u8], partial: bool) -> Result<usize, &'static str> {
+        if self.start == self.end {
+            // A large body is read straight into its packet.
+            if into.len() >= self.bytes.len() {
+                return read_some(&mut self.stream, into, partial);
+            }
+            self.start = 0;
+            self.end = read_some(&mut self.stream, &mut self.bytes, partial)?;
+            if self.end == 0 {
+                return Ok(0);
             }
         }
-    };
-    let mut body = Vec::new();
-    body.try_reserve_exact(header.remaining)
-        .map_err(|_| "allocation_failed")?;
-    body.resize(header.remaining, 0);
-    read_part(stream, &mut body, &mut started, control)?;
-    let observed = frame_observation(clock, previous);
-    Ok(Incoming::Packet {
-        first: header.first,
-        body,
-        observed,
-    })
+        let count = into.len().min(self.end - self.start);
+        into[..count].copy_from_slice(&self.bytes[self.start..self.start + count]);
+        self.start += count;
+        Ok(count)
+    }
+}
+
+/// Incremental MQTT framing within the current packet's absolute budget.
+/// An idle connection has no packet deadline: the runtime separately owns
+/// CONNECT and Keep Alive.
+#[derive(Default)]
+struct Parser {
+    prefix: [u8; 5],
+    prefix_len: usize,
+    header: Option<codec::Header>,
+    body: Vec<u8>,
+    offset: usize,
+    since: Option<Instant>,
+    // One watermark per reader detects a bad sample even if the provider has
+    // recovered before the runtime dequeues this frame. A bad sample never
+    // replaces the last valid observation or becomes evidence of expiration.
+    previous: Option<MessageTime>,
+    /// Bytes taken from the source, modulo the counter width.
+    consumed: usize,
+}
+
+impl Parser {
+    fn is_partial(&self) -> bool {
+        self.since.is_some()
+    }
+
+    fn packet(
+        &mut self,
+        source: &mut impl Source,
+        clock: &dyn SessionClock,
+    ) -> Result<Option<Incoming>, &'static str> {
+        if self
+            .since
+            .is_some_and(|start| start.elapsed() >= PARTIAL_PACKET_TIMEOUT)
+        {
+            return Err("partial_packet_timeout");
+        }
+        while self.header.is_none() {
+            if self.prefix_len == self.prefix.len() {
+                return Err("malformed_header");
+            }
+            let next = &mut self.prefix[self.prefix_len..self.prefix_len + 1];
+            if source.pull(next, self.since.is_some())? == 0 {
+                return Ok(None);
+            }
+            self.consumed = self.consumed.wrapping_add(1);
+            self.since.get_or_insert_with(Instant::now);
+            self.prefix_len += 1;
+            self.header = codec::header(&self.prefix[..self.prefix_len], MAX_PACKET_BYTES)
+                .map_err(|error| {
+                    if error.kind() == ErrorKind::Oversized {
+                        "packet_too_large"
+                    } else {
+                        "malformed_header"
+                    }
+                })?;
+        }
+        let header = self.header.expect("header checked");
+        if self.body.len() != header.remaining {
+            self.body
+                .try_reserve_exact(header.remaining)
+                .map_err(|_| "allocation_failed")?;
+            self.body.resize(header.remaining, 0);
+        }
+        while self.offset < self.body.len() {
+            let count = source.pull(&mut self.body[self.offset..], true)?;
+            if count == 0 {
+                return Ok(None);
+            }
+            self.consumed = self.consumed.wrapping_add(count);
+            self.offset += count;
+        }
+        if self
+            .since
+            .is_some_and(|start| start.elapsed() >= PARTIAL_PACKET_TIMEOUT)
+        {
+            return Err("partial_packet_timeout");
+        }
+        self.prefix_len = 0;
+        self.header = None;
+        self.offset = 0;
+        self.since = None;
+        Ok(Some(Incoming::Packet {
+            first: header.first,
+            body: std::mem::take(&mut self.body),
+            observed: frame_observation(clock, &mut self.previous),
+        }))
+    }
 }
 
 fn frame_observation(
@@ -483,48 +763,6 @@ fn frame_observation(
     }
     *previous = Some(observed);
     Ok(observed)
-}
-
-fn read_packets(
-    mut stream: TcpStream,
-    sender: Tx<Incoming>,
-    control: Control,
-    clock: &dyn SessionClock,
-) {
-    // One watermark per reader detects a bad sample even if the provider has
-    // recovered before the runtime dequeues this frame. A bad sample never
-    // replaces the last valid observation or becomes evidence of expiration.
-    let mut previous = None;
-    let code = loop {
-        let mut incoming = match next_packet(&mut stream, &control, clock, &mut previous) {
-            Ok(packet) => packet,
-            Err(code) => break code,
-        };
-        let deadline = Instant::now() + INPUT_WAIT;
-        loop {
-            if control.is_cancelled() {
-                break;
-            }
-            match sender.try_send(incoming) {
-                Ok(()) => break,
-                Err(TrySendError::Disconnected(_)) => {
-                    control.stop(&stream, "input_consumer_closed");
-                    return;
-                }
-                Err(TrySendError::Full(value)) => {
-                    incoming = value;
-                    if Instant::now() >= deadline {
-                        control.stop(&stream, "input_queue_full");
-                        // The cause remains in Control even when the queue is full.
-                        return;
-                    }
-                    thread::sleep(Duration::from_millis(1));
-                }
-            }
-        }
-    };
-    control.stop(&stream, code);
-    let _ = sender.try_send(Incoming::Closed { code });
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -580,6 +818,93 @@ fn prepare_expiry(
     Ok(())
 }
 
+/// What one write attempt on a frame decided.
+#[derive(Debug, PartialEq, Eq)]
+enum Attempt {
+    /// Every byte was accepted within the budget.
+    Done,
+    /// Bytes were accepted and some remain.
+    Advanced,
+    /// The transport accepted nothing now.
+    Blocked,
+}
+
+/// A frame taken from the output lane and its one absolute write budget.
+struct Active {
+    frame: Write,
+    offset: usize,
+    deadline: Instant,
+    /// Every byte left within the budget; only the receipts remain.
+    written: bool,
+}
+
+impl Active {
+    fn new(frame: Write) -> Self {
+        Self {
+            frame,
+            offset: 0,
+            deadline: Instant::now() + WRITE_TIMEOUT,
+            written: false,
+        }
+    }
+}
+
+/// One attempt to write the rest of a frame. Expiry is checked immediately
+/// before each attempt made while no byte has left: an unsuccessful attempt
+/// may consume the rest of the lifetime. `started` runs once, on the first
+/// accepted byte.
+fn write_attempt(
+    active: &mut Active,
+    control: &Control,
+    clock: &dyn SessionClock,
+    write: &mut impl FnMut(&[u8], Duration) -> io::Result<usize>,
+    started: &mut impl FnMut() -> bool,
+) -> Result<Attempt, WriteFailure> {
+    let bytes = &mut active.frame.bytes;
+    if bytes.len() > MAX_PACKET_BYTES {
+        return Err(WriteFailure::Failed("output_packet_too_large"));
+    }
+    if active.offset < bytes.len() {
+        if control.is_cancelled() {
+            return Err(WriteFailure::Failed("cancelled"));
+        }
+        let remaining = active.deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(WriteFailure::Failed("write_timeout"));
+        }
+        if active.offset == 0
+            && let Some(expiry) = active.frame.expiry
+        {
+            prepare_expiry(bytes, expiry, clock)?;
+        }
+        match write(&bytes[active.offset..], remaining) {
+            Ok(0) => return Err(WriteFailure::Failed("write_zero")),
+            Ok(count) => {
+                if count > bytes.len() - active.offset {
+                    return Err(WriteFailure::Failed("invalid_write_progress"));
+                }
+                let first = active.offset == 0;
+                active.offset += count;
+                if first && !started() {
+                    return Err(WriteFailure::Failed("write_result_queue_full"));
+                }
+            }
+            Err(error) if retryable(&error) => return Ok(Attempt::Blocked),
+            Err(_) => return Err(WriteFailure::Failed("write_io")),
+        }
+        if active.offset < bytes.len() {
+            return Ok(Attempt::Advanced);
+        }
+    }
+    if Instant::now() >= active.deadline {
+        return Err(WriteFailure::Failed("write_timeout"));
+    }
+    Ok(Attempt::Done)
+}
+
+/// Writes one frame with a transport that waits by itself, within one
+/// absolute budget. The task makes the same attempts across its turns.
+#[cfg(test)]
 fn write_attempts(
     bytes: &mut [u8],
     expiry: Option<WriteExpiry>,
@@ -588,192 +913,174 @@ fn write_attempts(
     mut write: impl FnMut(&[u8], Duration) -> io::Result<usize>,
     mut started: impl FnMut() -> bool,
 ) -> Result<(), WriteFailure> {
-    if bytes.len() > MAX_PACKET_BYTES {
-        return Err(WriteFailure::Failed("output_packet_too_large"));
-    }
-    let deadline = Instant::now() + WRITE_TIMEOUT;
-    let mut offset = 0;
-    while offset < bytes.len() {
-        if control.is_cancelled() {
-            return Err(WriteFailure::Failed("cancelled"));
-        }
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            return Err(WriteFailure::Failed("write_timeout"));
-        }
-        // An unsuccessful attempt may consume the rest of the lifetime. Gate
-        // every zero-progress retry, immediately before granting a write.
-        if offset == 0
-            && let Some(expiry) = expiry
-        {
-            prepare_expiry(bytes, expiry, clock)?;
-        }
-        match write(&bytes[offset..], remaining.min(POLL)) {
-            Ok(0) => return Err(WriteFailure::Failed("write_zero")),
-            Ok(count) => {
-                if count > bytes.len() - offset {
-                    return Err(WriteFailure::Failed("invalid_write_progress"));
-                }
-                let first = offset == 0;
-                offset += count;
-                if first && !started() {
-                    return Err(WriteFailure::Failed("write_result_queue_full"));
-                }
-            }
-            Err(error) if retryable(&error) => {}
-            Err(_) => return Err(WriteFailure::Failed("write_io")),
-        }
-    }
-    if Instant::now() >= deadline {
-        return Err(WriteFailure::Failed("write_timeout"));
-    }
-    Ok(())
-}
-
-fn write_one(
-    stream: &mut TcpStream,
-    frame: &mut Write,
-    control: &Control,
-    clock: &dyn SessionClock,
-    sender: &Tx<Written>,
-) -> Result<(), WriteFailure> {
-    write_attempts(
-        &mut frame.bytes,
-        frame.expiry,
-        control,
-        clock,
-        |bytes, timeout| {
-            stream.set_write_timeout(Some(timeout))?;
-            stream.write(bytes)
-        },
-        || {
-            frame.expiry.is_none()
-                || frame.correlation.is_none()
-                || report(
-                    sender,
-                    Written::Started {
-                        correlation: frame.correlation,
-                    },
-                )
-        },
-    )
-}
-
-fn report(sender: &Tx<Written>, mut result: Written) -> bool {
-    let deadline = Instant::now() + RESULT_WAIT;
-    loop {
-        match sender.try_send(result) {
-            Ok(()) => return true,
-            Err(TrySendError::Disconnected(_)) => return false,
-            Err(TrySendError::Full(value)) => {
-                result = value;
-                if Instant::now() >= deadline {
-                    return false;
-                }
-                thread::sleep(Duration::from_millis(1));
-            }
-        }
-    }
-}
-
-fn write_frames(
-    mut stream: TcpStream,
-    receiver: Receiver<Write>,
-    sender: Tx<Written>,
-    progress: Tx<WireProgress>,
-    control: Control,
-    clock: &dyn SessionClock,
-) {
-    let code = loop {
-        if control.is_cancelled() {
-            break "cancelled";
-        }
-        let mut frame = match receiver.recv_timeout(POLL) {
-            Ok(frame) => frame,
-            Err(RecvTimeoutError::Timeout) => continue,
-            Err(RecvTimeoutError::Disconnected) => break "output_producer_closed",
-        };
-        let result = match write_one(&mut stream, &mut frame, &control, clock, &sender) {
-            Ok(()) => Written::Complete {
-                correlation: frame.correlation,
-                bytes: frame.bytes.len(),
-            },
-            Err(WriteFailure::NotStarted(reason)) => {
-                if !report(
-                    &sender,
-                    Written::NotStarted {
-                        correlation: frame.correlation,
-                        reason,
-                    },
-                ) {
-                    break "write_result_queue_full";
-                }
-                continue;
-            }
-            Err(WriteFailure::Failed(code)) => {
-                let _ = report(
-                    &sender,
-                    Written::Failed {
-                        correlation: frame.correlation,
-                        code,
-                    },
-                );
-                break code;
-            }
-        };
-        if let Some((effect, connection)) = frame.correlation {
-            // This publication is deliberately separate from Written: the
-            // reactor may retain a core receipt while MQTT receive credit has
-            // already been returned on the wire. A preempted writer between
-            // write_one and this point is handled by bounded ingress deferral.
-            #[cfg(test)]
-            {
-                let start = Instant::now();
-                while control.pause_progress.load(Ordering::Acquire) && !control.is_cancelled() {
-                    control.progress_waiting.store(true, Ordering::Release);
-                    if start.elapsed() > Duration::from_secs(2) {
-                        break;
-                    }
-                    thread::sleep(Duration::from_millis(1));
-                }
-                control.progress_waiting.store(false, Ordering::Release);
-            }
-            let deadline = Instant::now() + RESULT_WAIT;
-            let mut value = WireProgress { effect, connection };
-            loop {
-                match progress.try_send(value) {
-                    Ok(()) => break,
-                    Err(TrySendError::Full(returned))
-                        if Instant::now() < deadline && !control.is_cancelled() =>
-                    {
-                        value = returned;
-                        thread::sleep(Duration::from_millis(1));
-                    }
-                    Err(_) => {
-                        control.stop(&stream, "wire_progress_unavailable");
-                        return;
-                    }
-                }
-            }
-        }
-        if !report(&sender, result) {
-            break "write_result_queue_full";
+    let mut active = Active::new(Write {
+        correlation: None,
+        bytes: bytes.to_vec(),
+        expiry,
+    });
+    let result = loop {
+        let mut bounded = |part: &[u8], remaining: Duration| write(part, remaining.min(POLL));
+        match write_attempt(&mut active, control, clock, &mut bounded, &mut started) {
+            Ok(Attempt::Done) => break Ok(()),
+            Ok(_) => {}
+            Err(failure) => break Err(failure),
         }
     };
-    control.stop(&stream, code);
-    // Accepted frames left in the bounded queue get explicit failed receipts.
-    // Their bytes may not have been attempted; none is called certainly rejected.
-    for frame in receiver.try_iter() {
-        if !report(
-            &sender,
-            Written::Failed {
-                correlation: frame.correlation,
-                code,
-            },
-        ) {
-            control.record("write_result_queue_full");
-            break;
+    bytes.copy_from_slice(&active.frame.bytes);
+    result
+}
+
+/// One plain TCP connection.
+struct Task {
+    source: Buffered,
+    parser: Parser,
+    clock: Arc<dyn SessionClock>,
+    control: Control,
+    lanes: Lanes,
+    active: Option<Active>,
+    #[cfg(test)]
+    paused: Option<Instant>,
+}
+
+impl Task {
+    /// Holds the completion of a correlated frame while a test asks for it.
+    #[cfg(test)]
+    fn held_by_test(&mut self) -> bool {
+        if self.control.pause_progress.load(Ordering::Acquire)
+            && self.paused.get_or_insert_with(Instant::now).elapsed() <= Duration::from_secs(2)
+        {
+            self.control.progress_waiting.store(true, Ordering::Release);
+            return true;
         }
+        self.paused = None;
+        self.control
+            .progress_waiting
+            .store(false, Ordering::Release);
+        false
+    }
+
+    fn output_turn(&mut self) -> Result<bool, &'static str> {
+        let mut progressed = false;
+        for _ in 0..BURST {
+            if self.active.is_none() {
+                let Some(frame) = self.lanes.next_frame()? else {
+                    break;
+                };
+                self.active = Some(Active::new(frame));
+                progressed = true;
+            }
+            let active = self.active.as_mut().expect("frame taken above");
+            if !active.written {
+                let correlation = active.frame.correlation;
+                let reports_start = active.frame.expiry.is_some() && correlation.is_some();
+                let stream = &mut self.source.stream;
+                let lanes = &mut self.lanes;
+                let attempt = write_attempt(
+                    active,
+                    &self.control,
+                    self.clock.as_ref(),
+                    &mut |part, _| stream.write(part),
+                    &mut || {
+                        if reports_start {
+                            lanes.report(Written::Started { correlation });
+                        }
+                        true
+                    },
+                );
+                match attempt {
+                    Ok(Attempt::Done) => active.written = true,
+                    Ok(Attempt::Advanced) => {
+                        progressed = true;
+                        continue;
+                    }
+                    Ok(Attempt::Blocked) => break,
+                    Err(WriteFailure::NotStarted(reason)) => {
+                        self.lanes.report(Written::NotStarted {
+                            correlation,
+                            reason,
+                        });
+                        self.active = None;
+                        progressed = true;
+                        // The receipt leaves before the next frame is taken.
+                        self.lanes.flush()?;
+                        continue;
+                    }
+                    // The frame stays in place: its failed receipt is one
+                    // of the terminal facts.
+                    Err(WriteFailure::Failed(code)) => return Err(code),
+                }
+            }
+            let frame = &self.active.as_ref().expect("frame written above").frame;
+            let (correlation, bytes) = (frame.correlation, frame.bytes.len());
+            if let Some((effect, connection)) = correlation {
+                // This publication is deliberately separate from Written: the
+                // reactor may retain a core receipt while MQTT receive credit
+                // has already been returned on the wire. A task preempted
+                // between the last byte and this point is handled by bounded
+                // ingress deferral.
+                #[cfg(test)]
+                if self.held_by_test() {
+                    break;
+                }
+                self.lanes
+                    .wire_progress(WireProgress { effect, connection });
+            }
+            self.lanes.report(Written::Complete { correlation, bytes });
+            self.active = None;
+            progressed = true;
+            self.lanes.flush()?;
+        }
+        Ok(progressed)
+    }
+
+    fn input_turn(&mut self) -> Result<bool, &'static str> {
+        let mut progressed = false;
+        for _ in 0..BURST {
+            if !self.lanes.deliver()? {
+                break;
+            }
+            let before = self.parser.consumed;
+            match self.parser.packet(&mut self.source, self.clock.as_ref())? {
+                Some(packet) => {
+                    self.lanes.hold(packet);
+                    progressed = true;
+                }
+                None => {
+                    progressed |= self.parser.consumed != before;
+                    break;
+                }
+            }
+        }
+        // A packet parsed by the last pass is offered before the turn ends.
+        self.lanes.deliver()?;
+        Ok(progressed)
+    }
+}
+
+impl Driven for Task {
+    fn descriptor(&self) -> RawFd {
+        self.source.stream.as_raw_fd()
+    }
+
+    fn turn(&mut self) -> Result<Turn, &'static str> {
+        if self.control.is_cancelled() {
+            return Err("cancelled");
+        }
+        let mut progress = self.lanes.flush()?;
+        progress |= self.output_turn()?;
+        progress |= self.lanes.flush()?;
+        progress |= self.input_turn()?;
+        Ok(Turn {
+            progress,
+            waiting: self.active.is_some() || self.parser.is_partial() || self.lanes.pending(),
+        })
+    }
+
+    fn finish(self: Box<Self>, code: &'static str) {
+        let task = *self;
+        task.control.stop(&task.source.stream, code);
+        task.lanes
+            .finish(code, task.active.map(|active| active.frame));
     }
 }
 

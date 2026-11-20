@@ -1,10 +1,9 @@
-//! One rustls connection and one bounded nonblocking task per secure transport.
+//! One rustls connection and one bounded non-blocking task per secure transport.
 
 use super::*;
-use crate::security::{HANDSHAKE_BYTES, HANDSHAKE_TIMEOUT, TLS_BUFFER_BYTES};
+use crate::security::{HANDSHAKE_BYTES, HANDSHAKE_TIMEOUT};
 use rustls::{CertificateError, Error, ProtocolVersion, ServerConnection};
 
-const TURN: Duration = Duration::from_millis(1);
 const READ_CHUNK: usize = 16 * 1024;
 // In the pinned ring TLS 1.3 provider, a record is a five byte header,
 // 16-byte AEAD tag and one inner content-type byte beyond its plaintext.
@@ -20,84 +19,51 @@ pub(super) struct Task {
     pub control: Control,
     pub principal: Arc<OnceLock<Principal>>,
     pub policy: Arc<Policy>,
-    pub input: Tx<Incoming>,
-    pub output: Receiver<Write>,
-    pub written: Tx<Written>,
-    pub progress: Tx<WireProgress>,
+    pub lanes: Lanes,
+    pub machine: Machine,
     #[cfg(feature = "test-hooks")]
     pub trace: (crate::writer::Hooks, crate::events::Events),
 }
 
-#[derive(Default)]
-struct Parser {
-    prefix: [u8; 5],
-    prefix_len: usize,
-    header: Option<codec::Header>,
-    body: Vec<u8>,
-    offset: usize,
-    since: Option<Instant>,
-    previous: Option<MessageTime>,
+enum Phase {
+    Handshake { start: Instant, received: usize },
+    Active,
 }
 
-impl Parser {
-    fn packet(
-        &mut self,
-        tls: &mut ServerConnection,
-        clock: &dyn SessionClock,
-    ) -> Result<Option<Incoming>, &'static str> {
-        if self
-            .since
-            .is_some_and(|start| start.elapsed() >= PARTIAL_PACKET_TIMEOUT)
-        {
-            return Err("partial_packet_timeout");
+/// What the task carries from one turn to the next.
+pub(super) struct Machine {
+    phase: Phase,
+    parser: Parser,
+    output: Option<Encoded>,
+    control_pending: Option<Instant>,
+    /// The transport reported its end; the TLS state names the reason.
+    eof: bool,
+    eof_reported: bool,
+}
+
+impl Machine {
+    /// The handshake budget starts here.
+    pub fn new() -> Self {
+        Self {
+            phase: Phase::Handshake {
+                start: Instant::now(),
+                received: 0,
+            },
+            parser: Parser::default(),
+            output: None,
+            control_pending: None,
+            eof: false,
+            eof_reported: false,
         }
-        while self.header.is_none() {
-            if self.prefix_len == self.prefix.len() {
-                return Err("malformed_header");
-            }
-            let next = &mut self.prefix[self.prefix_len..self.prefix_len + 1];
-            if read_plain(tls, next, self.since.is_some())? == 0 {
-                return Ok(None);
-            }
-            self.since.get_or_insert_with(Instant::now);
-            self.prefix_len += 1;
-            self.header = codec::header(&self.prefix[..self.prefix_len], MAX_PACKET_BYTES)
-                .map_err(|error| {
-                    if error.kind() == ErrorKind::Oversized {
-                        "packet_too_large"
-                    } else {
-                        "malformed_header"
-                    }
-                })?;
-        }
-        let header = self.header.expect("header checked");
-        if self.body.len() != header.remaining {
-            self.body
-                .try_reserve_exact(header.remaining)
-                .map_err(|_| "allocation_failed")?;
-            self.body.resize(header.remaining, 0);
-        }
-        if self.offset < self.body.len() {
-            self.offset += read_plain(tls, &mut self.body[self.offset..], true)?;
-            if self.offset < self.body.len() {
-                return Ok(None);
-            }
-        }
-        if self
-            .since
-            .is_some_and(|start| start.elapsed() >= PARTIAL_PACKET_TIMEOUT)
-        {
-            return Err("partial_packet_timeout");
-        }
-        self.prefix_len = 0;
-        self.header = None;
-        self.offset = 0;
-        self.since = None;
-        Ok(Some(Incoming::Packet {
-            first: header.first,
-            body: std::mem::take(&mut self.body),
-            observed: frame_observation(clock, &mut self.previous),
-        }))
+    }
+}
+
+/// The plaintext rustls already decrypted.
+struct Plaintext<'a>(&'a mut ServerConnection);
+
+impl Source for Plaintext<'_> {
+    fn pull(&mut self, into: &mut [u8], partial: bool) -> Result<usize, &'static str> {
+        read_plain(self.0, into, partial)
     }
 }
 
@@ -240,25 +206,6 @@ impl Task {
             .map_err(|_| "tls_hook_failed")
     }
 
-    pub fn run(mut self) {
-        self.state.set_buffer_limit(Some(TLS_BUFFER_BYTES));
-        let result = self.handshake().and_then(|()| self.active());
-        let code = result.err().unwrap_or("cancelled");
-        self.control.stop(&self.stream, code);
-        for frame in self.output.try_iter() {
-            if !report(
-                &self.written,
-                Written::Failed {
-                    correlation: frame.correlation,
-                    code,
-                },
-            ) {
-                break;
-            }
-        }
-        let _ = self.input.try_send(Incoming::Closed { code });
-    }
-
     fn read_ciphertext(&mut self, limit: usize, handshake: bool) -> Result<usize, &'static str> {
         if !self.state.wants_read() {
             return Ok(0);
@@ -269,6 +216,7 @@ impl Task {
         {
             Ok(0) if handshake => Err("tls_handshake_eof"),
             Ok(count) => {
+                self.machine.eof |= count == 0;
                 if let Err(error) = self.state.process_new_packets() {
                     // A best-effort fatal alert carries no application data.
                     if handshake {
@@ -295,13 +243,13 @@ impl Task {
         }
     }
 
-    fn handshake(&mut self) -> Result<(), &'static str> {
-        let start = Instant::now();
-        let mut received = 0usize;
+    fn handshake_turn(
+        &mut self,
+        start: Instant,
+        mut received: usize,
+    ) -> Result<Turn, &'static str> {
+        let mut progress = false;
         while self.state.is_handshaking() || self.state.wants_write() {
-            if self.control.is_cancelled() {
-                return Err("cancelled");
-            }
             if start.elapsed() >= HANDSHAKE_TIMEOUT {
                 return Err("tls_handshake_deadline");
             }
@@ -311,9 +259,14 @@ impl Task {
             let sent = self.flush_control()?;
             let read = self.read_ciphertext(HANDSHAKE_BYTES - received, true)?;
             received += read;
+            self.machine.phase = Phase::Handshake { start, received };
             if sent == 0 && read == 0 {
-                thread::sleep(TURN);
+                return Ok(Turn {
+                    progress,
+                    waiting: true,
+                });
             }
+            progress = true;
         }
         if self.state.protocol_version() != Some(ProtocolVersion::TLSv1_3)
             || self.state.handshake_kind() != Some(rustls::HandshakeKind::Full)
@@ -333,13 +286,21 @@ impl Task {
         self.principal
             .set(principal)
             .map_err(|_| "tls_duplicate_authentication")?;
-        self.input
+        self.lanes
+            .input
             .try_send(Incoming::Authenticated { elapsed })
             .map_err(|_| "tls_authentication_receipt")?;
-        Ok(())
+        self.machine.phase = Phase::Active;
+        // Application data may already be decrypted: the next turn reads it.
+        Ok(Turn {
+            progress: true,
+            waiting: true,
+        })
     }
 
-    fn next_write(&mut self) -> Result<Option<Encoded>, &'static str> {
+    /// The next frame, sealed. The flag says whether the attempt advanced
+    /// anything although no frame came out of it.
+    fn next_write(&mut self) -> Result<(Option<Encoded>, bool), &'static str> {
         // Empty plaintext flushes a queued peer KeyUpdate response into the
         // control lane without creating an application record.
         let _ = self
@@ -348,29 +309,21 @@ impl Task {
             .write(&[])
             .map_err(|_| "tls_control_encode")?;
         if self.state.wants_write() {
-            self.flush_control()?;
-            return Ok(None);
+            return Ok((None, self.flush_control()? != 0));
         }
-        let mut frame = match self.output.try_recv() {
-            Ok(frame) => frame,
-            Err(mpsc::TryRecvError::Empty) => return Ok(None),
-            Err(mpsc::TryRecvError::Disconnected) => return Err("output_producer_closed"),
+        let Some(mut frame) = self.lanes.next_frame()? else {
+            return Ok((None, false));
         };
         let deadline = Instant::now() + WRITE_TIMEOUT;
         if let Some(expiry) = frame.expiry {
             match prepare_expiry(&mut frame.bytes, expiry, self.clock.as_ref()) {
                 Ok(()) => {}
                 Err(WriteFailure::NotStarted(reason)) => {
-                    if !report(
-                        &self.written,
-                        Written::NotStarted {
-                            correlation: frame.correlation,
-                            reason,
-                        },
-                    ) {
-                        return Err("write_result_queue_full");
-                    }
-                    return Ok(None);
+                    self.lanes.report(Written::NotStarted {
+                        correlation: frame.correlation,
+                        reason,
+                    });
+                    return Ok((None, true));
                 }
                 Err(WriteFailure::Failed(code)) => return Err(code),
             }
@@ -382,33 +335,36 @@ impl Task {
             && self.armed("fragment-next-tls-publish");
         #[cfg(feature = "test-hooks")]
         if frame.expiry.is_some() && frame.correlation.is_some() {
-            if MUTANT_TLS_EARLY_STARTED
-                && !report(
-                    &self.written,
-                    Written::Started {
-                        correlation: frame.correlation,
-                    },
-                )
-            {
-                return Err("write_result_queue_full");
+            if MUTANT_TLS_EARLY_STARTED {
+                self.lanes.report(Written::Started {
+                    correlation: frame.correlation,
+                });
             }
+            // A held barrier keeps this reactor thread: test builds only.
             if self.armed("hold-next-tls-frame") {
                 self.observe_boundary("tls.frame.sealed", &frame, 0)?;
             }
         }
-        Ok(Some(Encoded {
-            frame,
-            ciphertext,
-            offset: 0,
-            deadline,
-            #[cfg(feature = "test-hooks")]
-            fragment,
-        }))
+        Ok((
+            Some(Encoded {
+                frame,
+                ciphertext,
+                offset: 0,
+                deadline,
+                #[cfg(feature = "test-hooks")]
+                fragment,
+            }),
+            true,
+        ))
     }
 
     fn output_turn(&mut self, output: &mut Option<Encoded>) -> Result<bool, &'static str> {
         if output.is_none() {
-            *output = self.next_write()?;
+            let (next, advanced) = self.next_write()?;
+            *output = next;
+            if output.is_none() {
+                return Ok(advanced);
+            }
         }
         let Some(encoded) = output.as_mut() else {
             return Ok(false);
@@ -435,24 +391,18 @@ impl Task {
                     if prior.is_none_or(|(range, bytes)| encoded.frame.bytes[range] == bytes) => {}
                 Ok(()) => return Err("tls_expiry_value_aged"),
                 Err(WriteFailure::NotStarted(reason)) => {
-                    if !report(
-                        &self.written,
-                        Written::NotStarted {
-                            correlation: encoded.frame.correlation,
-                            reason,
-                        },
-                    ) {
-                        return Err("write_result_queue_full");
-                    }
-                    // The sealed records advanced TLS sequence numbers. Close
-                    // rather than reusing that connection with a sequence gap.
+                    self.lanes.report(Written::NotStarted {
+                        correlation: encoded.frame.correlation,
+                        reason,
+                    });
+                    // The frame has its terminal receipt. The sealed records
+                    // advanced TLS sequence numbers: close rather than reuse
+                    // that connection with a sequence gap.
+                    *output = None;
                     return Err("tls_expired_before_ciphertext");
                 }
                 Err(WriteFailure::Failed(code)) => return Err(code),
             }
-        }
-        if self.control.is_cancelled() {
-            return Err("cancelled");
         }
         if Instant::now() >= encoded.deadline {
             return Err("tls_write_timeout");
@@ -471,17 +421,10 @@ impl Task {
             Err(_) => return Err("tls_write_io"),
         };
         let first = encoded.offset == 0;
-        if first
-            && encoded.frame.expiry.is_some()
-            && encoded.frame.correlation.is_some()
-            && !report(
-                &self.written,
-                Written::Started {
-                    correlation: encoded.frame.correlation,
-                },
-            )
-        {
-            return Err("write_result_queue_full");
+        if first && encoded.frame.expiry.is_some() && encoded.frame.correlation.is_some() {
+            self.lanes.report(Written::Started {
+                correlation: encoded.frame.correlation,
+            });
         }
         encoded.offset += count;
         #[cfg(feature = "test-hooks")]
@@ -490,61 +433,116 @@ impl Task {
         }
         if encoded.offset == encoded.ciphertext.len() {
             if let Some((effect, connection)) = encoded.frame.correlation {
-                self.progress
-                    .try_send(WireProgress { effect, connection })
-                    .map_err(|_| "wire_progress_unavailable")?;
+                self.lanes
+                    .wire_progress(WireProgress { effect, connection });
             }
-            if !report(
-                &self.written,
-                Written::Complete {
-                    correlation: encoded.frame.correlation,
-                    bytes: encoded.frame.bytes.len(),
-                },
-            ) {
-                return Err("write_result_queue_full");
-            }
+            self.lanes.report(Written::Complete {
+                correlation: encoded.frame.correlation,
+                bytes: encoded.frame.bytes.len(),
+            });
             *output = None;
         }
         Ok(true)
     }
 
-    fn active(&mut self) -> Result<(), &'static str> {
-        let mut parser = Parser::default();
-        let mut input = None;
-        let mut output = None;
-        let mut control_pending = None;
-        while !self.control.is_cancelled() {
-            let progressed = self.output_turn(&mut output)?;
-            if output.is_none() && self.state.wants_write() {
-                let first = control_pending.get_or_insert_with(Instant::now);
-                if first.elapsed() >= WRITE_TIMEOUT {
-                    return Err("tls_control_write_timeout");
-                }
-            } else {
-                control_pending = None;
+    fn input_turn(&mut self) -> Result<bool, &'static str> {
+        let mut progressed = false;
+        for _ in 0..BURST {
+            if !self.lanes.deliver()? {
+                return Ok(progressed);
             }
-            let mut received = false;
-            if input.is_none() {
-                if let Some(packet) = parser.packet(&mut self.state, self.clock.as_ref())? {
-                    input = Some((packet, Instant::now()));
-                } else if self.read_ciphertext(READ_CHUNK, false)? != 0 {
-                    received = true;
+            let packet = self
+                .machine
+                .parser
+                .packet(&mut Plaintext(&mut self.state), self.clock.as_ref())?;
+            if let Some(packet) = packet {
+                self.lanes.hold(packet);
+                progressed = true;
+                continue;
+            }
+            if self.read_ciphertext(READ_CHUNK, false)? != 0 {
+                progressed = true;
+                continue;
+            }
+            if !self.machine.eof {
+                break;
+            }
+            // After the end of the transport the TLS state refuses the next
+            // plaintext read with the reason; one more pass obtains it.
+            if self.machine.eof_reported {
+                return Err("tls_eof");
+            }
+            self.machine.eof_reported = true;
+            progressed = true;
+        }
+        // A packet parsed by the last pass is offered before the turn ends.
+        self.lanes.deliver()?;
+        Ok(progressed)
+    }
+
+    fn active_turn(&mut self) -> Result<Turn, &'static str> {
+        let mut progress = self.lanes.flush()?;
+        let mut output = self.machine.output.take();
+        let mut written = Ok(());
+        for _ in 0..BURST {
+            match self.output_turn(&mut output) {
+                Ok(true) => progress = true,
+                Ok(false) => break,
+                Err(code) => {
+                    written = Err(code);
+                    break;
                 }
             }
-            if let Some((packet, start)) = input.take() {
-                match self.input.try_send(packet) {
-                    Ok(()) => received = true,
-                    Err(TrySendError::Full(packet)) if start.elapsed() < INPUT_WAIT => {
-                        input = Some((packet, start))
-                    }
-                    Err(TrySendError::Full(_)) => return Err("input_queue_full"),
-                    Err(TrySendError::Disconnected(_)) => return Err("input_consumer_closed"),
-                }
-            }
-            if !progressed && !received {
-                thread::sleep(TURN);
+            if let Err(code) = self.lanes.flush() {
+                written = Err(code);
+                break;
             }
         }
-        Ok(())
+        // A frame in progress stays visible to the terminal facts.
+        self.machine.output = output;
+        written?;
+        if self.machine.output.is_none() && self.state.wants_write() {
+            let first = self
+                .machine
+                .control_pending
+                .get_or_insert_with(Instant::now);
+            if first.elapsed() >= WRITE_TIMEOUT {
+                return Err("tls_control_write_timeout");
+            }
+        } else {
+            self.machine.control_pending = None;
+        }
+        progress |= self.lanes.flush()?;
+        progress |= self.input_turn()?;
+        Ok(Turn {
+            progress,
+            waiting: self.machine.output.is_some()
+                || self.machine.control_pending.is_some()
+                || self.machine.parser.is_partial()
+                || self.lanes.pending(),
+        })
+    }
+}
+
+impl Driven for Task {
+    fn descriptor(&self) -> RawFd {
+        self.stream.as_raw_fd()
+    }
+
+    fn turn(&mut self) -> Result<Turn, &'static str> {
+        if self.control.is_cancelled() {
+            return Err("cancelled");
+        }
+        match self.machine.phase {
+            Phase::Handshake { start, received } => self.handshake_turn(start, received),
+            Phase::Active => self.active_turn(),
+        }
+    }
+
+    fn finish(self: Box<Self>, code: &'static str) {
+        let task = *self;
+        task.control.stop(&task.stream, code);
+        task.lanes
+            .finish(code, task.machine.output.map(|encoded| encoded.frame));
     }
 }
