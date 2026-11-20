@@ -8,8 +8,24 @@
 (*   sender.try_send(frame)                 ProducerPublish                *)
 (*   if !link.dirty.swap(true) {            ProducerSwap                   *)
 (*       queue.lock().push(Run(link))       ProducerPush                   *)
-(*       if sleeping.load() {               ProducerLoad                   *)
-(*           waker.wake() } }               ProducerWake                   *)
+(*       owing.store(true)                  ProducerOwe                    *)
+(*       if !held.load() {                  ProducerReadHeld               *)
+(*           kick() } }                                                    *)
+(*                                                                         *)
+(*   kick: if owing.swap(false)             ProducerKick                   *)
+(*            && sleeping.load() {          ProducerLoad                   *)
+(*             waker.wake() }               ProducerWake                   *)
+(*                                                                         *)
+(* A producer that serves many lanes in one pass holds the wake-ups        *)
+(* (`Reactors::hold`, taken by `Runtime::turn` through `net::hold_wakes`)  *)
+(* and pays one when its guard is dropped:                                 *)
+(*                                                                         *)
+(*   held.store(true)                       ProducerHold                   *)
+(*   ...                                                                   *)
+(*   held.store(false); kick()              ProducerRelease                *)
+(*                                                                         *)
+(* The debt is recorded before the hold is read, and the release clears    *)
+(* the hold before it reads the debt: one of the two pays it.              *)
 (*                                                                         *)
 (* The reactor thread loops (`run`):                                       *)
 (*                                                                         *)
@@ -29,23 +45,26 @@
 (*                                                                         *)
 (* A turn of the task takes every frame its lane holds. Socket readiness,  *)
 (* the tick of a waiting task and the timeout of the poll are absent: the  *)
-(* model shows that a published frame depends on none of them. A lane is   *)
-(* the count published - taken. No guard reads a history variable: there   *)
-(* is none.                                                                *)
+(* model shows that a published frame depends on none of them once every   *)
+(* hold is released. A lane is the count published - taken. No guard       *)
+(* reads a history variable: there is none.                                *)
 (***************************************************************************)
 EXTENDS Naturals, FiniteSets
 
 CONSTANTS
     NumLinks,     \* transport tasks of one reactor thread, each with a lane
     NumProducers, \* threads that publish and notify
+    Holders,      \* producers that hold the wake-ups around their publications
     LaneCap,      \* capacity of a lane (OUTPUT_SLOTS)
     MaxPublish,   \* frames one producer publishes in a run
     Mutation      \* "none" or the name of a model mutation
 
-Mutations == {"none", "CheckBeforePush", "PollWithoutRecheck", "ClearDirtyAfterRun"}
+Mutations == {"none", "CheckBeforePush", "PollWithoutRecheck", "ClearDirtyAfterRun",
+              "DebtReadBeforeRelease", "HoldReadBeforeDebt"}
 
 ASSUME /\ NumLinks \in Nat \ {0} /\ NumProducers \in Nat \ {0}
        /\ LaneCap \in Nat \ {0} /\ MaxPublish \in Nat \ {0}
+       /\ Holders \subseteq 1..NumProducers
        /\ Mutation \in Mutations
 
 Links == 1..NumLinks
@@ -62,6 +81,10 @@ VARIABLES
     queued,      \* per link: Entry::queued, the task is in `ready`
     sleeping,    \* Shared::sleeping
     waker,       \* a wake the poll has not returned yet
+    held,        \* Shared::held
+    owing,       \* Shared::owing
+    holding,     \* per producer: it has a live Held guard
+    pseen,       \* per producer: a flag it read ahead of its turn (mutants)
     pendingSeen, \* the reactor's `pending`, read after it set `sleeping`
     rpc,         \* where the reactor is in its loop
     ppc,         \* per producer: where it is in its steps
@@ -69,7 +92,10 @@ VARIABLES
     sent         \* per producer: frames published so far
 
 vars == <<published, taken, dirty, queue, batch, queued, sleeping, waker,
-          pendingSeen, rpc, ppc, ptarget, sent>>
+          held, owing, holding, pseen, pendingSeen, rpc, ppc, ptarget, sent>>
+
+\* What the reactor does not write and what a producer does not write.
+debtVars == <<held, owing, holding, pseen>>
 
 LaneLen(l) == published[l] - taken[l]
 QueueEmpty == \A l \in Links : queue[l] = 0
@@ -84,6 +110,9 @@ Init ==
     /\ queue = None /\ batch = None
     /\ queued = [l \in Links |-> FALSE]
     /\ sleeping = FALSE /\ waker = FALSE /\ pendingSeen = FALSE
+    /\ held = FALSE /\ owing = FALSE
+    /\ holding = [p \in Producers |-> FALSE]
+    /\ pseen = [p \in Producers |-> FALSE]
     /\ rpc = "take"
     /\ ppc = [p \in Producers |-> "idle"]
     /\ ptarget = [p \in Producers |-> NoLink]
@@ -93,10 +122,30 @@ Done(p) ==
     /\ ppc' = [ppc EXCEPT ![p] = "idle"]
     /\ ptarget' = [ptarget EXCEPT ![p] = NoLink]
 
+Releasing(p) == ppc[p] \in {"rkick", "rload", "rwake"}
+
+\* The end of a kick. The kick of a send ends the notification; the kick
+\* of a release ends the release, and DebtReadBeforeRelease clears the
+\* hold only now.
+Kicked(p) ==
+    IF Releasing(p)
+    THEN /\ ppc' = [ppc EXCEPT ![p] =
+                       IF Mutation = "DebtReadBeforeRelease" THEN "unhold" ELSE "idle"]
+         /\ UNCHANGED ptarget
+    ELSE Done(p)
+
 (***************************************************************************)
-(* Producers: `Outbound::try_send`, then `Link::notify` and                *)
-(* `Shared::send`.                                                         *)
+(* Producers: `Outbound::try_send`, then `Link::notify`, `Shared::send`    *)
+(* and `Shared::kick`; `Reactors::hold` and the drop of its guard.         *)
 (***************************************************************************)
+
+\* `Reactors::hold`: `held.store(true)`.
+ProducerHold(p) ==
+    /\ p \in Holders /\ ppc[p] = "idle" /\ ~holding[p] /\ sent[p] < MaxPublish
+    /\ held' = TRUE
+    /\ holding' = [holding EXCEPT ![p] = TRUE]
+    /\ UNCHANGED <<published, taken, dirty, queue, batch, queued, sleeping, waker,
+                   owing, pseen, pendingSeen, rpc, ppc, ptarget, sent>>
 
 \* try_send: a full lane refuses and raises no notification; the refusal
 \* is the absence of this step.
@@ -106,7 +155,8 @@ ProducerPublish(p, l) ==
     /\ sent' = [sent EXCEPT ![p] = @ + 1]
     /\ ppc' = [ppc EXCEPT ![p] = "notify"]
     /\ ptarget' = [ptarget EXCEPT ![p] = l]
-    /\ UNCHANGED <<taken, dirty, queue, batch, queued, sleeping, waker, pendingSeen, rpc>>
+    /\ UNCHANGED <<taken, dirty, queue, batch, queued, sleeping, waker, debtVars,
+                   pendingSeen, rpc>>
 
 \* `dirty.swap(true)`: a link already marked sends nothing.
 \* CheckBeforePush goes on to read `sleeping` before it pushes.
@@ -119,44 +169,106 @@ ProducerSwap(p) ==
             /\ ppc' = [ppc EXCEPT ![p] =
                           IF Mutation = "CheckBeforePush" THEN "preload" ELSE "push"]
             /\ UNCHANGED ptarget
-    /\ UNCHANGED <<published, taken, queue, batch, queued, sleeping, waker,
+    /\ UNCHANGED <<published, taken, queue, batch, queued, sleeping, waker, debtVars,
                    pendingSeen, rpc, sent>>
 
 \* Only CheckBeforePush reaches "preload": it remembers `sleeping` as it
 \* was before the message is in the queue.
 ProducerPreload(p) ==
     /\ ppc[p] = "preload"
-    /\ ppc' = [ppc EXCEPT ![p] = IF sleeping THEN "pushw" ELSE "pushn"]
+    /\ pseen' = [pseen EXCEPT ![p] = sleeping]
+    /\ ppc' = [ppc EXCEPT ![p] = "push"]
     /\ UNCHANGED <<published, taken, dirty, queue, batch, queued, sleeping, waker,
+                   held, owing, holding, pendingSeen, rpc, ptarget, sent>>
+
+\* `queue.lock().push(Run(link))`. HoldReadBeforeDebt reads the hold
+\* next, before it records the debt.
+ProducerPush(p) ==
+    /\ ppc[p] = "push"
+    /\ queue' = [queue EXCEPT ![ptarget[p]] = @ + 1]
+    /\ ppc' = [ppc EXCEPT ![p] =
+                  IF Mutation = "HoldReadBeforeDebt" THEN "readheld" ELSE "owe"]
+    /\ UNCHANGED <<published, taken, dirty, batch, queued, sleeping, waker, debtVars,
                    pendingSeen, rpc, ptarget, sent>>
 
-\* `queue.lock().push(Run(link))`.
-ProducerPush(p) ==
-    /\ ppc[p] \in {"push", "pushw", "pushn"}
-    /\ queue' = [queue EXCEPT ![ptarget[p]] = @ + 1]
-    /\ IF ppc[p] = "pushn"
-       THEN Done(p)
-       ELSE /\ ppc' = [ppc EXCEPT ![p] = IF ppc[p] = "push" THEN "load" ELSE "wake"]
-            /\ UNCHANGED ptarget
-    /\ UNCHANGED <<published, taken, dirty, batch, queued, sleeping, waker,
-                   pendingSeen, rpc, sent>>
-
-\* `sleeping.load()`, after the push.
-ProducerLoad(p) ==
-    /\ ppc[p] = "load"
-    /\ IF sleeping
-       THEN ppc' = [ppc EXCEPT ![p] = "wake"] /\ UNCHANGED ptarget
-       ELSE Done(p)
+\* `owing.store(true)`: the debt is recorded before the hold is read.
+ProducerOwe(p) ==
+    /\ ppc[p] = "owe"
+    /\ owing' = TRUE
+    /\ IF Mutation = "HoldReadBeforeDebt"
+       THEN IF pseen[p]
+            THEN Done(p)
+            ELSE ppc' = [ppc EXCEPT ![p] = "kick"] /\ UNCHANGED ptarget
+       ELSE ppc' = [ppc EXCEPT ![p] = "readheld"] /\ UNCHANGED ptarget
     /\ UNCHANGED <<published, taken, dirty, queue, batch, queued, sleeping, waker,
-                   pendingSeen, rpc, sent>>
+                   held, holding, pseen, pendingSeen, rpc, sent>>
+
+\* `held.load()`: under a hold the wake-up is left to the release.
+ProducerReadHeld(p) ==
+    /\ ppc[p] = "readheld"
+    /\ IF Mutation = "HoldReadBeforeDebt"
+       THEN /\ pseen' = [pseen EXCEPT ![p] = held]
+            /\ ppc' = [ppc EXCEPT ![p] = "owe"]
+            /\ UNCHANGED ptarget
+       ELSE /\ UNCHANGED pseen
+            /\ IF held
+               THEN Done(p)
+               ELSE ppc' = [ppc EXCEPT ![p] = "kick"] /\ UNCHANGED ptarget
+    /\ UNCHANGED <<published, taken, dirty, queue, batch, queued, sleeping, waker,
+                   held, owing, holding, pendingSeen, rpc, sent>>
+
+\* The drop of the guard: `held.store(false)`, then `kick()`.
+\* DebtReadBeforeRelease kicks first and clears the hold at
+\* ProducerUnhold.
+ProducerRelease(p) ==
+    /\ ppc[p] = "idle" /\ holding[p]
+    /\ ppc' = [ppc EXCEPT ![p] = "rkick"]
+    /\ IF Mutation = "DebtReadBeforeRelease"
+       THEN UNCHANGED <<held, holding>>
+       ELSE /\ held' = FALSE
+            /\ holding' = [holding EXCEPT ![p] = FALSE]
+    /\ UNCHANGED <<published, taken, dirty, queue, batch, queued, sleeping, waker,
+                   owing, pseen, pendingSeen, rpc, ptarget, sent>>
+
+\* `owing.swap(false)` in `kick`: whoever takes the debt gives the
+\* wake-up.
+ProducerKick(p) ==
+    /\ ppc[p] \in {"kick", "rkick"}
+    /\ owing' = FALSE
+    /\ IF owing
+       THEN /\ ppc' = [ppc EXCEPT ![p] = IF ppc[p] = "kick" THEN "load" ELSE "rload"]
+            /\ UNCHANGED ptarget
+       ELSE Kicked(p)
+    /\ UNCHANGED <<published, taken, dirty, queue, batch, queued, sleeping, waker,
+                   held, holding, pseen, pendingSeen, rpc, sent>>
+
+\* `sleeping.load()`, after the push. CheckBeforePush uses what it read
+\* before the push.
+ProducerLoad(p) ==
+    /\ ppc[p] \in {"load", "rload"}
+    /\ IF (IF Mutation = "CheckBeforePush" /\ ppc[p] = "load" THEN pseen[p] ELSE sleeping)
+       THEN /\ ppc' = [ppc EXCEPT ![p] = IF ppc[p] = "load" THEN "wake" ELSE "rwake"]
+            /\ UNCHANGED ptarget
+       ELSE Kicked(p)
+    /\ UNCHANGED <<published, taken, dirty, queue, batch, queued, sleeping, waker,
+                   debtVars, pendingSeen, rpc, sent>>
 
 \* `waker.wake()`.
 ProducerWake(p) ==
-    /\ ppc[p] = "wake"
+    /\ ppc[p] \in {"wake", "rwake"}
     /\ waker' = TRUE
-    /\ Done(p)
+    /\ Kicked(p)
     /\ UNCHANGED <<published, taken, dirty, queue, batch, queued, sleeping,
-                   pendingSeen, rpc, sent>>
+                   debtVars, pendingSeen, rpc, sent>>
+
+\* Only DebtReadBeforeRelease reaches "unhold".
+ProducerUnhold(p) ==
+    /\ ppc[p] = "unhold"
+    /\ held' = FALSE
+    /\ holding' = [holding EXCEPT ![p] = FALSE]
+    /\ ppc' = [ppc EXCEPT ![p] = "idle"]
+    /\ UNCHANGED <<published, taken, dirty, queue, batch, queued, sleeping, waker,
+                   owing, pseen, pendingSeen, rpc, ptarget, sent>>
 
 (***************************************************************************)
 (* The reactor thread.                                                     *)
@@ -168,7 +280,7 @@ ReactorTake ==
     /\ batch' = queue /\ queue' = None
     /\ rpc' = "handle"
     /\ UNCHANGED <<published, taken, dirty, queued, sleeping, waker, pendingSeen,
-                   ppc, ptarget, sent>>
+                   ppc, ptarget, sent, debtVars>>
 
 \* Message::Run: the mark is cleared before the task is queued, so a
 \* notification made while the task runs sends a new message.
@@ -182,7 +294,7 @@ ReactorHandle ==
             /\ batch' = None
     /\ rpc' = "run"
     /\ UNCHANGED <<published, taken, queue, sleeping, waker, pendingSeen,
-                   ppc, ptarget, sent>>
+                   ppc, ptarget, sent, debtVars>>
 
 \* One task of `ready` takes its turn: it takes every frame of its lane.
 \* With `ready` empty the reactor goes on to sleep.
@@ -197,7 +309,7 @@ ReactorRun ==
        ELSE /\ rpc' = IF Mutation = "ClearDirtyAfterRun" THEN "lateclear" ELSE "sleep"
             /\ UNCHANGED <<queued, taken>>
     /\ UNCHANGED <<published, dirty, queue, batch, sleeping, waker, pendingSeen,
-                   ppc, ptarget, sent>>
+                   ppc, ptarget, sent, debtVars>>
 
 \* Only ClearDirtyAfterRun reaches "lateclear".
 ReactorLateClear ==
@@ -206,7 +318,7 @@ ReactorLateClear ==
     /\ batch' = None
     /\ rpc' = "sleep"
     /\ UNCHANGED <<published, taken, queue, queued, sleeping, waker, pendingSeen,
-                   ppc, ptarget, sent>>
+                   ppc, ptarget, sent, debtVars>>
 
 \* `sleeping.store(true)`. PollWithoutRecheck polls without looking at
 \* the queue again.
@@ -216,7 +328,7 @@ ReactorSleep ==
     /\ pendingSeen' = FALSE
     /\ rpc' = IF Mutation = "PollWithoutRecheck" THEN "poll" ELSE "recheck"
     /\ UNCHANGED <<published, taken, dirty, queue, batch, queued, waker,
-                   ppc, ptarget, sent>>
+                   ppc, ptarget, sent, debtVars>>
 
 \* `pending = !queue.is_empty()`, read after `sleeping` is set.
 ReactorRecheck ==
@@ -224,7 +336,7 @@ ReactorRecheck ==
     /\ pendingSeen' = ~QueueEmpty
     /\ rpc' = "poll"
     /\ UNCHANGED <<published, taken, dirty, queue, batch, queued, sleeping, waker,
-                   ppc, ptarget, sent>>
+                   ppc, ptarget, sent, debtVars>>
 
 \* `poll`: it returns at once with a zero timeout or a wake already
 \* delivered, and otherwise when a wake arrives. It consumes the wake.
@@ -233,7 +345,7 @@ ReactorPoll ==
     /\ waker' = FALSE
     /\ rpc' = "awake"
     /\ UNCHANGED <<published, taken, dirty, queue, batch, queued, sleeping,
-                   pendingSeen, ppc, ptarget, sent>>
+                   pendingSeen, ppc, ptarget, sent, debtVars>>
 
 \* `sleeping.store(false)`.
 ReactorAwake ==
@@ -241,26 +353,33 @@ ReactorAwake ==
     /\ sleeping' = FALSE
     /\ rpc' = "take"
     /\ UNCHANGED <<published, taken, dirty, queue, batch, queued, waker,
-                   pendingSeen, ppc, ptarget, sent>>
+                   pendingSeen, ppc, ptarget, sent, debtVars>>
 
-\* The end of a run: every producer published its frames and finished its
-\* steps, every lane is empty and the reactor is blocked in its poll with
-\* an empty queue. Any other state without a step is a deadlock that TLC
-\* reports.
+\* The end of a run: every producer published its frames, released its
+\* hold and finished its steps, no debt is left, every lane is empty and
+\* the reactor is blocked in its poll with an empty queue. Any other state
+\* without a step is a deadlock that TLC reports.
 Terminal ==
-    /\ \A p \in Producers : ppc[p] = "idle" /\ sent[p] = MaxPublish
+    /\ \A p \in Producers : ppc[p] = "idle" /\ sent[p] = MaxPublish /\ ~holding[p]
+    /\ ~held /\ ~owing
     /\ \A l \in Links : LaneLen(l) = 0 /\ ~queued[l] /\ batch[l] = 0
     /\ QueueEmpty /\ Blocked
 
 Quiescent == Terminal /\ UNCHANGED vars
 
 Next ==
+    \/ \E p \in Producers : ProducerHold(p)
     \/ \E p \in Producers, l \in Links : ProducerPublish(p, l)
     \/ \E p \in Producers : ProducerSwap(p)
     \/ \E p \in Producers : ProducerPreload(p)
     \/ \E p \in Producers : ProducerPush(p)
+    \/ \E p \in Producers : ProducerOwe(p)
+    \/ \E p \in Producers : ProducerReadHeld(p)
+    \/ \E p \in Producers : ProducerRelease(p)
+    \/ \E p \in Producers : ProducerKick(p)
     \/ \E p \in Producers : ProducerLoad(p)
     \/ \E p \in Producers : ProducerWake(p)
+    \/ \E p \in Producers : ProducerUnhold(p)
     \/ ReactorTake
     \/ ReactorHandle
     \/ ReactorRun
@@ -273,14 +392,16 @@ Next ==
 
 Spec == Init /\ [][Next]_vars
 
-\* A thread that has a step takes it. Nothing is assumed about
-\* ProducerPublish: the core may never have another frame.
+\* A thread that has a step takes it, and a hold is released: it lasts
+\* one pass of its producer. Nothing is assumed about ProducerPublish and
+\* ProducerHold: the core may never have another frame.
 ReactorStep ==
     \/ ReactorTake \/ ReactorHandle \/ ReactorRun \/ ReactorLateClear
     \/ ReactorSleep \/ ReactorRecheck \/ ReactorPoll \/ ReactorAwake
 ProducerFinish(p) ==
     \/ ProducerSwap(p) \/ ProducerPreload(p) \/ ProducerPush(p)
-    \/ ProducerLoad(p) \/ ProducerWake(p)
+    \/ ProducerOwe(p) \/ ProducerReadHeld(p) \/ ProducerRelease(p)
+    \/ ProducerKick(p) \/ ProducerLoad(p) \/ ProducerWake(p) \/ ProducerUnhold(p)
 
 FairSpec ==
     /\ Spec
@@ -296,15 +417,18 @@ TypeOK ==
     /\ dirty \in [Links -> BOOLEAN] /\ queued \in [Links -> BOOLEAN]
     /\ queue \in [Links -> 0..MaxItems] /\ batch \in [Links -> 0..MaxItems]
     /\ sleeping \in BOOLEAN /\ waker \in BOOLEAN /\ pendingSeen \in BOOLEAN
+    /\ held \in BOOLEAN /\ owing \in BOOLEAN
+    /\ holding \in [Producers -> BOOLEAN] /\ pseen \in [Producers -> BOOLEAN]
     /\ rpc \in {"take", "handle", "run", "lateclear", "sleep", "recheck", "poll", "awake"}
-    /\ ppc \in [Producers -> {"idle", "notify", "preload", "push", "pushw", "pushn",
-                              "load", "wake"}]
+    /\ ppc \in [Producers -> {"idle", "notify", "preload", "push", "owe", "readheld",
+                              "kick", "load", "wake", "rkick", "rload", "rwake",
+                              "unhold"}]
     /\ ptarget \in [Producers -> Links \cup {NoLink}]
     /\ sent \in [Producers -> 0..MaxPublish]
 
 LaneBounded == \A l \in Links : taken[l] <= published[l] /\ LaneLen(l) <= LaneCap
 
-Pushing(p, l) == ptarget[p] = l /\ ppc[p] \in {"preload", "push", "pushw", "pushn"}
+Pushing(p, l) == ptarget[p] = l /\ ppc[p] \in {"preload", "push"}
 
 \* `notify` is idempotent until the task runs: a link has at most one Run
 \* message between its mark and the reactor, so the queue is bounded by
@@ -327,11 +451,23 @@ NoStrandedFrame ==
         \/ \E p \in Producers : ptarget[p] = l /\ ppc[p] = "notify"
         \/ \E p \in Producers : Pushing(p, l)
 
+\* A recorded debt has someone who will pay it: a producer between its
+\* record and its look at the hold, a kick that has not taken the debt
+\* yet, or a live hold, whose release kicks.
+DebtHasPayer ==
+    owing => \/ \E p \in Producers : ppc[p] \in {"readheld", "kick", "rkick"}
+             \/ \E p \in Producers : holding[p]
+
 \* A reactor blocked in its poll with a message in its queue has a wake
-\* on its way: the producer of that message has not read `sleeping` yet,
-\* or has read it set. Otherwise the message waits for the timeout.
+\* on its way: a kick took the debt and has not read `sleeping` yet or
+\* read it set, or a producer pushed and has not settled its debt yet, or
+\* the debt is recorded and has a payer. Otherwise the message waits for
+\* the timeout.
 NoLostWake ==
-    (Blocked /\ ~QueueEmpty) => \E p \in Producers : ppc[p] \in {"load", "wake"}
+    (Blocked /\ ~QueueEmpty) =>
+        \/ \E p \in Producers : ppc[p] \in {"load", "wake", "rload", "rwake"}
+        \/ \E p \in Producers : ppc[p] \in {"owe", "readheld"}
+        \/ owing /\ DebtHasPayer
 
 (***************************************************************************)
 (* Progress, under FairSpec: every published frame is taken by its task,   *)
@@ -351,8 +487,13 @@ NoWakeOfBlockedWitness == ~(Blocked /\ \E p \in Producers : ppc[p] = "wake")
 \* A producer read `sleeping` clear and left; the re-check of the queue,
 \* not a wake, keeps the reactor from blocking.
 NoRecheckSavesWitness ==
-    ~(rpc = "poll" /\ pendingSeen /\ ~waker /\ ~QueueEmpty
-      /\ \A p \in Producers : ppc[p] \notin {"load", "wake"})
+    ~(rpc = "poll" /\ pendingSeen /\ ~waker /\ ~QueueEmpty /\ ~owing
+      /\ \A p \in Producers : ppc[p] = "idle")
+
+\* A message queued under a hold waits in the queue of a blocked reactor
+\* until the release pays its wake-up.
+NoDebtPaidAtReleaseWitness ==
+    ~(Blocked /\ ~QueueEmpty /\ \E p \in Producers : ppc[p] = "rwake")
 
 \* A producer finds the link already marked and sends no message.
 NoCoalescedNotifyWitness ==

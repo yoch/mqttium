@@ -1,24 +1,31 @@
 {
   "module": "MReactorWake.tla",
   "status": "refinement",
-  "summary": "How the core gets a reactor thread to run a task (net/reactor.rs): Link::notify marks `dirty` once and pushes a Run message, Shared::send wakes the mio waker when `sleeping` is set, and the reactor sets `sleeping`, re-checks its queue, then polls; every published frame is taken without readiness, tick or timeout.",
+  "summary": "How the core gets a reactor thread to run a task (net/reactor.rs): Link::notify marks `dirty` once and pushes a Run message, Shared::send records a wake-up debt and pays it unless a hold is active, the release of a hold clears it and then pays, and the reactor sets `sleeping`, re-checks its queue, then polls; every published frame is taken without readiness, tick or timeout once the holds are released.",
   "issues": [648],
   "tests": ["mqttiumd/crates/mqttiumd/src/net/reactor.rs"],
-  "replays": [{"file": "mqttiumd/crates/mqttiumd/src/net/reactor.rs", "test": "a_notification_runs_the_task_once_and_a_waiting_task_is_ticked"}, {"file": "mqttiumd/crates/mqttiumd/src/net/reactor.rs", "test": "a_task_runs_on_readiness_and_rests_between_events"}],
-  "not_replayed": "The lost-message counterexamples (mut-check-before-push, mut-poll-without-recheck, mut-clear-dirty-after-run) need a chosen schedule of the core and reactor threads; no deterministic test replays them. The cited tests show a notification running an idle task once and an idle task resting, on real threads.",
+  "replays": [{"file": "mqttiumd/crates/mqttiumd/src/net/reactor.rs", "test": "a_notification_runs_the_task_once_and_a_waiting_task_is_ticked"}, {"file": "mqttiumd/crates/mqttiumd/src/net/reactor.rs", "test": "a_held_wake_up_is_given_when_the_hold_ends"}, {"file": "mqttiumd/crates/mqttiumd/src/net/reactor.rs", "test": "a_task_runs_on_readiness_and_rests_between_events"}],
+  "not_replayed": "The lost-message counterexamples (mut-*) need a chosen schedule of two or three threads; no deterministic test replays them. The two debt mutants need a second sending thread beside the one that holds, which the executable does not have. The cited tests show a notification running an idle task once, a held wake-up given at the release, and an idle task resting, on real threads.",
   "configs": [
-    {"config": "MReactorWake-safety.cfg", "expect": "pass", "invariants": ["TypeOK", "LaneBounded", "RunOnce", "DirtyHasRun", "NoStrandedFrame", "NoLostWake"]},
+    {"config": "MReactorWake-safety.cfg", "expect": "pass", "invariants": ["TypeOK", "LaneBounded", "RunOnce", "DirtyHasRun", "NoStrandedFrame", "DebtHasPayer", "NoLostWake"]},
+    {"config": "MReactorWake-safety-two-links.cfg", "expect": "pass", "invariants": ["TypeOK", "LaneBounded", "RunOnce", "DirtyHasRun", "NoStrandedFrame", "DebtHasPayer", "NoLostWake"]},
+    {"config": "MReactorWake-safety-two-holders.cfg", "expect": "pass", "invariants": ["TypeOK", "LaneBounded", "RunOnce", "DirtyHasRun", "NoStrandedFrame", "DebtHasPayer", "NoLostWake"]},
     {"config": "MReactorWake-liveness.cfg", "expect": "pass", "property": "EveryFrameTaken"},
-    {"config": "MReactorWake-liveness-one-link.cfg", "expect": "pass", "property": "EveryFrameTaken"},
+    {"config": "MReactorWake-liveness-two-links.cfg", "expect": "pass", "property": "EveryFrameTaken"},
     {"config": "MReactorWake-reach-wake-of-blocked.cfg", "expect": "violation", "invariant": "NoWakeOfBlockedWitness"},
     {"config": "MReactorWake-reach-recheck-saves.cfg", "expect": "violation", "invariant": "NoRecheckSavesWitness"},
     {"config": "MReactorWake-reach-coalesced-notify.cfg", "expect": "violation", "invariant": "NoCoalescedNotifyWitness"},
     {"config": "MReactorWake-reach-notify-during-run.cfg", "expect": "violation", "invariant": "NoNotifyDuringRunWitness"},
+    {"config": "MReactorWake-reach-debt-paid-at-release.cfg", "expect": "violation", "invariant": "NoDebtPaidAtReleaseWitness"},
     {"config": "MReactorWake-mut-check-before-push.cfg", "expect": "violation", "invariant": "NoLostWake"},
     {"config": "MReactorWake-mut-check-before-push-liveness.cfg", "expect": "liveness", "property": "EveryFrameTaken"},
     {"config": "MReactorWake-mut-poll-without-recheck.cfg", "expect": "violation", "invariant": "NoLostWake"},
     {"config": "MReactorWake-mut-poll-without-recheck-liveness.cfg", "expect": "liveness", "property": "EveryFrameTaken"},
     {"config": "MReactorWake-mut-clear-dirty-after-run.cfg", "expect": "violation", "invariant": "NoStrandedFrame"},
-    {"config": "MReactorWake-mut-clear-dirty-after-run-liveness.cfg", "expect": "liveness", "property": "EveryFrameTaken"}
+    {"config": "MReactorWake-mut-clear-dirty-after-run-liveness.cfg", "expect": "liveness", "property": "EveryFrameTaken"},
+    {"config": "MReactorWake-mut-debt-read-before-release.cfg", "expect": "violation", "invariant": "NoLostWake"},
+    {"config": "MReactorWake-mut-debt-read-before-release-liveness.cfg", "expect": "liveness", "property": "EveryFrameTaken"},
+    {"config": "MReactorWake-mut-hold-read-before-debt.cfg", "expect": "violation", "invariant": "NoLostWake"},
+    {"config": "MReactorWake-mut-hold-read-before-debt-liveness.cfg", "expect": "liveness", "property": "EveryFrameTaken"}
   ]
 }

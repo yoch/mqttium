@@ -1,16 +1,16 @@
 # Group commit of the store
 
-`MGroupCommit` models `SqliteStore::apply_group` as decision record 0045
-(proposed) describes it: K commands in one transaction of the engine, one
-savepoint per command, one `COMMIT`, and the answers only after it.
+`MGroupCommit` models `SqliteStore::apply_group`
+(`crates/mqttiumd-store-sqlite/src/group.rs`, decision record 0045): K
+commands in one transaction of the engine, one savepoint per command, one
+`COMMIT`, and the answers only after it. The store worker forms the
+groups and delivers the answers (`group_responses` and the worker loop in
+`crates/mqttiumd/src/writer.rs`).
 
-It is a specification model. The record, `group.rs` and the tests of
-`apply_group` belong to the store lot and are not on this branch; the
-model was written from them, read in that lot's worktree. Its sidecar
-therefore lists no test. Once both are merged the tests named in the
-correspondence table can be listed and the status reviewed. The store is
-in the core tier (ADR 0044): this model adds to its evidence and replaces
-none of it.
+Its actions are the steps of `apply_group`, `member` and `savepoint`, and
+its sidecar lists the tests of the store crate that replay them. The
+store is in the core tier (ADR 0044): this model adds to its evidence and
+replaces none of it. It is not a proof of the code.
 
 ## Running
 
@@ -62,10 +62,12 @@ killed at any point from `BEGIN` to the last answer.
   are folded into that. That a group equals its sequential application
   row for row is the claim of the differential tests, not of this model.
 - `MAX_GROUP`, the empty group and the group of one, which is `apply`.
-- The delivery of the answers. The store returns them together. The model
-  hands them over one member at a time, in order, because the writer that
-  will deliver them (record 0045, left open) is another lot; a kill
-  between two of them is `reach-crash-after-partial-release`.
+- How the worker forms a group: consecutive `Persist` commands waiting in
+  its request lane, at most `GROUP`, none while test controls exist. The
+  store returns the answers together; `group_responses` turns them into
+  replies and the worker loop publishes them one at a time, in the order
+  of the requests, which is what `Release` is. A kill between two of them
+  is `reach-crash-after-partial-release`.
 - Recovery after the kill: `established` and `resolve_and_fence` on the
   identities of the group are those of `apply` and of model M1.
 
@@ -98,23 +100,28 @@ that returns without a commit, and a commit that fails.
 
 ## Correspondence
 
-The tests named are those of
-`crates/mqttiumd-store-sqlite/tests/group_commit.rs` in the store lot.
-They are not on this branch and the sidecar does not list them.
+The tests are those of `crates/mqttiumd-store-sqlite/tests/group_commit.rs`
+unless another file is named. The two kill tests run in a build with the
+feature `kill-points`.
 
-| Model action | Code (`group.rs`, store lot) | Replay |
+| Model action | Code | Replay |
 | - | - | - |
-| `Begin` | `transaction_with_behavior(TransactionBehavior::Immediate)` in `apply_group` | Not on this branch: `admissions_with_fan_out_and_their_releases_commit_as_one_group` |
-| `MemberStage` | `recognise`, then `savepoint` around `stage_command` in `member` | Not on this branch: `an_operation_presented_twice_in_one_group_is_decided_once`, `claims_finishes_and_subscription_changes_see_the_earlier_members` |
-| `MemberUndo` | `ROLLBACK TO member`, `RELEASE member` in `savepoint` | Not on this branch: `a_refused_member_is_recorded_and_its_neighbours_still_apply` |
-| `MemberReject` | The second `savepoint`, around `stage_rejection` | Not on this branch: `a_refused_member_is_recorded_and_its_neighbours_still_apply`, `a_member_without_a_receipt_slot_is_unknown_inside_a_group_too` |
-| `MemberUndoFault` | `Txn::ReadFailed` and `Txn::NotWritten` in `member` | Not on this branch: the unit test of the crate that faults each transactional read of a group in turn |
-| `EngineDrops` | `tx.is_autocommit()` and `Lost` in `apply_group` | Not on this branch; no test named for it in the record |
-| `Decide` | The test `any member wrote` on the answers, before K1 | Not on this branch: `an_empty_group_commits_nothing` is the nearest; a group of recognised members only has no test named in the record |
-| `Commit` | K1, then `tx.commit()`, not called on a failing medium | Not on this branch: `a_group_on_a_failing_medium_leaves_nothing_and_says_nothing_certain`, `a_group_passes_each_kill_point_once` |
-| `Release`, `Finish` | The return of `apply_group` | Not on this branch: `varied_groups_equal_their_sequential_application` compares the answers; their delivery by the writer does not exist yet |
-| `Crash` | The kill points K1 and K2b | Not on this branch: `a_kill_before_the_commit_of_a_group_leaves_no_member`, `a_kill_once_the_commit_of_a_group_is_logged_keeps_every_member` |
+| `Begin` | `transaction_with_behavior(TransactionBehavior::Immediate)` in `apply_group` | `admissions_with_fan_out_and_their_releases_commit_as_one_group` |
+| `MemberStage` | `recognise`, then `savepoint` around `stage_command` in `member` | `an_operation_presented_twice_in_one_group_is_decided_once`, `claims_finishes_and_subscription_changes_see_the_earlier_members` |
+| `MemberUndo` | `ROLLBACK TO member`, `RELEASE member` in `savepoint` | `a_refused_member_is_recorded_and_its_neighbours_still_apply` |
+| `MemberReject` | The second `savepoint`, around `stage_rejection` | `a_refused_member_is_recorded_and_its_neighbours_still_apply`, `a_member_without_a_receipt_slot_is_unknown_inside_a_group_too` |
+| `MemberUndoFault` | `Txn::ReadFailed` and `Txn::NotWritten` in `member` | `a_member_whose_read_fails_is_unknown_and_the_group_still_commits` (`src/lib.rs` of the store crate) |
+| `EngineDrops` | `tx.is_autocommit()` and `Lost` in `apply_group` | No test drops the transaction of the engine inside a group |
+| `Decide` | The test `any member wrote` on the answers, before K1 | `an_empty_group_commits_nothing` is the nearest; no test names a group of recognised members only |
+| `Commit` | K1, then `tx.commit()`, not called on a failing medium | `a_group_on_a_failing_medium_leaves_nothing_and_says_nothing_certain`, `a_group_passes_each_kill_point_once` |
+| `Release`, `Finish` | The return of `apply_group`; `group_responses` and `rtx.try_send` in the worker loop (`writer.rs`) | `varied_groups_equal_their_sequential_application` compares the answers; no test of the product crate observes their delivery around a kill or a failed commit |
+| `Crash` | The kill points K1 and K2b | `a_kill_before_the_commit_of_a_group_leaves_no_member`, `a_kill_once_the_commit_of_a_group_is_logged_keeps_every_member` |
 | `Quiescent` | The end of a run of the model | Not an action of the code |
 
-No test replays a mutant: `apply_group` has no writer around it yet, so
-"an answer left before the commit" cannot be driven on the code.
+The sidecar lists under `replays` the tests that drive the store through
+a trace of the model: a refusal recorded between applied members, a
+member without a receipt slot, an operation presented twice, a member
+whose read fails, a failing medium, and a kill on each side of the
+commit. No test replays a mutant that lets an answer leave early:
+`apply_group` returns its answers only after the commit, so that defect
+cannot be driven without changing the function.

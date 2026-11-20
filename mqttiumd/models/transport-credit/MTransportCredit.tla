@@ -2,8 +2,9 @@
 (***************************************************************************)
 (* MTransportCredit: the frames the core hands to one transport task and   *)
 (* the receipts that come back, as written in crates/mqttiumd/src/net.rs   *)
-(* (`Lanes`, `Task`, `Lanes::finish`), net/reactor.rs (`retire`) and       *)
-(* runtime.rs (`collect_written`, `close`, `finish_close`).                *)
+(* (`Lanes`, `Task`, `Lanes::finish`), net/tls.rs (`Task`),                *)
+(* net/reactor.rs (`retire`) and runtime.rs (`collect_written`, `close`,   *)
+(* `finish_close`).                                                        *)
 (*                                                                         *)
 (* There is no credit counter in the runtime. What bounds the frames in    *)
 (* flight is the frame lane itself (`sync_channel(OUTPUT_SLOTS)`):         *)
@@ -22,7 +23,9 @@
 (* or Failed. A task that ends runs `Lanes::finish`: the pending receipts, *)
 (* then Failed for the frame in progress and for every frame still in the  *)
 (* lane, each offered once with `try_send`; the first refusal stops it.    *)
-(* `retire` sets `Link::finished` after that.                              *)
+(* A frame the task took and could not start (a bad expiry offset, a TLS   *)
+(* frame that cannot be sealed) is the frame in progress. `retire` sets    *)
+(* `Link::finished` after that.                                            *)
 (*                                                                         *)
 (* The core removes a frame from `Runtime::frames` when it reads its       *)
 (* terminal receipt. `finish_close` fails every frame the connection       *)
@@ -30,10 +33,10 @@
 (* again: it covers a receipt the full lane refused at the end and a       *)
 (* frame submitted while the task was ending.                              *)
 (*                                                                         *)
-(* The two transports differ in one step, TaskSealFails: see               *)
-(* TerminalWhenRoom. WireProgress, the input lane and the scheduling of    *)
-(* the task are not here: a task step may happen at any time. The history  *)
-(* of the verifier (prefix h) is read by no guard.                         *)
+(* WireProgress, the input lane and the scheduling of the task are not     *)
+(* here: a task step may happen at any time. A full input lane is          *)
+(* backpressure and ends no task (record 0046, model MLaneOwed). The       *)
+(* history of the verifier (prefix h) is read by no guard.                 *)
 (***************************************************************************)
 EXTENDS Naturals, Sequences, FiniteSets
 
@@ -42,17 +45,16 @@ CONSTANTS
     OutSlots,   \* capacity of the frame lane (OUTPUT_SLOTS)
     WrittenCap, \* capacity of the receipt lane (WRITTEN_SLOTS)
     Writable,   \* the socket: "always", "never", or "any" (it changes)
-    Transport,  \* "plain" (net.rs Task) or "tls" (net/tls.rs Task)
     Preserve,   \* the core waits for the task's facts before it closes
     Mutation    \* "none" or the name of a model mutation
 
 Mutations == {"none", "DoubleReceipt", "LostReceiptOnClose", "NoCloseSweep",
-              "FinishedFirst", "TakeWhilePending", "FlushNewestFirst"}
+              "FinishedFirst", "TakeWhilePending", "FlushNewestFirst",
+              "DropUnsealedFrame"}
 
 ASSUME /\ NumFrames \in Nat \ {0} /\ OutSlots \in Nat \ {0}
        /\ WrittenCap \in Nat \ {0}
        /\ Writable \in {"always", "never", "any"}
-       /\ Transport \in {"plain", "tls"}
        /\ Preserve \in BOOLEAN
        /\ Mutation \in Mutations
 
@@ -277,15 +279,15 @@ TaskDeadline ==
 \* End of file, a read or write error, a malformed packet: at any time.
 TaskTransportError == tpc = "run" /\ End
 
-\* tls::Task::next_write only. The frame taken from the lane is held in a
-\* local variable while it is sealed; when `prepare_expiry` or
-\* `frame_ciphertext` fails, the error ends the task and the frame is
-\* dropped: it is neither the frame in progress nor in the lane when
-\* `Lanes::finish` runs. The plain task keeps such a frame in place.
+\* The frame the task took cannot be started: `prepare_expiry` returns
+\* Failed in `write_attempt`, or `tls::Task::next_write` cannot seal it.
+\* The error ends the task and the frame stays the frame in progress
+\* (`Task::active`, `tls::Machine::unsealed`), which `Lanes::finish` fails.
+\* DropUnsealedFrame forgets it, as the TLS task did when it held the
+\* frame in a local variable.
 TaskSealFails ==
-    /\ Transport = "tls"
     /\ tpc = "run" /\ active # NoFrame /\ phase = "new"
-    /\ active' = NoFrame
+    /\ active' = IF Mutation = "DropUnsealedFrame" THEN NoFrame ELSE active
     /\ tpc' = "finReports"
     /\ finished' = (Mutation = "FinishedFirst")
     /\ UNCHANGED <<coreVars, cancelled, out, written, phase, reports, writable,
@@ -425,8 +427,7 @@ NothingAfterFinished == ~hAfterEnd
 
 \* A task that ended with room in the receipt lane left a terminal
 \* receipt for every accepted frame, but for one accepted after it last
-\* looked at the frame lane. This holds for the plain task. The TLS task
-\* breaks it at TaskSealFails; RetiredFramesResolved holds for both.
+\* looked at the frame lane.
 TerminalWhenRoom ==
     (finished /\ ~hRefused) => \A f \in Accepted : hProduced[f] = 1 \/ f \in hLate
 
