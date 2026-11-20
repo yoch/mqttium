@@ -127,7 +127,11 @@ def broker_command(kind, binary, directory, pki, port):
     acl = directory / "acl"
     acl.write_text("user sensor\ntopic write atelier/load/#\nuser dashboard\ntopic read atelier/load/#\n")
     config = directory / "mosquitto.conf"
+    # Started by root, Mosquitto drops to another user that cannot read the
+    # run's private files; a host that only has root keeps it.
+    identity = ["user root"] if os.geteuid() == 0 else []
     config.write_text("\n".join([
+        *identity,
         f"listener {port} 127.0.0.1", "allow_anonymous false", "require_certificate true",
         "use_identity_as_username true", "tls_version tlsv1.3",
         f"cafile {pki}/ca.crt", f"certfile {pki}/server.crt", f"keyfile {pki}/server.key",

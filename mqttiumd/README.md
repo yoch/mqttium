@@ -10,6 +10,27 @@ against a deterministic store and SQLite. The lab and independent Python
 oracle receive bounded scenarios, including real process kills. This is
 a bounded product, not a complete MQTT broker or a conformance or performance claim. Live receipt retirement recovers command capacity without restarting the broker, and outgoing QoS 1 Packet Identifiers are reused after known durable Finish application. The Will preview reports unexpected sensor loss through durable non-retained QoS1 publication. See [the Will decision](docs/decisions/0034-durable-will.md), [the normal package guide](preview/README.md), [Message Expiry reception](docs/reports/0017-message-expiry-preview.md), [CI follow-up](docs/reception/message-expiry-ci-reception.md), [Message Expiry decision](docs/decisions/0033-message-expiry.md), [retained reception](docs/reports/0016-durable-retained-preview.md), [the product profile and commands](docs/product-tcp.md), [QoS 0 reception](docs/reports/0010-qos0-product.md), [receipt retirement reception](docs/reports/0011-live-receipt-retirement.md) and [protected identifier reuse](docs/reports/0012-outgoing-pi-reuse.md).
 
+## Runtime since record 0044
+
+The product executable no longer polls. Each connection is one
+non-blocking task on a small pool of `mio` reactor threads, the core and
+the store worker wait for a signal, and the store commits the commands
+waiting in its lane as one transaction
+([0044](docs/decisions/0044-reactor-runtime-and-evidence-tiers.md),
+[0045](docs/decisions/0045-group-commit.md),
+[0046](docs/decisions/0046-input-backpressure.md)). The connection limit
+is an option (`--max-connections`, up to 128), and input pressure slows a
+peer instead of disconnecting it. The figures of report 0024 describe
+the executable before these records; no throughput claim is made for the
+current one.
+
+What the broker accepts of MQTT is still the bounded profile described in
+[the product guide](docs/product-tcp.md). The gap to the pinned Mosquitto
+is listed scenario by scenario in `tests/compat/` and statement by
+statement in `conformance/`. The system receptions, `preview/` and the
+pilot kits are frozen evidence of the executable built from `51be4079`
+([report 0026](docs/reports/0026-frozen-receptions.md)).
+
 ## What exists
 
 | Path | Content |

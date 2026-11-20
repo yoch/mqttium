@@ -218,3 +218,23 @@ supervision remains NO-GO under the shared broker quota. The measured online
 gap was 1,798.11 seconds. See `docs/pilot/forward-decision.md` and the results
 manifest. The original 49bbaaa4 runtime races were corrected and requalified.
 Full-PR independent review and power-loss reception remain open.
+
+## Version 0.1 on the reactor runtime (records 0044 to 0046)
+
+Found while the runtime of record 0044 was built, by the differential
+bench `tests/compat/`, by the statement register `conformance/` and by the
+runtime models. Each row is open; none is repaired by a frozen reception.
+
+| Condition | Closed by | Blocks |
+| - | - | - |
+| **A delivery larger than the client's Maximum Packet Size.** A QoS 1 or 2 delivery that does not fit closes the connection and keeps its claim (`plan_delivery_emit`); MQTT-3.1.2-25 requires discarding it as if sent. A persistent session is closed again at the same message on every reconnect. A core test pins the current behaviour | Core, with a decision record | Conformance; drop-in use |
+| **Order of deliveries under a late store result.** MQTT-4.6.0-5 and -6 are not established by code or test | Core and runtime models | Conformance |
+| **Refusals that say less than Mosquitto.** No DISCONNECT 0x95 or 0x81 before closing on an oversized or malformed packet; CONNACK 0x83 where 0x8C names an unsupported authentication method; a 40,000-byte PUBLISH refused although Maximum Packet Size 65,536 was announced (`tests/compat/divergences.json`, class `defect`) | Runtime (codec) | Compatibility matrix without `defect` |
+| **The profile refuses what Mosquitto accepts.** Empty ClientID, username and password, PUBLISH properties other than Message Expiry, Will QoS 0 and 2 and Will Delay, shared subscriptions, subscription identifiers, topic aliases, `$SYS`, MQTT 3.1, more than 8 filters per SUBSCRIBE, 128 subscriptions, 32 retained topics, packets over 65,536 bytes (26 scenarios of class `profile-refused`) | Product lots of version 0.1; PUBLISH properties need a durable encoding and a decision record | Version 0.1 |
+| **`$share/` grammar applied to MQTT 3.1.1.** A 3.1.1 SUBSCRIBE or UNSUBSCRIBE of a `$share/…` filter is closed without SUBACK or UNSUBACK (MQTT-3.8.4-1, MQTT-3.10.4-4) | Runtime (codec) | Conformance |
+| **Pressure on QoS 1 and 2 beyond the store's rate.** Refusals 0x97, then closures with `input_capacity` past a quarter of the input lane (record 0046) | Core cost model: effect slots reserved for the packets that release resources | Load profile of version 0.1 |
+| **Durable QoS 1 throughput.** One store worker commits a few thousand publications per second on tmpfs; report 0027 has the figures against Mosquitto. A fifth of the worker's samples were still statement preparation and a quarter the re-reading of work for online subscribers | Store (cached statements everywhere, direct delivery), Volatile profile of ARC-020 | Performance target |
+| **Scale.** 128 connections and sessions, 16 targets per publication, linear route selection, two reactor threads fixed | Core scaling with its cost model, `--io-threads` | Performance target |
+| **A reactor thread held by a TLS test barrier.** In a build with `test-hooks` a held TLS frame barrier blocks the reactor thread that serves it | Not planned: the barriers belong to the frozen secure reception | Nothing current |
+| **Codec property tests and fuzzing.** `tools/install-tools.sh` installs a fuzzer; no fuzz target or property test of `codec.rs` exists | Runtime (V2) | Evidence tier of record 0044 |
+| **Loom and a deterministic simulation of the runtime.** The wake-up protocols are modelled in TLA+ and exercised by timing tests; no interleaving explorer runs the Rust | Runtime (V4) | Evidence tier of record 0044 |
