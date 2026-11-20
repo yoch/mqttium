@@ -826,6 +826,81 @@ fn a_deferred_subscription_cannot_be_overtaken_by_its_later_unsubscribe() {
     });
 }
 
+/// MQTT 3.1.1 has no Receive Maximum: a client cannot know the broker's
+/// window, so a burst beyond it is pressure. The publications wait for the
+/// acknowledgements that free the window; every one is acknowledged and
+/// the connection stays open.
+#[test]
+fn a_3_1_1_burst_beyond_the_receive_window_is_acknowledged_not_refused() {
+    with_runtime(128, |runtime, _| {
+        let (generation, mut client) = peer(runtime);
+        runtime
+            .connect(
+                generation,
+                codec::Connect {
+                    version: codec::Version::V311,
+                    ..connect_packet(b"legacy-burst")
+                },
+            )
+            .unwrap();
+        until(runtime, |r| r.session_requests.is_empty());
+        assert_eq!(read_frame(&mut client).0, 0x20);
+        const BURST: u16 = 20;
+        for id in 1..=BURST {
+            let [high, low] = id.to_be_bytes();
+            // The transport hands packets over one at a time; a waiting
+            // publication keeps the later ones in their lane.
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while runtime.peers[&generation].deferred_publish.is_some() {
+                assert!(
+                    runtime.peers[&generation].closing.is_none(),
+                    "closed: {:?}",
+                    runtime.peers[&generation].closing
+                );
+                assert!(Instant::now() < deadline, "publication {id} never admitted");
+                pump(runtime);
+                thread::sleep(Duration::from_millis(1));
+            }
+            runtime
+                .packet(generation, 0x32, vec![0, 1, b't', high, low, b'v'])
+                .unwrap();
+            assert!(
+                runtime
+                    .peers
+                    .get(&generation)
+                    .is_some_and(|peer| peer.closing.is_none()),
+                "publication {id} closed the connection: {:?}",
+                runtime.peers.get(&generation).and_then(|peer| peer.closing)
+            );
+        }
+        client
+            .set_read_timeout(Some(Duration::from_millis(5)))
+            .unwrap();
+        let mut acknowledged = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut first = [0u8; 1];
+        while acknowledged.len() < usize::from(BURST) {
+            assert!(
+                Instant::now() < deadline,
+                "only {acknowledged:?} were acknowledged"
+            );
+            pump(runtime);
+            if client.peek(&mut first).is_ok() {
+                client
+                    .set_read_timeout(Some(Duration::from_secs(1)))
+                    .unwrap();
+                let (kind, body) = read_frame(&mut client);
+                assert_eq!(kind, 0x40, "PUBACK expected");
+                acknowledged.push(u16::from_be_bytes([body[0], body[1]]));
+                client
+                    .set_read_timeout(Some(Duration::from_millis(5)))
+                    .unwrap();
+            }
+        }
+        assert_eq!(acknowledged, (1..=BURST).collect::<Vec<_>>());
+    });
+}
+
 /// The one-pass bindings are what a lookup per cached session answered,
 /// for attached and detached sessions alike.
 #[test]
