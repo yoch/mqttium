@@ -23,7 +23,7 @@ use mqttiumd_store_api::{
 };
 use mqttiumd_store_sqlite::SqliteStore;
 use serde_json::json;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{
     Arc,
@@ -37,6 +37,12 @@ use std::time::Instant;
 
 pub const QUEUE: usize = 32;
 pub const CONTROL_QUEUE: usize = 4;
+/// Commands one transaction may carry: what the request lane can hold.
+const GROUP: usize = if QUEUE < mqttiumd_store_sqlite::MAX_GROUP {
+    QUEUE
+} else {
+    mqttiumd_store_sqlite::MAX_GROUP
+};
 pub const SESSIONS: usize = 128;
 pub const MAX_CLIENT: usize = 1024;
 pub const MAX_TOPIC: usize = 1024;
@@ -380,8 +386,11 @@ impl Writer {
                 if btx.send(Ok(boot)).is_err() {
                     return;
                 }
-                let mut pending = None;
+                let mut pending: VecDeque<Response> = VecDeque::new();
                 let mut pending_control = None;
+                // Barriers and one-shot controls of a test run address one
+                // command at a time: no group is formed while they exist.
+                let group = if hooks.directory.is_some() { 1 } else { GROUP };
                 let mut stopping = false;
                 let mut state = BusinessState::default();
                 #[cfg(feature="test-hooks")]
@@ -402,19 +411,20 @@ impl Writer {
                             Err(TrySendError::Disconnected(_)) => return,
                         }
                     }
-                    if let Some(reply) = pending.take() {
+                    // Replies leave in the order of their requests.
+                    while let Some(reply) = pending.pop_front() {
                         match rtx.try_send(reply) {
-                            Ok(()) if stopping => {
-                                worker_wake.wake();
-                                return;
-                            }
                             Ok(()) => worker_wake.wake(),
                             Err(TrySendError::Full(reply)) => {
                                 stalled = true;
-                                pending = Some(reply);
+                                pending.push_front(reply);
+                                break;
                             }
                             Err(TrySendError::Disconnected(_)) => return,
                         }
+                    }
+                    if stopping && pending.is_empty() {
+                        return;
                     }
                     // Even a completely unread ordinary result lane cannot prevent
                     // a reserved receipt closure from committing and replying.
@@ -442,24 +452,59 @@ impl Writer {
                             Err(TryRecvError::Disconnected) => return,
                         }
                     }
-                    if pending.is_none() && !stopping {
-                        match rx.try_recv() {
-                            Ok(Request::Stop) => {
-                                pending = Some(Response::Stopped);
+                    if pending.is_empty() && !stopping {
+                        // Consecutive commands waiting in the lane commit as
+                        // one group; any other request ends the group and is
+                        // served after it, in order.
+                        let mut members: Vec<Member> = Vec::new();
+                        let mut other = None;
+                        let mut closed = false;
+                        while members.len() < group {
+                            match rx.try_recv() {
+                                Ok(Request::Effect(effect)) => match effect.into_parts() {
+                                    (effect, Effect::Persist { command }) if group > 1 => {
+                                        members.push(Member { effect, command });
+                                    }
+                                    (effect, work) => {
+                                        other = Some(Ok((effect, work)));
+                                        break;
+                                    }
+                                },
+                                Ok(request) => {
+                                    other = Some(Err(request));
+                                    break;
+                                }
+                                Err(TryRecvError::Empty) => break,
+                                Err(TryRecvError::Disconnected) => {
+                                    closed = true;
+                                    break;
+                                }
+                            }
+                        }
+                        let idle_turn = members.is_empty() && other.is_none();
+                        if !members.is_empty() {
+                            pending.extend(group_responses(&mut store, members, &events, &cancel));
+                        }
+                        match other {
+                            Some(Err(Request::Stop)) => {
+                                pending.push_back(Response::Stopped);
                                 stopping = true;
                             }
-                            Ok(request) => {
-                                pending = Some(business_response(
-                                    &mut store, request, &events, &hooks, &cancel, &mut state,
-                                ))
-                            }
-                            // Both request lanes signal `requests`. A reply
-                            // produced in this turn is published before waiting.
-                            Err(TryRecvError::Empty) if pending_control.is_none() && !stalled => {
-                                requests.wait(idle);
-                            }
-                            Err(TryRecvError::Empty) => {}
-                            Err(TryRecvError::Disconnected) => return,
+                            Some(Err(request)) => pending.push_back(business_response(
+                                &mut store, request, &events, &hooks, &cancel, &mut state,
+                            )),
+                            Some(Ok((effect, work))) => pending.push_back(effect_response(
+                                &mut store, effect, work, &events, &hooks, &cancel, &mut state,
+                            )),
+                            None => {}
+                        }
+                        if closed && pending.is_empty() {
+                            return;
+                        }
+                        // Both request lanes signal `requests`. A reply
+                        // produced in this turn is published before waiting.
+                        if idle_turn && !closed && pending_control.is_none() && !stalled {
+                            requests.wait(idle);
                         }
                     }
                     if stalled {
@@ -533,231 +578,334 @@ fn business_response(
         },
         Request::Effect(effect) => {
             let (effect, work) = effect.into_parts();
-            match work {
-                Effect::Persist { command } => {
-                    let id = command.recipe.operation();
-                    let kind = recipe_kind(command.recipe.get());
-                    let recipe = command.recipe.get();
-                    let targets = if let Recipe::WillPublication(a) = recipe {
-                        a.targets.as_slice().iter().map(|t| t.session).collect()
-                    } else if let Some(a) = recipe.admission() {
-                        a.targets.as_slice().iter().map(|t| t.session).collect()
-                    } else if let Some(a) = recipe.retained_qos0() {
-                        a.targets.as_slice().iter().map(|t| t.session).collect()
-                    } else if let Some(a) = recipe.replay_subscriptions() {
-                        vec![a.update.session]
-                    } else {
-                        Vec::new()
-                    };
-                    #[cfg(feature = "test-hooks")]
+            effect_response(store, effect, work, events, hooks, cancel, state)
+        }
+    }
+}
+
+/// The sessions a committed command may have given work to.
+fn targets_of(recipe: &Recipe) -> Vec<SessionId> {
+    if let Recipe::WillPublication(a) = recipe {
+        a.targets.as_slice().iter().map(|t| t.session).collect()
+    } else if let Some(a) = recipe.admission() {
+        a.targets.as_slice().iter().map(|t| t.session).collect()
+    } else if let Some(a) = recipe.retained_qos0() {
+        a.targets.as_slice().iter().map(|t| t.session).collect()
+    } else if let Some(a) = recipe.replay_subscriptions() {
+        vec![a.update.session]
+    } else {
+        Vec::new()
+    }
+}
+
+/// The records of one applied command. They are written after its commit
+/// returned, for a command applied alone and for a member of a group.
+fn record_applied(
+    recipe: &Recipe,
+    applied: &mqttiumd_store_api::Applied,
+    events: &Events,
+    cancel: &AtomicBool,
+) {
+    let id = recipe.operation();
+    let kind = recipe_kind(recipe);
+    if kind == "WillAdmission"
+        && applied.committed_now
+        && matches!(
+            applied.reply,
+            StoreReply::Outcome(mqttiumd_contract::outcome::StoreOutcome::Committed(
+                mqttiumd_contract::outcome::CommitFacts::WillPublished { .. }
+            ))
+        )
+        && let Some(ns) = crate::events::monotonic_ns()
+        && events
+            .emit(
+                "will_commit_observed",
+                json!({"operation":operation(id),
+            "details":{"monotonic_ns":ns.to_string(),"authority":"sqlite_commit_return"}}),
+            )
+            .is_err()
+    {
+        cancel.store(true, Ordering::Relaxed);
+    }
+}
+
+/// The lifecycle records and the result record of one applied command.
+fn record_result(
+    recipe: &Recipe,
+    applied: &mqttiumd_store_api::Applied,
+    events: &Events,
+    cancel: &AtomicBool,
+) {
+    let id = recipe.operation();
+    let kind = recipe_kind(recipe);
+    if applied.committed_now {
+        use mqttiumd_contract::outcome::{CommitFacts, StoreOutcome};
+        let will_event = match (recipe, applied.reply) {
+            (
+                Recipe::SessionLifecycle(change),
+                StoreReply::Outcome(StoreOutcome::Committed(CommitFacts::SessionLifecycle(_))),
+            ) => match &change.action {
+                SessionAction::OpenWillAt {
+                    will: Some(spec), ..
+                } => Some((
+                    "will_installed",
+                    json!({"operation":operation(id),"will":operation(id),"details":{"topic_bytes":spec.topic.len(),"payload_bytes":spec.payload.len(),"authority":"durable_open_commit"}}),
+                )),
+                SessionAction::EndWill { guard, publish, .. } => Some((
+                    "will_decided",
+                    json!({"operation":operation(id),"will":guard.opened_by.map(operation),"details":{"publish":publish,"session":guard.session.get().to_string(),"authority":"durable_end_commit"}}),
+                )),
+                _ => None,
+            },
+            (
+                Recipe::WillPublication(value),
+                StoreReply::Outcome(StoreOutcome::Committed(CommitFacts::WillPublished {
+                    will,
+                    publication,
+                })),
+            ) => Some((
+                "will_admitted",
+                json!({"operation":operation(id),"will":operation(will),"details":{"publication":format!("{}/{}/{}/{}",publication.incarnation().get(),publication.epoch().get(),publication.owner().get(),publication.sequence().get()),"targets":value.targets.len(),"retained":value.live_retain.is_some(),"authority":"durable_admission_commit"}}),
+            )),
+            _ => None,
+        };
+        if let Some((name, fields)) = will_event
+            && events.emit(name, fields).is_err()
+        {
+            cancel.store(true, Ordering::Relaxed);
+        }
+    }
+    if events.emit("store_result",json!({"operation":operation(id),"command_kind":kind,"details":{"committed_now":applied.committed_now,"wrote":applied.wrote,"outcome":outcome_name(applied.reply)}})).is_err(){cancel.store(true,Ordering::Relaxed);}
+}
+
+/// One command of a group and the effect that carries it.
+struct Member {
+    effect: EffectId,
+    command: mqttiumd_contract::command::Command,
+}
+
+/// Applies the commands in one transaction (record 0045) and answers each
+/// in order. No answer exists before the commit of the group returned.
+fn group_responses(
+    store: &mut SqliteStore,
+    members: Vec<Member>,
+    events: &Events,
+    cancel: &AtomicBool,
+) -> Vec<Response> {
+    let commands: Vec<_> = members.iter().map(|member| &member.command).collect();
+    if events
+        .emit(
+            "store_group",
+            json!({"details":{"commands":commands.len()}}),
+        )
+        .is_err()
+    {
+        cancel.store(true, Ordering::Relaxed);
+    }
+    let applied = store.apply_group(&commands).unwrap_or_else(|_| {
+        // The caller bounds a group; an oversized one is applied in turn.
+        commands
+            .iter()
+            .map(|command| store.apply(command))
+            .collect()
+    });
+    members
+        .iter()
+        .zip(applied)
+        .map(|(member, applied)| {
+            let recipe = member.command.recipe.get();
+            record_applied(recipe, &applied, events, cancel);
+            record_result(recipe, &applied, events, cancel);
+            Response::Store {
+                effect: member.effect,
+                operation: recipe.operation(),
+                reply: applied.reply,
+                targets: targets_of(recipe),
+            }
+        })
+        .collect()
+}
+
+fn effect_response(
+    store: &mut SqliteStore,
+    effect: EffectId,
+    work: Effect,
+    events: &Events,
+    hooks: &Hooks,
+    cancel: &Arc<AtomicBool>,
+    state: &mut BusinessState,
+) -> Response {
+    let _ = (hooks, cancel, &state);
+    match work {
+        Effect::Persist { command } => {
+            let id = command.recipe.operation();
+            #[cfg(feature = "test-hooks")]
+            let kind = recipe_kind(command.recipe.get());
+            let recipe = command.recipe.get();
+            let targets = targets_of(recipe);
+            #[cfg(feature = "test-hooks")]
+            {
+                let hc = hooks.clone();
+                let ev = events.clone();
+                let stop = cancel.clone();
+                let point = match kind {
+                    "SessionOpen" => "session.open.prepared",
+                    "WillAdmission" => "will.admission.prepared",
+                    "WillEnd" => "will.end.prepared",
+                    "SessionClose" => "session.close.prepared",
+                    "SessionDetach" => "session.detach.prepared",
+                    "SessionExpire" => "session.expire.prepared",
+                    "Admission" => "admission.prepared",
+                    "RetainedQoS0" => "retained.prepared",
+                    "Release" => "release.prepared",
+                    "Subscriptions" => "subscription.prepared",
+                    "Claim" => "claim.prepared",
+                    "Consume" => "consume.prepared",
+                    "DeliveryStarted" => "delivery.started.prepared",
+                    "MessageExpire" => "message.delivery.expire.prepared",
+                    _ => "finish.prepared",
+                };
+                // The hook is inside the actual transaction, after all writes and before COMMIT.
+                let hook = Box::new(move |p| {
+                    if p == mqttiumd_store_sqlite::kill_points::KillPoint::CommitPrepared
+                        && hc.barrier(point, kind, id, &ev, &stop).is_err()
                     {
-                        let hc = hooks.clone();
-                        let ev = events.clone();
-                        let stop = cancel.clone();
-                        let point = match kind {
-                            "SessionOpen" => "session.open.prepared",
-                            "WillAdmission" => "will.admission.prepared",
-                            "WillEnd" => "will.end.prepared",
-                            "SessionClose" => "session.close.prepared",
-                            "SessionDetach" => "session.detach.prepared",
-                            "SessionExpire" => "session.expire.prepared",
-                            "Admission" => "admission.prepared",
-                            "RetainedQoS0" => "retained.prepared",
-                            "Release" => "release.prepared",
-                            "Subscriptions" => "subscription.prepared",
-                            "Claim" => "claim.prepared",
-                            "Consume" => "consume.prepared",
-                            "DeliveryStarted" => "delivery.started.prepared",
-                            "MessageExpire" => "message.delivery.expire.prepared",
-                            _ => "finish.prepared",
-                        };
-                        // The hook is inside the actual transaction, after all writes and before COMMIT.
-                        let hook = Box::new(move |p| {
-                            if p == mqttiumd_store_sqlite::kill_points::KillPoint::CommitPrepared
-                                && hc.barrier(point, kind, id, &ev, &stop).is_err()
-                            {
-                                stop.store(true, Ordering::Relaxed);
-                            }
-                        });
-                        if store.set_kill_hook(Some(hook)).is_err() {
-                            cancel.store(true, Ordering::Relaxed);
-                        }
+                        stop.store(true, Ordering::Relaxed);
                     }
-                    #[cfg(feature = "test-hooks")]
-                    if kind == "Admission"
-                        && hooks
-                            .directory
-                            .as_ref()
-                            .is_some_and(|d| consume_file(&d.join("capture-next-admission")))
-                    {
-                        state.captured = Some(command.clone());
-                        if let Some(a) = command.recipe.get().admission() {
-                            let _ = events.emit("receipt_replay_captured",json!({"command_kind":"Admission","operation":operation(id),"details":{"publication":identity_text(a.publication.incarnation().get(),a.publication.epoch().get(),a.publication.owner().get(),a.publication.sequence().get()),"payload":identity_text(a.payload.id.incarnation().get(),a.payload.id.epoch().get(),a.payload.id.owner().get(),a.payload.id.sequence().get())}}));
-                        }
-                    }
-                    let applied = store.apply(&command);
-                    if kind == "WillAdmission" && applied.committed_now
-                        && matches!(applied.reply, StoreReply::Outcome(mqttiumd_contract::outcome::StoreOutcome::Committed(mqttiumd_contract::outcome::CommitFacts::WillPublished { .. })))
-                        && let Some(ns) = crate::events::monotonic_ns()
-                        && events.emit("will_commit_observed", json!({"operation":operation(id),
-                            "details":{"monotonic_ns":ns.to_string(),"authority":"sqlite_commit_return"}})).is_err()
-                    {
-                        cancel.store(true,Ordering::Relaxed);
-                    }
-                    #[cfg(feature = "test-hooks")]
-                    {
-                        let _ = store.set_kill_hook(None);
-                        let point = match kind {
-                            "SessionOpen" => Some("session.open.committed"),
-                            "WillAdmission" => Some("will.admission.committed"),
-                            "WillEnd" => Some("will.end.committed"),
-                            "SessionClose" => Some("session.close.committed"),
-                            "SessionDetach" => Some("session.detach.committed"),
-                            "SessionExpire" => Some("session.expire.committed"),
-                            "Admission" => Some("admission.committed"),
-                            "RetainedQoS0" => Some("retained.committed"),
-                            "Subscriptions" => Some("subscription.committed"),
-                            "Claim" => Some("claim.committed"),
-                            "Finish" => Some("finish.committed"),
-                            "Consume" => Some("consume.committed"),
-                            "DeliveryStarted" => Some("delivery.started.committed"),
-                            "MessageExpire" => Some("message.delivery.expire.committed"),
-                            _ => None,
-                        };
-                        if applied.committed_now
-                            && let Some(point) = point
-                            && hooks.barrier(point, kind, id, events, cancel).is_err()
-                        {
-                            cancel.store(true, Ordering::Relaxed);
-                        }
-                    }
-                    if applied.committed_now {
-                        use mqttiumd_contract::outcome::{CommitFacts, StoreOutcome};
-                        let will_event = match (recipe, applied.reply) {
-                            (
-                                Recipe::SessionLifecycle(change),
-                                StoreReply::Outcome(StoreOutcome::Committed(
-                                    CommitFacts::SessionLifecycle(_),
-                                )),
-                            ) => match &change.action {
-                                SessionAction::OpenWillAt {
-                                    will: Some(spec), ..
-                                } => Some((
-                                    "will_installed",
-                                    json!({"operation":operation(id),"will":operation(id),"details":{"topic_bytes":spec.topic.len(),"payload_bytes":spec.payload.len(),"authority":"durable_open_commit"}}),
-                                )),
-                                SessionAction::EndWill { guard, publish, .. } => Some((
-                                    "will_decided",
-                                    json!({"operation":operation(id),"will":guard.opened_by.map(operation),"details":{"publish":publish,"session":guard.session.get().to_string(),"authority":"durable_end_commit"}}),
-                                )),
-                                _ => None,
-                            },
-                            (
-                                Recipe::WillPublication(value),
-                                StoreReply::Outcome(StoreOutcome::Committed(
-                                    CommitFacts::WillPublished { will, publication },
-                                )),
-                            ) => Some((
-                                "will_admitted",
-                                json!({"operation":operation(id),"will":operation(will),"details":{"publication":format!("{}/{}/{}/{}",publication.incarnation().get(),publication.epoch().get(),publication.owner().get(),publication.sequence().get()),"targets":value.targets.len(),"retained":value.live_retain.is_some(),"authority":"durable_admission_commit"}}),
-                            )),
-                            _ => None,
-                        };
-                        if let Some((name, fields)) = will_event
-                            && events.emit(name, fields).is_err()
-                        {
-                            cancel.store(true, Ordering::Relaxed);
-                        }
-                    }
-                    if events.emit("store_result",json!({"operation":operation(id),"command_kind":kind,"details":{"committed_now":applied.committed_now,"wrote":applied.wrote,"outcome":outcome_name(applied.reply)}})).is_err(){cancel.store(true,Ordering::Relaxed);}
-                    #[cfg(not(feature = "test-hooks"))]
-                    let reply = applied.reply;
-                    #[cfg(feature = "test-hooks")]
-                    let mut reply = applied.reply;
-                    #[cfg(feature = "test-hooks")]
-                    if applied.committed_now
-                        && matches!(
-                            kind,
-                            "WillAdmission"
-                                | "WillEnd"
-                                | "Claim"
-                                | "Admission"
-                                | "RetainedQoS0"
-                                | "Subscriptions"
-                                | "Finish"
-                                | "Consume"
-                                | "SessionOpen"
-                                | "SessionClose"
-                                | "SessionDetach"
-                                | "SessionExpire"
-                                | "DeliveryStarted"
-                                | "MessageExpire"
-                        )
-                        && let Some(dir) = &hooks.directory
-                    {
-                        let file_name = match kind {
-                            "WillAdmission" => "drop-next-will-admission-result".to_owned(),
-                            "WillEnd" => "drop-next-will-end-result".to_owned(),
-                            "SessionOpen" => "drop-next-session-open-result".to_owned(),
-                            "SessionClose" => "drop-next-session-close-result".to_owned(),
-                            "SessionDetach" => "drop-next-session-detach-result".to_owned(),
-                            "SessionExpire" => "drop-next-session-expire-result".to_owned(),
-                            "DeliveryStarted" => "drop-next-delivery-started-result".to_owned(),
-                            "MessageExpire" => {
-                                "drop-next-message-expire-delivery-result".to_owned()
-                            }
-                            _ => format!("drop-next-{}-result", kind.to_ascii_lowercase()),
-                        };
-                        let file = dir.join(file_name);
-                        if file.exists() && std::fs::remove_file(file).is_ok() {
-                            let _ = events.emit(
-                                "store_result_dropped",
-                                json!({"operation":operation(id),"command_kind":kind}),
-                            );
-                            reply = StoreReply::Outcome(
-                                mqttiumd_contract::outcome::StoreOutcome::PendingOrUnknown,
-                            );
-                        }
-                    }
-                    #[cfg(feature = "test-hooks")]
-                    let reply = hold_business_reply(state, hooks, id, kind, reply, events);
-                    Response::Store {
-                        effect,
-                        operation: id,
-                        reply,
-                        targets,
-                    }
+                });
+                if store.set_kill_hook(Some(hook)).is_err() {
+                    cancel.store(true, Ordering::Relaxed);
                 }
-                Effect::ResolveAndFence { operation: id } => {
-                    let reply = StoreReply::Outcome(store.resolve_and_fence(id).outcome);
-                    #[cfg(feature = "test-hooks")]
-                    let reply = hold_business_reply(state, hooks, id, "Resolution", reply, events);
-                    if events.emit("store_resolved",json!({"operation":operation(id),"details":{"outcome":outcome_name(reply).to_ascii_lowercase()}})).is_err(){cancel.store(true,Ordering::Relaxed);}
-                    Response::Store {
-                        effect,
-                        operation: id,
-                        reply,
-                        targets: Vec::new(),
-                    }
+            }
+            #[cfg(feature = "test-hooks")]
+            if kind == "Admission"
+                && hooks
+                    .directory
+                    .as_ref()
+                    .is_some_and(|d| consume_file(&d.join("capture-next-admission")))
+            {
+                state.captured = Some(command.clone());
+                if let Some(a) = command.recipe.get().admission() {
+                    let _ = events.emit("receipt_replay_captured",json!({"command_kind":"Admission","operation":operation(id),"details":{"publication":identity_text(a.publication.incarnation().get(),a.publication.epoch().get(),a.publication.owner().get(),a.publication.sequence().get()),"payload":identity_text(a.payload.id.incarnation().get(),a.payload.id.epoch().get(),a.payload.id.owner().get(),a.payload.id.sequence().get())}}));
                 }
-                Effect::LoadWills { after, limit } => Response::Wills {
-                    effect,
-                    result: store.read_wills(after, limit as usize, ReadBudget::PAGE),
-                },
-                Effect::LoadWork {
-                    session,
-                    after,
-                    limit,
-                } => {
-                    // A one-shot corruption-control barrier, before any read
-                    // transaction. The exclusive writer is idle here: an
-                    // external test mutation cannot race maintenance's BEGIN.
-                    #[cfg(feature = "test-hooks")]
-                    {
-                        let armed = hooks.directory.as_ref().is_some_and(|directory| {
-                            consume_file(&directory.join("arm-work-read"))
-                        });
-                        if armed
+            }
+            let applied = store.apply(&command);
+            record_applied(recipe, &applied, events, cancel);
+            #[cfg(feature = "test-hooks")]
+            {
+                let _ = store.set_kill_hook(None);
+                let point = match kind {
+                    "SessionOpen" => Some("session.open.committed"),
+                    "WillAdmission" => Some("will.admission.committed"),
+                    "WillEnd" => Some("will.end.committed"),
+                    "SessionClose" => Some("session.close.committed"),
+                    "SessionDetach" => Some("session.detach.committed"),
+                    "SessionExpire" => Some("session.expire.committed"),
+                    "Admission" => Some("admission.committed"),
+                    "RetainedQoS0" => Some("retained.committed"),
+                    "Subscriptions" => Some("subscription.committed"),
+                    "Claim" => Some("claim.committed"),
+                    "Finish" => Some("finish.committed"),
+                    "Consume" => Some("consume.committed"),
+                    "DeliveryStarted" => Some("delivery.started.committed"),
+                    "MessageExpire" => Some("message.delivery.expire.committed"),
+                    _ => None,
+                };
+                if applied.committed_now
+                    && let Some(point) = point
+                    && hooks.barrier(point, kind, id, events, cancel).is_err()
+                {
+                    cancel.store(true, Ordering::Relaxed);
+                }
+            }
+            record_result(recipe, &applied, events, cancel);
+            #[cfg(not(feature = "test-hooks"))]
+            let reply = applied.reply;
+            #[cfg(feature = "test-hooks")]
+            let mut reply = applied.reply;
+            #[cfg(feature = "test-hooks")]
+            if applied.committed_now
+                && matches!(
+                    kind,
+                    "WillAdmission"
+                        | "WillEnd"
+                        | "Claim"
+                        | "Admission"
+                        | "RetainedQoS0"
+                        | "Subscriptions"
+                        | "Finish"
+                        | "Consume"
+                        | "SessionOpen"
+                        | "SessionClose"
+                        | "SessionDetach"
+                        | "SessionExpire"
+                        | "DeliveryStarted"
+                        | "MessageExpire"
+                )
+                && let Some(dir) = &hooks.directory
+            {
+                let file_name = match kind {
+                    "WillAdmission" => "drop-next-will-admission-result".to_owned(),
+                    "WillEnd" => "drop-next-will-end-result".to_owned(),
+                    "SessionOpen" => "drop-next-session-open-result".to_owned(),
+                    "SessionClose" => "drop-next-session-close-result".to_owned(),
+                    "SessionDetach" => "drop-next-session-detach-result".to_owned(),
+                    "SessionExpire" => "drop-next-session-expire-result".to_owned(),
+                    "DeliveryStarted" => "drop-next-delivery-started-result".to_owned(),
+                    "MessageExpire" => "drop-next-message-expire-delivery-result".to_owned(),
+                    _ => format!("drop-next-{}-result", kind.to_ascii_lowercase()),
+                };
+                let file = dir.join(file_name);
+                if file.exists() && std::fs::remove_file(file).is_ok() {
+                    let _ = events.emit(
+                        "store_result_dropped",
+                        json!({"operation":operation(id),"command_kind":kind}),
+                    );
+                    reply = StoreReply::Outcome(
+                        mqttiumd_contract::outcome::StoreOutcome::PendingOrUnknown,
+                    );
+                }
+            }
+            #[cfg(feature = "test-hooks")]
+            let reply = hold_business_reply(state, hooks, id, kind, reply, events);
+            Response::Store {
+                effect,
+                operation: id,
+                reply,
+                targets,
+            }
+        }
+        Effect::ResolveAndFence { operation: id } => {
+            let reply = StoreReply::Outcome(store.resolve_and_fence(id).outcome);
+            #[cfg(feature = "test-hooks")]
+            let reply = hold_business_reply(state, hooks, id, "Resolution", reply, events);
+            if events.emit("store_resolved",json!({"operation":operation(id),"details":{"outcome":outcome_name(reply).to_ascii_lowercase()}})).is_err(){cancel.store(true,Ordering::Relaxed);}
+            Response::Store {
+                effect,
+                operation: id,
+                reply,
+                targets: Vec::new(),
+            }
+        }
+        Effect::LoadWills { after, limit } => Response::Wills {
+            effect,
+            result: store.read_wills(after, limit as usize, ReadBudget::PAGE),
+        },
+        Effect::LoadWork {
+            session,
+            after,
+            limit,
+        } => {
+            // A one-shot corruption-control barrier, before any read
+            // transaction. The exclusive writer is idle here: an
+            // external test mutation cannot race maintenance's BEGIN.
+            #[cfg(feature = "test-hooks")]
+            {
+                let armed = hooks
+                    .directory
+                    .as_ref()
+                    .is_some_and(|directory| consume_file(&directory.join("arm-work-read")));
+                if armed
                             && hooks
                                 .barrier_fields(
                                     "work.read.before",
@@ -777,18 +925,16 @@ fn business_response(
                                 result: Err(ReadError::Unavailable),
                             };
                         }
-                    }
-                    Response::Work {
-                        effect,
-                        session,
-                        result: store.read_work(session, after, limit as usize),
-                    }
-                }
-                _ => {
-                    cancel.store(true, Ordering::Relaxed);
-                    Response::Stopped
-                }
             }
+            Response::Work {
+                effect,
+                session,
+                result: store.read_work(session, after, limit as usize),
+            }
+        }
+        _ => {
+            cancel.store(true, Ordering::Relaxed);
+            Response::Stopped
         }
     }
 }
