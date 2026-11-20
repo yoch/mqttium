@@ -1,6 +1,6 @@
-# 0043 — Bounded reactor progress under transport pressure
+# ADR 0043 — Bounded reactor progress under transport pressure
 
-Status: proposed.
+Status: **Proposed**
 
 An occupied output channel is a refusal for writes on that connection
 generation. The outbox retains the refused effect with the same identity.
