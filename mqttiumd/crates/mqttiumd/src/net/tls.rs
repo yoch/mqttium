@@ -36,6 +36,8 @@ pub(super) struct Machine {
     parser: Parser,
     output: Option<Encoded>,
     control_pending: Option<Instant>,
+    /// A frame taken from the lane that could not be sealed.
+    unsealed: Option<Write>,
     /// The transport reported its end; the TLS state names the reason.
     eof: bool,
     eof_reported: bool,
@@ -52,6 +54,7 @@ impl Machine {
             parser: Parser::default(),
             output: None,
             control_pending: None,
+            unsealed: None,
             eof: false,
             eof_reported: false,
         }
@@ -325,10 +328,20 @@ impl Task {
                     });
                     return Ok((None, true));
                 }
-                Err(WriteFailure::Failed(code)) => return Err(code),
+                Err(WriteFailure::Failed(code)) => {
+                    // The frame was taken: it is one of the terminal facts.
+                    self.machine.unsealed = Some(frame);
+                    return Err(code);
+                }
             }
         }
-        let ciphertext = frame_ciphertext(&mut self.state, &frame.bytes)?;
+        let ciphertext = match frame_ciphertext(&mut self.state, &frame.bytes) {
+            Ok(ciphertext) => ciphertext,
+            Err(code) => {
+                self.machine.unsealed = Some(frame);
+                return Err(code);
+            }
+        };
         #[cfg(feature = "test-hooks")]
         let fragment = frame.expiry.is_some()
             && frame.correlation.is_some()
@@ -542,7 +555,11 @@ impl Driven for Task {
     fn finish(self: Box<Self>, code: &'static str) {
         let task = *self;
         task.control.stop(&task.stream, code);
-        task.lanes
-            .finish(code, task.machine.output.map(|encoded| encoded.frame));
+        let active = task
+            .machine
+            .output
+            .map(|encoded| encoded.frame)
+            .or(task.machine.unsealed);
+        task.lanes.finish(code, active);
     }
 }

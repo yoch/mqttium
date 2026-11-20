@@ -236,10 +236,13 @@ impl Control {
         self.wake.wake();
     }
 
+    /// The socket is shut before the reason is recorded: once a reader of
+    /// the reason sees it, no byte can leave any more. The flag alone
+    /// would not stop a write that already passed its check.
     fn stop(&self, stream: &TcpStream, code: &'static str) {
-        self.record(code);
         self.cancelled.store(true, Ordering::Release);
         let _ = stream.shutdown(Shutdown::Both);
+        self.record(code);
     }
 }
 
@@ -579,10 +582,13 @@ impl Lanes {
         self.held.is_some() || !self.reports.is_empty()
     }
 
-    /// Publishes the terminal facts without waiting. The frame in progress
-    /// and every accepted frame left in the bounded queue get an explicit
-    /// failed receipt. Their bytes may not have been attempted; none is
-    /// called certainly rejected.
+    /// Offers the terminal facts once, without waiting: the pending
+    /// receipts, then a failed receipt for the frame in progress and for
+    /// every accepted frame left in the bounded queue. A lane that is full
+    /// refuses them, and a frame the core publishes after this pass gets
+    /// none: the core gives every frame of a retired transport its one
+    /// result when it closes the connection. A failed receipt says the
+    /// bytes are not known complete, never that they were rejected.
     fn finish(mut self, code: &'static str, active: Option<Write>) {
         for report in self.reports.drain(..) {
             let published = match report {
