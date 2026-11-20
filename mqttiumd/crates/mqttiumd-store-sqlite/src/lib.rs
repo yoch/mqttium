@@ -111,6 +111,10 @@ use codec::{
 };
 
 pub use group::{GroupRefused, MAX_GROUP};
+
+/// Compiled statements one connection keeps. The store has fewer distinct
+/// statements than this; each is a few kilobytes.
+const STATEMENT_CACHE: usize = 512;
 pub use policy_transition::{
     PolicyInventory, PolicyMaintenanceError, PolicyTransition, PolicyTransitionPoint,
 };
@@ -1853,6 +1857,9 @@ impl SqliteStore {
     // Parameters drop in reverse order on an early error: close/checkpoint
     // SQLite before releasing the lease, as the fields of a live store do.
     fn verified(lock: WriterLease, conn: Connection, expected: i64) -> Result<Self, OpenError> {
+        // Every statement of the store stays compiled: the default cache
+        // of the binding is smaller than the set a single command uses.
+        conn.set_prepared_statement_cache_capacity(STATEMENT_CACHE);
         let settings = settle(&conn)?;
         // Before an epoch is opened: every page of the file is checked,
         // not only those opening reads.
