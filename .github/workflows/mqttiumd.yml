@@ -247,6 +247,13 @@ jobs:
           cargo test -p mqttiumd --features test-hooks --locked
       - name: The distribution profile builds
         run: cargo build -p mqttiumd --profile dist --locked
+      # The register of server-side normative statements names a test or a
+      # code location for each row: every identifier of the two OASIS
+      # indexes appears once, every cited test and file exists, and
+      # SUMMARY.md is up to date. Standard library only.
+      - name: The conformance register and its citations are consistent
+        working-directory: ${{ github.workspace }}
+        run: python3 mqttiumd/conformance/check.py --check
 
   # Differential scenarios against the pinned Mosquitto (ADR 0044, Runtime
   # tier). The job fails on a difference that tests/compat/divergences.json
