@@ -73,6 +73,16 @@ cargo build --locked -p mqttiumd
 python -m pip install -r tests/system/requirements.txt
 ```
 
+Two options size and observe the executable (records 0044 and 0046):
+
+| Option | Values | Default |
+| - | - | - |
+| `--max-connections N` | 1 to 128, the number of durable sessions | 128; 16 in a build with `test-hooks`, the profile of the earlier receptions |
+| `--event-level LEVEL` | `ops` writes lifecycle, refusal and fault records and counts every per-message observation in one `counters` record per second; `audit` writes every record | `ops`; `audit` in a build with `test-hooks` |
+
+The distributed executable is built with
+`cargo build -p mqttiumd --profile dist --locked`.
+
 Database and event paths in these examples must be fresh. The database may be
 absent, with an existing parent directory. A failed open never falls back to
 creating an empty replacement. Event files are created exclusively so earlier
@@ -229,8 +239,8 @@ every output. Peer Receive Maximum constrains QoS 1 and QoS 2 output in addition
 local limit; QoS 0 neither consumes nor returns receive-window credit in either
 direction. Topic Alias Maximum and Request Problem Information are checked;
 no alias or diagnostic string is emitted. CONNACK advertises Receive Maximum 8,
-Maximum Packet Size 65,536, wildcard and retained availability, and no subscription-identifier, shared,
-wildcard or topic-alias support. Maximum QoS is omitted: that property can
+Maximum Packet Size 65,536, wildcard and retained availability, and no subscription-identifier, shared
+or topic-alias support. Maximum QoS is omitted: that property can
 only encode 0 or 1, while this profile accepts incoming QoS 2.
 
 Malformed encodings, invalid protocol/context and valid unsupported features
@@ -242,11 +252,16 @@ a feature never produces a false success.
 ## Bounds and transport
 
 `contracts/v1/product-profile.json` identifies `tcp-qos0-exact-pubsub-v1`.
-Limits are 16 connections, 128 sessions, 128 exact subscriptions, eight filters
+Limits are `--max-connections` connections (16 in the receptions this guide
+cites), 128 sessions, 128 exact subscriptions, eight filters
 per request and 16 targets per publication/topic. Packets are at most 65,536
 bytes, ClientID/topic/filter 1,024 bytes and payload 32,768 bytes. Per-connection
 input/output queues hold four items; writer queue 32, commands in flight 16,
-timers 512 and physical receipts 8,192. Maintenance and the single lifecycle flight share reserved four-slot
+timers 512 and physical receipts 8,192. Timers, ordinary inputs, the effect
+box and the outgoing identifier bindings are multiplied for every further
+sixteen connections of the limit. A full input queue slows its peer through
+TCP and closes nothing; the store worker commits the commands waiting in
+its queue as one transaction (record 0045). Maintenance and the single lifecycle flight share reserved four-slot
 writer request/reply lanes. Maintenance has four owner control inputs; closure
 has a separate bounded two-facts-per-transport lane. The core remembers
 eight closed generations. Known terminal operation timers are removed only

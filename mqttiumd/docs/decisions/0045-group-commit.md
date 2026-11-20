@@ -115,10 +115,12 @@ are exactly as after sequential application.
 
 ## Left open
 
-- **Writer integration.** Nothing in `crates/mqttiumd/` calls
-  `apply_group` yet. Forming groups, the waiting delay and the byte bound
-  of ARC-020, and delivering each answer after the commit are another lot.
-  The store bounds a group in commands only.
+- **Group formation.** The store worker of `crates/mqttiumd/` forms a
+  group from the consecutive commands already waiting in its request lane,
+  up to the size of that lane (32), and publishes their answers in request
+  order after the commit. It waits for no further command and has no byte
+  bound: the waiting delay and the byte bound of ARC-020 are not
+  implemented. No group is formed while test controls are armed.
 - **Model.** M1 models the atomic `Commit` of one `ApplyCommand`. A group
   is K `ApplyCommand` steps with no crash between them; the TLA+ model
   `MGroupCommit` that states it is another lot.
