@@ -50,6 +50,10 @@ const CONNECTIONS: usize = 16;
 const IN_FLIGHT: usize = 16;
 const TIMERS: usize = 512;
 const INPUTS: usize = 128;
+// One FIFO with reserved capacity for accepted writer requests and due deadlines.
+const WRITER_INPUTS: usize = crate::writer::QUEUE;
+const DEADLINE_INPUTS: usize = 4;
+const ORDINARY_INPUTS: usize = INPUTS - WRITER_INPUTS - DEADLINE_INPUTS;
 const OUTGOING_BINDINGS: usize = 128;
 const LIFECYCLE_IN_FLIGHT: usize = 1;
 const MESSAGE_EXPIRY_RETRIES: u8 = 3;
@@ -195,6 +199,7 @@ struct Runtime<'a> {
     last_will_deferred: Option<(OperationId, mqttiumd_core::owner::WillDeferredReason)>,
     next_session_request: u64,
     generation: ConnectionGeneration,
+    peer_cursor: usize,
     inputs: VecDeque<Input>,
     control_inputs: VecDeque<Input>,
     closing_inputs: VecDeque<Input>,
@@ -242,6 +247,18 @@ struct Runtime<'a> {
     copied_session_change: Option<AppliedSessionChange>,
     #[cfg(feature = "test-hooks")]
     copied_session_close: Option<SessionCloseObservation>,
+}
+fn ordinary_room(inputs: &VecDeque<Input>, reservations: usize) -> usize {
+    // Most turns use only a small fraction of the ordinary lane.
+    let upper = inputs.len() + reservations;
+    if upper + 2 <= ORDINARY_INPUTS {
+        return ORDINARY_INPUTS - upper;
+    }
+    let occupied = inputs
+        .iter()
+        .filter(|input| !Runtime::writer_input(input) && !matches!(input, Input::Deadline { .. }))
+        .count();
+    ORDINARY_INPUTS.saturating_sub(occupied + reservations)
 }
 impl Runtime<'_> {
     fn message_now(&mut self) -> Result<MessageTime, Failure> {
@@ -597,11 +614,43 @@ impl Runtime<'_> {
             self.control_inputs.push_back(input);
             return Ok(());
         }
-        if self.inputs.len() + self.deferred_inputs.len() >= INPUTS {
+        if Self::writer_input(&input) {
+            if self.writer_input_count() >= WRITER_INPUTS {
+                return Err(Failure::plain("writer_input_budget"));
+            }
+        } else if matches!(input, Input::Deadline { .. }) {
+            if self.ordinary_deadline_count() >= DEADLINE_INPUTS {
+                return Err(Failure::plain("deadline_input_budget"));
+            }
+        } else if self.ordinary_room() == 0 {
             return Err(Failure::plain("core_input_budget"));
         }
         self.inputs.push_back(input);
         Ok(())
+    }
+    fn ordinary_room(&self) -> usize {
+        ordinary_room(
+            &self.inputs,
+            self.deferred_inputs.len() + self.will_connects.len(),
+        )
+    }
+    fn writer_input(input: &Input) -> bool {
+        matches!(
+            input,
+            Input::StoreResult { .. } | Input::WorkPage { .. } | Input::WillPage { .. }
+        )
+    }
+    fn writer_input_count(&self) -> usize {
+        self.inputs
+            .iter()
+            .filter(|input| Self::writer_input(input))
+            .count()
+    }
+    fn ordinary_deadline_count(&self) -> usize {
+        self.inputs
+            .iter()
+            .filter(|input| matches!(input, Input::Deadline { .. }))
+            .count()
     }
     fn terminal_input(input: &Input) -> bool {
         matches!(
@@ -621,10 +670,7 @@ impl Runtime<'_> {
     fn maintenance_input(&self, input: &Input) -> bool {
         matches!(
             input,
-            Input::WillPage { .. }
-                | Input::DiscoverWills
-                | Input::ReceiptsCollected { .. }
-                | Input::MaintainReceipts
+            Input::DiscoverWills | Input::ReceiptsCollected { .. } | Input::MaintainReceipts
         ) || matches!(input, Input::StoreResult { operation, .. } if self.owner.lifecycle_operation_is_live(*operation) || self.owner.will_operation_is_live(*operation))
             || matches!(input,Input::Deadline {token,..} if self.owner.collection_deadline_is_live(*token) || self.owner.lifecycle_dispatch().is_some_and(|(_,deadline)| deadline == *token) || self.owner.will_dispatch().is_some_and(|(_,deadline)| deadline == *token))
     }
@@ -1632,24 +1678,7 @@ impl Runtime<'_> {
             .map(|(token, _)| *token)
             .collect();
         for token in due {
-            let reserved = self.owner.collection_deadline_is_live(token)
-                || self
-                    .owner
-                    .lifecycle_dispatch()
-                    .is_some_and(|(_, deadline)| deadline == token)
-                || self
-                    .owner
-                    .will_dispatch()
-                    .is_some_and(|(_, deadline)| deadline == token);
-            let room = if reserved {
-                self.control_inputs.len() < crate::writer::CONTROL_QUEUE
-            } else {
-                self.inputs.len() + self.deferred_inputs.len() < INPUTS
-            };
-            if !room {
-                continue;
-            } // The exact token remains in the bounded timer map.
-            self.queue(Input::Deadline {
+            let input = Input::Deadline {
                 token,
                 now: LogicalTime::new(
                     self.started
@@ -1658,7 +1687,16 @@ impl Runtime<'_> {
                         .try_into()
                         .map_err(|_| Failure::plain("clock_exhausted"))?,
                 ),
-            })?;
+            };
+            let room = if self.maintenance_input(&input) {
+                self.control_inputs.len() < crate::writer::CONTROL_QUEUE
+            } else {
+                self.ordinary_deadline_count() < DEADLINE_INPUTS
+            };
+            if !room {
+                continue;
+            } // The exact token remains in the bounded timer map.
+            self.queue(input)?;
             self.timers.remove(&token);
         }
         Ok(())
@@ -1669,6 +1707,7 @@ impl Runtime<'_> {
             .values()
             .filter_map(|s| self.owner.connection_of(s.id).map(|c| (s.id, c)))
             .collect();
+        let queued_writer_replies = self.writer_input_count();
         let mut sink = Sink {
             writer: self.writer,
             peers: &mut self.peers,
@@ -1691,7 +1730,8 @@ impl Runtime<'_> {
             timers: &mut self.timers,
             inputs: &mut self.inputs,
             terminal_inputs: &mut self.terminal_inputs,
-            deferred_count: self.deferred_inputs.len(),
+            ordinary_reserved: self.deferred_inputs.len() + self.will_connects.len(),
+            queued_writer_replies,
             frames: &mut self.frames,
             outgoing_bindings: &mut self.outgoing_bindings,
             close: Vec::new(),
@@ -1916,10 +1956,7 @@ impl Runtime<'_> {
             };
             self.apply_control_response(response)?;
         }
-        for _ in 0..64 {
-            if self.inputs.len() + self.deferred_inputs.len() >= INPUTS {
-                break;
-            }
+        for _ in 0..WRITER_INPUTS.saturating_sub(self.writer_input_count()) {
             let response = match self.writer.receiver.try_recv() {
                 Ok(r) => r,
                 Err(TryRecvError::Empty) => break,
@@ -2138,7 +2175,7 @@ impl Runtime<'_> {
         }
     }
     fn queue_work(&mut self, session: SessionId) {
-        if self.inputs.len() + self.deferred_inputs.len() < INPUTS
+        if self.ordinary_room() != 0
             && !self
                 .inputs
                 .iter()
@@ -2828,7 +2865,12 @@ impl Runtime<'_> {
     }
     fn connections(&mut self) -> Result<(), Failure> {
         self.pump_will_connects()?;
-        let keys: Vec<_> = self.peers.keys().copied().collect();
+        let mut keys: Vec<_> = self.peers.keys().copied().collect();
+        if !keys.is_empty() {
+            let start = self.peer_cursor % keys.len();
+            keys.rotate_left(start);
+            self.peer_cursor = start + 1;
+        }
         for generation in keys {
             if let Some(code) = self
                 .peers
@@ -2867,6 +2909,11 @@ impl Runtime<'_> {
             self.wire_progress(generation)?;
             self.retry_deferred_publish(generation)?;
             for _ in 0..4 {
+                // A CONNECT can use one slot now and reserve one for Open.
+                // Leave the bytes with their socket reader until both fit.
+                if self.ordinary_room() < 2 {
+                    break;
+                }
                 let incoming = match self.peers.get_mut(&generation) {
                     Some(p) if p.closing.is_some() || p.deferred_publish.is_some() => break,
                     Some(p) if p.pending && p.handshake_packet.is_some() => break,
@@ -3188,6 +3235,9 @@ impl Runtime<'_> {
     }
 
     fn retry_deferred_publish(&mut self, generation: ConnectionGeneration) -> Result<(), Failure> {
+        if self.ordinary_room() == 0 {
+            return Ok(());
+        }
         let Some(peer) = self.peers.get_mut(&generation) else {
             return Ok(());
         };
@@ -3552,12 +3602,22 @@ struct Sink<'a> {
     timers: &'a mut BTreeMap<DeadlineToken, Instant>,
     inputs: &'a mut VecDeque<Input>,
     terminal_inputs: &'a mut VecDeque<Input>,
-    deferred_count: usize,
+    ordinary_reserved: usize,
+    queued_writer_replies: usize,
     frames: &'a mut BTreeMap<EffectId, PendingFrame>,
     outgoing_bindings: &'a mut BTreeMap<(ConnectionKey, OutboundPacketId), PubackTarget>,
     close: Vec<(ConnectionGeneration, &'static str)>,
     session_change: Option<AppliedSessionChange>,
     error: Option<Failure>,
+}
+impl Sink<'_> {
+    fn writer_reply_room(&self) -> bool {
+        self.queued_writer_replies
+            + self.inflight.len()
+            + self.work_reads.len()
+            + usize::from(self.will_reads.is_some())
+            < WRITER_INPUTS
+    }
 }
 impl Sink<'_> {
     fn submit_lifecycle(&mut self, effect: OwnedEffect) -> SubmitResult {
@@ -3869,7 +3929,7 @@ impl EffectSink for Sink<'_> {
                 self.submit_lifecycle(effect)
             }
             Effect::Persist { command } => {
-                if self.inflight.len() >= IN_FLIGHT {
+                if self.inflight.len() >= IN_FLIGHT || !self.writer_reply_room() {
                     return refused(effect, SubmitBlock::InFlightLimit);
                 }
                 let operation_id = command.recipe.operation();
@@ -3971,6 +4031,7 @@ impl EffectSink for Sink<'_> {
                         #[cfg(feature = "test-hooks")]
                         if let Some(input) = early_finish {
                             self.inputs.push_back(input);
+                            self.queued_writer_replies += 1;
                         }
                         if self
                             .events
@@ -4001,7 +4062,7 @@ impl EffectSink for Sink<'_> {
                 self.submit_lifecycle(effect)
             }
             Effect::ResolveAndFence { operation } => {
-                if self.inflight.len() >= IN_FLIGHT {
+                if self.inflight.len() >= IN_FLIGHT || !self.writer_reply_room() {
                     return refused(effect, SubmitBlock::InFlightLimit);
                 }
                 let op = *operation;
@@ -4067,7 +4128,8 @@ impl EffectSink for Sink<'_> {
                     .checked_add(2 * self.frames.len())
                     .is_none_or(|used| used >= TERMINAL_INPUTS)
                     || self.frames.len() >= FRAMES
-                    || (kind == "CONNACK" && self.inputs.len() + self.deferred_count >= INPUTS)
+                    || (kind == "CONNACK"
+                        && ordinary_room(self.inputs, self.ordinary_reserved) == 0)
                 {
                     return refused(effect, SubmitBlock::QueueFull);
                 }
@@ -4147,8 +4209,7 @@ impl EffectSink for Sink<'_> {
                     }
                     Err(TrySendError::Full(_)) => {
                         if self.events.emit("effect_retained",json!({"connection":generation.get().to_string(),"details":{"code":"output_queue_full","effect":effect_text(id),"packet_kind":kind}})).is_err(){self.error=Some(Failure::plain("events_unavailable"));}
-                        self.close.push((generation, "outgoing_queue_full"));
-                        refused(effect, SubmitBlock::QueueFull)
+                        refused(effect, SubmitBlock::TransportBackpressure)
                     }
                     Err(TrySendError::Disconnected(_)) => {
                         self.close.push((generation, "outgoing_queue_full"));
@@ -4239,7 +4300,7 @@ impl EffectSink for Sink<'_> {
                 SubmitResult::Accepted
             }
             Effect::Continue { continuation } => {
-                if self.inputs.len() + self.deferred_count >= INPUTS {
+                if ordinary_room(self.inputs, self.ordinary_reserved) == 0 {
                     return refused(effect, SubmitBlock::QueueFull);
                 }
                 self.inputs.push_back(Input::Continue {
@@ -4250,7 +4311,7 @@ impl EffectSink for Sink<'_> {
                 SubmitResult::Accepted
             }
             Effect::LoadWills { .. } => {
-                if self.will_reads.is_some() {
+                if self.will_reads.is_some() || !self.writer_reply_room() {
                     return refused(effect, SubmitBlock::InFlightLimit);
                 }
                 match self.writer.sender.try_send(Request::Effect(effect)) {
@@ -4268,7 +4329,7 @@ impl EffectSink for Sink<'_> {
                 }
             }
             Effect::LoadWork { session, .. } => {
-                if self.work_reads.len() >= IN_FLIGHT {
+                if self.work_reads.len() >= IN_FLIGHT || !self.writer_reply_room() {
                     return refused(effect, SubmitBlock::InFlightLimit);
                 }
                 let session = *session;
@@ -4411,7 +4472,7 @@ impl EffectSink for Sink<'_> {
                     Err(TrySendError::Full(_)) => {
                         self.outgoing_bindings.remove(&binding_key);
                         if self.events.emit("effect_retained",json!({"connection":generation.get().to_string(),"details":{"code":"output_queue_full","effect":effect_text(id),"packet_kind":"PUBLISH"}})).is_err(){self.error=Some(Failure::plain("events_unavailable"));}
-                        refused(effect, SubmitBlock::QueueFull)
+                        refused(effect, SubmitBlock::TransportBackpressure)
                     }
                     Err(TrySendError::Disconnected(_)) => {
                         self.outgoing_bindings.remove(&binding_key);
@@ -4799,6 +4860,7 @@ fn run_inner(
         last_will_deferred: None,
         next_session_request: 0,
         generation: ConnectionGeneration::new(0),
+        peer_cursor: 0,
         inputs: VecDeque::new(),
         control_inputs: VecDeque::new(),
         closing_inputs: VecDeque::new(),

@@ -119,6 +119,7 @@ fn with_runtime_clock_hooks(
         last_will_deferred: None,
         next_session_request: 0,
         generation: ConnectionGeneration::new(0),
+        peer_cursor: 0,
         inputs: VecDeque::new(),
         control_inputs: VecDeque::new(),
         closing_inputs: VecDeque::new(),
@@ -1803,6 +1804,8 @@ fn a_saturated_four_slot_output_retains_the_committed_puback_until_terminal_fail
             1,
             "the full queue retains the same PUBACK effect"
         );
+        assert!(runtime.peers.contains_key(&generation));
+        runtime.close(generation, "test_write_terminal").unwrap();
         assert!(!runtime.peers.contains_key(&generation));
         runtime.drain_inputs().unwrap();
         runtime.dispatch().unwrap();
@@ -2160,7 +2163,7 @@ fn collection_reply_keeps_reserved_owner_input_capacity_under_business_pressure(
         // Fill the regular retained-input budget while the actual SQLite
         // registration is in flight. These bounded no-op work hints are valid
         // owner inputs, so neither a fault nor a closed transport is involved.
-        for _ in 0..INPUTS {
+        for _ in 0..ORDINARY_INPUTS {
             runtime.deferred_inputs.push_back(Input::WorkAvailable {
                 session: SessionId::new(999),
             });
@@ -2458,7 +2461,7 @@ fn four_blocked_ordinary_deadlines_cannot_occupy_the_collectors_reserved_reply_l
             runtime.timers.insert(token, Instant::now());
         }
         runtime.due_deadlines().unwrap();
-        while runtime.inputs.len() + runtime.deferred_inputs.len() < INPUTS {
+        while runtime.ordinary_room() != 0 {
             runtime.inputs.push_back(Input::WorkAvailable {
                 session: SessionId::new(999),
             });
@@ -3819,7 +3822,7 @@ fn closing_an_ephemeral_transport_keeps_accepted_frame_facts_under_input_pressur
             r.frames.values().any(|frame| frame.kind == "PUBACK")
         });
         assert_eq!(read_frame(&mut client).0, 0x40);
-        for order in 0..INPUTS {
+        for order in 0..ORDINARY_INPUTS {
             runtime
                 .queue(Input::Packet {
                     connection: generation,
@@ -3830,7 +3833,7 @@ fn closing_an_ephemeral_transport_keeps_accepted_frame_facts_under_input_pressur
         }
         assert_eq!(
             runtime.inputs.len(),
-            INPUTS,
+            ORDINARY_INPUTS,
             "actual configured ordinary input budget is full"
         );
         let close = runtime.close(generation, "test_input_pressure");
@@ -4419,7 +4422,7 @@ fn blocked_expiration_keeps_its_reserved_lane_when_ordinary_inputs_are_full() {
         clock.set(sample(1_000_000_000));
         runtime.expire_sessions().unwrap();
         assert_eq!(runtime.expiry_inputs.len(), 1);
-        for _ in 0..INPUTS {
+        for _ in 0..ORDINARY_INPUTS {
             runtime.queue(Input::WorkAvailable { session }).unwrap();
         }
         runtime.drain_inputs().unwrap();

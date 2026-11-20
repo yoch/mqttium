@@ -885,8 +885,8 @@ impl Owner {
         Some(&self.outbox)
     }
 
-    /// Hands effects to `sink` in order. The live collector and its own
-    /// deadline alone can bypass blocked ordinary effects.
+    /// Hands effects to `sink` with the receipt and lifecycle control lanes.
+    /// A transport refusal preserves write order on its generation.
     pub fn dispatch(&mut self, sink: &mut dyn EffectSink) -> DispatchReport {
         let priority = self.receipts.priority().map(|(effect, deadline)| {
             self.outbox

@@ -485,6 +485,17 @@ pub enum Effect {
     Continue { continuation: ContinuationId },
 }
 
+impl Effect {
+    fn wire_generation(&self) -> Option<ConnectionGeneration> {
+        match self {
+            Self::EmitQos0 { connection, .. }
+            | Self::EmitPublish { connection, .. }
+            | Self::EmitFrame { connection, .. } => Some(connection.generation),
+            _ => None,
+        }
+    }
+}
+
 /// An effect together with its identity. It is moved, never copied: at any
 /// time exactly one party owns it.
 #[derive(PartialEq, Eq, Debug)]
@@ -524,6 +535,8 @@ impl OwnedEffect {
 pub enum SubmitBlock {
     /// The adapter's queue is full.
     QueueFull,
+    /// Only the wire queue of this frame's generation is full.
+    TransportBackpressure,
     /// The bound on operations in flight is reached.
     InFlightLimit,
     /// The adapter no longer accepts work.
@@ -688,7 +701,7 @@ struct ReservationRecord {
 pub struct DispatchReport {
     /// Effects whose ownership moved to the adapter, in order.
     pub accepted: usize,
-    /// Why the pass stopped early; the refused effect is back at the head.
+    /// The first refusal. An independent effect may have passed a blocked wire queue.
     pub blocked: Option<SubmitBlock>,
 }
 
@@ -1084,28 +1097,55 @@ impl Outbox {
         DispatchReport { accepted, blocked }
     }
 
-    /// Moves effects to `sink` in order until one is refused. The refused
-    /// effect returns to the head of the box with the same identity.
+    /// A full wire queue holds later writes on that generation. Other effects
+    /// can pass it in one bounded scan. Global refusals still stop the scan.
     pub fn dispatch(&mut self, sink: &mut dyn EffectSink) -> DispatchReport {
         let mut accepted = 0;
-        while let Some(effect) = self.queue.pop_front() {
+        let mut held = 0;
+        let mut blocked = None;
+        for remaining in (0..self.queue.len()).rev() {
+            let effect = self.queue.pop_front().expect("unvisited effect");
+            let wire = effect.effect().wire_generation();
+            if let Some(key) = wire
+                && held != 0
+                && self
+                    .queue
+                    .iter()
+                    .skip(remaining)
+                    .any(|older| older.effect().wire_generation() == Some(key))
+            {
+                let restored = self.queue.try_push_back(effect);
+                debug_assert!(restored.is_ok(), "the popped slot was taken");
+                held += 1;
+                continue;
+            }
             match sink.try_submit(effect) {
                 SubmitResult::Accepted => accepted += 1,
                 SubmitResult::NotSubmitted { effect, reason } => {
-                    // The slot freed by `pop_front` above is still free.
-                    let restored = self.queue.try_push_front(effect);
+                    blocked.get_or_insert(reason);
+                    let transport_only =
+                        reason == SubmitBlock::TransportBackpressure && wire.is_some();
+                    if !transport_only && held == 0 {
+                        let restored = self.queue.try_push_front(effect);
+                        debug_assert!(restored.is_ok(), "the popped slot was taken");
+                        break;
+                    }
+                    let restored = self.queue.try_push_back(effect);
                     debug_assert!(restored.is_ok(), "the popped slot was taken");
-                    return DispatchReport {
-                        accepted,
-                        blocked: Some(reason),
-                    };
+                    if !transport_only {
+                        // Put the already visited refusals before the unvisited tail.
+                        for _ in 0..remaining {
+                            let effect = self.queue.pop_front().expect("unvisited effect");
+                            let restored = self.queue.try_push_back(effect);
+                            debug_assert!(restored.is_ok(), "the popped slot was taken");
+                        }
+                        break;
+                    }
+                    held += 1;
                 }
             }
         }
-        DispatchReport {
-            accepted,
-            blocked: None,
-        }
+        DispatchReport { accepted, blocked }
     }
 }
 
