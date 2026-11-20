@@ -1518,13 +1518,15 @@ fn finish_retained_durable_publish(close_before_enqueue: bool) {
             assert_eq!(persisted.outbound, before.outbound);
             assert_eq!(persisted.obligations, before.obligations);
 
+            let retained_generation = target.get().to_string();
+            let retained_effect = effect_text(*effect);
             let events = std::fs::read_to_string(directory.join("events.jsonl")).unwrap();
             let events = events
                 .lines()
                 .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
                 .filter(|event| {
-                    event["connection"] == target.get().to_string()
-                        && event["details"]["effect"] == effect_text(*effect)
+                    event["connection"].as_str() == Some(retained_generation.as_str())
+                        && event["details"]["effect"].as_str() == Some(retained_effect.as_str())
                 })
                 .collect::<Vec<_>>();
             assert_eq!(
