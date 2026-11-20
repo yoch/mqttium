@@ -46,6 +46,7 @@
 #![forbid(unsafe_code)]
 
 mod codec;
+mod group;
 mod message_expiry;
 mod policy_transition;
 mod pubsub;
@@ -105,6 +106,7 @@ use codec::{
     session_state_code, u64_blob, usize_blob,
 };
 
+pub use group::{GroupRefused, MAX_GROUP};
 pub use policy_transition::{
     PolicyInventory, PolicyMaintenanceError, PolicyTransition, PolicyTransitionPoint,
 };
@@ -3054,12 +3056,23 @@ mod transaction_read_tests {
         static FAILURE: Cell<Option<ReadError>> = const { Cell::new(None) };
     }
 
+    std::thread_local! {
+        // How many metadata reads inside a transaction pass before the
+        // fault above is taken: a group reads once for each member before
+        // its savepoint and once inside it.
+        static HEALTHY_READS: Cell<u32> = const { Cell::new(0) };
+    }
+
     pub(super) fn take_if_transaction(conn: &Connection) -> Option<ReadError> {
-        if conn.is_autocommit() {
-            None
-        } else {
-            FAILURE.with(|failure| failure.take())
+        if conn.is_autocommit() || FAILURE.with(|failure| failure.get().is_none()) {
+            return None;
         }
+        let healthy = HEALTHY_READS.with(Cell::get);
+        if healthy > 0 {
+            HEALTHY_READS.with(|reads| reads.set(healthy - 1));
+            return None;
+        }
+        FAILURE.with(|failure| failure.take())
     }
 
     #[test]
@@ -3110,5 +3123,73 @@ mod transaction_read_tests {
         ));
         drop(store);
         std::fs::remove_dir_all(directory).expect("cleanup");
+    }
+
+    /// A member of a group whose transactional read fails is answered as
+    /// `apply` answers it, unknown, and leaves nothing; the members around
+    /// it are committed with the group (record 0045).
+    #[test]
+    fn a_member_whose_read_fails_is_unknown_and_the_group_still_commits() {
+        use mqttiumd_lab::store::conformance::{World, fixture_limits};
+
+        // The reads of a group of three inside its transaction, in order:
+        // before and inside the savepoint of each member.
+        for (healthy, failed) in [(0, 0), (1, 0), (2, 1), (3, 1), (4, 2), (5, 2)] {
+            let directory = std::env::temp_dir().join(format!(
+                "mqttiumd-group-read-{}-{healthy}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&directory).expect("test directory");
+            let path = directory.join("store.sqlite");
+            let mut world = World::with_limits(
+                &|incarnation, limits| {
+                    SqliteStore::create(&path, incarnation, limits).expect("healthy store")
+                },
+                fixture_limits(),
+            );
+            let commands = [
+                world.admission(1, 7, b"payload", &[world.b, world.c]),
+                world.admission(2, 8, b"payload", &[world.b]),
+                world.admission(3, 9, b"payload", &[world.c]),
+            ];
+            let members: Vec<&Command> = commands.iter().collect();
+            HEALTHY_READS.with(|reads| reads.set(healthy));
+            FAILURE.with(|failure| failure.set(Some(ReadError::Io)));
+            let replies = world.store.apply_group(&members);
+            assert_eq!(
+                FAILURE.with(|failure| failure.take()),
+                None,
+                "read {healthy} of the group took the fault"
+            );
+            let replies = replies.expect("within the bound");
+            let mut expected = [true; 3];
+            expected[failed] = false;
+            assert_eq!(
+                replies
+                    .iter()
+                    .map(|applied| applied.committed_now)
+                    .collect::<Vec<_>>(),
+                expected,
+                "fault at read {healthy}"
+            );
+            assert_eq!(
+                replies[failed],
+                Applied {
+                    reply: StoreReply::Outcome(StoreOutcome::PendingOrUnknown),
+                    committed_now: false,
+                    wrote: false,
+                }
+            );
+            let state = world.store.snapshot().expect("healthy snapshot");
+            assert_eq!(state.operations.len(), 2);
+            assert_eq!(state.publications.len(), 2);
+            let absent = commands[failed].recipe.get().operation();
+            assert!(!state.operations.contains_key(&absent));
+            assert_eq!(world.store.established(absent), Ok(None));
+            // Submitted again, it is decided as a first submission.
+            assert!(world.store.apply(&commands[failed]).committed_now);
+            drop(world);
+            std::fs::remove_dir_all(directory).expect("cleanup");
+        }
     }
 }
