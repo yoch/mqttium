@@ -47,25 +47,30 @@ def counter(path):
 
 
 def current_group():
-    entry = next(line.removeprefix("0::") for line in Path("/proc/self/cgroup").read_text().splitlines()
-                 if line.startswith("0::"))
+    # Without a cgroup v2 hierarchy the quota and throttling counters are
+    # absent: the run still records what it can observe.
+    entry = next((line.removeprefix("0::") for line in Path("/proc/self/cgroup").read_text().splitlines()
+                  if line.startswith("0::")), None)
+    if entry is None or not (CGROUP / "cgroup.controllers").is_file():
+        return CGROUP / ".absent-cgroup-v2"
     return CGROUP / entry.lstrip("/")
 
 
 def machine(scratch):
     group = current_group()
     ancestors = []
-    while group.is_relative_to(CGROUP):
+    while group.is_relative_to(CGROUP) and group.exists():
         quota = group / "cpu.max"
         if quota.is_file():
             ancestors.append({"path": str(group), "cpu_max": quota.read_text().strip()})
         group = group.parent
+    cpuset = current_group() / "cpuset.cpus.effective"
     return {
         "uname": platform.uname()._asdict(),
         "lscpu": subprocess.check_output(["lscpu", "-J"], text=True, env=dict(os.environ, LC_ALL="C")),
         "allowed_cpus": sorted(os.sched_getaffinity(0)),
         "cpu_limits": ancestors,
-        "cpuset": (current_group() / "cpuset.cpus.effective").read_text().strip(),
+        "cpuset": (cpuset.read_text().strip() if cpuset.is_file() else "unavailable"),
         "cgroup": Path("/proc/self/cgroup").read_text().strip(),
         "storage": subprocess.check_output(["findmnt", "-T", scratch, "-n", "-o", "TARGET,SOURCE,FSTYPE,OPTIONS"], text=True).strip(),
         "clock": "CLOCK_MONOTONIC",
