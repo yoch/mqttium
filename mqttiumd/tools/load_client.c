@@ -13,7 +13,7 @@
 #include <string.h>
 #include <time.h>
 
-enum { MAX_PAIRS = 8, MAX_EVENTS = 2000000, SEND_WINDOW = 128, LOCAL_WINDOW_FULL = -1 };
+enum { MAX_PAIRS = 64, MAX_EVENTS = 2000000, SEND_WINDOW = 128, LOCAL_WINDOW_FULL = -1 };
 static const uint64_t SECOND = 1000000000;
 
 struct event {

@@ -100,7 +100,7 @@ def provision(root):
     policy = pki / "identities.json"
     current = json.loads(policy.read_text())
     for identity, prefix in zip(current["principals"], ("sensor", "dashboard"), strict=True):
-        identity["client_ids"] = [f"{prefix}-{n}" for n in range(8)]
+        identity["client_ids"] = [f"{prefix}-{n}" for n in range(64)]
         identity["publish"] = ["atelier/load"] if prefix == "sensor" else []
         identity["subscribe"] = ["atelier/load"] if prefix == "dashboard" else []
     write_json(policy, current)
@@ -113,13 +113,17 @@ def free_port():
         return listener.getsockname()[1]
 
 
+# Extra options of the mqttiumd executable, from --broker-option.
+BROKER_OPTIONS = []
+
+
 def broker_command(kind, binary, directory, pki, port):
     listen = f"127.0.0.1:{port}"
     if kind != "mosquitto":
         return [binary, "--db", directory / "broker.sqlite", "--listen", listen,
                 "--events", directory / "events.jsonl", "--tls-cert", pki / "server.crt",
                 "--tls-key", pki / "server.key", "--client-ca", pki / "ca.crt",
-                "--identities", pki / "identities.json"]
+                "--identities", pki / "identities.json", *BROKER_OPTIONS]
     acl = directory / "acl"
     acl.write_text("user sensor\ntopic write atelier/load/#\nuser dashboard\ntopic read atelier/load/#\n")
     config = directory / "mosquitto.conf"
@@ -345,6 +349,10 @@ def run_case(args, root, pki, driver, kind, binary, cores, pairs, qos, rate, ind
                     time.sleep(0.05)
                 if client.poll() != 0:
                     shutil.copyfile(directory / "driver.log", result / "failed-driver.log")
+                    # The broker's own account of a failed run is the first
+                    # thing its diagnosis needs.
+                    if (directory / "events.jsonl").exists():
+                        shutil.copyfile(directory / "events.jsonl", result / "failed-events.jsonl")
                     raise RuntimeError(f"{label}: generator status {client.poll()}\n"
                                        + (directory / "driver.log").read_text())
             after = counter(current_group() / "cpu.stat")
@@ -409,6 +417,8 @@ def main():
     parser.add_argument("--scratch", type=Path, required=True, help="existing filesystem for the temporary stores and logs")
     parser.add_argument("--cores", type=integers, default=[1, 2, 4])
     parser.add_argument("--pairs", type=integers, default=[1, 4, 8])
+    parser.add_argument("--broker-option", action="append", default=[],
+                        help="one more argument of the mqttiumd executable; repeat for a flag and its value")
     parser.add_argument("--qos", type=integers, default=[0, 1])
     parser.add_argument("--rates-q0", type=integers, default=[500, 900, 1500, 6000, 24000, 48000, 96000, 150000])
     parser.add_argument("--rates-q1", type=integers, default=[100, 300, 500, 800, 1500, 3000, 6000, 12000, 48000])
@@ -427,6 +437,7 @@ def main():
         parser.error("--trace-main requires --only-broker mqttiumd")
     if args.expiry_witness and (not (args.candidate or args.only_broker == "mqttiumd") or args.duration_ms < 3000):
         parser.error("--expiry-witness needs a mqttiumd-only trial of at least three seconds")
+    BROKER_OPTIONS.extend(args.broker_option)
     os.umask(0o077)
     for name in ("mqttiumd", "reference", "out", "scratch"):
         setattr(args, name, getattr(args, name).resolve())
@@ -435,9 +446,9 @@ def main():
     limits = [item["cpu_max"].split() for item in host["cpu_limits"]]
     cpu_cap = min([len(affinity)] + [int(quota) / int(period) for quota, period in limits if quota != "max"])
     effective = [n for n in args.cores if 0 < n <= cpu_cap]
-    if (not effective or not set(args.qos) <= {0, 1} or not all(1 <= p <= 8 for p in args.pairs)
+    if (not effective or not set(args.qos) <= {0, 1} or not all(1 <= p <= 64 for p in args.pairs)
             or args.repeats < 1):
-        parser.error("invalid matrix for the available CPU budget and 16-connection limit")
+        parser.error("invalid matrix for the available CPU budget and 128-connection limit")
     args.out.mkdir(mode=0o700)
     driver, client = compile_driver(args.reference, args.out)
     binaries = {"mqttiumd": args.mqttiumd}

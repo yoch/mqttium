@@ -41,7 +41,6 @@ pub const WRITTEN_SLOTS: usize = 2 * (OUTPUT_SLOTS + 1) + 8;
 const WIRE_PROGRESS_SLOTS: usize = OUTPUT_SLOTS + 1 + 8;
 #[cfg(test)]
 const POLL: Duration = Duration::from_millis(20);
-const INPUT_WAIT: Duration = Duration::from_millis(100);
 const RESULT_WAIT: Duration = Duration::from_millis(100);
 const PARTIAL_PACKET_TIMEOUT: Duration = Duration::from_secs(5);
 const WRITE_TIMEOUT: Duration = Duration::from_millis(250);
@@ -455,15 +454,16 @@ enum Report {
 }
 
 /// The task's end of the four lanes. Nothing here blocks: a value a full
-/// lane refused is held with the instant of its first refusal, and the
-/// task is run again when the core takes a value or at the next tick.
+/// lane refused is held, and the task is run again when the core takes a
+/// value or at the next tick. A held packet has no deadline; a held
+/// receipt has one, counted from its first refusal.
 struct Lanes {
     input: Tx<Incoming>,
     output: Receiver<Write>,
     written: Tx<Written>,
     progress: Tx<WireProgress>,
     link: Arc<Link>,
-    held: Option<(Incoming, Instant)>,
+    held: Option<Incoming>,
     /// Receipts in publication order. At most three per frame, and no frame
     /// is taken while one is pending.
     reports: VecDeque<Report>,
@@ -495,12 +495,12 @@ impl Lanes {
     /// previous one first.
     fn hold(&mut self, incoming: Incoming) {
         debug_assert!(self.held.is_none());
-        self.held = Some((incoming, Instant::now()));
+        self.held = Some(incoming);
     }
 
     /// Publishes the held packet. Returns whether the lane is free again.
     fn deliver(&mut self) -> Result<bool, &'static str> {
-        let Some((incoming, since)) = self.held.take() else {
+        let Some(incoming) = self.held.take() else {
             return Ok(true);
         };
         let Some(refused) =
@@ -508,11 +508,10 @@ impl Lanes {
         else {
             return Ok(true);
         };
-        if since.elapsed() >= INPUT_WAIT {
-            // The cause remains in Control even when the queue is full.
-            return Err("input_queue_full");
-        }
-        self.held = Some((refused, since));
+        // The packet waits for the core, and the bytes behind it wait in the
+        // socket: the peer is slowed by its transport, not disconnected
+        // (record 0046). The runtime owns every deadline of a connection.
+        self.held = Some(refused);
         Ok(false)
     }
 
@@ -1669,16 +1668,37 @@ mod tests {
         finish(&mut connection);
     }
 
+    /// A core that takes nothing slows the peer through its transport. The
+    /// lane holds its packets, one more is held by the task, the rest stay
+    /// in the socket, and all of them arrive in order once the core takes
+    /// values again (record 0046).
     #[test]
-    fn input_saturation_retains_its_cause_outside_the_full_queue() {
+    fn input_saturation_is_backpressure_and_loses_no_packet() {
         let (mut connection, mut peer) = pair();
-        peer.write_all(&[0xc0, 0].repeat(INPUT_SLOTS + 2)).unwrap();
-        let deadline = Instant::now() + Duration::from_millis(600);
-        while !connection.is_finished() && Instant::now() < deadline {
-            thread::sleep(Duration::from_millis(2));
+        let packets = INPUT_SLOTS + 6;
+        for index in 0..packets {
+            peer.write_all(&[0x30, 4, 0, 1, b't', u8::try_from(index).unwrap()])
+                .unwrap();
         }
-        assert_eq!(connection.terminal_reason(), Some("input_queue_full"));
-        assert_eq!(connection.incoming.try_iter().count(), INPUT_SLOTS);
+        // Longer than any wait the task once bounded before closing.
+        thread::sleep(Duration::from_millis(400));
+        assert!(!connection.is_finished(), "a slow core closed its peer");
+        assert_eq!(connection.terminal_reason(), None);
+        for index in 0..packets {
+            let deadline = Instant::now() + Duration::from_millis(600);
+            let packet = loop {
+                match connection.incoming.try_recv() {
+                    Ok(packet) => break packet,
+                    Err(_) => assert!(Instant::now() < deadline, "packet {index} never arrived"),
+                }
+                thread::sleep(Duration::from_millis(1));
+            };
+            assert!(
+                matches!(packet, Incoming::Packet { first: 0x30, ref body, .. } if body.last() == Some(&u8::try_from(index).unwrap())),
+                "packet {index} out of order: {packet:?}"
+            );
+        }
+        connection.close();
         finish(&mut connection);
     }
 

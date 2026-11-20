@@ -46,7 +46,9 @@ use std::sync::{
 use std::thread;
 use std::time::{Duration, Instant};
 
-const CONNECTIONS: usize = 16;
+/// The connection cap of the unit tests and of the frozen bounded profile.
+#[cfg(test)]
+const CONNECTIONS: usize = Limits::BOUNDED.connections;
 const IN_FLIGHT: usize = 16;
 const TIMERS: usize = 512;
 const INPUTS: usize = 128;
@@ -56,18 +58,73 @@ const DEADLINE_INPUTS: usize = 4;
 const ORDINARY_INPUTS: usize = INPUTS - WRITER_INPUTS - DEADLINE_INPUTS;
 const OUTGOING_BINDINGS: usize = 128;
 const LIFECYCLE_IN_FLIGHT: usize = 1;
+/// Closing and terminal facts applied by one pass over the inputs. With
+/// the ordinary inputs of the same pass they stay under the effect box.
+const PASS_FACTS: usize = 16;
 /// Upper bound of an idle wait: connection deadlines and expiry scans are
 /// wall-clock checks without a producer to signal them.
 const IDLE_TICK: Duration = Duration::from_millis(20);
 /// A busy reactor reports its suppressed observations at this interval.
 const COUNTERS_INTERVAL: Duration = Duration::from_secs(1);
 const MESSAGE_EXPIRY_RETRIES: u8 = 3;
-const CLOSING_INPUTS: usize = 2 * CONNECTIONS;
-// Per transport: four queued frames, one active and eight terminal receipts.
-const FRAMES: usize = CONNECTIONS * (net::OUTPUT_SLOTS + 9);
-// A close can retire every accepted frame while an outbox-sized set of
-// synchronously refused volatile effects also awaits its exact owner fact.
-const TERMINAL_INPUTS: usize = 2 * FRAMES + 128;
+#[cfg(test)]
+const TERMINAL_INPUTS: usize = Limits::BOUNDED.terminal_inputs;
+#[cfg(test)]
+const CLOSING_INPUTS: usize = Limits::BOUNDED.closing_inputs;
+
+/// What the operator may size. Every queue that grows with the number of
+/// connections is derived here, once.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Limits {
+    /// Transports open at once, the retiring ones included.
+    pub connections: usize,
+    closing_inputs: usize,
+    /// Per transport: the queued frames, one active and eight terminal
+    /// receipts.
+    frames: usize,
+    /// A close can retire every accepted frame while an outbox-sized set of
+    /// synchronously refused volatile effects also awaits its exact owner
+    /// fact.
+    terminal_inputs: usize,
+    /// Packets and facts waiting for the core, the writer's and the
+    /// deadlines' reserved shares excluded.
+    ordinary_inputs: usize,
+    /// Effects the core may hold between two dispatches.
+    effect_box: usize,
+    /// Outgoing packet identifiers in flight: eight per connection.
+    outgoing_bindings: usize,
+    timers: usize,
+}
+
+impl Limits {
+    /// A session is durable and the store holds this many: more transports
+    /// than sessions could never all be established.
+    pub const MAX_CONNECTIONS: usize = crate::writer::SESSIONS;
+    /// The profile every reception before record 0044 ran with.
+    const BOUNDED_CONNECTIONS: usize = 16;
+    pub const BOUNDED: Self = Self::new(Self::BOUNDED_CONNECTIONS);
+    pub const DEFAULT: Self = Self::new(Self::MAX_CONNECTIONS);
+
+    /// `connections` is between 1 and [`Limits::MAX_CONNECTIONS`]; the
+    /// command line checks it.
+    #[must_use]
+    pub const fn new(connections: usize) -> Self {
+        let frames = connections * (net::OUTPUT_SLOTS + 9);
+        // The first profile sized these for sixteen connections; they grow
+        // with every further sixteen.
+        let scale = connections.div_ceil(Self::BOUNDED_CONNECTIONS);
+        Self {
+            connections,
+            closing_inputs: 2 * connections,
+            frames,
+            terminal_inputs: 2 * frames + 128 * scale,
+            ordinary_inputs: ORDINARY_INPUTS * scale,
+            effect_box: 128 * scale,
+            outgoing_bindings: OUTGOING_BINDINGS * scale,
+            timers: TIMERS * scale,
+        }
+    }
+}
 const BOUNDS: Bounds = Bounds {
     max_packet: 65536,
     max_client_id: 1024,
@@ -103,6 +160,7 @@ pub struct Config {
     pub listen: SocketAddr,
     pub events: PathBuf,
     pub event_level: crate::events::Level,
+    pub limits: Limits,
     pub hooks: Hooks,
     pub tls: Option<TlsFiles>,
 }
@@ -192,6 +250,7 @@ struct Runtime<'a> {
     /// unchanged has nothing to do until a producer signals `wake`.
     progress: u64,
     wake: crate::wake::Wake,
+    limits: Limits,
     security: Option<Security>,
     message_expiry_request: Option<(MessageTime, Option<PublicationId>)>,
     message_expiry_retry: bool,
@@ -228,6 +287,8 @@ struct Runtime<'a> {
     closing_inputs: VecDeque<Input>,
     terminal_inputs: VecDeque<Input>,
     deferred_inputs: VecDeque<Input>,
+    /// A packet waits in `deferred_inputs` for room in the effect box.
+    effects_awaited: bool,
     timers: BTreeMap<DeadlineToken, Instant>,
     inflight: BTreeMap<EffectId, OperationId>,
     lifecycle_inflight: BTreeMap<EffectId, OperationId>,
@@ -271,17 +332,17 @@ struct Runtime<'a> {
     #[cfg(feature = "test-hooks")]
     copied_session_close: Option<SessionCloseObservation>,
 }
-fn ordinary_room(inputs: &VecDeque<Input>, reservations: usize) -> usize {
+fn ordinary_room(inputs: &VecDeque<Input>, reservations: usize, limit: usize) -> usize {
     // Most turns use only a small fraction of the ordinary lane.
     let upper = inputs.len() + reservations;
-    if upper + 2 <= ORDINARY_INPUTS {
-        return ORDINARY_INPUTS - upper;
+    if upper + 2 <= limit {
+        return limit - upper;
     }
     let occupied = inputs
         .iter()
         .filter(|input| !Runtime::writer_input(input) && !matches!(input, Input::Deadline { .. }))
         .count();
-    ORDINARY_INPUTS.saturating_sub(occupied + reservations)
+    limit.saturating_sub(occupied + reservations)
 }
 impl Runtime<'_> {
     fn message_now(&mut self) -> Result<MessageTime, Failure> {
@@ -546,6 +607,21 @@ impl Runtime<'_> {
             .min(IDLE_TICK)
     }
 
+    /// Whether another transport may start its handshake now. While the
+    /// handshake budget is spent, pending transports wait in the listener's
+    /// backlog instead of being closed.
+    fn admits_handshake(&self) -> bool {
+        self.security.is_none()
+            || self
+                .peers
+                .values()
+                .map(|peer| &peer.io)
+                .chain(self.retiring.iter())
+                .filter(|io| io.is_authenticating())
+                .count()
+                < security::MAX_UNAUTHENTICATED
+    }
+
     fn accept(&mut self, stream: std::net::TcpStream) -> Result<bool, Failure> {
         // Retiring threads count against the same hard connection budget.
         let close_reserved = self
@@ -554,10 +630,10 @@ impl Runtime<'_> {
             .checked_add(1)
             .and_then(|peers| peers.checked_mul(2))
             .and_then(|future| future.checked_add(self.closing_inputs.len()))
-            .is_some_and(|required| required <= CLOSING_INPUTS);
-        let code = if self.peers.len() + self.retiring.len() >= CONNECTIONS
+            .is_some_and(|required| required <= self.limits.closing_inputs);
+        let code = if self.peers.len() + self.retiring.len() >= self.limits.connections
             || !close_reserved
-            || self.session_requests.len() >= CONNECTIONS
+            || self.session_requests.len() >= self.limits.connections
         {
             Some("connection_limit")
         } else if self.security.is_some()
@@ -643,7 +719,7 @@ impl Runtime<'_> {
             if self.terminal_inputs.iter().any(|queued| queued == &input) {
                 return Ok(());
             }
-            if self.terminal_inputs.len() >= TERMINAL_INPUTS {
+            if self.terminal_inputs.len() >= self.limits.terminal_inputs {
                 return Err(Failure::plain("terminal_input_budget"));
             }
             self.terminal_inputs.push_back(input);
@@ -656,7 +732,7 @@ impl Runtime<'_> {
             if self.closing_inputs.iter().any(|queued| queued == &input) {
                 return Ok(());
             }
-            if self.closing_inputs.len() >= CLOSING_INPUTS {
+            if self.closing_inputs.len() >= self.limits.closing_inputs {
                 return Err(Failure::plain("closing_input_budget"));
             }
             self.closing_inputs.push_back(input);
@@ -688,6 +764,7 @@ impl Runtime<'_> {
         ordinary_room(
             &self.inputs,
             self.deferred_inputs.len() + self.will_connects.len(),
+            self.limits.ordinary_inputs,
         )
     }
     fn writer_input(input: &Input) -> bool {
@@ -1281,8 +1358,10 @@ impl Runtime<'_> {
             }
         }
         let mut control_budget = crate::writer::CONTROL_QUEUE;
-        let mut closing_budget = self.closing_inputs.len().min(CONNECTIONS);
-        let mut terminal_budget = self.terminal_inputs.len().min(CONNECTIONS);
+        // Work per pass, not a capacity: each of these inputs can leave an
+        // effect in the core's box, which the dispatch after the pass empties.
+        let mut closing_budget = self.closing_inputs.len().min(PASS_FACTS);
+        let mut terminal_budget = self.terminal_inputs.len().min(PASS_FACTS);
         let mut expiry_budget = self.expiry_inputs.len().min(4);
         for _ in 0..(self.inputs.len()
             + self.control_inputs.len()
@@ -1627,10 +1706,25 @@ impl Runtime<'_> {
                             }
                             self.deferred_inputs.push_back(packet)
                         }
+                        // The effect box is emptied by the dispatch that
+                        // follows this pass. The packet waits for it in
+                        // order, behind nothing of its own connection.
+                        packet @ Input::Packet { .. }
+                            if need.resource == Resource::EffectSlots
+                                && need.wake == WakeCondition::EffectAccepted
+                                // The packets that release what the box
+                                // waits for share the lane: deferred ones
+                                // never take more than a quarter of it.
+                                && self.deferred_inputs.len()
+                                    < self.limits.ordinary_inputs / 4 =>
+                        {
+                            self.effects_awaited = true;
+                            self.deferred_inputs.push_back(packet)
+                        }
                         Input::Packet { connection, .. } => {
                             // No transition applied and no effect was submitted for this packet.
                             // Close its transport rather than reorder its positive acknowledgements.
-                            self.events.emit("input_capacity_refused",json!({"connection":connection.get().to_string(),"details":{"accepted_command_rejected":false}})).map_err(event_failure)?;
+                            self.events.emit("input_capacity_refused",json!({"connection":connection.get().to_string(),"details":{"accepted_command_rejected":false,"resource":format!("{:?}",need.resource),"wake":format!("{:?}",need.wake)}})).map_err(event_failure)?;
                             self.close(connection, "input_capacity")?;
                         }
                         other if Self::terminal_input(&other) => {
@@ -1773,6 +1867,7 @@ impl Runtime<'_> {
         let queued_writer_replies = self.writer_input_count();
         let mut sink = Sink {
             writer: self.writer,
+            limits: self.limits,
             peers: &mut self.peers,
             events: &self.events,
             inflight: &mut self.inflight,
@@ -1810,6 +1905,12 @@ impl Runtime<'_> {
         drop(sink);
         if report.accepted != 0 {
             self.progress = self.progress.wrapping_add(1);
+            if std::mem::take(&mut self.effects_awaited) {
+                // The packets that found the box full stay ahead of later
+                // bytes from their connections.
+                self.deferred_inputs.append(&mut self.inputs);
+                std::mem::swap(&mut self.inputs, &mut self.deferred_inputs);
+            }
         }
         if let Some(error) = error {
             return Err(error);
@@ -2346,7 +2447,7 @@ impl Runtime<'_> {
             receive_maximum: connect.receive_maximum,
             maximum_packet_size: connect.max_packet_size,
         })?;
-        if self.session_requests.len() >= CONNECTIONS {
+        if self.session_requests.len() >= self.limits.connections {
             return self.close(generation, "session_request_limit");
         }
         let request = self
@@ -3720,6 +3821,7 @@ struct Sink<'a> {
     queued_writer_replies: usize,
     frames: &'a mut BTreeMap<EffectId, PendingFrame>,
     outgoing_bindings: &'a mut BTreeMap<(ConnectionKey, OutboundPacketId), PubackTarget>,
+    limits: Limits,
     close: Vec<(ConnectionGeneration, &'static str)>,
     session_change: Option<AppliedSessionChange>,
     error: Option<Failure>,
@@ -3909,8 +4011,8 @@ impl EffectSink for Sink<'_> {
                     .terminal_inputs
                     .len()
                     .checked_add(2 * self.frames.len())
-                    .is_none_or(|used| used >= TERMINAL_INPUTS)
-                    || self.frames.len() >= FRAMES
+                    .is_none_or(|used| used >= self.limits.terminal_inputs)
+                    || self.frames.len() >= self.limits.frames
                 {
                     return refused(effect, SubmitBlock::QueueFull);
                 }
@@ -4206,7 +4308,7 @@ impl EffectSink for Sink<'_> {
                 let binding = match (*pubrel, frame) {
                     (Some((delivery, claim)), OutboundFrame::Pubrel { packet_id }) => {
                         let key = (connection, packet_id);
-                        if self.outgoing_bindings.len() >= OUTGOING_BINDINGS {
+                        if self.outgoing_bindings.len() >= self.limits.outgoing_bindings {
                             return refused(effect, SubmitBlock::InFlightLimit);
                         }
                         if self.outgoing_bindings.contains_key(&key) {
@@ -4241,10 +4343,14 @@ impl EffectSink for Sink<'_> {
                     .terminal_inputs
                     .len()
                     .checked_add(2 * self.frames.len())
-                    .is_none_or(|used| used >= TERMINAL_INPUTS)
-                    || self.frames.len() >= FRAMES
+                    .is_none_or(|used| used >= self.limits.terminal_inputs)
+                    || self.frames.len() >= self.limits.frames
                     || (kind == "CONNACK"
-                        && ordinary_room(self.inputs, self.ordinary_reserved) == 0)
+                        && ordinary_room(
+                            self.inputs,
+                            self.ordinary_reserved,
+                            self.limits.ordinary_inputs,
+                        ) == 0)
                 {
                     return refused(effect, SubmitBlock::QueueFull);
                 }
@@ -4404,7 +4510,7 @@ impl EffectSink for Sink<'_> {
                 }
             }
             Effect::ArmDeadline { token, after } => {
-                if self.timers.len() >= TIMERS {
+                if self.timers.len() >= self.limits.timers {
                     return refused(effect, SubmitBlock::QueueFull);
                 }
                 let Some(due) = Instant::now().checked_add(Duration::from_millis(after.get()))
@@ -4417,7 +4523,12 @@ impl EffectSink for Sink<'_> {
                 SubmitResult::Accepted
             }
             Effect::Continue { continuation } => {
-                if ordinary_room(self.inputs, self.ordinary_reserved) == 0 {
+                if ordinary_room(
+                    self.inputs,
+                    self.ordinary_reserved,
+                    self.limits.ordinary_inputs,
+                ) == 0
+                {
                     return refused(effect, SubmitBlock::QueueFull);
                 }
                 self.inputs.push_back(Input::Continue {
@@ -4507,8 +4618,8 @@ impl EffectSink for Sink<'_> {
                     .terminal_inputs
                     .len()
                     .checked_add(2 * self.frames.len())
-                    .is_none_or(|used| used >= TERMINAL_INPUTS)
-                    || self.frames.len() >= FRAMES
+                    .is_none_or(|used| used >= self.limits.terminal_inputs)
+                    || self.frames.len() >= self.limits.frames
                 {
                     return refused(effect, SubmitBlock::QueueFull);
                 }
@@ -4573,7 +4684,7 @@ impl EffectSink for Sink<'_> {
                     self.error = Some(Failure::plain("outgoing_binding_conflict"));
                     return refused(effect, SubmitBlock::InFlightLimit);
                 }
-                if self.outgoing_bindings.len() >= OUTGOING_BINDINGS {
+                if self.outgoing_bindings.len() >= self.limits.outgoing_bindings {
                     return refused(effect, SubmitBlock::InFlightLimit);
                 }
                 // Register before the network task can observe this frame.
@@ -4840,6 +4951,7 @@ pub fn run(config: Config) -> Result<(), Failure> {
         cancel.clone(),
         &mut writer,
         security,
+        config.limits,
     );
     if let Err(failure) = &result {
         let _ = events.emit("startup_or_runtime_refused", failure.fields());
@@ -4977,6 +5089,7 @@ fn run_inner(
     cancel: Arc<AtomicBool>,
     writer: &mut Writer,
     security: Option<Security>,
+    limits: Limits,
 ) -> Result<(), Failure> {
     let _ = &hooks;
     let boot = writer
@@ -4992,7 +5105,7 @@ fn run_inner(
     let outbox = authority
         .create_outbox(
             LogicalOwnerId::new(0),
-            NonZeroUsize::new(128).expect("nonzero"),
+            NonZeroUsize::new(limits.effect_box).expect("nonzero"),
             nz(65536),
         )
         .map_err(|_| Failure::plain("outbox_creation"))?;
@@ -5033,6 +5146,7 @@ fn run_inner(
     let mut runtime = Runtime {
         progress: 0,
         wake: writer.wake.clone(),
+        limits,
         security,
         message_expiry_request: None,
         message_expiry_retry: false,
@@ -5069,6 +5183,7 @@ fn run_inner(
         closing_inputs: VecDeque::new(),
         terminal_inputs: VecDeque::new(),
         deferred_inputs: VecDeque::new(),
+        effects_awaited: false,
         timers: BTreeMap::new(),
         inflight: BTreeMap::new(),
         lifecycle_inflight: BTreeMap::new(),
@@ -5254,7 +5369,7 @@ fn run_inner(
         events.emit("message_expiry_clock", json!({"details":{
             "domain":hex_domain(now.domain),"tick":now.tick.to_string(),"origin_status":runtime.clock.origin_status(),
             "policy":"quarantine-on-unknown-origin","time_unit":"nanoseconds","scan_ms":100,"batch":4,
-            "started_proof":"positive-socket-write-then-durable-marker","terminal_input_slots":TERMINAL_INPUTS,
+            "started_proof":"positive-socket-write-then-durable-marker","terminal_input_slots":limits.terminal_inputs,
             "socket_write_receipt_slots":net::WRITTEN_SLOTS
         }})).map_err(event_failure)?;
         events.emit("receipt_policy",json!({"details":{"receipt_window":1024,"receipt_data_window":mqttiumd_contract::receipts::RECEIPT_DATA_WINDOW,"receipt_control_reserve":512,"receipt_collection_rows":128,"receipt_collection_bytes":mqttiumd_store_api::ReadBudget::COLLECTION.max_bytes,"receipt_collection_trigger":64,"max_receipt_origins":64,"startup_origins_trigger":32,"startup_receipts_trigger":4096,"startup_closed_collection":collect_closed,"control_request_slots":crate::writer::CONTROL_QUEUE,"control_reply_slots":crate::writer::CONTROL_QUEUE,"control_input_slots":crate::writer::CONTROL_QUEUE}})).map_err(event_failure)?;
@@ -5271,7 +5386,7 @@ fn run_inner(
         } else {
             "tcp-will-pubsub-v1"
         };
-        let readiness = json!({"details":{"address":address.to_string(),"epoch":epoch.get().to_string(),"incarnation":incarnation.get().to_string(),"max_connections":16,"max_sessions":128,"max_packet_bytes":65536,"max_client_id_bytes":1024,"max_topic_bytes":1024,"max_payload_bytes":32768,"receive_maximum":8,"max_exchange_slots":128,"input_slots":4,"output_slots":4,"writer_slots":32,"commands_in_flight":16,"max_timers":512,"receipt_slots":8192,"partial_packet_ms":5000,"connect_ms":3000,"write_ms":250,"remembered_connections":8,"max_subscriptions":128,"max_targets":16,"outgoing_per_connection":8,"outgoing_metadata":128,"outgoing_packet_identifier_max":65535,"outgoing_packet_identifier_probe_limit":129,"outgoing_payload_bytes":4194304,"work_page_items":8,"work_scan_ms":100,"wildcard_subscriptions":true,"no_local":true,"shared_subscriptions":false,"subscription_identifiers":false,"sqlite_schema":sqlite.user_version,"retained_available":true,"retained_topics":32,"retained_bytes":1048576,"max_replay_candidates":256,"profile":profile}});
+        let readiness = json!({"details":{"address":address.to_string(),"epoch":epoch.get().to_string(),"incarnation":incarnation.get().to_string(),"max_connections":limits.connections,"max_sessions":128,"max_packet_bytes":65536,"max_client_id_bytes":1024,"max_topic_bytes":1024,"max_payload_bytes":32768,"receive_maximum":8,"max_exchange_slots":128,"input_slots":4,"output_slots":4,"writer_slots":32,"commands_in_flight":16,"max_timers":limits.timers,"receipt_slots":8192,"partial_packet_ms":5000,"connect_ms":3000,"write_ms":250,"remembered_connections":8,"max_subscriptions":128,"max_targets":16,"outgoing_per_connection":8,"outgoing_metadata":limits.outgoing_bindings,"outgoing_packet_identifier_max":65535,"outgoing_packet_identifier_probe_limit":129,"outgoing_payload_bytes":4194304,"work_page_items":8,"work_scan_ms":100,"wildcard_subscriptions":true,"no_local":true,"shared_subscriptions":false,"subscription_identifiers":false,"sqlite_schema":sqlite.user_version,"retained_available":true,"retained_topics":32,"retained_bytes":1048576,"max_replay_candidates":256,"profile":profile}});
         if let Some(security) = &runtime.security {
             events.emit("tls_profile", json!({"details":{"version":"TLS1.3","client_certificate":"required",
                 "policy_fingerprint":hex_domain(security.policy.storage().fingerprint),"max_handshakes":security::MAX_UNAUTHENTICATED,
@@ -5288,6 +5403,9 @@ fn run_inner(
             while !cancel.load(Ordering::Relaxed) {
                 let before = runtime.progress;
                 for _ in 0..4 {
+                    if !runtime.admits_handshake() {
+                        break;
+                    }
                     match acceptor.accepted.try_recv() {
                         Ok(Ok(stream)) => {
                             runtime.progress = runtime.progress.wrapping_add(1);

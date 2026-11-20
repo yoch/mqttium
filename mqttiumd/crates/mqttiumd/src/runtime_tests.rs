@@ -91,6 +91,7 @@ fn with_runtime_clock_hooks(
     let mut runtime = Runtime {
         progress: 0,
         wake: writer.wake.clone(),
+        limits: Limits::BOUNDED,
         security: None,
         message_expiry_request: None,
         message_expiry_retry: false,
@@ -127,6 +128,7 @@ fn with_runtime_clock_hooks(
         closing_inputs: VecDeque::new(),
         terminal_inputs: VecDeque::new(),
         deferred_inputs: VecDeque::new(),
+        effects_awaited: false,
         timers: BTreeMap::new(),
         inflight: BTreeMap::new(),
         lifecycle_inflight: BTreeMap::new(),
@@ -2319,6 +2321,7 @@ fn cancelled_startup_never_announces_ready_and_releases_its_opened_epoch() {
         cancel,
         &mut writer,
         None,
+        Limits::BOUNDED,
     );
     finish_startup_writer(&mut writer);
     let store = mqttiumd_store_sqlite::SqliteStore::open(&path)
@@ -2372,6 +2375,7 @@ fn established_typed_startup_failure_takes_precedence_over_cancellation() {
         cancel,
         &mut writer,
         None,
+        Limits::BOUNDED,
     );
     finish_startup_writer(&mut writer);
     assert!(
@@ -2435,6 +2439,7 @@ fn cancellation_during_unacknowledged_registration_never_announces_ready() {
             cancel.clone(),
             &mut writer,
             None,
+            Limits::BOUNDED,
         );
         (result, watcher.join().unwrap())
     });

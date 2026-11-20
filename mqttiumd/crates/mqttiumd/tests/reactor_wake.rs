@@ -21,6 +21,10 @@ struct Broker {
 
 impl Broker {
     fn start(name: &str) -> Self {
+        Self::start_with(name, &[])
+    }
+
+    fn start_with(name: &str, options: &[&str]) -> Self {
         let directory = std::env::temp_dir().join(format!(
             "mqttiumd-{name}-{}-{}",
             std::process::id(),
@@ -39,6 +43,7 @@ impl Broker {
             .arg("127.0.0.1:0")
             .arg("--events")
             .arg(directory.join("events.jsonl"))
+            .args(options)
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
             .spawn()
@@ -215,7 +220,8 @@ fn an_idle_broker_rests() {
 /// second, not after every exchange that leaves the broker idle.
 #[test]
 fn suppressed_observations_are_summarised_on_an_interval() {
-    let broker = Broker::start("counters");
+    // The instrumented build records everything unless told otherwise.
+    let broker = Broker::start_with("counters", &["--event-level", "ops"]);
     let mut subscriber = connect(broker.address, "counters-subscriber");
     subscribe(&mut subscriber, "wake/counters");
     let mut publisher = connect(broker.address, "counters-publisher");
@@ -237,5 +243,113 @@ fn suppressed_observations_are_summarised_on_an_interval() {
     assert!(
         summaries <= seconds + 2,
         "{summaries} summaries in {seconds} s"
+    );
+}
+
+/// The connection cap is the operator's: sixty clients are served at once
+/// where the first bounded profile stopped at sixteen, and a broker sized
+/// for two closes the third transport without a CONNACK.
+#[test]
+fn the_connection_limit_is_configurable() {
+    const CLIENTS: usize = 60;
+    let broker = Broker::start_with("many", &["--max-connections", "64"]);
+    let mut subscriber = connect(broker.address, "many-subscriber");
+    subscribe(&mut subscriber, "wake/many");
+    let mut publishers: Vec<TcpStream> = (1..CLIENTS)
+        .map(|index| connect(broker.address, &format!("many-publisher-{index}")))
+        .collect();
+    for (index, publisher) in publishers.iter_mut().enumerate() {
+        let payload = u32::try_from(index).unwrap().to_be_bytes();
+        publish_qos0(publisher, "wake/many", &payload);
+        let (first, body) = read_packet(&mut subscriber);
+        assert_eq!(first >> 4, 3, "PUBLISH expected");
+        assert!(body.ends_with(&payload), "publication {index} lost");
+    }
+    drop(publishers);
+    drop(subscriber);
+    drop(broker);
+
+    let broker = Broker::start_with("few", &["--max-connections", "2"]);
+    let _first = connect(broker.address, "few-1");
+    let _second = connect(broker.address, "few-2");
+    let mut third = TcpStream::connect(broker.address).unwrap();
+    third
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    let mut byte = [0u8; 1];
+    assert_eq!(
+        third.read(&mut byte).unwrap_or(0),
+        0,
+        "a transport over the limit was answered"
+    );
+}
+
+/// A burst from many publishers towards one subscriber is pressure, not a
+/// fault: QoS 0 publications may be dropped, but no publisher loses its
+/// connection. With a per-pass budget sized by the connection limit, the
+/// reports of the drops filled the core's effect box and the next publisher
+/// served was closed with `input_capacity` (about one run in three).
+#[test]
+fn a_fan_in_burst_closes_no_publisher() {
+    const PUBLISHERS: usize = 40;
+    const BURST: usize = 200;
+    const ROUNDS: usize = 8;
+    let broker = Broker::start_with("fan-in", &["--max-connections", "64"]);
+    let mut subscriber = connect(broker.address, "fan-in-subscriber");
+    subscribe(&mut subscriber, "wake/fan-in");
+    let mut publishers: Vec<TcpStream> = (0..PUBLISHERS)
+        .map(|index| connect(broker.address, &format!("fan-in-publisher-{index}")))
+        .collect();
+    let mut body = Vec::new();
+    text("wake/fan-in", &mut body);
+    body.push(0);
+    body.extend_from_slice(&[0x5a; 64]);
+    let burst = packet(0x30, &body).repeat(BURST);
+    // The subscriber is read so that it is never the one that stalls.
+    let drained = std::thread::spawn(move || {
+        let mut received = 0usize;
+        subscriber
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let mut bytes = [0u8; 65536];
+        while let Ok(count) = subscriber.read(&mut bytes) {
+            if count == 0 {
+                break;
+            }
+            received += count;
+        }
+        received
+    });
+    // Every publisher writes at once: their packets meet in the same turns.
+    let start = std::sync::Arc::new(std::sync::Barrier::new(PUBLISHERS));
+    let writers: Vec<_> = publishers
+        .drain(..)
+        .map(|mut publisher| {
+            let (start, burst) = (start.clone(), burst.clone());
+            std::thread::spawn(move || {
+                start.wait();
+                let mut reply = [0u8; 2];
+                for _ in 0..ROUNDS {
+                    publisher.write_all(&burst)?;
+                    publisher.write_all(&[0xc0, 0])?;
+                    publisher.read_exact(&mut reply)?;
+                    if reply != [0xd0, 0] {
+                        break;
+                    }
+                }
+                Ok::<_, std::io::Error>(reply)
+            })
+        })
+        .collect();
+    for (index, writer) in writers.into_iter().enumerate() {
+        let reply = writer
+            .join()
+            .unwrap()
+            .unwrap_or_else(|error| panic!("publisher {index} was closed: {error}"));
+        assert_eq!(reply, [0xd0, 0], "PINGRESP expected from publisher {index}");
+    }
+    assert!(
+        drained.join().unwrap() > 0,
+        "nothing reached the subscriber"
     );
 }

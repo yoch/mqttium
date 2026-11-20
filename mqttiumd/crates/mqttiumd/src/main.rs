@@ -1,6 +1,6 @@
 //! Experimental durable hierarchical MQTT TCP broker.
 use mqttiumd::{
-    runtime::{Config, run},
+    runtime::{Config, Limits, run},
     security::{Security, TlsFiles},
     writer::{self, Hooks},
 };
@@ -16,6 +16,12 @@ fn parse_arguments(mut args: impl Iterator<Item = String>) -> Result<Config, &'s
     } else {
         mqttiumd::events::Level::Ops
     };
+    // The instrumented build keeps the bounded profile its receptions state.
+    let mut limits = if cfg!(feature = "test-hooks") {
+        Limits::BOUNDED
+    } else {
+        Limits::DEFAULT
+    };
     let mut hooks = Hooks::default();
     let (mut cert, mut key, mut client_ca, mut identities) = (None, None, None, None);
     while let Some(arg) = args.next() {
@@ -29,6 +35,14 @@ fn parse_arguments(mut args: impl Iterator<Item = String>) -> Result<Config, &'s
             "--listen" => listen = value.parse().map_err(|_| "invalid listen address")?,
             "--events" => events = Some(PathBuf::from(value)),
             "--event-level" => event_level = value.parse().map_err(|()| "invalid event level")?,
+            "--max-connections" => {
+                limits = value
+                    .parse()
+                    .ok()
+                    .filter(|count| (1..=Limits::MAX_CONNECTIONS).contains(count))
+                    .map(Limits::new)
+                    .ok_or("invalid connection limit")?;
+            }
             "--tls-cert" if cert.is_none() => cert = Some(PathBuf::from(value)),
             "--tls-key" if key.is_none() => key = Some(PathBuf::from(value)),
             "--client-ca" if client_ca.is_none() => client_ca = Some(PathBuf::from(value)),
@@ -106,6 +120,7 @@ fn parse_arguments(mut args: impl Iterator<Item = String>) -> Result<Config, &'s
         listen,
         events: events.ok_or("--events is required")?,
         event_level,
+        limits,
         hooks,
         tls: match (cert, key, client_ca, identities) {
             (None, None, None, None) => None,
