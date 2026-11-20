@@ -11,10 +11,18 @@
 //! comparison, no profile. `tools/measure_writer.sh` runs it with the
 //! description of the machine; the data it writes is never committed.
 //!
+//! With `--group N` (record 0045) the same stream of commands, admission
+//! then release of each exchange, is committed `N` commands at a time
+//! through `SqliteStore::apply_group`: one engine transaction and one
+//! synchronisation for each group. `transactions_per_second` then counts
+//! the commands made durable, and `commits_per_second` the groups. The
+//! default, 1, is the measurement of record 0008 unchanged: `apply`, one
+//! transaction for each command.
+//!
 //! ```text
 //! cargo run --release -p mqttiumd-store-sqlite --example measure_writer -- \
 //!     --dir <directory on the storage measured> --payload 1024 --fanout 1 \
-//!     --ops 2000 --warmup 100 [--memory]
+//!     --ops 2000 --warmup 100 [--group 32] [--memory]
 //! ```
 
 use std::path::PathBuf;
@@ -35,8 +43,10 @@ use mqttiumd_contract::ids::{
 use mqttiumd_contract::outcome::{StoreOutcome, StoreReply};
 use mqttiumd_contract::packet::{Qos, SharedBytes};
 use mqttiumd_lab::store::conformance::open;
-use mqttiumd_lab::store::durable::{AdminCommand, AdminDone, DurableStore, Limits, MemoryStore};
-use mqttiumd_store_sqlite::SqliteStore;
+use mqttiumd_lab::store::durable::{
+    AdminCommand, AdminDone, Applied, DurableStore, Limits, MemoryStore,
+};
+use mqttiumd_store_sqlite::{MAX_GROUP, SqliteStore};
 use serde_json::{Value, json};
 
 const INCARNATION: StoreIncarnation = StoreIncarnation::new(1);
@@ -50,6 +60,9 @@ struct Options {
     ops: u64,
     warmup: u64,
     memory: bool,
+    /// Commands committed together (record 0045). 1: `apply`, one
+    /// transaction for each command.
+    group: usize,
     /// For the experiment of report 0002 only: another
     /// `wal_autocheckpoint`, in pages. The store keeps its default.
     wal_autocheckpoint: Option<i64>,
@@ -63,6 +76,7 @@ fn options() -> Options {
         ops: 2000,
         warmup: 100,
         memory: false,
+        group: 1,
         wal_autocheckpoint: None,
     };
     let mut args = std::env::args().skip(1);
@@ -75,12 +89,17 @@ fn options() -> Options {
             "--ops" => options.ops = value().parse().expect("operations"),
             "--warmup" => options.warmup = value().parse().expect("operations"),
             "--memory" => options.memory = true,
+            "--group" => options.group = value().parse().expect("commands"),
             "--wal-autocheckpoint" => {
                 options.wal_autocheckpoint = Some(value().parse().expect("pages"));
             }
             other => panic!("unknown flag {other}"),
         }
     }
+    assert!(
+        (1..=MAX_GROUP).contains(&options.group),
+        "a group holds 1 to {MAX_GROUP} commands"
+    );
     options
 }
 
@@ -329,6 +348,125 @@ fn measure<S: DurableStore>(store: &mut S, options: &Options, wal: Option<&PathB
     })
 }
 
+/// A store that commits several commands together.
+trait GroupWriter: DurableStore {
+    fn commit_together(&mut self, commands: &[&Command]) -> Vec<Applied>;
+}
+
+impl GroupWriter for SqliteStore {
+    fn commit_together(&mut self, commands: &[&Command]) -> Vec<Applied> {
+        self.apply_group(commands).expect("within the bound")
+    }
+}
+
+/// The deterministic store has no medium and no transaction: a group is
+/// its commands in order.
+impl GroupWriter for MemoryStore {
+    fn commit_together(&mut self, commands: &[&Command]) -> Vec<Applied> {
+        commands.iter().map(|command| self.apply(command)).collect()
+    }
+}
+
+/// Commits the commands of `exchanges`, admission then release of each,
+/// `group` at a time, and hands the duration of each group to `timed`.
+/// The commands are built outside the timed call, as for `apply`.
+fn grouped<S: GroupWriter>(
+    store: &mut S,
+    group: usize,
+    exchanges: std::ops::RangeInclusive<u64>,
+    build: &dyn Fn(u64) -> [Command; 2],
+    mut timed: impl FnMut(Duration),
+) {
+    let mut pending: Vec<Command> = Vec::with_capacity(group);
+    let mut flush = |store: &mut S, pending: &mut Vec<Command>| {
+        let members: Vec<&Command> = pending.iter().collect();
+        let started = Instant::now();
+        let applied = store.commit_together(&members);
+        let elapsed = started.elapsed();
+        assert_eq!(applied.len(), members.len());
+        for reply in &applied {
+            assert!(
+                matches!(reply.reply, StoreReply::Outcome(StoreOutcome::Committed(_))),
+                "not committed: {:?}",
+                reply.reply
+            );
+        }
+        pending.clear();
+        timed(elapsed);
+    };
+    for n in exchanges {
+        for command in build(n) {
+            pending.push(command);
+            if pending.len() == group {
+                flush(store, &mut pending);
+            }
+        }
+    }
+    if !pending.is_empty() {
+        flush(store, &mut pending);
+    }
+}
+
+/// The measurement with `--group N`, N above 1: the same stream of
+/// commands as `measure`, committed N at a time.
+fn measure_groups<S: GroupWriter>(
+    store: &mut S,
+    options: &Options,
+    wal: Option<&PathBuf>,
+) -> Value {
+    let (producer, targets, route_revision, epoch) = prepare(store, options.fanout);
+    let payload = vec![0x5A; options.payload];
+    let build = |n: u64| {
+        [
+            admission(epoch, route_revision, producer, &targets, n, &payload),
+            release(epoch, producer, n),
+        ]
+    };
+    if options.warmup > 0 {
+        grouped(store, options.group, 1..=options.warmup, &build, |_| {});
+    }
+    let before = usage();
+    let mut groups = Vec::new();
+    // The largest the WAL file grew, sampled after each group, outside the
+    // timed commit; the sampling is in the window.
+    let mut wal_max = 0u64;
+    let started = Instant::now();
+    grouped(
+        store,
+        options.group,
+        options.warmup + 1..=options.warmup + options.ops,
+        &build,
+        |elapsed| {
+            groups.push(elapsed);
+            if let Some(wal) = wal {
+                wal_max = wal_max.max(std::fs::metadata(wal).map_or(0, |m| m.len()));
+            }
+        },
+    );
+    let window = started.elapsed();
+    let group_tail = tail(&groups);
+    let after = usage();
+    json!({
+        "window_s": window.as_secs_f64(),
+        "transactions_per_second": (2 * options.ops) as f64 / window.as_secs_f64(),
+        "commits_per_second": groups.len() as f64 / window.as_secs_f64(),
+        "group_commit": summary(groups),
+        "group_commit_tail": group_tail,
+        "wal_max_bytes": wal.map(|_| wal_max),
+        "usage_before": before,
+        "usage_after": after,
+    })
+}
+
+/// One transaction for each command, or one for each group.
+fn measured<S: GroupWriter>(store: &mut S, options: &Options, wal: Option<&PathBuf>) -> Value {
+    if options.group == 1 {
+        measure(store, options, wal)
+    } else {
+        measure_groups(store, options, wal)
+    }
+}
+
 fn main() {
     let options = options();
     let parameters = json!({
@@ -337,7 +475,8 @@ fn main() {
         "ops": options.ops,
         "warmup": options.warmup,
         "wal_autocheckpoint_set": options.wal_autocheckpoint,
-        "one_transaction_per_command": true,
+        "group": options.group,
+        "one_transaction_per_command": options.group == 1,
     });
     let report = if options.memory {
         let mut store = MemoryStore::create(INCARNATION, limits(&options));
@@ -346,7 +485,7 @@ fn main() {
             "qualifies": "nothing",
             "backend": "memory (the deterministic store: no medium, no transaction)",
             "parameters": parameters,
-            "result": measure(&mut store, &options, None),
+            "result": measured(&mut store, &options, None),
         })
     } else {
         std::fs::create_dir_all(&options.dir).expect("the directory");
@@ -367,7 +506,7 @@ fn main() {
         let mut wal = path.clone().into_os_string();
         wal.push("-wal");
         let wal = PathBuf::from(wal);
-        let result = measure(&mut store, &options, Some(&wal));
+        let result = measured(&mut store, &options, Some(&wal));
         let size = |suffix: &str| {
             let mut file = path.clone().into_os_string();
             file.push(suffix);

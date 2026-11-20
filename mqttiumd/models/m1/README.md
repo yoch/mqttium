@@ -378,7 +378,9 @@ not properties of the core. They are raised as an open condition.
 - The atomic `Commit(o, r)` update used by `ApplyCommand` is an assumption
   (`ApplyCommit` in the M1a comment). The SQLite implementation maps it to
   one `BEGIN IMMEDIATE` transaction through guards, all durable writes and
-  the meta revision, followed by `COMMIT`. Full-state reference tests at
+  the meta revision, followed by `COMMIT`. A group of proposed record 0045
+  is K `ApplyCommand` steps in one such transaction, with no crash between
+  them; this model does not describe it. Full-state reference tests at
   K1/K2b/K3, sampled K2a process kills and separate artificial WAL-prefix
   images support that implementation. A finite test family does not prove
   atomicity for every instant or failure; the kernel/page cache survive
