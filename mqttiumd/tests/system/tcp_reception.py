@@ -568,7 +568,7 @@ def concurrency(binary: Path, case: Path) -> dict:
                     retained = [event for event in events if event["kind"] == "effect_retained"
                                 and event.get("details", {}).get("code") == "output_queue_full"]
                     closed = [event for event in events if event["kind"] == "connection_closed"]
-                    if retained or closed:
+                    if closed:
                         break
                     if sent < maximum and send_error is None:
                         try:
@@ -584,15 +584,13 @@ def concurrency(binary: Path, case: Path) -> dict:
                         except OSError as error:
                             send_error = type(error).__name__
                     # Continue observing after reaching the byte cap, bounded
-                    # by the same deadline, until the actual pressure event.
+                    # by the same deadline, until the transport closes. A
+                    # transient full queue can recover and accept its frame.
                     time.sleep(.002)
                 healthy.result(timeout=10)
             broker.observations.record("nonreader_flood", bytes_sent=sent, byte_budget=maximum,
                                        deadline_ms=12000, elapsed_ms=int((time.monotonic() - started) * 1000),
                                        send_error=send_error or "none", output_queue_full=bool(retained))
-            require(not any(event["kind"] == "connection_closed"
-                            and event.get("details", {}).get("code") == "input_queue_full" for event in events),
-                    "input_saturation_instead_of_output")
             require(retained, "output_saturation_not_reached")
             deadline = time.monotonic() + 3
             while time.monotonic() < deadline:
@@ -600,8 +598,10 @@ def concurrency(binary: Path, case: Path) -> dict:
                           and event.get("connection") == generation]
                 retained = [event for event in events if event["kind"] == "effect_retained"
                             and event.get("details", {}).get("code") == "output_queue_full"]
-                if retained and any(event["kind"] == "frame_failed" and event.get("details", {}).get("effect")
-                                   in {r["details"]["effect"] for r in retained} for event in events):
+                retained_ids = {event["details"]["effect"] for event in retained}
+                terminal = {event.get("details", {}).get("effect") for event in events
+                            if event["kind"] in ("frame_failed", "frame_written")}
+                if retained and retained_ids <= terminal and any(event["kind"] == "connection_closed" for event in events):
                     break
                 time.sleep(.01)
             require(retained, "output_saturation_not_reached")
@@ -609,8 +609,10 @@ def concurrency(binary: Path, case: Path) -> dict:
             terminal = {event.get("details", {}).get("effect") for event in events
                         if event["kind"] in ("frame_failed", "frame_written")}
             require(retained_ids <= terminal, "retained_effect_lost", repr(retained_ids - terminal))
-            require(any(event["kind"] == "connection_closed" and event.get("details", {}).get("code")
-                        in ("outgoing_queue_full", "write_timeout", "write_io") for event in events),
+            first_pressure = min(int(event["seq"]) for event in retained)
+            require(any(event["kind"] == "connection_closed" and int(event["seq"]) > first_pressure
+                        and event.get("details", {}).get("code") in
+                        ("outgoing_queue_full", "write_timeout", "write_io", "input_queue_full") for event in events),
                     "nonreader_not_closed_within_budget")
             pressure = database(broker.db)
             require(target[0] in pressure["admissions"], "nonreader_committed_admission_lost")

@@ -121,7 +121,18 @@ struct Peer {
     receiving: crate::receiving::Window,
     closing: Option<(&'static str, Instant)>,
     deferred_publish: Option<DeferredPublish>,
+    blocked_output: Option<EffectId>,
     retire_code: Option<&'static str>,
+}
+impl Peer {
+    fn submitted_output(&mut self, effect: EffectId) -> bool {
+        if self.blocked_output == Some(effect) {
+            self.blocked_output = None;
+            true
+        } else {
+            false
+        }
+    }
 }
 struct DeferredPublish {
     packet: InboundPacket,
@@ -135,6 +146,7 @@ struct PendingFrame {
     receive_serial: Option<u64>,
     terminal: Option<Terminal>,
     wire_released: bool,
+    was_retained: bool,
 }
 struct PendingWillConnect {
     connect: codec::Connect,
@@ -567,6 +579,7 @@ impl Runtime<'_> {
                 receiving: crate::receiving::Window::default(),
                 closing: None,
                 deferred_publish: None,
+                blocked_output: None,
                 retire_code: None,
             },
         );
@@ -801,6 +814,7 @@ impl Runtime<'_> {
                     .frames
                     .remove(&id)
                     .ok_or_else(|| Failure::plain("frame_missing_on_close"))?;
+                self.retained_write_failed(id, &frame, code)?;
                 if frame.kind == "PUBLISH0" {
                     self.queue(Input::Qos0EmitRefused {
                         effect: id,
@@ -2907,11 +2921,25 @@ impl Runtime<'_> {
             let mut tls_close = None;
             let mut input_ended = false;
             self.wire_progress(generation)?;
-            self.retry_deferred_publish(generation)?;
+            let backpressured = self.peers.get_mut(&generation).is_some_and(|peer| {
+                if let Some(effect) = peer.blocked_output
+                    && self.owner.outbox().is_some_and(|outbox| {
+                        outbox.pending().any(|pending| pending.id() == effect)
+                    })
+                {
+                    peer.io.terminal_reason().is_none()
+                } else {
+                    peer.blocked_output = None;
+                    false
+                }
+            });
+            if !backpressured {
+                self.retry_deferred_publish(generation)?;
+            }
             for _ in 0..4 {
                 // A CONNECT can use one slot now and reserve one for Open.
                 // Leave the bytes with their socket reader until both fit.
-                if self.ordinary_room() < 2 {
+                if backpressured || self.ordinary_room() < 2 {
                     break;
                 }
                 let incoming = match self.peers.get_mut(&generation) {
@@ -3169,7 +3197,9 @@ impl Runtime<'_> {
                 }
                 Ok(net::Written::Failed { correlation, code }) => {
                     if let Some((effect, connection)) = correlation {
-                        self.frames.remove(&effect);
+                        if let Some(frame) = self.frames.remove(&effect) {
+                            self.retained_write_failed(effect, &frame, code)?;
+                        }
                         self.queue(Input::FrameResult {
                             effect,
                             connection,
@@ -3293,7 +3323,7 @@ impl Runtime<'_> {
         let (kind, id) = (pending.kind, pending.packet_id);
         if kind == "PUBLISH0" {
             self.events.emit("frame_written",json!({"connection":generation.get().to_string(),"details":{"packet_kind":"PUBLISH","qos":0,"effect":effect_text(effect),"bytes":bytes}})).map_err(event_failure)?;
-        } else if kind != "PINGRESP" {
+        } else if kind != "PINGRESP" || pending.was_retained {
             self.events.emit("frame_written",json!({"connection":generation.get().to_string(),"details":{"packet_kind":kind,"effect":effect_text(effect),"packet_id":id.unwrap_or(0),"publish_order":pending.receive_serial.map(|v|v.to_string()).unwrap_or_default(),"bytes":bytes}})).map_err(event_failure)?;
         }
         if let Some(terminal) = pending.terminal
@@ -3503,6 +3533,23 @@ impl Runtime<'_> {
                     self.connect(generation, connect)?;
                 }
             }
+        }
+        Ok(())
+    }
+    fn retained_write_failed(
+        &self,
+        effect: EffectId,
+        frame: &PendingFrame,
+        code: &str,
+    ) -> Result<(), Failure> {
+        if frame.was_retained {
+            self.events
+                .emit(
+                    "frame_failed",
+                    json!({"connection":frame.connection.generation.get().to_string(),
+                "details":{"effect":effect_text(effect),"packet_kind":frame.kind,"code":code}}),
+                )
+                .map_err(event_failure)?;
         }
         Ok(())
     }
@@ -3887,6 +3934,7 @@ impl EffectSink for Sink<'_> {
                                 receive_serial: None,
                                 terminal: None,
                                 wire_released: false,
+                                was_retained: false,
                             },
                         );
                         if self.events.emit("frame_queued",json!({"connection":generation.get().to_string(),"details":{"packet_kind":"PUBLISH","qos":0,"origin":qos0_origin(origin),"effect":effect_text(id)}})).is_err(){self.error=Some(Failure::plain("events_unavailable"));}
@@ -4201,6 +4249,7 @@ impl EffectSink for Sink<'_> {
                                 receive_serial,
                                 terminal,
                                 wire_released: false,
+                                was_retained: peer.submitted_output(id),
                             },
                         );
                         let _ = effect.into_parts();
@@ -4208,7 +4257,8 @@ impl EffectSink for Sink<'_> {
                         SubmitResult::Accepted
                     }
                     Err(TrySendError::Full(_)) => {
-                        if self.events.emit("effect_retained",json!({"connection":generation.get().to_string(),"details":{"code":"output_queue_full","effect":effect_text(id),"packet_kind":kind}})).is_err(){self.error=Some(Failure::plain("events_unavailable"));}
+                        if peer.blocked_output.replace(id) != Some(id)
+                            && self.events.emit("effect_retained",json!({"connection":generation.get().to_string(),"details":{"code":"output_queue_full","effect":effect_text(id),"packet_kind":kind}})).is_err(){self.error=Some(Failure::plain("events_unavailable"));}
                         refused(effect, SubmitBlock::TransportBackpressure)
                     }
                     Err(TrySendError::Disconnected(_)) => {
@@ -4463,6 +4513,7 @@ impl EffectSink for Sink<'_> {
                                 receive_serial: None,
                                 terminal: None,
                                 wire_released: false,
+                                was_retained: peer.submitted_output(id),
                             },
                         );
                         let _ = effect.into_parts();
@@ -4471,7 +4522,8 @@ impl EffectSink for Sink<'_> {
                     }
                     Err(TrySendError::Full(_)) => {
                         self.outgoing_bindings.remove(&binding_key);
-                        if self.events.emit("effect_retained",json!({"connection":generation.get().to_string(),"details":{"code":"output_queue_full","effect":effect_text(id),"packet_kind":"PUBLISH"}})).is_err(){self.error=Some(Failure::plain("events_unavailable"));}
+                        if peer.blocked_output.replace(id) != Some(id)
+                            && self.events.emit("effect_retained",json!({"connection":generation.get().to_string(),"details":{"code":"output_queue_full","effect":effect_text(id),"packet_kind":"PUBLISH"}})).is_err(){self.error=Some(Failure::plain("events_unavailable"));}
                         refused(effect, SubmitBlock::TransportBackpressure)
                     }
                     Err(TrySendError::Disconnected(_)) => {

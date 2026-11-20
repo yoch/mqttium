@@ -10,6 +10,9 @@ resource still stops the scan and preserves the relative order of the
 remaining effects. The same preallocated outbox holds the deferred frames.
 The adapter's actual transport terminal or write deadline retires the
 connection and its outstanding facts through the existing close path.
+The reactor stops dequeuing further packets on a backpressured generation
+and still collects write receipts and transport terminals. A previously
+held write keeps an observable terminal even for PINGRESP.
 
 Reserve the room a packet can use before removing it from the socket
 channel. Polling starts at a rotating connection. A CONNECT reserves

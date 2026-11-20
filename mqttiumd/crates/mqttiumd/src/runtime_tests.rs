@@ -258,6 +258,7 @@ fn peer(runtime: &mut Runtime<'_>) -> (ConnectionGeneration, TcpStream) {
             receiving: crate::receiving::Window::default(),
             closing: None,
             deferred_publish: None,
+            blocked_output: None,
             retire_code: None,
         },
     );
@@ -1614,6 +1615,19 @@ fn a_slow_transport_holds_its_acks_while_an_independent_exchange_progresses() {
                 before.iter().map(|(_, mid)| *mid).collect::<Vec<_>>(),
                 [1, 2]
             );
+            let (incoming, held_packet) = std::sync::mpsc::sync_channel(net::INPUT_SLOTS);
+            incoming
+                .try_send(net::Incoming::Packet {
+                    first: 0xc0,
+                    body: vec![],
+                    observed: Ok(runtime.message_now().unwrap()),
+                })
+                .unwrap();
+            let original_input = std::mem::replace(
+                &mut runtime.peers.get_mut(&slow).unwrap().io.incoming,
+                held_packet,
+            );
+            let ingress = runtime.peers[&slow].ingress;
 
             runtime.packet(independent, 0x32, publish_body(7)).unwrap();
             until(runtime, |r| {
@@ -1635,6 +1649,10 @@ fn a_slow_transport_holds_its_acks_while_an_independent_exchange_progresses() {
                 before,
                 "slow connection must still own both ordered frames"
             );
+            assert_eq!(
+                runtime.peers[&slow].ingress, ingress,
+                "a blocked output must stop further input for that peer"
+            );
             assert_eq!(held.try_iter().count(), net::OUTPUT_SLOTS);
             runtime.peers.get_mut(&slow).unwrap().io.outgoing = original;
             runtime.dispatch().unwrap();
@@ -1643,6 +1661,11 @@ fn a_slow_transport_holds_its_acks_while_an_independent_exchange_progresses() {
                 assert_eq!((first, &body[..2]), (0x40, &[0, mid][..]));
             }
             assert!(pending(runtime).is_empty());
+            runtime.connections().unwrap();
+            runtime.drain_inputs().unwrap();
+            assert_eq!(runtime.peers[&slow].ingress, ingress + 1);
+            assert_eq!(read_frame(&mut receiver_a), (0xd0, vec![]));
+            runtime.peers.get_mut(&slow).unwrap().io.incoming = original_input;
         });
     }
 }
