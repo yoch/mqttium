@@ -28,7 +28,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
-    mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError},
+    mpsc::{self, Receiver, TryRecvError, TrySendError},
 };
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -300,11 +300,13 @@ impl Hooks {
     }
 }
 pub struct Writer {
-    pub sender: SyncSender<Request>,
+    pub sender: crate::wake::Signalled<Request>,
     pub receiver: Receiver<Response>,
-    pub control_sender: SyncSender<ControlRequest>,
+    pub control_sender: crate::wake::Signalled<ControlRequest>,
     pub control_receiver: Receiver<ControlResponse>,
     pub boot: Receiver<Result<Boot, Failure>>,
+    /// Signalled after each reply the worker publishes.
+    pub wake: crate::wake::Wake,
     handle: Option<JoinHandle<()>>,
 }
 impl Writer {
@@ -350,11 +352,21 @@ impl Writer {
         require_existing: bool,
     ) -> Result<Self, Failure> {
         let _ = &hooks;
-        let (tx, rx) = mpsc::sync_channel(QUEUE);
+        // The worker waits on `requests` when both request lanes are empty.
+        let requests = crate::wake::Wake::new();
+        let (tx, rx) = crate::wake::signalled(QUEUE, &requests);
         let (rtx, rrx) = mpsc::sync_channel(64);
         let (btx, brx) = mpsc::sync_channel(1);
-        let (ctx, crx) = mpsc::sync_channel(CONTROL_QUEUE);
+        let (ctx, crx) = crate::wake::signalled(CONTROL_QUEUE, &requests);
+        // File-polled test controls have no producer to signal the worker.
+        let idle = if hooks.directory.is_some() {
+            Duration::from_millis(1)
+        } else {
+            Duration::from_millis(100)
+        };
         let (cctx, ccrx) = mpsc::sync_channel(CONTROL_QUEUE);
+        let wake = crate::wake::Wake::new();
+        let worker_wake = wake.clone();
         let handle = thread::Builder::new()
             .name("sqlite-writer".into())
             .spawn(move || {
@@ -377,18 +389,30 @@ impl Writer {
                 loop {
                     #[cfg(feature="test-hooks")]
                     if replay_controls(&mut store,&state,&hooks,&events).is_err() { cancel.store(true,Ordering::Relaxed); }
+                    // A reply lane the core has not drained is retried on a
+                    // short timer; nothing else in this loop waits on a timer.
+                    let mut stalled = false;
                     if let Some(reply) = pending_control.take() {
                         match cctx.try_send(reply) {
-                            Ok(()) => {}
-                            Err(TrySendError::Full(reply)) => pending_control = Some(reply),
+                            Ok(()) => worker_wake.wake(),
+                            Err(TrySendError::Full(reply)) => {
+                                stalled = true;
+                                pending_control = Some(reply);
+                            }
                             Err(TrySendError::Disconnected(_)) => return,
                         }
                     }
                     if let Some(reply) = pending.take() {
                         match rtx.try_send(reply) {
-                            Ok(()) if stopping => return,
-                            Ok(()) => {}
-                            Err(TrySendError::Full(reply)) => pending = Some(reply),
+                            Ok(()) if stopping => {
+                                worker_wake.wake();
+                                return;
+                            }
+                            Ok(()) => worker_wake.wake(),
+                            Err(TrySendError::Full(reply)) => {
+                                stalled = true;
+                                pending = Some(reply);
+                            }
                             Err(TrySendError::Disconnected(_)) => return,
                         }
                     }
@@ -419,7 +443,7 @@ impl Writer {
                         }
                     }
                     if pending.is_none() && !stopping {
-                        match rx.recv_timeout(Duration::from_millis(1)) {
+                        match rx.try_recv() {
                             Ok(Request::Stop) => {
                                 pending = Some(Response::Stopped);
                                 stopping = true;
@@ -429,10 +453,16 @@ impl Writer {
                                     &mut store, request, &events, &hooks, &cancel, &mut state,
                                 ))
                             }
-                            Err(mpsc::RecvTimeoutError::Timeout) => {}
-                            Err(mpsc::RecvTimeoutError::Disconnected) => return,
+                            // Both request lanes signal `requests`. A reply
+                            // produced in this turn is published before waiting.
+                            Err(TryRecvError::Empty) if pending_control.is_none() && !stalled => {
+                                requests.wait(idle);
+                            }
+                            Err(TryRecvError::Empty) => {}
+                            Err(TryRecvError::Disconnected) => return,
                         }
-                    } else {
+                    }
+                    if stalled {
                         thread::sleep(Duration::from_millis(1));
                     }
                 }
@@ -444,6 +474,7 @@ impl Writer {
             control_sender: ctx,
             control_receiver: ccrx,
             boot: brx,
+            wake,
             handle: Some(handle),
         })
     }

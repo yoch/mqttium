@@ -56,6 +56,9 @@ const DEADLINE_INPUTS: usize = 4;
 const ORDINARY_INPUTS: usize = INPUTS - WRITER_INPUTS - DEADLINE_INPUTS;
 const OUTGOING_BINDINGS: usize = 128;
 const LIFECYCLE_IN_FLIGHT: usize = 1;
+/// Upper bound of an idle wait: connection deadlines and expiry scans are
+/// wall-clock checks without a producer to signal them.
+const IDLE_TICK: Duration = Duration::from_millis(20);
 const MESSAGE_EXPIRY_RETRIES: u8 = 3;
 const CLOSING_INPUTS: usize = 2 * CONNECTIONS;
 // Per transport: four queued frames, one active and eight terminal receipts.
@@ -181,6 +184,11 @@ struct AppliedSessionChange {
     change: SessionChange,
 }
 struct Runtime<'a> {
+    /// Counts what a pass achieved: a value taken from a lane, an applied
+    /// transition, an effect accepted by an adapter. A pass that leaves it
+    /// unchanged has nothing to do until a producer signals `wake`.
+    progress: u64,
+    wake: crate::wake::Wake,
     security: Option<Security>,
     message_expiry_request: Option<(MessageTime, Option<PublicationId>)>,
     message_expiry_retry: bool,
@@ -504,6 +512,37 @@ impl Runtime<'_> {
         Ok(())
     }
 
+    /// One pass over every source, in the fixed order of the reactor.
+    fn turn(&mut self) -> Result<(), Failure> {
+        self.writer_results()?;
+        self.connections()?;
+        self.discover_work();
+        self.expire_messages()?;
+        self.expire_sessions()?;
+        self.due_deadlines()?;
+        #[cfg(feature = "test-hooks")]
+        self.controls()?;
+        self.drain_inputs()?;
+        self.dispatch()
+    }
+
+    /// How long an idle reactor may wait for a signal. A due core deadline
+    /// bounds it exactly. The connection deadlines, the expiry scans and the
+    /// file-polled test controls have no producer and are bounded by a tick.
+    fn idle_wait(&self) -> Duration {
+        #[cfg(feature = "test-hooks")]
+        if self.hooks.directory.is_some() {
+            return Duration::from_millis(1);
+        }
+        let now = Instant::now();
+        self.timers
+            .values()
+            .map(|due| due.saturating_duration_since(now))
+            .min()
+            .unwrap_or(IDLE_TICK)
+            .min(IDLE_TICK)
+    }
+
     fn accept(&mut self, stream: std::net::TcpStream) -> Result<bool, Failure> {
         // Retiring threads count against the same hard connection budget.
         let close_reserved = self
@@ -549,10 +588,11 @@ impl Runtime<'_> {
                 security.tls.clone(),
                 security.policy.clone(),
                 self.clock.clone(),
+                self.wake.clone(),
                 #[cfg(feature = "test-hooks")]
                 (self.hooks.clone(), self.events.clone()),
             ),
-            None => net::spawn_with_clock(stream, self.clock.clone()),
+            None => net::spawn_with_wake(stream, self.clock.clone(), self.wake.clone()),
         }
         .map_err(|_| Failure::plain("socket_spawn"))?;
         let sendbuf = io.send_buffer_bytes();
@@ -1520,6 +1560,7 @@ impl Runtime<'_> {
             ) {
                 StepOutcome::Applied { .. } => {
                     applied = true;
+                    self.progress = self.progress.wrapping_add(1);
                     if let Some(connection) = opening
                         && let Some((operation, _)) = self.owner.lifecycle_dispatch()
                         && previous_lifecycle != Some(operation)
@@ -1754,11 +1795,14 @@ impl Runtime<'_> {
         };
         #[cfg(feature = "test-hooks")]
         sink.release_qos0();
-        let _ = self.owner.dispatch(&mut sink);
+        let report = self.owner.dispatch(&mut sink);
         let close = std::mem::take(&mut sink.close);
         let changed = sink.session_change.take();
         let error = sink.error.take();
         drop(sink);
+        if report.accepted != 0 {
+            self.progress = self.progress.wrapping_add(1);
+        }
         if let Some(error) = error {
             return Err(error);
         }
@@ -1962,7 +2006,10 @@ impl Runtime<'_> {
         // attempt correlation; no adapter history or second retry loop exists.
         for _ in 0..crate::writer::CONTROL_QUEUE.saturating_sub(self.control_inputs.len()) {
             let response = match self.writer.control_receiver.try_recv() {
-                Ok(reply) => reply,
+                Ok(reply) => {
+                    self.progress = self.progress.wrapping_add(1);
+                    reply
+                }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
                     return Err(Failure::plain("writer_control_disconnected"));
@@ -1972,7 +2019,10 @@ impl Runtime<'_> {
         }
         for _ in 0..WRITER_INPUTS.saturating_sub(self.writer_input_count()) {
             let response = match self.writer.receiver.try_recv() {
-                Ok(r) => r,
+                Ok(r) => {
+                    self.progress = self.progress.wrapping_add(1);
+                    r
+                }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
                     return Err(Failure::plain("writer_disconnected"));
@@ -2955,6 +3005,9 @@ impl Runtime<'_> {
                     },
                     None => break,
                 };
+                if incoming.is_ok() {
+                    self.progress = self.progress.wrapping_add(1);
+                }
                 match incoming {
                     Ok(net::Incoming::Authenticated { elapsed }) => {
                         self.events.emit("tls_authenticated", json!({"connection":generation.get().to_string(),
@@ -3102,6 +3155,9 @@ impl Runtime<'_> {
                 Some(p) => p.io.written.try_recv(),
                 None => break,
             };
+            if written.is_ok() {
+                self.progress = self.progress.wrapping_add(1);
+            }
             match written {
                 Ok(net::Written::Started { correlation }) => {
                     if let Some((effect, connection)) = correlation
@@ -3240,7 +3296,10 @@ impl Runtime<'_> {
         };
         for _ in 0..net::OUTPUT_SLOTS + 1 + 8 {
             let progress = match peer.io.wire_progress.try_recv() {
-                Ok(progress) => progress,
+                Ok(progress) => {
+                    self.progress = self.progress.wrapping_add(1);
+                    progress
+                }
                 Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
             };
             // Written may already have consumed a completion between two
@@ -4800,6 +4859,74 @@ pub fn run(config: Config) -> Result<(), Failure> {
     events.emit("stopped",json!({"details":{"writer_released":true,"accepted_commands_certainly_rejected":false}})).map_err(event_failure)?;
     result
 }
+/// Accepts on its own thread so that the reactor never polls the listener.
+/// The lane is bounded: a reactor that does not take connections leaves
+/// them in the kernel backlog.
+struct Acceptor {
+    accepted: std::sync::mpsc::Receiver<Result<std::net::TcpStream, ()>>,
+    handle: thread::JoinHandle<()>,
+}
+
+impl Acceptor {
+    fn spawn(
+        listener: TcpListener,
+        cancel: Arc<AtomicBool>,
+        wake: crate::wake::Wake,
+    ) -> Result<Self, Failure> {
+        listener
+            .set_nonblocking(false)
+            .map_err(|_| Failure::plain("listen_blocking"))?;
+        let (sender, accepted) = std::sync::mpsc::sync_channel(4);
+        let handle = thread::Builder::new()
+            .name("mqttiumd-acceptor".into())
+            .spawn(move || {
+                while !cancel.load(Ordering::Relaxed) {
+                    let item = match listener.accept() {
+                        Ok((stream, _)) => Ok(stream),
+                        Err(error)
+                            if matches!(
+                                error.kind(),
+                                std::io::ErrorKind::Interrupted
+                                    | std::io::ErrorKind::ConnectionAborted
+                                    | std::io::ErrorKind::WouldBlock
+                            ) =>
+                        {
+                            continue;
+                        }
+                        Err(_) => Err(()),
+                    };
+                    if cancel.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    let failed = item.is_err();
+                    if sender.send(item).is_err() {
+                        break;
+                    }
+                    wake.wake();
+                    if failed {
+                        break;
+                    }
+                }
+            })
+            .map_err(|_| Failure::plain("acceptor_spawn"))?;
+        Ok(Self { accepted, handle })
+    }
+
+    /// The cancel flag is already set. One local connection ends the
+    /// blocking accept; the listener closes with the thread.
+    fn stop(self, address: SocketAddr) {
+        drop(self.accepted);
+        let _ = std::net::TcpStream::connect_timeout(&address, Duration::from_millis(200));
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !self.handle.is_finished() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(2));
+        }
+        if self.handle.is_finished() {
+            let _ = self.handle.join();
+        }
+    }
+}
+
 fn check_startup_cancel(cancel: &AtomicBool) -> Result<(), Failure> {
     if cancel.load(Ordering::Relaxed) {
         Err(Failure::plain("startup_cancelled"))
@@ -4896,6 +5023,8 @@ fn run_inner(
         })
         .collect();
     let mut runtime = Runtime {
+        progress: 0,
+        wake: writer.wake.clone(),
         security,
         message_expiry_request: None,
         message_expiry_retry: false,
@@ -5125,9 +5254,6 @@ fn run_inner(
         check_startup_cancel(&cancel)?;
         let listener =
             TcpListener::bind(listen).map_err(|_| Failure::plain("listen_unavailable"))?;
-        listener
-            .set_nonblocking(true)
-            .map_err(|_| Failure::plain("listen_nonblocking"))?;
         let address = listener
             .local_addr()
             .map_err(|_| Failure::plain("listen_address"))?;
@@ -5148,29 +5274,35 @@ fn run_inner(
         events.emit("will_capabilities",json!({"details":{"will":true,"will_qos":1,"will_retain":true,"will_delay_interval":0,"will_message_expiry":false,"max_will_intents":256,"max_will_bytes":8388608,"max_will_receipt_bytes":8388608}})).map_err(event_failure)?;
         events.emit("ready", readiness).map_err(event_failure)?;
         println!("mqttiumd ready {address} ({profile})");
-        while !cancel.load(Ordering::Relaxed) {
-            for _ in 0..4 {
-                match listener.accept() {
-                    Ok((stream, _)) => {
-                        let _ = runtime.accept(stream)?;
+        let acceptor = Acceptor::spawn(listener, cancel.clone(), runtime.wake.clone())?;
+        let served = (|| {
+            while !cancel.load(Ordering::Relaxed) {
+                let before = runtime.progress;
+                for _ in 0..4 {
+                    match acceptor.accepted.try_recv() {
+                        Ok(Ok(stream)) => {
+                            runtime.progress = runtime.progress.wrapping_add(1);
+                            let _ = runtime.accept(stream)?;
+                        }
+                        Ok(Err(())) => return Err(Failure::plain("accept_failed")),
+                        Err(TryRecvError::Empty) => break,
+                        Err(TryRecvError::Disconnected) => {
+                            return Err(Failure::plain("accept_failed"));
+                        }
                     }
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-                    Err(_) => return Err(Failure::plain("accept_failed")),
+                }
+                runtime.turn()?;
+                if runtime.progress == before {
+                    // Nothing was runnable. Every producer signals after it
+                    // publishes; the timeout only bounds the wall-clock
+                    // checks that have no producer.
+                    runtime.wake.wait(runtime.idle_wait());
                 }
             }
-            runtime.writer_results()?;
-            runtime.connections()?;
-            runtime.discover_work();
-            runtime.expire_messages()?;
-            runtime.expire_sessions()?;
-            runtime.due_deadlines()?;
-            #[cfg(feature = "test-hooks")]
-            runtime.controls()?;
-            runtime.drain_inputs()?;
-            runtime.dispatch()?;
-            thread::sleep(Duration::from_millis(1));
-        }
-        Ok(())
+            Ok(())
+        })();
+        acceptor.stop(address);
+        served
     })();
     cancel.store(true, Ordering::Relaxed);
     // A typed startup/read failure remains authoritative and performs no

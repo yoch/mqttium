@@ -89,6 +89,8 @@ fn with_runtime_clock_hooks(
     )
     .unwrap();
     let mut runtime = Runtime {
+        progress: 0,
+        wake: writer.wake.clone(),
         security: None,
         message_expiry_request: None,
         message_expiry_retry: false,
@@ -5047,6 +5049,7 @@ fn tls_test_peer(
         security.tls,
         security.policy,
         runtime.clock.clone(),
+        runtime.wake.clone(),
         #[cfg(feature = "test-hooks")]
         (runtime.hooks.clone(), runtime.events.clone()),
     )

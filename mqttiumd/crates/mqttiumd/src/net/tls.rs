@@ -20,10 +20,10 @@ pub(super) struct Task {
     pub control: Control,
     pub principal: Arc<OnceLock<Principal>>,
     pub policy: Arc<Policy>,
-    pub input: SyncSender<Incoming>,
+    pub input: Tx<Incoming>,
     pub output: Receiver<Write>,
-    pub written: SyncSender<Written>,
-    pub progress: SyncSender<WireProgress>,
+    pub written: Tx<Written>,
+    pub progress: Tx<WireProgress>,
     #[cfg(feature = "test-hooks")]
     pub trace: (crate::writer::Hooks, crate::events::Events),
 }

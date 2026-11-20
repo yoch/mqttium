@@ -8,6 +8,7 @@ pub mod net;
 pub mod policy_transition;
 pub mod runtime;
 pub mod session_time;
+pub mod wake;
 pub mod writer;
 
 mod receiving;

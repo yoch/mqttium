@@ -16,6 +16,7 @@ use mqttiumd_contract::message_expiry::{
 use crate::codec::{self, ErrorKind};
 use crate::security::{Policy, Principal};
 use crate::session_time::{SessionClock, SystemClock, TimeError};
+use crate::wake::Wake;
 
 mod tls;
 
@@ -94,10 +95,17 @@ pub struct WireProgress {
     pub connection: ConnectionKey,
 }
 
+use crate::wake::Signalled as Tx;
+
+fn lane<T>(slots: usize, wake: &Wake) -> (Tx<T>, Receiver<T>) {
+    crate::wake::signalled(slots, wake)
+}
+
 #[derive(Clone)]
 struct Control {
     cancelled: Arc<AtomicBool>,
     terminal: Arc<Mutex<Option<Terminal>>>,
+    wake: Wake,
     #[cfg(test)]
     pause_progress: Arc<AtomicBool>,
     #[cfg(test)]
@@ -122,6 +130,8 @@ impl Control {
                 observed_ns: crate::events::monotonic_ns(),
             });
         }
+        // The terminal reason is read by the core outside any lane.
+        self.wake.wake();
     }
 
     fn stop(&self, stream: &TcpStream, code: &'static str) {
@@ -153,6 +163,15 @@ pub fn spawn(stream: TcpStream) -> io::Result<Connection> {
 }
 
 pub fn spawn_with_clock(stream: TcpStream, clock: Arc<dyn SessionClock>) -> io::Result<Connection> {
+    spawn_with_wake(stream, clock, Wake::new())
+}
+
+/// `wake` is signalled whenever a task publishes towards the core.
+pub fn spawn_with_wake(
+    stream: TcpStream,
+    clock: Arc<dyn SessionClock>,
+    wake: Wake,
+) -> io::Result<Connection> {
     stream.set_nodelay(true)?;
     stream.set_read_timeout(Some(POLL))?;
     let socket = socket2::SockRef::from(&stream);
@@ -160,13 +179,14 @@ pub fn spawn_with_clock(stream: TcpStream, clock: Arc<dyn SessionClock>) -> io::
     let send_buffer = socket.send_buffer_size()?;
     let input_stream = stream.try_clone()?;
     let output_stream = stream.try_clone()?;
-    let (input_tx, incoming) = mpsc::sync_channel(INPUT_SLOTS);
+    let (input_tx, incoming) = lane(INPUT_SLOTS, &wake);
     let (outgoing, output_rx) = mpsc::sync_channel(OUTPUT_SLOTS);
-    let (written_tx, written) = mpsc::sync_channel(WRITTEN_SLOTS);
-    let (progress_tx, wire_progress) = mpsc::sync_channel(WIRE_PROGRESS_SLOTS);
+    let (written_tx, written) = lane(WRITTEN_SLOTS, &wake);
+    let (progress_tx, wire_progress) = lane(WIRE_PROGRESS_SLOTS, &wake);
     let control = Control {
         cancelled: Arc::new(AtomicBool::new(false)),
         terminal: Arc::new(Mutex::new(None)),
+        wake,
         #[cfg(test)]
         pause_progress: Arc::new(AtomicBool::new(false)),
         #[cfg(test)]
@@ -223,6 +243,7 @@ pub(crate) fn spawn_tls(
     config: Arc<rustls::ServerConfig>,
     policy: Arc<Policy>,
     clock: Arc<dyn SessionClock>,
+    wake: Wake,
     #[cfg(feature = "test-hooks")] trace: (crate::writer::Hooks, crate::events::Events),
 ) -> io::Result<Connection> {
     stream.set_nodelay(true)?;
@@ -230,13 +251,14 @@ pub(crate) fn spawn_tls(
     let socket = socket2::SockRef::from(&stream);
     socket.set_send_buffer_size(4096)?;
     let send_buffer = socket.send_buffer_size()?;
-    let (input_tx, incoming) = mpsc::sync_channel(INPUT_SLOTS);
+    let (input_tx, incoming) = lane(INPUT_SLOTS, &wake);
     let (outgoing, output_rx) = mpsc::sync_channel(OUTPUT_SLOTS);
-    let (written_tx, written) = mpsc::sync_channel(WRITTEN_SLOTS);
-    let (progress_tx, wire_progress) = mpsc::sync_channel(WIRE_PROGRESS_SLOTS);
+    let (written_tx, written) = lane(WRITTEN_SLOTS, &wake);
+    let (progress_tx, wire_progress) = lane(WIRE_PROGRESS_SLOTS, &wake);
     let control = Control {
         cancelled: Arc::new(AtomicBool::new(false)),
         terminal: Arc::new(Mutex::new(None)),
+        wake,
         #[cfg(test)]
         pause_progress: Arc::new(AtomicBool::new(false)),
         #[cfg(test)]
@@ -465,7 +487,7 @@ fn frame_observation(
 
 fn read_packets(
     mut stream: TcpStream,
-    sender: SyncSender<Incoming>,
+    sender: Tx<Incoming>,
     control: Control,
     clock: &dyn SessionClock,
 ) {
@@ -613,7 +635,7 @@ fn write_one(
     frame: &mut Write,
     control: &Control,
     clock: &dyn SessionClock,
-    sender: &SyncSender<Written>,
+    sender: &Tx<Written>,
 ) -> Result<(), WriteFailure> {
     write_attempts(
         &mut frame.bytes,
@@ -637,7 +659,7 @@ fn write_one(
     )
 }
 
-fn report(sender: &SyncSender<Written>, mut result: Written) -> bool {
+fn report(sender: &Tx<Written>, mut result: Written) -> bool {
     let deadline = Instant::now() + RESULT_WAIT;
     loop {
         match sender.try_send(result) {
@@ -657,8 +679,8 @@ fn report(sender: &SyncSender<Written>, mut result: Written) -> bool {
 fn write_frames(
     mut stream: TcpStream,
     receiver: Receiver<Write>,
-    sender: SyncSender<Written>,
-    progress: SyncSender<WireProgress>,
+    sender: Tx<Written>,
+    progress: Tx<WireProgress>,
     control: Control,
     clock: &dyn SessionClock,
 ) {
@@ -784,6 +806,7 @@ mod tests {
         Control {
             cancelled: Arc::new(AtomicBool::new(false)),
             terminal: Arc::new(Mutex::new(None)),
+            wake: Wake::new(),
             pause_progress: Arc::new(AtomicBool::new(false)),
             progress_waiting: Arc::new(AtomicBool::new(false)),
         }
