@@ -5302,7 +5302,9 @@ fn run_inner(
                 }
                 runtime.turn()?;
                 let idle = runtime.progress == before;
-                if idle || Instant::now() >= counters_due {
+                // The idle wait below is shorter than the interval, so the
+                // summary is at most one tick late.
+                if Instant::now() >= counters_due {
                     runtime.events.flush_tallies().map_err(event_failure)?;
                     counters_due = Instant::now() + COUNTERS_INTERVAL;
                 }
@@ -5313,7 +5315,8 @@ fn run_inner(
                     runtime.wake.wait(runtime.idle_wait());
                 }
             }
-            Ok(())
+            // What was counted since the last summary is not lost at the end.
+            runtime.events.flush_tallies().map_err(event_failure)
         })();
         acceptor.stop(address);
         served
