@@ -15,8 +15,8 @@
 (*     frame. Its close follows (at once for MQTT 3.1.1, after the         *)
 (*     DISCONNECT or the 300 ms bound for MQTT 5).                         *)
 (*   - `Connection::close` is `Control::stop` on the core thread, three    *)
-(*     steps the task may interleave: the terminal reason is recorded,     *)
-(*     `cancelled` is set, the socket is shut down.                        *)
+(*     steps the task may interleave: `cancelled` is set, the socket is    *)
+(*     shut down, and only then the terminal reason is recorded.           *)
 (*   - The task checks `cancelled` and then writes; a write on a socket    *)
 (*     that is shut down fails. A task that ends runs `Lanes::finish`.     *)
 (*   - `finish_close` gives Failed to every frame the old generation       *)
@@ -44,7 +44,7 @@ CONSTANTS
     Mutation    \* "none" or the name of a model mutation
 
 Mutations == {"none", "NoGenerationCheck", "LeaveFramesAtClose",
-              "OpenWithoutWaiting", "CancelWithoutShutdown"}
+              "OpenWithoutWaiting", "CancelWithoutShutdown", "RecordBeforeShutdown"}
 
 ASSUME /\ NumOld \in Nat /\ NumNew \in Nat
        /\ OutSlots \in Nat \ {0} /\ WrittenCap \in Nat \ {0}
@@ -76,7 +76,7 @@ VARIABLES
     inbox,      \* inputs queued for the owner
     binding,    \* Owner::connection_of(session)
     result,     \* per frame: the terminal result the owner applied
-    stopPc,     \* the core inside Control::stop: "idle", "cancel", "shut"
+    stopPc,     \* the core inside Control::stop: 0, or the step it is at
     stopGen,    \* the generation it is stopping
     recorded,   \* per generation: Control::terminal is set
     cancelled,  \* per generation: Control::cancelled
@@ -99,6 +99,16 @@ taskVars == <<tpc, active, phase, finished>>
 histVars == <<hForeignEnd, hWriteAfterBound, hWriteAfterRecord>>
 vars == <<coreVars, ownerVars, stopVars, ctlVars, out, written, taskVars, histVars>>
 
+\* The three steps of Control::stop, in order. RecordBeforeShutdown is
+\* the order the function had before the socket was shut first.
+StopOrder ==
+    IF Mutation = "RecordBeforeShutdown"
+    THEN <<"record", "cancel", "shut">>
+    ELSE <<"cancel", "shut", "record">>
+Stopping(step) == stopPc > 0 /\ StopOrder[stopPc] = step
+StopNext == stopPc' = IF stopPc = 3 THEN 0 ELSE stopPc + 1
+Idle == stopPc = 0
+
 Room(g) == Len(written[g]) < WrittenCap
 \* The receipts of the lane before its first Failed have been read.
 FactsRead(g) ==
@@ -112,7 +122,7 @@ Init ==
     /\ submitted = {} /\ pendingF = {}
     /\ inbox = {} /\ binding = Old
     /\ result = [f \in Frames |-> "none"]
-    /\ stopPc = "idle" /\ stopGen = Old
+    /\ stopPc = 0 /\ stopGen = Old
     /\ recorded = [g \in Gens |-> FALSE]
     /\ cancelled = [g \in Gens |-> FALSE]
     /\ shut = [g \in Gens |-> FALSE]
@@ -132,7 +142,7 @@ Init ==
 \* that peer is not closing and the session is bound to it.
 CoreSubmit(f) ==
     LET g == GenOf(f) IN
-    /\ stopPc = "idle"
+    /\ Idle
     /\ f \notin submitted /\ \A e \in Of(g) : e < f => e \in submitted
     /\ g \in peers /\ ~closing[g] /\ binding = g
     /\ Len(out[g]) < OutSlots /\ tpc[g] # "done"
@@ -145,7 +155,7 @@ CoreSubmit(f) ==
 \* collect_written, one receipt of a peer that is still in the table. The
 \* receipt carries the ConnectionKey of its frame; the result keeps it.
 CoreCollect(g) ==
-    /\ stopPc = "idle" /\ g \in peers /\ written[g] # <<>>
+    /\ Idle /\ g \in peers /\ written[g] # <<>>
     /\ LET r == Head(written[g]) IN
           /\ written' = [written EXCEPT ![g] = Tail(@)]
           /\ pendingF' = pendingF \ {r.frame}
@@ -158,7 +168,7 @@ CoreCollect(g) ==
 \* The second connection of the client arrives. `connect` finds the
 \* generation its session is bound to and `start_takeover` marks it.
 NewConnect ==
-    /\ stopPc = "idle" /\ opening = "none"
+    /\ Idle /\ opening = "none"
     /\ peers' = peers \cup {New}
     /\ opening' = "waiting"
     /\ closing' = [closing EXCEPT ![Old] = @ \/ Old \in peers]
@@ -166,14 +176,13 @@ NewConnect ==
                    written, taskVars, histVars>>
 
 \* Runtime::close begins: the retire code is set and Connection::close
-\* records the terminal reason, the first step of Control::stop.
+\* enters Control::stop.
 BeginClose(g) ==
-    /\ stopPc = "idle" /\ g \in peers /\ ~retire[g]
+    /\ Idle /\ g \in peers /\ ~retire[g]
     /\ retire' = [retire EXCEPT ![g] = TRUE]
     /\ closing' = [closing EXCEPT ![g] = TRUE]
-    /\ recorded' = [recorded EXCEPT ![g] = TRUE]
-    /\ stopPc' = "cancel" /\ stopGen' = g
-    /\ UNCHANGED <<peers, opening, submitted, pendingF, ownerVars, cancelled, shut,
+    /\ stopPc' = 1 /\ stopGen' = g
+    /\ UNCHANGED <<peers, opening, submitted, pendingF, ownerVars, ctlVars,
                    out, written, taskVars, histVars>>
 
 \* A close that is due: the peer was taken over, or its task ended.
@@ -184,20 +193,28 @@ CoreCloseOther(g) == BeginClose(g)
 
 \* `cancelled.store(true)`.
 CoreStopCancel ==
-    /\ stopPc = "cancel"
+    /\ Stopping("cancel")
     /\ cancelled' = [cancelled EXCEPT ![stopGen] = TRUE]
-    /\ stopPc' = "shut"
+    /\ StopNext
     /\ UNCHANGED <<coreVars, ownerVars, stopGen, recorded, shut, out, written,
                    taskVars, histVars>>
 
 \* `stream.shutdown(Shutdown::Both)`. CancelWithoutShutdown leaves the
 \* socket open and relies on the flag.
 CoreStopShut ==
-    /\ stopPc = "shut"
+    /\ Stopping("shut")
     /\ shut' = IF Mutation = "CancelWithoutShutdown" THEN shut
                ELSE [shut EXCEPT ![stopGen] = TRUE]
-    /\ stopPc' = "idle"
+    /\ StopNext
     /\ UNCHANGED <<coreVars, ownerVars, stopGen, recorded, cancelled, out, written,
+                   taskVars, histVars>>
+
+\* `self.record(code)`: the terminal reason, after the socket is shut.
+CoreStopRecord ==
+    /\ Stopping("record")
+    /\ recorded' = [recorded EXCEPT ![stopGen] = TRUE]
+    /\ StopNext
+    /\ UNCHANGED <<coreVars, ownerVars, stopGen, cancelled, shut, out, written,
                    taskVars, histVars>>
 
 \* finish_close: Failed for every frame the generation still has in the
@@ -206,7 +223,7 @@ CoreStopShut ==
 \* first Failed. LeaveFramesAtClose removes the peer and leaves its
 \* frames.
 CoreFinishClose(g) ==
-    /\ stopPc = "idle" /\ g \in peers /\ retire[g]
+    /\ Idle /\ g \in peers /\ retire[g]
     /\ Preserve => finished[g] /\ FactsRead(g)
     /\ peers' = peers \ {g}
     /\ LET left == pendingF \cap Of(g) IN
@@ -223,7 +240,7 @@ CoreFinishClose(g) ==
 \* the previous peer is gone from the table. OpenWithoutWaiting starts it
 \* at once.
 CoreOpenNew ==
-    /\ stopPc = "idle" /\ opening = "waiting"
+    /\ Idle /\ opening = "waiting"
     /\ New \in peers /\ ~closing[New]
     /\ Old \notin peers \/ Mutation = "OpenWithoutWaiting"
     /\ opening' = "queued"
@@ -273,7 +290,9 @@ OwnerOpen ==
 (***************************************************************************)
 
 \* The task ends: `Driven::finish` runs Control::stop on its own thread,
-\* where no write of this task can interleave, then Lanes::finish.
+\* where no write of this task can interleave, then Lanes::finish. The
+\* reason the task records is the one kept if the core has not recorded
+\* its own yet.
 End(g) ==
     /\ tpc' = [tpc EXCEPT ![g] = "fin"]
     /\ recorded' = [recorded EXCEPT ![g] = TRUE]
@@ -354,7 +373,7 @@ TaskFinish(g) ==
 \* A peer that stays in the table always has a step left: the core may
 \* close it.
 Terminal ==
-    /\ peers = {} /\ opening # "none" /\ stopPc = "idle"
+    /\ peers = {} /\ opening # "none" /\ Idle
     /\ \A g \in Gens : tpc[g] = "done"
     /\ inbox = {}
 
@@ -368,6 +387,7 @@ Next ==
     \/ \E g \in Gens : CoreCloseOther(g)
     \/ CoreStopCancel
     \/ CoreStopShut
+    \/ CoreStopRecord
     \/ \E g \in Gens : CoreFinishClose(g)
     \/ CoreOpenNew
     \/ \E i \in Inputs : OwnerFrameResult(i)
@@ -391,8 +411,8 @@ Spec == Init /\ [][Next]_vars
 \* sockets.
 FairSpec ==
     /\ Spec
-    /\ WF_vars(CoreStopCancel) /\ WF_vars(CoreStopShut) /\ WF_vars(CoreOpenNew)
-    /\ WF_vars(OwnerOpen)
+    /\ WF_vars(CoreStopCancel) /\ WF_vars(CoreStopShut) /\ WF_vars(CoreStopRecord)
+    /\ WF_vars(CoreOpenNew) /\ WF_vars(OwnerOpen)
     /\ \A i \in Inputs : WF_vars(OwnerFrameResult(i)) /\ WF_vars(OwnerClosed(i))
     /\ \A g \in Gens :
           /\ WF_vars(CoreCollect(g)) /\ WF_vars(CoreCloseDue(g))
@@ -412,7 +432,7 @@ TypeOK ==
     /\ inbox \subseteq Inputs
     /\ binding \in Gens \cup {Unbound}
     /\ result \in [Frames -> Terminals \cup {"none", "twice"}]
-    /\ stopPc \in {"idle", "cancel", "shut"} /\ stopGen \in Gens
+    /\ stopPc \in 0..3 /\ stopGen \in Gens
     /\ recorded \in [Gens -> BOOLEAN] /\ cancelled \in [Gens -> BOOLEAN]
     /\ shut \in [Gens -> BOOLEAN] /\ finished \in [Gens -> BOOLEAN]
     /\ out \in [Gens -> Seq(Frames)] /\ written \in [Gens -> Seq(Receipts)]
@@ -458,10 +478,15 @@ OldClosedBeforeNewBound ==
 \* new generation.
 OldSilentOnceNewBound == ~hWriteAfterBound
 
-\* A peer that is closed has its socket shut down before the core does
-\* anything else.
+\* A peer that is closed has its socket shut down and its reason
+\* recorded before the core does anything else.
 ClosedIsShut ==
-    \A g \in Gens : (retire[g] /\ stopPc = "idle") => shut[g] /\ cancelled[g]
+    \A g \in Gens : (retire[g] /\ Idle) => shut[g] /\ cancelled[g] /\ recorded[g]
+
+\* Once the terminal reason of a connection can be read, its socket is
+\* shut down, and no byte leaves on it any more.
+RecordedIsShut == \A g \in Gens : recorded[g] => shut[g]
+NoWriteAfterRecord == ~hWriteAfterRecord
 
 (***************************************************************************)
 (* Progress, under FairSpec.                                               *)
@@ -478,11 +503,6 @@ TakeoverCompletes == (opening = "waiting") ~> (binding = New \/ retire[New])
 (***************************************************************************)
 (* Non-vacuity, each the negation of an invariant TLC must report.         *)
 (***************************************************************************)
-
-\* Bytes leave on a socket after the core recorded its terminal reason and
-\* before it shut the socket down: the task had checked `cancelled` before
-\* the core set it. The implementation allows this window.
-NoWriteAfterRecord == ~hWriteAfterRecord
 
 \* A Failed result of the old generation is applied while the session is
 \* bound to the new one, and the generation check absorbs it.
