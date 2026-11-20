@@ -1,0 +1,22 @@
+{
+  "module": "MLaneOwed.tla",
+  "status": "refinement",
+  "summary": "A task that finds a lane to the core full (net.rs publish, Link::owe / Link::consumed): try, mark `owed`, try again; the consumer that takes a value swaps the mark and notifies. A refused value is published or the task ends with its queue-full code after its wait bound, by the tick with a stalled consumer and without any tick when the consumer consumes.",
+  "issues": [648],
+  "tests": ["mqttiumd/crates/mqttiumd/src/net.rs", "mqttiumd/crates/mqttiumd/src/net/reactor.rs"],
+  "replays": [{"file": "mqttiumd/crates/mqttiumd/src/net.rs", "test": "input_saturation_retains_its_cause_outside_the_full_queue"}, {"file": "mqttiumd/crates/mqttiumd/src/net/reactor.rs", "test": "a_notification_runs_the_task_once_and_a_waiting_task_is_ticked"}],
+  "not_replayed": "The counterexample of mut-single-attempt (the consumer empties the lane between the first attempt and the mark) needs a chosen schedule of the core and reactor threads; no deterministic test replays it, and the 5 ms tick hides it from a timing test (mut-single-attempt-ticked passes).",
+  "configs": [
+    {"config": "MLaneOwed-safety.cfg", "expect": "pass", "invariants": ["TypeOK", "LaneBounded", "NoLostOwed", "EndedOnlyAfterDeadline"]},
+    {"config": "MLaneOwed-safety-ticked.cfg", "expect": "pass", "invariants": ["TypeOK", "LaneBounded", "NoLostOwed", "EndedOnlyAfterDeadline"]},
+    {"config": "MLaneOwed-liveness-tick.cfg", "expect": "pass", "property": "HeldEndsOrPublishes"},
+    {"config": "MLaneOwed-liveness-consumer.cfg", "expect": "pass", "property": "HeldEndsOrPublishes"},
+    {"config": "MLaneOwed-reach-second-attempt-saves.cfg", "expect": "violation", "invariant": "NoSecondAttemptSavesWitness"},
+    {"config": "MLaneOwed-reach-consumed-runs-task.cfg", "expect": "violation", "invariant": "NoConsumedRunsTaskWitness"},
+    {"config": "MLaneOwed-reach-queue-full-end.cfg", "expect": "violation", "invariant": "NoQueueFullEndWitness"},
+    {"config": "MLaneOwed-mut-single-attempt.cfg", "expect": "violation", "invariant": "NoLostOwed"},
+    {"config": "MLaneOwed-mut-single-attempt-liveness.cfg", "expect": "liveness", "property": "HeldEndsOrPublishes"},
+    {"config": "MLaneOwed-mut-single-attempt-ticked.cfg", "expect": "pass", "property": "HeldEndsOrPublishes"},
+    {"config": "MLaneOwed-no-tick-stalled-consumer.cfg", "expect": "liveness", "property": "HeldEndsOrPublishes"}
+  ]
+}
