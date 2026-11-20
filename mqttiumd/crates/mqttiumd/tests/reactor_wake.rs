@@ -210,3 +210,32 @@ fn an_idle_broker_rests() {
         "{wakeups} voluntary context switches in one idle second"
     );
 }
+
+/// Per-message observations are counted and summarised about once a
+/// second, not after every exchange that leaves the broker idle.
+#[test]
+fn suppressed_observations_are_summarised_on_an_interval() {
+    let broker = Broker::start("counters");
+    let mut subscriber = connect(broker.address, "counters-subscriber");
+    subscribe(&mut subscriber, "wake/counters");
+    let mut publisher = connect(broker.address, "counters-publisher");
+    let started = Instant::now();
+    for sequence in 0u32..300 {
+        publish_qos0(&mut publisher, "wake/counters", &sequence.to_be_bytes());
+        assert_eq!(read_packet(&mut subscriber).0 >> 4, 3);
+        // The broker goes idle between two exchanges.
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    std::thread::sleep(Duration::from_millis(1200));
+    let seconds = started.elapsed().as_secs();
+    let log = std::fs::read_to_string(broker.directory.join("events.jsonl")).unwrap();
+    let summaries = log
+        .lines()
+        .filter(|line| line.contains("\"kind\":\"counters\""))
+        .count() as u64;
+    assert!(summaries >= 1, "no summary of the suppressed observations");
+    assert!(
+        summaries <= seconds + 2,
+        "{summaries} summaries in {seconds} s"
+    );
+}
