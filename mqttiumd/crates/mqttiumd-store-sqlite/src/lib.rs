@@ -19,6 +19,10 @@
 //! transaction whose commit fails; the answer is then unknown, never a
 //! certain rejection, and the next command reads the durable state again.
 //!
+//! `SqliteStore::apply_group` (record 0045) runs up to `MAX_GROUP` commands
+//! in one such transaction, each in a savepoint that runs the code of
+//! `apply`, and answers after the one commit. `apply` is unchanged by it.
+//!
 //! # The writer's lock
 //!
 //! `BEGIN IMMEDIATE` with no busy timeout serialises transactions; it does
@@ -1348,6 +1352,192 @@ fn stage_admin(
     }
 }
 
+/// The answer of an application that did not commit the effect of the
+/// operation: a repetition, a rejection, or nothing certain. `wrote` says
+/// whether this application recorded the rejection.
+const fn answered(outcome: StoreOutcome, wrote: bool) -> Applied {
+    Applied {
+        reply: StoreReply::Outcome(outcome),
+        committed_now: false,
+        wrote,
+    }
+}
+
+/// The answer of the application that committed the effect.
+const fn committed(facts: CommitFacts) -> Applied {
+    Applied {
+        reply: StoreReply::Outcome(StoreOutcome::Committed(facts)),
+        committed_now: true,
+        wrote: true,
+    }
+}
+
+/// Nothing certain can be said, and this application wrote nothing.
+const UNKNOWN: Applied = answered(StoreOutcome::PendingOrUnknown, false);
+
+/// What the reads made before any write establish about a command.
+enum Recognised {
+    /// The operation is already decided, or nothing certain can be said:
+    /// the answer, without a write.
+    Settled(Applied),
+    /// Nothing is established about the operation: it is to be decided,
+    /// in an epoch of this phase.
+    Absent(EpochPhase),
+}
+
+/// Recognises an operation that was already decided, on `conn` as it
+/// stands: outside any transaction for `apply`, inside the transaction of
+/// its group for a member, which therefore sees the members before it.
+fn recognise(conn: &Connection, command: &Command, canonical: &[u8]) -> Recognised {
+    let settled = |outcome| Recognised::Settled(answered(outcome, false));
+    let unknown = Recognised::Settled(UNKNOWN);
+    let recipe = command.recipe.get();
+    let operation = recipe.operation();
+    let Ok(meta) = read_meta(conn) else {
+        return unknown;
+    };
+
+    // Logical retirement wins even while a bounded sweep leaves physical rows.
+    match established(conn, &meta, operation) {
+        Ok(Established::Outcome(StoreOutcome::RetiredOutcomeUnavailable)) => {
+            return settled(StoreOutcome::RetiredOutcomeUnavailable);
+        }
+        Err(_) => return unknown,
+        _ => {}
+    }
+    // 1. Recognise an operation that was already decided.
+    let Ok(record) = read_operation(conn, operation) else {
+        return unknown;
+    };
+    if let Some(record) = record {
+        let same_payload = match (recipe, &command.payload, record.decision) {
+            (recipe, Some(bytes), Decision::Committed(_))
+                if retained::bounds(recipe)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|b| b.payload.is_some()) =>
+            {
+                let payload_id = retained::bounds(recipe)
+                    .ok()
+                    .flatten()
+                    .and_then(|b| b.payload)
+                    .expect("guarded publication payload");
+                let stored: Result<Option<Vec<u8>>, _> = conn
+                    .prepare_cached("SELECT bytes FROM payloads WHERE id = ?1")
+                    .and_then(|mut statement| {
+                        statement
+                            .query_row([payload_id.to_be_bytes().as_slice()], |row| row.get(0))
+                            .optional()
+                    });
+                match stored {
+                    Ok(stored) => stored.is_none_or(|stored| stored == bytes.as_slice()),
+                    Err(_) => return unknown,
+                }
+            }
+            _ => true,
+        };
+        if record.recipe != canonical || !same_payload {
+            return Recognised::Settled(Applied {
+                reply: StoreReply::Violation(StoreViolation::RecipeMismatch),
+                committed_now: false,
+                wrote: false,
+            });
+        }
+    }
+    let phase = match established(conn, &meta, operation) {
+        Ok(Established::Outcome(outcome)) => return settled(outcome),
+        Ok(Established::Absent(phase)) => phase,
+        Err(_) => return unknown,
+    };
+    if !matches!(
+        receipts::capacity(conn, &meta, operation, Some(ReceiptClass::of(recipe))),
+        Ok(true)
+    ) {
+        return unknown;
+    }
+    if !matches!(will::receipt_capacity(conn, canonical), Ok(true)) {
+        return unknown;
+    }
+    Recognised::Absent(phase)
+}
+
+/// Stages a command of an open epoch: its guards, its capacities, every
+/// row and its receipt. The caller owns the transaction or the savepoint
+/// around it and undoes all of it on a refusal.
+fn stage_command(
+    conn: &Connection,
+    meta: &mut Meta,
+    command: &Command,
+    canonical: &[u8],
+) -> Guard<CommitFacts> {
+    let recipe = command.recipe.get();
+    let payload = command.payload.as_ref();
+    let facts = match recipe {
+        Recipe::WillPublication(value) => will::publish(conn, meta, value, payload)?,
+        Recipe::AdmitPublication(admit) => stage_admission(conn, meta, admit, payload)?,
+        Recipe::RetainedPublication(value) => stage_publication(
+            conn,
+            meta,
+            Admission::from(&value.admission),
+            Some(value.retain_targets),
+            payload,
+        )?,
+        Recipe::RetainedQos0(value) => stage_publication(
+            conn,
+            meta,
+            Admission::from(value),
+            Some(value.retain_targets),
+            payload,
+        )?,
+        Recipe::ReplaySubscriptions(value) => retained::subscribe(conn, meta, value, None)?,
+        Recipe::TimedReplaySubscriptions(value) => {
+            retained::subscribe(conn, meta, &value.replay, Some(value.observed))?
+        }
+        Recipe::ExpiringPublication(value) => {
+            let (mut admit, mask) = match &value.admission {
+                ExpiringAdmission::Qos12(v) => (
+                    Admission::from(&v.admission),
+                    v.admission.retain.then_some(v.retain_targets),
+                ),
+                ExpiringAdmission::Qos0(v) => (Admission::from(v), Some(v.retain_targets)),
+            };
+            admit.expiry = Some(value.expiry);
+            stage_publication(conn, meta, admit, mask, payload)?
+        }
+        Recipe::MarkDeliveryStarted(command) => pubsub::mark_started(conn, meta, command)?,
+        Recipe::ExpireDelivery(command) => pubsub::expire(conn, meta, command)?,
+        Recipe::ReleaseInbound(release) => stage_release(conn, meta, release)?,
+        Recipe::ChangeSubscriptions(command) => pubsub::subscriptions(conn, meta, command)?,
+        Recipe::ClaimDelivery(command) => pubsub::claim(conn, meta, command)?,
+        Recipe::FinishDelivery(command) => pubsub::finish(conn, meta, command)?,
+        Recipe::PreparePubrel(command) => pubsub::prepare_pubrel(conn, meta, command)?,
+        Recipe::ConsumeDelivery(command) => pubsub::consume(conn, meta, command)?,
+        Recipe::UpdateSubscriptions(command) => pubsub::updates(conn, meta, command)?,
+        Recipe::SessionLifecycle(command) => sessions::stage(conn, meta, command)?,
+    };
+    insert_operation(
+        conn,
+        recipe.operation(),
+        canonical,
+        Decision::Committed(facts),
+    )?;
+    Ok(facts)
+}
+
+/// Stages the receipt of a certain rejection: it holds a receipt slot, and
+/// without one it refuses, so that nothing certain is announced.
+fn stage_rejection(
+    conn: &Connection,
+    meta: &mut Meta,
+    operation: OperationId,
+    recipe: &[u8],
+    reason: RejectReason,
+) -> Result<(), Abort<()>> {
+    charge(meta, Accounts::RECEIPT).map_err(|_| Abort::Refused(()))?;
+    insert_operation(conn, operation, recipe, Decision::Rejected(reason))?;
+    Ok(())
+}
+
 /// Opens a connection to `path` and checks, before anything is written,
 /// that its schema version is `expected` (0 for a file to create).
 /// The path of the writer's lock of the database at `path`.
@@ -1916,11 +2106,8 @@ impl SqliteStore {
         recipe: &[u8],
         reason: RejectReason,
     ) -> (StoreOutcome, bool) {
-        let written = self.transact(|conn, meta| {
-            charge(meta, Accounts::RECEIPT).map_err(|_| Abort::Refused(()))?;
-            insert_operation(conn, operation, recipe, Decision::Rejected(reason))?;
-            Ok::<(), Abort<()>>(())
-        });
+        let written =
+            self.transact(|conn, meta| stage_rejection(conn, meta, operation, recipe, reason));
         match written {
             Txn::Committed(()) => (StoreOutcome::RejectedCertain(reason), true),
             Txn::Refused(()) | Txn::ReadFailed(_) | Txn::NotWritten => {
@@ -2715,156 +2902,34 @@ impl DurableStore for SqliteStore {
     }
 
     fn apply(&mut self, command: &Command) -> Applied {
-        let settled = |outcome| Applied {
-            reply: StoreReply::Outcome(outcome),
-            committed_now: false,
-            wrote: false,
-        };
-        let rejected = |(outcome, wrote)| Applied {
-            reply: StoreReply::Outcome(outcome),
-            committed_now: false,
-            wrote,
-        };
-        let unknown = settled(StoreOutcome::PendingOrUnknown);
         let recipe = command.recipe.get();
         let operation = recipe.operation();
         let mut canonical = Vec::new();
         if recipe.encode_canonical(&mut canonical).is_err() {
-            return settled(StoreOutcome::RejectedCertain(
-                RejectReason::PreconditionFailed,
-            ));
+            return answered(
+                StoreOutcome::RejectedCertain(RejectReason::PreconditionFailed),
+                false,
+            );
         }
-        let Ok(meta) = read_meta(&self.conn) else {
-            return unknown;
+        let phase = match recognise(&self.conn, command, &canonical) {
+            Recognised::Settled(applied) => return applied,
+            Recognised::Absent(phase) => phase,
         };
-
-        // Logical retirement wins even while a bounded sweep leaves physical rows.
-        match established(&self.conn, &meta, operation) {
-            Ok(Established::Outcome(StoreOutcome::RetiredOutcomeUnavailable)) => {
-                return settled(StoreOutcome::RetiredOutcomeUnavailable);
-            }
-            Err(_) => return unknown,
-            _ => {}
-        }
-        // 1. Recognise an operation that was already decided.
-        let Ok(record) = read_operation(&self.conn, operation) else {
-            return unknown;
-        };
-        if let Some(record) = record {
-            let same_payload = match (recipe, &command.payload, record.decision) {
-                (recipe, Some(bytes), Decision::Committed(_))
-                    if retained::bounds(recipe)
-                        .ok()
-                        .flatten()
-                        .is_some_and(|b| b.payload.is_some()) =>
-                {
-                    let payload_id = retained::bounds(recipe)
-                        .ok()
-                        .flatten()
-                        .and_then(|b| b.payload)
-                        .expect("guarded publication payload");
-                    let stored: Result<Option<Vec<u8>>, _> = self
-                        .conn
-                        .prepare_cached("SELECT bytes FROM payloads WHERE id = ?1")
-                        .and_then(|mut statement| {
-                            statement
-                                .query_row([payload_id.to_be_bytes().as_slice()], |row| row.get(0))
-                                .optional()
-                        });
-                    match stored {
-                        Ok(stored) => stored.is_none_or(|stored| stored == bytes.as_slice()),
-                        Err(_) => return unknown,
-                    }
-                }
-                _ => true,
-            };
-            if record.recipe != canonical || !same_payload {
-                return Applied {
-                    reply: StoreReply::Violation(StoreViolation::RecipeMismatch),
-                    committed_now: false,
-                    wrote: false,
-                };
-            }
-        }
-        let phase = match established(&self.conn, &meta, operation) {
-            Ok(Established::Outcome(outcome)) => return settled(outcome),
-            Ok(Established::Absent(phase)) => phase,
-            Err(_) => return unknown,
-        };
-        if !matches!(
-            receipts::capacity(&self.conn, &meta, operation, Some(ReceiptClass::of(recipe))),
-            Ok(true)
-        ) {
-            return unknown;
-        }
-        if !matches!(will::receipt_capacity(&self.conn, &canonical), Ok(true)) {
-            return unknown;
-        }
         if phase != EpochPhase::Open {
-            return rejected(self.commit_rejection(
-                operation,
-                &canonical,
-                RejectReason::PreconditionFailed,
-            ));
+            let (outcome, wrote) =
+                self.commit_rejection(operation, &canonical, RejectReason::PreconditionFailed);
+            return answered(outcome, wrote);
         }
 
         // 2 to 5. Guards, capacities and every row, in one transaction.
-        let payload = command.payload.as_ref();
-        let written = self.transact(|conn, meta| {
-            let facts = match recipe {
-                Recipe::WillPublication(value) => will::publish(conn, meta, value, payload)?,
-                Recipe::AdmitPublication(admit) => stage_admission(conn, meta, admit, payload)?,
-                Recipe::RetainedPublication(value) => stage_publication(
-                    conn,
-                    meta,
-                    Admission::from(&value.admission),
-                    Some(value.retain_targets),
-                    payload,
-                )?,
-                Recipe::RetainedQos0(value) => stage_publication(
-                    conn,
-                    meta,
-                    Admission::from(value),
-                    Some(value.retain_targets),
-                    payload,
-                )?,
-                Recipe::ReplaySubscriptions(value) => retained::subscribe(conn, meta, value, None)?,
-                Recipe::TimedReplaySubscriptions(value) => {
-                    retained::subscribe(conn, meta, &value.replay, Some(value.observed))?
-                }
-                Recipe::ExpiringPublication(value) => {
-                    let (mut admit, mask) = match &value.admission {
-                        ExpiringAdmission::Qos12(v) => (
-                            Admission::from(&v.admission),
-                            v.admission.retain.then_some(v.retain_targets),
-                        ),
-                        ExpiringAdmission::Qos0(v) => (Admission::from(v), Some(v.retain_targets)),
-                    };
-                    admit.expiry = Some(value.expiry);
-                    stage_publication(conn, meta, admit, mask, payload)?
-                }
-                Recipe::MarkDeliveryStarted(command) => pubsub::mark_started(conn, meta, command)?,
-                Recipe::ExpireDelivery(command) => pubsub::expire(conn, meta, command)?,
-                Recipe::ReleaseInbound(release) => stage_release(conn, meta, release)?,
-                Recipe::ChangeSubscriptions(command) => pubsub::subscriptions(conn, meta, command)?,
-                Recipe::ClaimDelivery(command) => pubsub::claim(conn, meta, command)?,
-                Recipe::FinishDelivery(command) => pubsub::finish(conn, meta, command)?,
-                Recipe::PreparePubrel(command) => pubsub::prepare_pubrel(conn, meta, command)?,
-                Recipe::ConsumeDelivery(command) => pubsub::consume(conn, meta, command)?,
-                Recipe::UpdateSubscriptions(command) => pubsub::updates(conn, meta, command)?,
-                Recipe::SessionLifecycle(command) => sessions::stage(conn, meta, command)?,
-            };
-            insert_operation(conn, operation, &canonical, Decision::Committed(facts))?;
-            Ok(facts)
-        });
+        let written = self.transact(|conn, meta| stage_command(conn, meta, command, &canonical));
         match written {
-            Txn::Committed(facts) => Applied {
-                reply: StoreReply::Outcome(StoreOutcome::Committed(facts)),
-                committed_now: true,
-                wrote: true,
-            },
-            Txn::Refused(reason) => rejected(self.commit_rejection(operation, &canonical, reason)),
-            Txn::ReadFailed(_) | Txn::NotWritten => unknown,
+            Txn::Committed(facts) => committed(facts),
+            Txn::Refused(reason) => {
+                let (outcome, wrote) = self.commit_rejection(operation, &canonical, reason);
+                answered(outcome, wrote)
+            }
+            Txn::ReadFailed(_) | Txn::NotWritten => UNKNOWN,
         }
     }
 

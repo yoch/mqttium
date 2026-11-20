@@ -1,9 +1,37 @@
-//! Group commit (record 0045): several commands in one transaction.
+//! Group commit (record 0045, ARC-020): several commands in one
+//! transaction of the engine.
+//!
+//! `SqliteStore::apply_group` opens one `BEGIN IMMEDIATE` transaction and
+//! runs in it, for each command in order, what `apply` runs: the same
+//! reads recognise an operation that is already decided, the same function
+//! stages its guards and rows, and the same function stages the receipt of
+//! a rejection. Where `apply` begins a transaction of its own, a member
+//! opens a savepoint; where `apply` rolls its transaction back, the member
+//! rolls back to its savepoint. One `COMMIT` then makes every member
+//! durable together.
+//!
+//! The answers are those of `apply` called on each command in turn, and
+//! they are given only once that `COMMIT` has returned. A group that is
+//! not committed, because the medium fails, the commit fails or the
+//! engine dropped the transaction, leaves nothing: every member is then
+//! answered `PendingOrUnknown`, whatever was computed for it, the member
+//! that would have been rejected included. Absence is not rejection.
+//!
+//! What changes is the crash granularity: a kill before the commit loses
+//! the whole group, a kill after it keeps the whole group, and no state in
+//! between is ever durable. `apply` itself is unchanged: one command, one
+//! transaction.
 
-use mqttiumd_contract::command::Command;
-use mqttiumd_store_api::Applied;
+use rusqlite::{Connection, TransactionBehavior};
 
-use crate::SqliteStore;
+use mqttiumd_contract::command::{Command, EpochPhase};
+use mqttiumd_contract::outcome::{RejectReason, StoreOutcome};
+use mqttiumd_store_api::{Applied, Durability, DurableStore};
+
+use crate::{
+    Abort, Meta, Recognised, SqliteStore, Txn, UNKNOWN, answered, committed, read_meta, recognise,
+    stage_command, stage_rejection, write_meta,
+};
 
 /// The largest number of commands one group holds (ARC-020: batches are
 /// bounded).
@@ -17,10 +45,160 @@ pub enum GroupRefused {
     TooLarge { commands: usize, max: usize },
 }
 
+/// The transaction of the group is gone, or a savepoint of it could not be
+/// closed: nothing of the group may be committed or answered.
+struct Lost;
+
 impl SqliteStore {
-    /// Not implemented yet: applies nothing and answers nothing.
+    /// Applies `commands` in order in one transaction and returns, in the
+    /// same order, what `apply` would have answered for each of them had
+    /// they been applied one after the other on the same state.
+    ///
+    /// A member sees the members before it: the same `OperationId`
+    /// presented twice is decided once and recognised the second time. A
+    /// member that is refused is rolled back alone and its rejection is
+    /// recorded on a receipt in the same group; the members around it are
+    /// not affected. A member that cannot be read or written is answered
+    /// `PendingOrUnknown` and leaves nothing, as after a failed `apply`.
+    ///
+    /// The answers hold only when the commit of the group succeeded. When
+    /// the group had something to write and was not committed, nothing of
+    /// it is durable and every member is answered `PendingOrUnknown`. A
+    /// group that had nothing to write commits nothing: its answers were
+    /// read from what was already durable, as `apply` reads them.
+    ///
+    /// At most `MAX_GROUP` commands. A larger group is refused before
+    /// anything is read. An empty group does nothing, and a group of one
+    /// is `apply`.
+    ///
+    /// The kill point `store.commit.prepared` is passed once, before the
+    /// commit of the group; `store.commit.logged` once, by that commit.
     pub fn apply_group(&mut self, commands: &[&Command]) -> Result<Vec<Applied>, GroupRefused> {
-        let _ = commands;
-        Ok(Vec::new())
+        if commands.len() > MAX_GROUP {
+            return Err(GroupRefused::TooLarge {
+                commands: commands.len(),
+                max: MAX_GROUP,
+            });
+        }
+        match commands {
+            [] => return Ok(Vec::new()),
+            [only] => return Ok(vec![self.apply(only)]),
+            _ => {}
+        }
+        // Bounded by `MAX_GROUP`, checked above.
+        let unknown = || vec![UNKNOWN; commands.len()];
+        let failing = self.durability == Durability::Failing;
+        let Ok(tx) = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+        else {
+            return Ok(unknown());
+        };
+        let mut replies = Vec::with_capacity(commands.len());
+        for command in commands {
+            match member(&tx, command) {
+                // The engine drops a whole transaction on some errors; a
+                // statement after that would be committed on its own.
+                Ok(applied) if !tx.is_autocommit() => replies.push(applied),
+                // Dropping the transaction rolls back what is left of it.
+                Ok(_) | Err(Lost) => return Ok(unknown()),
+            }
+        }
+        if !replies.iter().any(|applied| applied.wrote) {
+            // No savepoint was kept: every answer was read from the state
+            // that was durable before the group, and there is nothing to
+            // commit. Dropping the transaction ends it.
+            return Ok(replies);
+        }
+        // K1 `store.commit.prepared`: every row of every member written,
+        // `COMMIT` not called; the transaction is open.
+        #[cfg(feature = "kill-points")]
+        crate::kill_points::pass(
+            &self.kill_hook,
+            crate::kill_points::KillPoint::CommitPrepared,
+        );
+        if failing || tx.commit().is_err() {
+            return Ok(unknown());
+        }
+        Ok(replies)
     }
+}
+
+/// One member of a group, on the transaction of the group: the steps of
+/// `apply`, with a savepoint where `apply` has a transaction.
+fn member(conn: &Connection, command: &Command) -> Result<Applied, Lost> {
+    let recipe = command.recipe.get();
+    let operation = recipe.operation();
+    let mut canonical = Vec::new();
+    if recipe.encode_canonical(&mut canonical).is_err() {
+        return Ok(answered(
+            StoreOutcome::RejectedCertain(RejectReason::PreconditionFailed),
+            false,
+        ));
+    }
+    let phase = match recognise(conn, command, &canonical) {
+        Recognised::Settled(applied) => return Ok(applied),
+        Recognised::Absent(phase) => phase,
+    };
+    let reason = if phase == EpochPhase::Open {
+        let staged = savepoint(conn, |conn, meta| {
+            stage_command(conn, meta, command, &canonical)
+        })?;
+        match staged {
+            Txn::Committed(facts) => return Ok(committed(facts)),
+            Txn::Refused(reason) => reason,
+            Txn::ReadFailed(_) | Txn::NotWritten => return Ok(UNKNOWN),
+        }
+    } else {
+        RejectReason::PreconditionFailed
+    };
+    // The rejection is recorded as `commit_rejection` records it, in a
+    // savepoint of its own: without a receipt slot nothing certain is said.
+    let recorded = savepoint(conn, |conn, meta| {
+        stage_rejection(conn, meta, operation, &canonical, reason)
+    })?;
+    Ok(match recorded {
+        Txn::Committed(()) => answered(StoreOutcome::RejectedCertain(reason), true),
+        Txn::Refused(()) | Txn::ReadFailed(_) | Txn::NotWritten => UNKNOWN,
+    })
+}
+
+/// Runs `prepare` in a savepoint of the open transaction, as `transact`
+/// runs it in a transaction: on success `meta` is written one revision
+/// later and the savepoint released into the group; otherwise everything
+/// `prepare` wrote is rolled back and the group goes on without it.
+/// `Txn::Committed` means staged here: nothing is durable before the
+/// commit of the group.
+fn savepoint<T, E>(
+    conn: &Connection,
+    prepare: impl FnOnce(&Connection, &mut Meta) -> Result<T, Abort<E>>,
+) -> Result<Txn<T, E>, Lost> {
+    let run = |sql: &str| conn.execute_batch(sql).map_err(|_| Lost);
+    run("SAVEPOINT member")?;
+    let staged = (|| {
+        let mut meta = read_meta(conn).map_err(|fault| Some(fault.read_error()))?;
+        let value = match prepare(conn, &mut meta) {
+            Ok(value) => value,
+            Err(Abort::Refused(refusal)) => return Ok(Err(refusal)),
+            Err(Abort::Read(error)) => return Err(Some(error)),
+            Err(Abort::Fault) => return Err(None),
+        };
+        meta.revision = meta.revision.checked_add(1).ok_or(None)?;
+        write_meta(conn, &meta).map_err(|_| None)?;
+        Ok(Ok(value))
+    })();
+    let undone = match staged {
+        Ok(Ok(value)) => {
+            run("RELEASE member")?;
+            return Ok(Txn::Committed(value));
+        }
+        Ok(Err(refusal)) => Txn::Refused(refusal),
+        Err(Some(error)) => Txn::ReadFailed(error),
+        Err(None) => Txn::NotWritten,
+    };
+    // Fails when the engine already dropped the transaction: the group is
+    // lost, and no statement may follow outside it.
+    run("ROLLBACK TO member")?;
+    run("RELEASE member")?;
+    Ok(undone)
 }

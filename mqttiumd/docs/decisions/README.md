@@ -52,3 +52,4 @@ What each record leaves open is tracked in
 | [0035](0035-private-mtls-profile.md) | Proposed | TLS 1.3, durable ClientID ownership and topic grants | Product |
 | [0036](0036-offline-monotone-policy.md) | Proposed | Offline inventory, checked backup and atomic monotone authority transition | Product and SQLite |
 | [0044](0044-reactor-runtime-and-evidence-tiers.md) | Accepted | Target profile of version 0.1, readiness-driven reactor runtime without `async` (departs from ARC-021), two evidence tiers, frozen receptions | Runtime lots |
+| [0045](0045-group-commit.md) | Proposed | Group commit in the SQLite store: up to 64 commands in one transaction, each a savepoint running the code of `apply`; answers after the commit; crash granularity of one group; trait and durable encodings unchanged | Store; writer integration and model `MGroupCommit` are other lots |
