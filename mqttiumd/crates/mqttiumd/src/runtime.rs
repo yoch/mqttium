@@ -4451,6 +4451,20 @@ impl EffectSink for Sink<'_> {
                         && self.bindings.get(&connection.session) == Some(&generation)
                 }) else {
                     let _ = effect.into_parts();
+                    if self
+                        .events
+                        .emit(
+                            "frame_failed",
+                            json!({
+                                "connection": generation.get().to_string(),
+                                "details": {"effect": effect_text(id), "packet_kind": "PUBLISH",
+                                            "code": "unusable_generation"}
+                            }),
+                        )
+                        .is_err()
+                    {
+                        self.error = Some(Failure::plain("events_unavailable"));
+                    }
                     self.terminal_inputs.push_back(Input::FrameResult {
                         effect: id,
                         connection,

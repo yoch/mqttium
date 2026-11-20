@@ -1399,6 +1399,15 @@ fn a_peer_reuses_qos1_identifier_before_the_old_internal_written_receipt() {
 
 #[test]
 fn a_temporarily_full_output_retries_the_same_durable_publish_without_closing() {
+    finish_retained_durable_publish(false);
+}
+
+#[test]
+fn a_publish_retained_before_enqueue_reports_failure_and_resumes_the_same_claim() {
+    finish_retained_durable_publish(true);
+}
+
+fn finish_retained_durable_publish(close_before_enqueue: bool) {
     with_runtime(128, |runtime, directory| {
         let (target, mut receiver) = peer(runtime);
         runtime
@@ -1492,29 +1501,86 @@ fn a_temporarily_full_output_retries_the_same_durable_publish_without_closing() 
         let blocked_state = mqttiumd_store_sqlite::SqliteStore::inspect(&path).unwrap();
         assert_eq!(blocked_state.outbound, before.outbound);
         assert_eq!(blocked_state.obligations, before.obligations);
-        assert_eq!(queued.try_iter().count(), net::OUTPUT_SLOTS);
-        runtime.peers.get_mut(&target).unwrap().io.outgoing = original;
-        runtime.dispatch().unwrap();
+        let (target, mut receiver, active) = if close_before_enqueue {
+            // Leave the substitute queue full until the old network task dies.
+            receiver.shutdown(std::net::Shutdown::Both).unwrap();
+            until(runtime, |r| {
+                !r.peers.contains_key(&target)
+                    && r.owner
+                        .outbox()
+                        .unwrap()
+                        .pending()
+                        .all(|pending| pending.id() != *effect)
+            });
+            assert_eq!(queued.try_iter().count(), net::OUTPUT_SLOTS);
+            drop(original);
+            let persisted = mqttiumd_store_sqlite::SqliteStore::inspect(&path).unwrap();
+            assert_eq!(persisted.outbound, before.outbound);
+            assert_eq!(persisted.obligations, before.obligations);
+
+            let events = std::fs::read_to_string(directory.join("events.jsonl")).unwrap();
+            let events = events
+                .lines()
+                .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+                .filter(|event| {
+                    event["connection"] == target.get().to_string()
+                        && event["details"]["effect"] == effect_text(*effect)
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                events
+                    .iter()
+                    .map(|event| event["kind"].as_str().unwrap())
+                    .collect::<Vec<_>>(),
+                ["effect_retained", "frame_failed"],
+                "retained_publish_terminal_before_enqueue"
+            );
+            assert!(
+                events
+                    .iter()
+                    .all(|event| event["details"]["packet_kind"] == "PUBLISH")
+            );
+            assert_eq!(events[0]["details"]["code"], "output_queue_full");
+            assert_eq!(events[1]["details"]["code"], "unusable_generation");
+
+            let (resumed, mut client) = peer(runtime);
+            runtime
+                .connect(resumed, connect_packet(b"publish-output-full-target"))
+                .unwrap();
+            until(runtime, |r| r.session_requests.is_empty());
+            let (first, body) = read_frame(&mut client);
+            assert_eq!((first, &body[..2]), (0x20, &[1, 0][..]));
+            assert_eq!(runtime.peers[&resumed].session, Some(connection.session));
+            (
+                resumed,
+                client,
+                ConnectionKey {
+                    generation: resumed,
+                    session: connection.session,
+                },
+            )
+        } else {
+            assert_eq!(queued.try_iter().count(), net::OUTPUT_SLOTS);
+            runtime.peers.get_mut(&target).unwrap().io.outgoing = original;
+            runtime.dispatch().unwrap();
+            (target, receiver, *connection)
+        };
+        until(runtime, |r| {
+            r.outgoing_bindings.contains_key(&(active, *packet_id))
+        });
         assert!(
-            !runtime
+            runtime
                 .owner
                 .outbox()
                 .unwrap()
                 .pending()
-                .any(|pending| pending.id() == *effect)
+                .all(|pending| pending.id() != *effect)
         );
-        let expected = PubackTarget {
-            delivery: *delivery,
-            claim: *claim,
-            frame: *effect,
-        };
-        assert_eq!(
-            runtime.outgoing_bindings.get(&(*connection, *packet_id)),
-            Some(&expected)
-        );
-        assert!(runtime.peers.contains_key(&target));
+        let expected = runtime.outgoing_bindings[&(active, *packet_id)];
+        assert_eq!((expected.delivery, expected.claim), (*delivery, *claim));
+        assert_eq!(expected.frame == *effect, !close_before_enqueue);
         let (first, body) = read_frame(&mut receiver);
-        assert_eq!(first, 0x32);
+        assert_eq!(first & !0x08, 0x32);
         assert_eq!(&body[3..5], &packet_id.get().to_be_bytes());
         assert_eq!(body.last(), Some(&b'v'));
         assert_eq!(read_frame(&mut publisher).0, 0x40);
@@ -5074,4 +5140,306 @@ fn tls_terminal_writer_cannot_discard_an_already_decoded_normal_disconnect() {
             "normal TLS disconnect admitted an unauthorized Will occurrence"
         );
     });
+}
+
+#[test]
+fn blocked_output_and_full_input_preserve_independent_work_and_reconnect_credit() {
+    for reverse in [false, true] {
+        with_runtime(128, |runtime, directory| {
+            let first = peer(runtime);
+            let second = peer(runtime);
+            let ((slow, mut receiver_a), (publisher, mut source)) = if reverse {
+                (second, first)
+            } else {
+                (first, second)
+            };
+            let (subscriber, mut receiver_b) = peer(runtime);
+            let slow_name = b"pressure-slow";
+            for (generation, name, socket) in [
+                (slow, slow_name.as_slice(), &mut receiver_a),
+                (publisher, b"pressure-source".as_slice(), &mut source),
+                (
+                    subscriber,
+                    b"pressure-subscriber".as_slice(),
+                    &mut receiver_b,
+                ),
+            ] {
+                let mut connect = connect_packet(name);
+                if generation == slow {
+                    connect.receive_maximum = 1;
+                }
+                runtime.connect(generation, connect).unwrap();
+                until(runtime, |state| {
+                    state.session_requests.is_empty() && state.frames.is_empty()
+                });
+                assert_eq!(read_frame(socket).0, 0x20);
+            }
+            for (generation, topic, socket) in [
+                (slow, b'a', &mut receiver_a),
+                (subscriber, b't', &mut receiver_b),
+            ] {
+                runtime
+                    .packet(generation, 0x82, vec![0, 1, 0, 0, 1, topic, 1])
+                    .unwrap();
+                until(runtime, |state| {
+                    state.inflight.is_empty() && state.inputs.is_empty()
+                });
+                assert_eq!(read_frame(socket).0, 0x90);
+            }
+
+            let session = runtime.peers[&slow].session.unwrap();
+            let old_connection = ConnectionKey {
+                generation: slow,
+                session,
+            };
+            let first_id = OutboundPacketId::new(1).unwrap();
+            let sqlite = directory.join("store.sqlite");
+            let mut initial = publish_body(6);
+            initial[2] = b'a';
+            runtime.packet(publisher, 0x32, initial).unwrap();
+            until_without_socket_receipts(runtime, |state| {
+                state
+                    .outgoing_bindings
+                    .contains_key(&(old_connection, first_id))
+            });
+            let old_target = runtime.outgoing_bindings[&(old_connection, first_id)];
+            let (first, body) = read_frame(&mut receiver_a);
+            assert_eq!(first, 0x32);
+            assert_eq!(body, [0, 1, b'a', 0, 1, 0, b'v']);
+            assert_eq!(read_frame(&mut source), (0x40, vec![0, 6]));
+
+            // Take the real socket receipt before the reactor can see it.
+            let wire = &runtime.peers[&slow].io.written;
+            let old_completion = loop {
+                match wire.recv_timeout(Duration::from_secs(1)).unwrap() {
+                    net::Written::Complete {
+                        correlation: Some((effect, connection)),
+                        bytes,
+                    } if effect == old_target.frame && connection == old_connection => {
+                        break bytes;
+                    }
+                    net::Written::Started { .. } | net::Written::Complete { .. } => {}
+                    other => panic!("unexpected old write observation: {other:?}"),
+                }
+            };
+            assert!(runtime.frames.contains_key(&old_target.frame));
+
+            let (blocked, held) = std::sync::mpsc::sync_channel(net::OUTPUT_SLOTS);
+            for _ in 0..net::OUTPUT_SLOTS {
+                blocked
+                    .try_send(net::Write {
+                        expiry: None,
+                        correlation: None,
+                        bytes: vec![0xd0, 0],
+                    })
+                    .unwrap();
+            }
+            let _old_sender = std::mem::replace(
+                &mut runtime.peers.get_mut(&slow).unwrap().io.outgoing,
+                blocked,
+            );
+            for id in [1, 2] {
+                let mut body = publish_body(id);
+                body[2] = b'x';
+                runtime.packet(slow, 0x32, body).unwrap();
+            }
+            let held_acks = |r: &Runtime<'_>| {
+                r.owner
+                    .outbox()
+                    .unwrap()
+                    .pending()
+                    .filter_map(|effect| match effect.effect() {
+                        Effect::EmitFrame {
+                            connection,
+                            frame: OutboundFrame::Puback { packet_id, .. },
+                            ..
+                        } if connection.generation == slow => Some((effect.id(), packet_id.get())),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+            };
+            until(runtime, |state| {
+                held_acks(state).len() == 2
+                    && state.inflight.is_empty()
+                    && state.work_reads.is_empty()
+                    && state.inputs.is_empty()
+            });
+            let pending = held_acks(runtime);
+            assert_eq!(
+                pending.iter().map(|(_, id)| *id).collect::<Vec<_>>(),
+                [1, 2]
+            );
+            for _ in 0..3 {
+                runtime.dispatch().unwrap();
+                assert_eq!(held_acks(runtime), pending);
+            }
+
+            runtime.packet(publisher, 0x32, publish_body(7)).unwrap();
+            runtime.drain_inputs().unwrap();
+            let reply = runtime
+                .writer
+                .receiver
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap();
+            let Response::Store {
+                effect,
+                reply:
+                    StoreReply::Outcome(StoreOutcome::Committed(CommitFacts::PublicationAdmitted {
+                        ..
+                    })),
+                ..
+            } = &reply
+            else {
+                panic!("expected the real committed B admission");
+            };
+            let committed_effect = *effect;
+            assert!(runtime.inflight.contains_key(&committed_effect));
+            let (replay, ready) = std::sync::mpsc::sync_channel(1);
+            replay.try_send(reply).unwrap();
+            let writer = std::mem::replace(&mut runtime.writer.receiver, ready);
+            fill_ordinary_inputs(runtime, publisher);
+            assert_eq!(runtime.ordinary_room(), 0);
+            assert_eq!(runtime.inputs.len(), ORDINARY_INPUTS);
+            let progress_started = Instant::now();
+            runtime.writer_results().unwrap();
+            runtime.writer.receiver = writer;
+            assert!(!runtime.inflight.contains_key(&committed_effect));
+            assert_eq!(runtime.ordinary_room(), 0);
+            assert_eq!(runtime.writer_input_count(), 1);
+            until(runtime, |state| {
+                state
+                    .outgoing_bindings
+                    .keys()
+                    .any(|(key, _)| key.generation == subscriber)
+            });
+            for _ in 0..ORDINARY_INPUTS {
+                assert_eq!(read_frame(&mut source), (0xd0, vec![]));
+            }
+            assert_eq!(read_frame(&mut source), (0x40, vec![0, 7]));
+            let (first, body) = read_frame(&mut receiver_b);
+            assert_eq!((first, body[2], body[6]), (0x32, b't', b'v'));
+            let b_id = u16::from_be_bytes([body[3], body[4]]);
+            let independent_micros = progress_started.elapsed().as_micros();
+            assert_eq!(held_acks(runtime), pending);
+            let b_ack = dequeue_puback(runtime, subscriber, &mut receiver_b, b_id);
+            runtime.queue(b_ack).unwrap();
+            until(runtime, |state| {
+                state.inputs.is_empty() && state.inflight.is_empty()
+            });
+
+            let before = mqttiumd_store_sqlite::SqliteStore::inspect(&sqlite).unwrap();
+            assert_eq!((before.obligations.len(), before.outbound.len()), (1, 1));
+            assert_eq!(
+                before.outbound[&old_target.delivery].claim,
+                old_target.claim
+            );
+            receiver_a.shutdown(std::net::Shutdown::Both).unwrap();
+            until(runtime, |state| {
+                !state.peers.contains_key(&slow) && state.closing_inputs.is_empty()
+            });
+            assert_eq!(held.try_iter().count(), net::OUTPUT_SLOTS);
+            let offline = mqttiumd_store_sqlite::SqliteStore::inspect(&sqlite).unwrap();
+            assert_eq!(offline.outbound, before.outbound);
+            assert_eq!(offline.obligations, before.obligations);
+
+            let (resumed, mut receiver) = peer(runtime);
+            let mut reconnect = connect_packet(slow_name);
+            reconnect.receive_maximum = 1;
+            runtime.connect(resumed, reconnect).unwrap();
+            until(runtime, |state| state.session_requests.is_empty());
+            let (kind, connack) = read_frame(&mut receiver);
+            assert_eq!((kind, &connack[..2]), (0x20, &[1, 0][..]));
+            assert_eq!(runtime.peers[&resumed].session, Some(session));
+            let current = ConnectionKey {
+                generation: resumed,
+                session,
+            };
+            until(runtime, |state| {
+                state.outgoing_bindings.contains_key(&(current, first_id))
+            });
+            assert_eq!(
+                read_frame(&mut receiver),
+                (0x3a, vec![0, 1, b'a', 0, 1, 0, b'v'])
+            );
+            let new_target = runtime.outgoing_bindings[&(current, first_id)];
+            assert_eq!(
+                (old_target.delivery, old_target.claim),
+                (new_target.delivery, new_target.claim)
+            );
+            assert_ne!(old_target.frame, new_target.frame);
+
+            let mut next = publish_body(8);
+            next[2] = b'a';
+            next[6] = b'w';
+            runtime.packet(publisher, 0x32, next).unwrap();
+            until(runtime, |state| {
+                state.inflight.is_empty() && state.inputs.is_empty()
+            });
+            assert_eq!(read_frame(&mut source), (0x40, vec![0, 8]));
+            let waiting = mqttiumd_store_sqlite::SqliteStore::inspect(&sqlite).unwrap();
+            assert_eq!((waiting.obligations.len(), waiting.outbound.len()), (2, 1));
+            runtime
+                .written_complete(old_target.frame, old_connection, old_completion)
+                .unwrap();
+            runtime
+                .queue(Input::FrameResult {
+                    effect: old_target.frame,
+                    connection: old_connection,
+                    progress: FrameProgress::Written {
+                        confirmed: old_completion as u64,
+                        total: old_completion as u64,
+                    },
+                })
+                .unwrap();
+            runtime.packet(resumed, 0xc0, vec![]).unwrap();
+            runtime.drain_inputs().unwrap();
+            assert_eq!(read_frame(&mut receiver), (0xd0, vec![]));
+            assert_eq!(
+                runtime.owner.puback_target(current, first_id),
+                Some(new_target)
+            );
+            let after_late = mqttiumd_store_sqlite::SqliteStore::inspect(&sqlite).unwrap();
+            assert_eq!(after_late.outbound, waiting.outbound);
+            assert_eq!(after_late.obligations, waiting.obligations);
+
+            let genuine = dequeue_puback(runtime, resumed, &mut receiver, 1);
+            runtime.queue(genuine).unwrap();
+            until(runtime, |state| {
+                state
+                    .owner
+                    .puback_target(current, first_id)
+                    .is_some_and(|target| target != new_target)
+            });
+            assert_eq!(
+                read_frame(&mut receiver),
+                (0x32, vec![0, 1, b'a', 0, 1, 0, b'w'])
+            );
+            let final_ack = dequeue_puback(runtime, resumed, &mut receiver, 1);
+            runtime.queue(final_ack).unwrap();
+            until(runtime, |state| {
+                state.inflight.is_empty()
+                    && state.inputs.is_empty()
+                    && state.owner.puback_target(current, first_id).is_none()
+            });
+            let final_state = mqttiumd_store_sqlite::SqliteStore::inspect(&sqlite).unwrap();
+            assert!(final_state.outbound.is_empty() && final_state.obligations.is_empty());
+            eprintln!(
+                "progression witness {}",
+                json!({
+                    "reversed": reverse, "slow_generation": slow.get(), "publisher_generation": publisher.get(),
+                    "resumed_generation": resumed.get(), "ordinary_input_count": ORDINARY_INPUTS,
+                    "actual_writer_reply": effect_text(committed_effect),
+                    "held_frames": pending.iter().map(|(effect, mid)| (effect_text(*effect), *mid)).collect::<Vec<_>>(),
+                    "repeated_dispatch_passes": 3, "independent_subscriber_micros": independent_micros,
+                    "independent_publisher_puback": 7, "independent_subscriber_packet_id": b_id,
+                    "session_present": true, "replay_dup": true, "packet_id": 1,
+                    "original_frame": effect_text(old_target.frame), "resumed_frame": effect_text(new_target.frame),
+                    "late_written_bytes": old_completion,
+                    "outgoing_claims_before_and_after_old_callback": [waiting.outbound.len(), after_late.outbound.len()],
+                    "obligations_before_and_after_old_callback": [waiting.obligations.len(), after_late.obligations.len()],
+                    "final_claims": final_state.outbound.len(), "final_obligations": final_state.obligations.len(),
+                })
+            );
+        });
+    }
 }

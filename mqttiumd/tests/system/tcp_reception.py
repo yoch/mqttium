@@ -20,6 +20,7 @@ import subprocess
 import sys
 import time
 
+from retained_frames import verify_retained_frames
 from tcp_probe import (
     Observations, ReceiptFailure, Wire, assert_no_positive_ack, assert_stale_filtered,
     connect_packet, database, operation_hex, packet, publish_packet, pubrel_packet,
@@ -598,17 +599,10 @@ def concurrency(binary: Path, case: Path) -> dict:
                           and event.get("connection") == generation]
                 retained = [event for event in events if event["kind"] == "effect_retained"
                             and event.get("details", {}).get("code") == "output_queue_full"]
-                retained_ids = {event["details"]["effect"] for event in retained}
-                terminal = {event.get("details", {}).get("effect") for event in events
-                            if event["kind"] in ("frame_failed", "frame_written")}
-                if retained and retained_ids <= terminal and any(event["kind"] == "connection_closed" for event in events):
+                if retained and any(event["kind"] == "connection_closed" for event in events):
                     break
                 time.sleep(.01)
             require(retained, "output_saturation_not_reached")
-            retained_ids = {event["details"]["effect"] for event in retained}
-            terminal = {event.get("details", {}).get("effect") for event in events
-                        if event["kind"] in ("frame_failed", "frame_written")}
-            require(retained_ids <= terminal, "retained_effect_lost", repr(retained_ids - terminal))
             first_pressure = min(int(event["seq"]) for event in retained)
             require(any(event["kind"] == "connection_closed" and int(event["seq"]) > first_pressure
                         and event.get("details", {}).get("code") in
@@ -629,9 +623,12 @@ def concurrency(binary: Path, case: Path) -> dict:
                 "pressure_exchange_not_completed")
         write_json(case / "after-pressure-recovery.json", final)
         broker.stop()
+        retained_report = verify_retained_frames(broker.events(), generation=generation)
+        write_json(case / "retained-frames.json", retained_report)
         return {"criterion": "G-concurrency", "status": "PASS", "two_clients_completed": True,
                 "partial_reader_timeout": True, "output_queue_saturation_reached": True,
-                "retained_effects_terminal": len(retained_ids), "flood_bytes": sent, "flood_budget": maximum,
+                "retained_effects_terminal": len(retained_report["effects"]),
+                "flood_bytes": sent, "flood_budget": maximum,
                 "pressure_deadline_ms": 12000, "receive_buffer_requested": 1024,
                 "unread_pubrec_operation": admission["operation"], "unread_pubrec_packet_identifier": 55,
                 "pressure_retransmission_admissions": 0, "pressure_exchange_completed": True}
