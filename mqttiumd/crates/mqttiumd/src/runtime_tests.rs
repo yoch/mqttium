@@ -1865,6 +1865,60 @@ fn fill_ordinary_inputs(runtime: &mut Runtime<'_>, generation: ConnectionGenerat
     assert!(count > 0 && count <= INPUTS);
 }
 
+/// Keep Alive measures the silence of a peer. A PINGREQ the broker has
+/// received and not yet taken, because its own input lane is full, is not
+/// silence: the connection is not closed over it (record 0046).
+#[test]
+fn keep_alive_does_not_run_against_input_the_broker_holds() {
+    with_runtime(128, |runtime, _| {
+        let (generation, mut client) = peer(runtime);
+        runtime
+            .connect(
+                generation,
+                codec::Connect {
+                    keep_alive: 1,
+                    ..connect_packet(b"pressure-keep-alive")
+                },
+            )
+            .unwrap();
+        until(runtime, |r| {
+            r.session_requests.is_empty() && r.frames.is_empty()
+        });
+        assert_eq!(read_frame(&mut client).0, 0x20);
+        fill_ordinary_inputs(runtime, generation);
+        client.write_all(&[0xc0, 0]).unwrap();
+        // Longer than one and a half Keep Alive, with the PINGREQ parsed
+        // and waiting in the connection's lane.
+        thread::sleep(Duration::from_millis(1700));
+        let ingress = runtime.peers[&generation].ingress;
+        runtime.connections().unwrap();
+        assert_eq!(
+            runtime.peers[&generation].ingress, ingress,
+            "the full lane took the packet"
+        );
+        assert!(
+            runtime
+                .peers
+                .get(&generation)
+                .is_some_and(|peer| peer.closing.is_none()),
+            "a peer whose PINGREQ waits in the broker was closed: {:?}",
+            runtime.peers.get(&generation).and_then(|peer| peer.closing)
+        );
+        // Once the lane has room the packet is taken and answered.
+        runtime.inputs.clear();
+        client
+            .set_read_timeout(Some(Duration::from_millis(5)))
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut first = [0u8; 1];
+        while client.peek(&mut first).is_err() {
+            assert!(Instant::now() < deadline, "no PINGRESP");
+            pump(runtime);
+        }
+        assert_eq!(read_frame(&mut client).0, 0xd0);
+    });
+}
+
 #[test]
 fn a_full_input_lane_leaves_the_next_socket_packet_in_its_bounded_channel() {
     with_runtime(128, |runtime, _| {
