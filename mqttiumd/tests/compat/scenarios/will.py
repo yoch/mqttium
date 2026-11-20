@@ -1,0 +1,102 @@
+"""Will messages: QoS 0/1/2, retain, abrupt close, DISCONNECT with and without Will, takeover."""
+import mqttwire as wire
+from dsl import (ack, close, collect, connect, disconnect, publish_sync, quiet, recv, scenario, send, subscribe)
+
+
+def acknowledge(conn, qos):
+    """The subscriber's side of a delivery at `qos`."""
+    if qos == 1:
+        return [ack(conn)]
+    if qos == 2:
+        return [ack(conn, "pubrec"), recv(conn), ack(conn, "pubcomp")]
+    return []
+
+
+def abrupt(level, qos):
+    v = f"v{level}"
+    scenario(
+        f"will/abrupt-close-qos{qos}-{v}",
+        doc=f"""A client with a QoS {qos} Will closes its connection without DISCONNECT:
+        the Will is published to a QoS 2 subscription at QoS {qos}.""",
+        steps=[
+            connect("sub", f"w-q{qos}-sub", level=level), subscribe("sub", 1, [("will/t", 2)], level=level),
+            connect("w", f"w-q{qos}", level=level, will={"topic": "will/t", "payload": "gone", "qos": qos}),
+            close("w"),
+            recv("sub"), acknowledge("sub", qos), quiet("sub"),
+        ],
+    )
+
+
+abrupt(4, 0)
+abrupt(4, 1)
+abrupt(5, 1)
+abrupt(4, 2)
+abrupt(5, 2)
+
+for level in (4, 5):
+    v = f"v{level}"
+
+    scenario(
+        f"will/retain-{v}",
+        doc="""A QoS 1 Will with Will Retain 1 is published on abrupt close and kept as the
+        retained message of its topic: a later subscriber receives it with RETAIN 1.""",
+        steps=[
+            connect("sub", "w-ret-sub", level=level), subscribe("sub", 1, [("willr/t", 1)], level=level),
+            connect("w", "w-ret", level=level,
+                    will={"topic": "willr/t", "payload": "gone", "qos": 1, "retain": True}),
+            close("w"),
+            recv("sub"), ack("sub"), quiet("sub"),
+            connect("late", "w-ret-late", level=level),
+            subscribe("late", 1, [("willr/t", 0)], level=level, expect=0), collect("late", sort=True),
+        ],
+    )
+
+    scenario(
+        f"will/disconnect-discards-will-{v}",
+        doc="A normal DISCONNECT discards the Will: the subscriber receives only a later marker message.",
+        steps=[
+            connect("sub", "w-disc-sub", level=level), subscribe("sub", 1, [("willd/t", 0)], level=level),
+            connect("w", "w-disc", level=level, will={"topic": "willd/t", "payload": "gone", "qos": 1}),
+            disconnect("w", level=level),
+            connect("pub", "w-disc-pub", level=level), publish_sync("pub", "willd/t", "marker", level=level),
+            collect("sub"),
+        ],
+    )
+
+scenario(
+    "will/disconnect-with-will-v5",
+    doc="DISCONNECT with Reason Code 0x04 (Disconnect with Will Message): the Will is published.",
+    steps=[
+        connect("sub", "w-dww-sub", level=5), subscribe("sub", 1, [("willw/t", 0)], level=5),
+        connect("w", "w-dww", level=5, will={"topic": "willw/t", "payload": "gone", "qos": 1}),
+        send("w", wire.disconnect(level=5, reason=0x04)), close("w", wait_peer=1.0),
+        recv("sub"), quiet("sub"),
+    ],
+)
+
+scenario(
+    "will/delay-interval-v5",
+    doc="""A Will with Will Delay Interval 1 on a session that outlives the connection is
+    published after an abrupt close (observed within 3 s, not timed).""",
+    steps=[
+        connect("sub", "w-delay-sub", level=5), subscribe("sub", 1, [("willdelay/t", 0)], level=5),
+        connect("w", "w-delay", level=5, props={"session_expiry_interval": 60},
+                will={"topic": "willdelay/t", "payload": "gone", "qos": 1, "props": {"will_delay_interval": 1}}),
+        close("w"),
+        recv("sub"), quiet("sub"),
+    ],
+)
+
+scenario(
+    "will/takeover-v5",
+    doc="""A client with a Will is taken over by a new connection with the same ClientID
+    and Clean Start 1: the Will of the first connection is published.""",
+    steps=[
+        connect("sub", "w-take-sub", level=5), subscribe("sub", 1, [("willt/t", 0)], level=5),
+        connect("w", "w-take", level=5, will={"topic": "willt/t", "payload": "gone", "qos": 1}),
+        connect("w2", "w-take", level=5),
+        recv("sub"), quiet("sub"),
+    ],
+)
+
+del level, v
