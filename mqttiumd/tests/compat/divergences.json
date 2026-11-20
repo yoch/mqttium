@@ -38,13 +38,6 @@
     "fingerprint": "c10bb4d968dfdad2"
   },
   {
-    "id": "connect/twenty-connections-v4",
-    "class": "profile-refused",
-    "difference": "Mosquitto accepts twenty simultaneous connections; mqttiumd accepts sixteen and closes the seventeenth to the twentieth without CONNACK.",
-    "lot": "Runtime limits of the bounded preview (ADR 0044), to be raised to Mosquitto's defaults or made configurable: 16 simultaneous connections",
-    "fingerprint": "866609939aa7d14a"
-  },
-  {
     "id": "connect/user-property-v5",
     "class": "profile-refused",
     "difference": "Mosquitto accepts a CONNECT that carries a User Property; mqttiumd refuses it with CONNACK 0x83 (Implementation specific error) and closes.",
@@ -146,13 +139,6 @@
     "difference": "Mosquitto acknowledges and delivers a 40 000-byte message; mqttiumd answers DISCONNECT 0x95 (Packet too large) although the packet is below the Maximum Packet Size 65 536 it announced: its payload limit is 32 768 bytes.",
     "lot": "Runtime limits of the bounded preview (ADR 0044), to be raised to Mosquitto's defaults or made configurable: 32 768-byte payloads; meanwhile announce the limit that is enforced",
     "fingerprint": "d17213c9dad9d837"
-  },
-  {
-    "id": "publish/pipelined-qos1-v4",
-    "class": "defect",
-    "difference": "Mosquitto acknowledges all twenty PUBLISH; mqttiumd closes the connection instead of acknowledging them: it applies its Receive Maximum (8) as a protocol error to a MQTT 3.1.1 client, which has no way to learn it.",
-    "lot": "Runtime limits of the bounded preview (ADR 0044), to be raised to Mosquitto's defaults or made configurable: Receive Maximum 8; on MQTT 3.1.1 connections apply backpressure instead of closing",
-    "fingerprint": "9df3f8eb48ca7ef4"
   },
   {
     "id": "publish/pubrel-retransmit-v5",

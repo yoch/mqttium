@@ -202,6 +202,10 @@ struct DeferredPublish {
     packet: InboundPacket,
     ingress_order: u64,
     since: Instant,
+    /// The window is held by a frame whose write is not yet reported: a
+    /// short, bounded wait. Otherwise the publication waits for the
+    /// acknowledgements of a 3.1.1 client's earlier ones.
+    wire: bool,
 }
 struct PendingFrame {
     connection: ConnectionKey,
@@ -2894,7 +2898,10 @@ impl Runtime<'_> {
                                     )
                                 })
                     });
-                    if pending_terminal {
+                    // MQTT 3.1.1 has no Receive Maximum to announce: a burst
+                    // beyond the window is pressure, never a violation.
+                    let unannounced = p.version == Some(codec::Version::V311);
+                    if pending_terminal || unannounced {
                         if p.deferred_publish.is_some() {
                             return Err(Failure::plain("deferred_publish_overlap"));
                         }
@@ -2906,6 +2913,7 @@ impl Runtime<'_> {
                             packet,
                             ingress_order,
                             since: Instant::now(),
+                            wire: pending_terminal,
                         });
                         self.events.emit("publish_waiting_wire",json!({"connection":generation.get().to_string(),"details":{"publish_order":ingress_order.to_string()}})).map_err(event_failure)?;
                         return Ok(());
@@ -3474,7 +3482,7 @@ impl Runtime<'_> {
                 ingress_order: deferred.ingress_order,
                 packet: deferred.packet,
             })?;
-        } else if deferred.since.elapsed() > Duration::from_millis(500) {
+        } else if deferred.wire && deferred.since.elapsed() > Duration::from_millis(500) {
             self.close(generation, "wire_progress_deadline")?;
         }
         Ok(())
