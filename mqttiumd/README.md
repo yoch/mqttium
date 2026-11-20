@@ -20,9 +20,10 @@ waiting in its lane as one transaction
 [0045](docs/decisions/0045-group-commit.md),
 [0046](docs/decisions/0046-input-backpressure.md)). The connection limit
 is an option (`--max-connections`, up to 128), and input pressure slows a
-peer instead of disconnecting it. The figures of report 0024 describe
-the executable before these records; no throughput claim is made for the
-current one.
+peer instead of disconnecting it. The first measurements on that runtime
+are in [report 0027](docs/reports/0027-reactor-runtime-load.md): they
+replace the figures of report 0024 for the current executable, which
+remains behind Mosquitto, by a factor of two or more on durable QoS 1.
 
 What the broker accepts of MQTT is still the bounded profile described in
 [the product guide](docs/product-tcp.md). The gap to the pinned Mosquitto
