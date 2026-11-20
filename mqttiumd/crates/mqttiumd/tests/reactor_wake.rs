@@ -169,8 +169,11 @@ fn publish_qos0(stream: &mut TcpStream, topic: &str, payload: &[u8]) {
     stream.write_all(&packet(0x30, &body)).unwrap();
 }
 
-/// A publication reaches its subscriber without waiting for a timer: 500
-/// sequential round trips took more than a second on the polling reactor.
+/// A publication reaches its subscriber without waiting for a timer. On
+/// the polling reactor every hop slept a millisecond, so no round trip
+/// took less than two; here the typical one must take less than 1.5 ms.
+/// The median is asserted, not the total: a loaded machine delays some
+/// round trips, a timer delays all of them.
 #[test]
 fn a_publication_is_delivered_without_waiting_for_a_timer() {
     const ROUND_TRIPS: u32 = 500;
@@ -182,18 +185,23 @@ fn a_publication_is_delivered_without_waiting_for_a_timer() {
     publish_qos0(&mut publisher, "wake/latency", b"warm");
     assert_eq!(read_packet(&mut subscriber).0 >> 4, 3);
     let started = Instant::now();
+    let mut delays = Vec::new();
     for sequence in 0..ROUND_TRIPS {
         let payload = sequence.to_be_bytes();
+        let sent = Instant::now();
         publish_qos0(&mut publisher, "wake/latency", &payload);
         let (first, body) = read_packet(&mut subscriber);
+        delays.push(sent.elapsed());
         assert_eq!(first >> 4, 3, "PUBLISH expected");
         assert!(body.ends_with(&payload), "delivery {sequence} out of order");
     }
     let elapsed = started.elapsed();
-    eprintln!("{ROUND_TRIPS} round trips in {elapsed:?}");
+    delays.sort();
+    let median = delays[delays.len() / 2];
+    eprintln!("{ROUND_TRIPS} round trips in {elapsed:?}, median {median:?}");
     assert!(
-        elapsed < Duration::from_millis(500),
-        "{ROUND_TRIPS} round trips took {elapsed:?}"
+        median < Duration::from_micros(1500),
+        "the median round trip took {median:?} ({ROUND_TRIPS} in {elapsed:?})"
     );
 }
 

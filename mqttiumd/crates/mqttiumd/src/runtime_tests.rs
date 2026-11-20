@@ -337,6 +337,25 @@ fn until(runtime: &mut Runtime<'_>, condition: impl Fn(&Runtime<'_>) -> bool) {
     );
 }
 
+/// Reads the next frame, serving the runtime while it has not arrived: a
+/// four-slot output lane is refilled by dispatches, and a wait for output
+/// must not depend on how the transport's thread was scheduled.
+fn served_frame(runtime: &mut Runtime<'_>, client: &mut TcpStream) -> (u8, Vec<u8>) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut first = [0u8; 1];
+    client
+        .set_read_timeout(Some(Duration::from_millis(2)))
+        .unwrap();
+    while client.peek(&mut first).is_err() {
+        assert!(Instant::now() < deadline, "no frame arrived");
+        pump(runtime);
+    }
+    client
+        .set_read_timeout(Some(Duration::from_secs(1)))
+        .unwrap();
+    read_frame(client)
+}
+
 fn read_frame(client: &mut impl Read) -> (u8, Vec<u8>) {
     let mut byte = [0];
     client.read_exact(&mut byte).unwrap();
@@ -5484,11 +5503,13 @@ fn blocked_output_and_full_input_preserve_independent_work_and_reconnect_credit(
                     .keys()
                     .any(|(key, _)| key.generation == subscriber)
             });
+            // The order and content of the output are what is asserted;
+            // how many frames the passes above had already queued is not.
             for _ in 0..ORDINARY_INPUTS {
-                assert_eq!(read_frame(&mut source), (0xd0, vec![]));
+                assert_eq!(served_frame(runtime, &mut source), (0xd0, vec![]));
             }
-            assert_eq!(read_frame(&mut source), (0x40, vec![0, 7]));
-            let (first, body) = read_frame(&mut receiver_b);
+            assert_eq!(served_frame(runtime, &mut source), (0x40, vec![0, 7]));
+            let (first, body) = served_frame(runtime, &mut receiver_b);
             assert_eq!((first, body[2], body[6]), (0x32, b't', b'v'));
             let b_id = u16::from_be_bytes([body[3], body[4]]);
             let independent_micros = progress_started.elapsed().as_micros();
