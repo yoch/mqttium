@@ -1,9 +1,10 @@
 ---------------------------- MODULE MGroupCommit ----------------------------
 (***************************************************************************)
 (* MGroupCommit: several store commands in one transaction of the engine,  *)
-(* as decision record 0045 (proposed) and                                  *)
-(* crates/mqttiumd-store-sqlite/src/group.rs of its lot describe           *)
-(* `SqliteStore::apply_group`. Specification: neither is on this branch.   *)
+(* as written in crates/mqttiumd-store-sqlite/src/group.rs                 *)
+(* (`SqliteStore::apply_group`, `member`, `savepoint`; decision record     *)
+(* 0045) and delivered by the store worker of                              *)
+(* crates/mqttiumd/src/writer.rs (`group_responses`).                      *)
 (*                                                                         *)
 (*   BEGIN IMMEDIATE                              Begin                    *)
 (*   for each command, in order:                                           *)
@@ -27,9 +28,10 @@
 (* TO restores the state at its SAVEPOINT, and that a transaction which    *)
 (* is not committed leaves nothing. An operation has one of four durable   *)
 (* states; rows, quotas and the meta revision are folded into it. The      *)
-(* answers are handed over one member at a time: the store returns them    *)
-(* together, the writer that will deliver them is another lot. The         *)
-(* history of the verifier (prefix h) is read by no guard.                 *)
+(* store returns the answers together; the worker publishes them one       *)
+(* member at a time, in the order of the requests. How the worker forms    *)
+(* a group from its request lane is not here. The history of the verifier  *)
+(* (prefix h) is read by no guard.                                         *)
 (***************************************************************************)
 EXTENDS Naturals, Sequences, FiniteSets
 
@@ -187,9 +189,10 @@ Commit ==
     /\ pc' = "reply"
     /\ UNCHANGED <<sp, cur, wrote, released, hVerdict, hCrashAt>>
 
-\* One answer is handed to the caller. In the decision this happens only
-\* once COMMIT returned; ReleaseBeforeCommit does it with the group
-\* staged and COMMIT not called.
+\* One answer is published to the core, in the order of the requests
+\* (`rtx.try_send` in the worker loop). This happens only once
+\* `apply_group` returned, so after COMMIT; ReleaseBeforeCommit does it
+\* with the group staged and COMMIT not called.
 Release(m) ==
     /\ pc = "reply" \/ (Mutation = "ReleaseBeforeCommit" /\ pc = "prepared")
     /\ released[m] = "none" /\ reply[m] # "none"
