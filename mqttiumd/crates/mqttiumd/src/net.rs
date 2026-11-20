@@ -259,6 +259,13 @@ pub struct Connection {
     principal: Option<Arc<OnceLock<Principal>>>,
 }
 
+/// Defers the wake-ups of the reactor threads until the guard is dropped.
+/// A caller that serves many lanes in one pass pays one wake-up per thread
+/// instead of one per lane. A deferred wake-up is late, never lost.
+pub(crate) fn hold_wakes() -> reactor::Held<'static> {
+    Reactors::shared().hold()
+}
+
 pub fn spawn(stream: TcpStream) -> io::Result<Connection> {
     let clock = SystemClock::new().map_err(io::Error::other)?;
     spawn_with_clock(stream, Arc::new(clock))

@@ -826,6 +826,39 @@ fn a_deferred_subscription_cannot_be_overtaken_by_its_later_unsubscribe() {
     });
 }
 
+/// The one-pass bindings are what a lookup per cached session answered,
+/// for attached and detached sessions alike.
+#[test]
+fn the_bindings_of_a_dispatch_equal_a_lookup_per_session() {
+    with_runtime(128, |runtime, _| {
+        let per_session = |runtime: &Runtime<'_>| -> BTreeMap<_, _> {
+            runtime
+                .sessions
+                .values()
+                .filter_map(|s| runtime.owner.connection_of(s.id).map(|c| (s.id, c)))
+                .collect()
+        };
+        assert!(runtime.bindings().is_empty());
+        let (first, mut first_client) = peer(runtime);
+        runtime.connect(first, connect_packet(b"bound-1")).unwrap();
+        until(runtime, |r| r.session_requests.is_empty());
+        assert_eq!(read_frame(&mut first_client).0, 0x20);
+        let (second, mut second_client) = peer(runtime);
+        runtime.connect(second, connect_packet(b"bound-2")).unwrap();
+        until(runtime, |r| r.session_requests.is_empty());
+        assert_eq!(read_frame(&mut second_client).0, 0x20);
+        assert_eq!(runtime.bindings().len(), 2);
+        assert_eq!(runtime.bindings(), per_session(runtime));
+        // A persistent session that lost its transport stays cached and
+        // has no binding.
+        drop(first_client);
+        until(runtime, |r| !r.peers.contains_key(&first));
+        assert_eq!(runtime.sessions.len(), 2);
+        assert_eq!(runtime.bindings(), per_session(runtime));
+        assert_eq!(runtime.bindings().len(), 1);
+    });
+}
+
 #[test]
 fn capacity_blocked_publish_does_not_starve_another_clients_release_or_result() {
     with_runtime(1, |runtime, _| {

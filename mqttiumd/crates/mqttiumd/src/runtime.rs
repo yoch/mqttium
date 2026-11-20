@@ -34,7 +34,7 @@ use mqttiumd_contract::{ids::DeliveryId, pubsub::WorkItem};
 use mqttiumd_core::owner::{Owner, OwnerConfig};
 use mqttiumd_store_api::{ReadError, ReadPhase, SessionClockAnchor, SessionClockReading};
 use serde_json::json;
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::net::{SocketAddr, TcpListener};
 use std::num::{NonZeroU32, NonZeroUsize};
 use std::path::PathBuf;
@@ -578,6 +578,9 @@ impl Runtime<'_> {
 
     /// One pass over every source, in the fixed order of the reactor.
     fn turn(&mut self) -> Result<(), Failure> {
+        // However many lanes the turn serves, each reactor thread is woken
+        // once, when the turn ends.
+        let _wakes = net::hold_wakes();
         self.writer_results()?;
         self.connections()?;
         self.discover_work();
@@ -1858,12 +1861,19 @@ impl Runtime<'_> {
         }
         Ok(())
     }
+    /// The connection of every cached session the owner has attached. One
+    /// pass over each side, where a lookup per session was quadratic.
+    fn bindings(&self) -> BTreeMap<SessionId, ConnectionGeneration> {
+        let cached: BTreeSet<SessionId> =
+            self.sessions.values().map(|session| session.id).collect();
+        self.owner
+            .connections()
+            .filter(|(session, _)| cached.contains(session))
+            .collect()
+    }
+
     fn dispatch(&mut self) -> Result<(), Failure> {
-        let bindings: BTreeMap<_, _> = self
-            .sessions
-            .values()
-            .filter_map(|s| self.owner.connection_of(s.id).map(|c| (s.id, c)))
-            .collect();
+        let bindings = self.bindings();
         let queued_writer_replies = self.writer_input_count();
         let mut sink = Sink {
             writer: self.writer,

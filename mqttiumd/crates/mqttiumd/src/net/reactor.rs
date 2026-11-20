@@ -107,15 +107,53 @@ struct Shared {
     /// it published: one of the two always sees the other.
     sleeping: AtomicBool,
     waker: Waker,
+    /// A producer serves many lanes in one pass and will wake once.
+    held: AtomicBool,
+    /// A message was queued and its wake-up not given yet.
+    owing: AtomicBool,
 }
 
 impl Shared {
+    fn new(waker: Waker) -> Self {
+        Self {
+            queue: Mutex::new(Vec::new()),
+            sleeping: AtomicBool::new(false),
+            waker,
+            held: AtomicBool::new(false),
+            owing: AtomicBool::new(false),
+        }
+    }
+
     fn send(&self, message: Message) {
         if let Ok(mut queue) = self.queue.lock() {
             queue.push(message);
         }
-        if self.sleeping.load(Ordering::SeqCst) {
+        // The debt is recorded before the hold is read, and the release
+        // clears the hold before it reads the debt: one of them pays it.
+        self.owing.store(true, Ordering::SeqCst);
+        if !self.held.load(Ordering::SeqCst) {
+            self.kick();
+        }
+    }
+
+    fn kick(&self) {
+        if self.owing.swap(false, Ordering::SeqCst) && self.sleeping.load(Ordering::SeqCst) {
             let _ = self.waker.wake();
+        }
+    }
+}
+
+/// While it lives, messages to the reactors are queued without a wake-up.
+/// Dropping it wakes each reactor that was sent something meanwhile. A
+/// reactor that is awake takes its messages as usual, and one that sleeps
+/// takes them at its next timeout at the latest.
+pub(crate) struct Held<'a>(&'a Reactors);
+
+impl Drop for Held<'_> {
+    fn drop(&mut self) {
+        for (shared, _) in &self.0.threads {
+            shared.held.store(false, Ordering::SeqCst);
+            shared.kick();
         }
     }
 }
@@ -140,11 +178,7 @@ impl Reactors {
         let mut started = Vec::new();
         for index in 0..threads.max(1) {
             let poll = Poll::new()?;
-            let shared = Arc::new(Shared {
-                queue: Mutex::new(Vec::new()),
-                sleeping: AtomicBool::new(false),
-                waker: Waker::new(poll.registry(), WAKER)?,
-            });
+            let shared = Arc::new(Shared::new(Waker::new(poll.registry(), WAKER)?));
             let worker = shared.clone();
             let handle = thread::Builder::new()
                 .name(format!("mqttiumd-io-{index}"))
@@ -175,6 +209,13 @@ impl Reactors {
             finished: AtomicBool::new(false),
             wake,
         })
+    }
+
+    pub(crate) fn hold(&self) -> Held<'_> {
+        for (shared, _) in &self.threads {
+            shared.held.store(true, Ordering::SeqCst);
+        }
+        Held(self)
     }
 
     pub(crate) fn register(&self, link: &Arc<Link>, task: Box<dyn Driven>) {
@@ -506,6 +547,25 @@ mod tests {
         fixture.link.consumed();
         thread::sleep(Duration::from_millis(50));
         assert!(fixture.turns.load(Ordering::SeqCst) > settled);
+    }
+
+    #[test]
+    fn a_held_wake_up_is_given_when_the_hold_ends() {
+        let pool = Reactors::new(1).unwrap();
+        let fixture = echo(&pool);
+        thread::sleep(Duration::from_millis(50));
+        let before = fixture.turns.load(Ordering::SeqCst);
+        let held = pool.hold();
+        fixture.link.notify();
+        drop(held);
+        let deadline = Instant::now() + Duration::from_millis(500);
+        while fixture.turns.load(Ordering::SeqCst) == before {
+            assert!(
+                Instant::now() < deadline,
+                "the wake-up owed at the end of the hold was not given"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
     }
 
     #[test]

@@ -994,6 +994,15 @@ impl Owner {
             .and_then(|held| held.connection)
     }
 
+    /// Every session that has a connection, with that connection: what
+    /// [`Owner::connection_of`] answers for each of them, in one pass.
+    pub fn connections(&self) -> impl Iterator<Item = (SessionId, ConnectionGeneration)> + '_ {
+        self.sessions
+            .as_slice()
+            .iter()
+            .filter_map(|held| held.connection.map(|connection| (held.id, connection)))
+    }
+
     /// The exchange the session holds under this Packet Identifier, and
     /// its state; `None` is the `Absent` of the registry.
     #[must_use]
