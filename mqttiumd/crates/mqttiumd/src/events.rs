@@ -1,6 +1,7 @@
 //! Bounded product observations, independent of fixture-based campaign verdicts.
 use mqttiumd_contract::ids::OperationId;
 use serde_json::{Value, json};
+use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -17,8 +18,77 @@ pub(crate) fn monotonic_ns() -> Option<u64> {
 
 const MAX_RECORD: usize = 2048;
 const MAX_LOG: usize = 16 * 1024 * 1024;
+/// What the event file records.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Level {
+    /// Every observation, including one record per frame and per command.
+    #[default]
+    Audit,
+    /// Lifecycle, refusals and faults. Observations made per message are
+    /// counted and reported as one `counters` record per interval, so a
+    /// drop or a refusal on the data path stays visible without a write
+    /// per message.
+    Ops,
+}
+
+impl std::str::FromStr for Level {
+    type Err = ();
+    fn from_str(name: &str) -> Result<Self, ()> {
+        match name {
+            "audit" => Ok(Self::Audit),
+            "ops" => Ok(Self::Ops),
+            _ => Err(()),
+        }
+    }
+}
+
+/// The kinds written at [`Level::Ops`], sorted. Any other kind is counted.
+const OPS_KINDS: &[&str] = &[
+    "authorization_refused",
+    "barrier_hit",
+    "barrier_released",
+    "closed_receipts_collected",
+    "connect_validated",
+    "connection_closed",
+    "connection_opened",
+    "connection_refused",
+    "core_fault",
+    "counters",
+    "expiry_inventory",
+    "input_capacity_refused",
+    "log_rotated",
+    "message_expiry_clock",
+    "message_expiry_retry_exhausted",
+    "packet_refused",
+    "ready",
+    "receipt_policy",
+    "receipt_window_pressure",
+    "session_changed",
+    "session_clock_anchor",
+    "session_clock_checkpoint",
+    "session_clock_degraded",
+    "session_established",
+    "session_refused",
+    "session_shutdown_completed",
+    "shutdown_incomplete",
+    "sqlite_configuration",
+    "starting",
+    "startup_or_runtime_refused",
+    "stopped",
+    "tls_authenticated",
+    "tls_profile",
+    "will_capabilities",
+    "will_deferred",
+];
+
+/// Distinct suppressed kinds a `counters` record can carry.
+const MAX_TALLIES: usize = 96;
+
 #[derive(Clone)]
-pub struct Events(Arc<Mutex<Log>>);
+pub struct Events {
+    log: Arc<Mutex<Log>>,
+    level: Level,
+}
 struct Log {
     file: File,
     path: PathBuf,
@@ -26,9 +96,58 @@ struct Log {
     seq: u64,
     bytes: usize,
     first_seq: u64,
+    tallies: BTreeMap<String, u64>,
 }
 impl Events {
     pub fn open(path: &Path) -> io::Result<Self> {
+        Self::open_at(path, Level::Audit)
+    }
+
+    /// Whether a record of this kind is written at the current level. A
+    /// caller on the data path asks before it builds the fields.
+    #[must_use]
+    pub fn records(&self, kind: &str) -> bool {
+        self.level == Level::Audit || OPS_KINDS.binary_search(&kind).is_ok()
+    }
+
+    /// Counts one observation that the current level does not write.
+    pub fn tally(&self, kind: &str) {
+        if self.records(kind) {
+            return;
+        }
+        if let Ok(mut log) = self.log.lock() {
+            if let Some(count) = log.tallies.get_mut(kind) {
+                *count = count.saturating_add(1);
+            } else if log.tallies.len() < MAX_TALLIES {
+                log.tallies.insert(kind.to_owned(), 1);
+            } else {
+                let other = log.tallies.entry("other".to_owned()).or_insert(0);
+                *other = other.saturating_add(1);
+            }
+        }
+    }
+
+    /// Writes the counts gathered since the previous call as one `counters`
+    /// record, or nothing when no suppressed observation was made.
+    pub fn flush_tallies(&self) -> io::Result<()> {
+        let counts = {
+            let mut log = self
+                .log
+                .lock()
+                .map_err(|_| io::Error::other("event lock"))?;
+            if log.tallies.is_empty() {
+                return Ok(());
+            }
+            std::mem::take(&mut log.tallies)
+        };
+        let counts: serde_json::Map<String, Value> = counts
+            .into_iter()
+            .map(|(kind, count)| (kind, Value::String(count.to_string())))
+            .collect();
+        self.write("counters", json!({"details":{"counts":counts}}))
+    }
+
+    pub fn open_at(path: &Path, level: Level) -> io::Result<Self> {
         let mut name = path.as_os_str().to_owned();
         name.push(".previous");
         let previous = PathBuf::from(name);
@@ -39,17 +158,31 @@ impl Events {
             ));
         }
         let file = OpenOptions::new().write(true).create_new(true).open(path)?;
-        Ok(Self(Arc::new(Mutex::new(Log {
-            file,
-            path: path.to_owned(),
-            previous,
-            seq: 0,
-            bytes: 0,
-            first_seq: 1,
-        }))))
+        Ok(Self {
+            log: Arc::new(Mutex::new(Log {
+                file,
+                path: path.to_owned(),
+                previous,
+                seq: 0,
+                bytes: 0,
+                first_seq: 1,
+                tallies: BTreeMap::new(),
+            })),
+            level,
+        })
     }
     pub fn emit(&self, kind: &str, fields: Value) -> io::Result<()> {
-        let mut log = self.0.lock().map_err(|_| io::Error::other("event lock"))?;
+        if !self.records(kind) {
+            self.tally(kind);
+            return Ok(());
+        }
+        self.write(kind, fields)
+    }
+    fn write(&self, kind: &str, fields: Value) -> io::Result<()> {
+        let mut log = self
+            .log
+            .lock()
+            .map_err(|_| io::Error::other("event lock"))?;
         let mut seq = log
             .seq
             .checked_add(1)
@@ -209,5 +342,68 @@ mod tests {
         events.emit("stopped", json!({})).unwrap();
         assert!(!directory.0.join("events.jsonl.previous").exists());
         assert_eq!(read(&path).iter().map(sequence).collect::<Vec<_>>(), [1, 2]);
+    }
+
+    #[test]
+    fn the_operations_level_keeps_lifecycle_records_and_counts_the_rest() {
+        let directory = Directory::new();
+        let path = directory.0.join("events.jsonl");
+        let events = Events::open_at(&path, Level::Ops).unwrap();
+        assert!(events.records("ready"));
+        assert!(!events.records("frame_queued"));
+        events.emit("ready", json!({})).unwrap();
+        for _ in 0..3 {
+            events
+                .emit("frame_queued", json!({"details":{"packet_kind":"PUBLISH"}}))
+                .unwrap();
+        }
+        events.tally("qos0_dropped");
+        events.tally("qos0_dropped");
+        events.emit("connection_closed", json!({})).unwrap();
+        // Nothing per message was written, and nothing was lost either.
+        assert_eq!(
+            read(&path)
+                .iter()
+                .map(|row| row["kind"].as_str().unwrap().to_owned())
+                .collect::<Vec<_>>(),
+            ["ready", "connection_closed"]
+        );
+        events.flush_tallies().unwrap();
+        let rows = read(&path);
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[2]["kind"], "counters");
+        assert_eq!(rows[2]["details"]["counts"]["frame_queued"], "3");
+        assert_eq!(rows[2]["details"]["counts"]["qos0_dropped"], "2");
+        assert!(
+            rows.windows(2)
+                .all(|pair| sequence(&pair[1]) == sequence(&pair[0]) + 1)
+        );
+        // An interval without a suppressed record writes nothing.
+        events.flush_tallies().unwrap();
+        assert_eq!(read(&path).len(), 3);
+    }
+
+    #[test]
+    fn the_audit_level_writes_every_record() {
+        let directory = Directory::new();
+        let path = directory.0.join("events.jsonl");
+        let events = Events::open(&path).unwrap();
+        assert!(events.records("frame_queued"));
+        events.emit("frame_queued", json!({})).unwrap();
+        events.tally("qos0_dropped");
+        events.flush_tallies().unwrap();
+        assert_eq!(read(&path).len(), 1);
+    }
+
+    #[test]
+    fn the_operations_kinds_are_sorted_for_their_lookup() {
+        assert!(OPS_KINDS.windows(2).all(|pair| pair[0] < pair[1]));
+    }
+
+    #[test]
+    fn a_level_is_parsed_from_its_name_only() {
+        assert_eq!("audit".parse(), Ok(Level::Audit));
+        assert_eq!("ops".parse(), Ok(Level::Ops));
+        assert!("AUDIT".parse::<Level>().is_err());
     }
 }

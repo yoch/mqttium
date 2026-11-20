@@ -10,6 +10,12 @@ fn parse_arguments(mut args: impl Iterator<Item = String>) -> Result<Config, &'s
     let mut require_existing_db = false;
     let mut listen = "127.0.0.1:1883".parse().map_err(|_| "listen")?;
     let mut events = None;
+    // The instrumented build serves receptions that read every record.
+    let mut event_level = if cfg!(feature = "test-hooks") {
+        mqttiumd::events::Level::Audit
+    } else {
+        mqttiumd::events::Level::Ops
+    };
     let mut hooks = Hooks::default();
     let (mut cert, mut key, mut client_ca, mut identities) = (None, None, None, None);
     while let Some(arg) = args.next() {
@@ -22,6 +28,7 @@ fn parse_arguments(mut args: impl Iterator<Item = String>) -> Result<Config, &'s
             }
             "--listen" => listen = value.parse().map_err(|_| "invalid listen address")?,
             "--events" => events = Some(PathBuf::from(value)),
+            "--event-level" => event_level = value.parse().map_err(|()| "invalid event level")?,
             "--tls-cert" if cert.is_none() => cert = Some(PathBuf::from(value)),
             "--tls-key" if key.is_none() => key = Some(PathBuf::from(value)),
             "--client-ca" if client_ca.is_none() => client_ca = Some(PathBuf::from(value)),
@@ -98,6 +105,7 @@ fn parse_arguments(mut args: impl Iterator<Item = String>) -> Result<Config, &'s
         require_existing_db,
         listen,
         events: events.ok_or("--events is required")?,
+        event_level,
         hooks,
         tls: match (cert, key, client_ca, identities) {
             (None, None, None, None) => None,
@@ -160,7 +168,7 @@ fn main() {
         Ok(c) => c,
         Err(e) => {
             eprintln!(
-                "mqttiumd: {e}\nusage: mqttiumd (--db PATH | --existing-db PATH) --listen ADDRESS --events NEW_JSONL_PATH [--tls-cert PATH --tls-key PATH --client-ca PATH --identities PATH]"
+                "mqttiumd: {e}\nusage: mqttiumd (--db PATH | --existing-db PATH) --listen ADDRESS --events NEW_JSONL_PATH [--event-level audit|ops] [--tls-cert PATH --tls-key PATH --client-ca PATH --identities PATH]"
             );
             std::process::exit(2);
         }

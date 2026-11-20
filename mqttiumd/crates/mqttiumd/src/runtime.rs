@@ -59,6 +59,8 @@ const LIFECYCLE_IN_FLIGHT: usize = 1;
 /// Upper bound of an idle wait: connection deadlines and expiry scans are
 /// wall-clock checks without a producer to signal them.
 const IDLE_TICK: Duration = Duration::from_millis(20);
+/// A busy reactor reports its suppressed observations at this interval.
+const COUNTERS_INTERVAL: Duration = Duration::from_secs(1);
 const MESSAGE_EXPIRY_RETRIES: u8 = 3;
 const CLOSING_INPUTS: usize = 2 * CONNECTIONS;
 // Per transport: four queued frames, one active and eight terminal receipts.
@@ -100,6 +102,7 @@ pub struct Config {
     pub require_existing_db: bool,
     pub listen: SocketAddr,
     pub events: PathBuf,
+    pub event_level: crate::events::Level,
     pub hooks: Hooks,
     pub tls: Option<TlsFiles>,
 }
@@ -1155,6 +1158,11 @@ impl Runtime<'_> {
 
     fn emit_session_cardinality(&mut self) -> Result<(), Failure> {
         if !self.session_cardinality_dirty {
+            return Ok(());
+        }
+        if !self.events.records("session_cardinality") {
+            // Computed for the audit record only.
+            self.session_cardinality_dirty = false;
             return Ok(());
         }
         let owner = self.owner.session_status();
@@ -4797,7 +4805,7 @@ fn nz(v: u32) -> NonZeroU32 {
 }
 
 pub fn run(config: Config) -> Result<(), Failure> {
-    let events = Events::open(&config.events).map_err(event_failure)?;
+    let events = Events::open_at(&config.events, config.event_level).map_err(event_failure)?;
     let security = match &config.tls {
         Some(files) => Security::load(files).map(Some).map_err(Failure::plain),
         None if config.listen.ip().is_loopback() => Ok(None),
@@ -5276,6 +5284,7 @@ fn run_inner(
         println!("mqttiumd ready {address} ({profile})");
         let acceptor = Acceptor::spawn(listener, cancel.clone(), runtime.wake.clone())?;
         let served = (|| {
+            let mut counters_due = Instant::now() + COUNTERS_INTERVAL;
             while !cancel.load(Ordering::Relaxed) {
                 let before = runtime.progress;
                 for _ in 0..4 {
@@ -5292,7 +5301,12 @@ fn run_inner(
                     }
                 }
                 runtime.turn()?;
-                if runtime.progress == before {
+                let idle = runtime.progress == before;
+                if idle || Instant::now() >= counters_due {
+                    runtime.events.flush_tallies().map_err(event_failure)?;
+                    counters_due = Instant::now() + COUNTERS_INTERVAL;
+                }
+                if idle {
                     // Nothing was runnable. Every producer signals after it
                     // publishes; the timeout only bounds the wall-clock
                     // checks that have no producer.
