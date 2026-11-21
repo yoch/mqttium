@@ -140,6 +140,8 @@ const BOUNDS: Bounds = Bounds {
     max_topic: 1024,
     max_payload: 32768,
 };
+// The announced Maximum Packet Size follows the payload limit.
+const _: () = assert!(codec::ANNOUNCED_PACKET_BYTES as usize == BOUNDS.max_payload + 8);
 #[cfg(feature = "test-hooks")]
 const MUTANT_EARLY_ACK: bool = false;
 #[cfg(feature = "test-hooks")]
@@ -2660,6 +2662,50 @@ impl Runtime<'_> {
         self.close(generation, "not_authorized")
     }
 
+    /// A fixed header the transport refused: the transport reads no
+    /// further packet. An MQTT 5 client that holds its CONNACK is told why
+    /// before the close. A refused first header names no protocol version
+    /// to answer in, and MQTT 3.1.1 has no packet for it.
+    fn header_refused(
+        &mut self,
+        generation: ConnectionGeneration,
+        code: &'static str,
+    ) -> Result<(), Failure> {
+        let (name, reason) = if code == "packet_too_large" {
+            ("PacketTooLarge", 0x95u8)
+        } else {
+            ("MalformedHeader", 0x81u8)
+        };
+        self.events
+            .emit(
+                "packet_refused",
+                json!({"connection":generation.get().to_string(),
+                    "details":{"code":name,"reason":reason}}),
+            )
+            .map_err(event_failure)?;
+        if let Some(p) = self.peers.get_mut(&generation)
+            && p.connected
+            && p.version == Some(codec::Version::V5)
+            && p.closing.is_none()
+        {
+            let bytes = codec::disconnect_reason(reason);
+            if bytes.len() <= p.max_packet
+                && p.io
+                    .outgoing
+                    .try_send(net::Write {
+                        expiry: None,
+                        correlation: None,
+                        bytes,
+                    })
+                    .is_ok()
+            {
+                p.closing = Some((code, Instant::now()));
+                return Ok(());
+            }
+        }
+        self.close(generation, code)
+    }
+
     fn packet_at(
         &mut self,
         generation: ConnectionGeneration,
@@ -3188,6 +3234,10 @@ impl Runtime<'_> {
                             break;
                         }
                         self.packet_at(generation, first, body, observed)?
+                    }
+                    Ok(net::Incoming::Refused { code }) => {
+                        self.header_refused(generation, code)?;
+                        break;
                     }
                     Ok(net::Incoming::Closed { code }) => {
                         if tls {

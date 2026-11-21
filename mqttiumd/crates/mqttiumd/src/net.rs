@@ -61,6 +61,12 @@ pub enum Incoming {
         /// bounded channel or pending-CONNECT residence can age it.
         observed: FrameObservation,
     },
+    /// The peer sent a fixed header the broker refuses. The transport reads
+    /// no further packet and drops what follows, but still writes: the
+    /// runtime may name the cause before it closes the connection.
+    Refused {
+        code: &'static str,
+    },
     Closed {
         code: &'static str,
     },
@@ -529,8 +535,11 @@ impl Lanes {
     /// previous one first.
     fn hold(&mut self, incoming: Incoming) {
         debug_assert!(self.held.is_none());
-        let since = u64::try_from(epoch().elapsed().as_nanos()).unwrap_or(u64::MAX - 1);
-        self.heard.store(since + 1, Ordering::Relaxed);
+        // A refused header is not a packet the peer was heard to send.
+        if matches!(incoming, Incoming::Packet { .. }) {
+            let since = u64::try_from(epoch().elapsed().as_nanos()).unwrap_or(u64::MAX - 1);
+            self.heard.store(since + 1, Ordering::Relaxed);
+        }
         self.held = Some(incoming);
     }
 
@@ -711,6 +720,11 @@ struct Parser {
     previous: Option<MessageTime>,
     /// Bytes taken from the source, modulo the counter width.
     consumed: usize,
+    /// The cause a refused fixed header gave. From then on the input is
+    /// read and dropped: the peer is not blocked in its own writes while
+    /// the reason travels to it, and the connection ends with this cause
+    /// whichever side closes first.
+    refused: Option<&'static str>,
 }
 
 impl Parser {
@@ -718,11 +732,25 @@ impl Parser {
         self.since.is_some()
     }
 
+    /// Ends framing: no packet has a deadline any more, the runtime owns
+    /// the one of the closing connection.
+    fn refuse(&mut self, code: &'static str) -> Incoming {
+        self.refused = Some(code);
+        self.since = None;
+        Incoming::Refused { code }
+    }
+
     fn packet(
         &mut self,
         source: &mut impl Source,
         clock: &dyn SessionClock,
     ) -> Result<Option<Incoming>, &'static str> {
+        if let Some(code) = self.refused {
+            let mut dropped = [0u8; 512];
+            let count = source.pull(&mut dropped, false).map_err(|_| code)?;
+            self.consumed = self.consumed.wrapping_add(count);
+            return Ok(None);
+        }
         if self
             .since
             .is_some_and(|start| start.elapsed() >= PARTIAL_PACKET_TIMEOUT)
@@ -731,7 +759,7 @@ impl Parser {
         }
         while self.header.is_none() {
             if self.prefix_len == self.prefix.len() {
-                return Err("malformed_header");
+                return Ok(Some(self.refuse("malformed_header")));
             }
             let next = &mut self.prefix[self.prefix_len..self.prefix_len + 1];
             if source.pull(next, self.since.is_some())? == 0 {
@@ -740,14 +768,13 @@ impl Parser {
             self.consumed = self.consumed.wrapping_add(1);
             self.since.get_or_insert_with(Instant::now);
             self.prefix_len += 1;
-            self.header = codec::header(&self.prefix[..self.prefix_len], MAX_PACKET_BYTES)
-                .map_err(|error| {
-                    if error.kind() == ErrorKind::Oversized {
-                        "packet_too_large"
-                    } else {
-                        "malformed_header"
-                    }
-                })?;
+            match codec::header(&self.prefix[..self.prefix_len], MAX_PACKET_BYTES) {
+                Ok(header) => self.header = header,
+                Err(error) if error.kind() == ErrorKind::Oversized => {
+                    return Ok(Some(self.refuse("packet_too_large")));
+                }
+                Err(_) => return Ok(Some(self.refuse("malformed_header"))),
+            }
         }
         let header = self.header.expect("header checked");
         if self.body.len() != header.remaining {
@@ -1237,6 +1264,13 @@ mod tests {
             .unwrap()
     }
 
+    fn refused(connection: &Connection, expected: &str) {
+        match incoming(connection) {
+            Incoming::Refused { code } => assert_eq!(code, expected),
+            packet => panic!("expected a refused header, got {packet:?}"),
+        }
+    }
+
     fn closed(connection: &Connection, expected: &str) {
         match incoming(connection) {
             Incoming::Closed { code } => assert_eq!(code, expected),
@@ -1595,6 +1629,24 @@ mod tests {
     fn oversized_header_is_refused_without_waiting_for_its_body() {
         let (mut connection, mut peer) = pair();
         peer.write_all(&[0x34, 0xff, 0xff, 0x7f]).unwrap();
+        refused(&connection, "packet_too_large");
+        // The write side stays: the runtime can name the cause, and what
+        // the peer still sends is dropped, not framed.
+        peer.write_all(&[0xc0, 0]).unwrap();
+        connection
+            .outgoing
+            .try_send(Write {
+                correlation: None,
+                bytes: vec![0xe0, 2, 0x95, 0],
+                expiry: None,
+            })
+            .unwrap();
+        let mut answer = [0u8; 4];
+        peer.read_exact(&mut answer).unwrap();
+        assert_eq!(answer, [0xe0, 2, 0x95, 0]);
+        assert!(connection.incoming.try_recv().is_err());
+        // The peer closing first keeps the cause.
+        drop(peer);
         closed(&connection, "packet_too_large");
         finish(&mut connection);
     }
@@ -1697,7 +1749,8 @@ mod tests {
     fn noncanonical_header_is_a_malformed_packet_not_clean_eof() {
         let (mut connection, mut peer) = pair();
         peer.write_all(&[0xc0, 0x80, 0]).unwrap();
-        closed(&connection, "malformed_header");
+        refused(&connection, "malformed_header");
+        connection.close();
         finish(&mut connection);
     }
 

@@ -239,8 +239,11 @@ every output. Peer Receive Maximum constrains QoS 1 and QoS 2 output in addition
 local limit; QoS 0 neither consumes nor returns receive-window credit in either
 direction. Topic Alias Maximum and Request Problem Information are checked;
 no alias or diagnostic string is emitted. CONNACK advertises Receive Maximum 8,
-Maximum Packet Size 65,536, wildcard and retained availability, and no subscription-identifier, shared
-or topic-alias support. Maximum QoS is omitted: that property can
+Maximum Packet Size 32,776, wildcard and retained availability, and no subscription-identifier, shared
+or topic-alias support. The announced size follows the payload limit: no
+PUBLISH within it carries more than 32,768 bytes of payload, so none is refused
+for its size. The transport itself reads frames up to 65,536 bytes, which a
+CONNECT with a large Will needs before any announcement. Maximum QoS is omitted: that property can
 only encode 0 or 1, while this profile accepts incoming QoS 2.
 
 Malformed encodings, invalid protocol/context and valid unsupported features
@@ -248,6 +251,17 @@ have distinct stable error/event codes. Complete properties are validated before
 classifying an unsupported feature. A refusal attempts a bounded MQTT response
 when the peer's limit is known, then closes the unusable connection. Ignoring
 a feature never produces a false success.
+
+A fixed header the transport refuses is answered the same way without waiting
+for a body: an MQTT 5 client that holds its CONNACK receives DISCONNECT 0x95
+for a packet larger than the transport reads and 0x81 for forbidden flags or a
+malformed Remaining Length. The transport frames nothing further and drops
+what the peer still sends until the connection closes, with
+`packet_too_large` or `malformed_header` as its cause. A refused first header
+names no protocol version and MQTT 3.1.1 has no packet for it: both are closed
+without one. A SUBSCRIBE that is valid but carries more than eight filters is
+not a refusal of the connection: its SUBACK refuses every filter (0x97, or
+0x80 in MQTT 3.1.1) and the connection stays open.
 
 ## Bounds and transport
 

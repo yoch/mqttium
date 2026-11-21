@@ -820,6 +820,17 @@ fn legacy_connack_refusal(reason: u8) -> Vec<u8> {
 }
 
 /// The lifecycle runtime uses this bounded control frame before physical close.
+/// The Maximum Packet Size the CONNACK announces. It is a promise that no
+/// packet within it is refused for its size, so it follows the payload
+/// limit, not the larger frame the transport reads: the PUBLISH with the
+/// least overhead (one-byte topic, QoS 0, no property) spends eight bytes
+/// around its payload once the Remaining Length takes three. A client that
+/// honours it never sends a payload over the limit. The transport still
+/// reads frames up to its own bound, which a CONNECT with a large Will
+/// needs before any announcement.
+pub const ANNOUNCED_PACKET_BYTES: u32 = 32_768 + 8;
+const ANNOUNCED: [u8; 4] = ANNOUNCED_PACKET_BYTES.to_be_bytes();
+
 pub fn disconnect_reason(reason: u8) -> Vec<u8> {
     vec![0xe0, 2, reason, 0]
 }
@@ -1106,10 +1117,10 @@ pub fn encode(frame: OutboundFrame) -> Result<Vec<u8>, Error> {
             0,
             8,
             0x27,
-            0,
-            1,
-            0,
-            0,
+            ANNOUNCED[0],
+            ANNOUNCED[1],
+            ANNOUNCED[2],
+            ANNOUNCED[3],
             0x25,
             1,
             0x22,
@@ -2436,7 +2447,7 @@ mod tests {
         assert_eq!(
             &packet[5..],
             &[
-                0x21, 0, 8, 0x27, 0, 1, 0, 0, 0x25, 1, 0x22, 0, 0, 0x28, 1, 0x29, 0, 0x2a, 0
+                0x21, 0, 8, 0x27, 0, 0, 0x80, 8, 0x25, 1, 0x22, 0, 0, 0x28, 1, 0x29, 0, 0x2a, 0
             ]
         );
         assert_eq!(encode(OutboundFrame::Pingresp).unwrap(), [0xd0, 0]);
