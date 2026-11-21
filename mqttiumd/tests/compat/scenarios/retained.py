@@ -1,6 +1,8 @@
 """Retained messages: set, replace, clear, delivery to new subscribers, MQTT 5 retain options."""
 from mqttwire import sub_options
-from dsl import (ack, collect, connect, publish_ack, publish_qos2, publish_sync, quiet, recv, scenario, subscribe)
+from dsl import (ack, collect, connect, drain, mark, measure, publish_ack, publish_qos2, publish_sync, quiet, recv,
+                 scenario, subscribe)
+from expectations import at, expectation, in_any_order
 
 
 def store(conn, topic, payload, level, packet_id=1):
@@ -87,15 +89,66 @@ scenario(
     ],
 )
 
+def many(prefix, count):
+    """`{topic: payload}` of `count` retained messages under `prefix`."""
+    return {f"{prefix}/{index:02d}": f"r{index:02d}" for index in range(1, count + 1)}
+
+
+def keep(conn, topics):
+    """Publish one retained message per topic at QoS 1, each after the
+    PUBACK of the one before."""
+    return [publish_ack(conn, topic, payload, retain=True, packet_id=index)
+            for index, (topic, payload) in enumerate(topics.items(), 1)]
+
+
+def stored(topics):
+    """What a new subscription is owed of a store that holds `topics`."""
+    deliveries = [{"type": "PUBLISH", "topic": topic, "payload": payload, "retain": True}
+                  for topic, payload in topics.items()]
+    return expectation(
+        "store", statement="MQTT-3.3.1-6, with MQTT-3.3.1-5 for the store and MQTT-3.3.1-8 for the RETAIN flag",
+        requires=f"The SUBACK and the {len(topics)} retained messages, one for each topic, with its payload and "
+                 "RETAIN 1, each once and in any order; then nothing",
+        then=[at("retained", {"got": in_any_order({"type": "SUBACK", "packet_id": 1}, *deliveries), "end": "ok"}),
+              at("after", {"got": [], "end": "quiet"})])
+
+
+# The two questions a subscription to many retained topics asks are kept
+# apart. What the store holds is read by a subscriber at QoS 1 that
+# acknowledges every delivery: nothing may be shed for it, so every
+# message is owed whatever the timing. How many QoS 0 deliveries reach a
+# subscriber is something else: a broker may shed them, the number depends
+# on timing, and it is measured, not compared.
+for count, word, doc in (
+    (32, "thirty-two", "thirty-two is what the bounded profile of mqttiumd keeps"),
+    (40, "forty", "forty is more than the bounded profile of mqttiumd keeps"),
+):
+    topics = many(word, count)
+    scenario(
+        f"retained/{word}-topics-qos1-v4",
+        doc=f"""The content of the retained store: {word} topics each keep a retained message
+        ({doc}), and a `{word}/#` subscription made afterwards at QoS 1 acknowledges every
+        delivery. Each message is owed once, with RETAIN 1, in any order, and nothing after.""",
+        steps=[
+            connect("pub", f"r-{word}1-pub"), keep("pub", topics),
+            connect("sub", f"r-{word}1-sub"),
+            subscribe("sub", 1, [(f"{word}/#", 1)], expect=0),
+            drain("sub", count, sort=True), mark("retained"), quiet("sub"), mark("after"),
+        ],
+        expectations=[stored(topics)],
+    )
+
 scenario(
     "retained/forty-topics-v4",
-    doc="Forty topics each keep a retained message: a `forty/#` subscription made afterwards receives all forty.",
+    doc="""QoS 0 deliveries of retained messages: forty topics each keep a retained message and
+    a `forty/#` subscription is made afterwards at QoS 0. A broker may shed QoS 0 deliveries
+    for a subscriber it cannot write to fast enough: each message that comes is one of the
+    forty and comes once; how many come is measured, not compared.""",
     steps=[
-        connect("pub", "r-forty-pub"),
-        [publish_ack("pub", f"forty/{index:02d}", f"r{index:02d}", retain=True, packet_id=index)
-         for index in range(1, 41)],
+        connect("pub", "r-forty-pub"), keep("pub", many("forty", 40)),
         connect("sub", "r-forty-sub"),
-        subscribe("sub", 1, [("forty/#", 0)], expect=0), collect("sub", sort=True),
+        subscribe("sub", 1, [("forty/#", 0)], expect=0),
+        measure("sub", many("forty", 40).values(), ordered=False, window=1.0),
     ],
 )
 
@@ -131,4 +184,4 @@ for handling, doc in (
         ],
     )
 
-del level, v, handling, doc
+del level, v, handling, doc, count, word, topics

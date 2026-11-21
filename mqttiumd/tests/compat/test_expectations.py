@@ -17,7 +17,8 @@ sys.path.insert(0, str(HERE))
 import classify  # noqa: E402
 import dsl  # noqa: E402
 import expectations  # noqa: E402
-from expectations import CLOSED, FAIL, NOT_APPLICABLE, PASS, Each, at, expectation, matches, one_of  # noqa: E402
+from expectations import (CLOSED, FAIL, NOT_APPLICABLE, PASS, Each, at, at_most, expectation, in_any_order,  # noqa: E402
+                          matches, one_of)
 import harness  # noqa: E402
 import mqttwire as wire  # noqa: E402
 import normalize  # noqa: E402
@@ -67,6 +68,34 @@ class Matching(unittest.TestCase):
         self.assertFalse(matches(granted_or_refused, [0, 0x97, 2]))
         self.assertFalse(matches(granted_or_refused, "abc"))
 
+    def test_in_any_order(self):
+        suback = {"type": "SUBACK", "codes": [1]}
+        a, b = {"type": "PUBLISH", "topic": "a", "payload": "x"}, {"type": "PUBLISH", "topic": "b"}
+        bag = in_any_order({"type": "SUBACK"}, {"type": "PUBLISH", "topic": "a"}, {"type": "PUBLISH", "topic": "b"})
+        self.assertTrue(matches(bag, [suback, a, b]))
+        self.assertTrue(matches(bag, [b, suback, a]))
+        self.assertFalse(matches(bag, [suback, a]), "one is missing")
+        self.assertFalse(matches(bag, [suback, a, a]), "one came twice and one is missing")
+        self.assertFalse(matches(bag, [suback, a, b, b]), "one more than expected")
+        self.assertFalse(matches(bag, [suback, a, {"type": "PUBLISH", "topic": "c"}]), "a foreign one")
+        self.assertFalse(matches(bag, "sab"))
+        self.assertTrue(matches(in_any_order(), []))
+        # Each packet answers one pattern and each pattern one packet,
+        # whichever pattern a packet is tried against first.
+        loose = in_any_order({"type": "PUBLISH"}, {"type": "PUBLISH", "topic": "a"})
+        self.assertTrue(matches(loose, [a, b]))
+        self.assertTrue(matches(loose, [b, a]))
+        self.assertFalse(matches(loose, [b, b]))
+
+    def test_at_most(self):
+        self.assertTrue(matches(at_most(64), 64))
+        self.assertTrue(matches(at_most(64), 0))
+        self.assertFalse(matches(at_most(64), 65))
+        for other in (True, "64", None, 12.0):
+            self.assertFalse(matches(at_most(64), other), other)
+        self.assertTrue(matches({"type": "PUBLISH", "wire_bytes": at_most(64)}, {"type": "PUBLISH", "wire_bytes": 15}))
+        self.assertFalse(matches({"type": "PUBLISH", "wire_bytes": at_most(64)}, {"type": "PUBLISH"}))
+
 
 ANSWERED = expectation(
     "answered", statement="MQTT-3.8.4-1", requires="A SUBACK",
@@ -104,6 +133,25 @@ class Evaluation(unittest.TestCase):
         _, observed = expectations.evaluate(ANSWERED, [record("connack", REFUSING),
                                                        record("answer", wire.suback(7, [0, 0x80], level=5))])
         self.assertTrue(observed.endswith("; answer: recv [SUBACK packet_id=7 codes=0x00,0x80] ok"), observed)
+
+    def test_the_fields_a_pattern_reads_are_shown(self):
+        small = expectation("small", statement="MQTT-3.1.2-24", requires="x", then=[
+            at("answer", {"got": in_any_order({"type": "PUBLISH", "payload": "s", "wire_bytes": at_most(64)})})])
+        delivery = {**wire.decode(wire.publish("t", "s", qos=1, packet_id=3, level=5), 5), "wire_bytes": 9}
+        result, observed = expectations.evaluate(small, [{"conn": "a", "op": "recv", "got": [delivery], "end": "ok",
+                                                         "mark": "answer"}])
+        self.assertEqual((result, observed), (PASS, 'answer: recv [PUBLISH packet_id=3 payload="s" wire_bytes=9] ok'))
+        result, observed = expectations.evaluate(small, [{"conn": "a", "op": "recv", "end": "ok", "mark": "answer",
+                                                         "got": [{**delivery, "wire_bytes": 114}]}])
+        self.assertEqual((result, observed), (FAIL, 'answer: recv [PUBLISH packet_id=3 payload="s" wire_bytes=114] ok'))
+
+    def test_a_long_record_is_shown_by_its_counts(self):
+        deliveries = [wire.publish(f"t/{index}", "x", qos=1, packet_id=index + 1, level=5) for index in range(9)]
+        many = record("answer", wire.suback(7, [1], level=5), *deliveries, op="drain")
+        whole = expectation("whole", statement="MQTT-3.3.1-6", requires="x", then=[at("answer", {"end": "ok"})])
+        self.assertEqual(expectations.evaluate(whole, [many])[1], "answer: drain [10 packets: 1 SUBACK, 9 PUBLISH] ok")
+        eight = record("answer", *deliveries[:8], op="drain")
+        self.assertIn("PUBLISH packet_id=8] ok", expectations.evaluate(whole, [eight])[1])
 
 
 def listed(identifier, statement="MQTT-3.8.4-1", observed="closes without SUBACK"):
@@ -259,16 +307,130 @@ CASES = {
 }
 
 
+def kept(count, word, *, qos=1, retain=True):
+    """The SUBACK and the retained messages of `count` topics, as a
+    subscriber at QoS 1 reads them."""
+    return [wire.suback(1, [qos]),
+            *[wire.publish(f"{word}/{index:02d}", f"r{index:02d}", qos=qos, packet_id=index if qos else None,
+                           retain=retain) for index in range(1, count + 1)]]
+
+
+def drained(*packets, end="ok"):
+    return record("retained", *packets, op="drain", end=end, level=4)
+
+
+def silent(mark, *packets, end="quiet", level=4):
+    return record(mark, *packets, op="quiet", end=end, level=level)
+
+
+def store_cases(count, word):
+    """Transcripts for the content of a retained store of `count` topics."""
+    whole = kept(count, word)
+    return {
+        PASS: [[drained(*whole), silent("after")],
+               [drained(*whole[::-1]), silent("after")],
+               # A broker that grants QoS 0 owes the same messages.
+               [drained(*kept(count, word, qos=0)), silent("after")]],
+        FAIL: [[drained(*whole[:-8], end="idle"), silent("after")],            # eight are missing
+               [drained(*whole[:-1], whole[1]), silent("after")],              # one twice, one missing
+               [drained(*whole, whole[1]), silent("after")],                   # one twice
+               [drained(*kept(count, word, retain=False)), silent("after")],   # without RETAIN
+               [drained(*whole[:-1], wire.publish(f"{word}/{count:02d}", "other", qos=1, packet_id=count,
+                                                  retain=True)), silent("after")],
+               [drained(*whole[:-1], wire.publish("elsewhere/01", f"r{count:02d}", qos=1, packet_id=count,
+                                                  retain=True)), silent("after")],
+               [drained(*whole), silent("after", whole[1])],                   # one again afterwards
+               [drained(*whole), silent("after", end="eof")],
+               [drained(*whole)]],
+    }
+
+
+def sized(packet, wire_bytes=None, level=5):
+    """A packet as the player records it, with its size on the wire."""
+    return {**wire.decode(packet, level), "wire_bytes": len(packet) if wire_bytes is None else wire_bytes}
+
+
+def read(mark, *packets, op="recv", end="ok"):
+    return {"conn": "sub", "op": op, "got": list(packets), "end": end, "mark": mark}
+
+
+def limit_cases(qos):
+    """Transcripts for a delivery over the subscriber's Maximum Packet Size."""
+    def delivery(payload, **more):
+        return sized(wire.publish("limit/t", payload, qos=qos, packet_id=1, level=5, **more))
+
+    large = delivery(b"x" * 100)
+    small, following = delivery("small"), delivery("next")
+    resumed = sized(wire.connack(True, level=5))
+    discarded = {
+        PASS: [[read("large", op="quiet", end="quiet"), read("small", small), read("after-small", op="quiet", end="quiet")]],
+        FAIL: [
+            # The frozen behaviour: the connection is closed and nothing more is delivered.
+            [read("large", sized(wire.disconnect(level=5, reason=0x95)), op="quiet", end="eof"),
+             read("small", end="eof"), read("after-small", op="quiet", end="eof")],
+            [read("large", op="quiet", end="eof"), read("small", end="eof"), read("after-small", op="quiet", end="eof")],
+            # The packet is sent although it exceeds the limit.
+            [read("large", large, op="quiet", end="quiet"), read("small", small),
+             read("after-small", op="quiet", end="quiet")],
+            [read("large", op="quiet", end="quiet"), read("small", large), read("after-small", small, op="quiet", end="quiet")],
+            # Nothing is delivered any more, or a packet over the limit is.
+            [read("large", op="quiet", end="quiet"), read("small", end="timeout"),
+             read("after-small", op="quiet", end="quiet")],
+            [read("large", op="quiet", end="quiet"), read("small", {**small, "wire_bytes": 65}),
+             read("after-small", op="quiet", end="quiet")],
+            [read("large", op="quiet", end="quiet"), read("small", delivery("small", dup=True)),
+             read("after-small", op="quiet", end="quiet")],
+            [read("large", op="quiet", end="quiet"), read("small", small), read("after-small", large, op="quiet", end="quiet")],
+        ],
+    }
+    kept_out = {
+        PASS: [[read("resumed", resumed), read("no-redelivery", op="quiet", end="quiet"), read("next", following)]],
+        FAIL: [
+            # The frozen behaviour: the obligation was kept and is delivered to the larger connection.
+            [read("resumed", resumed), read("no-redelivery", large, op="quiet", end="quiet"), read("next", following)],
+            [read("resumed", resumed), read("no-redelivery", delivery(b"x" * 100, dup=True), op="quiet", end="quiet"),
+             read("next", following)],
+            [read("resumed", resumed), read("no-redelivery", op="quiet", end="quiet"), read("next", large)],
+            [read("resumed", resumed), read("no-redelivery", op="quiet", end="quiet"),
+             read("next", delivery("next", dup=True))],
+            # The session was not kept.
+            [read("resumed", sized(wire.connack(False, level=5))), read("no-redelivery", op="quiet", end="quiet"),
+             read("next", end="timeout")],
+            [read("resumed", resumed), read("no-redelivery", op="quiet", end="quiet"), read("next", end="timeout")],
+        ],
+    }
+    return discarded, kept_out
+
+
+STORE_AT_CAPACITY = "retained/thirty-two-topics-qos1-v4#store"
+STORE_BEYOND = "retained/forty-topics-qos1-v4#store"
+CASES[STORE_AT_CAPACITY] = store_cases(32, "thirty-two")
+CASES[STORE_BEYOND] = store_cases(40, "forty")
+# What mqttiumd does today beyond the thirty-two topics it keeps.
+CASES[STORE_BEYOND][FAIL].insert(0, [drained(*kept(32, "forty"), end="idle"), silent("after")])
+for level_of_service in (1, 2):
+    name = f"publish/over-maximum-packet-size-qos{level_of_service}-v5#"
+    CASES[name + "discarded"], CASES[name + "not-redelivered"] = limit_cases(level_of_service)
+del level_of_service, name
+
+
 class Repository(unittest.TestCase):
     """The expectations checked in, whatever the brokers do."""
 
     declared = expectations.declared(dsl.REGISTRY)
 
-    def test_the_expectations_are_the_six_of_the_audit(self):
+    def test_each_expectation_has_its_cases(self):
         self.assertEqual(sorted(self.declared), sorted(CASES))
         cited = {SHARE_LITERAL: {"MQTT-3.8.4-1"}, UNSUBSCRIBE_SHARE: {"MQTT-3.10.4-5", "MQTT-3.10.4-4"},
                  TWELVE: {"MQTT-3.8.4-5"}, SHARED: {"MQTT-4.13.1-1"}, SUBSCRIPTION_IDENTIFIER: {"MQTT-4.13.1-1"},
-                 RESERVED: {"MQTT-3.8.3-5", "MQTT-4.13.1-1"}}
+                 RESERVED: {"MQTT-3.8.3-5", "MQTT-4.13.1-1"},
+                 STORE_AT_CAPACITY: {"MQTT-3.3.1-5", "MQTT-3.3.1-6", "MQTT-3.3.1-8"},
+                 STORE_BEYOND: {"MQTT-3.3.1-5", "MQTT-3.3.1-6", "MQTT-3.3.1-8"},
+                 **{f"publish/over-maximum-packet-size-qos{qos}-v5#discarded": {"MQTT-3.1.2-25", "MQTT-3.1.2-24"}
+                    for qos in (1, 2)},
+                 **{f"publish/over-maximum-packet-size-qos{qos}-v5#not-redelivered": {"MQTT-3.1.2-25", "MQTT-3.2.2-3"}
+                    for qos in (1, 2)}}
+        self.assertEqual(sorted(cited), sorted(CASES))
         for name, statements in cited.items():
             found = {match.group(0) for match in classify.STATEMENT.finditer(self.declared[name].statement)}
             self.assertLessEqual(statements, found, name)

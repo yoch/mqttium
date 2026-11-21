@@ -30,6 +30,17 @@ compares:
   step declares the sequence sent, in which order (`order`: `as-sent`,
   `permuted`, `other`). How many came and which permutation are in the
   raw transcript; they may vary from one run to the next;
+- the packets a `measure` step counted become what the protocol
+  guarantees about them whatever their number: whether each is one of
+  the values that could lawfully come and came once (`values`:
+  `distinct`, `repeated`, `foreign`) and, when the step asks for it,
+  their order. How many came is not compared at all: it is a measurement,
+  printed in the matrix for both brokers;
+- in a `drain` step the client acknowledged each QoS 1 PUBLISH as it read
+  it, so each one gets a label of its own, whatever identifier the broker
+  used again;
+- the size of a packet on the wire (`wire_bytes`), which is in the raw
+  transcript for the expectations, is removed;
 - the packets of a step declared with `sort=True` are put in one order;
 - in a scenario declared with `closure="any"`, `eof` and `reset` both
   become `closed`: the kind of closure depends there on how much of the
@@ -86,6 +97,11 @@ class BrokerIdentifiers:
             self.active[raw] = f"b{self.count}"
         packet["packet_id"] = self.active.get(raw, raw)
 
+    def acknowledged(self, raw: int) -> None:
+        """The client acknowledged the QoS 1 PUBLISH `raw` as it read it
+        (`drain`): the identifier is free for another delivery."""
+        self.active.pop(raw, None)
+
     def answered(self, packet: dict) -> None:
         """A PUBACK, PUBREC or PUBCOMP the client sent."""
         raw = packet["packet_id"]
@@ -95,6 +111,7 @@ class BrokerIdentifiers:
 
 
 def normalize_received(packet: dict, *, buckets: dict, capabilities: bool) -> None:
+    packet.pop("wire_bytes", None)
     props = packet.get("properties")
     if props is None:
         return
@@ -142,9 +159,34 @@ def tally(record: dict) -> dict:
     return {**out, "got": [packet for packet in record["got"] if packet["type"] != kind], "end": record["end"]}
 
 
+def values(seen, sequence) -> str:
+    """How the values `seen` stand against the `sequence` that could
+    lawfully come: `foreign` when one is not of it, else `repeated` when
+    one came twice, else `distinct`."""
+    if any(value not in sequence for value in seen):
+        return "foreign"
+    return "repeated" if len(set(seen)) != len(seen) else "distinct"
+
+
+def measure(record: dict) -> dict:
+    """The comparable form of a raw `measure` record: what the protocol
+    guarantees about the packets counted, whatever their number, and the
+    packets of another type. How many came is not in it."""
+    kind = record["kind"]
+    seen = [packet.get(record["field"]) for packet in record["got"] if packet["type"] == kind]
+    out = {"conn": record["conn"], "op": "measure", "kind": kind, "values": values(seen, record["sequence"])}
+    if record["ordered"]:
+        out["order"] = order(seen, record["sequence"])
+    return {**out, "got": [packet for packet in record["got"] if packet["type"] != kind], "end": record["end"]}
+
+
+REDUCED = {"tally": tally, "measure": measure}
+
+
 def normalize(transcript, scenario) -> list:
     """A deep copy of `transcript` in comparable form."""
-    out = [tally(record) if record["op"] == "tally" else record for record in copy.deepcopy(transcript)]
+    out = [REDUCED[record["op"]](record) if record["op"] in REDUCED else record
+           for record in copy.deepcopy(transcript)]
     identifiers: dict[str, BrokerIdentifiers] = {}
     for record in out:
         record.pop("mark", None)
@@ -156,7 +198,10 @@ def normalize(transcript, scenario) -> list:
         for packet in record.get("got", ()):
             normalize_received(packet, buckets=scenario.buckets, capabilities=scenario.capabilities)
             if (packet["type"] == "PUBLISH" and packet.get("qos")) or packet["type"] == "PUBREL":
+                raw = packet["packet_id"]
                 ids.delivered(packet)
+                if record["op"] == "drain" and packet["type"] == "PUBLISH" and packet["qos"] == 1:
+                    ids.acknowledged(raw)
         sent = record.get("packet")
         if record["op"] == "send" and sent and sent["type"] in ("PUBACK", "PUBREC", "PUBCOMP"):
             ids.answered(sent)

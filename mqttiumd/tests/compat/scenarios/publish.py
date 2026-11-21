@@ -1,7 +1,8 @@
 """PUBLISH in both directions: QoS 0/1/2, downgrade, duplicates, invalid topics, flow control."""
 import mqttwire as wire
-from dsl import (ack, collect, connect, publish, publish_ack, publish_qos2, publish_sync, quiet, recv, scenario,
-                 send, subscribe, tally, until_close)
+from dsl import (ack, collect, connect, disconnect, mark, publish, publish_ack, publish_qos2, publish_sync, quiet, recv,
+                 scenario, send, subscribe, tally, until_close)
+from expectations import at, at_most, expectation
 
 for level in (4, 5):
     v = f"v{level}"
@@ -179,6 +180,59 @@ scenario(
     ],
 )
 
+def limited(maximum_packet_size):
+    """CONNECT options of the subscriber that keeps its session and
+    accepts packets of at most `maximum_packet_size` bytes."""
+    return {"clean": False, "props": {"session_expiry_interval": 3600, "maximum_packet_size": maximum_packet_size}}
+
+
+for qos in (1, 2):
+    published = publish_ack if qos == 1 else publish_qos2
+    # The subscriber's side of one delivery, played to its end.
+    answered = [ack("sub")] if qos == 1 else [ack("sub", "pubrec"), recv("sub"), ack("sub", "pubcomp")]
+
+    scenario(
+        f"publish/over-maximum-packet-size-qos{qos}-v5",
+        doc=f"""A subscriber with a kept session announces Maximum Packet Size 64 and subscribes
+        at QoS {qos}. A message of 100 bytes published at QoS {qos}, which would take 114 bytes
+        on the wire, is accepted from its publisher and not sent to the subscriber, whose
+        connection stays open; the next message, which fits, is delivered and acknowledged.
+        The session then resumes with Maximum Packet Size 1024: nothing is redelivered, and
+        the first PUBLISH it reads is a new message.""",
+        steps=[
+            connect("sub", f"p-limit{qos}-sub", level=5, **limited(64)),
+            subscribe("sub", 1, [("limit/t", qos)], level=5),
+            connect("pub", f"p-limit{qos}-pub", level=5),
+            published("pub", "limit/t", b"x" * 100, packet_id=1, level=5),
+            quiet("sub"), mark("large"),
+            published("pub", "limit/t", "small", packet_id=2, level=5),
+            recv("sub"), mark("small"), answered, quiet("sub"), mark("after-small"),
+            disconnect("sub", level=5),
+            connect("sub", f"p-limit{qos}-sub", level=5, **limited(1024)), mark("resumed"),
+            quiet("sub"), mark("no-redelivery"),
+            published("pub", "limit/t", "next", packet_id=3, level=5),
+            recv("sub"), mark("next"), answered, quiet("sub"),
+        ],
+        expectations=[
+            expectation(
+                "discarded", statement="MQTT-3.1.2-25, with MQTT-3.1.2-24 for the size of what is sent",
+                requires="Nothing is sent for the message that would take 114 bytes and the connection stays open; "
+                         "the next message is delivered in a packet of at most 64 bytes, and nothing follows it",
+                then=[at("large", {"got": [], "end": "quiet"}),
+                      at("small", {"got": [{"type": "PUBLISH", "topic": "limit/t", "payload": "small", "dup": False,
+                                            "wire_bytes": at_most(64)}], "end": "ok"}),
+                      at("after-small", {"got": [], "end": "quiet"})]),
+            expectation(
+                "not-redelivered", statement="MQTT-3.1.2-25, with MQTT-3.2.2-3 for Session Present",
+                requires="The resumed session (Session Present 1), which now accepts 1024 bytes, is sent nothing "
+                         "for the discarded message: the first PUBLISH it reads is a new message, with DUP 0",
+                then=[at("resumed", {"got": [{"type": "CONNACK", "session_present": True, "reason": 0}], "end": "ok"}),
+                      at("no-redelivery", {"got": [], "end": "quiet"}),
+                      at("next", {"got": [{"type": "PUBLISH", "topic": "limit/t", "payload": "next", "dup": False}],
+                                  "end": "ok"})]),
+        ],
+    )
+
 scenario(
     "publish/cross-version-v5-to-v4",
     version="3.1.1 + 5.0",
@@ -192,4 +246,4 @@ scenario(
     ],
 )
 
-del level, v
+del level, v, qos, published, answered

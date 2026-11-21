@@ -1,1 +1,7 @@
-[]
+[
+  {
+    "id": "retained/forty-topics-qos1-v4#store",
+    "statement": "MQTT-3.3.1-6, with MQTT-3.3.1-5 for the store and MQTT-3.3.1-8 for the RETAIN flag",
+    "observed": "mqttiumd keeps thirty-two retained topics, the bound of its profile: it closes the publisher's connection on the thirty-third retained PUBLISH and sends a new subscription those thirty-two, each once with RETAIN 1"
+  }
+]
