@@ -2874,12 +2874,16 @@ impl Runtime<'_> {
         match decoded {
             Packet::TimedPublish { .. } => Err(Failure::plain("timed_publish_not_anchored")),
             Packet::Connect(connect) => self.connect(generation, connect),
-            Packet::SubscribeOverLimit { packet_id, filters } => {
-                // Nothing is subscribed and nothing reaches the core: the
-                // request is answered, one refusal per filter.
+            Packet::RequestBeyondProfile {
+                packet_id,
+                filters,
+                unsubscribe,
+            } => {
+                // Nothing changes and nothing reaches the core: the
+                // request is answered, one failure per filter.
                 let version = p.version.unwrap_or(codec::Version::V5);
-                self.events.emit("packet_refused", json!({"connection":generation.get().to_string(),"details":{"code":"TooManyFilters","filters":filters}})).map_err(event_failure)?;
-                let sent = codec::encode_suback_refusal(version, packet_id, filters)
+                self.events.emit("packet_refused", json!({"connection":generation.get().to_string(),"details":{"code":"RequestBeyondProfile","filters":filters,"unsubscribe":unsubscribe}})).map_err(event_failure)?;
+                let sent = codec::encode_request_refusal(version, packet_id, filters, unsubscribe)
                     .ok()
                     .filter(|bytes| bytes.len() <= p.max_packet)
                     .is_some_and(|bytes| {
