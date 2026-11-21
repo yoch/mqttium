@@ -209,6 +209,7 @@ struct Peer {
     /// within milliseconds; a wait that outlasts [`CAPACITY_WAIT`] is not
     /// pressure any more and ends the connection.
     capacity_wait: Option<Instant>,
+    requests: Option<Requests>,
     pending: bool,
     keep_alive: u16,
     max_packet: usize,
@@ -228,6 +229,23 @@ impl Peer {
             false
         }
     }
+}
+/// A SUBSCRIBE or UNSUBSCRIBE served as several requests of the core, in
+/// order, and acknowledged once (codec `Packet::Requests`). No other packet
+/// of its connection is taken while it lasts.
+struct Requests {
+    packet_id: mqttiumd_contract::ids::InboundPacketId,
+    unsubscribe: bool,
+    /// The unit requests the core has not been given yet.
+    parts: VecDeque<InboundPacket>,
+    /// One entry per filter of the request: a code the codec decided, or
+    /// `None` for a filter a unit request answers.
+    answers: Vec<Option<u8>>,
+    /// The codes the unit requests were answered with so far, in order, as
+    /// this protocol version writes them.
+    served: Vec<u8>,
+    /// A unit request is with the core and its answer has not come back.
+    awaiting: bool,
 }
 struct DeferredPublish {
     packet: InboundPacket,
@@ -738,6 +756,7 @@ impl Runtime<'_> {
                 close_observed_at: None,
                 held_packet: None,
                 capacity_wait: None,
+                requests: None,
                 pending: false,
                 keep_alive: 0,
                 max_packet: 268435455,
@@ -820,6 +839,76 @@ impl Runtime<'_> {
                 .iter()
                 .any(|input| business_connection(input) == Some(generation))
     }
+    /// Advances a SUBSCRIBE or UNSUBSCRIBE served as several requests of
+    /// the core: gives the core the next unit request once the previous one
+    /// is answered, then sends the one acknowledgement of the whole. What
+    /// cannot be done now (no room in the lane, a full output lane) is done
+    /// on a later turn.
+    fn serve_requests(&mut self, generation: ConnectionGeneration) -> Result<(), Failure> {
+        let room = self.ordinary_room();
+        let Some(p) = self.peers.get_mut(&generation) else {
+            return Ok(());
+        };
+        let Some(requests) = p.requests.as_mut() else {
+            return Ok(());
+        };
+        if requests.awaiting || p.closing.is_some() {
+            return Ok(());
+        }
+        if !requests.parts.is_empty() {
+            if room < 2 {
+                return Ok(());
+            }
+            let packet = requests.parts.pop_front().expect("checked above");
+            requests.awaiting = true;
+            p.ingress = p
+                .ingress
+                .checked_add(1)
+                .ok_or_else(|| Failure::plain("ingress_exhausted"))?;
+            let ingress_order = p.ingress;
+            self.progress = self.progress.wrapping_add(1);
+            return self.queue(Input::Packet {
+                connection: generation,
+                ingress_order,
+                packet,
+            });
+        }
+        // Every unit request is answered: one code per filter, in the order
+        // of the request.
+        let version = p.version.unwrap_or_default();
+        let mut served = requests.served.iter().copied();
+        let codes: Vec<u8> = requests
+            .answers
+            .iter()
+            .filter_map(|answer| answer.or_else(|| served.next()))
+            .collect();
+        let silent = requests.unsubscribe && version == codec::Version::V311;
+        if (!silent && codes.len() != requests.answers.len()) || served.next().is_some() {
+            return Err(Failure::plain("requests_answers_mismatch"));
+        }
+        let Ok(bytes) =
+            codec::encode_filter_ack(version, requests.packet_id, requests.unsubscribe, &codes)
+        else {
+            return self.close(generation, "failure_without_wire_ack");
+        };
+        if bytes.len() > p.max_packet {
+            return self.close(generation, "outgoing_packet_limit");
+        }
+        if p.io
+            .outgoing
+            .try_send(net::Write {
+                expiry: None,
+                correlation: None,
+                bytes,
+            })
+            .is_ok()
+        {
+            p.requests = None;
+            self.progress = self.progress.wrapping_add(1);
+        }
+        Ok(())
+    }
+
     /// A packet the core handed back waits in order. One that was the
     /// retried head goes back to the head, and the retries stop: what is
     /// behind it waits for the same thing or for its turn.
@@ -2869,46 +2958,60 @@ impl Runtime<'_> {
                 return self.close(generation, "packet_refused");
             }
         };
-        if let (Some(security), Packet::Core(packet) | Packet::TimedPublish { packet, .. }) =
-            (&self.security, &mut decoded)
-        {
-            let Some(principal) = self
-                .peers
-                .get(&generation)
-                .and_then(|peer| peer.io.principal())
-            else {
-                return self.close(generation, "tls_principal_missing");
+        if let Some(security) = &self.security {
+            let targets: Vec<&mut InboundPacket> = match &mut decoded {
+                Packet::Core(packet) | Packet::TimedPublish { packet, .. } => vec![packet],
+                // Each unit request is authorized as a request of its own.
+                Packet::Requests { parts, .. } => parts.iter_mut().collect(),
+                _ => Vec::new(),
             };
-            if let InboundPacket::Subscribe {
-                filters, denied, ..
-            } = packet
-            {
-                for (index, filter) in filters.as_slice().iter().enumerate() {
-                    if !security
-                        .policy
-                        .allows_filter(principal, filter.filter.as_slice())
-                    {
-                        *denied |= 1 << index;
-                    }
-                }
-                if *denied != 0 {
-                    self.events
-                        .emit(
-                            "authorization_refused",
-                            json!({
-                                "connection":generation.get().to_string(),
-                                "details":{"stage":"subscribe","reason":0x87}
-                            }),
-                        )
-                        .map_err(event_failure)?;
-                }
-            } else if !security.policy.allows_packet(principal, packet) {
-                let stage = if matches!(packet, InboundPacket::Publish { .. }) {
-                    "publish"
-                } else {
-                    "unsubscribe"
+            let principal = if targets.is_empty() {
+                None
+            } else {
+                let Some(principal) = self
+                    .peers
+                    .get(&generation)
+                    .and_then(|peer| peer.io.principal())
+                else {
+                    return self.close(generation, "tls_principal_missing");
                 };
-                return self.authorization_refusal(generation, stage, None);
+                Some(principal)
+            };
+            let mut filters_denied = false;
+            for packet in targets {
+                let principal = principal.expect("a principal for every target");
+                if let InboundPacket::Subscribe {
+                    filters, denied, ..
+                } = packet
+                {
+                    for (index, filter) in filters.as_slice().iter().enumerate() {
+                        if !security
+                            .policy
+                            .allows_filter(principal, filter.filter.as_slice())
+                        {
+                            *denied |= 1 << index;
+                        }
+                    }
+                    filters_denied |= *denied != 0;
+                } else if !security.policy.allows_packet(principal, packet) {
+                    let stage = if matches!(packet, InboundPacket::Publish { .. }) {
+                        "publish"
+                    } else {
+                        "unsubscribe"
+                    };
+                    return self.authorization_refusal(generation, stage, None);
+                }
+            }
+            if filters_denied {
+                self.events
+                    .emit(
+                        "authorization_refused",
+                        json!({
+                            "connection":generation.get().to_string(),
+                            "details":{"stage":"subscribe","reason":0x87}
+                        }),
+                    )
+                    .map_err(event_failure)?;
             }
         }
         let decoded = match decoded {
@@ -2953,6 +3056,28 @@ impl Runtime<'_> {
         match decoded {
             Packet::TimedPublish { .. } => Err(Failure::plain("timed_publish_not_anchored")),
             Packet::Connect(connect) => self.connect(generation, connect),
+            Packet::Requests {
+                packet_id,
+                unsubscribe,
+                parts,
+                answers,
+            } => {
+                if !p.connected {
+                    return self.close(generation, "packet_before_connack");
+                }
+                if p.requests.is_some() {
+                    return Err(Failure::plain("requests_overlap"));
+                }
+                p.requests = Some(Requests {
+                    packet_id,
+                    unsubscribe,
+                    parts: parts.into(),
+                    answers,
+                    served: Vec::new(),
+                    awaiting: false,
+                });
+                self.serve_requests(generation)
+            }
             Packet::RequestBeyondProfile {
                 packet_id,
                 filters,
@@ -3300,6 +3425,7 @@ impl Runtime<'_> {
             if !backpressured {
                 self.retry_deferred_publish(generation)?;
             }
+            self.serve_requests(generation)?;
             for _ in 0..4 {
                 // A CONNECT can use one slot now and reserve one for Open.
                 // Leave the bytes with their socket reader until both fit.
@@ -3308,7 +3434,13 @@ impl Runtime<'_> {
                 }
                 let business_waits = self.business_waits(generation);
                 let incoming = match self.peers.get_mut(&generation) {
-                    Some(p) if p.closing.is_some() || p.deferred_publish.is_some() => break,
+                    Some(p)
+                        if p.closing.is_some()
+                            || p.deferred_publish.is_some()
+                            || p.requests.is_some() =>
+                    {
+                        break;
+                    }
                     Some(p) if p.pending && p.held_packet.is_some() => break,
                     Some(p)
                         if business_waits
@@ -4631,6 +4763,37 @@ impl EffectSink for Sink<'_> {
                     });
                     return SubmitResult::Accepted;
                 };
+                // The answer of one unit request of a larger SUBSCRIBE or
+                // UNSUBSCRIBE: it is kept for the one acknowledgement of
+                // the whole request and reported to the core as written.
+                let part_of = matches!(frame, OutboundFrame::Unsuback { .. });
+                if let Some(answered) = packet_id
+                    && matches!(kind, "SUBACK" | "UNSUBACK")
+                    && let Some(requests) = peer.requests.as_mut()
+                    && requests.awaiting
+                    && requests.packet_id.get() == answered
+                    && requests.unsubscribe == part_of
+                {
+                    let version = peer.version.unwrap_or_default();
+                    let Ok(bytes) = codec::encode_for(version, frame) else {
+                        self.close.push((generation, "failure_without_wire_ack"));
+                        return refused(effect, SubmitBlock::Closed);
+                    };
+                    requests
+                        .served
+                        .extend_from_slice(codec::filter_ack_codes(version, &bytes));
+                    requests.awaiting = false;
+                    let _ = effect.into_parts();
+                    self.terminal_inputs.push_back(Input::FrameResult {
+                        effect: id,
+                        connection,
+                        progress: FrameProgress::Written {
+                            confirmed: bytes.len() as u64,
+                            total: bytes.len() as u64,
+                        },
+                    });
+                    return SubmitResult::Accepted;
+                }
                 let bytes = match codec::encode_for(peer.version.unwrap_or_default(), frame) {
                     Ok(bytes) if bytes.len() <= peer.max_packet => bytes,
                     Err(error) if error.code() == "AckNotEncodableInMqtt311" => {

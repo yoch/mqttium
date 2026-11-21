@@ -418,32 +418,49 @@ fn a_fan_in_burst_closes_no_publisher() {
     );
 }
 
-/// A SUBSCRIBE with more filters than the broker takes in one request is
-/// answered, one result per filter, and the connection stays open
-/// (MQTT-3.8.4-1, MQTT-3.8.4-6): it used to be closed at the ninth filter.
+/// A request with more filters than the broker serves in one request
+/// (sixty-four) is still owed its acknowledgement (MQTT-3.8.4-1,
+/// MQTT-3.10.4-4): it changes nothing and is answered with a failure for
+/// every filter, and the connection stays open.
 #[test]
-fn a_subscribe_over_the_filter_limit_is_answered_per_filter() {
-    let broker = Broker::start("many-filters");
-    let mut client = connect(broker.address, "many-filters");
+fn a_request_beyond_the_bound_of_a_request_is_refused_per_filter() {
+    let broker = Broker::start("beyond-bound");
+    let mut client = connect(broker.address, "beyond-bound");
+    const FILTERS: usize = 65;
+
     let mut body = vec![0, 7, 0];
-    for index in 0..12u8 {
+    for index in 0..FILTERS {
         text(&format!("wake/filter/{index}"), &mut body);
         body.push(0);
     }
     client.write_all(&packet(0x82, &body)).unwrap();
     let (first, answer) = read_packet(&mut client);
-    assert_eq!(first, 0x90, "SUBACK expected");
+    assert_eq!(first, 0x90, "SUBACK expected\n{}", broker.refusals());
     assert_eq!(
         &answer[..3],
         &[0, 7, 0],
         "packet identifier and no property"
     );
-    assert_eq!(answer.len(), 3 + 12, "one result per filter");
-    assert!(
-        answer[3..].iter().all(|code| *code == 0x97),
-        "every filter refused for quota: {:?}",
-        &answer[3..]
+    assert_eq!(
+        &answer[3..],
+        &[0x97; FILTERS],
+        "every filter refused for quota"
     );
+
+    let mut body = vec![0, 8, 0];
+    for index in 0..FILTERS {
+        text(&format!("wake/filter/{index}"), &mut body);
+    }
+    client.write_all(&packet(0xa2, &body)).unwrap();
+    let (first, answer) = read_packet(&mut client);
+    assert_eq!(first, 0xb0, "UNSUBACK expected\n{}", broker.refusals());
+    assert_eq!(
+        &answer[..3],
+        &[0, 8, 0],
+        "packet identifier and no property"
+    );
+    assert_eq!(&answer[3..], &[0x83; FILTERS], "one failure per filter");
+
     client.write_all(&[0xc0, 0]).unwrap();
     assert_eq!(
         read_packet(&mut client).0,
@@ -568,48 +585,6 @@ fn a_packet_over_the_announced_maximum_packet_size_is_refused() {
         "a SUBSCRIBE of {} bytes\n{}",
         over.len(),
         broker.refusals()
-    );
-}
-
-/// A request the profile cannot serve is still owed its acknowledgement
-/// (MQTT-3.8.4-1, MQTT-3.10.4-4): a SUBSCRIBE whose Topic Filter is longer
-/// than the profile stores and an UNSUBSCRIBE with more filters than a
-/// request may carry are answered filter by filter, as failures, and the
-/// connection stays open.
-#[test]
-fn a_request_beyond_the_profile_is_refused_in_its_acknowledgement() {
-    let broker = Broker::start("beyond-profile");
-    let mut client = connect(broker.address, "beyond-profile");
-
-    let mut body = vec![0, 7, 0];
-    text(&"f".repeat(2_000), &mut body);
-    body.push(0);
-    text("wake/short", &mut body);
-    body.push(0);
-    client.write_all(&packet(0x82, &body)).unwrap();
-    let (first, answer) = read_packet(&mut client);
-    assert_eq!(first, 0x90, "SUBACK expected\n{}", broker.refusals());
-    assert_eq!(answer, [0, 7, 0, 0x97, 0x97], "both filters refused");
-
-    let mut body = vec![0, 8, 0];
-    for index in 0..9u8 {
-        text(&format!("wake/filter/{index}"), &mut body);
-    }
-    client.write_all(&packet(0xa2, &body)).unwrap();
-    let (first, answer) = read_packet(&mut client);
-    assert_eq!(first, 0xb0, "UNSUBACK expected\n{}", broker.refusals());
-    assert_eq!(
-        &answer[..3],
-        &[0, 8, 0],
-        "packet identifier and no property"
-    );
-    assert_eq!(&answer[3..], &[0x83; 9], "one failure per filter");
-
-    client.write_all(&[0xc0, 0]).unwrap();
-    assert_eq!(
-        read_packet(&mut client).0,
-        0xd0,
-        "the connection stays open"
     );
 }
 

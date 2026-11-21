@@ -257,6 +257,7 @@ fn peer(runtime: &mut Runtime<'_>) -> (ConnectionGeneration, TcpStream) {
             close_observed_at: None,
             held_packet: None,
             capacity_wait: None,
+            requests: None,
             pending: false,
             keep_alive: 0,
             max_packet: 268435455,

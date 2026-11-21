@@ -62,6 +62,10 @@ pub struct Connect {
     pub request_problem_information: bool,
 }
 
+/// The filters one SUBSCRIBE or UNSUBSCRIBE may carry: eight requests of
+/// the core. A larger one is refused filter by filter.
+pub const MAX_REQUEST_FILTERS: usize = 8 * MAX_FILTERS;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Packet {
     Connect(Connect),
@@ -75,9 +79,21 @@ pub enum Packet {
         expiry: Option<SessionExpiry>,
         publish_will: bool,
     },
-    /// A valid SUBSCRIBE or UNSUBSCRIBE the profile cannot serve: more
-    /// filters than one request takes, or a filter longer than it stores.
-    /// It is answered with one failure per filter and changes nothing.
+    /// A valid SUBSCRIBE or UNSUBSCRIBE the core does not take as one
+    /// request: more filters than its request holds, or a filter longer
+    /// than the profile stores beside others. It is served as the unit
+    /// requests `parts`, in order, and acknowledged once. `answers` has one
+    /// entry per filter of the request: the code of a filter the profile
+    /// cannot store, or `None` for a filter given to the core.
+    Requests {
+        packet_id: InboundPacketId,
+        unsubscribe: bool,
+        parts: Vec<InboundPacket>,
+        answers: Vec<Option<u8>>,
+    },
+    /// A valid SUBSCRIBE or UNSUBSCRIBE with more filters than
+    /// [`MAX_REQUEST_FILTERS`]. It is answered with one failure per filter
+    /// and changes nothing.
     RequestBeyondProfile {
         packet_id: InboundPacketId,
         filters: usize,
@@ -894,20 +910,21 @@ fn subscribe(
     let outside = props.unsupported;
     // A SUBACK and an MQTT 5 UNSUBACK say what happened to each filter. An
     // UNSUBACK of 3.1.1 carries no result: it cannot say that nothing was
-    // removed, so a request it cannot serve still ends the connection.
+    // removed, so a request beyond the bound still ends the connection.
     let answerable = !unsubscribe || version == Version::V5;
-    // Every filter is validated; those the profile cannot take are counted.
+    // What a filter longer than the profile stores is answered: it holds
+    // no subscription and can hold none.
+    let unstorable = match (unsubscribe, version) {
+        (false, Version::V5) => 0x97,
+        (false, Version::V311) => 0x80,
+        (true, _) => 0x11,
+    };
+    // Every filter is validated; those beyond the bound are only counted.
     let mut count = 0usize;
-    let mut beyond = false;
+    let mut answers = Vec::with_capacity(MAX_FILTERS);
     while !input.is_empty() {
         let text = input.string()?;
         let shared = filter(version, text)?;
-        if text.len() > bounds.max_topic {
-            if !answerable {
-                return Err(oversized("FilterTooLarge"));
-            }
-            beyond = true;
-        }
         let mut qos = Qos::AtLeastOnce;
         let mut subscription_options = SubscriptionOptions::DEFAULT;
         if !unsubscribe {
@@ -935,51 +952,74 @@ fn subscribe(
                 .ok_or_else(|| protocol("InvalidSubscriptionOptions"))?;
         }
         count += 1;
-        if count > MAX_FILTERS && !answerable {
-            return Err(oversized("TooManyFilters"));
+        if count > MAX_REQUEST_FILTERS {
+            if !answerable {
+                return Err(oversized("TooManyFilters"));
+            }
+            continue;
         }
-        if parsed.len() < MAX_FILTERS {
+        if text.len() > bounds.max_topic {
+            answers.push(Some(unstorable));
+        } else {
+            answers.push(None);
             parsed.push((text, qos, subscription_options));
         }
     }
     if outside {
         return Err(unsupported("SubscriptionOptionsOutsideProfile"));
     }
-    if beyond || count > MAX_FILTERS {
+    if count > MAX_REQUEST_FILTERS {
         return Ok(Packet::RequestBeyondProfile {
             packet_id,
             filters: count,
             unsubscribe,
         });
     }
-    if unsubscribe {
-        let mut filters = Vec::with_capacity(parsed.len());
-        for (text, _, _) in parsed {
-            filters.push(
-                SharedBytes::copy_from(text, bounds.max_topic)
-                    .map_err(|_| oversized("FilterTooLarge"))?,
-            );
-        }
-        Ok(Packet::Core(InboundPacket::Unsubscribe {
-            packet_id,
-            filters: FilterList::copy_from(&filters).map_err(|_| oversized("TooManyFilters"))?,
-        }))
-    } else {
-        let mut filters = Vec::with_capacity(parsed.len());
-        for (text, qos, options) in parsed {
-            filters.push(SubscriptionFilter {
-                filter: SharedBytes::copy_from(text, bounds.max_topic)
-                    .map_err(|_| oversized("FilterTooLarge"))?,
-                qos,
-                options,
-            });
-        }
-        Ok(Packet::Core(InboundPacket::Subscribe {
-            packet_id,
-            filters: FilterList::copy_from(&filters).map_err(|_| oversized("TooManyFilters"))?,
-            denied: 0,
-        }))
+    let whole = parsed.len() == count && count <= MAX_FILTERS;
+    let mut parts = Vec::with_capacity(parsed.len().div_ceil(MAX_FILTERS));
+    for unit in parsed.chunks(MAX_FILTERS) {
+        let part = if unsubscribe {
+            let mut filters = Vec::with_capacity(unit.len());
+            for (text, _, _) in unit {
+                filters.push(
+                    SharedBytes::copy_from(text, bounds.max_topic)
+                        .map_err(|_| oversized("FilterTooLarge"))?,
+                );
+            }
+            InboundPacket::Unsubscribe {
+                packet_id,
+                filters: FilterList::copy_from(&filters)
+                    .map_err(|_| oversized("TooManyFilters"))?,
+            }
+        } else {
+            let mut filters = Vec::with_capacity(unit.len());
+            for (text, qos, options) in unit {
+                filters.push(SubscriptionFilter {
+                    filter: SharedBytes::copy_from(text, bounds.max_topic)
+                        .map_err(|_| oversized("FilterTooLarge"))?,
+                    qos: *qos,
+                    options: *options,
+                });
+            }
+            InboundPacket::Subscribe {
+                packet_id,
+                filters: FilterList::copy_from(&filters)
+                    .map_err(|_| oversized("TooManyFilters"))?,
+                denied: 0,
+            }
+        };
+        parts.push(part);
     }
+    if whole {
+        // The ordinary case: one request the core takes as it is.
+        return Ok(Packet::Core(parts.remove(0)));
+    }
+    Ok(Packet::Requests {
+        packet_id,
+        unsubscribe,
+        parts,
+        answers,
+    })
 }
 
 fn puback(version: Version, body: &[u8]) -> Result<Packet, Error> {
@@ -1248,30 +1288,52 @@ pub fn encode_for(version: Version, frame: OutboundFrame) -> Result<Vec<u8>, Err
 /// The acknowledgement of a request the profile cannot serve: one failure
 /// per filter. A SUBACK refuses with 0x97 (quota exceeded) in MQTT 5 and
 /// with 0x80 in 3.1.1; an MQTT 5 UNSUBACK with 0x83 (implementation
-/// specific error). An UNSUBACK of 3.1.1 carries no result and cannot be
-/// built.
+/// specific error). An UNSUBACK of 3.1.1 carries no result and cannot say
+/// that nothing was removed: it is not built.
 pub fn encode_request_refusal(
     version: Version,
     packet_id: InboundPacketId,
     filters: usize,
     unsubscribe: bool,
 ) -> Result<Vec<u8>, Error> {
-    let (first, properties, code) = match (unsubscribe, version) {
-        (false, Version::V5) => (0x90, 1, 0x97),
-        (false, Version::V311) => (0x90, 0, 0x80),
-        (true, Version::V5) => (0xb0, 1, 0x83),
+    let code = match (unsubscribe, version) {
+        (false, Version::V5) => 0x97,
+        (false, Version::V311) => 0x80,
+        (true, Version::V5) => 0x83,
         (true, Version::V311) => return Err(unsupported("UnsubackCarriesNoResult")),
+    };
+    let mut codes = Vec::new();
+    codes
+        .try_reserve_exact(filters)
+        .map_err(|_| oversized("AckTooLarge"))?;
+    codes.resize(filters, code);
+    encode_filter_ack(version, packet_id, unsubscribe, &codes)
+}
+
+/// One SUBACK or UNSUBACK with a code per filter, of any length. An
+/// UNSUBACK of MQTT 3.1.1 has no payload: its codes are not written.
+pub fn encode_filter_ack(
+    version: Version,
+    packet_id: InboundPacketId,
+    unsubscribe: bool,
+    codes: &[u8],
+) -> Result<Vec<u8>, Error> {
+    let properties = usize::from(version == Version::V5);
+    let codes = if unsubscribe && version == Version::V311 {
+        &[][..]
+    } else {
+        codes
     };
     let remaining = 2usize
         .checked_add(properties)
-        .and_then(|n| n.checked_add(filters))
+        .and_then(|n| n.checked_add(codes.len()))
         .filter(|n| *n <= 268_435_455)
         .ok_or_else(|| oversized("AckTooLarge"))?;
     let mut bytes = Vec::new();
     bytes
         .try_reserve_exact(remaining + 5)
         .map_err(|_| oversized("AckTooLarge"))?;
-    bytes.push(first);
+    bytes.push(if unsubscribe { 0xb0 } else { 0x90 });
     let mut length = remaining;
     loop {
         let mut byte = (length % 128) as u8;
@@ -1288,8 +1350,18 @@ pub fn encode_request_refusal(
     if properties == 1 {
         bytes.push(0);
     }
-    bytes.resize(bytes.len() + filters, code);
+    bytes.extend_from_slice(codes);
     Ok(bytes)
+}
+
+/// The codes of a SUBACK or UNSUBACK that [`encode_for`] built for one
+/// request of the core (at most [`MAX_FILTERS`] codes, so one length
+/// byte): what follows the Packet Identifier and, in MQTT 5, the empty
+/// property list. None for an UNSUBACK of MQTT 3.1.1.
+#[must_use]
+pub fn filter_ack_codes(version: Version, bytes: &[u8]) -> &[u8] {
+    let head = 4 + usize::from(version == Version::V5);
+    bytes.get(head..).unwrap_or(&[])
 }
 
 pub fn refusal_for(version: Version, error: Error, before_connack: bool) -> Option<Vec<u8>> {
@@ -1736,47 +1808,83 @@ mod tests {
         for _ in 0..9 {
             too_many.extend_from_slice(&[0, 1, b't', 1]);
         }
-        // A valid request over the limit is answered per filter, not closed.
+        // A valid request the core does not take as one is served as unit
+        // requests, in order, and answered once.
         let id = InboundPacketId::new(1).unwrap();
-        let beyond = |filters, unsubscribe| Packet::RequestBeyondProfile {
-            packet_id: id,
-            filters,
-            unsubscribe,
+        let split = |packet: Packet| -> (bool, Vec<usize>, Vec<Option<u8>>) {
+            let Packet::Requests {
+                packet_id,
+                unsubscribe,
+                parts,
+                answers,
+            } = packet
+            else {
+                panic!("unit requests expected, got {packet:?}");
+            };
+            assert_eq!(packet_id, id);
+            let sizes = parts
+                .iter()
+                .map(|part| match part {
+                    InboundPacket::Subscribe {
+                        packet_id, filters, ..
+                    } if !unsubscribe => {
+                        assert_eq!(*packet_id, id);
+                        filters.as_slice().len()
+                    }
+                    InboundPacket::Unsubscribe { packet_id, filters } if unsubscribe => {
+                        assert_eq!(*packet_id, id);
+                        filters.as_slice().len()
+                    }
+                    other => panic!("a unit request of another kind: {other:?}"),
+                })
+                .collect();
+            (unsubscribe, sizes, answers)
         };
         assert_eq!(
-            super::decode(0x82, &too_many, BOUNDS).unwrap(),
-            beyond(9, false)
-        );
-        assert_eq!(
-            super::encode_request_refusal(Version::V5, id, 9, false).unwrap(),
-            [&[0x90, 12, 0, 1, 0][..], &[0x97; 9]].concat()
-        );
-        assert_eq!(
-            super::encode_request_refusal(Version::V311, id, 9, false).unwrap(),
-            [&[0x90, 11, 0, 1][..], &[0x80; 9]].concat()
+            split(super::decode(0x82, &too_many, BOUNDS).unwrap()),
+            (false, vec![8, 1], vec![None; 9])
         );
         let mut unsubscribed = vec![0, 1, 0];
         for _ in 0..9 {
             unsubscribed.extend_from_slice(&[0, 1, b't']);
         }
         assert_eq!(
-            super::decode(0xa2, &unsubscribed, BOUNDS).unwrap(),
-            beyond(9, true)
+            split(super::decode(0xa2, &unsubscribed, BOUNDS).unwrap()),
+            (true, vec![8, 1], vec![None; 9])
         );
-        assert_eq!(
-            super::encode_request_refusal(Version::V5, id, 9, true).unwrap(),
-            [&[0xb0, 12, 0, 1, 0][..], &[0x83; 9]].concat()
-        );
-        // An UNSUBACK of 3.1.1 carries no result: the request still closes.
         let legacy = [&[0u8, 1][..], &[0, 1, b't'].repeat(9)].concat();
         assert_eq!(
-            super::decode_for(Version::V311, 0xa2, &legacy, BOUNDS)
-                .unwrap_err()
-                .code(),
-            "TooManyFilters"
+            split(super::decode_for(Version::V311, 0xa2, &legacy, BOUNDS).unwrap()),
+            (true, vec![8, 1], vec![None; 9])
         );
-        assert!(super::encode_request_refusal(Version::V311, id, 9, true).is_err());
-        // A filter longer than the profile stores, alone or beside another.
+        // The one acknowledgement, of any length, in both versions.
+        let codes = [0, 1, 2, 0x80, 0, 0, 0, 0, 0x97];
+        assert_eq!(
+            super::encode_filter_ack(Version::V5, id, false, &codes).unwrap(),
+            [&[0x90, 12, 0, 1, 0][..], &codes].concat()
+        );
+        assert_eq!(
+            super::encode_filter_ack(Version::V311, id, false, &codes).unwrap(),
+            [&[0x90, 11, 0, 1][..], &codes].concat()
+        );
+        assert_eq!(
+            super::encode_filter_ack(Version::V5, id, true, &[0x11; 9]).unwrap(),
+            [&[0xb0, 12, 0, 1, 0][..], &[0x11; 9]].concat()
+        );
+        assert_eq!(
+            super::encode_filter_ack(Version::V311, id, true, &[0x11; 9]).unwrap(),
+            [0xb0, 2, 0, 1]
+        );
+        let long = super::encode_filter_ack(Version::V5, id, false, &[0; 200]).unwrap();
+        assert_eq!(&long[..6], &[0x90, 0xcb, 1, 0, 1, 0]);
+        // The codes of the answer to one unit request.
+        for version in [Version::V5, Version::V311] {
+            let part = super::encode_filter_ack(version, id, false, &[1, 0x80]).unwrap();
+            assert_eq!(super::filter_ack_codes(version, &part), [1, 0x80]);
+        }
+        assert!(super::filter_ack_codes(Version::V311, &[0xb0, 2, 0, 1]).is_empty());
+        // A filter longer than the profile stores is answered for itself;
+        // its neighbours are served.
         let long = [
             &[0u8, 1, 0][..],
             &2_000u16.to_be_bytes(),
@@ -1785,14 +1893,47 @@ mod tests {
         ]
         .concat();
         assert_eq!(
-            super::decode(0x82, &long, BOUNDS).unwrap(),
-            beyond(1, false)
+            split(super::decode(0x82, &long, BOUNDS).unwrap()),
+            (false, vec![], vec![Some(0x97)])
         );
         let both = [&long[..], &[0, 1, b't', 1]].concat();
         assert_eq!(
-            super::decode(0x82, &both, BOUNDS).unwrap(),
-            beyond(2, false)
+            split(super::decode(0x82, &both, BOUNDS).unwrap()),
+            (false, vec![1], vec![Some(0x97), None])
         );
+        let gone = [&[0u8, 1, 0][..], &2_000u16.to_be_bytes(), &[b'f'; 2_000]].concat();
+        assert_eq!(
+            split(super::decode(0xa2, &gone, BOUNDS).unwrap()),
+            (true, vec![], vec![Some(0x11)])
+        );
+        // Beyond the bound of a request: refused filter by filter where the
+        // acknowledgement can say so, closed in an UNSUBSCRIBE of 3.1.1.
+        let over = super::MAX_REQUEST_FILTERS + 1;
+        let many = [&[0u8, 1, 0][..], &[0, 1, b't', 1].repeat(over)].concat();
+        assert_eq!(
+            super::decode(0x82, &many, BOUNDS).unwrap(),
+            Packet::RequestBeyondProfile {
+                packet_id: id,
+                filters: over,
+                unsubscribe: false
+            }
+        );
+        assert_eq!(
+            super::encode_request_refusal(Version::V5, id, 9, false).unwrap(),
+            [&[0x90, 12, 0, 1, 0][..], &[0x97; 9]].concat()
+        );
+        assert_eq!(
+            super::encode_request_refusal(Version::V5, id, 9, true).unwrap(),
+            [&[0xb0, 12, 0, 1, 0][..], &[0x83; 9]].concat()
+        );
+        let legacy = [&[0u8, 1][..], &[0, 1, b't'].repeat(over)].concat();
+        assert_eq!(
+            super::decode_for(Version::V311, 0xa2, &legacy, BOUNDS)
+                .unwrap_err()
+                .code(),
+            "TooManyFilters"
+        );
+        assert!(super::encode_request_refusal(Version::V311, id, 9, true).is_err());
         let bytes = super::encode_publish(
             OutboundPacketId::new(4).unwrap(),
             &SharedBytes::copy_from(b"t", 1).unwrap(),
