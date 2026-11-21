@@ -17,7 +17,8 @@ sys.path.insert(0, str(HERE))
 import classify  # noqa: E402
 import dsl  # noqa: E402
 import expectations  # noqa: E402
-from expectations import CLOSED, FAIL, NOT_APPLICABLE, PASS, Each, at, expectation, matches, one_of  # noqa: E402
+from expectations import (CLOSED, FAIL, NOT_APPLICABLE, PASS, Each, at, at_most, expectation, in_any_order,  # noqa: E402
+                          matches, one_of)
 import harness  # noqa: E402
 import mqttwire as wire  # noqa: E402
 import normalize  # noqa: E402
@@ -67,6 +68,34 @@ class Matching(unittest.TestCase):
         self.assertFalse(matches(granted_or_refused, [0, 0x97, 2]))
         self.assertFalse(matches(granted_or_refused, "abc"))
 
+    def test_in_any_order(self):
+        suback = {"type": "SUBACK", "codes": [1]}
+        a, b = {"type": "PUBLISH", "topic": "a", "payload": "x"}, {"type": "PUBLISH", "topic": "b"}
+        bag = in_any_order({"type": "SUBACK"}, {"type": "PUBLISH", "topic": "a"}, {"type": "PUBLISH", "topic": "b"})
+        self.assertTrue(matches(bag, [suback, a, b]))
+        self.assertTrue(matches(bag, [b, suback, a]))
+        self.assertFalse(matches(bag, [suback, a]), "one is missing")
+        self.assertFalse(matches(bag, [suback, a, a]), "one came twice and one is missing")
+        self.assertFalse(matches(bag, [suback, a, b, b]), "one more than expected")
+        self.assertFalse(matches(bag, [suback, a, {"type": "PUBLISH", "topic": "c"}]), "a foreign one")
+        self.assertFalse(matches(bag, "sab"))
+        self.assertTrue(matches(in_any_order(), []))
+        # Each packet answers one pattern and each pattern one packet,
+        # whichever pattern a packet is tried against first.
+        loose = in_any_order({"type": "PUBLISH"}, {"type": "PUBLISH", "topic": "a"})
+        self.assertTrue(matches(loose, [a, b]))
+        self.assertTrue(matches(loose, [b, a]))
+        self.assertFalse(matches(loose, [b, b]))
+
+    def test_at_most(self):
+        self.assertTrue(matches(at_most(64), 64))
+        self.assertTrue(matches(at_most(64), 0))
+        self.assertFalse(matches(at_most(64), 65))
+        for other in (True, "64", None, 12.0):
+            self.assertFalse(matches(at_most(64), other), other)
+        self.assertTrue(matches({"type": "PUBLISH", "wire_bytes": at_most(64)}, {"type": "PUBLISH", "wire_bytes": 15}))
+        self.assertFalse(matches({"type": "PUBLISH", "wire_bytes": at_most(64)}, {"type": "PUBLISH"}))
+
 
 ANSWERED = expectation(
     "answered", statement="MQTT-3.8.4-1", requires="A SUBACK",
@@ -104,6 +133,25 @@ class Evaluation(unittest.TestCase):
         _, observed = expectations.evaluate(ANSWERED, [record("connack", REFUSING),
                                                        record("answer", wire.suback(7, [0, 0x80], level=5))])
         self.assertTrue(observed.endswith("; answer: recv [SUBACK packet_id=7 codes=0x00,0x80] ok"), observed)
+
+    def test_the_fields_a_pattern_reads_are_shown(self):
+        small = expectation("small", statement="MQTT-3.1.2-24", requires="x", then=[
+            at("answer", {"got": in_any_order({"type": "PUBLISH", "payload": "s", "wire_bytes": at_most(64)})})])
+        delivery = {**wire.decode(wire.publish("t", "s", qos=1, packet_id=3, level=5), 5), "wire_bytes": 9}
+        result, observed = expectations.evaluate(small, [{"conn": "a", "op": "recv", "got": [delivery], "end": "ok",
+                                                         "mark": "answer"}])
+        self.assertEqual((result, observed), (PASS, 'answer: recv [PUBLISH packet_id=3 payload="s" wire_bytes=9] ok'))
+        result, observed = expectations.evaluate(small, [{"conn": "a", "op": "recv", "end": "ok", "mark": "answer",
+                                                         "got": [{**delivery, "wire_bytes": 114}]}])
+        self.assertEqual((result, observed), (FAIL, 'answer: recv [PUBLISH packet_id=3 payload="s" wire_bytes=114] ok'))
+
+    def test_a_long_record_is_shown_by_its_counts(self):
+        deliveries = [wire.publish(f"t/{index}", "x", qos=1, packet_id=index + 1, level=5) for index in range(9)]
+        many = record("answer", wire.suback(7, [1], level=5), *deliveries, op="drain")
+        whole = expectation("whole", statement="MQTT-3.3.1-6", requires="x", then=[at("answer", {"end": "ok"})])
+        self.assertEqual(expectations.evaluate(whole, [many])[1], "answer: drain [10 packets: 1 SUBACK, 9 PUBLISH] ok")
+        eight = record("answer", *deliveries[:8], op="drain")
+        self.assertIn("PUBLISH packet_id=8] ok", expectations.evaluate(whole, [eight])[1])
 
 
 def listed(identifier, statement="MQTT-3.8.4-1", observed="closes without SUBACK"):
