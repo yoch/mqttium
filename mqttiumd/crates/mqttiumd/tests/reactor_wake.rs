@@ -134,6 +134,11 @@ fn read_packet(stream: &mut TcpStream) -> (u8, Vec<u8>) {
 }
 
 fn connect(address: SocketAddr, client_id: &str) -> TcpStream {
+    open(address, client_id).0
+}
+
+/// A connected client and the body of the CONNACK it received.
+fn open(address: SocketAddr, client_id: &str) -> (TcpStream, Vec<u8>) {
     let mut stream = TcpStream::connect(address).unwrap();
     stream.set_nodelay(true).unwrap();
     stream
@@ -148,7 +153,41 @@ fn connect(address: SocketAddr, client_id: &str) -> TcpStream {
     let (first, body) = read_packet(&mut stream);
     assert_eq!(first, 0x20, "CONNACK expected");
     assert_eq!(body[1], 0, "CONNACK reason");
-    stream
+    (stream, body)
+}
+
+/// Everything the broker sends until it ends the stream.
+fn read_until_close(stream: &mut TcpStream) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    let mut chunk = [0u8; 256];
+    loop {
+        match stream.read(&mut chunk) {
+            Ok(0) => return bytes,
+            Ok(count) => bytes.extend_from_slice(&chunk[..count]),
+            Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => return bytes,
+            Err(error) => panic!("the broker neither answered nor closed: {error}"),
+        }
+    }
+}
+
+/// The Maximum Packet Size a CONNACK announces. The walk knows the
+/// properties this broker sends.
+fn announced_maximum(connack: &[u8]) -> usize {
+    let properties = &connack[3..3 + usize::from(connack[2])];
+    let mut at = 0;
+    while at < properties.len() {
+        let width = match properties[at] {
+            0x27 => {
+                let value: [u8; 4] = properties[at + 1..at + 5].try_into().unwrap();
+                return u32::from_be_bytes(value) as usize;
+            }
+            0x21 | 0x22 => 2,
+            0x25 | 0x28 | 0x29 | 0x2a => 1,
+            other => panic!("CONNACK property {other:#x} is not known to this test"),
+        };
+        at += 1 + width;
+    }
+    panic!("CONNACK announces no Maximum Packet Size");
 }
 
 fn subscribe(stream: &mut TcpStream, filter: &str) {
@@ -393,5 +432,78 @@ fn a_subscribe_over_the_filter_limit_is_answered_per_filter() {
         read_packet(&mut client).0,
         0xd0,
         "the connection stays open"
+    );
+}
+
+/// A fixed header the broker refuses ends the connection, and in MQTT 5
+/// the broker says why first: 0x95 for a packet larger than it accepts,
+/// 0x81 for flags the protocol forbids (MQTT-3.3.1-2). Only the header of
+/// the large packet is sent: the refusal does not wait for a body.
+#[test]
+fn a_refused_header_is_named_before_the_close() {
+    let broker = Broker::start("refused-header");
+
+    let mut large = connect(broker.address, "too-large");
+    let mut header = vec![0x32];
+    remaining_length(70_000, &mut header);
+    large.write_all(&header).unwrap();
+    assert_eq!(
+        read_until_close(&mut large),
+        [0xe0, 2, 0x95, 0],
+        "Packet too large"
+    );
+
+    let mut duplicate = connect(broker.address, "dup-at-qos0");
+    let mut body = Vec::new();
+    text("wake/dup", &mut body);
+    body.push(0);
+    duplicate.write_all(&packet(0x38, &body)).unwrap();
+    assert_eq!(
+        read_until_close(&mut duplicate),
+        [0xe0, 2, 0x81, 0],
+        "Malformed Packet"
+    );
+}
+
+/// The Maximum Packet Size of the CONNACK is a promise: a PUBLISH no
+/// larger than it is not refused for its size, whatever its shape. The
+/// two largest shapes are a QoS 0 and a QoS 1 PUBLISH with a one-byte
+/// topic and no property.
+#[test]
+fn a_publish_within_the_announced_maximum_packet_size_is_accepted() {
+    let broker = Broker::start("announced-maximum");
+    let (mut client, connack) = open(broker.address, "announced-maximum");
+    let maximum = announced_maximum(&connack);
+    assert!(
+        maximum > 16_384,
+        "the header below assumes three length bytes"
+    );
+
+    // Fixed header 1 + 3, topic 2 + 1, property length 1.
+    let mut body = Vec::new();
+    text("t", &mut body);
+    body.push(0);
+    body.resize(maximum - 4, b'x');
+    let largest = packet(0x30, &body);
+    assert_eq!(largest.len(), maximum);
+    client.write_all(&largest).unwrap();
+
+    // The same with a Packet Identifier: the PUBACK says it was accepted.
+    let mut body = Vec::new();
+    text("t", &mut body);
+    body.extend_from_slice(&[0, 1, 0]);
+    body.resize(maximum - 4, b'x');
+    let largest = packet(0x32, &body);
+    assert_eq!(largest.len(), maximum);
+    client.write_all(&largest).unwrap();
+    let (first, answer) = read_packet(&mut client);
+    assert_eq!(
+        (first, &answer[..2]),
+        (0x40, &[0, 1][..]),
+        "PUBACK expected, got {first:#x} {answer:?}"
+    );
+    assert!(
+        answer.len() == 2 || answer[2] == 0 || answer[2] == 0x10,
+        "the publication is accepted: {answer:?}"
     );
 }
