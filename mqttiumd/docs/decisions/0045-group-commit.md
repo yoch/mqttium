@@ -22,8 +22,10 @@ Update of 21 November 2026, after the independent counter-audit of
 "Consequences" (the real worker killed after each number of answers of a
 group, and a commit that is durable while its call returns an error), the
 paragraph on a group that is not committed says that such a commit exists,
-and the model `MGroupCommit` has that outcome and the reconciliation that
-follows it. The decision itself is unchanged.
+the model `MGroupCommit` has that outcome and the reconciliation that
+follows it, and a campaign of the bench now commits through `apply_group`
+and is judged by the oracle up to the acknowledgements observed. The
+decision itself is unchanged.
 
 ## Context
 
@@ -205,6 +207,39 @@ are exactly as after sequential application.
   reconciliation says is what the disk holds, and no operation takes
   effect twice. A mutant that believes the error and applies the command
   again is caught by the last one. The sidecar names the tests above.
+- **A campaign judged by the oracle.** The store adapter of the bench
+  (`crates/mqttiumd-lab/src/store/adapter.rs`) can be told to commit in
+  groups: the action that moves a command into the writer takes with it
+  the consecutive `Persist` commands waiting in its transit that no fault
+  holds, and one call of `apply_group` commits them. The evidence of each
+  member is recorded after that call returned, every `StoreCommitStable`
+  before any `StoreResultReady`, and each result then travels alone. The
+  backend `sqlite-group` of the runner is the SQLite store with that
+  writer. No schema, trace record, scenario word or reading of the oracle
+  changes: the trace header, the manifest and the snapshots name the
+  store, `sqlite`; the campaign names the mode in its replay command and
+  in `covers.commit`, and states the count of the adapter in
+  `store_groups` of `campaign.json`.
+  No scenario written before has two commands outstanding, each having
+  one client and one exchange: the grouped writer plays P1-02, P1-02b,
+  QABS-A, QABS-B, QABS-C and F3 in groups of one, which is `apply`, and
+  their traces are the same bytes as on `sqlite`. Three scenarios under
+  `tests/scenarios/group/` hold two admissions of one client in transit
+  and release both, so a group of two is reached whatever the seed:
+  `GROUP-A` to both PUBCOMP, `GROUP-B` through a lost result, a crash
+  before any answer of the group reached the core, and the recovery,
+  `GROUP-ACK` up to the acknowledgements. The oracle passes the three on
+  `sqlite-group`, as on `sqlite` and `sim-store`, with every assertion
+  they list, `no_positive_ack_before_confirmed_commit` among them
+  (`crates/mqttiumd-lab/tests/bench_group.rs`, which requires the group
+  of two on the count of the adapter and on the records of the trace;
+  `tests/store_adapter_groups.rs` for the adapter alone). Mutation `g1`
+  of `tests/mutants/loop/` rolls the group back and answers its members
+  as committed: on `GROUP-ACK` the oracle fails the run on
+  `one_admission_per_observed_inbound_exchange`, each exchange being
+  acknowledged with no admission, and on the obligations and the recipe
+  of the two inspections. With one transaction for each command the same
+  patch is not reached and the run passes.
 - The bytes of a group need no limit of their own. The worker forms a
   group of at most 32 commands, the store accepts at most 64, and each
   command is bounded by the limits of the store (one payload of at most
@@ -260,6 +295,18 @@ are exactly as after sequential application.
   `admin`, `expire_messages`, `checkpoint_session_clock` and `open_epoch`
   stay one transaction each and are not members of a group.
 - **The deterministic store** has no group: it is the sequential
-  reference the differential tests judge the adapter by. A campaign of
-  the oracle does not exercise `apply_group`.
+  reference the differential tests judge the adapter by.
+- **The limits of the judged campaign.** Its groups have two members:
+  the fixture allows two commands in flight. They are formed by the store
+  adapter of the bench from its transit, not by the store worker of the
+  product, whose group formation no campaign runs. A crash is simulated
+  in the process of the bench: `--process child` is refused in this mode,
+  so no campaign kills a process inside the transaction of a group (K1,
+  K2b) or between two of its answers; the tests of the store and of the
+  worker do. The trace has no record of a group: it shows one by the
+  commits of its members coming before any of their results, and the
+  oracle judges it as a sequence of commands. No qualifying campaign
+  (`run --rebuild`) was produced in this mode: its results are
+  provisional. In CI the mode is run by `bench_group.rs` and by mutation
+  `g1`; the other loop mutants are not replayed on `sqlite-group`.
 - **Volatile backend** of ARC-020: not addressed.
