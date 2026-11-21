@@ -3,7 +3,7 @@
 Written by `tests/compat/run.py`: regenerate it with the command in
 `tests/compat/README.md` and copy `matrix.md` here; do not edit it by hand.
 
-- broker: `mqttiumd` built from commit `bd95a13d2227141f832e5b8efdee31e5f2e789cd`
+- broker: `mqttiumd` built from commit `3769918ec1e9d58c71b16afdaeeacc2d45aa117c`
 - reference: Mosquitto 2.0.21, the version `preview/build-mosquitto-reference.sh` builds
 - scenarios played: 117
 
