@@ -558,6 +558,8 @@ struct BusinessState {
     #[cfg(feature = "test-hooks")]
     held_finish: Option<OperationId>,
     #[cfg(feature = "test-hooks")]
+    held_pubrel_ready: Option<OperationId>,
+    #[cfg(feature = "test-hooks")]
     captured: Option<mqttiumd_contract::command::Command>,
 }
 fn business_response(
@@ -978,6 +980,11 @@ fn hold_business_reply(
         ),
         ("Claim", "hold-claim-result", &mut state.held_claim),
         ("Finish", "hold-finish-result", &mut state.held_finish),
+        (
+            "DeliveryPubrelReady",
+            "hold-pubrel-ready-result",
+            &mut state.held_pubrel_ready,
+        ),
     ] {
         let active = hooks
             .directory

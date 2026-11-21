@@ -1346,6 +1346,115 @@ fn deliveries_keep_the_order_of_reception_when_an_earlier_store_result_is_late()
     }
 }
 
+/// The PUBRELs of a subscriber leave in the order of the PUBRECs it sent,
+/// whenever the answers of the store reach the core (MQTT-4.6.0-6 in
+/// 3.1.1; the same order is kept in MQTT 5). This is the order of the
+/// PUBRELs, a rule apart from the order of the PUBLISH packets that the
+/// test above states. The test barrier keeps the committed result of the
+/// first preparation unknown to the core while the second PUBREC is
+/// prepared and answered; the real store then resolves the first. No
+/// PUBREL leaves while the earlier one is unknown, and the two leave in
+/// the order of the PUBRECs. Before the core kept that order the second
+/// PUBREL left first.
+#[cfg(feature = "test-hooks")]
+#[test]
+fn pubrels_keep_the_order_of_the_pubrecs_when_an_earlier_store_result_is_late() {
+    use codec::Version::{V5, V311};
+    for version in [V311, V5] {
+        let controls = Directory::new();
+        let hold = controls.0.join("hold-pubrel-ready-result");
+        with_runtime_clock_hooks(
+            128,
+            Arc::new(crate::session_time::SystemClock::new().unwrap()),
+            Hooks {
+                directory: Some(controls.0.clone()),
+                pause: vec![],
+            },
+            |runtime, _| {
+                let case = format!("{version:?}");
+                let properties: &[u8] = if version == V5 { &[0] } else { &[] };
+                let open = |runtime: &mut Runtime<'_>, client_id: &[u8]| {
+                    let (generation, mut client) = peer(runtime);
+                    let connect = codec::Connect {
+                        version,
+                        ..connect_packet(client_id)
+                    };
+                    runtime.connect(generation, connect).unwrap();
+                    until(runtime, |r| r.session_requests.is_empty());
+                    assert_eq!(read_frame(&mut client).0, 0x20, "{case}");
+                    (generation, client)
+                };
+                let (subscriber, mut subscribed) = open(runtime, b"release-subscriber");
+                let (publisher, mut publishing) = open(runtime, b"release-publisher");
+                let subscribe = [&[0, 1][..], properties, &[0, 1, b't', 2]].concat();
+                runtime.packet(subscriber, 0x82, subscribe).unwrap();
+                assert_eq!(served_frame(runtime, &mut subscribed).0, 0x90, "{case}");
+
+                let mut delivered = Vec::new();
+                for (id, payload) in [(7u8, b'A'), (8, b'B')] {
+                    let body = [&[0, 1, b't', 0, id][..], properties, &[payload]].concat();
+                    runtime.packet(publisher, 0x34, body).unwrap();
+                    assert_eq!(served_frame(runtime, &mut publishing).0, 0x50, "{case}");
+                    runtime.packet(publisher, 0x62, vec![0, id]).unwrap();
+                    assert_eq!(served_frame(runtime, &mut publishing).0, 0x70, "{case}");
+                    let (kind, body) = served_frame(runtime, &mut subscribed);
+                    assert_eq!(kind & 0xf6, 0x34, "{case}: a QoS 2 PUBLISH");
+                    assert_eq!(*body.last().unwrap(), payload, "{case}");
+                    delivered.push(vec![body[3], body[4]]);
+                }
+
+                std::fs::write(&hold, []).unwrap();
+                for id in &delivered {
+                    runtime.packet(subscriber, 0x50, id.clone()).unwrap();
+                }
+                // Long enough for the second preparation to be committed
+                // and answered behind the held one.
+                let settled = Instant::now() + Duration::from_millis(400);
+                subscribed
+                    .set_read_timeout(Some(Duration::from_millis(2)))
+                    .unwrap();
+                let mut first = [0u8; 1];
+                while Instant::now() < settled {
+                    pump(runtime);
+                    assert!(
+                        subscribed.peek(&mut first).is_err(),
+                        "{case}: a PUBREL left while that of an earlier PUBREC was unknown"
+                    );
+                }
+
+                // The core resolves an unknown result on a deadline of
+                // seconds, with whole turns and not only the passes of
+                // `pump`.
+                std::fs::remove_file(&hold).unwrap();
+                let deadline = Instant::now() + Duration::from_secs(20);
+                let mut released = Vec::new();
+                while released.len() < delivered.len() {
+                    while subscribed.peek(&mut first).is_err() {
+                        assert!(
+                            Instant::now() < deadline,
+                            "{case}: the held result never resolved"
+                        );
+                        runtime.turn().unwrap();
+                    }
+                    subscribed
+                        .set_read_timeout(Some(Duration::from_secs(1)))
+                        .unwrap();
+                    let (kind, body) = read_frame(&mut subscribed);
+                    assert_eq!(kind, 0x62, "{case}: PUBREL expected");
+                    released.push(body[..2].to_vec());
+                    runtime
+                        .packet(subscriber, 0x70, body[..2].to_vec())
+                        .unwrap();
+                    subscribed
+                        .set_read_timeout(Some(Duration::from_millis(2)))
+                        .unwrap();
+                }
+                assert_eq!(released, delivered, "{case}: the order of the PUBRECs");
+            },
+        );
+    }
+}
+
 /// A publication that finds every exchange credit lent to admissions in
 /// flight waits for one of them: the results of the store return the
 /// credits. It is pressure, not a fault of the client, and its connection
