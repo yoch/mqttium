@@ -307,16 +307,65 @@ CASES = {
 }
 
 
+def kept(count, word, *, qos=1, retain=True):
+    """The SUBACK and the retained messages of `count` topics, as a
+    subscriber at QoS 1 reads them."""
+    return [wire.suback(1, [qos]),
+            *[wire.publish(f"{word}/{index:02d}", f"r{index:02d}", qos=qos, packet_id=index if qos else None,
+                           retain=retain) for index in range(1, count + 1)]]
+
+
+def drained(*packets, end="ok"):
+    return record("retained", *packets, op="drain", end=end, level=4)
+
+
+def silent(mark, *packets, end="quiet", level=4):
+    return record(mark, *packets, op="quiet", end=end, level=level)
+
+
+def store_cases(count, word):
+    """Transcripts for the content of a retained store of `count` topics."""
+    whole = kept(count, word)
+    return {
+        PASS: [[drained(*whole), silent("after")],
+               [drained(*whole[::-1]), silent("after")],
+               # A broker that grants QoS 0 owes the same messages.
+               [drained(*kept(count, word, qos=0)), silent("after")]],
+        FAIL: [[drained(*whole[:-8], end="idle"), silent("after")],            # eight are missing
+               [drained(*whole[:-1], whole[1]), silent("after")],              # one twice, one missing
+               [drained(*whole, whole[1]), silent("after")],                   # one twice
+               [drained(*kept(count, word, retain=False)), silent("after")],   # without RETAIN
+               [drained(*whole[:-1], wire.publish(f"{word}/{count:02d}", "other", qos=1, packet_id=count,
+                                                  retain=True)), silent("after")],
+               [drained(*whole[:-1], wire.publish("elsewhere/01", f"r{count:02d}", qos=1, packet_id=count,
+                                                  retain=True)), silent("after")],
+               [drained(*whole), silent("after", whole[1])],                   # one again afterwards
+               [drained(*whole), silent("after", end="eof")],
+               [drained(*whole)]],
+    }
+
+
+STORE_AT_CAPACITY = "retained/thirty-two-topics-qos1-v4#store"
+STORE_BEYOND = "retained/forty-topics-qos1-v4#store"
+CASES[STORE_AT_CAPACITY] = store_cases(32, "thirty-two")
+CASES[STORE_BEYOND] = store_cases(40, "forty")
+# What mqttiumd does today beyond the thirty-two topics it keeps.
+CASES[STORE_BEYOND][FAIL].insert(0, [drained(*kept(32, "forty"), end="idle"), silent("after")])
+
+
 class Repository(unittest.TestCase):
     """The expectations checked in, whatever the brokers do."""
 
     declared = expectations.declared(dsl.REGISTRY)
 
-    def test_the_expectations_are_the_six_of_the_audit(self):
+    def test_each_expectation_has_its_cases(self):
         self.assertEqual(sorted(self.declared), sorted(CASES))
         cited = {SHARE_LITERAL: {"MQTT-3.8.4-1"}, UNSUBSCRIBE_SHARE: {"MQTT-3.10.4-5", "MQTT-3.10.4-4"},
                  TWELVE: {"MQTT-3.8.4-5"}, SHARED: {"MQTT-4.13.1-1"}, SUBSCRIPTION_IDENTIFIER: {"MQTT-4.13.1-1"},
-                 RESERVED: {"MQTT-3.8.3-5", "MQTT-4.13.1-1"}}
+                 RESERVED: {"MQTT-3.8.3-5", "MQTT-4.13.1-1"},
+                 STORE_AT_CAPACITY: {"MQTT-3.3.1-5", "MQTT-3.3.1-6", "MQTT-3.3.1-8"},
+                 STORE_BEYOND: {"MQTT-3.3.1-5", "MQTT-3.3.1-6", "MQTT-3.3.1-8"}}
+        self.assertEqual(sorted(cited), sorted(CASES))
         for name, statements in cited.items():
             found = {match.group(0) for match in classify.STATEMENT.finditer(self.declared[name].statement)}
             self.assertLessEqual(statements, found, name)

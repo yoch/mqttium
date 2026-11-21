@@ -107,7 +107,7 @@
   {
     "id": "publish/burst-qos0-v4",
     "class": "profile-refused",
-    "difference": "Mosquitto delivers all one hundred QoS 0 messages written at once to an online subscriber; mqttiumd delivers fewer (between 8 and 46 in the runs read), in the order sent, and drops the others silently.",
+    "difference": "Mosquitto delivers all one hundred QoS 0 messages written at once to an online subscriber; mqttiumd delivers fewer (between 4 and 52 in the runs read), in the order sent, and drops the others silently.",
     "lot": "Runtime limits of the bounded preview (ADR 0044), to be raised to Mosquitto's defaults or made configurable: the bounded volatile path of QoS 0 messages (8 outgoing messages per connection, 32 writer slots)",
     "fingerprint": "737eee3aa9a2785b"
   },
@@ -148,11 +148,18 @@
     "fingerprint": "3d5fe5d94ba4a6cf"
   },
   {
+    "id": "retained/forty-topics-qos1-v4",
+    "class": "profile-refused",
+    "difference": "Mosquitto keeps forty retained messages and sends them all to a new subscription at QoS 1; mqttiumd keeps thirty-two, closes the publisher's connection on the thirty-third and sends those thirty-two, each once.",
+    "lot": "Runtime limits of the bounded preview (ADR 0044), to be raised to Mosquitto's defaults or made configurable: 32 retained topics",
+    "fingerprint": "737963249fbca0ae"
+  },
+  {
     "id": "retained/forty-topics-v4",
     "class": "profile-refused",
-    "difference": "Mosquitto keeps forty retained messages and sends them all to a new subscriber; mqttiumd keeps thirty-two, closes the publisher's connection on the thirty-third and sends thirty-two.",
-    "lot": "Runtime limits of the bounded preview (ADR 0044), to be raised to Mosquitto's defaults or made configurable: 32 retained topics",
-    "fingerprint": "7579302c42a02d99"
+    "difference": "Mosquitto acknowledges forty retained publications; mqttiumd acknowledges thirty-two and closes the publisher's connection on the thirty-third. The messages that reach the subscription at QoS 0 compare equal (each one of the forty, none twice); how many reach it is measured and not compared: forty from Mosquitto, between 18 and 32 from mqttiumd in the runs read.",
+    "lot": "Runtime limits of the bounded preview (ADR 0044), to be raised to Mosquitto's defaults or made configurable: 32 retained topics; the QoS 0 deliveries mqttiumd sheds go through the bounded volatile path (4 output slots per connection)",
+    "fingerprint": "5b8352a9198b0cf8"
   },
   {
     "id": "subscribe/invalid-empty-filter-v5",
