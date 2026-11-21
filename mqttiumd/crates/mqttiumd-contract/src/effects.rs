@@ -24,7 +24,9 @@ use crate::ids::{
 use crate::message_expiry::{ExpiredDelivery, MessageExpiry, MessageExpiryBlock, MessageTime};
 use crate::outcome::{EpochGrant, Knowledge, StoreReply};
 use crate::packet::{InboundPacket, OutboundFrame, Qos, Qos2Ack, SharedBytes};
-use crate::pubsub::{DeliveryClaim, PubackTarget, Qos0DropReason, Qos0Origin, WorkItem};
+use crate::pubsub::{
+    DeliveryClaim, DeliveryDiscardReason, PubackTarget, Qos0DropReason, Qos0Origin, WorkItem,
+};
 
 /// Durable phase of an inbound QoS 2 exchange.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -431,6 +433,16 @@ pub enum Effect {
         origin: Qos0Origin,
         target: Option<SessionId>,
         reason: Qos0DropReason,
+    },
+    /// A claimed QoS 1 or 2 delivery ended without a PUBLISH. `operation` is
+    /// the committed `FinishDelivery` that ended it, guarded by its claim.
+    /// Volatile: published when that commit is applied, lost by a crash
+    /// before an adapter accepts it; the durable receipt remains.
+    DeliveryDiscarded {
+        delivery: DeliveryId,
+        target: SessionId,
+        operation: OperationId,
+        reason: DeliveryDiscardReason,
     },
     /// Propose a frozen command.
     Persist { command: Command },

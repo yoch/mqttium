@@ -3268,6 +3268,7 @@ mod tests {
             Effect::EmitPublish { .. } => "EmitPublish",
             Effect::EmitQos0 { .. } => "EmitQos0",
             Effect::Qos0Dropped { .. } => "Qos0Dropped",
+            Effect::DeliveryDiscarded { .. } => "DeliveryDiscarded",
             Effect::CloseConnection { .. } => "CloseConnection",
             Effect::ArmDeadline { .. } => "ArmDeadline",
             Effect::Continue { .. } => "Continue",
@@ -8047,18 +8048,115 @@ mod tests {
         );
     }
 
-    #[test]
-    fn product_pubsub_peer_maximum_packet_size_refuses_emission_and_preserves_claim() {
-        let mut world = product_world();
-        world.applied(Input::ConnectionSettings {
-            connection: ConnectionGeneration::new(CONN),
+    /// The producer's connection with a Maximum Packet Size of 18 bytes:
+    /// `work_item(0)` needs 19 and a one-byte payload needs 13.
+    fn small_packet_settings(connection: u64) -> Input {
+        Input::ConnectionSettings {
+            connection: ConnectionGeneration::new(connection),
             receive_maximum: 1,
-            maximum_packet_size: 8,
-        });
+            maximum_packet_size: 18,
+        }
+    }
+
+    fn small_work_item(index: u32) -> crate::contract::pubsub::WorkItem {
+        let mut item = work_item(index);
+        item.payload = bytes(b"p");
+        item
+    }
+
+    /// Replaces
+    /// `product_pubsub_peer_maximum_packet_size_refuses_emission_and_preserves_claim`,
+    /// which pinned the closure of the connection and the kept claim. A
+    /// delivery whose PUBLISH exceeds the Maximum Packet Size of the client
+    /// is not sent and ends as a completed one (MQTT-3.1.2-25).
+    #[test]
+    fn product_pubsub_delivery_over_peer_maximum_packet_size_is_discarded_and_the_next_one_sent() {
+        let session = SessionId::new(PRODUCER);
+        let mut world = product_world();
+        world.applied(small_packet_settings(CONN));
+        load_work(&mut world, &[work_item(0), small_work_item(1)], None);
+        let claim = pubsub_flight(&mut world, work_available());
+        world.applied(committed(&claim));
+        assert!(
+            world.drain().is_empty(),
+            "neither a PUBLISH nor a close follows the claim of an oversized delivery"
+        );
+        assert!(
+            world.owner.has_ready_work(session),
+            "the discard is ready work"
+        );
+        let discard = pubsub_flight(&mut world, work_available());
+        let CommitFacts::DeliveryClaimed {
+            packet_id,
+            claim: claimed_as,
+            ..
+        } = claim.facts
+        else {
+            panic!("claim")
+        };
+        assert_eq!(
+            discard.facts,
+            CommitFacts::DeliveryFinished {
+                delivery: work_item(0).delivery,
+                target: session,
+                packet_id,
+                claim: claimed_as,
+            },
+            "the discard is the finish guarded by the claim"
+        );
+        assert_ne!(discard.operation, claim.operation);
+        assert!(
+            world.sent(work_available()).is_empty(),
+            "the window of the discarded delivery is held until its finish is known"
+        );
+        world.applied(committed(&discard));
+        let observed = world.drain();
+        assert_eq!(kinds(&observed), ["DeliveryDiscarded"]);
+        assert_eq!(
+            observed[0].1,
+            Effect::DeliveryDiscarded {
+                delivery: work_item(0).delivery,
+                target: session,
+                operation: discard.operation,
+                reason: crate::contract::pubsub::DeliveryDiscardReason::PacketTooLarge,
+            },
+            "the observation names the committed finish"
+        );
+        assert!(world.owner.has_ready_work(session));
+        let next = pubsub_flight(&mut world, work_available());
+        assert_eq!(
+            next.facts,
+            CommitFacts::DeliveryClaimed {
+                delivery: small_work_item(1).delivery,
+                target: session,
+                packet_id,
+                claim: next.operation,
+            },
+            "the next delivery reuses the freed Packet Identifier on the same connection"
+        );
+        world.applied(committed(&next));
+        let publish = world.drain();
+        assert_eq!(kinds(&publish), ["EmitPublish"]);
+        assert!(matches!(
+            &publish[0].1,
+            Effect::EmitPublish { delivery, dup: false, connection, .. }
+                if *delivery == small_work_item(1).delivery
+                    && connection.generation == ConnectionGeneration::new(CONN)
+        ));
+    }
+
+    #[test]
+    fn product_pubsub_oversized_claim_not_yet_discarded_is_sent_on_a_larger_connection() {
+        let mut world = product_world();
+        world.applied(small_packet_settings(CONN));
         load_work(&mut world, &[work_item(0)], None);
         let claim = pubsub_flight(&mut world, work_available());
         world.applied(committed(&claim));
-        assert_eq!(kinds(&world.drain()), ["CloseConnection"]);
+        assert!(world.drain().is_empty());
+        world.applied(Input::ConnectionClosed {
+            connection: ConnectionGeneration::new(CONN),
+        });
+        let _ = world.drain();
         world.applied(product_settings(CONN + 1, 1));
         assert_eq!(
             world.sent(connect(CONN + 1, b"p1-producer")),
@@ -8066,10 +8164,31 @@ mod tests {
         );
         world.applied(work_available());
         let publish = world.drain();
+        assert_eq!(kinds(&publish), ["EmitPublish"]);
         assert!(
             matches!(&publish[0].1,Effect::EmitPublish {claim:op,dup:false,..}if *op==claim.operation),
-            "known claim never made eligible still sends DUP=0"
+            "a known claim that was never made eligible still sends DUP=0"
         );
+    }
+
+    #[test]
+    fn product_pubsub_discard_reserves_every_effect_before_mutating_the_submachine() {
+        fn discard() -> (World, Input) {
+            let mut world = product_world();
+            world.applied(small_packet_settings(CONN));
+            load_work(&mut world, &[work_item(0), small_work_item(1)], None);
+            let claim = pubsub_flight(&mut world, work_available());
+            world.applied(committed(&claim));
+            assert!(world.drain().is_empty());
+            (world, work_available())
+        }
+        fn discard_result() -> (World, Input) {
+            let (mut world, input) = discard();
+            let flight = pubsub_flight(&mut world, input);
+            (world, committed(&flight))
+        }
+        product_capacity_refusals(discard, 2);
+        product_capacity_refusals(discard_result, 1);
     }
 
     #[test]

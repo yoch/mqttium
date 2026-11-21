@@ -112,6 +112,7 @@
     "contracts/examples/v1/valid/product-session-transitions.json",
     "contracts/examples/v1/valid/product-event.json",
     "contracts/examples/v1/valid/product-qos0-drop-event.json",
+    "contracts/examples/v1/valid/product-delivery-discarded-event.json",
     "contracts/examples/v1/valid/product-puback-observed.json",
     "contracts/examples/v1/valid/product-puback-no-target.json",
     "contracts/examples/v1/valid/product-puback-ignored-historical-target.json",

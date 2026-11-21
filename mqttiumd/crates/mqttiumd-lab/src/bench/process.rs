@@ -624,6 +624,7 @@ impl<S: DurableStore> EffectSink for Sink<'_, S> {
             | Effect::EmitPublish { .. }
             | Effect::EmitQos0 { .. }
             | Effect::Qos0Dropped { .. }
+            | Effect::DeliveryDiscarded { .. }
             | Effect::Continue { .. } => SubmitResult::NotSubmitted {
                 effect,
                 reason: SubmitBlock::Closed,

@@ -4149,6 +4149,27 @@ impl EffectSink for Sink<'_> {
                 let _ = effect.into_parts();
                 SubmitResult::Accepted
             }
+            Effect::DeliveryDiscarded {
+                delivery,
+                target,
+                operation: finished,
+                reason,
+            } => {
+                let record = json!({
+                    "operation": operation(*finished),
+                    "command_kind": "Finish",
+                    "details": {
+                        "delivery": delivery_text(*delivery),
+                        "target": target.get().to_string(),
+                        "reason": reason.code(),
+                    },
+                });
+                if self.events.emit("delivery_discarded", record).is_err() {
+                    self.error = Some(Failure::plain("events_unavailable"));
+                }
+                let _ = effect.into_parts();
+                SubmitResult::Accepted
+            }
             Effect::EmitQos0 {
                 expiry,
                 connection,

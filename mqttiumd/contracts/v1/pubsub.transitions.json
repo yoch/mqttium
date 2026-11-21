@@ -87,7 +87,7 @@
       "machine": "OutgoingQos1",
       "state_class": "Queued",
       "event_class": "WorkDiscovered",
-      "guard": "Bounded durable QoS 1 work; current destination session/revision and available destination/local window. Packet size is checked before emission; an oversized obligation is retained on connection refusal.",
+      "guard": "Bounded durable QoS 1 work; current destination session/revision and available destination/local window. Packet size does not guard the claim: it is checked where the PUBLISH would be emitted, and a claimed delivery larger than the peer Maximum Packet Size is discarded through its guarded FinishDelivery while the connection stays open (record 0025 as amended). No rule of this subset describes that discard.",
       "next_state_class": "ClaimPending",
       "required_actions": [
         "PersistClaimDelivery",
@@ -125,7 +125,7 @@
       "machine": "OutgoingQos1",
       "state_class": "ClaimPending",
       "event_class": "KnownCommit",
-      "guard": "Matching delivery, target revision, packet identifier and claim operation are durably known; current connection generation is authorized.",
+      "guard": "Matching delivery, target revision, packet identifier and claim operation are durably known; current connection generation is authorized and the PUBLISH fits the peer Maximum Packet Size. A delivery that does not fit emits nothing at this commit and is discarded at the next work turn.",
       "next_state_class": "AwaitPuback",
       "required_actions": [
         "EligiblePublish"

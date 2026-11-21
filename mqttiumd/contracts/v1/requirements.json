@@ -145,6 +145,11 @@
       "sha256": "f62529a9634cda6a305acb805118b63f378b262300aeee03df0eb8bfcc8d9ef0"
     },
     {
+      "decision": "0025",
+      "path": "docs/decisions/0025-exact-pubsub.md",
+      "sha256": "5f730e52f5100e94f624587e7b7b949f93937b1fee54c83850586c6ffd291337"
+    },
+    {
       "decision": "0026",
       "path": "docs/decisions/0026-qos0-volatile-and-consumed.md",
       "sha256": "ff41182e0f5c5f9592f2f0c6f0972324d31326ec1348450fe5b6c53e2e5a7275"
@@ -157,7 +162,7 @@
     {
       "decision": "0028",
       "path": "docs/decisions/0028-outgoing-packet-identifier-reuse.md",
-      "sha256": "51a07bcc785540af45ea209772fd4c0df65bcc52961681970990d3bd1ee018bc"
+      "sha256": "3876330a6cd14f66d293cc1be17eae659ef5b3ce0b2dcf3c724348a7e3a77054"
     },
     {
       "decision": "0029",

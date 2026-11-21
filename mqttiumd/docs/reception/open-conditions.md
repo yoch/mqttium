@@ -227,7 +227,6 @@ runtime models. Each row is open; none is repaired by a frozen reception.
 
 | Condition | Closed by | Blocks |
 | - | - | - |
-| **A delivery larger than the client's Maximum Packet Size.** A QoS 1 or 2 delivery that does not fit closes the connection and keeps its claim (`plan_delivery_emit`); MQTT-3.1.2-25 requires discarding it as if sent. A persistent session is closed again at the same message on every reconnect. A core test pins the current behaviour | Core, with a decision record | Conformance; drop-in use |
 | **Order of deliveries under a late store result.** MQTT-4.6.0-5 and -6 are not established by code or test | Core and runtime models | Conformance |
 | **Refusals that say less than Mosquitto.** No DISCONNECT 0x95 or 0x81 before closing on an oversized or malformed packet; CONNACK 0x83 where 0x8C names an unsupported authentication method; a 40,000-byte PUBLISH refused although Maximum Packet Size 65,536 was announced (`tests/compat/divergences.json`, class `defect`) | Runtime (codec) | Compatibility matrix without `defect` |
 | **The profile refuses what Mosquitto accepts.** Empty ClientID, username and password, PUBLISH properties other than Message Expiry, Will QoS 0 and 2 and Will Delay, shared subscriptions, subscription identifiers, topic aliases, `$SYS`, MQTT 3.1, more than 8 filters per SUBSCRIBE, 128 subscriptions, 32 retained topics, packets over 65,536 bytes (26 scenarios of class `profile-refused`) | Product lots of version 0.1; PUBLISH properties need a durable encoding and a decision record | Version 0.1 |

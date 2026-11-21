@@ -134,6 +134,23 @@ impl Qos0DropReason {
     }
 }
 
+/// Why the owner ended a claimed QoS 1 or 2 delivery without sending it
+/// (ADR 0025, amendment of 21 November 2026). The obligation ends through
+/// its guarded `FinishDelivery`; no PUBLISH and no acknowledgement exist.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum DeliveryDiscardReason {
+    /// The only encoding of its PUBLISH exceeds the Maximum Packet Size of
+    /// the receiving connection (MQTT-3.1.2-25).
+    PacketTooLarge,
+}
+impl DeliveryDiscardReason {
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::PacketTooLarge => "packet_too_large",
+        }
+    }
+}
+
 /// Durable intent that a QoS 1 or 2 delivery may have begun. It is not proof of
 /// socket write or peer receipt. Its operation is also its slot generation.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

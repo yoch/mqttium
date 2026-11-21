@@ -8,23 +8,17 @@ exercises the statement. It is not a proof of conformance: see `README.md`.
 
 | Status | MQTT 5.0 | MQTT 3.1.1 |
 | - | -: | -: |
-| `covered` | 134 | 75 |
+| `covered` | 135 | 75 |
 | `implemented-untested` | 43 | 32 |
 | `profile-refused` | 37 | 8 |
-| `open` | 4 | 7 |
+| `open` | 3 | 7 |
 | `not-applicable` | 33 | 17 |
 | statements | 251 | 139 |
 | of which bind a server | 221 | 125 |
 
-## Open (11)
+## Open (10)
 
 Applies to a server, and either no implementation and no deliberate refusal was found, or the behaviour looks non-conformant. The note says which.
-
-### maximum-packet-size (1)
-
-| MQTT | Statement | Note |
-| - | - | - |
-| 5.0 | `MQTT-3.1.2-25` | Non-conformant for QoS 1 and 2: `plan_delivery_emit` closes the connection (CapacityExceeded, no DISCONNECT) and keeps the delivery, so each reconnection of that session is closed at the same message; `product_pubsub_peer_maximum_packet_size_refuses_emission_and_preserves_claim` pins this. A QoS 0 copy is discarded as required (`qos0_fits`). |
 
 ### message-ordering (7)
 

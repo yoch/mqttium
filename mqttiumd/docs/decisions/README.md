@@ -39,7 +39,7 @@ its source; a test fails when the register and the records drift apart.
 | [0022](0022-product-tcp-qos2.md) | Accepted with amendments | Product TCP incoming QoS 2, durable session facts, bounded transport and system evidence | Product |
 | [0023](0023-incoming-qos1.md) | Accepted | Incoming QoS 1 occurrences and acknowledgement receipts | Product |
 | [0024](0024-receive-wire-progress.md) | Accepted | Receive credits follow bounded transport progress | Product |
-| [0025](0025-exact-pubsub.md) | Proposed | Exact persistent subscriptions and outgoing QoS 1 | Product |
+| [0025](0025-exact-pubsub.md) | Accepted with amendments | Exact persistent subscriptions and outgoing QoS 1; a delivery larger than the peer's Maximum Packet Size is discarded | Product |
 | [0026](0026-qos0-volatile-and-consumed.md) | Accepted with amendments | Volatile QoS 0 and consumed durable obligations | Product |
 | [0027](0027-live-receipt-retirement.md) | Accepted | Live bounded receipt retirement | Product |
 | [0028](0028-outgoing-packet-identifier-reuse.md) | Accepted | Recyclable outgoing Packet Identifiers and immutable PUBACK observations | Product |
