@@ -13,18 +13,18 @@ is inferred from. The others are not reviewed, which is not a third kind.
 
 | Status | MQTT 5.0 | MQTT 3.1.1 |
 | - | -: | -: |
-| `covered` | 134 | 75 |
-| of which `direct` | 0 | 0 |
-| of which `partial` | 0 | 0 |
-| not reviewed | 134 | 75 |
+| `covered` | 135 | 75 |
+| of which `direct` | 13 | 4 |
+| of which `partial` | 6 | 8 |
+| not reviewed | 116 | 63 |
 | `implemented-untested` | 43 | 32 |
 | `profile-refused` | 37 | 8 |
-| `open` | 4 | 7 |
+| `open` | 3 | 7 |
 | `not-applicable` | 33 | 17 |
 | statements | 251 | 139 |
 | of which bind a server | 221 | 125 |
 
-## Open (11)
+## Open (10)
 
 Applies to a server, and either no implementation and no deliberate refusal was found, or the behaviour looks non-conformant. The note says which.
 
@@ -38,31 +38,25 @@ Applies to a server, and either no implementation and no deliberate refusal was 
 
 | MQTT | Statement | Note |
 | - | - | - |
-| 5.0 | `MQTT-4.6.0-5` | Not established. Core tests show that an earlier outgoing claim is not overtaken by a later one, but nothing read or tested shows that deliveries keep the publisher's order when the store result of an earlier admission is late or unknown; no test compares the order a subscriber reads with the order a publisher sent at QoS 1 or 2. |
-| 5.0 | `MQTT-4.6.0-6` | Not established. Every topic takes one path and there is no unordered mode, but whether that path is ordered is the open point of MQTT-4.6.0-5. |
-| 3.1.1 | `MQTT-4.6.0-2` | Written for the Client; MQTT-4.6.0-6 extends 'the rules listed above' to a Server. No implementation found: a PUBACK leaves when the store result of its admission is applied, and no code or test states that PUBACKs keep the arrival order of their PUBLISH packets. |
-| 3.1.1 | `MQTT-4.6.0-3` | Written for the Client; MQTT-4.6.0-6 extends 'the rules listed above' to a Server. No implementation found: a PUBREC leaves when the store result of its admission is applied, and no code or test states that PUBRECs keep the arrival order of their PUBLISH packets. |
-| 3.1.1 | `MQTT-4.6.0-4` | Written for the Client; MQTT-4.6.0-6 extends 'the rules listed above' to a Server. No implementation found: the broker's PUBREL leaves after the durable commit of its PUBREC, and no code or test states that two PUBRELs keep the order of their PUBRECs. |
-| 3.1.1 | `MQTT-4.6.0-5` | Not established. Every topic takes one path and there is no unordered mode, but whether that path is ordered is the open point of MQTT-4.6.0-6. |
-| 3.1.1 | `MQTT-4.6.0-6` | Not established. Core tests show that an earlier outgoing claim is not overtaken by a later one, but nothing read or tested shows that deliveries keep the publisher's order when the store result of an earlier admission is late or unknown; no test compares the order a subscriber reads with the order a publisher sent at QoS 1 or 2. |
+| 5.0 | `MQTT-4.6.0-5` | Not established. Core tests show that an earlier outgoing claim is not overtaken by a later one, but nothing read or tested shows that deliveries keep the publisher's order when the store result of an earlier admission is late or unknown; no test compares the order a subscriber reads with the order a publisher sent at QoS 1 or 2. The independent audit of 8e4303d, 21 November 2026, observed deliveries to a subscriber in the order published (A then B, and twelve messages in order across two pages after a reconnection); the compatibility scenario `publish/burst-qos0-v4` compares the order of the QoS 0 messages of a burst with the order sent (as sent, among those the broker did not shed, in every play read with the broker built from 81acd13). Neither shows the order when the store result of an earlier admission is late or unknown. |
+| 5.0 | `MQTT-4.6.0-6` | Not established. Every topic takes one path and there is no unordered mode, but whether that path is ordered is the open point of MQTT-4.6.0-5. The observations are in the note of MQTT-4.6.0-5. |
+| 3.1.1 | `MQTT-4.6.0-2` | Written for the Client; MQTT-4.6.0-6 extends 'the rules listed above' to a Server. Looks non-conformant: a PUBACK leaves when the store result of its admission is applied, and no code or test states that PUBACKs keep the arrival order of their PUBLISH packets. The independent audit of 8e4303d, 21 November 2026, observed acknowledgements leaving in the order of the store results: 8 then 7 for publications received as 7 then 8. The compatibility scenario `publish/pipelined-qos1-v4` compares the order of twenty PUBACK with the order of their PUBLISH packets on one topic: as sent in every play read with the broker built from 81acd13, which does not show the order when a store result is late. |
+| 3.1.1 | `MQTT-4.6.0-3` | Written for the Client; MQTT-4.6.0-6 extends 'the rules listed above' to a Server. Looks non-conformant: a PUBREC leaves when the store result of its admission is applied, and no code or test states that PUBRECs keep the arrival order of their PUBLISH packets. The independent audit of 8e4303d, 21 November 2026, observed acknowledgements leaving in the order of the store results: 8 then 7 for publications received as 7 then 8. |
+| 3.1.1 | `MQTT-4.6.0-4` | Written for the Client; MQTT-4.6.0-6 extends 'the rules listed above' to a Server. No implementation found: the broker's PUBREL leaves after the durable commit of its PUBREC, and no code or test states that two PUBRELs keep the order of their PUBRECs. The independent audit of 8e4303d, 21 November 2026, did not observe the order of PUBREL packets. |
+| 3.1.1 | `MQTT-4.6.0-5` | Not established. Every topic takes one path and there is no unordered mode, but whether that path is ordered is the open point of MQTT-4.6.0-6. The observations are in the note of MQTT-4.6.0-6. |
+| 3.1.1 | `MQTT-4.6.0-6` | Not established. Core tests show that an earlier outgoing claim is not overtaken by a later one, but nothing read or tested shows that deliveries keep the publisher's order when the store result of an earlier admission is late or unknown; no test compares the order a subscriber reads with the order a publisher sent at QoS 1 or 2. The independent audit of 8e4303d, 21 November 2026, observed deliveries to a subscriber in the order published (A then B, and twelve messages in order across two pages after a reconnection); the compatibility scenario `publish/burst-qos0-v4` compares the order of the QoS 0 messages of a burst with the order sent (as sent, among those the broker did not shed, in every play read with the broker built from 81acd13). Neither shows the order when the store result of an earlier admission is late or unknown. |
 
 ### subscribe (1)
 
 | MQTT | Statement | Note |
 | - | - | - |
-| 3.1.1 | `MQTT-3.8.4-1` | Ordinary filters are answered with a SUBACK (asserted on MQTT 5 connections). Non-conformant corner: `codec::filter` applies the MQTT 5 `$share/` grammar to 3.1.1 too, so a SUBSCRIBE to `$share/x`, a valid 3.1.1 filter, is a Protocol Error and the connection is closed without a SUBACK. |
-
-### subscription-options (1)
-
-| MQTT | Statement | Note |
-| - | - | - |
-| 5.0 | `MQTT-3.8.3-5` | Looks non-conformant in its classification: reserved option bits are refused and the connection is closed, but as a Protocol Error (DISCONNECT 0x82), not as a Malformed Packet (0x81); `valid_subscription_options_reach_the_core_without_loss` pins the Protocol kind. |
+| 3.1.1 | `MQTT-3.8.4-1` | The independent audit of 8e4303d, 21 November 2026, found a SUBSCRIBE to `$share/x`, a valid 3.1.1 filter, closed without a SUBACK. Since 81acd13 the 3.1.1 decoder hands such a filter to the core as an ordinary one (`a_share_prefixed_filter_is_an_ordinary_filter_in_3_1_1`), which refuses it in the SUBACK (0x80), and a SUBSCRIBE with more than eight filters is answered with one 0x80 per filter. Still non-conformant: a SUBSCRIBE whose Topic Filter is longer than 1,024 bytes is closed without a SUBACK (`FilterTooLarge`; observed on a socket with a 2,000-byte filter on the broker built from 81acd13). Ordinary filters are answered with a SUBACK, asserted on MQTT 5 connections. |
 
 ### unsubscribe (1)
 
 | MQTT | Statement | Note |
 | - | - | - |
-| 3.1.1 | `MQTT-3.10.4-4` | Ordinary filters are answered with an UNSUBACK (core test, 3.1.1 encoder test); its identifier is not compared with the request. Non-conformant corner: for a `$share/` filter the core answers 0x8F, which `encode_for` cannot express in 3.1.1, and the connection is closed without an UNSUBACK (`failure_without_wire_ack`). |
+| 3.1.1 | `MQTT-3.10.4-4` | The independent audit of 8e4303d, 21 November 2026, found an UNSUBSCRIBE of a `$share/` filter closed without an UNSUBACK. Since 81acd13 the 3.1.1 encoder acknowledges the result 0x8F of such a filter (`an_unsubscribe_of_a_filter_that_cannot_be_subscribed_is_acknowledged_in_3_1_1`). Still non-conformant: an UNSUBSCRIBE with more than eight Topic Filters is closed without an UNSUBACK (`TooManyFilters`; observed on a socket with nine filters on the broker built from 81acd13). Ordinary filters are answered with an UNSUBACK (core test, 3.1.1 encoder test); no Rust test compares its identifier with the request. |
 
 ## Refused by the profile (45)
 
@@ -92,13 +86,13 @@ The broker deliberately rejects or does not offer the feature today. The note sa
 
 | MQTT | Statement | Code | Note |
 | - | - | - | - |
-| 5.0 | `MQTT-3.15.2-1` | `mqttiumd/crates/mqttiumd/src/codec.rs:decode_for` | Not offered: the broker never sends AUTH, a CONNECT with an Authentication Method is refused with CONNACK 0x83, and an AUTH packet from a client is answered with DISCONNECT 0x82. |
-| 5.0 | `MQTT-3.15.2-2` | `mqttiumd/crates/mqttiumd/src/codec.rs:decode_for` | Not offered: the broker never sends AUTH, a CONNECT with an Authentication Method is refused with CONNACK 0x83, and an AUTH packet from a client is answered with DISCONNECT 0x82. |
-| 5.0 | `MQTT-3.15.2-3` | `mqttiumd/crates/mqttiumd/src/codec.rs:decode_for` | Not offered: the broker never sends AUTH, a CONNECT with an Authentication Method is refused with CONNACK 0x83, and an AUTH packet from a client is answered with DISCONNECT 0x82. |
-| 5.0 | `MQTT-4.12.0-2` | `mqttiumd/crates/mqttiumd/src/codec.rs:decode_for` | Not offered: the broker never sends AUTH, a CONNECT with an Authentication Method is refused with CONNACK 0x83, and an AUTH packet from a client is answered with DISCONNECT 0x82. |
-| 5.0 | `MQTT-4.12.0-4` | `mqttiumd/crates/mqttiumd/src/codec.rs:decode_for` | Not offered: the broker never sends AUTH, a CONNECT with an Authentication Method is refused with CONNACK 0x83, and an AUTH packet from a client is answered with DISCONNECT 0x82. |
-| 5.0 | `MQTT-4.12.0-5` | `mqttiumd/crates/mqttiumd/src/codec.rs:decode_for` | Not offered: the broker never sends AUTH, a CONNECT with an Authentication Method is refused with CONNACK 0x83, and an AUTH packet from a client is answered with DISCONNECT 0x82. |
-| 5.0 | `MQTT-4.12.1-2` | `mqttiumd/crates/mqttiumd/src/codec.rs:decode_for` | Not offered: the broker never sends AUTH, a CONNECT with an Authentication Method is refused with CONNACK 0x83, and an AUTH packet from a client is answered with DISCONNECT 0x82. |
+| 5.0 | `MQTT-3.15.2-1` | `mqttiumd/crates/mqttiumd/src/codec.rs:decode_for` | Not offered: the broker never sends AUTH, a CONNECT with an Authentication Method is refused with CONNACK 0x8C, and an AUTH packet from a client is answered with DISCONNECT 0x82. |
+| 5.0 | `MQTT-3.15.2-2` | `mqttiumd/crates/mqttiumd/src/codec.rs:decode_for` | Not offered: the broker never sends AUTH, a CONNECT with an Authentication Method is refused with CONNACK 0x8C, and an AUTH packet from a client is answered with DISCONNECT 0x82. |
+| 5.0 | `MQTT-3.15.2-3` | `mqttiumd/crates/mqttiumd/src/codec.rs:decode_for` | Not offered: the broker never sends AUTH, a CONNECT with an Authentication Method is refused with CONNACK 0x8C, and an AUTH packet from a client is answered with DISCONNECT 0x82. |
+| 5.0 | `MQTT-4.12.0-2` | `mqttiumd/crates/mqttiumd/src/codec.rs:decode_for` | Not offered: the broker never sends AUTH, a CONNECT with an Authentication Method is refused with CONNACK 0x8C, and an AUTH packet from a client is answered with DISCONNECT 0x82. |
+| 5.0 | `MQTT-4.12.0-4` | `mqttiumd/crates/mqttiumd/src/codec.rs:decode_for` | Not offered: the broker never sends AUTH, a CONNECT with an Authentication Method is refused with CONNACK 0x8C, and an AUTH packet from a client is answered with DISCONNECT 0x82. |
+| 5.0 | `MQTT-4.12.0-5` | `mqttiumd/crates/mqttiumd/src/codec.rs:decode_for` | Not offered: the broker never sends AUTH, a CONNECT with an Authentication Method is refused with CONNACK 0x8C, and an AUTH packet from a client is answered with DISCONNECT 0x82. |
+| 5.0 | `MQTT-4.12.1-2` | `mqttiumd/crates/mqttiumd/src/codec.rs:decode_for` | Not offered: the broker never sends AUTH, a CONNECT with an Authentication Method is refused with CONNACK 0x8C, and an AUTH packet from a client is answered with DISCONNECT 0x82. |
 
 ### publish-properties (5)
 
@@ -123,18 +117,18 @@ The broker deliberately rejects or does not offer the feature today. The note sa
 
 | MQTT | Statement | Code | Note |
 | - | - | - | - |
-| 5.0 | `MQTT-4.8.2-3` | `mqttiumd/crates/mqttiumd-core/src/owner/pubsub.rs:subscription_changes` | Not offered: CONNACK announces Shared Subscription Available = 0 and a `$share/` filter is answered with SUBACK 0x9E, so no shared subscription exists. |
-| 5.0 | `MQTT-4.8.2-4` | `mqttiumd/crates/mqttiumd-core/src/owner/pubsub.rs:subscription_changes` | Not offered: CONNACK announces Shared Subscription Available = 0 and a `$share/` filter is answered with SUBACK 0x9E, so no shared subscription exists. |
-| 5.0 | `MQTT-4.8.2-5` | `mqttiumd/crates/mqttiumd-core/src/owner/pubsub.rs:subscription_changes` | Not offered: CONNACK announces Shared Subscription Available = 0 and a `$share/` filter is answered with SUBACK 0x9E, so no shared subscription exists. |
-| 5.0 | `MQTT-4.8.2-6` | `mqttiumd/crates/mqttiumd-core/src/owner/pubsub.rs:subscription_changes` | Not offered: CONNACK announces Shared Subscription Available = 0 and a `$share/` filter is answered with SUBACK 0x9E, so no shared subscription exists. |
+| 5.0 | `MQTT-4.8.2-3` | `mqttiumd/crates/mqttiumd/src/codec.rs:subscribe`<br>`mqttiumd/crates/mqttiumd-core/src/owner/pubsub.rs:subscription_changes` | Not offered: CONNACK announces Shared Subscription Available = 0 and a SUBSCRIBE with a `$share/` filter is a Protocol Error, answered with DISCONNECT 0x9E and closed (SUBACK 0x9E before 81acd13), so no shared subscription exists. |
+| 5.0 | `MQTT-4.8.2-4` | `mqttiumd/crates/mqttiumd/src/codec.rs:subscribe`<br>`mqttiumd/crates/mqttiumd-core/src/owner/pubsub.rs:subscription_changes` | Not offered: CONNACK announces Shared Subscription Available = 0 and a SUBSCRIBE with a `$share/` filter is a Protocol Error, answered with DISCONNECT 0x9E and closed (SUBACK 0x9E before 81acd13), so no shared subscription exists. |
+| 5.0 | `MQTT-4.8.2-5` | `mqttiumd/crates/mqttiumd/src/codec.rs:subscribe`<br>`mqttiumd/crates/mqttiumd-core/src/owner/pubsub.rs:subscription_changes` | Not offered: CONNACK announces Shared Subscription Available = 0 and a SUBSCRIBE with a `$share/` filter is a Protocol Error, answered with DISCONNECT 0x9E and closed (SUBACK 0x9E before 81acd13), so no shared subscription exists. |
+| 5.0 | `MQTT-4.8.2-6` | `mqttiumd/crates/mqttiumd/src/codec.rs:subscribe`<br>`mqttiumd/crates/mqttiumd-core/src/owner/pubsub.rs:subscription_changes` | Not offered: CONNACK announces Shared Subscription Available = 0 and a SUBSCRIBE with a `$share/` filter is a Protocol Error, answered with DISCONNECT 0x9E and closed (SUBACK 0x9E before 81acd13), so no shared subscription exists. |
 
 ### subscription-identifiers (3)
 
 | MQTT | Statement | Code | Note |
 | - | - | - | - |
-| 5.0 | `MQTT-3.3.4-3` | `mqttiumd/crates/mqttiumd/src/codec.rs:subscribe` | Not offered: CONNACK announces Subscription Identifiers Available = 0, and a SUBSCRIBE that carries one is answered with DISCONNECT 0x83 (the specific 0xA1 is not used) and closed. |
-| 5.0 | `MQTT-3.3.4-4` | `mqttiumd/crates/mqttiumd/src/codec.rs:subscribe` | Not offered: CONNACK announces Subscription Identifiers Available = 0, and a SUBSCRIBE that carries one is answered with DISCONNECT 0x83 (the specific 0xA1 is not used) and closed. |
-| 5.0 | `MQTT-3.3.4-5` | `mqttiumd/crates/mqttiumd/src/codec.rs:subscribe` | Not offered: CONNACK announces Subscription Identifiers Available = 0, and a SUBSCRIBE that carries one is answered with DISCONNECT 0x83 (the specific 0xA1 is not used) and closed. |
+| 5.0 | `MQTT-3.3.4-3` | `mqttiumd/crates/mqttiumd/src/codec.rs:subscribe` | Not offered: CONNACK announces Subscription Identifiers Available = 0, and a SUBSCRIBE that carries one is answered with DISCONNECT 0xA1 and closed (0x83 before 81acd13). |
+| 5.0 | `MQTT-3.3.4-4` | `mqttiumd/crates/mqttiumd/src/codec.rs:subscribe` | Not offered: CONNACK announces Subscription Identifiers Available = 0, and a SUBSCRIBE that carries one is answered with DISCONNECT 0xA1 and closed (0x83 before 81acd13). |
+| 5.0 | `MQTT-3.3.4-5` | `mqttiumd/crates/mqttiumd/src/codec.rs:subscribe` | Not offered: CONNACK announces Subscription Identifiers Available = 0, and a SUBSCRIBE that carries one is answered with DISCONNECT 0xA1 and closed (0x83 before 81acd13). |
 
 ### topic-alias (2)
 

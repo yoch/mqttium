@@ -5,7 +5,7 @@
     "5.0": "docs/spec/mqtt-v5.0-statements.json",
     "3.1.1": "docs/spec/mqtt-v3.1.1-statements.json"
   },
-  "reviewed_at": "1ded4117b913e301a490311c4b198620240b9fa8",
+  "reviewed_at": "81acd13a063051c341ade8e4efe4d3a705eedeb6",
   "versions": {
     "5.0": [
       {
@@ -70,6 +70,7 @@
             "test": "expiry_overhead_counts_remaining_length_boundary_growth"
           }
         ],
+        "evidence_kind": "partial",
         "note": "A non-minimal Remaining Length is malformed and closes the connection; sent lengths are checked at the 128 and 16,384 boundaries. The same rule for a Property Length (`Cursor::variable`) is not asserted."
       },
       {
@@ -161,6 +162,7 @@
             "test": "qos2_keeps_window_and_identifier_until_pubcomp_finish_is_known"
           }
         ],
+        "evidence_kind": "direct",
         "note": "PUBACK and PUBREC are read from the socket with the identifier of their PUBLISH; PUBCOMP and the broker's own PUBREL are asserted at core level."
       },
       {
@@ -269,6 +271,7 @@
             "test": "full_capacity_refuses_a_new_name_but_clean_start_replaces_in_one_slot"
           }
         ],
+        "evidence_kind": "direct",
         "note": "Clean Start replaces a stored session by a new one with Session Present 0. The socket-level test exists in the `test-hooks` build only; the store and core tests run in both."
       },
       {
@@ -371,6 +374,7 @@
             "test": "disconnect_four_before_real_open_reply_survives_source_cleanup_and_admits_once"
           }
         ],
+        "evidence_kind": "direct",
         "note": "The stored Will is gone after DISCONNECT 0x00 and after its publication."
       },
       {
@@ -502,12 +506,22 @@
         "id": "MQTT-3.1.2-22",
         "feature": "keep-alive",
         "applies_to_server": true,
-        "status": "implemented-untested",
-        "evidence": [],
+        "status": "covered",
+        "evidence": [
+          {
+            "file": "mqttiumd/crates/mqttiumd/src/runtime_tests.rs",
+            "test": "keep_alive_expires_a_silent_peer_although_its_last_packet_is_still_held"
+          },
+          {
+            "file": "mqttiumd/crates/mqttiumd/src/runtime_tests.rs",
+            "test": "keep_alive_does_not_expire_a_peer_the_broker_keeps_hearing"
+          }
+        ],
+        "evidence_kind": "partial",
         "code": [
           "mqttiumd/crates/mqttiumd/src/runtime.rs:connections"
         ],
-        "note": "A connection without a decoded packet for more than 1.5 times its Keep Alive is closed (`keep_alive`), checked on the reactor's idle tick. No maintained test waits for it."
+        "note": "With Keep Alive 1, a peer that sent one PINGREQ and then nothing for 1.7 s is closing with the code `keep_alive` at the next check, also while the core has not taken that packet (`keep_alive_expires_a_silent_peer_although_its_last_packet_is_still_held`), and a peer heard every 0.4 s is not closed (`keep_alive_does_not_expire_a_peer_the_broker_keeps_hearing`). Any threshold between 0.4 s and 1.7 s passes both tests: the factor one and a half is read in the code (`keep_alive * 1500` ms since the last complete packet heard, in `connections`), not established by a test. That the closure is handled as a network failure, with the Will published, is not asserted there. Both tests drive MQTT 5 connections. The compatibility scenario `connect/keepalive-timeout-v4` observes a closure within 5 s of silence on a MQTT 3.1.1 socket, not timed."
       },
       {
         "id": "MQTT-3.1.2-23",
@@ -528,6 +542,7 @@
             "test": "graceful_shutdown_finishes_zero_sessions_and_preserves_persistent_state"
           }
         ],
+        "evidence_kind": "direct",
         "note": "A session with a finite or infinite interval survives its connection and a graceful stop; one with interval 0 does not."
       },
       {
@@ -629,6 +644,7 @@
             "test": "the_profile_connect_accepts_expiry_and_applies_common_limits"
           }
         ],
+        "evidence_kind": "partial",
         "note": "The broker never sends a Reason String or a User Property on any packet: every encoder writes a fixed layout. Request Problem Information is parsed and needs no further handling."
       },
       {
@@ -688,14 +704,19 @@
         "evidence": [
           {
             "file": "mqttiumd/crates/mqttiumd/src/codec.rs",
-            "test": "field_bounds_accept_the_boundary_and_refuse_one_byte_more"
+            "test": "supported_will_preserves_owned_bytes_and_redacts_debug"
           },
           {
             "file": "mqttiumd/crates/mqttiumd/src/codec.rs",
-            "test": "the_profile_connect_accepts_expiry_and_applies_common_limits"
+            "test": "a_tiny_nonzero_peer_limit_is_retained_for_the_writer"
+          },
+          {
+            "file": "mqttiumd/crates/mqttiumd/src/runtime_tests.rs",
+            "test": "capacity_blocked_publish_does_not_starve_another_clients_release_or_result"
           }
         ],
-        "note": "ClientIDs up to 1,024 bytes are accepted. The tests use a few identifiers, not the whole alphabet and every length; on the mTLS listener the ClientID must also be granted to the certificate."
+        "evidence_kind": "partial",
+        "note": "The decoder accepts the identifiers `plain` and `small`, and the runtime opens a session for `first` and for `second` and serves a QoS 2 exchange on them. That is four identifiers of five or six lower-case letters: lengths 1 and 23, digits and upper-case letters are not exercised, and no test sends such a CONNECT on a socket and reads CONNACK 0 (the runtime test checks the type of the CONNACK, not its reason). The tests cited before used identifiers outside the domain of the statement, a hyphen or 1,024 bytes (independent audit of 8e4303d, 21 November 2026). On the mTLS listener the ClientID must also be granted to the certificate."
       },
       {
         "id": "MQTT-3.1.3-6",
@@ -865,6 +886,7 @@
             "test": "a_publication_is_delivered_without_waiting_for_a_timer"
           }
         ],
+        "evidence_kind": "direct",
         "note": "An accepted CONNECT is answered with CONNACK reason 0x00, on the runtime and on the real executable."
       },
       {
@@ -1009,6 +1031,7 @@
             "test": "a_validated_unsupported_connect_flushes_its_bounded_failure_before_close"
           }
         ],
+        "evidence_kind": "partial",
         "note": "After a refusing CONNACK the connection is gone."
       },
       {
@@ -1446,6 +1469,7 @@
             "test": "offline_expiry_removes_pending_copies"
           }
         ],
+        "evidence_kind": "direct",
         "note": "An expired copy is disposed before its first byte, on the write path and in the store."
       },
       {
@@ -1672,7 +1696,7 @@
         "code": [
           "mqttiumd/crates/mqttiumd/src/codec.rs:subscribe"
         ],
-        "note": "Not offered: CONNACK announces Subscription Identifiers Available = 0, and a SUBSCRIBE that carries one is answered with DISCONNECT 0x83 (the specific 0xA1 is not used) and closed."
+        "note": "Not offered: CONNACK announces Subscription Identifiers Available = 0, and a SUBSCRIBE that carries one is answered with DISCONNECT 0xA1 and closed (0x83 before 81acd13)."
       },
       {
         "id": "MQTT-3.3.4-4",
@@ -1683,7 +1707,7 @@
         "code": [
           "mqttiumd/crates/mqttiumd/src/codec.rs:subscribe"
         ],
-        "note": "Not offered: CONNACK announces Subscription Identifiers Available = 0, and a SUBSCRIBE that carries one is answered with DISCONNECT 0x83 (the specific 0xA1 is not used) and closed."
+        "note": "Not offered: CONNACK announces Subscription Identifiers Available = 0, and a SUBSCRIBE that carries one is answered with DISCONNECT 0xA1 and closed (0x83 before 81acd13)."
       },
       {
         "id": "MQTT-3.3.4-5",
@@ -1694,7 +1718,7 @@
         "code": [
           "mqttiumd/crates/mqttiumd/src/codec.rs:subscribe"
         ],
-        "note": "Not offered: CONNACK announces Subscription Identifiers Available = 0, and a SUBSCRIBE that carries one is answered with DISCONNECT 0x83 (the specific 0xA1 is not used) and closed."
+        "note": "Not offered: CONNACK announces Subscription Identifiers Available = 0, and a SUBSCRIBE that carries one is answered with DISCONNECT 0xA1 and closed (0x83 before 81acd13)."
       },
       {
         "id": "MQTT-3.3.4-6",
@@ -1990,12 +2014,18 @@
         "id": "MQTT-3.8.3-5",
         "feature": "subscription-options",
         "applies_to_server": true,
-        "status": "open",
-        "evidence": [],
+        "status": "covered",
+        "evidence": [
+          {
+            "file": "mqttiumd/crates/mqttiumd/src/codec.rs",
+            "test": "valid_subscription_options_reach_the_core_without_loss"
+          }
+        ],
+        "evidence_kind": "direct",
         "code": [
           "mqttiumd/crates/mqttiumd/src/codec.rs:subscribe"
         ],
-        "note": "Looks non-conformant in its classification: reserved option bits are refused and the connection is closed, but as a Protocol Error (DISCONNECT 0x82), not as a Malformed Packet (0x81); `valid_subscription_options_reach_the_core_without_loss` pins the Protocol kind."
+        "note": "The independent audit of 8e4303d, 21 November 2026, observed DISCONNECT 0x82 (Protocol Error) for reserved option bits. Since 81acd13 the decoder treats them as a Malformed Packet: the test requires the kind Malformed and the reason 0x81 for the bits 0x40, 0x80 and 0xC0 of a MQTT 5 SUBSCRIBE. That the connection is then closed after DISCONNECT 0x81 is not asserted by a Rust test; the compatibility scenario `subscribe/reserved-option-bits-v5` observes it on a socket."
       },
       {
         "id": "MQTT-3.8.4-1",
@@ -2061,6 +2091,7 @@
             "test": "product_pubsub_filter_replacement_and_removal_preserve_preexisting_work"
           }
         ],
+        "evidence_kind": "direct",
         "note": "A repeated filter with Retain Handling 0 is replayed (store level), and a delivery already owed survives the replacement (core level)."
       },
       {
@@ -2078,6 +2109,7 @@
             "test": "thirty_two_topics_and_ordered_options"
           }
         ],
+        "evidence_kind": "direct",
         "note": "Several filters in one SUBSCRIBE are applied in order and answered by one SUBACK."
       },
       {
@@ -2168,6 +2200,7 @@
             "test": "duplicate_filter_last_options_win_only_after_known_commit_and_before_suback"
           }
         ],
+        "evidence_kind": "direct",
         "note": "Core level: the results [2, 0] follow the order of the two filters."
       },
       {
@@ -2189,7 +2222,8 @@
             "test": "product_pubsub_subscription_capacity_refusal_is_atomic_and_has_negative_suback"
           }
         ],
-        "note": "The broker produces a granted QoS, 0x87, 0x8F, 0x97 or 0x9E; the QoS and 0x97 results are asserted, the other three are not."
+        "evidence_kind": "direct",
+        "note": "The broker produces a granted QoS, 0x87, 0x8F or 0x97; the QoS and 0x97 results are asserted, the other two are not. The core's 0x9E for a `$share/` filter no longer reaches a MQTT 5 SUBACK since 81acd13: such a SUBSCRIBE is a Protocol Error."
       },
       {
         "id": "MQTT-3.10.1-1",
@@ -2282,6 +2316,7 @@
             "test": "product_pubsub_filter_replacement_and_removal_preserve_preexisting_work"
           }
         ],
+        "evidence_kind": "direct",
         "note": "Core level: each UNSUBSCRIBE produces an UNSUBACK."
       },
       {
@@ -2394,6 +2429,7 @@
             "test": "known_connect_pipeline_cannot_send_disconnect_before_core_connack"
           }
         ],
+        "evidence_kind": "direct",
         "note": "A refusal of a packet pipelined behind CONNECT waits: the client reads CONNACK 0x00, then DISCONNECT."
       },
       {
@@ -2542,7 +2578,7 @@
         "code": [
           "mqttiumd/crates/mqttiumd/src/codec.rs:decode_for"
         ],
-        "note": "Not offered: the broker never sends AUTH, a CONNECT with an Authentication Method is refused with CONNACK 0x83, and an AUTH packet from a client is answered with DISCONNECT 0x82."
+        "note": "Not offered: the broker never sends AUTH, a CONNECT with an Authentication Method is refused with CONNACK 0x8C, and an AUTH packet from a client is answered with DISCONNECT 0x82."
       },
       {
         "id": "MQTT-3.15.2-2",
@@ -2553,7 +2589,7 @@
         "code": [
           "mqttiumd/crates/mqttiumd/src/codec.rs:decode_for"
         ],
-        "note": "Not offered: the broker never sends AUTH, a CONNECT with an Authentication Method is refused with CONNACK 0x83, and an AUTH packet from a client is answered with DISCONNECT 0x82."
+        "note": "Not offered: the broker never sends AUTH, a CONNECT with an Authentication Method is refused with CONNACK 0x8C, and an AUTH packet from a client is answered with DISCONNECT 0x82."
       },
       {
         "id": "MQTT-3.15.2-3",
@@ -2564,7 +2600,7 @@
         "code": [
           "mqttiumd/crates/mqttiumd/src/codec.rs:decode_for"
         ],
-        "note": "Not offered: the broker never sends AUTH, a CONNECT with an Authentication Method is refused with CONNACK 0x83, and an AUTH packet from a client is answered with DISCONNECT 0x82."
+        "note": "Not offered: the broker never sends AUTH, a CONNECT with an Authentication Method is refused with CONNACK 0x8C, and an AUTH packet from a client is answered with DISCONNECT 0x82."
       },
       {
         "id": "MQTT-4.1.0-1",
@@ -2795,18 +2831,13 @@
         "id": "MQTT-4.3.3-7",
         "feature": "message-expiry",
         "applies_to_server": true,
-        "status": "covered",
-        "evidence": [
-          {
-            "file": "mqttiumd/crates/mqttiumd/src/net.rs",
-            "test": "a_known_started_exchange_replays_with_zero_after_expiry_or_clock_uncertainty"
-          },
-          {
-            "file": "mqttiumd/crates/mqttiumd-core/src/owner/pubsub.rs",
-            "test": "message_expiry_started_claim_replays_past_ttl_and_old_facts_cannot_hit_reused_pi"
-          }
+        "status": "implemented-untested",
+        "evidence": [],
+        "code": [
+          "mqttiumd/crates/mqttiumd-core/src/owner/pubsub.rs:expiry_allows_send",
+          "mqttiumd/crates/mqttiumd/src/net.rs:prepare_expiry"
         ],
-        "note": "A delivery known to have started is replayed past its lifetime, with a remaining interval of 0."
+        "note": "A delivery whose PUBLISH is known to have started, or that awaits PUBCOMP, is sent again whatever its lifetime (`expiry_allows_send`), and the writer gives a started frame a remaining interval of 0 instead of withholding it (`prepare_expiry`). No test exercises this for an outgoing QoS 2 delivery, the sender the statement is about: `a_known_started_exchange_replays_with_zero_after_expiry_or_clock_uncertainty` writes a QoS 0 frame (`encode_qos0_expiring`) and `message_expiry_started_claim_replays_past_ttl_and_old_facts_cannot_hit_reused_pi` replays a QoS 1 delivery (independent audit of 8e4303d, 21 November 2026); no test with an outgoing QoS 2 delivery that carries an expiry was found."
       },
       {
         "id": "MQTT-4.3.3-8",
@@ -3011,7 +3042,7 @@
           "mqttiumd/crates/mqttiumd-core/src/owner/pubsub.rs:plan_work",
           "mqttiumd/crates/mqttiumd-core/src/owner.rs:plan_admission"
         ],
-        "note": "Not established. Core tests show that an earlier outgoing claim is not overtaken by a later one, but nothing read or tested shows that deliveries keep the publisher's order when the store result of an earlier admission is late or unknown; no test compares the order a subscriber reads with the order a publisher sent at QoS 1 or 2."
+        "note": "Not established. Core tests show that an earlier outgoing claim is not overtaken by a later one, but nothing read or tested shows that deliveries keep the publisher's order when the store result of an earlier admission is late or unknown; no test compares the order a subscriber reads with the order a publisher sent at QoS 1 or 2. The independent audit of 8e4303d, 21 November 2026, observed deliveries to a subscriber in the order published (A then B, and twelve messages in order across two pages after a reconnection); the compatibility scenario `publish/burst-qos0-v4` compares the order of the QoS 0 messages of a burst with the order sent (as sent, among those the broker did not shed, in every play read with the broker built from 81acd13). Neither shows the order when the store result of an earlier admission is late or unknown."
       },
       {
         "id": "MQTT-4.6.0-6",
@@ -3023,7 +3054,7 @@
           "mqttiumd/crates/mqttiumd-core/src/owner/pubsub.rs:plan_work",
           "mqttiumd/crates/mqttiumd-core/src/owner.rs:plan_admission"
         ],
-        "note": "Not established. Every topic takes one path and there is no unordered mode, but whether that path is ordered is the open point of MQTT-4.6.0-5."
+        "note": "Not established. Every topic takes one path and there is no unordered mode, but whether that path is ordered is the open point of MQTT-4.6.0-5. The observations are in the note of MQTT-4.6.0-5."
       },
       {
         "id": "MQTT-4.7.0-1",
@@ -3170,9 +3201,10 @@
         "status": "profile-refused",
         "evidence": [],
         "code": [
+          "mqttiumd/crates/mqttiumd/src/codec.rs:subscribe",
           "mqttiumd/crates/mqttiumd-core/src/owner/pubsub.rs:subscription_changes"
         ],
-        "note": "Not offered: CONNACK announces Shared Subscription Available = 0 and a `$share/` filter is answered with SUBACK 0x9E, so no shared subscription exists."
+        "note": "Not offered: CONNACK announces Shared Subscription Available = 0 and a SUBSCRIBE with a `$share/` filter is a Protocol Error, answered with DISCONNECT 0x9E and closed (SUBACK 0x9E before 81acd13), so no shared subscription exists."
       },
       {
         "id": "MQTT-4.8.2-4",
@@ -3181,9 +3213,10 @@
         "status": "profile-refused",
         "evidence": [],
         "code": [
+          "mqttiumd/crates/mqttiumd/src/codec.rs:subscribe",
           "mqttiumd/crates/mqttiumd-core/src/owner/pubsub.rs:subscription_changes"
         ],
-        "note": "Not offered: CONNACK announces Shared Subscription Available = 0 and a `$share/` filter is answered with SUBACK 0x9E, so no shared subscription exists."
+        "note": "Not offered: CONNACK announces Shared Subscription Available = 0 and a SUBSCRIBE with a `$share/` filter is a Protocol Error, answered with DISCONNECT 0x9E and closed (SUBACK 0x9E before 81acd13), so no shared subscription exists."
       },
       {
         "id": "MQTT-4.8.2-5",
@@ -3192,9 +3225,10 @@
         "status": "profile-refused",
         "evidence": [],
         "code": [
+          "mqttiumd/crates/mqttiumd/src/codec.rs:subscribe",
           "mqttiumd/crates/mqttiumd-core/src/owner/pubsub.rs:subscription_changes"
         ],
-        "note": "Not offered: CONNACK announces Shared Subscription Available = 0 and a `$share/` filter is answered with SUBACK 0x9E, so no shared subscription exists."
+        "note": "Not offered: CONNACK announces Shared Subscription Available = 0 and a SUBSCRIBE with a `$share/` filter is a Protocol Error, answered with DISCONNECT 0x9E and closed (SUBACK 0x9E before 81acd13), so no shared subscription exists."
       },
       {
         "id": "MQTT-4.8.2-6",
@@ -3203,9 +3237,10 @@
         "status": "profile-refused",
         "evidence": [],
         "code": [
+          "mqttiumd/crates/mqttiumd/src/codec.rs:subscribe",
           "mqttiumd/crates/mqttiumd-core/src/owner/pubsub.rs:subscription_changes"
         ],
-        "note": "Not offered: CONNACK announces Shared Subscription Available = 0 and a `$share/` filter is answered with SUBACK 0x9E, so no shared subscription exists."
+        "note": "Not offered: CONNACK announces Shared Subscription Available = 0 and a SUBSCRIBE with a `$share/` filter is a Protocol Error, answered with DISCONNECT 0x9E and closed (SUBACK 0x9E before 81acd13), so no shared subscription exists."
       },
       {
         "id": "MQTT-4.9.0-1",
@@ -3268,7 +3303,7 @@
           "mqttiumd/crates/mqttiumd/src/codec.rs:properties",
           "mqttiumd/crates/mqttiumd/src/codec.rs:client_connect"
         ],
-        "note": "A CONNECT with an Authentication Method is refused with CONNACK 0x83 (not 0x8C) and closed. No test sends one."
+        "note": "A CONNECT with an Authentication Method is refused with CONNACK 0x8C and closed (0x83 before 81acd13). `unsupported_features_are_refused_with_their_own_reason` asserts the reason the decoder gives; no Rust test asserts the closure, which the compatibility scenario `connect/authentication-method-v5` observes on a socket."
       },
       {
         "id": "MQTT-4.12.0-2",
@@ -3279,7 +3314,7 @@
         "code": [
           "mqttiumd/crates/mqttiumd/src/codec.rs:decode_for"
         ],
-        "note": "Not offered: the broker never sends AUTH, a CONNECT with an Authentication Method is refused with CONNACK 0x83, and an AUTH packet from a client is answered with DISCONNECT 0x82."
+        "note": "Not offered: the broker never sends AUTH, a CONNECT with an Authentication Method is refused with CONNACK 0x8C, and an AUTH packet from a client is answered with DISCONNECT 0x82."
       },
       {
         "id": "MQTT-4.12.0-3",
@@ -3298,7 +3333,7 @@
         "code": [
           "mqttiumd/crates/mqttiumd/src/codec.rs:decode_for"
         ],
-        "note": "Not offered: the broker never sends AUTH, a CONNECT with an Authentication Method is refused with CONNACK 0x83, and an AUTH packet from a client is answered with DISCONNECT 0x82."
+        "note": "Not offered: the broker never sends AUTH, a CONNECT with an Authentication Method is refused with CONNACK 0x8C, and an AUTH packet from a client is answered with DISCONNECT 0x82."
       },
       {
         "id": "MQTT-4.12.0-5",
@@ -3309,7 +3344,7 @@
         "code": [
           "mqttiumd/crates/mqttiumd/src/codec.rs:decode_for"
         ],
-        "note": "Not offered: the broker never sends AUTH, a CONNECT with an Authentication Method is refused with CONNACK 0x83, and an AUTH packet from a client is answered with DISCONNECT 0x82."
+        "note": "Not offered: the broker never sends AUTH, a CONNECT with an Authentication Method is refused with CONNACK 0x8C, and an AUTH packet from a client is answered with DISCONNECT 0x82."
       },
       {
         "id": "MQTT-4.12.0-6",
@@ -3322,6 +3357,7 @@
             "test": "outbound_frames_are_mqtt5_and_advertise_only_implemented_features"
           }
         ],
+        "evidence_kind": "partial",
         "note": "The CONNACK is a fixed layout without an Authentication Method, and the broker has no encoder for AUTH."
       },
       {
@@ -3349,7 +3385,7 @@
         "code": [
           "mqttiumd/crates/mqttiumd/src/codec.rs:decode_for"
         ],
-        "note": "Not offered: the broker never sends AUTH, a CONNECT with an Authentication Method is refused with CONNACK 0x83, and an AUTH packet from a client is answered with DISCONNECT 0x82."
+        "note": "Not offered: the broker never sends AUTH, a CONNECT with an Authentication Method is refused with CONNACK 0x8C, and an AUTH packet from a client is answered with DISCONNECT 0x82."
       },
       {
         "id": "MQTT-4.13.1-1",
@@ -3682,6 +3718,7 @@
             "test": "twelve_offline_deliveries_drain_without_a_discovery_tick_per_message_or_page"
           }
         ],
+        "evidence_kind": "direct",
         "note": "CleanSession 0 decodes to a session that never expires; resumption and storage are asserted on the runtime. The deciding code is shared by both protocol versions; the test drives it with an MQTT 5 connection or below the wire."
       },
       {
@@ -3733,6 +3770,7 @@
             "test": "normal_disconnect_during_real_will_open_result_drain_cancels_exact_intention"
           }
         ],
+        "evidence_kind": "partial",
         "note": "The Will is admitted when the connection is taken over and cancelled by DISCONNECT. The deciding code is shared by both protocol versions; the test drives it with an MQTT 5 connection or below the wire. Only a QoS 1 Will is accepted."
       },
       {
@@ -3761,6 +3799,7 @@
             "test": "disconnect_four_before_real_open_reply_survives_source_cleanup_and_admits_once"
           }
         ],
+        "evidence_kind": "partial",
         "note": "The stored Will is gone after a DISCONNECT and after its publication. The deciding code is shared by both protocol versions; the test drives it with an MQTT 5 connection or below the wire."
       },
       {
@@ -3915,12 +3954,22 @@
         "id": "MQTT-3.1.2-24",
         "feature": "keep-alive",
         "applies_to_server": true,
-        "status": "implemented-untested",
-        "evidence": [],
+        "status": "covered",
+        "evidence": [
+          {
+            "file": "mqttiumd/crates/mqttiumd/src/runtime_tests.rs",
+            "test": "keep_alive_expires_a_silent_peer_although_its_last_packet_is_still_held"
+          },
+          {
+            "file": "mqttiumd/crates/mqttiumd/src/runtime_tests.rs",
+            "test": "keep_alive_does_not_expire_a_peer_the_broker_keeps_hearing"
+          }
+        ],
+        "evidence_kind": "partial",
         "code": [
           "mqttiumd/crates/mqttiumd/src/runtime.rs:connections"
         ],
-        "note": "A connection without a decoded packet for more than 1.5 times its Keep Alive is closed (`keep_alive`), checked on the reactor's idle tick. No maintained test waits for it."
+        "note": "With Keep Alive 1, a peer that sent one PINGREQ and then nothing for 1.7 s is closing with the code `keep_alive` at the next check, also while the core has not taken that packet (`keep_alive_expires_a_silent_peer_although_its_last_packet_is_still_held`), and a peer heard every 0.4 s is not closed (`keep_alive_does_not_expire_a_peer_the_broker_keeps_hearing`). Any threshold between 0.4 s and 1.7 s passes both tests: the factor one and a half is read in the code (`keep_alive * 1500` ms since the last complete packet heard, in `connections`), not established by a test. That the closure is handled as a network failure, with the Will published, is not asserted there. Both tests drive MQTT 5 connections; the check has no branch on the protocol version. The compatibility scenario `connect/keepalive-timeout-v4` observes a closure within 5 s of silence on a MQTT 3.1.1 socket, not timed."
       },
       {
         "id": "MQTT-3.1.3-1",
@@ -4248,6 +4297,7 @@
             "test": "resumed_qos2_pubrel_is_independent_of_the_reduced_publish_window"
           }
         ],
+        "evidence_kind": "partial",
         "note": "Core level: a delivery replayed after reconnection carries DUP 1. The deciding code is shared by both protocol versions; the test drives it with an MQTT 5 connection or below the wire."
       },
       {
@@ -4323,18 +4373,12 @@
         "id": "MQTT-3.3.1-7",
         "feature": "retained",
         "applies_to_server": true,
-        "status": "covered",
-        "evidence": [
-          {
-            "file": "mqttiumd/crates/mqttiumd-store-sqlite/tests/retained.rs",
-            "test": "retained_survives_without_targets_and_producer"
-          },
-          {
-            "file": "mqttiumd/crates/mqttiumd-core/src/owner.rs",
-            "test": "a_retained_qos0_occurrence_has_a_durable_command_without_an_mqtt_identifier"
-          }
+        "status": "implemented-untested",
+        "evidence": [],
+        "code": [
+          "mqttiumd/crates/mqttiumd-core/src/owner/pubsub.rs:plan_retained_qos0"
         ],
-        "note": "A QoS 0 retained publication is stored. The replacement of a previous value is asserted with QoS 1 and 2 publications, not with QoS 0."
+        "note": "A QoS 0 retained publication takes a durable command of its own (`plan_retained_qos0`, asserted by `a_retained_qos0_occurrence_has_a_durable_command_without_an_mqtt_identifier`) that replaces the retained value of its topic. No test replaces an existing retained message with a QoS 0 one that has a payload: `retained_survives_without_targets_and_producer` stores each QoS in an empty store, `retained_replacement_clear_and_replay_freeze` replaces with QoS 2 then QoS 1, and the only QoS 0 publication onto an existing retained value is the zero-length one of `collected_retained_identities_never_execute_again`, after which nothing is retained (independent audit of 8e4303d, 21 November 2026)."
       },
       {
         "id": "MQTT-3.3.1-8",
@@ -4412,6 +4456,7 @@
             "test": "legacy_publish_keeps_binary_payload_and_has_no_properties"
           }
         ],
+        "evidence_kind": "direct",
         "note": "The Topic Name is the first field of the decoded and of the written 3.1.1 PUBLISH."
       },
       {
@@ -4425,6 +4470,7 @@
             "test": "publish_restrictions_do_not_hide_invalid_fields"
           }
         ],
+        "evidence_kind": "partial",
         "note": "A PUBLISH to `a/+` is refused; the check is shared and asserted on the MQTT 5 layout."
       },
       {
@@ -4554,7 +4600,7 @@
           "mqttiumd/crates/mqttiumd/src/codec.rs:filter",
           "mqttiumd/crates/mqttiumd/src/codec.rs:subscribe"
         ],
-        "note": "Ordinary filters are answered with a SUBACK (asserted on MQTT 5 connections). Non-conformant corner: `codec::filter` applies the MQTT 5 `$share/` grammar to 3.1.1 too, so a SUBSCRIBE to `$share/x`, a valid 3.1.1 filter, is a Protocol Error and the connection is closed without a SUBACK."
+        "note": "The independent audit of 8e4303d, 21 November 2026, found a SUBSCRIBE to `$share/x`, a valid 3.1.1 filter, closed without a SUBACK. Since 81acd13 the 3.1.1 decoder hands such a filter to the core as an ordinary one (`a_share_prefixed_filter_is_an_ordinary_filter_in_3_1_1`), which refuses it in the SUBACK (0x80), and a SUBSCRIBE with more than eight filters is answered with one 0x80 per filter. Still non-conformant: a SUBSCRIBE whose Topic Filter is longer than 1,024 bytes is closed without a SUBACK (`FilterTooLarge`; observed on a socket with a 2,000-byte filter on the broker built from 81acd13). Ordinary filters are answered with a SUBACK, asserted on MQTT 5 connections."
       },
       {
         "id": "MQTT-3.8.4-2",
@@ -4616,6 +4662,7 @@
             "test": "versioned_subscription_acknowledgements_and_disconnect"
           }
         ],
+        "evidence_kind": "direct",
         "note": "One return code per filter: the granted QoS, or 0x80 for any failure."
       },
       {
@@ -4744,11 +4791,11 @@
         "status": "open",
         "evidence": [],
         "code": [
+          "mqttiumd/crates/mqttiumd/src/codec.rs:subscribe",
           "mqttiumd/crates/mqttiumd/src/codec.rs:encode_for",
-          "mqttiumd/crates/mqttiumd-core/src/owner/pubsub.rs:subscription_changes",
-          "mqttiumd/crates/mqttiumd/src/runtime.rs:try_submit"
+          "mqttiumd/crates/mqttiumd-core/src/owner/pubsub.rs:subscription_changes"
         ],
-        "note": "Ordinary filters are answered with an UNSUBACK (core test, 3.1.1 encoder test); its identifier is not compared with the request. Non-conformant corner: for a `$share/` filter the core answers 0x8F, which `encode_for` cannot express in 3.1.1, and the connection is closed without an UNSUBACK (`failure_without_wire_ack`)."
+        "note": "The independent audit of 8e4303d, 21 November 2026, found an UNSUBSCRIBE of a `$share/` filter closed without an UNSUBACK. Since 81acd13 the 3.1.1 encoder acknowledges the result 0x8F of such a filter (`an_unsubscribe_of_a_filter_that_cannot_be_subscribed_is_acknowledged_in_3_1_1`). Still non-conformant: an UNSUBSCRIBE with more than eight Topic Filters is closed without an UNSUBACK (`TooManyFilters`; observed on a socket with nine filters on the broker built from 81acd13). Ordinary filters are answered with an UNSUBACK (core test, 3.1.1 encoder test); no Rust test compares its identifier with the request."
       },
       {
         "id": "MQTT-3.10.4-5",
@@ -4875,6 +4922,7 @@
             "test": "ephemeral_sessions_return_owner_cache_and_durable_capacity"
           }
         ],
+        "evidence_kind": "partial",
         "note": "A session is never ended while its connection is attached. The deciding code is shared by both protocol versions; the test drives it with an MQTT 5 connection or below the wire."
       },
       {
@@ -4998,6 +5046,7 @@
             "test": "twelve_offline_deliveries_drain_without_a_discovery_tick_per_message_or_page"
           }
         ],
+        "evidence_kind": "partial",
         "note": "A QoS 1 publication is stored for the matching offline session and delivered at reconnection. The deciding code is shared by both protocol versions; the test drives it with an MQTT 5 connection or below the wire."
       },
       {
@@ -5022,7 +5071,7 @@
         "applies_to_server": true,
         "status": "open",
         "evidence": [],
-        "note": "Written for the Client; MQTT-4.6.0-6 extends 'the rules listed above' to a Server. No implementation found: a PUBACK leaves when the store result of its admission is applied, and no code or test states that PUBACKs keep the arrival order of their PUBLISH packets."
+        "note": "Written for the Client; MQTT-4.6.0-6 extends 'the rules listed above' to a Server. Looks non-conformant: a PUBACK leaves when the store result of its admission is applied, and no code or test states that PUBACKs keep the arrival order of their PUBLISH packets. The independent audit of 8e4303d, 21 November 2026, observed acknowledgements leaving in the order of the store results: 8 then 7 for publications received as 7 then 8. The compatibility scenario `publish/pipelined-qos1-v4` compares the order of twenty PUBACK with the order of their PUBLISH packets on one topic: as sent in every play read with the broker built from 81acd13, which does not show the order when a store result is late."
       },
       {
         "id": "MQTT-4.6.0-3",
@@ -5030,7 +5079,7 @@
         "applies_to_server": true,
         "status": "open",
         "evidence": [],
-        "note": "Written for the Client; MQTT-4.6.0-6 extends 'the rules listed above' to a Server. No implementation found: a PUBREC leaves when the store result of its admission is applied, and no code or test states that PUBRECs keep the arrival order of their PUBLISH packets."
+        "note": "Written for the Client; MQTT-4.6.0-6 extends 'the rules listed above' to a Server. Looks non-conformant: a PUBREC leaves when the store result of its admission is applied, and no code or test states that PUBRECs keep the arrival order of their PUBLISH packets. The independent audit of 8e4303d, 21 November 2026, observed acknowledgements leaving in the order of the store results: 8 then 7 for publications received as 7 then 8."
       },
       {
         "id": "MQTT-4.6.0-4",
@@ -5038,7 +5087,7 @@
         "applies_to_server": true,
         "status": "open",
         "evidence": [],
-        "note": "Written for the Client; MQTT-4.6.0-6 extends 'the rules listed above' to a Server. No implementation found: the broker's PUBREL leaves after the durable commit of its PUBREC, and no code or test states that two PUBRELs keep the order of their PUBRECs."
+        "note": "Written for the Client; MQTT-4.6.0-6 extends 'the rules listed above' to a Server. No implementation found: the broker's PUBREL leaves after the durable commit of its PUBREC, and no code or test states that two PUBRELs keep the order of their PUBRECs. The independent audit of 8e4303d, 21 November 2026, did not observe the order of PUBREL packets."
       },
       {
         "id": "MQTT-4.6.0-5",
@@ -5050,7 +5099,7 @@
           "mqttiumd/crates/mqttiumd-core/src/owner/pubsub.rs:plan_work",
           "mqttiumd/crates/mqttiumd-core/src/owner.rs:plan_admission"
         ],
-        "note": "Not established. Every topic takes one path and there is no unordered mode, but whether that path is ordered is the open point of MQTT-4.6.0-6."
+        "note": "Not established. Every topic takes one path and there is no unordered mode, but whether that path is ordered is the open point of MQTT-4.6.0-6. The observations are in the note of MQTT-4.6.0-6."
       },
       {
         "id": "MQTT-4.6.0-6",
@@ -5062,7 +5111,7 @@
           "mqttiumd/crates/mqttiumd-core/src/owner/pubsub.rs:plan_work",
           "mqttiumd/crates/mqttiumd-core/src/owner.rs:plan_admission"
         ],
-        "note": "Not established. Core tests show that an earlier outgoing claim is not overtaken by a later one, but nothing read or tested shows that deliveries keep the publisher's order when the store result of an earlier admission is late or unknown; no test compares the order a subscriber reads with the order a publisher sent at QoS 1 or 2."
+        "note": "Not established. Core tests show that an earlier outgoing claim is not overtaken by a later one, but nothing read or tested shows that deliveries keep the publisher's order when the store result of an earlier admission is late or unknown; no test compares the order a subscriber reads with the order a publisher sent at QoS 1 or 2. The independent audit of 8e4303d, 21 November 2026, observed deliveries to a subscriber in the order published (A then B, and twelve messages in order across two pages after a reconnection); the compatibility scenario `publish/burst-qos0-v4` compares the order of the QoS 0 messages of a burst with the order sent (as sent, among those the broker did not shed, in every play read with the broker built from 81acd13). Neither shows the order when the store result of an earlier admission is late or unknown."
       },
       {
         "id": "MQTT-4.7.1-1",
@@ -5148,6 +5197,7 @@
             "test": "utf8_and_client_boundaries_are_checked_before_owned_packets"
           }
         ],
+        "evidence_kind": "partial",
         "note": "U+0000 is refused in every string and in the core's filter grammar."
       },
       {
@@ -5278,6 +5328,7 @@
             "test": "fragmented_and_concatenated_packets_keep_their_boundaries"
           }
         ],
+        "evidence_kind": "direct",
         "note": "TCP, and TLS 1.3 over TCP on the secure listener. Framing is independent of segment boundaries."
       },
       {

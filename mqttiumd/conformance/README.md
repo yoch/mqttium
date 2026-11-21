@@ -35,7 +35,11 @@ It is a map of evidence, not a proof of conformance.
   note says.
 - A row was classified by reading the code and the tests at the revision
   recorded in `reviewed_at`. Code that changed since may have made a row
-  wrong without making the checker fail.
+  wrong without making the checker fail. The whole register was read at
+  `1ded4117`; at `81acd13`, the revision recorded now, only the rows that
+  an independent audit of `8e4303d` named and the rows whose note
+  describes a behaviour that changed since that commit (Keep Alive, six
+  refusals of SUBSCRIBE, UNSUBSCRIBE and CONNECT) were read again.
 - A `not-applicable` or `profile-refused` row is not a conformance claim
   either: it says why the statement asks nothing of the broker, or what the
   broker refuses instead.
@@ -119,6 +123,9 @@ the cited tests change and the row was not read again.
   `implemented-untested`.
 - The system receptions under `mqttiumd/tests/system/` are frozen
   (ADR 0044). They may be named in a note and are refused as evidence.
+- A compatibility scenario under `mqttiumd/tests/compat/` is not a test
+  function: what it observes on a socket, and the expectations it carries,
+  may be named in a note and are not cited as evidence.
 - Cite only a test that was read, and that would fail without the
   behaviour. A test whose name sounds right is not evidence.
 
