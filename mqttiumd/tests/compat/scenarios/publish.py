@@ -99,27 +99,29 @@ scenario(
 scenario(
     "publish/pipelined-qos1-v4",
     doc="""A MQTT 3.1.1 client writes twenty QoS 1 PUBLISH packets at once, before reading
-    any PUBACK: MQTT 3.1.1 has no Receive Maximum, and all twenty are acknowledged
-    (the transcript keeps whether all PUBACK came, not how many).""",
+    any PUBACK: MQTT 3.1.1 has no Receive Maximum, and all twenty are acknowledged, in
+    the order of the PUBLISH packets (the transcript keeps whether all PUBACK came and
+    whether their Packet Identifiers came as sent, not how many).""",
     steps=[
         connect("pub", "p-pipe-pub"),
         send("pub", b"".join(wire.publish("pipe/t", f"m{index}", qos=1, packet_id=index) for index in range(1, 21)),
              note="twenty QoS 1 PUBLISH on pipe/t, Packet Identifiers 1 to 20, in one write"),
-        tally("pub", 20, kind="PUBACK"),
+        tally("pub", 20, kind="PUBACK", sequence=range(1, 21)),
     ],
 )
 
 scenario(
     "publish/burst-qos0-v4",
     doc="""One hundred QoS 0 messages written at once reach an online QoS 0 subscriber;
-    the transcript keeps whether all came, not how many.""",
+    the transcript keeps whether all came and whether those that came are in the order
+    sent, not how many.""",
     steps=[
         connect("sub", "p-burst-sub"), subscribe("sub", 1, [("burst/t", 0)]),
         connect("pub", "p-burst-pub"),
         send("pub", b"".join(wire.publish("burst/t", f"m{index}") for index in range(100)),
              note="one hundred QoS 0 PUBLISH on burst/t in one write"),
         send("pub", wire.pingreq()), recv("pub"),
-        tally("sub", 100),
+        tally("sub", 100, sequence=[f"m{index}" for index in range(100)]),
     ],
 )
 

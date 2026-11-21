@@ -38,18 +38,30 @@ class Scenario:
     buckets: dict = field(default_factory=dict)
     # Keep the capabilities advertised in a MQTT 5 CONNACK (normalize.py).
     capabilities: bool = False
+    # `exact`: a closure by end of stream and one by reset differ. `any`:
+    # they compare equal, for a scenario in which the broker closes while
+    # the client is still writing, so that the kind depends on timing.
+    closure: str = "exact"
+    # What the specification requires of mqttiumd here (expectations.py).
+    expectations: tuple = ()
 
 
 REGISTRY: dict[str, Scenario] = {}
 
 
-def scenario(name, *, doc, steps, version=None, reference_config=(), buckets=None, capabilities=False) -> Scenario:
+def scenario(name, *, doc, steps, version=None, reference_config=(), buckets=None, capabilities=False,
+             closure="exact", expectations=()) -> Scenario:
     """Register a scenario.
 
     `name` is `area/what-vN`: the suffix `-v4` or `-v5` gives the protocol
     version every connection of the scenario speaks. A scenario that mixes
     versions, or speaks neither, states `version` itself.
+
+    `expectations` are built with `expectations.expectation`; each reads
+    records that the steps name with `mark`.
     """
+    if closure not in ("exact", "any"):
+        raise ValueError(f"{name}: closure is `exact` or `any`")
     area, _, rest = name.partition("/")
     if area not in AREAS or not rest:
         raise ValueError(f"{name}: unknown area")
@@ -65,12 +77,28 @@ def scenario(name, *, doc, steps, version=None, reference_config=(), buckets=Non
         for item in items:
             if isinstance(item, list):
                 flatten(item)
+            elif item["op"] == "mark":
+                # An `open` that succeeds leaves no record to name.
+                if not flat or flat[-1]["op"] == "open" or "mark" in flat[-1]:
+                    raise ValueError(f"{name}: mark `{item['name']}` does not follow a step with a record of its own")
+                if any(step.get("mark") == item["name"] for step in flat):
+                    raise ValueError(f"{name}: mark `{item['name']}` is used twice")
+                flat[-1] = {**flat[-1], "mark": item["name"]}
             else:
                 flat.append(item)
 
     flatten(steps)
+    marks = {step["mark"] for step in flat if "mark" in step}
+    expectations = tuple(expectations)
+    if len({item.name for item in expectations}) != len(expectations):
+        raise ValueError(f"{name}: two expectations have one name")
+    for item in expectations:
+        if set(item.marks) - marks:
+            raise ValueError(f"{name}: expectation `{item.name}` reads records that no step marks: "
+                             f"{sorted(set(item.marks) - marks)}")
     entry = Scenario(name=name, area=area, version=version, doc=" ".join(doc.split()), steps=tuple(flat),
-                     reference_config=tuple(reference_config), buckets=buckets or {}, capabilities=capabilities)
+                     reference_config=tuple(reference_config), buckets=buckets or {}, capabilities=capabilities,
+                     closure=closure, expectations=expectations)
     REGISTRY[name] = entry
     return entry
 
@@ -134,16 +162,25 @@ def collect(conn, *, sort=False, window=QUIET, timeout=WAIT):
     return quiet(conn, window=window, timeout=timeout, sort=sort)
 
 
-def tally(conn, expected, *, kind="PUBLISH", window=QUIET, timeout=WAIT):
-    """Count the packets of type `kind` that arrive, and record only whether
+def tally(conn, expected, *, kind="PUBLISH", sequence=None, field=None, window=QUIET, timeout=WAIT):
+    """Count the packets of type `kind` that arrive, and compare only whether
     all `expected` came (`all`), fewer (`fewer`) or more (`more`).
 
     For an exchange in which how many packets a broker lets through before
     it sheds or refuses depends on timing, and whether it sheds any does
     not. The same round trip and window as `quiet`; packets of another
     type are recorded as they are.
+
+    `sequence` is what the client sent, in order, as the counted packets
+    show it in `field` (`packet_id`, or `payload` for PUBLISH): the
+    transcript then also says whether they came `as-sent`, `permuted`, or
+    with a repeated or foreign value (`other`). The raw transcript keeps
+    every packet.
     """
-    return {"op": "tally", "conn": conn, "expected": expected, "kind": kind, "window": window, "timeout": timeout}
+    step = {"op": "tally", "conn": conn, "expected": expected, "kind": kind, "window": window, "timeout": timeout}
+    if sequence is not None:
+        step.update(sequence=list(sequence), field=field or ("payload" if kind == "PUBLISH" else "packet_id"))
+    return step
 
 
 def until_close(conn, *, timeout=WAIT):
@@ -162,6 +199,15 @@ def close(conn, *, wait_peer=0.0):
 
 def sleep(seconds):
     return {"op": "sleep", "seconds": seconds}
+
+
+def mark(name):
+    """Name the record of the step before it, for the expectations of the
+    scenario. After a composed step it names the record of its last
+    primitive step (the `recv` of `connect`, `subscribe` or `publish_ack`).
+    The name is kept in the raw transcript only: it changes nothing in
+    what is played or compared."""
+    return {"op": "mark", "name": name}
 
 
 # -- composed steps ---------------------------------------------------------

@@ -10,11 +10,18 @@ scenario whose two transcripts differ:
      "statement": "MQTT-3.1.4-2",        (required for reference-nonconformant)
      "mqttiumd": "what mqttiumd does",   (required for reference-nonconformant)
      "lot": "product lot that closes it" (profile-refused and defect, when known)
+     "incident": {"mqttiumd": ["exited"]} (only when a broker exits, hangs or panics)
      "fingerprint": "16 hex digits"}
 
 `fingerprint` names the exact pair of normalized transcripts the entry
 was written against, so that a classification never silently covers
 another difference than the one that was read.
+
+`incident` names, per broker, the incidents (`INCIDENTS`) that are part
+of the difference that was read. A broker that exits by itself, has to be
+killed or prints a panic fails the run in every class unless that exact
+incident is recorded here, and a recorded incident that does not happen
+fails it too. An incident of mqttiumd is a `defect` by definition.
 """
 from __future__ import annotations
 
@@ -31,7 +38,14 @@ CLASSES = {
     "unspecified": "both behaviours are allowed by the specification",
 }
 UNCLASSIFIED = "unclassified"
-FIELDS = {"id", "class", "difference", "statement", "mqttiumd", "lot", "fingerprint"}
+# What a broker process can do besides answering: `harness.Running.incidents`.
+INCIDENTS = {
+    "exited": "exited by itself during the scenario",
+    "killed": "did not stop when asked to and was killed",
+    "panic": "printed a panic",
+}
+BACKENDS = ("reference", "mqttiumd")
+FIELDS = {"id", "class", "difference", "statement", "mqttiumd", "lot", "incident", "fingerprint"}
 STATEMENT = re.compile(r"MQTT-\d+(\.\d+)+-\d+")
 
 # Problems that make a run fail.
@@ -40,6 +54,8 @@ STALE = "divergences.json has an entry but the transcripts are now the same"
 CHANGED = "the difference is not the one the entry was written against (fingerprint {now}, entry {then})"
 UNKNOWN = "divergences.json names a scenario that does not exist"
 BROKEN = "a broker could not be started or the harness failed"
+UNRECORDED = "{backend} {what}, and no entry of divergences.json records that incident for this scenario"
+NO_INCIDENT = "divergences.json records that {backend} {what}, and it did not"
 
 
 class DivergenceError(ValueError):
@@ -80,8 +96,24 @@ def check_divergences(data) -> dict:
             raise DivergenceError(f"{name}: `statement` cites no statement identifier such as MQTT-3.1.4-2")
         if "lot" in entry and kind not in ("profile-refused", "defect"):
             raise DivergenceError(f"{name}: `lot` is for profile-refused and defect entries")
+        if "incident" in entry:
+            check_incident(entry["incident"], name, kind)
         out[name] = entry
     return out
+
+
+def check_incident(incident, name: str, kind: str) -> None:
+    if not isinstance(incident, dict) or not incident:
+        raise DivergenceError(f"{name}: `incident` maps a broker to the kinds of its incidents")
+    for backend, kinds in incident.items():
+        if backend not in BACKENDS:
+            raise DivergenceError(f"{name}: `incident` names {backend!r}, not one of {', '.join(BACKENDS)}")
+        if (not isinstance(kinds, list) or not kinds or any(item not in INCIDENTS for item in kinds)
+                or kinds != sorted(set(kinds))):
+            raise DivergenceError(f"{name}: the incidents of {backend} are a sorted list without repetition of "
+                                  f"{', '.join(INCIDENTS)}")
+    if "mqttiumd" in incident and kind != "defect":
+        raise DivergenceError(f"{name}: an incident of mqttiumd is a defect, not {kind}")
 
 
 def load_divergences(path: Path) -> dict:
@@ -146,3 +178,25 @@ def judge(observed: dict, divergences: dict, known) -> tuple[dict, list]:
             if entry["fingerprint"] != fingerprint:
                 problems.append((name, CHANGED.format(now=fingerprint, then=entry["fingerprint"])))
     return classes, problems
+
+
+def judge_incidents(observed: dict, classes: dict, divergences: dict) -> list:
+    """The `(scenario, problem)` pairs of the broker incidents of a run.
+
+    `observed` maps each scenario played to `{backend: [kinds]}`, the
+    kinds being those of `INCIDENTS`. Whatever the class of the scenario
+    (`classes`, the first result of `judge`; a scenario that is `same` has
+    no entry), an incident that its entry does not record is a problem,
+    and so is a recorded incident that did not happen.
+    """
+    problems = []
+    for name in sorted(observed):
+        recorded = divergences.get(name, {}).get("incident", {}) if classes.get(name) in CLASSES else {}
+        for backend in BACKENDS:
+            seen, expected = observed[name].get(backend, ()), recorded.get(backend, ())
+            for kind, what in INCIDENTS.items():
+                if kind in seen and kind not in expected:
+                    problems.append((name, UNRECORDED.format(backend=backend, what=what)))
+                elif kind in expected and kind not in seen:
+                    problems.append((name, NO_INCIDENT.format(backend=backend, what=what)))
+    return problems
