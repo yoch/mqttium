@@ -64,6 +64,10 @@ const PASS_FACTS: usize = 16;
 /// Upper bound of an idle wait: connection deadlines and expiry scans are
 /// wall-clock checks without a producer to signal them.
 const IDLE_TICK: Duration = Duration::from_millis(20);
+/// How long a packet may wait for a credit that other work holds before
+/// its connection is closed with `input_capacity`: as long as the budget
+/// of a partial packet.
+const CAPACITY_WAIT: Duration = Duration::from_secs(5);
 /// A busy reactor reports its suppressed observations at this interval.
 const COUNTERS_INTERVAL: Duration = Duration::from_secs(1);
 const MESSAGE_EXPIRY_RETRIES: u8 = 3;
@@ -200,6 +204,11 @@ struct Peer {
     /// being opened, or a business packet the lane has no place for. The
     /// packets behind it stay with the transport, in order.
     held_packet: Option<(u8, Vec<u8>, net::FrameObservation)>,
+    /// Since when a packet of this connection waits for a credit that
+    /// other work holds. The results of the store return such credits
+    /// within milliseconds; a wait that outlasts [`CAPACITY_WAIT`] is not
+    /// pressure any more and ends the connection.
+    capacity_wait: Option<Instant>,
     pending: bool,
     keep_alive: u16,
     max_packet: usize,
@@ -720,6 +729,7 @@ impl Runtime<'_> {
                 disconnect_expiry: None,
                 close_observed_at: None,
                 held_packet: None,
+                capacity_wait: None,
                 pending: false,
                 keep_alive: 0,
                 max_packet: 268435455,
@@ -1681,6 +1691,7 @@ impl Runtime<'_> {
                 });
             let previous_lifecycle = self.owner.lifecycle_dispatch().map(|(op, _)| op);
             let mut applied = false;
+            let business = business_connection(&input);
             match self.owner.step(
                 input,
                 TurnGrant {
@@ -1690,6 +1701,9 @@ impl Runtime<'_> {
                 StepOutcome::Applied { .. } => {
                     applied = true;
                     self.progress = self.progress.wrapping_add(1);
+                    if let Some(peer) = business.and_then(|key| self.peers.get_mut(&key)) {
+                        peer.capacity_wait = None;
+                    }
                     if let Some(connection) = opening
                         && let Some((operation, _)) = self.owner.lifecycle_dispatch()
                         && previous_lifecycle != Some(operation)
@@ -1763,6 +1777,22 @@ impl Runtime<'_> {
                                 && need.wake == WakeCondition::EffectAccepted =>
                         {
                             self.effects_awaited = true;
+                            self.deferred_inputs.push_back(packet)
+                        }
+                        // A credit that an admission or an exchange in
+                        // flight holds: the result of the store that ends
+                        // it returns the credit and takes the deferred
+                        // packets up again. The wait is bounded per
+                        // connection (`CAPACITY_WAIT`). Only a business
+                        // packet waits: nothing of its connection passes
+                        // it, so no order changes.
+                        packet @ Input::Packet { .. }
+                            if need.wake == WakeCondition::ResourceReleased
+                                && business.is_some() =>
+                        {
+                            if let Some(peer) = business.and_then(|key| self.peers.get_mut(&key)) {
+                                peer.capacity_wait.get_or_insert_with(Instant::now);
+                            }
                             self.deferred_inputs.push_back(packet)
                         }
                         Input::Packet { connection, .. } => {
@@ -3357,6 +3387,11 @@ impl Runtime<'_> {
                     && p.created.elapsed() > Duration::from_secs(3)
                 {
                     Some("connect_deadline")
+                } else if p
+                    .capacity_wait
+                    .is_some_and(|since| since.elapsed() > CAPACITY_WAIT)
+                {
+                    Some("input_capacity")
                 } else if p.keep_alive != 0
                     // The clock runs from the last complete packet the
                     // transport received, taken by the core or not: a peer

@@ -79,6 +79,18 @@ that connection passes it: an acknowledgement behind a publication of
 its own connection waits with it. Holding a packet is not progress, so a
 runtime with nothing else to do still rests.
 
+**A packet that finds a credit lent waits for it.** The core lends an
+exchange credit and the bytes of a payload to every admission in flight
+and asks to be called again when one is released. The runtime used to
+close the connection of such a packet with `input_capacity`; it now
+keeps the packet with the deferred ones, and the result of the store
+that returns a credit takes them up again. Only a business packet waits
+this way, so nothing of its connection passes it. The wait has a bound,
+because a credit can also be held by an exchange that a client never
+finishes: a connection whose packet has waited five seconds for a credit
+is closed with `input_capacity`. (Added on 21 November 2026, after the
+acceptance of this record, on the measurement below.)
+
 **The budgets sized for sixteen connections grow with the limit.** The
 effect box, the ordinary input lane, the outgoing identifier bindings,
 the timers and the terminal inputs are multiplied for every further
@@ -139,6 +151,13 @@ be told what was written, and that is a fault, not pressure.
   messages per second; QoS 1: about 1,050 against 700 to 1,100): the
   rules cost no throughput there. They were not measured on a quiet
   machine.
+- At 3,000 QoS 1 publications per second offered to 64 connections,
+  beyond what the store commits, 20 connections were closed for want of
+  an exchange credit in each of two runs on a quiet machine. With the
+  wait, none is closed in two runs: every publication is submitted, and
+  the excess is refused in its PUBACK (0x97, 44 to 48 % of them). The
+  test `a_publication_waits_for_the_exchange_credit_of_an_admission_in_flight`
+  states the rule with one credit and three publications.
 - A peer that sends faster than the broker serves it now waits. QoS 0
   publications towards a saturated subscriber are still dropped and
   counted; this record changes nothing for output.
