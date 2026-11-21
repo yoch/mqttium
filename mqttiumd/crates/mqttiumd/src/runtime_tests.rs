@@ -1329,6 +1329,113 @@ fn a_publication_waits_for_the_exchange_credit_of_an_admission_in_flight() {
     });
 }
 
+/// The same wait when the write confirmation is the last fact: at QoS 1 the
+/// core returns the credit of an admission when its PUBACK is written, not
+/// when the store answers. The test holds the write receipts of the
+/// transport, lets the store answer everything it was asked and fall
+/// silent, and only then hands the receipt over: the deferred publication
+/// must be taken up by that receipt alone, with no later answer of the
+/// store to wake it. Three publications share one credit; the connection
+/// then serves a PINGREQ and a fourth publication.
+#[test]
+fn a_write_confirmation_alone_takes_up_a_publication_that_waits_for_a_credit() {
+    with_runtime(1, |runtime, _| {
+        let (generation, mut client) = connected(runtime, b"credit-by-receipt");
+        // The receipts of the transport reach the runtime only when the
+        // test forwards them.
+        let (held, lane) = std::sync::mpsc::sync_channel(net::WRITTEN_SLOTS);
+        let real = std::mem::replace(
+            &mut runtime.peers.get_mut(&generation).unwrap().io.written,
+            lane.into(),
+        );
+        let forward = |held: &std::sync::mpsc::SyncSender<net::Written>| {
+            let mut forwarded = 0;
+            while let Ok(receipt) = real.try_recv() {
+                held.send(receipt).unwrap();
+                forwarded += 1;
+            }
+            forwarded
+        };
+        let waiting = |runtime: &Runtime<'_>| {
+            business_packets(&runtime.deferred_inputs, generation)
+                + business_packets(&runtime.inputs, generation)
+        };
+        let quiet = |runtime: &mut Runtime<'_>| {
+            // Every answer of the store is applied and it is asked nothing.
+            for _ in 0..200 {
+                pump(runtime);
+                thread::sleep(Duration::from_millis(1));
+            }
+            assert!(
+                runtime.inflight.is_empty(),
+                "the store is still asked something"
+            );
+        };
+        for id in 1..=3u8 {
+            runtime
+                .packet(generation, 0x32, vec![0, 1, b't', 0, id, 0, b'v'])
+                .unwrap();
+        }
+        for id in 1..=3u8 {
+            // The PUBACK is on the wire; its receipt is still held. Two
+            // seconds are far more than a turn needs and well within the
+            // bound of the wait for a credit.
+            let deadline = Instant::now() + Duration::from_secs(2);
+            let mut first = [0u8; 1];
+            client
+                .set_read_timeout(Some(Duration::from_millis(2)))
+                .unwrap();
+            while client.peek(&mut first).is_err() {
+                assert!(
+                    Instant::now() < deadline,
+                    "publication {id} was not taken up once the credit was returned: \
+                     deferred={} closing={:?}",
+                    business_packets(&runtime.deferred_inputs, generation),
+                    runtime.peers.get(&generation).and_then(|peer| peer.closing)
+                );
+                pump(runtime);
+            }
+            client
+                .set_read_timeout(Some(Duration::from_secs(1)))
+                .unwrap();
+            let (kind, body) = read_frame(&mut client);
+            assert_eq!((kind, &body[..2]), (0x40, &[0, id][..]));
+            quiet(runtime);
+            assert_eq!(
+                waiting(runtime),
+                usize::from(3 - id),
+                "publication {id} still holds the credit until its PUBACK is confirmed"
+            );
+            // The receipt alone: no answer of the store follows it.
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while forward(&held) == 0 {
+                assert!(
+                    Instant::now() < deadline,
+                    "no write receipt for PUBACK {id}"
+                );
+                thread::sleep(Duration::from_millis(1));
+            }
+        }
+        assert!(runtime.peers[&generation].closing.is_none());
+        // The connection is usable: a control packet and a new publication.
+        runtime.packet(generation, 0xc0, vec![]).unwrap();
+        loop {
+            forward(&held);
+            let (kind, _) = served_frame(runtime, &mut client);
+            if kind == 0xd0 {
+                break;
+            }
+        }
+        runtime
+            .packet(generation, 0x32, vec![0, 1, b't', 0, 4, 0, b'v'])
+            .unwrap();
+        forward(&held);
+        let (kind, body) = served_frame(runtime, &mut client);
+        assert_eq!((kind, &body[..2]), (0x40, &[0, 4][..]));
+        assert!(runtime.peers[&generation].closing.is_none());
+    });
+}
+
 /// The one-pass bindings are what a lookup per cached session answered,
 /// for attached and detached sessions alike.
 #[test]
