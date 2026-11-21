@@ -3436,12 +3436,15 @@ impl Runtime<'_> {
                 } else if p.keep_alive != 0
                     // The clock runs from the last complete packet the
                     // transport received, taken by the core or not: a peer
-                    // the broker keeps hearing is not silent, and a packet
-                    // the broker holds does not stop the clock.
+                    // the broker keeps hearing is not silent, a packet the
+                    // broker holds does not stop the clock, and taking an
+                    // old packet does not restart it. The time the core
+                    // took a packet stands in only for a transport that
+                    // has reported no reception.
                     && p
                         .io
                         .last_heard()
-                        .map_or(p.last_packet, |heard| heard.max(p.last_packet))
+                        .unwrap_or(p.last_packet)
                         .elapsed()
                         > Duration::from_millis(u64::from(p.keep_alive) * 1500)
                 {
