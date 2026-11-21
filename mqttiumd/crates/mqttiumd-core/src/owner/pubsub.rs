@@ -7277,4 +7277,86 @@ mod tests {
             assert_eq!(names(&sent), ["EmitPublish"]);
         }
     }
+    /// The broker sends PUBREL in the order in which it received the
+    /// PUBRECs (MQTT-4.6.0-4, which MQTT-4.6.0-6 of 3.1.1 puts on a server
+    /// for its deliveries), whenever the durable preparations of those
+    /// PUBRELs are known. Here two PUBRECs arrive in order and the store
+    /// answers their preparations in reverse: the PUBREL of the second
+    /// waits for that of the first (counter-audit of bbe1453).
+    #[test]
+    fn pubrel_leaves_in_the_order_of_the_pubrecs_whatever_the_order_of_the_results() {
+        let mut owner = world();
+        let key = ConnectionKey {
+            session: TARGET,
+            generation: CONNECTION,
+        };
+        let mut pids = Vec::new();
+        for index in 0..2 {
+            queued(&mut owner, index);
+            owner.pubsub.deliveries.as_mut_slice()[index as usize].qos = Qos::ExactlyOnce;
+            let claim = apply(&mut owner, Input::WorkAvailable { session: TARGET });
+            let (id, Effect::Persist { command }) = &claim[0] else {
+                panic!("claim")
+            };
+            let publish = known(&mut owner, *id, command);
+            let Effect::EmitPublish { packet_id, .. } = publish[0].1 else {
+                panic!("publish")
+            };
+            pids.push(packet_id);
+        }
+        let mut preparations = Vec::new();
+        for pid in &pids {
+            let target = owner.qos2_ack_target(key, *pid, Qos2Ack::Pubrec);
+            assert!(target.is_some());
+            let effects = apply(
+                &mut owner,
+                Input::ObservedQos2Ack {
+                    connection: key,
+                    kind: Qos2Ack::Pubrec,
+                    packet_id: *pid,
+                    reason: 0,
+                    target,
+                },
+            );
+            let (id, Effect::Persist { command }) = &effects[0] else {
+                panic!("prepare")
+            };
+            assert!(matches!(command.recipe.get(), Recipe::PreparePubrel(_)));
+            preparations.push((*id, command.clone()));
+        }
+        let pubrels = |effects: &[(EffectId, Effect)]| -> Vec<u16> {
+            effects
+                .iter()
+                .filter_map(|(_, effect)| match effect {
+                    Effect::EmitFrame {
+                        frame: OutboundFrame::Pubrel { packet_id },
+                        ..
+                    } => Some(packet_id.get()),
+                    _ => None,
+                })
+                .collect()
+        };
+        // The preparation of the second PUBREL is known first.
+        let (id, command) = &preparations[1];
+        let mut seen = pubrels(&known(&mut owner, *id, command));
+        seen.extend(pubrels(&apply(
+            &mut owner,
+            Input::WorkAvailable { session: TARGET },
+        )));
+        assert_eq!(
+            seen,
+            Vec::<u16>::new(),
+            "the second PUBREL left before the first"
+        );
+        // Then that of the first: both leave, in the order of the PUBRECs.
+        let (id, command) = &preparations[0];
+        seen.extend(pubrels(&known(&mut owner, *id, command)));
+        for _ in 0..2 {
+            seen.extend(pubrels(&apply(
+                &mut owner,
+                Input::WorkAvailable { session: TARGET },
+            )));
+        }
+        assert_eq!(seen, [pids[0].get(), pids[1].get()]);
+    }
 }
