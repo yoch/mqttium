@@ -86,10 +86,10 @@ def play(scenario, binaries: dict, scratch: Path) -> dict:
             with tempfile.TemporaryDirectory(dir=scratch, prefix="compat-") as directory:
                 raw, running = harness.run_scenario(scenario, backend, binaries[backend], Path(directory))
             out[backend] = normalize.normalize(raw, scenario)
-            incident = running.incident()
-            if incident:
-                out["incidents"][backend] = {"what": incident, "log": running.log_tail,
-                                             "events": running.events_tail}
+            kinds = running.incidents()
+            if kinds:
+                out["incidents"][backend] = {"kinds": kinds, "what": "; ".join(map(running.describe, kinds)),
+                                             "log": running.log_tail, "events": running.events_tail}
         if normalize.same(out[harness.REFERENCE], out[harness.BROKER]):
             out["status"] = classify.SAME
         else:
@@ -122,6 +122,27 @@ def transcript_diff(result) -> str:
 
     return "\n".join(difflib.unified_diff(pretty(result[harness.REFERENCE]), pretty(result[harness.BROKER]),
                                           "mosquitto", "mqttiumd", lineterm="", n=2))
+
+
+def write_transcripts(directory: Path, result) -> str | None:
+    """Write the files of one played scenario under `directory`:
+    `<id>.json`, and for a pair that differs `<id>.diff`, for a broker
+    incident `<id>.<backend>.incident.txt`, for a scenario that could not
+    be played `<id>.error.txt` only. Returns the diff, or None."""
+    target = directory / (result["name"] + ".json")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if result["status"] == classify.ERROR:
+        target.with_suffix(".error.txt").write_text(result["error"])
+        return None
+    target.write_text(render_transcripts(result))
+    diff = None
+    if result["status"] == classify.DIFFERENT:
+        diff = transcript_diff(result)
+        target.with_suffix(".diff").write_text(diff + "\n")
+    for backend, incident in result["incidents"].items():
+        target.with_suffix(f".{backend}.incident.txt").write_text(
+            f"{incident['what']}\n\n-- output --\n{incident['log']}\n-- events --\n{incident['events']}\n")
+    return diff
 
 
 def summarize(rows) -> dict:
@@ -284,24 +305,17 @@ def main(argv=None) -> int:
                "difference": entry.get("difference", ""), "statement": entry.get("statement", ""),
                "mqttiumd": entry.get("mqttiumd", ""), "lot": entry.get("lot", "")}
         rows.append(row)
-        target = transcripts / (name + ".json")
-        target.parent.mkdir(parents=True, exist_ok=True)
+        diff = write_transcripts(transcripts, result)
         if result["status"] == classify.ERROR:
-            target.with_suffix(".error.txt").write_text(result["error"])
             print(f"ERROR {name}\n{result['error']}", file=sys.stderr)
             continue
-        target.write_text(render_transcripts(result))
-        if result["status"] == classify.DIFFERENT:
-            diff = transcript_diff(result)
-            target.with_suffix(".diff").write_text(diff + "\n")
-            if args.verbose:
-                print(f"--- {name} [{classes[name]}] fingerprint {result['fingerprint']}\n{diff}\n")
+        if diff is not None and args.verbose:
+            print(f"--- {name} [{classes[name]}] fingerprint {result['fingerprint']}\n{diff}\n")
         for backend, incident in result["incidents"].items():
             incidents.append({"scenario": name, "backend": backend, "what": incident["what"]})
-            target.with_suffix(f".{backend}.incident.txt").write_text(
-                f"{incident['what']}\n\n-- output --\n{incident['log']}\n-- events --\n{incident['events']}\n")
-            if classes[name] != "defect":
-                problems.append((name, f"{backend} {incident['what']}, and the scenario is not listed as a defect"))
+    problems += classify.judge_incidents(
+        {result["name"]: {backend: incident["kinds"] for backend, incident in result["incidents"].items()}
+         for result in results if result["status"] != classify.ERROR}, classes, divergences)
 
     problems.sort()
     summary = summarize(rows)

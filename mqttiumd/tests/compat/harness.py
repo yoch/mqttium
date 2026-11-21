@@ -127,19 +127,28 @@ class Running:
         self.log_tail = ""
         self.events_tail = ""
 
-    def incident(self):
-        """What a reader must be told about this process, or None.
-
-        A broker that ended before it was asked to, that had to be killed,
-        or whose output mentions a panic did not merely answer differently.
+    def incidents(self) -> list:
+        """The kinds of incident of this process, `classify.INCIDENTS`: a
+        broker that ended before it was asked to (`exited`), that had to be
+        killed (`killed`), or whose output mentions a panic (`panic`) did
+        not merely answer differently. Several kinds can hold at once.
         """
+        kinds = []
         if self.ended == "exited":
-            return f"exited by itself with status {self.returncode}"
+            kinds.append("exited")
         if self.ended == "killed":
-            return f"did not stop within {STOP_TIMEOUT:.0f} s of SIGTERM and was killed"
+            kinds.append("killed")
         if "panicked at" in self.log_tail:
-            return "its output mentions a panic"
-        return None
+            kinds.append("panic")
+        return kinds
+
+    def describe(self, kind: str) -> str:
+        """One incident of `incidents()`, for a reader."""
+        if kind == "exited":
+            return f"exited by itself with status {self.returncode}"
+        if kind == "killed":
+            return f"did not stop within {STOP_TIMEOUT:.0f} s of SIGTERM and was killed"
+        return "its output mentions a panic"
 
 
 @contextmanager
@@ -424,7 +433,7 @@ def run_scenario(scenario, backend: str, binary: Path, directory: Path):
     """Play `scenario` against a fresh broker.
 
     Returns `(transcript, running)`: the raw transcript and the ended
-    process, whose `incident()` says whether it crashed or hung.
+    process, whose `incidents()` say whether it crashed or hung.
     """
     config = scenario.reference_config if backend == REFERENCE else ()
     with broker(backend, binary, directory, config) as running:

@@ -31,6 +31,12 @@ CLASSES = {
     "unspecified": "both behaviours are allowed by the specification",
 }
 UNCLASSIFIED = "unclassified"
+# What a broker process can do besides answering: `harness.Running.incidents`.
+INCIDENTS = {
+    "exited": "exited by itself during the scenario",
+    "killed": "did not stop when asked to and was killed",
+    "panic": "printed a panic",
+}
 FIELDS = {"id", "class", "difference", "statement", "mqttiumd", "lot", "fingerprint"}
 STATEMENT = re.compile(r"MQTT-\d+(\.\d+)+-\d+")
 
@@ -40,6 +46,7 @@ STALE = "divergences.json has an entry but the transcripts are now the same"
 CHANGED = "the difference is not the one the entry was written against (fingerprint {now}, entry {then})"
 UNKNOWN = "divergences.json names a scenario that does not exist"
 BROKEN = "a broker could not be started or the harness failed"
+INCIDENT = "{backend} {what}, and the scenario is not listed as a defect"
 
 
 class DivergenceError(ValueError):
@@ -146,3 +153,18 @@ def judge(observed: dict, divergences: dict, known) -> tuple[dict, list]:
             if entry["fingerprint"] != fingerprint:
                 problems.append((name, CHANGED.format(now=fingerprint, then=entry["fingerprint"])))
     return classes, problems
+
+
+def judge_incidents(observed: dict, classes: dict, divergences: dict) -> list:
+    """The `(scenario, problem)` pairs of the broker incidents of a run.
+
+    `observed` maps a scenario to `{backend: [kinds]}`, the kinds being
+    those of `INCIDENTS`; `classes` is the first result of `judge`.
+    """
+    problems = []
+    for name in sorted(observed):
+        for backend in sorted(observed[name]):
+            for kind in observed[name][backend]:
+                if classes.get(name) != "defect":
+                    problems.append((name, INCIDENT.format(backend=backend, what=INCIDENTS[kind])))
+    return problems
