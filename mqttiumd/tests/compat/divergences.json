@@ -1,13 +1,5 @@
 [
   {
-    "id": "connect/authentication-method-v5",
-    "class": "defect",
-    "difference": "Both refuse the CONNECT and close; Mosquitto with CONNACK 0x8C (Bad authentication method), mqttiumd with CONNACK 0x83 (Implementation specific error).",
-    "statement": "MQTT-4.12.0-1 allows 0x8C or 0x87 here",
-    "lot": "MQTT 5 error reporting: send CONNACK or DISCONNECT with the Reason Code that names the cause before closing",
-    "fingerprint": "e62bb53d0e8ee14b"
-  },
-  {
     "id": "connect/connack-capabilities-v5",
     "class": "profile-refused",
     "difference": "Mosquitto announces Receive Maximum 20 and Topic Alias Maximum 10 and leaves every other capability at its default; mqttiumd announces Receive Maximum 8, Maximum Packet Size 65 536, Topic Alias Maximum 0, and shared subscriptions and Subscription Identifiers not available.",
@@ -122,7 +114,7 @@
   {
     "id": "publish/burst-qos0-v4",
     "class": "profile-refused",
-    "difference": "Mosquitto delivers all one hundred QoS 0 messages written at once to an online subscriber; mqttiumd delivers fewer (about thirty) and drops the others silently.",
+    "difference": "Mosquitto delivers all one hundred QoS 0 messages written at once to an online subscriber; mqttiumd delivers fewer (between 8 and 46 in the runs read), in the order sent, and drops the others silently.",
     "lot": "Runtime limits of the bounded preview (ADR 0044), to be raised to Mosquitto's defaults or made configurable: the bounded volatile path of QoS 0 messages (8 outgoing messages per connection, 32 writer slots)",
     "fingerprint": "737eee3aa9a2785b"
   },
@@ -216,16 +208,18 @@
   {
     "id": "subscribe/shared-subscription-v5",
     "class": "profile-refused",
-    "difference": "Mosquitto grants `$share/group/shared/t` and delivers to it; mqttiumd answers SUBACK 0x9E (Shared Subscriptions not supported), as its CONNACK announces, and delivers to the plain subscription only.",
+    "difference": "Mosquitto grants `$share/group/shared/t` and delivers to it; mqttiumd, whose CONNACK announces Shared Subscription Available 0, answers the SUBSCRIBE with DISCONNECT 0x9E (Shared Subscriptions not supported) and closes; the plain subscription of the other client is served by both.",
+    "statement": "MQTT-4.13.1-1, with section 3.2.2.3.13: how a broker that announced the feature as not available refuses it",
     "lot": "Shared subscriptions (CMP-002)",
-    "fingerprint": "7a4ed1e157ca786f"
+    "fingerprint": "123224fc7a862456"
   },
   {
     "id": "subscribe/subscription-identifier-v5",
     "class": "profile-refused",
-    "difference": "Mosquitto accepts the Subscription Identifier and returns it in the PUBLISH; mqttiumd, whose CONNACK announces them not available, answers the SUBSCRIBE with DISCONNECT 0x83 (the code that names the cause is 0xA1) and closes.",
+    "difference": "Mosquitto accepts the Subscription Identifier and returns it in the PUBLISH; mqttiumd, whose CONNACK announces Subscription Identifier Available 0, answers the SUBSCRIBE with DISCONNECT 0xA1 (Subscription Identifiers not supported) and closes.",
+    "statement": "MQTT-4.13.1-1, with section 3.2.2.3.12: how a broker that announced the feature as not available refuses it",
     "lot": "Subscription Identifiers",
-    "fingerprint": "bf03fab2e0d105ef"
+    "fingerprint": "1f9b87b6eeac5463"
   },
   {
     "id": "subscribe/sys-explicit-filter-v4",
@@ -237,10 +231,10 @@
   {
     "id": "subscribe/twelve-filters-v4",
     "class": "profile-refused",
-    "difference": "Mosquitto answers a SUBSCRIBE of twelve Topic Filters with twelve granted QoS; mqttiumd accepts at most eight Topic Filters per SUBSCRIBE and closes the connection without SUBACK.",
-    "statement": "MQTT-3.8.4-5: what the feature requires once the limit is lifted",
+    "difference": "Mosquitto answers a SUBSCRIBE of twelve Topic Filters with twelve granted QoS; mqttiumd accepts at most eight Topic Filters per SUBSCRIBE, answers with a SUBACK of twelve return codes 0x80 (Failure), subscribes nothing and keeps the connection.",
+    "statement": "MQTT-3.8.4-5: a return code per Topic Filter, which may say that the subscription failed",
     "lot": "Runtime limits of the bounded preview (ADR 0044), to be raised to Mosquitto's defaults or made configurable: 8 Topic Filters per SUBSCRIBE or UNSUBSCRIBE",
-    "fingerprint": "95ff478e2fc7d3c0"
+    "fingerprint": "38474a5e39a147c1"
   },
   {
     "id": "subscribe/user-property-v5",
