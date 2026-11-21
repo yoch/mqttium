@@ -96,14 +96,39 @@ are exactly as after sequential application.
 ## Consequences
 
 - `crates/mqttiumd-store-sqlite/tests/group_commit.rs` compares a group
-  with the same commands applied one transaction each on a second SQLite
-  store: replies, snapshot and raw rows, for admissions with fan-out,
+  with the same commands applied one after the other on two references:
+  a second SQLite store, one transaction each (replies, snapshot and raw
+  rows), and the deterministic store of the lab, which shares no code
+  with the adapter (replies and snapshot, on a healthy medium, on a
+  failing one and through a resolution). The comparison covers admissions
+  with fan-out,
   releases, claims and finishes, subscription changes, retained
   publications and their replay, session close and replacement, a
   repeated operation, a recipe mismatch, refusals of each kind and a
   missing receipt slot. It covers the failing medium, the bound, and a
   process killed at each of the two points while it commits a group. A
   unit test faults each transactional read of a group in turn.
+- Four further cases answer the independent audit of `8e4303d`. The
+  answers of a committed group are lost: every member is found again by
+  its identity with the outcome the lost answer carried, the refused one
+  included, nothing is fenced or written, and the group presented again
+  admits and releases nothing twice. The engine drops the whole
+  transaction under a member (a trigger raising ROLLBACK): no member is
+  answered or durable, those staged before the fault included. Every
+  member is staged and the COMMIT itself fails (a deferred constraint):
+  the same. The largest group of the largest admissions is bounded by the
+  accounts of the store, and the member that does not fit is refused
+  alone.
+- The bytes of a group need no limit of their own. The worker forms a
+  group of at most 32 commands, the store accepts at most 64, and each
+  command is bounded by the limits of the store (one payload of at most
+  32,768 bytes and one topic of at most 1,024 in the product profile):
+  one transaction of the product carries at most about 1.1 MiB of
+  payload and topic, and never more than the payload account allows.
+- A group waits for nothing: it is made of the commands already in the
+  request lane when the worker takes the first, so it adds no voluntary
+  latency. A command waits only for the commit of the group before its
+  own, as it waited for the commits before it when each was alone.
 - `apply`, `commit_rejection` and `transact` keep their behaviour; the
   conformance suite, K1/K2b/K3, the lab twin and the loop mutants run
   unchanged.
@@ -118,9 +143,26 @@ are exactly as after sequential application.
 - **Group formation.** The store worker of `crates/mqttiumd/` forms a
   group from the consecutive commands already waiting in its request lane,
   up to the size of that lane (32), and publishes their answers in request
-  order after the commit. It waits for no further command and has no byte
-  bound: the waiting delay and the byte bound of ARC-020 are not
-  implemented. No group is formed while test controls are armed.
+  order after the commit. It waits for no further command: the waiting
+  delay of ARC-020 is not implemented, and its byte bound follows from
+  the bounds of the members (see above) instead of a limit of the group.
+  No group is formed while test controls are armed, so the instrumented
+  receptions exercise groups of one.
+- **Answers delivered in part.** The members of a group are committed
+  together and their answers reach the core one by one. A process that
+  dies in between has delivered some and not the others; the store then
+  holds every member, which is the case of the lost answers above. The
+  audit observed it on the real worker (one answer of two published,
+  then a kill, then both recognised without a write). No permanent test
+  drives the worker itself through that kill.
+- **A lost diagnostic.** A recipe presented under an identity that
+  already holds another recipe is a violation (`RecipeMismatch`) when it
+  is applied alone. Inside a group that is not committed it is answered
+  `PendingOrUnknown` like every other member, and a resolution by that
+  identity returns the decision of the earlier recipe. The core takes
+  each operation identity from a counter that only advances and freezes
+  the recipe with it, so the case is a defect of the core, not a state it
+  reaches; a group that failed would hide such a defect.
 - **Model.** M1 models the atomic `Commit` of one `ApplyCommand`. A group
   is K `ApplyCommand` steps with no crash between them; the TLA+ model
   `MGroupCommit` (`models/group-commit`) states it and names the tests of
@@ -128,7 +170,10 @@ are exactly as after sequential application.
 - **The other controls.** `resolve_and_fence`, the receipt collections,
   `admin`, `expire_messages`, `checkpoint_session_clock` and `open_epoch`
   stay one transaction each and are not members of a group.
-- **The deterministic store** has no group. A campaign of the oracle does
-  not exercise `apply_group`; the differential tests above are its
-  evidence.
+- **The deterministic store** has no group: it is the sequential
+  reference the differential tests judge the adapter by. A campaign of
+  the oracle does not exercise `apply_group`.
+- **The model** `MGroupCommit` has no outcome "the commit is durable and
+  an error is returned"; the lost answers above are its executable
+  counterpart.
 - **Volatile backend** of ARC-020: not addressed.
