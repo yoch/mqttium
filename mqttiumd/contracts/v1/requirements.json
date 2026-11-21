@@ -75,9 +75,129 @@
       "sha256": "9df1bf2b547bcbc02bdbf9ce58057a09ecd981bb1a3c3f87b42a2153c1f8b8fc"
     },
     {
+      "decision": "0010",
+      "path": "docs/decisions/0010-credits-interface.md",
+      "sha256": "2fbaad5b8792b920704bd9939d73dd7558433ddde937006df3baa72a67093da7"
+    },
+    {
+      "decision": "0011",
+      "path": "docs/decisions/0011-epoch-opening.md",
+      "sha256": "10405a4f8633677b7a4bb61f3b95526e3c520d7dc6f278b7c3cb00526a2e1eb9"
+    },
+    {
+      "decision": "0012",
+      "path": "docs/decisions/0012-reservation-refusals.md",
+      "sha256": "909a1e6886b8115220a6081f90e78d45eb628413f3d1f7fa9a2ee1a58f25ec1b"
+    },
+    {
+      "decision": "0014",
+      "path": "docs/decisions/0014-recovered-facts-order.md",
+      "sha256": "108db37a0c834d7a7cefb403865619d087b893238e3b1e79231d9e1474b7b917"
+    },
+    {
+      "decision": "0015",
+      "path": "docs/decisions/0015-scenario-vocabulary-and-fence-point.md",
+      "sha256": "cccd639c04aec8bdd0384739c09cf06577b88b21ce6311652cc843605ab65839"
+    },
+    {
+      "decision": "0016",
+      "path": "docs/decisions/0016-evidence-formats.md",
+      "sha256": "37f6eb93a9e378da2a1feb51aeba17f47c39fc7063dab1e9e461ab998c8abfa2"
+    },
+    {
+      "decision": "0017",
+      "path": "docs/decisions/0017-binary-tied-to-its-source.md",
+      "sha256": "8afca7df4c178f6321741bee7ce17f34b7f924796e18c7bd3e69dc1cf391dd06"
+    },
+    {
+      "decision": "0019",
+      "path": "docs/decisions/0019-real-kill-of-the-broker.md",
+      "sha256": "e1864ac92f0d372c045260318f8d1ef90656e3cb1aec67d81a5601c00c8d51da"
+    },
+    {
+      "decision": "0020",
+      "path": "docs/decisions/0020-kill-inside-a-transaction.md",
+      "sha256": "223e95d21c3bedcecd2c0eb43c3d5cde578dc7209ea07dceed1c4db07c3cac8e"
+    },
+    {
+      "decision": "0021",
+      "path": "docs/decisions/0021-typed-bounded-durable-reads.md",
+      "sha256": "e32ff2a160a055f2561d7ec6079870af4bab162722d3213fe2e2fd13abb01e25"
+    },
+    {
+      "decision": "0023",
+      "path": "docs/decisions/0023-incoming-qos1.md",
+      "sha256": "d53af5a60e7fbbe46d1fd4a917418df9a23b1f874eafff44ab797a9a8461ca40"
+    },
+    {
+      "decision": "0024",
+      "path": "docs/decisions/0024-receive-wire-progress.md",
+      "sha256": "f62529a9634cda6a305acb805118b63f378b262300aeee03df0eb8bfcc8d9ef0"
+    },
+    {
+      "decision": "0027",
+      "path": "docs/decisions/0027-live-receipt-retirement.md",
+      "sha256": "bd2215b96e85b53ea5150bbc1442a9863900f426764d6fc0f6cf28ffea4c24f2"
+    },
+    {
+      "decision": "0028",
+      "path": "docs/decisions/0028-outgoing-packet-identifier-reuse.md",
+      "sha256": "51a07bcc785540af45ea209772fd4c0df65bcc52961681970990d3bd1ee018bc"
+    },
+    {
+      "decision": "0030",
+      "path": "docs/decisions/0030-finite-session-expiry.md",
+      "sha256": "326680d4d5ad17c7037dbb912bda9f9c860eb0ddcff6b3293c7eddb0965c1406"
+    },
+    {
+      "decision": "0031",
+      "path": "docs/decisions/0031-hierarchical-subscriptions.md",
+      "sha256": "0f83d8bca6503b1367217f43ffdaee20d108a54adb9093eb2a884bebe61a1000"
+    },
+    {
+      "decision": "0032",
+      "path": "docs/decisions/0032-durable-retained.md",
+      "sha256": "126dcbc0f7447c1f4fa9e4cbe0ff770d4c3a4d19558d8a6e05231ccc78d80f13"
+    },
+    {
+      "decision": "0036",
+      "path": "docs/decisions/0036-offline-monotone-policy.md",
+      "sha256": "fa212391cfb279012f60fc26428c7c3f72d4720ece22dd492c398cfd583d29b5"
+    },
+    {
+      "decision": "0037",
+      "path": "docs/decisions/0037-retained-will.md",
+      "sha256": "3322f9990a0e5c0aea656c8988df7baa235c59558d780be1f8d12ec569c0d140"
+    },
+    {
+      "decision": "0038",
+      "path": "docs/decisions/0038-mqtt311-wire-profile.md",
+      "sha256": "95815f28419b331b2116ad0eead177b792fafa54135058a8c0fed432c284e22a"
+    },
+    {
+      "decision": "0039",
+      "path": "docs/decisions/0039-per-filter-subscribe-authorization.md",
+      "sha256": "c0f4bcfa2f0ccffdf89111bb06c551c3cffeecef2f688f507ecf380a51006c24"
+    },
+    {
+      "decision": "0040",
+      "path": "docs/decisions/0040-mqtt311-incoming-qos2.md",
+      "sha256": "b84f7f205a0cee800d5dcd688fe0cdfcba022e53f35e20629eec4eea5b52b0c9"
+    },
+    {
+      "decision": "0041",
+      "path": "docs/decisions/0041-outgoing-qos2.md",
+      "sha256": "435b0d11b1a20b3b1925492fb9c97f3c2149a254e99d2a1c5df66a4008b2fbe4"
+    },
+    {
       "decision": "0044",
       "path": "docs/decisions/0044-reactor-runtime-and-evidence-tiers.md",
       "sha256": "c16a5ecc81dbb1c860669f1c27b02bbc8cd07534c9be266b2492c80a2f109825"
+    },
+    {
+      "decision": "0047",
+      "path": "docs/decisions/0047-precedence-between-records.md",
+      "sha256": "57d5d76c7973a6332babfb51ba116b89c5fc0bffccd67c3d6971c3ab4106a728"
     }
   ],
   "entries": [

@@ -1,6 +1,6 @@
 # 0024 — Receive credits follow bounded transport progress
 
-Status: **Proposed**. No historical ADR is accepted by this change.
+Status: **Accepted** (21 November 2026, by the repository owner).
 
 Receive Maximum accounting must not confuse a delayed internal callback with
 an outstanding MQTT exchange. A peer can receive PUBACK and send a new

@@ -1,6 +1,6 @@
 # ADR 0041 — Durable outgoing QoS 2
 
-Status: **Proposed**
+Status: **Accepted** (21 November 2026, by the repository owner).
 
 On both protocol levels an authorized SUBSCRIBE grants its requested QoS.
 The effective QoS is the smaller of the subscription and publication QoS.

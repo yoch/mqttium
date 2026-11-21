@@ -1,10 +1,10 @@
 # 0015 — Scenario vocabulary for a race without a crash, and the correction of step 3 of P1-02b
 
-Status: **Proposed** (15 November 2026, lot L3 with lot L2, first wave).
+Status: **Accepted** (21 November 2026, by the repository owner;
+proposed 15 November 2026, lot L3 with lot L2, first wave).
 Written by lot L3, recorded by the integration owner. It completes record
 0001 and DEM-017, and **corrects step 3 of scenario P1-02b in record
-0001**. It becomes a requirement only when the owner of the repository
-accepts it.
+0001**.
 
 ## Context
 
@@ -86,4 +86,5 @@ released at step 4 is refused, and no positive PUBREC is ever observed.
   of an absent identity as succeeding unless a counted fault refuses it.
 - `FireDeadline` names no deadline; a scenario that must choose among
   deadlines in another order than their due time needs a further change.
-- No bench plays these scenarios yet (lot L4).
+- No bench played these scenarios when this record was written; the
+  campaigns of lot L4 play them on both stores since.

@@ -3,6 +3,14 @@
 Status: **Proposed**. This bounded product increment preserves ARC-025 and
 does not qualify all MQTT/P1/P2 semantics or accept historical proposals.
 
+Amended by 0041 (record 0047): a QoS 2 request is granted QoS 2; "QoS 2
+requests grant 1" below no longer holds.
+
+Note (21 November 2026): the budgets this record states for sixteen connections are
+the bounded profile of `runtime::Limits`. The connection limit is an option
+since record 0046 (proposed), and the queues sized for sixteen connections
+grow with it.
+
 Initially QoS 0, non-retained publications use VolatilePublicationId
 (source ConnectionKey and ingress order), immutable shared payloads and
 bounded owner fanout. No MQTT identifier, store recipe/receipt, receive

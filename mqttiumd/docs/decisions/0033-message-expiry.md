@@ -3,6 +3,11 @@
 Status: **Proposed**. This extends the implemented profile without accepting
 0030, 0032 or other proposed decisions.
 
+Note (21 November 2026): the budgets this record states for sixteen connections are
+the bounded profile of `runtime::Limits`. The connection limit is an option
+since record 0046 (proposed), and the queues sized for sixteen connections
+grow with it.
+
 ## Lifetime and temporal authority
 
 Message Expiry is separate from Session Expiry. Absence means no lifetime;

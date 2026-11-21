@@ -1,8 +1,7 @@
 # 0014 — Routes and limits among the recovered facts, and the order of an inventory
 
-Status: **Proposed** (15 November 2026, lot L1 with lots L2 and L3, first
-wave). Recorded by the integration owner. It becomes a requirement only
-when the owner of the repository accepts it.
+Status: **Accepted** (21 November 2026, by the repository owner;
+proposed 15 November 2026, lot L1 with lots L2 and L3, first wave). Recorded by the integration owner.
 
 ## Context
 

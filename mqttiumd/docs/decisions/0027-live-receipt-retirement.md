@@ -1,7 +1,10 @@
 # 0027 — Live bounded receipt retirement
 
-Status: **Proposed**. This implements the bounded producer-prefix direction of
+Status: **Accepted** (21 November 2026, by the repository owner). This implements the bounded producer-prefix direction of
 ARC-019 within ARC-021, without hot epoch rotation or a global broker proof.
+
+Amended by 0029 and 0030 (record 0047): the business threshold of the
+receipt window is 640, then 512, where this record says 768.
 
 The pure owner issues contiguous checked OperationSeq values per
 (StoreIncarnation, RunEpoch, LogicalOwnerId). A bounded issuance window records

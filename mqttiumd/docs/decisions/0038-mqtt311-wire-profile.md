@@ -1,6 +1,6 @@
 # ADR 0038 — MQTT 3.1.1 wire profile
 
-Status: **Proposed**
+Status: **Accepted** (21 November 2026, by the repository owner).
 
 The product accepts protocol levels 4 and 5 on the same listener. The TCP
 adapter records the protocol level in `connect_validated` and uses it

@@ -4,6 +4,15 @@ Status: **Proposed**. This adds zero/infinite session retention to the existing
 experimental MQTT 5 profile. Finite intermediate intervals remain unsupported.
 It does not accept historical proposals or change the immutable chapters.
 
+Amended by 0030 (record 0047): finite session expiry intervals are
+supported, and the business threshold of the receipt window is 512 where
+this record says 640.
+
+Note (21 November 2026): the budgets this record states for sixteen connections are
+the bounded profile of `runtime::Limits`. The connection limit is an option
+since record 0046 (proposed), and the queues sized for sixteen connections
+grow with it.
+
 ## Public matrix and ordering
 
 Absent CONNECT Session Expiry Interval means zero. Both Clean Start values

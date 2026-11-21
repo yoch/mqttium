@@ -1,11 +1,10 @@
 # 0011 — The opening of an epoch is one conditional, idempotent command with an identity
 
-Status: **Proposed** (15 November 2026, lot L2, first wave). Written by
+Status: **Accepted** (21 November 2026, by the repository owner;
+proposed 15 November 2026, lot L2, first wave). Written by
 lot L2 after five reviews of its contract change, recorded by the
 integration owner. It amends record 0009, section "A durable fact is not
-an authorisation to construct". It becomes a requirement only when the
-owner of the repository accepts it; until then the requirement register
-does not list it.
+an authorisation to construct".
 
 ## Context
 

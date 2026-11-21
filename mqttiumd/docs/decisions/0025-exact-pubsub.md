@@ -3,6 +3,15 @@
 Status: **Proposed**. A bounded product increment, not full P1/P2 reception,
 complete MQTT conformance or acceptance of historical proposed decisions.
 
+Amended by 0028 (record 0047): an outgoing Packet Identifier is reused after
+its durable Finish; the rule "never reused within a live connection" below
+no longer holds.
+
+Note (21 November 2026): the budgets this record states for sixteen connections are
+the bounded profile of `runtime::Limits`. The connection limit is an option
+since record 0046 (proposed), and the queues sized for sixteen connections
+grow with it.
+
 ## Profile and ordering
 
 The existing single logical owner and FIFO SQLite writer add exact SUBSCRIBE

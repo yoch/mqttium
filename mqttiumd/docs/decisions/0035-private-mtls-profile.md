@@ -3,6 +3,15 @@
 Status: **Proposed**. This decision applies to the private-network MQTT 5
 product and preserves the existing clear-text loopback profile.
 
+Amended by 0037 (record 0047): schemas 10 and 11 are refused without
+migration; "Schema 10 continues to serve the loopback profile" below no
+longer holds.
+
+Note (21 November 2026): the budgets this record states for sixteen connections are
+the bounded profile of `runtime::Limits`. The connection limit is an option
+since record 0046 (proposed), and the queues sized for sixteen connections
+grow with it.
+
 ## Trust and storage authority
 
 The listener loads its complete configuration before it starts a writer.

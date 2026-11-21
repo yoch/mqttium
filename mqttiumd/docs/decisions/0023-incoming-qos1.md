@@ -1,7 +1,7 @@
 # 0023 — Incoming QoS 1 occurrences and acknowledgement receipts
 
-Status: **Proposed**. This increment does not accept historical decisions,
-merge main or qualify the product as a complete MQTT broker.
+Status: **Accepted** (21 November 2026, by the repository owner). It does not
+qualify the product as a complete MQTT broker.
 
 ## One admission, one occurrence
 

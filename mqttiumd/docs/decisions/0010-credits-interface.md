@@ -1,9 +1,8 @@
 # 0010 — Credits: the interface of `release_if_current`, its guards and its precondition
 
-Status: **Proposed** (15 November 2026, lot L6, first wave). Written by
-lot L6, recorded by the integration owner. It becomes a requirement only
-when the owner of the repository accepts it; until then the requirement
-register does not list it.
+Status: **Accepted** (21 November 2026, by the repository owner;
+proposed 15 November 2026, lot L6, first wave). Written by
+lot L6, recorded by the integration owner.
 
 ## Context
 
@@ -70,8 +69,7 @@ That is a change of the design of the interface and is not made here.
 
 ## Evidence
 
-In `proofs/credits/PROOF.md` on the branch of lot L6, not yet on the
-integration branch and not run in CI:
+In `proofs/credits/PROOF.md`, run in CI by the job `pilot proof`:
 
 - order, rank 1: mutant `account-checked-before-the-key`, check P2a,
   witness W2c, unit test

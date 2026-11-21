@@ -1,7 +1,8 @@
 # 0021 — Typed, bounded durable reads through the surviving supervisor
 
-Status: **Proposed**. Working choice of S0; not an acceptance of the global
-decision records or permission to merge the integration branch into main.
+Status: **Accepted** (21 November 2026, by the repository owner). Written as a
+working choice of S0; its acceptance is no permission to merge the
+integration branch into main.
 
 ## Problem
 

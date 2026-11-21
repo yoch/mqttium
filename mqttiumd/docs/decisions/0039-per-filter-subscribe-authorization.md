@@ -1,6 +1,6 @@
 # ADR 0039 — Per-filter SUBSCRIBE authorization
 
-Status: **Proposed**
+Status: **Accepted** (21 November 2026, by the repository owner).
 
 The secure adapter authorizes each decoded SUBSCRIBE filter independently.
 The result is a bounded denial mask indexed in request order. The owner

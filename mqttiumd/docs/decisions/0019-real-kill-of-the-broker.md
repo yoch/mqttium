@@ -1,10 +1,10 @@
 # 0019 — A real kill of the broker: its record, its claim, and what it must show
 
-Status: **Proposed** (15 November 2026, lot L3, second wave). Written by
+Status: **Accepted** (21 November 2026, by the repository owner;
+proposed 15 November 2026, lot L3, second wave). Written by
 lot L3 at the request of the integration owner and of lot L4, to be
 recorded by them. It completes record 0016 (the failure model of a run)
-and DEM-011. It becomes a requirement only when the owner of the
-repository accepts it.
+and DEM-011.
 
 ## Context
 

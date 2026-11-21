@@ -1,11 +1,10 @@
 # 0012 — Refusals of a reservation, their wake-ups, and a definitive refusal at the boundary of a step
 
-Status: **Proposed** (15 November 2026, lot L1, first wave). Written by
+Status: **Accepted** (21 November 2026, by the repository owner;
+proposed 15 November 2026, lot L1, first wave). Written by
 lot L1 after two reviews of its contract changes, recorded by the
 integration owner. It amends record 0006 (shape of a core transition) and
-adds to record 0009 (refusals of creation). It becomes a requirement only
-when the owner of the repository accepts it; until then the requirement
-register does not list it.
+adds to record 0009 (refusals of creation).
 
 ## Context
 
@@ -110,10 +109,10 @@ Order when several hold: `TooLarge`, `SerialsExhausted`, then
 - `effects.rs`, `capacity.rs` (`WakeCondition::EffectAcceptedOrResourceReleased`)
   and `step.rs` change their public interface. The contract digest is
   unchanged: no file under `contracts/` is touched.
-- Still owed by lot L1 with the state of an owner in `mqttiumd-core`: the
-  guard of the constructor of an owner, the emission of
-  `Exhaustion::IdentityCounter`, and the test that replacing a box resets
-  no counter of its owner.
+- Owed by lot L1 when this record was written, with the state of an owner
+  in `mqttiumd-core`: the guard of the constructor of an owner, the
+  emission of `Exhaustion::IdentityCounter` (the core emits it since), and
+  the test that replacing a box resets no counter of its owner.
 - The transition registry (lot L3) has no guard for an exhausted identity
   counter yet.
 

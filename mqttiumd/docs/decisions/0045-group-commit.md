@@ -123,7 +123,8 @@ are exactly as after sequential application.
   implemented. No group is formed while test controls are armed.
 - **Model.** M1 models the atomic `Commit` of one `ApplyCommand`. A group
   is K `ApplyCommand` steps with no crash between them; the TLA+ model
-  `MGroupCommit` that states it is another lot.
+  `MGroupCommit` (`models/group-commit`) states it and names the tests of
+  `tests/group_commit.rs`. It has not been reviewed independently.
 - **The other controls.** `resolve_and_fence`, the receipt collections,
   `admin`, `expire_messages`, `checkpoint_session_clock` and `open_epoch`
   stay one transaction each and are not members of a group.

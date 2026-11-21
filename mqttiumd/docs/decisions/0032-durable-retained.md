@@ -1,6 +1,6 @@
 # 0032 — Durable retained values and frozen replay
 
-Status: **Proposed**
+Status: **Accepted** (21 November 2026, by the repository owner).
 
 ## Decision
 

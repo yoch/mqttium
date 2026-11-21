@@ -2,6 +2,11 @@
 
 Status: **Proposed**
 
+Note (21 November 2026): the budgets this record states for sixteen connections are
+the bounded profile of `runtime::Limits`. The connection limit is an option
+since record 0046 (proposed), and the queues sized for sixteen connections
+grow with it.
+
 An occupied output channel is a refusal for writes on that connection
 generation. The outbox retains the refused effect with the same identity.
 Later wire effects on that generation also remain in their original order.

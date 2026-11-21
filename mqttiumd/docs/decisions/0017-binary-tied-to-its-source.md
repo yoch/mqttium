@@ -1,12 +1,12 @@
 # 0017 — The binary of a run tied to the source it was rebuilt from
 
-Status: **Proposed** (15 November 2026, lot L3, second wave). Written by
+Status: **Accepted** (21 November 2026, by the repository owner;
+proposed 15 November 2026, lot L3, second wave). Written by
 lot L3 at the request of the integration owner, to be recorded by them. It
 completes DEM-003 and V3-002 and closes, for runs made with `--rebuild`,
 the open condition "the binary of a campaign is built from the recorded
 content inside the campaign, or its correspondence to that content is
-otherwise established" (lot L4). It becomes a requirement only when the
-owner of the repository accepts it.
+otherwise established" (lot L4).
 
 ## Context
 

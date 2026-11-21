@@ -1,7 +1,7 @@
 # 0031 — Hierarchical subscriptions and per-destination aggregation
 
-Status: **Proposed**. This implements a bounded local MQTT 5 preview without
-accepting earlier proposals. Retained, shared subscriptions, Subscription
+Status: **Accepted** (21 November 2026, by the repository owner). This implements a
+bounded local MQTT 5 preview. Retained, shared subscriptions, Subscription
 Identifiers and outgoing QoS 2 are separate increments.
 
 ## Selection and identity

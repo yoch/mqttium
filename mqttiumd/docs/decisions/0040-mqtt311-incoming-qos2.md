@@ -1,6 +1,9 @@
 # ADR 0040 — Incoming QoS 2 on MQTT 3.1.1
 
-Status: **Proposed**
+Status: **Accepted** (21 November 2026, by the repository owner).
+
+Amended by 0041 (record 0047): outgoing deliveries reach QoS 2; "Outgoing
+deliveries remain QoS 0 or 1" below no longer holds.
 
 This extends ADR 0038 with level-4 incoming QoS 2 according to MQTT 3.1.1
 with Errata 01, sections 3.3, 3.5–3.7, 4.3.3 and 4.4, and chapter 1

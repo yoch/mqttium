@@ -1,10 +1,10 @@
 # 0020 — A kill inside a transaction of the store: two injection points, and what a run claims
 
-Status: **Proposed** (15 November 2026, lot L3, second wave). Written by
+Status: **Accepted** (21 November 2026, by the repository owner;
+proposed 15 November 2026, lot L3, second wave). Written by
 lot L3 at the request of the integration owner, for the plan of lot L7
 (`docs/missions/L7-kill-inside-a-transaction.md`), to be recorded by them.
 It completes records 0015 (the injection points) and 0019 (a real kill).
-It becomes a requirement only when the owner of the repository accepts it.
 
 ## Decision
 

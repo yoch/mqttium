@@ -1,6 +1,6 @@
 # ADR 0037 — Retained zero-delay Will
 
-Status: **Proposed**
+Status: **Accepted** (21 November 2026, by the repository owner).
 
 MQTT 5 sections 3.1.2.5–3.1.2.8 and 3.3.1.3 govern the CONNECT Will
 Retain bit, the resulting publication and empty retained payloads. The

@@ -2,6 +2,11 @@
 
 Status: **Proposed**
 
+Note (21 November 2026): the budgets this record states for sixteen connections are
+the bounded profile of `runtime::Limits`. The connection limit is an option
+since record 0046 (proposed), and the queues sized for sixteen connections
+grow with it.
+
 A successful MQTT5 CONNECT may install a non-retained QoS1 Will with delay
 absent or zero. All other Will properties, including Message Expiry, are
 explicitly unsupported in this increment. MQTT5 §§3.1.2.5–8, 3.1.3.2.2,

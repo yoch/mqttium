@@ -3,6 +3,11 @@
 Status: **Proposed**. Experimental implementation choice, not acceptance of
 the historical proposed records or permission to merge main.
 
+Note (21 November 2026): the budgets this record states for sixteen connections are
+the bounded profile of `runtime::Limits`. The connection limit is an option
+since record 0046 (proposed), and the queues sized for sixteen connections
+grow with it.
+
 ## Profile and authority
 
 The product binary depends on contract/core/store-api/SQLite, never on the

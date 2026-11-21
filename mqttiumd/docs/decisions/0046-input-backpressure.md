@@ -66,8 +66,9 @@ be told what was written, and that is a fault, not pressure.
   or receipt slots, and for a packet refused for effect slots beyond the
   quarter of the lane. Measured with 32 publisher and subscriber pairs
   over mTLS: at 1,500 QoS 1 publications per second offered nothing is
-  closed; at 3,000, beyond what the store commits, 12 of 64 connections
-  are.
+  closed; at 3,000, beyond what the store commits, 8 of 64 connections
+  are in one run of two (report 0027; 12 in an earlier run made while
+  other jobs used the machine).
 - The net test that required the closure after 100 ms is replaced by one
   that requires the opposite: a saturated lane closes nothing and every
   packet arrives in order once the core takes values. The executable test
@@ -92,7 +93,8 @@ be told what was written, and that is a fault, not pressure.
   reservation of effect slots for the packets that release resources
   belongs to the core's cost model and to another record.
 
-- The model `MTransportCredit` of the runtime tier states the lane
-  bounds; it must drop the input deadline and state that a held packet is
-  eventually delivered or its task cancelled.
+- The model `MLaneOwed` (`models/reactor-wake`) states that a held
+  packet is eventually delivered or its task cancelled, and keeps the old
+  input deadline as a mutant; `MTransportCredit` states the receipts. They
+  have not been reviewed independently.
 - A per-connection read budget (bytes per second) is not provided.

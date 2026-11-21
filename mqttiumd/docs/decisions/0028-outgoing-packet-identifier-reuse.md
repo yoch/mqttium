@@ -1,7 +1,8 @@
 # 0028 — Recyclable outgoing Packet Identifiers and immutable PUBACK observations
 
-Status: **Proposed**. A local extension of Proposed 0025/0027, not acceptance
-of those records or a claim of complete MQTT conformance.
+Status: **Accepted** (21 November 2026, by the repository owner). A local extension
+of 0027 (accepted) and of 0025 (still proposed), whose identifier rule it
+replaces; not a claim of complete MQTT conformance.
 
 ## Resource numbers and durable authority
 

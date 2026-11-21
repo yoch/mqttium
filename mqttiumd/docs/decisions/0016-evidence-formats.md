@@ -1,9 +1,9 @@
 # 0016 — Trace records of the input audit, what every run owes, the perimeter, and the store snapshot
 
-Status: **Proposed** (15 November 2026, lot L3, first wave). Written by lot
+Status: **Accepted** (21 November 2026, by the repository owner;
+proposed 15 November 2026, lot L3, first wave). Written by lot
 L3, recorded by the integration owner. It completes record 0003, DEM-011,
-DEM-016, DEM-017 and DEM-019. It becomes a requirement only when the owner
-of the repository accepts it.
+DEM-016, DEM-017 and DEM-019.
 
 ## Decision
 
@@ -73,8 +73,8 @@ of the repository accepts it.
 
 ## Limits
 
-- No bench produces these traces or snapshots yet: the oracle has judged
-  hand-written traces only.
+- No bench produced these traces or snapshots when this record was
+  written; the campaigns produce them on both stores since.
 - One quantity has two encodings today: the limits of an admission are
   JSON integers in a recovered fact of a trace and decimal strings in a
   snapshot. It is an open point of the review of lot L3.
