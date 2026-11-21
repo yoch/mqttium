@@ -497,7 +497,23 @@ fn properties(input: &mut Cursor<'_>, context: Context) -> Result<Properties, Er
             (Context::Connect, 0x17, Property::Byte(n)) => {
                 result.problem_information = Some(n != 0)
             }
-            (Context::Connect, 0x19, Property::Byte(0)) => (),
+            // The server may return Response Information when asked; it
+            // returns none.
+            (Context::Connect, 0x19, Property::Byte(_)) => (),
+            // Outside a publication and a Will, which must forward them,
+            // the protocol gives a server nothing to do with a User
+            // Property; nor with the Reason String of an acknowledgement
+            // or of a DISCONNECT. They are validated and left unused.
+            (
+                Context::Connect
+                | Context::Subscribe
+                | Context::Unsubscribe
+                | Context::Acknowledge
+                | Context::Disconnect,
+                0x26,
+                _,
+            )
+            | (Context::Acknowledge | Context::Disconnect, 0x1f, _) => (),
             (Context::Disconnect, 0x11, Property::Four(n)) => result.expiry = Some(n),
             (Context::Publish, 0x02, Property::Four(n)) => result.message_expiry = Some(n),
             (Context::Will, 0x18, Property::Four(n)) => result.will_delay = Some(n),
@@ -1765,6 +1781,14 @@ mod tests {
 
     const EXPIRY: &[u8] = &[0x11, 0xff, 0xff, 0xff, 0xff];
 
+    /// The same CONNECT with the User Name flag and a user name: valid,
+    /// and outside the profile.
+    fn with_user_name(mut body: Vec<u8>) -> Vec<u8> {
+        body[7] |= 0x80;
+        body.extend_from_slice(&[0, 1, b'u']);
+        body
+    }
+
     fn will_connect(
         properties: &[u8],
         will_properties: &[u8],
@@ -2131,10 +2155,11 @@ mod tests {
 
     #[test]
     fn an_unsupported_connect_retains_its_validated_response_limit() {
-        let mut props = vec![0x11, 0, 0, 0, 7, 0x19, 1];
+        let mut props = vec![0x11, 0, 0, 0, 7];
         props.extend_from_slice(&[0x27, 0, 0, 0, 3]);
-        let mut clean = connect(&props, b"small-refusal");
-        clean[7] = 2; // Request Response Information remains outside this profile.
+        // A user name remains outside this profile.
+        let mut clean = with_user_name(connect(&props, b"small-refusal"));
+        clean[7] |= 2;
         let error = decode(0x10, &clean, BOUNDS).unwrap_err();
         assert_eq!(error.kind(), ErrorKind::Unsupported);
         assert_eq!(error.peer_maximum(), Some(3));
@@ -2142,7 +2167,7 @@ mod tests {
 
         let finite = decode(
             0x10,
-            &connect(&[0x11, 0, 0, 0, 7, 0x19, 1], b"unsupported-response-info"),
+            &with_user_name(connect(&[0x11, 0, 0, 0, 7], b"unsupported-user-name")),
             BOUNDS,
         )
         .unwrap_err();
@@ -2167,7 +2192,7 @@ mod tests {
         kind(
             decode(
                 0x10,
-                &connect(&[0x11, 0, 0, 0, 7, 0x19, 1], b"client"),
+                &with_user_name(connect(&[0x11, 0, 0, 0, 7], b"client")),
                 BOUNDS,
             ),
             ErrorKind::Unsupported,

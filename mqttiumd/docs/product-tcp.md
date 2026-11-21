@@ -231,7 +231,13 @@ subscription identifiers and topic aliases are outside this profile. No Local,
 Retain As Published and valid Retain
 Handling values are accepted and durably preserved per subscription. No Local
 removes only its own matching contribution before aggregation. RAP is combined across eligible live contributions; retained replay always sets
-RETAIN1. RH is evaluated per ordered filter occurrence as described below. Subscription properties remain outside the profile.
+RETAIN1. RH is evaluated per ordered filter occurrence as described below. A Subscription Identifier is refused with
+reason 0xA1, as the CONNACK announces.
+
+Information the protocol gives a server nothing to do with is validated and left unused: a User Property on CONNECT,
+SUBSCRIBE, UNSUBSCRIBE, an acknowledgement or DISCONNECT, the Reason String of an acknowledgement or of a DISCONNECT, and
+Request Response Information (no Response Information is returned). A publication or a Will that carries a User Property is
+still refused: the broker would have to forward it and does not store it.
 Malformed options are distinguished from well-formed unsupported options.
 
 Necessary CONNECT properties are validated. Peer Maximum Packet Size constrains

@@ -1303,11 +1303,12 @@ fn closing_transport_reconciles_late_commit_without_acknowledging_after_disconne
 }
 
 fn unsupported_connect_with_cap(cap: u32) -> Vec<u8> {
+    // Valid and outside the profile: it carries a user name.
     let mut body = vec![
-        0, 4, b'M', b'Q', b'T', b'T', 5, 2, 0, 10, 12, 0x19, 1, 0x11, 0, 0, 0, 1, 0x27,
+        0, 4, b'M', b'Q', b'T', b'T', 5, 0x82, 0, 10, 10, 0x11, 0, 0, 0, 1, 0x27,
     ];
     body.extend_from_slice(&cap.to_be_bytes());
-    body.extend_from_slice(&[0, 4, b't', b'i', b'n', b'y']);
+    body.extend_from_slice(&[0, 4, b't', b'i', b'n', b'y', 0, 1, b'u']);
     body
 }
 
