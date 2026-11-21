@@ -1,8 +1,20 @@
 # ADR 0046 — Input pressure slows a peer; it does not disconnect it
 
-Status: **Proposed** (20 November 2026, runtime tier of record 0044). It
+Status: **Accepted with amendments** (21 November 2026, decided under the
+repository owner's delegation on the advice of the independent audit of
+`8e4303d`; proposed on 20 November 2026, runtime tier of record 0044). It
 changes no public type of the core tier, no durable encoding and no
-contract; the contract digest that `validate` prints does not move.
+contract. The contract digest that `validate` prints moves only because
+the register lists the accepted records.
+
+Amendment of acceptance (21 November 2026). The record is accepted with
+the rules of the text below, which differ from its first form on three
+points. Keep Alive runs from the last packet the transport heard; it is
+not suspended while a packet is held. The last eighth of the ordinary
+lane is kept for the packets that release capacity, and a connection
+adds no business packet behind one of its own that waits. No count of
+deferred packets closes a connection: the quarter rule is withdrawn.
+What "Left open" lists stays owed.
 
 ## Context
 

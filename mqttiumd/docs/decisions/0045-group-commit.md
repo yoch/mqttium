@@ -1,10 +1,21 @@
 # ADR 0045 — Group commit in the SQLite store
 
-Status: **Proposed** (20 November 2026, lot P4-store). It binds nobody
-until the repository owner decides it. It adds an inherent method to
-`SqliteStore`; the `DurableStore` trait, the contracts and every durable
-encoding are unchanged, so the contract digest that `validate` prints does
-not move.
+Status: **Accepted with amendments** (21 November 2026, decided under the
+repository owner's delegation on the advice of the independent audit of
+`8e4303d`; proposed on 20 November 2026, lot P4-store). It adds an
+inherent method to `SqliteStore`; the `DurableStore` trait, the contracts
+and every durable encoding are unchanged. The contract digest that
+`validate` prints moves only because the register lists the accepted
+records.
+
+Amendment of acceptance (21 November 2026). The decision is accepted for
+the SQLite adapter and the store worker, as qualified under
+"Consequences": by two references, one of them the deterministic store of
+the lab, and by the cases of the lost answers, of the transaction the
+engine drops, of the commit that fails and of the largest group. It is
+not qualified by an oracle campaign and says nothing of a volatile
+backend. What "Left open" lists stays owed, first of all a permanent test
+that kills the real worker between two answers of a group.
 
 ## Context
 

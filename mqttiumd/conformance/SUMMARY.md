@@ -13,18 +13,18 @@ is inferred from. The others are not reviewed, which is not a third kind.
 
 | Status | MQTT 5.0 | MQTT 3.1.1 |
 | - | -: | -: |
-| `covered` | 136 | 75 |
+| `covered` | 136 | 76 |
 | of which `direct` | 13 | 4 |
-| of which `partial` | 6 | 8 |
+| of which `partial` | 6 | 9 |
 | not reviewed | 117 | 63 |
 | `implemented-untested` | 43 | 32 |
 | `profile-refused` | 37 | 8 |
-| `open` | 2 | 7 |
+| `open` | 2 | 6 |
 | `not-applicable` | 33 | 17 |
 | statements | 251 | 139 |
 | of which bind a server | 221 | 125 |
 
-## Open (9)
+## Open (8)
 
 Applies to a server, and either no implementation and no deliberate refusal was found, or the behaviour looks non-conformant. The note says which.
 
@@ -40,17 +40,11 @@ Applies to a server, and either no implementation and no deliberate refusal was 
 | 3.1.1 | `MQTT-4.6.0-5` | Not established. Every topic takes one path and there is no unordered mode, but whether that path is ordered is the open point of MQTT-4.6.0-6. The observations are in the note of MQTT-4.6.0-6. |
 | 3.1.1 | `MQTT-4.6.0-6` | Not established. Core tests show that an earlier outgoing claim is not overtaken by a later one, but nothing read or tested shows that deliveries keep the publisher's order when the store result of an earlier admission is late or unknown; no test compares the order a subscriber reads with the order a publisher sent at QoS 1 or 2. The independent audit of 8e4303d, 21 November 2026, observed deliveries to a subscriber in the order published (A then B, and twelve messages in order across two pages after a reconnection); the compatibility scenario `publish/burst-qos0-v4` compares the order of the QoS 0 messages of a burst with the order sent (as sent, among those the broker did not shed, in every play read with the broker built from 81acd13). Neither shows the order when the store result of an earlier admission is late or unknown. |
 
-### subscribe (1)
-
-| MQTT | Statement | Note |
-| - | - | - |
-| 3.1.1 | `MQTT-3.8.4-1` | The independent audit of 8e4303d, 21 November 2026, found a SUBSCRIBE to `$share/x`, a valid 3.1.1 filter, closed without a SUBACK. Since 81acd13 the 3.1.1 decoder hands such a filter to the core as an ordinary one (`a_share_prefixed_filter_is_an_ordinary_filter_in_3_1_1`), which refuses it in the SUBACK (0x80), and a SUBSCRIBE with more than eight filters is answered with one 0x80 per filter. Still non-conformant: a SUBSCRIBE whose Topic Filter is longer than 1,024 bytes is closed without a SUBACK (`FilterTooLarge`; observed on a socket with a 2,000-byte filter on the broker built from 81acd13). Ordinary filters are answered with a SUBACK, asserted on MQTT 5 connections. |
-
 ### unsubscribe (1)
 
 | MQTT | Statement | Note |
 | - | - | - |
-| 3.1.1 | `MQTT-3.10.4-4` | The independent audit of 8e4303d, 21 November 2026, found an UNSUBSCRIBE of a `$share/` filter closed without an UNSUBACK. Since 81acd13 the 3.1.1 encoder acknowledges the result 0x8F of such a filter (`an_unsubscribe_of_a_filter_that_cannot_be_subscribed_is_acknowledged_in_3_1_1`). Still non-conformant: an UNSUBSCRIBE with more than eight Topic Filters is closed without an UNSUBACK (`TooManyFilters`; observed on a socket with nine filters on the broker built from 81acd13). Ordinary filters are answered with an UNSUBACK (core test, 3.1.1 encoder test); no Rust test compares its identifier with the request. |
+| 3.1.1 | `MQTT-3.10.4-4` | Still non-conformant in one case. The independent audit of 8e4303d, 21 November 2026, found an UNSUBSCRIBE of a `$share/` filter closed without an UNSUBACK; the 3.1.1 encoder now acknowledges the result 0x8F of such a filter (`an_unsubscribe_of_a_filter_that_cannot_be_subscribed_is_acknowledged_in_3_1_1`). An UNSUBSCRIBE with more than eight Topic Filters, or with a filter longer than 1,024 bytes, is still closed without an UNSUBACK (`pubsub_reasons_frames_and_filter_counts_have_packet_specific_bounds` asserts the closure): an UNSUBACK of 3.1.1 carries no result, and acknowledging a request that removed nothing would report a success that did not happen. Ordinary filters are answered with an UNSUBACK (core test, 3.1.1 encoder test); no Rust test compares its identifier with the request. |
 
 ## Refused by the profile (45)
 

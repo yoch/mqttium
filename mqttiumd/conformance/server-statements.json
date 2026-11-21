@@ -640,7 +640,7 @@
             "test": "outbound_frames_are_mqtt5_and_advertise_only_implemented_features"
           }
         ],
-        "note": "The CONNACK is a fixed layout without Response Information. A CONNECT with Request Response Information 1 is refused with CONNACK 0x83."
+        "note": "The CONNACK is a fixed layout without Response Information. A CONNECT with Request Response Information 1 is accepted and gets none, which the statement allows (`information_the_broker_may_leave_unused_does_not_refuse_its_packet`)."
       },
       {
         "id": "MQTT-3.1.2-29",
@@ -1131,7 +1131,7 @@
         "applies_to_server": false,
         "status": "not-applicable",
         "evidence": [],
-        "note": "Binds the client only. A packet above the announced 65,536 bytes closes the connection without a DISCONNECT."
+        "note": "Binds the client only. The CONNACK announces 32,776 bytes, the size within which no PUBLISH exceeds the payload limit; a frame above the 65,536 bytes the transport reads is answered with DISCONNECT 0x95 and closed (`a_refused_header_is_named_before_the_close`)."
       },
       {
         "id": "MQTT-3.2.2-16",
@@ -1244,9 +1244,13 @@
           {
             "file": "mqttiumd/crates/mqttiumd/src/codec.rs",
             "test": "qos0_has_no_mqtt_identifier_ack_or_duplicate_flag"
+          },
+          {
+            "file": "mqttiumd/crates/mqttiumd/tests/reactor_wake.rs",
+            "test": "a_refused_header_is_named_before_the_close"
           }
         ],
-        "note": "The sent QoS 0 PUBLISH is compared byte for byte, and a received one with DUP is refused."
+        "note": "The sent QoS 0 PUBLISH is compared byte for byte, and a received one with DUP is answered with DISCONNECT 0x81 and closed."
       },
       {
         "id": "MQTT-3.3.1-3",
@@ -1268,7 +1272,7 @@
         "code": [
           "mqttiumd/crates/mqttiumd/src/codec.rs:flags"
         ],
-        "note": "QoS 3 is `InvalidQos` in the header parser and the reader closes the connection (`malformed_header`) without a DISCONNECT. Not asserted."
+        "note": "QoS 3 is `InvalidQos` in the header parser: the connection is answered with DISCONNECT 0x81 and closed. The test of that answer sends the DUP flag at QoS 0, not QoS 3."
       },
       {
         "id": "MQTT-3.3.1-5",
@@ -1971,7 +1975,7 @@
         "code": [
           "mqttiumd/crates/mqttiumd/src/codec.rs:flags"
         ],
-        "note": "Flag bits other than 0010 are `InvalidFixedFlags`; the reader closes the connection without a DISCONNECT. Not asserted for SUBSCRIBE."
+        "note": "Flag bits other than 0010 are `InvalidFixedFlags`: the connection is answered with DISCONNECT 0x81 and closed. Not asserted for SUBSCRIBE."
       },
       {
         "id": "MQTT-3.8.3-1",
@@ -2061,9 +2065,13 @@
           {
             "file": "mqttiumd/crates/mqttiumd-core/src/owner.rs",
             "test": "product_pubsub_suback_requires_commit_then_routing_projection"
+          },
+          {
+            "file": "mqttiumd/crates/mqttiumd/tests/reactor_wake.rs",
+            "test": "a_request_beyond_the_profile_is_refused_in_its_acknowledgement"
           }
         ],
-        "note": "A SUBSCRIBE is answered with a SUBACK, after its durable commit."
+        "note": "A SUBSCRIBE is answered with a SUBACK, after its durable commit. A request with more than eight filters or with a filter longer than the profile stores is answered too, with 0x97 for every filter, and the connection stays open."
       },
       {
         "id": "MQTT-3.8.4-2",
@@ -2251,7 +2259,7 @@
         "code": [
           "mqttiumd/crates/mqttiumd/src/codec.rs:flags"
         ],
-        "note": "Flag bits other than 0010 are `InvalidFixedFlags`; the reader closes the connection without a DISCONNECT. Not asserted for UNSUBSCRIBE."
+        "note": "Flag bits other than 0010 are `InvalidFixedFlags`: the connection is answered with DISCONNECT 0x81 and closed. Not asserted for UNSUBSCRIBE."
       },
       {
         "id": "MQTT-3.10.3-1",
@@ -2331,10 +2339,14 @@
           {
             "file": "mqttiumd/crates/mqttiumd-core/src/owner.rs",
             "test": "product_pubsub_filter_replacement_and_removal_preserve_preexisting_work"
+          },
+          {
+            "file": "mqttiumd/crates/mqttiumd/tests/reactor_wake.rs",
+            "test": "a_request_beyond_the_profile_is_refused_in_its_acknowledgement"
           }
         ],
         "evidence_kind": "direct",
-        "note": "Core level: each UNSUBSCRIBE produces an UNSUBACK."
+        "note": "Core level: each UNSUBSCRIBE produces an UNSUBACK. On a socket, an UNSUBSCRIBE with more than eight filters is answered with an UNSUBACK that carries 0x83 for every filter."
       },
       {
         "id": "MQTT-3.10.4-5",
@@ -3421,9 +3433,13 @@
           {
             "file": "mqttiumd/crates/mqttiumd/src/runtime_tests.rs",
             "test": "eight_live_qos2_exchanges_still_refuse_a_genuine_ninth_identifier"
+          },
+          {
+            "file": "mqttiumd/crates/mqttiumd/tests/reactor_wake.rs",
+            "test": "a_refused_header_is_named_before_the_close"
           }
         ],
-        "note": "A malformed header ends the reader, and a refused packet or an exceeded Receive Maximum is answered with a DISCONNECT and closed."
+        "note": "A refused fixed header is answered with DISCONNECT 0x81, or 0x95 for a packet larger than the transport reads, and the connection is closed; a refused packet or an exceeded Receive Maximum is answered with a DISCONNECT and closed."
       },
       {
         "id": "MQTT-4.13.2-1",
@@ -4611,13 +4627,27 @@
         "id": "MQTT-3.8.4-1",
         "feature": "subscribe",
         "applies_to_server": true,
-        "status": "open",
-        "evidence": [],
+        "status": "covered",
+        "evidence": [
+          {
+            "file": "mqttiumd/crates/mqttiumd/tests/mqtt311_codec.rs",
+            "test": "a_share_prefixed_filter_is_an_ordinary_filter_in_3_1_1"
+          },
+          {
+            "file": "mqttiumd/crates/mqttiumd/tests/mqtt311_codec.rs",
+            "test": "a_subscribe_with_a_filter_longer_than_the_profile_is_answered_in_3_1_1"
+          },
+          {
+            "file": "mqttiumd/crates/mqttiumd/src/codec.rs",
+            "test": "pubsub_reasons_frames_and_filter_counts_have_packet_specific_bounds"
+          }
+        ],
+        "evidence_kind": "partial",
         "code": [
           "mqttiumd/crates/mqttiumd/src/codec.rs:filter",
           "mqttiumd/crates/mqttiumd/src/codec.rs:subscribe"
         ],
-        "note": "The independent audit of 8e4303d, 21 November 2026, found a SUBSCRIBE to `$share/x`, a valid 3.1.1 filter, closed without a SUBACK. Since 81acd13 the 3.1.1 decoder hands such a filter to the core as an ordinary one (`a_share_prefixed_filter_is_an_ordinary_filter_in_3_1_1`), which refuses it in the SUBACK (0x80), and a SUBSCRIBE with more than eight filters is answered with one 0x80 per filter. Still non-conformant: a SUBSCRIBE whose Topic Filter is longer than 1,024 bytes is closed without a SUBACK (`FilterTooLarge`; observed on a socket with a 2,000-byte filter on the broker built from 81acd13). Ordinary filters are answered with a SUBACK, asserted on MQTT 5 connections."
+        "note": "The independent audit of 8e4303d, 21 November 2026, found a SUBSCRIBE to `$share/x`, a valid 3.1.1 filter, closed without a SUBACK, and the reading of this register then found the same for a filter longer than 1,024 bytes. The three valid requests the profile cannot serve are now answered: a `$share/` filter is an ordinary filter the core refuses in the SUBACK (0x80), and a request with more than eight filters or with a filter longer than the profile stores is answered with one 0x80 per filter. Partial: the tests decode the request and encode the SUBACK; the answer on a socket is asserted by the compatibility bench (`subscribe/share-literal-filter-v4`, `subscribe/twelve-filters-v4`) and, for the long filter, on an MQTT 5 connection only."
       },
       {
         "id": "MQTT-3.8.4-2",
@@ -4812,7 +4842,7 @@
           "mqttiumd/crates/mqttiumd/src/codec.rs:encode_for",
           "mqttiumd/crates/mqttiumd-core/src/owner/pubsub.rs:subscription_changes"
         ],
-        "note": "The independent audit of 8e4303d, 21 November 2026, found an UNSUBSCRIBE of a `$share/` filter closed without an UNSUBACK. Since 81acd13 the 3.1.1 encoder acknowledges the result 0x8F of such a filter (`an_unsubscribe_of_a_filter_that_cannot_be_subscribed_is_acknowledged_in_3_1_1`). Still non-conformant: an UNSUBSCRIBE with more than eight Topic Filters is closed without an UNSUBACK (`TooManyFilters`; observed on a socket with nine filters on the broker built from 81acd13). Ordinary filters are answered with an UNSUBACK (core test, 3.1.1 encoder test); no Rust test compares its identifier with the request."
+        "note": "Still non-conformant in one case. The independent audit of 8e4303d, 21 November 2026, found an UNSUBSCRIBE of a `$share/` filter closed without an UNSUBACK; the 3.1.1 encoder now acknowledges the result 0x8F of such a filter (`an_unsubscribe_of_a_filter_that_cannot_be_subscribed_is_acknowledged_in_3_1_1`). An UNSUBSCRIBE with more than eight Topic Filters, or with a filter longer than 1,024 bytes, is still closed without an UNSUBACK (`pubsub_reasons_frames_and_filter_counts_have_packet_specific_bounds` asserts the closure): an UNSUBACK of 3.1.1 carries no result, and acknowledging a request that removed nothing would report a success that did not happen. Ordinary filters are answered with an UNSUBACK (core test, 3.1.1 encoder test); no Rust test compares its identifier with the request."
       },
       {
         "id": "MQTT-3.10.4-5",

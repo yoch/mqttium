@@ -3,7 +3,7 @@
 The optional mTLS listener uses TLS 1.3, explicit client certificate pins,
 ClientID ownership and static topic grants. The legacy plaintext listener
 accepts loopback addresses only. For setup, see the [secure preview guide](../preview/SECURE.md)
-and [Proposed 0035](decisions/0035-private-mtls-profile.md). The secure
+and [record 0035](decisions/0035-private-mtls-profile.md). The secure
 SQLite profile uses schema 13 and a separate database from schema 12.
 The sections below describe the shared MQTT behavior and historical loopback profile.
 
@@ -11,10 +11,10 @@ The same listener accepts MQTT 3.1.1 and MQTT 5. The
 [interoperability preview](../preview/MQTT311.md) shows ordinary Mosquitto clients
 using the default MQTT version and the shared routing across both versions.
 The adapter retains the protocol level for each transport generation.
-[Proposed 0038](decisions/0038-mqtt311-wire-profile.md) specifies the level-4
-profile. [Proposed 0040](decisions/0040-mqtt311-incoming-qos2.md) adds incoming
+[record 0038](decisions/0038-mqtt311-wire-profile.md) specifies the level-4
+profile. [record 0040](decisions/0040-mqtt311-incoming-qos2.md) adds incoming
 QoS 2 with the same durable admission and replay state as MQTT 5.
-[Proposed 0041](decisions/0041-outgoing-qos2.md) describes the outbound exchanges.
+[record 0041](decisions/0041-outgoing-qos2.md) describes the outbound exchanges.
 
 The product receives QoS 0/1/2 publications on both protocol levels, including
 durable retained values and zero-delay QoS 1 Wills with optional Retain.
@@ -192,7 +192,7 @@ malformed encodings remain protocol/malformed errors. Finite overrides are
 supported; they do not reset a deadline when a command result is delayed. DISCONNECT has no MQTT ACK:
 local client completion alone does not establish durable termination.
 
-Proposed [ADR 0029](decisions/0029-explicit-session-lifecycle.md) defines the
+[ADR 0029](decisions/0029-explicit-session-lifecycle.md) defines the
 atomic target-only cancellation and lifecycle authority. Ending a session
 cancels its own filters, deliveries, claims and incoming markers. Publications
 already owed to other destinations survive their producer's termination.
@@ -265,9 +265,12 @@ malformed Remaining Length. The transport frames nothing further and drops
 what the peer still sends until the connection closes, with
 `packet_too_large` or `malformed_header` as its cause. A refused first header
 names no protocol version and MQTT 3.1.1 has no packet for it: both are closed
-without one. A SUBSCRIBE that is valid but carries more than eight filters is
-not a refusal of the connection: its SUBACK refuses every filter (0x97, or
-0x80 in MQTT 3.1.1) and the connection stays open.
+without one. A SUBSCRIBE that is valid but that the profile cannot serve
+(more than eight filters, or a filter longer than 1,024 bytes) is not a
+refusal of the connection: its SUBACK refuses every filter (0x97, or 0x80 in
+MQTT 3.1.1) and the connection stays open. The same holds for an MQTT 5
+UNSUBSCRIBE, whose UNSUBACK carries 0x83 for every filter. An UNSUBACK of
+MQTT 3.1.1 carries no result: such an UNSUBSCRIBE still ends the connection.
 
 ## Bounds and transport
 
@@ -444,7 +447,7 @@ Canonical format 1 adds kind 6 ConsumeDelivery, kind 7 UpdateSubscriptions and
 kind 8 SessionLifecycle.
 The latter encodes granted QoS in its decision. Existing kinds 1–5 preserve
 their bytes and meanings; kind 3 remains implicit QoS 1 rather than silently
-being reinterpreted. Proposed [ADR 0026](decisions/0026-qos0-volatile-and-consumed.md)
+being reinterpreted. [ADR 0026](decisions/0026-qos0-volatile-and-consumed.md)
 specifies the layouts and separate volatile/consumed cycles.
 
 SQLite schema **6** stores compact receipt guards, retention/attachment, durable
@@ -471,7 +474,7 @@ the next actual epoch opening still finalizes previous zero-policy sessions.
 
 ## Live receipt retirement
 
-Proposed [ADR 0027](decisions/0027-live-receipt-retirement.md) separates result
+[ADR 0027](decisions/0027-live-receipt-retirement.md) separates result
 consumption from completion of the responsibility a command created. Only an
 applied, correlated terminal store result whose consequences are retained by
 the pure owner can close its sequence position. Unknown outcomes, disconnection,
@@ -556,7 +559,7 @@ are labeled rather than presented as ordinary product configuration changes.
 
 These are finite system tests. Existing K1/K2b/K3 qualifications and proof/model
 limits stay separate; no new path automatically qualifies all P1/P2. ADRs
-0024/0025/0026/0027/0028 retain Proposed status and guard partitions stay incomplete.
+Records 0024 to 0028 are accepted, 0025 and 0026 with amendments (see the index of decisions); the guard partitions stay incomplete.
 Legacy epoch-zero/session collection, indefinite operation,
 shared delivery, runtime management of authorization policy, deployment
 security and performance remain separate. Process SIGKILL is not a power-loss
@@ -564,7 +567,7 @@ or universal storage guarantee.
 
 ## Recyclable outgoing QoS 1 identifiers
 
-Proposed [ADR 0028](decisions/0028-outgoing-packet-identifier-reuse.md) removes
+[ADR 0028](decisions/0028-outgoing-packet-identifier-reuse.md) removes
 the cumulative 65535-delivery connection limit. The owner selects the smallest
 free PI in 1..65535 for the target session. Selection consults all live claims,
 including pending/unknown Claim, pending/unknown Finish and recovered metadata
@@ -666,7 +669,7 @@ system evidence, separate from the fixture oracle's K1/K2b/K3 qualification.
 Will variants outside the received profile and general migration remain separate increments.
 
 
-## Durable retained values (Proposed0032)
+## Durable retained values (record 0032)
 
 The normal preview now stores up to32 exact retained topics and1MiB of current
 retained payload. Each topic owns one reference independently of subscribers
@@ -722,7 +725,7 @@ The retained reception here covers MQTT 5. Username/Password, Enhanced
 Authentication, shared subscriptions, Subscription Identifiers
 and general migration remain outside the profile.
 
-## Message Expiry (Proposed0033)
+## Message Expiry (record 0033)
 
 Property0x02 is accepted only for PUBLISH, once, as four-byte seconds. Absence
 is unlimited, zero expires at reception and every positive value including
@@ -767,7 +770,7 @@ K1/K2b/K3 independent-oracle qualification. Message Expiry does not implement
 shared subscriptions, dynamic authentication or schema migration.
 
 
-## Zero-delay durable Will (Proposed0034)
+## Zero-delay durable Will (record 0034)
 
 The normal preview supports CONNECT Will QoS1, both RETAIN values and delay absent/zero.
 Use `preview/will-demo.sh /tmp/mqttiumd-sensor-demo` with Mosquitto clients to
@@ -815,7 +818,7 @@ or failure may defer Wills until restart. This is not a guarantee of notificatio
 before a server SIGKILL, power-loss certification, or complete MQTT compliance.
 The [secure preview guide](../preview/SECURE.md) exercises this Will behavior over mTLS.
 
-## Retained presence (Proposed0037)
+## Retained presence (record 0037)
 
 Run `python3 retained-will-demo.py ./presence-demo-data` from the extracted
 mTLS preview. A retained Will replaces the stored value without subscribers.

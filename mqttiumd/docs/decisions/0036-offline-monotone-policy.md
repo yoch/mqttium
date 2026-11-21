@@ -1,7 +1,7 @@
 # 0036 — Offline monotone mTLS policy transitions
 
 Status: **Accepted** (21 November 2026, by the repository owner). This decision
-extends the schema 11 product boundary of 0035, which is still proposed. An existing secure database can gain principals, ClientIDs
+extends the schema 11 product boundary of 0035. An existing secure database can gain principals, ClientIDs
 and permission subtrees while its business history and authority are retained.
 
 ## Authority and inclusion

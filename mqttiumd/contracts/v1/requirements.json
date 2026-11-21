@@ -172,7 +172,7 @@
     {
       "decision": "0030",
       "path": "docs/decisions/0030-finite-session-expiry.md",
-      "sha256": "326680d4d5ad17c7037dbb912bda9f9c860eb0ddcff6b3293c7eddb0965c1406"
+      "sha256": "194d718ee596b2c07aa54508b0846cc5fb8e9f2b3ef5b66cd8495feb9270680a"
     },
     {
       "decision": "0031",
@@ -202,7 +202,7 @@
     {
       "decision": "0036",
       "path": "docs/decisions/0036-offline-monotone-policy.md",
-      "sha256": "fa212391cfb279012f60fc26428c7c3f72d4720ece22dd492c398cfd583d29b5"
+      "sha256": "ae0a2118e47d60651da15eba8aea0e460b638e186ac8d3f62c48192fcc577768"
     },
     {
       "decision": "0037",
@@ -243,6 +243,16 @@
       "decision": "0044",
       "path": "docs/decisions/0044-reactor-runtime-and-evidence-tiers.md",
       "sha256": "7f2ac6b8eea8d8f55bff64afc25fa9341cd0dc3e825ae134bb6a054735b8d763"
+    },
+    {
+      "decision": "0045",
+      "path": "docs/decisions/0045-group-commit.md",
+      "sha256": "dd67e73429241c8915dbb7b88db98369beb576f87949d196879917d4b859aa8f"
+    },
+    {
+      "decision": "0046",
+      "path": "docs/decisions/0046-input-backpressure.md",
+      "sha256": "2b5a9e1fd5afae0a0dca2c47ba337956f3a26b22cd381fbba271a07e6a278a27"
     },
     {
       "decision": "0047",

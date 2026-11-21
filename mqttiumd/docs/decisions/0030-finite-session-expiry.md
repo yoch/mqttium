@@ -1,7 +1,7 @@
 # 0030 — Finite session expiry with a durable temporal anchor
 
 Status: **Accepted** (21 November 2026, by the repository owner). This extends
-0029, which is still proposed.
+0029.
 Message Expiry, Will, finite-session eviction and general migration are separate.
 
 ## Profile and authority

@@ -14,17 +14,17 @@ the end.
 
 Each now reads "Accepted (21 November 2026, by the repository owner)".
 Three of them extended a record that was proposed at the time: 0028 (0025),
-0030 (0029) and 0036 (0035). The status of 0030 and of 0036 still says so;
-that of 0028 names 0025 as accepted with amendments.
+0030 (0029) and 0036 (0035). Those three are accepted with amendments
+since, and the status lines no longer call them proposed.
 
 ## After the second opinion
 
 Thirteen records waited for an independent reviewer, who audited the tree
 at `8e4303d` and recommended a decision for each with the exact text of
 its amendments. The owner then delegated the decisions. They follow the
-audit, with one difference: 0025 stayed proposed until its amendment was
-implemented, and is accepted with amendments since the change that
-implements it.
+audit, with one difference: 0025, 0045 and 0046 stayed proposed until
+what the audit asked of each was done, and are accepted with amendments
+since. Only 0018 is still proposed.
 
 | Record | Decision | Why |
 | - | - | - |
@@ -33,8 +33,8 @@ implements it.
 | 0042 | Accepted as a historical decision | It binds the frozen kit and the executable built from `51be4079`; a version 0.1 claim needs a new reader and a new reception |
 | 0025 | Accepted with amendments | Its amendment requires that a delivery larger than the peer's Maximum Packet Size be discarded and its obligation completed with the connection kept open (MQTT-3.1.2-25). The record stayed proposed while the core closed the connection and kept the claim; it is accepted with the change that implements the amendment: the delivery ends through the finish guarded by its claim, and the effect `DeliveryDiscarded` reports it |
 | 0018 | Proposed | The bench refuses to play its vocabulary; accepted when a campaign qualifies a scenario and rejects its mutant, withdrawn if none uses it |
-| 0045 | Proposed | An unknown answer can hide a commit or an earlier diagnostic, and no oracle campaign runs a group |
-| 0046 | Proposed | A quarter of the lane does not reserve the way of an acknowledgement; its Keep Alive rule was corrected after the audit |
+| 0045 | Accepted with amendments | Accepted once the deterministic store of the lab judged every differential test and the lost answers, the dropped transaction, the failed commit and the largest group had permanent tests. Still owed: a kill of the real worker between two answers of a group; no oracle campaign runs a group |
+| 0046 | Accepted with amendments | Accepted with three changes to its first form: Keep Alive runs from the last packet heard, the last eighth of the lane is kept for packets that release capacity, and the quarter rule, which closed publishers, is withdrawn |
 
 Records 0047 (precedence) and 0048 (capacities of the runtime) were
 accepted with these decisions. Record 0044 carries an amendment line: two

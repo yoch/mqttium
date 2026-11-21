@@ -51,12 +51,12 @@ It is a map of evidence, not a proof of conformance.
 
 ```json
 {
-  "id": "MQTT-3.1.2-25",
-  "feature": "maximum-packet-size",
+  "id": "MQTT-3.10.4-4",
+  "feature": "unsubscribe",
   "applies_to_server": true,
   "status": "open",
   "evidence": [],
-  "code": ["mqttiumd/crates/mqttiumd-core/src/owner/pubsub.rs:plan_delivery_emit"],
+  "code": ["mqttiumd/crates/mqttiumd/src/codec.rs:subscribe"],
   "note": "One or two precise sentences."
 }
 ```
