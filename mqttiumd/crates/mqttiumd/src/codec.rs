@@ -2258,6 +2258,25 @@ mod tests {
         kind(decode(0x60, &[0, 7], BOUNDS), ErrorKind::Malformed);
     }
 
+    /// What the broker announced it does not support is refused with the
+    /// reason the specification names, not with a generic one: a shared
+    /// subscription (0x9E), a Subscription Identifier (0xA1) and an
+    /// Authentication Method (0x8C).
+    #[test]
+    fn unsupported_features_are_refused_with_their_own_reason() {
+        let shared = decode(0x82, b"\0\x01\0\0\x0a$share/g/t\0", BOUNDS).unwrap_err();
+        assert_eq!(shared.reason, 0x9e, "{}", shared.code);
+        let identified = decode(0x82, b"\0\x01\x02\x0b\x05\0\x01t\0", BOUNDS).unwrap_err();
+        assert_eq!(identified.reason, 0xa1, "{}", identified.code);
+        let authenticated = decode(
+            0x10,
+            b"\0\x04MQTT\x05\x02\0\x1e\x06\x15\0\x03abc\0\x03cid",
+            BOUNDS,
+        )
+        .unwrap_err();
+        assert_eq!(authenticated.reason, 0x8c, "{}", authenticated.code);
+    }
+
     #[test]
     fn valid_subscription_options_reach_the_core_without_loss() {
         for bits in [0, 4, 8, 12, 16, 20, 24, 28, 32, 36, 40, 44] {
@@ -2269,11 +2288,17 @@ mod tests {
             assert_eq!(filters.as_slice()[0].options.bits(), bits);
             assert_eq!(filters.as_slice()[0].qos, Qos::ExactlyOnce);
         }
-        for bits in [0x30, 0x40, 0x80, 3] {
+        // Retain Handling 3 and QoS 3 are protocol errors of defined fields.
+        for bits in [0x30, 3] {
             kind(
                 decode(0x82, &[0, 1, 0, 0, 3, b'a', b'/', b'#', bits], BOUNDS),
                 ErrorKind::Protocol,
             );
+        }
+        // Reserved bits make the packet malformed (MQTT-3.8.3-5).
+        for bits in [0x40, 0x80, 0xc0] {
+            let error = decode(0x82, &[0, 1, 0, 0, 3, b'a', b'/', b'#', bits], BOUNDS).unwrap_err();
+            assert_eq!((error.kind, error.reason), (ErrorKind::Malformed, 0x81));
         }
         kind(
             decode(0x82, b"\0\x01\0\0\x03a/#", BOUNDS),

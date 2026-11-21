@@ -361,3 +361,37 @@ fn a_fan_in_burst_closes_no_publisher() {
         "nothing reached the subscriber"
     );
 }
+
+/// A SUBSCRIBE with more filters than the broker takes in one request is
+/// answered, one result per filter, and the connection stays open
+/// (MQTT-3.8.4-1, MQTT-3.8.4-6): it used to be closed at the ninth filter.
+#[test]
+fn a_subscribe_over_the_filter_limit_is_answered_per_filter() {
+    let broker = Broker::start("many-filters");
+    let mut client = connect(broker.address, "many-filters");
+    let mut body = vec![0, 7, 0];
+    for index in 0..12u8 {
+        text(&format!("wake/filter/{index}"), &mut body);
+        body.push(0);
+    }
+    client.write_all(&packet(0x82, &body)).unwrap();
+    let (first, answer) = read_packet(&mut client);
+    assert_eq!(first, 0x90, "SUBACK expected");
+    assert_eq!(
+        &answer[..3],
+        &[0, 7, 0],
+        "packet identifier and no property"
+    );
+    assert_eq!(answer.len(), 3 + 12, "one result per filter");
+    assert!(
+        answer[3..].iter().all(|code| *code == 0x97),
+        "every filter refused for quota: {:?}",
+        &answer[3..]
+    );
+    client.write_all(&[0xc0, 0]).unwrap();
+    assert_eq!(
+        read_packet(&mut client).0,
+        0xd0,
+        "the connection stays open"
+    );
+}
