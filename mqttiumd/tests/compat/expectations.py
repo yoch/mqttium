@@ -22,6 +22,11 @@ A pattern is matched structurally:
 - `one_of(a, b, ...)` matches what one alternative matches; `CLOSED` is
   `one_of("eof", "reset")`;
 - `Each(count, allowed)` matches a list of `count` values of `allowed`;
+- `in_any_order(a, b, ...)` matches a list of as many values, each one
+  matching a pattern of its own: what a broker may send in any order
+  (the retained messages of several topics), each once and nothing else;
+- `at_most(bound)` matches an integer no greater than `bound` (the
+  `wire_bytes` of a packet against a Maximum Packet Size);
 - anything else matches an equal value of the same type.
 
 `expectations-open.json` lists the expectations mqttiumd is known to
@@ -69,17 +74,68 @@ class Each:
         self.count, self.allowed = count, tuple(allowed)
 
 
+class AnyOrder:
+    """Matches a list of as many values as `patterns`, in any order."""
+
+    def __init__(self, *patterns):
+        self.patterns = patterns
+
+
+class AtMost:
+    """Matches an integer no greater than `bound`."""
+
+    def __init__(self, bound: int):
+        self.bound = bound
+
+
 def one_of(*alternatives) -> OneOf:
     return OneOf(*alternatives)
 
 
+def in_any_order(*patterns) -> AnyOrder:
+    return AnyOrder(*patterns)
+
+
+def at_most(bound: int) -> AtMost:
+    return AtMost(bound)
+
+
 # How a read finds a connection the broker closed (harness.CLOSED).
 CLOSED = one_of("eof", "reset")
+# A record of more packets than this is shown by its counts per type.
+SHOWN = 8
+
+
+def paired(patterns, values) -> bool:
+    """Whether each value can be given a pattern of its own that it
+    matches: a perfect matching, found by augmenting paths, so that the
+    answer does not depend on which pattern a value is tried against
+    first."""
+    if len(patterns) != len(values):
+        return False
+    fits = [[index for index, pattern in enumerate(patterns) if matches(pattern, value)] for value in values]
+    owner: dict[int, int] = {}
+
+    def place(value: int, tried: set) -> bool:
+        for index in fits[value]:
+            if index in tried:
+                continue
+            tried.add(index)
+            if index not in owner or place(owner[index], tried):
+                owner[index] = value
+                return True
+        return False
+
+    return all(place(value, set()) for value in range(len(values)))
 
 
 def matches(pattern, value) -> bool:
     if isinstance(pattern, OneOf):
         return any(matches(alternative, value) for alternative in pattern.alternatives)
+    if isinstance(pattern, AnyOrder):
+        return isinstance(value, list) and paired(pattern.patterns, value)
+    if isinstance(pattern, AtMost):
+        return type(value) is int and value <= pattern.bound
     if isinstance(pattern, Each):
         return (isinstance(value, list) and len(value) == pattern.count
                 and all(any(matches(allowed, item) for allowed in pattern.allowed) for item in value))
@@ -132,14 +188,22 @@ def declared(registry: dict) -> dict:
 
 # -- evaluation ---------------------------------------------------------------
 
+# The fields of a packet that are always shown, each in its own form.
+ALWAYS = ("type", "packet_id", "reason", "codes", "properties")
+
+
 def mentioned_properties(pattern, out: dict) -> dict:
-    """`{packet type: property names}` that the patterns read."""
-    if isinstance(pattern, OneOf):
-        for alternative in pattern.alternatives:
-            mentioned_properties(alternative, out)
+    """`{packet type: names}` that the patterns read: the properties of a
+    packet of that type, and under `(type, "fields")` its other fields
+    that are not shown anyway."""
+    if isinstance(pattern, (OneOf, AnyOrder)):
+        for inner in (pattern.alternatives if isinstance(pattern, OneOf) else pattern.patterns):
+            mentioned_properties(inner, out)
     elif isinstance(pattern, dict):
-        if isinstance(pattern.get("type"), str) and isinstance(pattern.get("properties"), dict):
-            out.setdefault(pattern["type"], set()).update(pattern["properties"])
+        if isinstance(pattern.get("type"), str):
+            if isinstance(pattern.get("properties"), dict):
+                out.setdefault(pattern["type"], set()).update(pattern["properties"])
+            out.setdefault((pattern["type"], "fields"), set()).update(set(pattern) - set(ALWAYS))
         for inner in pattern.values():
             mentioned_properties(inner, out)
     elif isinstance(pattern, (list, tuple)):
@@ -156,6 +220,8 @@ def show_packet(packet: dict, properties: dict) -> str:
         parts.append(f"reason=0x{packet['reason']:02x}")
     if "codes" in packet:
         parts.append("codes=" + ",".join(f"0x{code:02x}" for code in packet["codes"]))
+    for name in sorted(properties.get((packet["type"], "fields"), ())):
+        parts.append(f"{name}={json.dumps(packet[name])}" if name in packet else f"{name} absent")
     for name in sorted(properties.get(packet["type"], ())):
         found = packet.get("properties", {})
         parts.append(f"{name}={json.dumps(found[name])}" if name in found else f"{name} absent")
@@ -165,7 +231,14 @@ def show_packet(packet: dict, properties: dict) -> str:
 def show(record, properties: dict) -> str:
     if record is None:
         return "no such record"
-    got = ", ".join(show_packet(packet, properties) for packet in record.get("got", ()))
+    packets = record.get("got", ())
+    if len(packets) > SHOWN:
+        counts: dict[str, int] = {}
+        for packet in packets:
+            counts[packet["type"]] = counts.get(packet["type"], 0) + 1
+        got = f"{len(packets)} packets: " + ", ".join(f"{count} {kind}" for kind, count in counts.items())
+    else:
+        got = ", ".join(show_packet(packet, properties) for packet in packets)
     return f"{record['op']} [{got}] {record.get('end', '')}".rstrip()
 
 
@@ -173,9 +246,10 @@ def evaluate(item: Expectation, transcript) -> tuple:
     """`(result, observed)` of one expectation on one raw transcript.
 
     `observed` is one line: the records the expectation reads, reduced to
-    packet types, identifiers, reason codes and the properties its
-    patterns name. A record that the transcript does not have matches
-    nothing.
+    packet types, identifiers, reason codes and the fields and properties
+    its patterns name; a record of more than `SHOWN` packets is reduced
+    to its counts per type. A record that the transcript does not have
+    matches nothing.
     """
     records = {record["mark"]: record for record in transcript if "mark" in record}
     properties = mentioned_properties([pattern for _, pattern in (*item.when, *item.then)], {})
