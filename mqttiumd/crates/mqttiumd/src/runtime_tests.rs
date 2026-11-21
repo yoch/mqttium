@@ -920,6 +920,147 @@ fn a_3_1_1_burst_beyond_the_receive_window_is_acknowledged_not_refused() {
     });
 }
 
+/// A connected MQTT 5 peer.
+fn connected(runtime: &mut Runtime<'_>, client_id: &[u8]) -> (ConnectionGeneration, TcpStream) {
+    let (generation, mut client) = peer(runtime);
+    runtime
+        .connect(generation, connect_packet(client_id))
+        .unwrap();
+    until(runtime, |r| r.session_requests.is_empty());
+    assert_eq!(read_frame(&mut client).0, 0x20);
+    (generation, client)
+}
+
+/// The business packets of a connection that wait in a lane of the core.
+fn business_packets(lane: &VecDeque<Input>, generation: ConnectionGeneration) -> usize {
+    lane.iter()
+        .filter(|input| business_connection(input) == Some(generation))
+        .count()
+}
+
+/// Reads the transports until `condition` holds, without giving the core
+/// any input: what the reading itself decides stays visible.
+fn read_until(runtime: &mut Runtime<'_>, condition: impl Fn(&Runtime<'_>) -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !condition(runtime) {
+        assert!(
+            Instant::now() < deadline,
+            "inputs={:?} deferred={:?}",
+            runtime.inputs,
+            runtime.deferred_inputs
+        );
+        runtime.connections().unwrap();
+        thread::sleep(Duration::from_millis(1));
+    }
+}
+
+/// The last places of the ordinary lane are kept for the packets that
+/// release capacity (acknowledgements, PINGREQ, DISCONNECT): a publication
+/// that arrives when only they are left waits with its transport, and a
+/// control packet of another connection still reaches the core (record
+/// 0046). When room returns the publication follows.
+#[test]
+fn the_last_places_of_the_lane_are_kept_for_packets_that_release_capacity() {
+    with_runtime(128, |runtime, _| {
+        let (publisher, mut publishing) = connected(runtime, b"reserve-publisher");
+        let (other, mut controlling) = connected(runtime, b"reserve-other");
+        until(runtime, |r| {
+            r.inputs.is_empty() && r.deferred_inputs.is_empty()
+        });
+        // Three places are left: more than the two a CONNECT needs, fewer
+        // than the lane keeps for control.
+        let mut filler = 0;
+        while runtime.ordinary_room() > 3 {
+            runtime.inputs.push_back(Input::DiscoverWills);
+            filler += 1;
+        }
+        publishing
+            .write_all(&[0x30, 4, 0, 1, b't', 0, 0xc0, 0])
+            .unwrap();
+        controlling.write_all(&[0xc0, 0]).unwrap();
+        let pings = |r: &Runtime<'_>, generation| {
+            r.inputs
+                .iter()
+                .filter(|input| {
+                    matches!(input, Input::Packet { connection, packet: InboundPacket::Pingreq, .. }
+                        if *connection == generation)
+                })
+                .count()
+        };
+        read_until(runtime, |r| pings(r, other) == 1);
+        // The publisher's lane was read too: several passes went by.
+        for _ in 0..20 {
+            runtime.connections().unwrap();
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(
+            business_packets(&runtime.inputs, publisher),
+            0,
+            "a publication took a place kept for control: {:?}",
+            runtime.inputs
+        );
+        assert_eq!(
+            pings(runtime, publisher),
+            0,
+            "a packet overtook the publication of its own connection"
+        );
+        assert!(runtime.peers[&publisher].closing.is_none());
+
+        // Room returns: the publication is taken, then what followed it.
+        for _ in 0..filler {
+            assert_eq!(runtime.inputs.pop_front(), Some(Input::DiscoverWills));
+        }
+        read_until(runtime, |r| pings(r, publisher) == 1);
+        assert_eq!(business_packets(&runtime.inputs, publisher), 1);
+        let order: Vec<bool> = runtime
+            .inputs
+            .iter()
+            .filter(|input| matches!(input, Input::Packet { connection, .. } if *connection == publisher))
+            .map(|input| business_connection(input).is_some())
+            .collect();
+        assert_eq!(order, [true, false], "the order of the connection");
+    });
+}
+
+/// While a business packet of a connection waits for capacity in the
+/// core, the next business packet of that connection waits with its
+/// transport: one connection cannot fill the lane with its own backlog.
+/// Another connection is still read.
+#[test]
+fn a_connection_with_a_deferred_packet_adds_no_further_business_packet() {
+    with_runtime(128, |runtime, _| {
+        let (waiting, mut first) = connected(runtime, b"deferred-waiting");
+        let (other, mut second) = connected(runtime, b"deferred-other");
+        until(runtime, |r| {
+            r.inputs.is_empty() && r.deferred_inputs.is_empty()
+        });
+        first.write_all(&[0x30, 4, 0, 1, b't', 0]).unwrap();
+        read_until(runtime, |r| business_packets(&r.inputs, waiting) == 1);
+        // The core found no capacity for it: it waits, in order.
+        let deferred = runtime.inputs.pop_back().unwrap();
+        runtime.deferred_inputs.push_back(deferred);
+
+        first.write_all(&[0x30, 4, 0, 1, b'u', 0]).unwrap();
+        second.write_all(&[0x30, 4, 0, 1, b'v', 0]).unwrap();
+        read_until(runtime, |r| business_packets(&r.inputs, other) == 1);
+        for _ in 0..20 {
+            runtime.connections().unwrap();
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(
+            business_packets(&runtime.inputs, waiting),
+            0,
+            "a second packet joined the backlog of its connection"
+        );
+        assert!(runtime.peers[&waiting].closing.is_none());
+
+        // The first packet is taken up again: the second follows it.
+        let resumed = runtime.deferred_inputs.pop_front().unwrap();
+        runtime.inputs.push_front(resumed);
+        read_until(runtime, |r| business_packets(&r.inputs, waiting) == 2);
+    });
+}
+
 /// The one-pass bindings are what a lookup per cached session answered,
 /// for attached and detached sessions alike.
 #[test]
