@@ -206,6 +206,14 @@
     "fingerprint": "041811d9fa699fcb"
   },
   {
+    "id": "subscribe/share-literal-filter-v4",
+    "class": "profile-refused",
+    "difference": "Mosquitto, which offers shared subscriptions to MQTT 3.1.1 clients too, grants `$share/group/lit/t` at QoS 0; mqttiumd reads it as an ordinary Topic Filter of MQTT 3.1.1 and refuses to hold it: SUBACK with return code 0x80 (Failure), connection kept.",
+    "statement": "MQTT-3.8.4-5 allows a return code that says the subscription failed",
+    "lot": "Shared subscriptions (CMP-002)",
+    "fingerprint": "427ec304ee5b275f"
+  },
+  {
     "id": "subscribe/shared-subscription-v5",
     "class": "profile-refused",
     "difference": "Mosquitto grants `$share/group/shared/t` and delivers to it; mqttiumd answers SUBACK 0x9E (Shared Subscriptions not supported), as its CONNACK announces, and delivers to the plain subscription only.",

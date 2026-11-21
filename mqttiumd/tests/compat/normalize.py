@@ -34,6 +34,7 @@ compares:
 - in a scenario declared with `closure="any"`, `eof` and `reset` both
   become `closed`: the kind of closure depends there on how much of the
   client's writing the broker had read when it closed;
+- a `mark`, which names a record for `expectations.py`, is removed;
 - no time is recorded;
 - properties are a mapping, so their wire order is not compared; user
   properties keep their order, which the specification makes significant.
@@ -146,6 +147,7 @@ def normalize(transcript, scenario) -> list:
     out = [tally(record) if record["op"] == "tally" else record for record in copy.deepcopy(transcript)]
     identifiers: dict[str, BrokerIdentifiers] = {}
     for record in out:
+        record.pop("mark", None)
         if record.pop("sort", False):
             record["got"].sort(key=packet_order)
         if scenario.closure == "any" and record.get("end") in CLOSED:

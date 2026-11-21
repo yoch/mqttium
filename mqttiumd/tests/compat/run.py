@@ -7,13 +7,17 @@
 
 Each scenario is played against a fresh instance of each broker. The two
 normalized transcripts are compared and the pair is joined with
-`divergences.json`. The run writes `matrix.md`, `matrix.json` and the
-transcripts, raw and normalized, in the output directory.
+`divergences.json`; the expectations a scenario declares are evaluated on
+mqttiumd's raw transcript and joined with `expectations-open.json`. The
+run writes `matrix.md`, `matrix.json` and the transcripts, raw and
+normalized, in the output directory.
 
-Exit status: 0 when every difference is classified and every classified
-difference still reproduces as it was read; 1 otherwise; 2 for a wrong
-command line or an unusable `divergences.json`. See README.md for what the
-result does and does not establish.
+Exit status: 0 when every difference is classified, every classified
+difference still reproduces as it was read, no broker had an incident that
+is not recorded, and every expectation passes or is listed as open; 1
+otherwise; 2 for a wrong command line or an unusable `divergences.json` or
+`expectations-open.json`. See README.md for what the result does and does
+not establish.
 """
 from __future__ import annotations
 
@@ -36,11 +40,12 @@ sys.path.insert(0, str(HERE))
 
 import classify  # noqa: E402
 import dsl  # noqa: E402
+import expectations  # noqa: E402
 import harness  # noqa: E402
 import normalize  # noqa: E402
 import scenarios  # noqa: E402,F401  (fills dsl.REGISTRY)
 
-FORMAT = "mqttiumd-compat-matrix-v1"
+FORMAT = "mqttiumd-compat-matrix-v2"
 RESULTS = (classify.SAME, *classify.CLASSES, classify.UNCLASSIFIED, classify.ERROR)
 # What the broker is built from: the last commit that changed one of these
 # names the content under test better than HEAD does.
@@ -153,6 +158,43 @@ def write_transcripts(directory: Path, result) -> str | None:
     return diff
 
 
+def evaluate_expectations(scenario, result, listed: dict) -> list:
+    """One row per expectation of a played scenario: its result on
+    mqttiumd's raw transcript, which is the one judged, and on the
+    reference's, for information."""
+    rows = []
+    for item in scenario.expectations:
+        identifier = f"{scenario.name}#{item.name}"
+        row = {"id": identifier, "scenario": scenario.name, "name": item.name, "version": scenario.version,
+               "statement": item.statement, "requires": item.requires, "open": identifier in listed}
+        for backend in harness.BACKENDS:
+            row[backend], row[backend + "_observed"] = expectations.evaluate(item, result["raw"][backend])
+        rows.append(row)
+    return rows
+
+
+def summarize_expectations(rows) -> dict:
+    counts = {result: sum(1 for row in rows if row[harness.BROKER] == result) for result in expectations.RESULTS}
+    return {**counts, "open": sum(1 for row in rows if row["open"])}
+
+
+def expectation_lines(rows) -> list:
+    counts = summarize_expectations(rows)
+    lines = ["## Expectations on mqttiumd's transcript", "",
+             "What a normative statement requires of the broker in a scenario, whatever Mosquitto",
+             "does there. A `fail` is listed in `expectations-open.json` or fails the run; the",
+             "column of the reference is information.", "",
+             f"{len(rows)} expectations: {counts[expectations.PASS]} `pass`, {counts[expectations.FAIL]} `fail` "
+             f"({counts['open']} listed as open), {counts[expectations.NOT_APPLICABLE]} `not-applicable`.", "",
+             "| Expectation | MQTT | Statement | Requires | mqttiumd | Observed on mqttiumd | Mosquitto |",
+             "| - | - | - | - | - | - | - |"]
+    for row in rows:
+        result = row[harness.BROKER] + (" (open)" if row["open"] else "")
+        lines.append(f"| `{row['id']}` | {row['version']} | {cell(row['statement'])} | {cell(row['requires'])} | "
+                     f"{result} | {cell(row[harness.BROKER + '_observed'])} | {row[harness.REFERENCE]} |")
+    return [*lines, ""]
+
+
 def summarize(rows) -> dict:
     by_result = {result: 0 for result in RESULTS}
     by_area = {area: {result: 0 for result in RESULTS} for area in dsl.AREAS}
@@ -209,6 +251,8 @@ def markdown(matrix) -> str:
                   + (" (recorded in `divergences.json`)" if item["recorded"] else " (**not recorded**)")
                   for item in matrix["incidents"]]
         lines.append("")
+    if matrix["expectations"]:
+        lines += expectation_lines(matrix["expectations"])
     lines += ["## Scenarios", "", "| Scenario | MQTT | Result | Note |", "| - | - | - | - |"]
     for row in rows:
         note = row["difference"] or row["doc"]
@@ -288,6 +332,11 @@ def main(argv=None) -> int:
     except (classify.DivergenceError, json.JSONDecodeError) as error:
         print(f"divergences.json: {error}", file=sys.stderr)
         return 2
+    try:
+        listed = expectations.load_open(HERE / "expectations-open.json")
+    except (expectations.OpenError, json.JSONDecodeError) as error:
+        print(f"expectations-open.json: {error}", file=sys.stderr)
+        return 2
 
     started = time.monotonic()
     with tempfile.TemporaryDirectory(prefix="mqttiumd-compat-") as scratch:
@@ -303,11 +352,14 @@ def main(argv=None) -> int:
     observed = {result["name"]: (result["status"], result["fingerprint"]) for result in results}
     classes, problems = classify.judge(observed, divergences, set(registry))
     versions = {name: entry.version for name, entry in registry.items()}
-    problems += classify.check_statements(divergences, versions, classify.known_statements(HERE.parents[2] / "docs/spec"))
+    statements = classify.known_statements(HERE.parents[2] / "docs/spec")
+    problems += classify.check_statements(divergences, versions, statements)
+    declared = expectations.declared(registry)
+    problems += expectations.check_statements(declared, versions, statements)
 
     args.out.mkdir(parents=True, exist_ok=True)
     transcripts = args.out / "transcripts"
-    rows, incidents = [], []
+    rows, incidents, expected = [], [], []
     for result in results:
         name = result["name"]
         scenario = registry[name]
@@ -324,6 +376,7 @@ def main(argv=None) -> int:
             continue
         if diff is not None and args.verbose:
             print(f"--- {name} [{classes[name]}] fingerprint {result['fingerprint']}\n{diff}\n")
+        expected += evaluate_expectations(scenario, result, listed)
         for backend, incident in result["incidents"].items():
             recorded = set(entry.get("incident", {}).get(backend, ()))
             incidents.append({"scenario": name, "backend": backend, "kinds": incident["kinds"],
@@ -331,6 +384,7 @@ def main(argv=None) -> int:
     problems += classify.judge_incidents(
         {result["name"]: {backend: incident["kinds"] for backend, incident in result["incidents"].items()}
          for result in results if result["status"] != classify.ERROR}, classes, divergences)
+    problems += expectations.judge({row["id"]: row[harness.BROKER] for row in expected}, listed, declared)
 
     problems.sort()
     summary = summarize(rows)
@@ -338,12 +392,19 @@ def main(argv=None) -> int:
               "reference": {"version": version, "sha256": sha256(reference)},
               "broker": {"commit": broker_commit(), "sha256": sha256(broker)},
               "complete": not args.only, "scenario_count": len(rows), "summary": summary,
-              "problems": [list(item) for item in problems], "incidents": incidents, "scenarios": rows}
+              "problems": [list(item) for item in problems], "incidents": incidents,
+              "expectations": expected, "expectation_summary": summarize_expectations(expected), "scenarios": rows}
     (args.out / "matrix.json").write_text(json.dumps(matrix, indent=1, sort_keys=True) + "\n")
     (args.out / "matrix.md").write_text(markdown(matrix))
 
     print("\n".join(summary_table(summary)))
     print(f"\n{len(rows)} scenarios in {elapsed:.1f} s; matrix in {args.out}")
+    counts = matrix["expectation_summary"]
+    print(f"{len(expected)} expectations on mqttiumd: {counts[expectations.PASS]} pass, {counts[expectations.FAIL]} "
+          f"fail ({counts['open']} listed as open), {counts[expectations.NOT_APPLICABLE]} not applicable")
+    for row in expected:
+        if args.verbose or row[harness.BROKER] != expectations.PASS:
+            print(f"EXPECTATION {row['id']}: {row[harness.BROKER]}: {row[harness.BROKER + '_observed']}")
     for item in incidents:
         print(f"INCIDENT {item['scenario']}: {item['backend']} {item['what']}"
               + (" (recorded)" if item["recorded"] else ""))

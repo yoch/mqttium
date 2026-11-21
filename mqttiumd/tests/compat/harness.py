@@ -253,6 +253,8 @@ class Player:
             for step in steps:
                 record = getattr(self, "do_" + step["op"])(step)
                 if record is not None:
+                    if "mark" in step:
+                        record["mark"] = step["mark"]
                     self.transcript.append(record)
         finally:
             self.close_all()

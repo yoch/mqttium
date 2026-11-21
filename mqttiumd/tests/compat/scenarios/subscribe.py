@@ -1,8 +1,28 @@
 """SUBSCRIBE, SUBACK, UNSUBSCRIBE: grants, wildcards, `$` topics, invalid filters, MQTT 5 options."""
 import mqttwire as wire
 from mqttwire import sub_options
-from dsl import (collect, connect, publish, publish_ack, publish_qos2, publish_sync, quiet, recv, scenario, send,
-                 subscribe, until_close)
+from dsl import (collect, connect, mark, publish, publish_ack, publish_qos2, publish_sync, quiet, recv, scenario,
+                 send, subscribe, until_close)
+from expectations import CLOSED, Each, at, expectation, one_of
+
+# SUBACK return codes of MQTT 3.1.1: a granted QoS, or failure.
+RETURN_CODES = (0, 1, 2, 0x80)
+
+
+def refused_as_protocol_error(capability, reason, section):
+    """The expectation of a MQTT 5 SUBSCRIBE that uses a feature the CONNACK
+    of the broker announced as not available: a Protocol Error with a
+    Reason Code of its own."""
+    return expectation(
+        "refusal",
+        statement=f"MQTT-4.13.1-1, with section {section}: the Protocol Error has the Reason Code 0x{reason:02X}",
+        requires=f"Where CONNACK announces {capability.replace('_', ' ').title()} 0: the connection is closed, and a "
+                 f"DISCONNECT sent before closing carries 0x{reason:02X}",
+        when=[at("connack", {"got": [{"type": "CONNACK", "properties": {capability: 0}}]})],
+        then=[at("answer", one_of({"got": [{"type": "DISCONNECT", "reason": reason}], "end": "ok"},
+                                  {"got": [], "end": CLOSED})),
+              at("after", {"got": [], "end": CLOSED})],
+    )
 
 
 def matching(name, topic_filter, topics, doc):
@@ -89,7 +109,40 @@ scenario(
 scenario(
     "subscribe/twelve-filters-v4",
     doc="One SUBSCRIBE packet with twelve Topic Filters is answered by a SUBACK with twelve granted QoS.",
-    steps=[connect("a", "s-twelve"), subscribe("a", 1, [(f"twelve/{index}", 0) for index in range(12)]), quiet("a")],
+    steps=[connect("a", "s-twelve"), subscribe("a", 1, [(f"twelve/{index}", 0) for index in range(12)]),
+           mark("answer"), quiet("a")],
+    expectations=[expectation(
+        "suback", statement="MQTT-3.8.4-5",
+        requires="A SUBACK with twelve return codes, each a granted QoS or 0x80 (Failure)",
+        then=[at("answer", {"got": [{"type": "SUBACK", "packet_id": 1, "codes": Each(12, RETURN_CODES)}],
+                            "end": "ok"})])],
+)
+
+scenario(
+    "subscribe/share-literal-filter-v4",
+    doc="""MQTT 3.1.1 has no shared subscriptions: `$share/group/lit/t` is a Topic Filter
+    like another, and its SUBSCRIBE is answered by a SUBACK.""",
+    steps=[connect("a", "s-literal"), subscribe("a", 0x0A01, [("$share/group/lit/t", 0)]), mark("answer"),
+           quiet("a")],
+    expectations=[expectation(
+        "suback",
+        statement="MQTT-3.8.4-1, with MQTT-3.8.4-2 for the Packet Identifier and MQTT-3.8.4-5 for the return code",
+        requires="A SUBACK with the Packet Identifier of the SUBSCRIBE and one return code, a granted QoS or "
+                 "0x80 (Failure)",
+        then=[at("answer", {"got": [{"type": "SUBACK", "packet_id": 0x0A01, "codes": Each(1, RETURN_CODES)}],
+                            "end": "ok"})])],
+)
+
+scenario(
+    "subscribe/unsubscribe-share-filter-v4",
+    doc="""A MQTT 3.1.1 UNSUBSCRIBE of `$share/group/lit/t`, which was never subscribed, is
+    acknowledged like the one of any other Topic Filter.""",
+    steps=[connect("a", "s-unliteral"), send("a", wire.unsubscribe(0x0A02, ["$share/group/lit/t"])), recv("a"),
+           mark("answer"), quiet("a")],
+    expectations=[expectation(
+        "unsuback", statement="MQTT-3.10.4-5, with MQTT-3.10.4-4 for the Packet Identifier",
+        requires="An UNSUBACK with the Packet Identifier of the UNSUBSCRIBE, although no subscription is deleted",
+        then=[at("answer", {"got": [{"type": "UNSUBACK", "packet_id": 0x0A02}], "end": "ok"})])],
 )
 
 scenario(
@@ -142,22 +195,38 @@ scenario(
     doc="""A shared subscription `$share/group/shared/t` with one member receives the
     messages of `shared/t`, as does a plain subscription of another client.""",
     steps=[
-        connect("m", "s-share-m", level=5), subscribe("m", 1, [("$share/group/shared/t", 1)], level=5),
+        connect("m", "s-share-m", level=5), mark("connack"),
+        subscribe("m", 1, [("$share/group/shared/t", 1)], level=5), mark("answer"),
         connect("p", "s-share-p", level=5), subscribe("p", 1, [("shared/t", 0)], level=5),
         connect("pub", "s-share-pub", level=5), publish_ack("pub", "shared/t", "for-the-group", level=5),
-        collect("m"), collect("p"),
+        collect("m"), mark("after"), collect("p"),
     ],
+    expectations=[refused_as_protocol_error("shared_subscription_available", 0x9E, "3.2.2.3.13")],
 )
 
 scenario(
     "subscribe/subscription-identifier-v5",
     doc="A Subscription Identifier given at SUBSCRIBE comes back in the matching PUBLISH.",
     steps=[
-        connect("sub", "s-subid-sub", level=5),
-        subscribe("sub", 1, [("subid/t", 0)], level=5, props={"subscription_identifier": 7}),
+        connect("sub", "s-subid-sub", level=5), mark("connack"),
+        subscribe("sub", 1, [("subid/t", 0)], level=5, props={"subscription_identifier": 7}), mark("answer"),
         connect("pub", "s-subid-pub", level=5), publish_sync("pub", "subid/t", "tagged", level=5),
-        collect("sub"),
+        collect("sub"), mark("after"),
     ],
+    expectations=[refused_as_protocol_error("subscription_identifier_available", 0xA1, "3.2.2.3.12")],
+)
+
+scenario(
+    "subscribe/reserved-option-bits-v5",
+    doc="""A SUBSCRIBE whose Subscription Options byte has a reserved bit set (0x40) is a
+    Malformed Packet: the connection is closed.""",
+    steps=[connect("a", "s-reserved", level=5),
+           send("a", wire.subscribe(1, [("reserved/t", sub_options(0, reserved=1))], level=5)),
+           until_close("a"), mark("closure")],
+    expectations=[expectation(
+        "closure", statement="MQTT-3.8.3-5, with MQTT-4.13.1-1 for the closure",
+        requires="The connection is closed, and a DISCONNECT sent before closing carries 0x81 (Malformed Packet)",
+        then=[at("closure", {"got": one_of([], [{"type": "DISCONNECT", "reason": 0x81}]), "end": CLOSED})])],
 )
 
 scenario(
