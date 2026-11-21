@@ -5,7 +5,11 @@
 #   tools/run_loop_mutants.sh [--backend sim-store|sqlite]
 #
 # The runner plays every mutation on the backend given (sim-store when
-# none is); an entry that names `backends` is played only on those.
+# none is); an entry that names `backends` is played only on those. An
+# entry that names `runner_backend` is played by the runner on that
+# backend instead, on the runs its `backends` select: the mutation of the
+# grouped writer (sqlite-group, record 0045) is played with the SQLite
+# mutations.
 # Each mutation of tests/mutants/loop/ is a unified diff named *.mutant
 # (the root .gitignore ignores *.patch and *.diff as review artefacts). It
 # is applied to a temporary worktree of the repository, never to the
@@ -48,6 +52,7 @@ for id in $ids; do
     patch="$here/tests/mutants/loop/$(field patch)"
     scenario=$(field scenario)
     process=$(field process)
+    runner_backend=$(field runner_backend)
     tree="$work/tree-$id"
     git -C "$repository" worktree add -q --detach "$tree" HEAD
     if ! git -C "$tree" apply "$patch"; then
@@ -57,7 +62,7 @@ for id in $ids; do
     fi
     campaign="$work/campaign-$id"
     if ! (cd "$tree/mqttiumd" && CARGO_TARGET_DIR="$work/target" cargo run -q -p mqttiumd-lab --locked -- \
-        run --contracts contracts/v1 --scenario "$scenario" --out "$campaign" --backend "$backend" \
+        run --contracts contracts/v1 --scenario "$scenario" --out "$campaign" --backend "${runner_backend:-$backend}" \
         ${process:+--process "$process"} >/dev/null); then
         echo "$id: no campaign was written"
         failures=$((failures + 1))

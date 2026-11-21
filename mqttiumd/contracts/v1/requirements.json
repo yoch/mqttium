@@ -247,7 +247,7 @@
     {
       "decision": "0045",
       "path": "docs/decisions/0045-group-commit.md",
-      "sha256": "dd67e73429241c8915dbb7b88db98369beb576f87949d196879917d4b859aa8f"
+      "sha256": "2ce338365bfb985e85bdecf30eaf0c4dd37b1ce3216643cfc98ecacfaa7beda2"
     },
     {
       "decision": "0046",

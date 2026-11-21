@@ -18,7 +18,7 @@ const USAGE: &str = "\
 usage:
   mqttiumd-lab validate --contracts <dir> [--scenario <file>]... [--file <file>]... [--root <dir>]
   mqttiumd-lab manifest [--contracts <dir>] [--root <dir>]
-  mqttiumd-lab run --contracts <dir> --scenario <file> --out <dir> [--seed <n>] [--run-id <slug>] [--backend sim-store|sqlite] [--process in-process|child] [--rebuild] [--root <dir>]
+  mqttiumd-lab run --contracts <dir> --scenario <file> --out <dir> [--seed <n>] [--run-id <slug>] [--backend sim-store|sqlite|sqlite-group] [--process in-process|child] [--rebuild] [--root <dir>]
 
 Paths are relative to --root, which defaults to the current directory.
 Exit codes: 0 PASS, 1 FAIL, 2 INCONCLUSIVE, 3 OUT_OF_SCOPE (DEM-023).
@@ -27,7 +27,11 @@ run computes no verdict: it exits 0 when the campaign directory was
 written, whatever the oracle will find in it, and 2 when no campaign
 could be written; it refuses an --out inside the work tree of the
 repository, where a campaign never goes. --process child runs the
-process under test in a child process of this binary (sqlite only). The oracle judges the directory (--root <out>).";
+process under test in a child process of this binary (sqlite only).
+--backend sqlite-group is the SQLite store with a writer that commits
+the commands waiting together in one transaction (record 0045); the
+trace and the manifest name the store, sqlite. The oracle judges the
+directory (--root <out>).";
 
 /// Invalid configuration prevents a conclusion (DEM-023).
 const INCONCLUSIVE: u8 = 2;

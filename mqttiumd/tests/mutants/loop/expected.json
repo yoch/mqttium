@@ -1,7 +1,7 @@
 {
   "format": "mqttiumd-lab.loop-mutants",
   "version": 1,
-  "description": "Mutations of the real loop of lot L4: each patch, applied to a temporary worktree of the repository, is played by the runner and judged by the oracle of the unmodified tree. A rejected mutation must get the verdict, the assertion with its status (FAIL unless `assertion_status` says otherwise) and a reason holding the fragment below; when `stopped` is given, the campaign must also say that the run stopped, with that fragment. An entry that names `backends` is played only on those (`tools/run_loop_mutants.sh --backend <name>`); one that names none, on every backend. An entry that names `process` is played with `--process` of that value (the process under test in a child process). A known survivor is reported and does not fail the run until the finding it names is merged.",
+  "description": "Mutations of the real loop of lot L4: each patch, applied to a temporary worktree of the repository, is played by the runner and judged by the oracle of the unmodified tree. A rejected mutation must get the verdict, the assertion with its status (FAIL unless `assertion_status` says otherwise) and a reason holding the fragment below; when `stopped` is given, the campaign must also say that the run stopped, with that fragment. An entry that names `backends` is played only on those (`tools/run_loop_mutants.sh --backend <name>`); one that names none, on every backend. An entry that names `process` is played with `--process` of that value (the process under test in a child process). An entry that names `runner_backend` is played by the runner with `--backend` of that value, on the runs its `backends` select: the writer of `sqlite-group` commits the commands waiting together in one transaction of the SQLite store (record 0045), and its mutation is played when the script runs for `sqlite`. A known survivor is reported and does not fail the run until the finding it names is merged.",
   "mutants": [
     {
       "id": "m1-payload-owed-lost",
@@ -72,6 +72,22 @@
       "verdict": "FAIL",
       "assertion": "terminal_knowledge_never_regresses",
       "reason": "follows from the unknown answer of record"
+    },
+    {
+      "id": "g1-group-answered-without-commit",
+      "patch": "g1-group-answered-without-commit.mutant",
+      "mutation": "SqliteStore::apply_group rolls the transaction of a group back and answers every member as if the group had committed",
+      "scenario": "tests/scenarios/group/GROUP-ACK.json",
+      "backends": [
+        "sqlite"
+      ],
+      "runner_backend": "sqlite-group",
+      "not_on": "the mutation is in the group commit of the SQLite store, which the deterministic backend does not run",
+      "expect": "rejected",
+      "verdict": "FAIL",
+      "assertion": "one_admission_per_observed_inbound_exchange",
+      "reason": "was acknowledged and has no admission",
+      "note": "Two admissions wait together and commit as one group; the store answers both Committed and holds neither. Each exchange is acknowledged by a PUBREC the peer observes, and the inspections that follow show no admission, no obligation and no recipe: same_required_obligations_at_both_checkpoints and same_recipe_for_op_A fail too. The run ends there, so the trace is complete and the rejection is a FAIL. Played with one transaction for each command (--backend sqlite), the same patch is not reached and the run passes: a group of one is apply."
     },
     {
       "id": "n1-decisive-record-withheld-by-the-child",
