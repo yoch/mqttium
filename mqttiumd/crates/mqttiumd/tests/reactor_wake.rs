@@ -765,3 +765,69 @@ fn a_request_with_many_filters_is_served_like_its_unit_requests() {
         }
     }
 }
+
+/// The Receive Maximum of the CONNACK is a promise to every client at
+/// once. A hundred clients each open the eight QoS 2 exchanges it allows, all
+/// together, and answer every PUBREC with its PUBREL as it arrives: they
+/// respect the window and give the broker what it needs to finish. The
+/// broker holds fewer exchange credits than the windows add up to, so
+/// some publications wait; none of these clients may be closed for it,
+/// and every exchange completes (counter-audit of bbe1453: a peer that
+/// had already sent the PUBREL its own progress needed was closed).
+#[test]
+fn clients_that_fill_their_announced_window_together_all_complete() {
+    // Far more exchanges than the broker has credits (128): the first
+    // packets read take them all, and every client that holds one has
+    // later publications waiting and its PUBRELs behind them in its stream.
+    const CLIENTS: usize = 100;
+    const WINDOW: u16 = 8;
+    let broker = Broker::start("duplex-window");
+    let start = std::sync::Arc::new(std::sync::Barrier::new(CLIENTS));
+    let clients: Vec<_> = (0..CLIENTS)
+        .map(|index| {
+            let mut stream = connect(broker.address, &format!("duplex-{index}"));
+            let start = start.clone();
+            std::thread::spawn(move || -> Result<u16, String> {
+                let mut burst = Vec::new();
+                for id in 1..=WINDOW {
+                    let mut body = Vec::new();
+                    text(&format!("duplex/{index}"), &mut body);
+                    body.extend_from_slice(&id.to_be_bytes());
+                    body.push(0);
+                    body.extend_from_slice(b"payload");
+                    burst.extend_from_slice(&packet(0x34, &body));
+                }
+                start.wait();
+                stream
+                    .write_all(&burst)
+                    .map_err(|error| error.to_string())?;
+                let mut completed = 0;
+                while completed < WINDOW {
+                    let mut first = [0u8; 2];
+                    stream
+                        .read_exact(&mut first)
+                        .map_err(|error| format!("after {completed} PUBCOMP: {error}"))?;
+                    let mut body = vec![0; usize::from(first[1])];
+                    stream
+                        .read_exact(&mut body)
+                        .map_err(|error| error.to_string())?;
+                    match first[0] {
+                        // PUBREC: a failure Reason Code would be a refusal.
+                        0x50 if body.len() == 2 || body[2] < 0x80 => stream
+                            .write_all(&[0x62, 2, body[0], body[1]])
+                            .map_err(|error| error.to_string())?,
+                        0x70 => completed += 1,
+                        other => return Err(format!("packet {other:#x} {body:?}")),
+                    }
+                }
+                Ok(completed)
+            })
+        })
+        .collect();
+    for (index, client) in clients.into_iter().enumerate() {
+        match client.join().unwrap() {
+            Ok(completed) => assert_eq!(completed, WINDOW),
+            Err(error) => panic!("client {index}: {error}\n{}", broker.refusals()),
+        }
+    }
+}
