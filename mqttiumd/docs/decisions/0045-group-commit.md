@@ -17,6 +17,14 @@ not qualified by an oracle campaign and says nothing of a volatile
 backend. What "Left open" lists stays owed, first of all a permanent test
 that kills the real worker between two answers of a group.
 
+Update of 21 November 2026, after the independent counter-audit of
+`bbe1453`: the two probes of that audit are permanent tests, named under
+"Consequences" (the real worker killed after each number of answers of a
+group, and a commit that is durable while its call returns an error), the
+paragraph on a group that is not committed says that such a commit exists,
+and the model `MGroupCommit` has that outcome and the reconciliation that
+follows it. The decision itself is unchanged.
+
 ## Context
 
 Every command of the SQLite store is one `BEGIN IMMEDIATE` … `COMMIT`
@@ -85,6 +93,19 @@ charged: the accounts are in the meta row, rolled back with the rest.
 `established` and `resolve_and_fence` then behave on these identities as
 after a failed `apply`.
 
+**A commit whose call fails may be durable.** One of these cases is not a
+rollback. SQLite returns the result of its write-ahead-log callback as the
+result of `COMMIT`, after the transaction was logged and synchronised: the
+call can return an error for a group that is durable. `apply_group` cannot
+tell that case from a commit that failed and answers the same,
+`PendingOrUnknown` for every member, which is then true of members that
+are all in the file, with their quotas charged as a commit charges them.
+The answer says nothing certain, in either direction, and the caller
+reconciles by identity: `established` and `resolve_and_fence` find each
+member with its outcome and fence nothing, and the group presented again
+is recognised member by member without a write. The same holds for
+`apply`, whose commit is the same call.
+
 A group in which no member staged anything has nothing to commit. Its
 answers were read from the state that was durable before it, as `apply`
 reads them, and are returned as they are, also while the medium fails.
@@ -130,6 +151,60 @@ are exactly as after sequential application.
   the same. The largest group of the largest admissions is bounded by the
   accounts of the store, and the member that does not fit is refused
   alone.
+- **Answers delivered in part.** The members of a group are committed
+  together and their answers reach the core one by one, through the
+  bounded reply lane. `crates/mqttiumd/tests/writer_group_kill.rs` drives
+  the real worker (`writer::Writer`, a real SQLite file, the normal build,
+  no test control armed) in a child process: one group of five commands,
+  three admissions towards two sessions and two releases, is committed,
+  the consumer takes k of the five answers, and the parent kills the
+  child with `SIGKILL`, for each k from none to four
+  (`a_worker_killed_before_any_answer_of_its_group_left_every_member`,
+  `a_worker_killed_after_one_answer_of_its_group_left_every_member`,
+  `a_worker_killed_after_two_answers_of_its_group_left_every_member`,
+  `a_worker_killed_after_three_answers_of_its_group_left_every_member`,
+  `a_worker_killed_after_all_answers_but_one_of_its_group_left_every_member`).
+  The size of
+  the group is read on the `store_group` record of the worker. Whatever k
+  was, the reopened file holds a receipt for each member, the three
+  publications and an obligation towards each target, two exchanges
+  released and one open. A new worker that is given the same commands
+  recognises them as one group, answers each in request order with the
+  outcome of its receipt, records `wrote` false for each, and leaves the
+  durable state unchanged down to its revision. The group is formed
+  without a seam: the worker takes no request while a reply of its own
+  waits for room in the reply lane, so the test leaves that lane full,
+  queues the commands and then reads.
+- **A commit that is durable and whose call returns an error.**
+  `crates/mqttiumd-store-sqlite/src/commit_error_tests.rs` installs, on
+  the connection of a store, a write-ahead-log callback that returns an
+  error: the engine linked into the product (SQLite 3.54.1) then returns
+  an error from a `COMMIT` it has logged
+  (`the_engine_reports_an_error_for_a_commit_it_made_durable`). A group of
+  five members, one of them refused and recorded, is answered
+  `PendingOrUnknown` for every member while every member is in the file
+  and in an image of the file copied at that moment; `established` and
+  `resolve_and_fence` find each member with the outcome a second SQLite
+  store and the deterministic store gave to the same commands applied one
+  after the other, and fence nothing; the group presented again is
+  recognised member by member, `wrote` false, no row changed, no second
+  admission or release; and the same holds once the file was closed and
+  opened again
+  (`a_group_whose_durable_commit_returns_an_error_is_reconciled_without_a_second_effect`).
+  `apply` is covered alike for an admission, its release and a rejection,
+  whose failing commit is the one of its receipt
+  (`a_command_whose_durable_commit_returns_an_error_is_reconciled_without_a_second_effect`).
+  Only a test inside the crate can reach the connection: no way to
+  inject this exists in any build. The tests need the callback interface
+  of the binding and run under the feature `kill-points`.
+- **The model has that outcome.** In `MGroupCommit` the commit of a group
+  returns, fails, or is durable while its call returns an error; the last
+  two answer unknown for every member. The caller then resolves each
+  member by its identity or presents its command again. Three invariants
+  are added: no answer is certain after such a commit, what a
+  reconciliation says is what the disk holds, and no operation takes
+  effect twice. A mutant that believes the error and applies the command
+  again is caught by the last one. The sidecar names the tests above.
 - The bytes of a group need no limit of their own. The worker forms a
   group of at most 32 commands, the store accepts at most 64, and each
   command is bounded by the limits of the store (one payload of at most
@@ -159,13 +234,15 @@ are exactly as after sequential application.
   the bounds of the members (see above) instead of a limit of the group.
   No group is formed while test controls are armed, so the instrumented
   receptions exercise groups of one.
-- **Answers delivered in part.** The members of a group are committed
-  together and their answers reach the core one by one. A process that
-  dies in between has delivered some and not the others; the store then
-  holds every member, which is the case of the lost answers above. The
-  audit observed it on the real worker (one answer of two published,
-  then a kill, then both recognised without a write). No permanent test
-  drives the worker itself through that kill.
+- **The core after such a kill.** The kill test presents the commands of
+  the group again to a new worker. The product does not: after a restart
+  the core learns what is durable from the recovery pages and resolves
+  what it holds by identity. No test drives the runtime itself, with
+  client connections, through a kill between two answers of a group.
+- **A durable commit with an error, through the worker.** The tests of
+  that case call the store. The worker turns the unknown answers into
+  replies like any others, and what the core does with them is its
+  handling of `PendingOrUnknown`, which no test exercises on a group.
 - **A lost diagnostic.** A recipe presented under an identity that
   already holds another recipe is a violation (`RecipeMismatch`) when it
   is applied alone. Inside a group that is not committed it is answered
@@ -176,15 +253,13 @@ are exactly as after sequential application.
   reaches; a group that failed would hide such a defect.
 - **Model.** M1 models the atomic `Commit` of one `ApplyCommand`. A group
   is K `ApplyCommand` steps with no crash between them; the TLA+ model
-  `MGroupCommit` (`models/group-commit`) states it and names the tests of
-  `tests/group_commit.rs`. It has not been reviewed independently.
+  `MGroupCommit` (`models/group-commit`) states it and names the tests
+  that replay it. Neither the model nor its extension of 21 November 2026
+  has been reviewed independently.
 - **The other controls.** `resolve_and_fence`, the receipt collections,
   `admin`, `expire_messages`, `checkpoint_session_clock` and `open_epoch`
   stay one transaction each and are not members of a group.
 - **The deterministic store** has no group: it is the sequential
   reference the differential tests judge the adapter by. A campaign of
   the oracle does not exercise `apply_group`.
-- **The model** `MGroupCommit` has no outcome "the commit is durable and
-  an error is returned"; the lost answers above are its executable
-  counterpart.
 - **Volatile backend** of ARC-020: not addressed.

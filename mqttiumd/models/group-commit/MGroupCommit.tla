@@ -18,11 +18,22 @@
 (*   nothing staged: return the answers           Decide                   *)
 (*   K1 store.commit.prepared; COMMIT             Commit                   *)
 (*   return the answers                           Release                  *)
+(*   the caller, for a member it knows nothing certain about:              *)
+(*     resolve_and_fence by its identity          Resolve                  *)
+(*     the same command presented again           Represent                *)
 (*                                                                         *)
 (* An answer leaves the store only after COMMIT returned. A group that     *)
 (* staged a write and was not committed answers PendingOrUnknown for       *)
 (* every member. A process killed before the COMMIT is logged leaves no    *)
 (* member; killed after it, every member.                                  *)
+(*                                                                         *)
+(* COMMIT has three results. It returns and the group is durable. It       *)
+(* fails and nothing is durable. Or the group is durable and the call      *)
+(* returns an error: the engine reports the result of its write-ahead-log  *)
+(* callback, which runs after the commit was logged. The store cannot      *)
+(* tell the last two apart and answers PendingOrUnknown for every member   *)
+(* in both. The caller then reconciles each member by its identity; that   *)
+(* never gives an operation a second effect.                               *)
 (*                                                                         *)
 (* The model takes from the engine that COMMIT is atomic, that ROLLBACK    *)
 (* TO restores the state at its SAVEPOINT, and that a transaction which    *)
@@ -31,7 +42,9 @@
 (* store returns the answers together; the worker publishes them one       *)
 (* member at a time, in the order of the requests. How the worker forms    *)
 (* a group from its request lane is not here. The history of the verifier  *)
-(* (prefix h) is read by no guard.                                         *)
+(* (prefix h, and `effects`) is read by no guard of the store or of the    *)
+(* worker; the mutation UncertainIsNotCommitted alone reads hCommit, to    *)
+(* model a caller that believes the error of the commit call.              *)
 (***************************************************************************)
 EXTENDS Naturals, Sequences, FiniteSets
 
@@ -42,7 +55,8 @@ CONSTANTS
     Faults,     \* reads, writes and the commit may fail, the engine may drop
     Mutation    \* "none" or the name of a model mutation
 
-Mutations == {"none", "ReleaseBeforeCommit", "RefusalAbortsGroup", "ReleaseAtSavepoint"}
+Mutations == {"none", "ReleaseBeforeCommit", "RefusalAbortsGroup", "ReleaseAtSavepoint",
+              "UncertainIsNotCommitted"}
 
 ASSUME /\ NumMembers \in Nat \ {0}
        /\ Repeats \subseteq 2..NumMembers /\ Settled \subseteq 1..NumMembers
@@ -59,7 +73,7 @@ InitDurable == [o \in Ops |-> IF o \in Settled THEN "applied" ELSE "absent"]
 AllUnknown == [m \in Members |-> "Unknown"]
 
 VARIABLES
-    durable,   \* per operation: "absent", "applied" or "rejected", on disk
+    durable,   \* per operation: "absent", "applied", "rejected" or "fenced", on disk
     staged,    \* per operation: what the open transaction holds
     sp,        \* `staged` at the SAVEPOINT of the member in progress
     pc,        \* the store worker
@@ -67,11 +81,14 @@ VARIABLES
     reply,     \* per member: the answer computed, or "none"
     wrote,     \* per member: it staged something (Applied::wrote)
     released,  \* per member: the answer handed to the caller, or "none"
+    known,     \* per member: what the caller learnt by reconciling, or "none"
+    effects,   \* per operation: how many times its effect was made durable
     hVerdict,  \* per member: what staging decided
-    hCommit,   \* "none", "ok" or "failed"
+    hCommit,   \* "none", "ok", "failed" or "uncertain"
     hCrashAt   \* where the process was killed, or "none"
 
-vars == <<durable, staged, sp, pc, cur, reply, wrote, released, hVerdict, hCommit, hCrashAt>>
+vars == <<durable, staged, sp, pc, cur, reply, wrote, released, known, effects,
+          hVerdict, hCommit, hCrashAt>>
 
 InTransaction == {"member", "undo", "reject", "undoFault", "decide", "prepared"}
 Decided(o) == staged[o] \in {"applied", "rejected"}
@@ -83,6 +100,8 @@ Init ==
     /\ reply = [m \in Members |-> "none"]
     /\ wrote = [m \in Members |-> FALSE]
     /\ released = [m \in Members |-> "none"]
+    /\ known = [m \in Members |-> "none"]
+    /\ effects = [o \in Ops |-> IF o \in Settled THEN 1 ELSE 0]
     /\ hVerdict = [m \in Members |-> "none"]
     /\ hCommit = "none" /\ hCrashAt = "none"
 
@@ -97,7 +116,8 @@ Answer(a, w) ==
 Begin ==
     /\ pc = "idle"
     /\ pc' = "member"
-    /\ UNCHANGED <<durable, staged, sp, cur, reply, wrote, released, hVerdict, hCommit, hCrashAt>>
+    /\ UNCHANGED <<durable, staged, sp, cur, reply, wrote, released, known, effects,
+                   hVerdict, hCommit, hCrashAt>>
 
 \* One member: the recognition reads see the members before it, so an
 \* operation presented twice is decided once. Otherwise a savepoint is
@@ -124,7 +144,7 @@ MemberStage ==
                ELSE /\ staged' = [staged EXCEPT ![o] = "partial"]
                     /\ pc' = IF v = "refuse" THEN "undo" ELSE "undoFault"
                     /\ UNCHANGED <<cur, reply, wrote, released>>
-    /\ UNCHANGED <<durable, hCommit, hCrashAt>>
+    /\ UNCHANGED <<durable, known, effects, hCommit, hCrashAt>>
 
 \* ROLLBACK TO member: the refused member is undone alone.
 \* RefusalAbortsGroup rolls the whole transaction back and goes on.
@@ -132,7 +152,8 @@ MemberUndo ==
     /\ pc = "undo"
     /\ staged' = IF Mutation = "RefusalAbortsGroup" THEN durable ELSE sp
     /\ pc' = "reject"
-    /\ UNCHANGED <<durable, sp, cur, reply, wrote, released, hVerdict, hCommit, hCrashAt>>
+    /\ UNCHANGED <<durable, sp, cur, reply, wrote, released, known, effects,
+                   hVerdict, hCommit, hCrashAt>>
 
 \* The rejection is recorded on a receipt, in a savepoint of its own.
 \* Without a receipt slot nothing is staged and nothing certain is said.
@@ -144,7 +165,7 @@ MemberReject ==
                /\ Answer("Rejected", TRUE)
           ELSE /\ Answer("Unknown", FALSE)
                /\ UNCHANGED staged
-    /\ UNCHANGED <<durable, sp, released, hVerdict, hCommit, hCrashAt>>
+    /\ UNCHANGED <<durable, sp, released, known, effects, hVerdict, hCommit, hCrashAt>>
 
 \* A member that could not be read or written is rolled back to its
 \* savepoint and answered PendingOrUnknown; the group goes on.
@@ -152,7 +173,7 @@ MemberUndoFault ==
     /\ pc = "undoFault"
     /\ staged' = sp
     /\ Answer("Unknown", FALSE)
-    /\ UNCHANGED <<durable, sp, released, hVerdict, hCommit, hCrashAt>>
+    /\ UNCHANGED <<durable, sp, released, known, effects, hVerdict, hCommit, hCrashAt>>
 
 \* The engine dropped the transaction on an error, or a savepoint could
 \* not be closed: the group is lost and every member is unknown.
@@ -161,7 +182,7 @@ EngineDrops ==
     /\ staged' = durable
     /\ reply' = AllUnknown
     /\ pc' = "reply"
-    /\ UNCHANGED <<durable, sp, cur, wrote, released, hVerdict, hCommit, hCrashAt>>
+    /\ UNCHANGED <<durable, sp, cur, wrote, released, known, effects, hVerdict, hCommit, hCrashAt>>
 
 \* Every member ran. A group that staged nothing has nothing to commit:
 \* its answers were read from what was already durable.
@@ -170,24 +191,32 @@ Decide ==
     /\ IF \E m \in Members : wrote[m]
        THEN pc' = "prepared" /\ UNCHANGED staged
        ELSE pc' = "reply" /\ staged' = durable
-    /\ UNCHANGED <<durable, sp, cur, reply, wrote, released, hVerdict, hCommit, hCrashAt>>
+    /\ UNCHANGED <<durable, sp, cur, reply, wrote, released, known, effects,
+                   hVerdict, hCommit, hCrashAt>>
 
 \* COMMIT, after the point K1 `store.commit.prepared`. It makes every
-\* staged member durable at once, or fails (the medium is failing, the
-\* engine refuses): then nothing is durable and every member is unknown.
+\* staged member durable at once ("ok"), or fails (the medium is failing,
+\* the engine refuses): then nothing is durable and every member is
+\* unknown ("failed"). Or it makes every staged member durable and its call
+\* returns an error ("uncertain"): the store sees a commit that failed and
+\* answers every member unknown, with the group on disk.
 \* ReleaseBeforeCommit calls it once the answers have left.
 Commit ==
     /\ pc = "prepared"
     /\ Mutation = "ReleaseBeforeCommit" => \A m \in Members : released[m] # "none"
-    /\ \E ok \in (IF Faults THEN BOOLEAN ELSE {TRUE}) :
-          IF ok
-          THEN /\ durable' = staged /\ hCommit' = "ok"
-               /\ UNCHANGED <<staged, reply>>
-          ELSE /\ staged' = durable /\ hCommit' = "failed"
-               /\ reply' = AllUnknown
-               /\ UNCHANGED durable
+    /\ \E result \in (IF Faults THEN {"ok", "failed", "uncertain"} ELSE {"ok"}) :
+          /\ hCommit' = result
+          /\ IF result = "failed"
+             THEN /\ staged' = durable
+                  /\ UNCHANGED <<durable, effects>>
+             ELSE /\ durable' = staged
+                  /\ effects' = [o \in Ops |->
+                                    IF staged[o] = "applied" /\ durable[o] # "applied"
+                                    THEN effects[o] + 1 ELSE effects[o]]
+                  /\ UNCHANGED staged
+          /\ reply' = IF result = "ok" THEN reply ELSE AllUnknown
     /\ pc' = "reply"
-    /\ UNCHANGED <<sp, cur, wrote, released, hVerdict, hCrashAt>>
+    /\ UNCHANGED <<sp, cur, wrote, released, known, hVerdict, hCrashAt>>
 
 \* One answer is published to the core, in the order of the requests
 \* (`rtx.try_send` in the worker loop). This happens only once
@@ -198,13 +227,15 @@ Release(m) ==
     /\ released[m] = "none" /\ reply[m] # "none"
     /\ \A k \in Members : k < m => released[k] # "none"
     /\ released' = [released EXCEPT ![m] = reply[m]]
-    /\ UNCHANGED <<durable, staged, sp, pc, cur, reply, wrote, hVerdict, hCommit, hCrashAt>>
+    /\ UNCHANGED <<durable, staged, sp, pc, cur, reply, wrote, known, effects,
+                   hVerdict, hCommit, hCrashAt>>
 
 \* Every answer was handed over.
 Finish ==
     /\ pc = "reply" /\ \A m \in Members : released[m] # "none"
     /\ pc' = "done"
-    /\ UNCHANGED <<durable, staged, sp, cur, reply, wrote, released, hVerdict, hCommit, hCrashAt>>
+    /\ UNCHANGED <<durable, staged, sp, cur, reply, wrote, released, known, effects,
+                   hVerdict, hCommit, hCrashAt>>
 
 \* The process is killed. The open transaction is gone; what is on disk
 \* stays; the answers not yet handed over never are.
@@ -213,9 +244,50 @@ Crash ==
     /\ hCrashAt' = pc
     /\ pc' = "crashed"
     /\ staged' = durable
-    /\ UNCHANGED <<durable, sp, cur, reply, wrote, released, hVerdict, hCommit>>
+    /\ UNCHANGED <<durable, sp, cur, reply, wrote, released, known, effects, hVerdict, hCommit>>
 
 Terminal == pc \in {"done", "crashed"}
+
+\* The call of the group is over, by its last answer or by a kill, and the
+\* caller holds nothing certain about member m: its answer was unknown or
+\* never arrived, and it has not been reconciled yet.
+Unsettled(m) == Terminal /\ released[m] \in {"none", "Unknown"} /\ known[m] = "none"
+
+\* What a durable state tells the caller.
+Knowledge(state) ==
+    CASE state = "applied" -> "Committed"
+      [] state = "rejected" -> "Rejected"
+      [] state = "fenced" -> "Fenced"
+
+\* `resolve_and_fence` on the identity of a member: a durable decision is
+\* returned as it is and nothing is written; an absence is fenced, so the
+\* operation never executes.
+Resolve(m) ==
+    /\ Unsettled(m)
+    /\ LET o == OpOf[m]
+           found == IF durable[o] = "absent" THEN "fenced" ELSE durable[o]
+       IN /\ durable' = [durable EXCEPT ![o] = found]
+          /\ known' = [known EXCEPT ![m] = Knowledge(found)]
+    /\ UNCHANGED <<staged, sp, pc, cur, reply, wrote, released, effects,
+                   hVerdict, hCommit, hCrashAt>>
+
+\* The same command presented again, alone or in a later group: the
+\* recognition reads answer a decided operation from its receipt and write
+\* nothing; an operation that is absent is decided as a first submission.
+\* UncertainIsNotCommitted believes the error of the commit call: what the
+\* group left is taken for absent and applied again.
+Represent(m) ==
+    /\ Unsettled(m)
+    /\ LET o == OpOf[m]
+           seen == IF Mutation = "UncertainIsNotCommitted" /\ hCommit = "uncertain"
+                   THEN "absent" ELSE durable[o]
+       IN IF seen = "absent"
+          THEN /\ durable' = [durable EXCEPT ![o] = "applied"]
+               /\ effects' = [effects EXCEPT ![o] = @ + 1]
+               /\ known' = [known EXCEPT ![m] = "Committed"]
+          ELSE /\ known' = [known EXCEPT ![m] = Knowledge(seen)]
+               /\ UNCHANGED <<durable, effects>>
+    /\ UNCHANGED <<staged, sp, pc, cur, reply, wrote, released, hVerdict, hCommit, hCrashAt>>
 
 Quiescent == Terminal /\ UNCHANGED vars
 
@@ -231,6 +303,8 @@ Next ==
     \/ \E m \in Members : Release(m)
     \/ Finish
     \/ Crash
+    \/ \E m \in Members : Resolve(m)
+    \/ \E m \in Members : Represent(m)
     \/ Quiescent
 
 Spec == Init /\ [][Next]_vars
@@ -250,15 +324,17 @@ FairSpec == Spec /\ WF_vars(WorkerStep)
 States == {"absent", "partial", "applied", "rejected"}
 
 TypeOK ==
-    /\ durable \in [Ops -> States \ {"partial"}]
+    /\ durable \in [Ops -> (States \ {"partial"}) \cup {"fenced"}]
     /\ staged \in [Ops -> States] /\ sp \in [Ops -> States]
     /\ pc \in InTransaction \cup {"idle", "reply", "done", "crashed"}
     /\ cur \in 1..(NumMembers + 1)
     /\ reply \in [Members -> Answers \cup {"none"}]
     /\ wrote \in [Members -> BOOLEAN]
     /\ released \in [Members -> Answers \cup {"none"}]
+    /\ known \in [Members -> {"none", "Committed", "Rejected", "Fenced"}]
+    /\ effects \in [Ops -> 0..(NumMembers + 1)]
     /\ hVerdict \in [Members -> {"none", "accept", "refuse", "fault", "recognised"}]
-    /\ hCommit \in {"none", "ok", "failed"}
+    /\ hCommit \in {"none", "ok", "failed", "uncertain"}
     /\ hCrashAt \in InTransaction \cup {"none", "reply"}
 
 \* No acknowledgement before commit: an answer that says committed or
@@ -272,24 +348,54 @@ AckAfterCommit ==
 NothingReleasedInTransaction ==
     pc \in InTransaction => \A m \in Members : released[m] = "none"
 
+\* Until the caller reconciles a member, the disk holds what the group
+\* left; a reconciliation may then fence or decide an absent operation.
+Unreconciled == \A m \in Members : known[m] = "none"
+
 \* The group is atomic: what is on disk is what was there before the
 \* group, or, once it committed, that and every staged member.
 GroupAtomic ==
-    /\ hCommit # "ok" => durable = InitDurable
+    /\ (hCommit \notin {"ok", "uncertain"} /\ Unreconciled) => durable = InitDurable
     /\ \A o \in Ops : InitDurable[o] # "absent" => durable[o] = InitDurable[o]
 
 \* A kill before the COMMIT loses the whole group, and no answer was
 \* handed over for it.
 CrashBeforeCommitLosesGroup ==
     hCrashAt \in InTransaction =>
-        durable = InitDurable /\ \A m \in Members : released[m] = "none"
+        /\ Unreconciled => durable = InitDurable
+        /\ \A m \in Members : released[m] = "none"
 
 \* A commit that failed makes every member unknown, never positive, and
 \* leaves nothing.
 CommitFailureSaysNothingCertain ==
     hCommit = "failed" =>
-        /\ durable = InitDurable
+        /\ Unreconciled => durable = InitDurable
         /\ \A m \in Members : released[m] \in {"none", "Unknown"}
+
+\* A commit that is durable and whose call returned an error says nothing
+\* certain either: every answer handed over is unknown, for members that
+\* are all on disk. The caller learns their outcome by reconciling only.
+UncertainCommitSaysNothingCertain ==
+    hCommit = "uncertain" =>
+        /\ \A m \in Members : released[m] \in {"none", "Unknown"}
+        /\ \A m \in Members : hVerdict[m] = "accept" => durable[OpOf[m]] = "applied"
+
+\* What a reconciliation tells the caller is what the disk holds, and it
+\* is told only about a member whose answer said nothing certain.
+ReconciledFromDisk ==
+    \A m \in Members :
+        /\ known[m] = "Committed" => durable[OpOf[m]] = "applied"
+        /\ known[m] = "Rejected" => durable[OpOf[m]] = "rejected"
+        /\ known[m] = "Fenced" => durable[OpOf[m]] = "fenced"
+        /\ known[m] # "none" => released[m] \in {"none", "Unknown"}
+
+\* No operation takes effect twice: not through the group, and not through
+\* the reconciliation of an answer that was unknown or lost. A fence closes
+\* only an operation that never took effect.
+NoSecondEffect ==
+    \A o \in Ops :
+        /\ effects[o] <= 1
+        /\ durable[o] = "fenced" => effects[o] = 0
 
 \* A refused or faulted member leaves none of its rows in the group.
 NoPartialMemberCommitted ==
@@ -339,5 +445,14 @@ NoNothingToCommitWitness ==
 
 \* The commit of a group fails.
 NoCommitFailureWitness == hCommit # "failed"
+
+\* The commit of a group is durable and its call returns an error; the
+\* caller, told nothing certain, finds every member committed.
+NoUncertainCommitReconciledWitness ==
+    ~(hCommit = "uncertain" /\ \A m \in Members : known[m] = "Committed")
+
+\* The commit of a group fails and the caller fences a member of it.
+NoFenceAfterFailureWitness ==
+    ~(hCommit = "failed" /\ \E m \in Members : known[m] = "Fenced")
 
 =============================================================================
