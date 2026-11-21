@@ -545,6 +545,10 @@
             "test": "product_pubsub_delivery_over_peer_maximum_packet_size_is_discarded_and_the_next_one_sent"
           },
           {
+            "file": "mqttiumd/crates/mqttiumd/src/runtime_tests.rs",
+            "test": "a_delivery_over_the_subscribers_maximum_packet_size_is_discarded_and_the_session_stays_usable"
+          },
+          {
             "file": "mqttiumd/crates/mqttiumd/src/codec.rs",
             "test": "a_tiny_nonzero_peer_limit_is_retained_for_the_writer"
           }
@@ -555,13 +559,26 @@
         "id": "MQTT-3.1.2-25",
         "feature": "maximum-packet-size",
         "applies_to_server": true,
-        "status": "open",
-        "evidence": [],
+        "status": "covered",
+        "evidence": [
+          {
+            "file": "mqttiumd/crates/mqttiumd-core/src/owner/pubsub.rs",
+            "test": "a_delivery_is_sent_at_its_exact_packet_size_and_discarded_one_byte_below"
+          },
+          {
+            "file": "mqttiumd/crates/mqttiumd-core/src/owner.rs",
+            "test": "product_pubsub_delivery_over_peer_maximum_packet_size_is_discarded_and_the_next_one_sent"
+          },
+          {
+            "file": "mqttiumd/crates/mqttiumd/src/runtime_tests.rs",
+            "test": "a_delivery_over_the_subscribers_maximum_packet_size_is_discarded_and_the_session_stays_usable"
+          }
+        ],
         "code": [
           "mqttiumd/crates/mqttiumd-core/src/owner/pubsub.rs:plan_delivery_emit",
           "mqttiumd/crates/mqttiumd-core/src/owner/pubsub.rs:qos0_fits"
         ],
-        "note": "Non-conformant for QoS 1 and 2: `plan_delivery_emit` closes the connection (CapacityExceeded, no DISCONNECT) and keeps the delivery, so each reconnection of that session is closed at the same message; `product_pubsub_delivery_over_peer_maximum_packet_size_is_discarded_and_the_next_one_sent` states the required behaviour and fails on this code. A QoS 0 copy is discarded as required (`qos0_fits`)."
+        "note": "A QoS 1 or 2 delivery whose PUBLISH would exceed the client's Maximum Packet Size is not sent and ends through the FinishDelivery guarded by its claim; the connection stays open and the next delivery is sent (record 0025 as amended). The core tests cover QoS 1 and 2, with and without Message Expiry, at the exact size and across the Remaining Length step; the runtime test covers QoS 1 on the wire and the resumed session. A QoS 0 copy is dropped (`qos0_fits`). Not covered: a kill of the real process between the claim and its discard (shown on the core with a recovered claim and on both stores with a reopen), and no differential scenario against Mosquitto above QoS 0."
       },
       {
         "id": "MQTT-3.1.2-26",

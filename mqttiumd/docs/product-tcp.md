@@ -385,9 +385,16 @@ are distinct, and no live-connection retransmission timer is added.
 A valid recipient PUBACK, including a negative reason, starts conditional
 idempotent FinishDelivery. Only known finish commit frees its window/slot and
 reference, collecting the final payload. Unknown outcomes retain their operation.
-Peer packet limits apply before output; oversized QoS 1 work closes that
-connection but remains durable for a suitable reconnect. A full outgoing window
-leaves ACK, PING, closure and results runnable. Each destination owns its window.
+Peer packet limits apply before output. A QoS 1 or 2 delivery whose PUBLISH
+would exceed the client's Maximum Packet Size is not sent and is discarded as
+a completed delivery (MQTT-3.1.2-25, record 0025 as amended): its guarded
+FinishDelivery ends the claim and the obligation, the connection stays open
+and later deliveries are sent. The owner records `delivery_discarded` with the
+finish operation, the delivery, its target and the reason `packet_too_large`
+(a counter at the ops event level). The message is lost for that subscriber;
+a claim not yet discarded is sent on a reconnection that accepts it. A full
+outgoing window leaves ACK, PING, closure and results runnable. Each
+destination owns its window.
 
 Incoming and outgoing PI spaces are independent. The client's active PUBLISH,
 SUBSCRIBE and UNSUBSCRIBE share its sender space; active collisions are errors.

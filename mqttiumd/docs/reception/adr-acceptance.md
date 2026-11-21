@@ -13,23 +13,25 @@ the end.
 0027, 0028, 0030, 0031, 0032, 0036, 0037, 0038, 0039, 0040, 0041.
 
 Each now reads "Accepted (21 November 2026, by the repository owner)".
-Three of them extend a record that stays proposed and say so in their
-status: 0028 (0025), 0030 (0029) and 0036 (0035).
+Three of them extended a record that was proposed at the time: 0028 (0025),
+0030 (0029) and 0036 (0035). The status of 0030 and of 0036 still says so;
+that of 0028 names 0025 as accepted with amendments.
 
 ## After the second opinion
 
 Thirteen records waited for an independent reviewer, who audited the tree
 at `8e4303d` and recommended a decision for each with the exact text of
 its amendments. The owner then delegated the decisions. They follow the
-audit, with one difference: 0025 stays proposed until its amendment is
-implemented.
+audit, with one difference: 0025 stayed proposed until its amendment was
+implemented, and is accepted with amendments since the change that
+implements it.
 
 | Record | Decision | Why |
 | - | - | - |
 | 0013 | Accepted with amendments | The amendment is the line-by-line answer the record asked for. On line 12 it chooses the transition registry: after a certain refusal a new attempt gets a fresh identity. Gate G0 closes after the registry, M1a, M1b and an executable witness agree |
 | 0022, 0026, 0029, 0033, 0034, 0035, 0043 | Accepted with amendments | Each states numbers of the sixteen-connection profile, now governed by record 0048, and each amendment says which of its rules a later record replaced or what it still owes (0026 keeps its 100 ms rescan until a replacement is shown; 0043 owes an executable progress test) |
 | 0042 | Accepted as a historical decision | It binds the frozen kit and the executable built from `51be4079`; a version 0.1 claim needs a new reader and a new reception |
-| 0025 | Proposed | Its amendment requires that a delivery larger than the peer's Maximum Packet Size be discarded and its obligation completed with the connection kept open (MQTT-3.1.2-25). The core closes the connection and keeps the claim. The record is accepted with the change that implements it |
+| 0025 | Accepted with amendments | Its amendment requires that a delivery larger than the peer's Maximum Packet Size be discarded and its obligation completed with the connection kept open (MQTT-3.1.2-25). The record stayed proposed while the core closed the connection and kept the claim; it is accepted with the change that implements the amendment: the delivery ends through the finish guarded by its claim, and the effect `DeliveryDiscarded` reports it |
 | 0018 | Proposed | The bench refuses to play its vocabulary; accepted when a campaign qualifies a scenario and rejects its mutant, withdrawn if none uses it |
 | 0045 | Proposed | An unknown answer can hide a commit or an earlier diagnostic, and no oracle campaign runs a group |
 | 0046 | Proposed | A quarter of the lane does not reserve the way of an acknowledgement; its Keep Alive rule was corrected after the audit |

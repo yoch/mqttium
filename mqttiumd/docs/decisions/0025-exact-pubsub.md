@@ -1,7 +1,27 @@
 # 0025 — Exact persistent subscriptions and outgoing QoS 1
 
-Status: **Proposed**. A bounded product increment, not full P1/P2 reception,
-complete MQTT conformance or acceptance of historical proposed decisions.
+Status: **Accepted with amendments** (21 November 2026, decided under the
+repository owner's delegation on the advice of the independent audit of
+`8e4303d`, with the change that implements its amendment). A bounded product
+increment, not full P1/P2 reception, complete MQTT conformance or acceptance
+of historical proposed decisions.
+
+Amendment of acceptance (21 November 2026).
+A QoS 1 or 2 delivery whose PUBLISH would exceed the Maximum Packet Size of
+the receiving client is not sent and is discarded as a completed delivery
+(MQTT-3.1.2-25): its obligation ends, the connection stays open and the
+deliveries that follow it are sent. This replaces the rule of the proposed
+text, "the obligation is retained and the connection safely refused, not
+discarded". The discard reuses the recipe `FinishDelivery`, guarded by the
+claim of the delivery; no recipe, stored fact or schema is added. Its commit
+publishes the new volatile effect `DeliveryDiscarded { delivery, target,
+operation, reason }` with the reason `PacketTooLarge`. No existing effect or
+fact fits: `Qos0Dropped` carries a `Qos0Origin` and names QoS 0, the fact
+`DeliveryFinished` is the same for an acknowledged delivery, and a new commit
+fact would be a durable encoding. The section "A delivery larger than the
+peer's Maximum Packet Size" states the rule. Record 0048 states the
+capacities of the runtime and their derivation; the sixteen-connection
+numbers below describe the bounded qualification profile.
 
 Amended by 0026 and 0041 (record 0047): QoS 0 subscriptions are granted and
 a QoS 2 request is granted QoS 2; the grant rule below no longer holds.
@@ -69,6 +89,62 @@ This bounded policy protects wire PUBACK aliasing, which internal DeliveryId
 alone cannot solve. Incoming PUBLISH/SUBSCRIBE/UNSUBSCRIBE share their sender's
 identifier space and active collisions are explicit errors.
 
+## A delivery larger than the peer's Maximum Packet Size
+
+A claimed QoS 1 or 2 delivery whose PUBLISH would exceed the Maximum Packet
+Size of the receiving connection is never sent (MQTT-3.1.2-24) and ends as a
+completed delivery (MQTT-3.1.2-25). The connection is not closed, the session
+stays usable and the deliveries that follow are claimed and sent. The message
+is lost for that subscriber only: every other destination of the publication
+is decided against its own connection. A QoS 0 copy is dropped in the same
+case (record 0026).
+
+The size is that of the one PUBLISH the profile encodes: fixed header,
+minimal Remaining Length, Topic Name, Packet Identifier, a one-byte Property
+Length, the Message Expiry Interval when the message has one, payload. The
+profile sends no other property, and MQTT-3.3.2-6 forbids leaving the Message
+Expiry Interval out, so there is no smaller encoding and nothing is omitted
+to make a packet fit. An MQTT 3.1.1 client, and an MQTT 5 client that states
+no Maximum Packet Size, have no limit: nothing that the topic and payload
+limits admit is discarded for them.
+
+The decision is taken where the PUBLISH would have been emitted, behind every
+gate that holds a delivery (message expiry, connection, claim, PUBREL, Receive
+Maximum, an earlier delivery still waiting, loaded bytes). It is therefore
+taken in delivery order, against the connection of that moment. A claim commit
+that finds its delivery too large emits nothing, and the work turn that
+follows submits the discard.
+
+The discard is `FinishDelivery` (kind 5), unchanged. Both stores guard a
+finish by DeliveryId, target/revision, outgoing identifier and claim
+operation, and by nothing a transmission would have established, so a claimed
+delivery that never started is ended by the transaction that ends an
+acknowledged one: claim and obligation removed, reference decremented, last
+payload released. `ConsumeDelivery` cannot be used, since it only ends an
+unclaimed QoS 0 obligation. The owner adds the state DiscardPending beside
+FinishPending. Until the finish is known the delivery keeps its Packet
+Identifier and its place in the window, as an acknowledged delivery does.
+
+The known commit publishes `DeliveryDiscarded`, whose `operation` is the
+committed finish; the runtime writes it as the event `delivery_discarded`
+(`operation`, `command_kind` "Finish", details `delivery`, `target` and
+`reason` "packet_too_large"), a full record at the audit level and a counter
+at the ops level. It is an observation and not a durable fact: a crash between
+the commit and its acceptance by an adapter loses the event and keeps the
+receipt of the finish.
+
+Until the finish commits, the claim is the durable fact. A restart recovers
+it: under the same limit the delivery is discarded again, by a new operation
+guarded by the same claim, and under a larger limit it is sent with DUP 1
+like every recovered claim. A known claim that was never made eligible, on a
+new connection with a larger limit, is sent with DUP 0. After the commit
+there is neither obligation nor claim, and a repeated finish returns its
+receipt without a second observation. An unknown outcome is resolved under
+the same OperationId and the delivery is not sent meanwhile. A fenced discard
+closes nothing and is decided again at the next work turn; any other certain
+refusal keeps the rule of a refused finish, which closes the connection and
+keeps the claim.
+
 ## Bounded work and storage
 
 Startup recovery includes obligation/claim metadata, not payload copies.
@@ -85,8 +161,9 @@ Initial product bounds: 128 sessions, 128 exact subscriptions globally,
 bounded outgoing metadata entries, eight outgoing slots per connection bounded
 further by the peer Receive Maximum, 32 KiB payload, 1 KiB topic and eight-item
 work pages. Existing receipt/epoch collection limits still bound service life.
-Peer Maximum Packet Size applies before emitting an oversized delivery;
-the obligation is retained and the connection safely refused, not discarded.
+Peer Maximum Packet Size applies before emitting a delivery; one that exceeds
+it is discarded as a completed delivery and the connection stays open (see
+"A delivery larger than the peer's Maximum Packet Size").
 
 SQLite schema 2 adds durable outgoing claims and bounded receipt fact bytes.
 Version 1 is refused with a typed error before write-affecting pragmas; there
