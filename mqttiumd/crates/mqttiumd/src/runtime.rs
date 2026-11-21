@@ -105,6 +105,13 @@ impl Limits {
     pub const BOUNDED: Self = Self::new(Self::BOUNDED_CONNECTIONS);
     pub const DEFAULT: Self = Self::new(Self::MAX_CONNECTIONS);
 
+    /// The places of the ordinary lane that business packets leave free:
+    /// an eighth of it. Acknowledgements, PINGREQ and DISCONNECT are read
+    /// down to the last two places.
+    const fn control_reserve(&self) -> usize {
+        self.ordinary_inputs / 8
+    }
+
     /// `connections` is between 1 and [`Limits::MAX_CONNECTIONS`]; the
     /// command line checks it.
     /// A value outside that range is brought to its nearest bound: no
@@ -188,7 +195,11 @@ struct Peer {
     connect_expiry: SessionExpiry,
     disconnect_expiry: Option<SessionExpiry>,
     close_observed_at: Option<u64>,
-    handshake_packet: Option<(u8, Vec<u8>, net::FrameObservation)>,
+    /// The next packet of this connection, taken from its lane and not
+    /// yet given to the core: a packet behind a CONNECT that is still
+    /// being opened, or a business packet the lane has no place for. The
+    /// packets behind it stay with the transport, in order.
+    held_packet: Option<(u8, Vec<u8>, net::FrameObservation)>,
     pending: bool,
     keep_alive: u16,
     max_packet: usize,
@@ -708,7 +719,7 @@ impl Runtime<'_> {
                 connect_expiry: SessionExpiry::OnDisconnect,
                 disconnect_expiry: None,
                 close_observed_at: None,
-                handshake_packet: None,
+                held_packet: None,
                 pending: false,
                 keep_alive: 0,
                 max_packet: 268435455,
@@ -777,6 +788,19 @@ impl Runtime<'_> {
         }
         self.inputs.push_back(input);
         Ok(())
+    }
+    /// Whether a business packet of this connection must wait with its
+    /// transport. The last places of the ordinary lane are kept for the
+    /// packets that release capacity, and a connection adds no business
+    /// packet behind one of its own that already waits in the core: the
+    /// backlog of a connection stays in its socket, where it slows its
+    /// peer, and cannot fill the lane (record 0046).
+    fn business_waits(&self, generation: ConnectionGeneration) -> bool {
+        self.ordinary_room() < self.limits.control_reserve()
+            || self
+                .deferred_inputs
+                .iter()
+                .any(|input| business_connection(input) == Some(generation))
     }
     fn ordinary_room(&self) -> usize {
         ordinary_room(
@@ -3197,10 +3221,19 @@ impl Runtime<'_> {
                 if backpressured || self.ordinary_room() < 2 {
                     break;
                 }
+                let business_waits = self.business_waits(generation);
                 let incoming = match self.peers.get_mut(&generation) {
                     Some(p) if p.closing.is_some() || p.deferred_publish.is_some() => break,
-                    Some(p) if p.pending && p.handshake_packet.is_some() => break,
-                    Some(p) => match p.handshake_packet.take() {
+                    Some(p) if p.pending && p.held_packet.is_some() => break,
+                    Some(p)
+                        if business_waits
+                            && p.held_packet
+                                .as_ref()
+                                .is_some_and(|(first, ..)| business_header(*first)) =>
+                    {
+                        break;
+                    }
+                    Some(p) => match p.held_packet.take() {
                         Some((first, body, observed)) => Ok(net::Incoming::Packet {
                             first,
                             body,
@@ -3230,7 +3263,16 @@ impl Runtime<'_> {
                             self.peers
                                 .get_mut(&generation)
                                 .expect("checked peer")
-                                .handshake_packet = Some((first, body, observed));
+                                .held_packet = Some((first, body, observed));
+                            break;
+                        }
+                        // It was taken from the lane to learn what it is;
+                        // it goes no further for now (record 0046).
+                        if business_waits
+                            && business_header(first)
+                            && let Some(peer) = self.peers.get_mut(&generation)
+                        {
+                            peer.held_packet = Some((first, body, observed));
                             break;
                         }
                         self.packet_at(generation, first, body, observed)?
@@ -4871,6 +4913,11 @@ fn frame_info(frame: OutboundFrame) -> (&'static str, Option<u16>) {
         OutboundFrame::Suback { packet_id, .. } => ("SUBACK", Some(packet_id.get())),
         OutboundFrame::Unsuback { packet_id, .. } => ("UNSUBACK", Some(packet_id.get())),
     }
+}
+/// PUBLISH, SUBSCRIBE and UNSUBSCRIBE ask the broker for new work. Every
+/// other packet completes or ends work it already holds.
+fn business_header(first: u8) -> bool {
+    matches!(first >> 4, 3 | 8 | 10)
 }
 fn business_connection(input: &Input) -> Option<ConnectionGeneration> {
     match input {

@@ -254,7 +254,7 @@ fn peer(runtime: &mut Runtime<'_>) -> (ConnectionGeneration, TcpStream) {
             connect_expiry: SessionExpiry::OnDisconnect,
             disconnect_expiry: None,
             close_observed_at: None,
-            handshake_packet: None,
+            held_packet: None,
             pending: false,
             keep_alive: 0,
             max_packet: 268435455,
@@ -2382,7 +2382,7 @@ fn a_framed_publish_waiting_for_connack_keeps_its_reader_expiry_origin() {
         frames.extend_from_slice(&[0x31, 10, 0, 1, b't', 5, 2, 0, 0, 0, 1, b'v']);
         client.write_all(&frames).unwrap();
         let deadline = Instant::now() + Duration::from_secs(1);
-        while runtime.peers[&generation].handshake_packet.is_none() {
+        while runtime.peers[&generation].held_packet.is_none() {
             runtime.connections().unwrap();
             assert!(
                 Instant::now() < deadline,
@@ -2396,7 +2396,7 @@ fn a_framed_publish_waiting_for_connack_keeps_its_reader_expiry_origin() {
         runtime.drain_inputs().unwrap();
         until(runtime, |r| {
             r.session_requests.is_empty()
-                && r.peers[&generation].handshake_packet.is_none()
+                && r.peers[&generation].held_packet.is_none()
                 && r.inputs.is_empty()
                 && r.inflight.is_empty()
         });
@@ -2447,7 +2447,7 @@ fn a_regressed_reader_sample_is_not_reclassified_as_message_expiration() {
         client
             .write_all(&[0x31, 10, 0, 1, b't', 5, 2, 0, 0, 0, 1, b'v'])
             .unwrap();
-        while runtime.peers[&generation].handshake_packet.is_none() {
+        while runtime.peers[&generation].held_packet.is_none() {
             runtime.connections().unwrap();
             assert!(
                 Instant::now() < deadline,
