@@ -262,3 +262,23 @@ fn recovery_field_limits_apply_to_the_selected_page() {
 fn recovery_field_limits_include_fixed_identities() {
     conformance::recovery_field_limits_include_fixed_identities(&memory);
 }
+
+#[test]
+fn a_never_started_claim_is_ended_once_by_its_guarded_finish() {
+    use mqttiumd_contract::packet::Qos;
+    // The deterministic store keeps its state across the simulated restart:
+    // the next epoch is opened on the same value.
+    for (qos, timed) in [
+        (Qos::AtLeastOnce, false),
+        (Qos::ExactlyOnce, false),
+        (Qos::AtLeastOnce, true),
+        (Qos::ExactlyOnce, true),
+    ] {
+        conformance::a_never_started_claim_is_ended_once_by_its_guarded_finish(
+            &memory,
+            &|store| store,
+            qos,
+            timed,
+        );
+    }
+}

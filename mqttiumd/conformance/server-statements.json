@@ -542,7 +542,7 @@
           },
           {
             "file": "mqttiumd/crates/mqttiumd-core/src/owner.rs",
-            "test": "product_pubsub_peer_maximum_packet_size_refuses_emission_and_preserves_claim"
+            "test": "product_pubsub_delivery_over_peer_maximum_packet_size_is_discarded_and_the_next_one_sent"
           },
           {
             "file": "mqttiumd/crates/mqttiumd/src/codec.rs",
@@ -561,7 +561,7 @@
           "mqttiumd/crates/mqttiumd-core/src/owner/pubsub.rs:plan_delivery_emit",
           "mqttiumd/crates/mqttiumd-core/src/owner/pubsub.rs:qos0_fits"
         ],
-        "note": "Non-conformant for QoS 1 and 2: `plan_delivery_emit` closes the connection (CapacityExceeded, no DISCONNECT) and keeps the delivery, so each reconnection of that session is closed at the same message; `product_pubsub_peer_maximum_packet_size_refuses_emission_and_preserves_claim` pins this. A QoS 0 copy is discarded as required (`qos0_fits`)."
+        "note": "Non-conformant for QoS 1 and 2: `plan_delivery_emit` closes the connection (CapacityExceeded, no DISCONNECT) and keeps the delivery, so each reconnection of that session is closed at the same message; `product_pubsub_delivery_over_peer_maximum_packet_size_is_discarded_and_the_next_one_sent` states the required behaviour and fails on this code. A QoS 0 copy is discarded as required (`qos0_fits`)."
       },
       {
         "id": "MQTT-3.1.2-26",

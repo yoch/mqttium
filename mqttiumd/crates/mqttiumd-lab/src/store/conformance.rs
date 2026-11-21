@@ -4277,3 +4277,240 @@ pub fn lost_claim_results_preserve_packet_reservations_until_guarded_finish<S: D
         operation_id(world.epoch, 6)
     );
 }
+
+/// What the discard of an oversized delivery relies on (ADR 0025 as
+/// amended): a claim that never started, of which no byte was ever sent
+/// and which no `MarkDeliveryStarted` followed, is ended exactly once by
+/// the finish guarded by that claim. A restart before the finish recovers
+/// the claim and offers its work item again; a restart after it shows
+/// neither. The obligation of the other target and the payload they share
+/// are untouched. `reopen` hands back the store as a new process finds it.
+pub fn a_never_started_claim_is_ended_once_by_its_guarded_finish<S: DurableStore>(
+    make: &dyn Fn(StoreIncarnation, Limits) -> S,
+    reopen: &dyn Fn(S) -> S,
+    qos: Qos,
+    timed: bool,
+) {
+    use super::durable::SessionClockReading;
+    use mqttiumd_contract::command::{ClaimDelivery, FinishDelivery};
+    use mqttiumd_contract::ids::OutboundPacketId;
+    use mqttiumd_contract::message_expiry::{
+        ExpiringAdmission, ExpiringPublication, MessageExpiry, MessageTime,
+    };
+    use mqttiumd_contract::pubsub::DeliveryClaim;
+    use mqttiumd_contract::retained::RetainedPublication;
+    let mut limits = fixture_limits();
+    limits.receipt_slots = ReceiptSlots::new(64);
+    let world = World::with_limits(make, limits);
+    let World {
+        mut store,
+        b,
+        c,
+        epoch: claimed_in,
+        ..
+    } = world;
+    let admission = altered(
+        &admission_in(
+            claimed_in,
+            world.route_revision,
+            world.producer,
+            1,
+            7,
+            b"oversized",
+            &[b, c],
+        ),
+        |admit| {
+            for target in admit.targets.as_mut_slice() {
+                target.effective_qos = qos;
+            }
+        },
+    );
+    let expiry = timed.then(|| {
+        let observed = MessageTime {
+            domain: [7; 32],
+            tick: 0,
+        };
+        store
+            .checkpoint_session_clock(
+                None,
+                SessionClockReading {
+                    domain: observed.domain,
+                    tick: observed.tick,
+                },
+            )
+            .expect("the first clock checkpoint");
+        MessageExpiry {
+            observed,
+            interval: 60,
+        }
+    });
+    let admission = match expiry {
+        None => admission,
+        Some(expiry) => altered_into(&admission, |admission| {
+            Recipe::ExpiringPublication(ExpiringPublication {
+                admission: ExpiringAdmission::Qos12(RetainedPublication {
+                    admission,
+                    retain_targets: 0,
+                }),
+                expiry,
+            })
+        }),
+    };
+    assert!(store.apply(&admission).committed_now);
+    let discarded = DeliveryId {
+        publication: publication_id(claimed_in, 1),
+        index: 0,
+    };
+    let kept = DeliveryId {
+        publication: discarded.publication,
+        index: 1,
+    };
+    let claim = DeliveryClaim {
+        operation: operation_id(claimed_in, 2),
+        packet_id: OutboundPacketId::new(5).unwrap(),
+        started: false,
+        await_pubcomp: false,
+    };
+    let claimed = store.apply(&Command {
+        recipe: FrozenRecipe::freeze(Recipe::ClaimDelivery(ClaimDelivery {
+            operation: claim.operation,
+            delivery: discarded,
+            target: b,
+            target_revision: Revision::new(1),
+            packet_id: claim.packet_id,
+        }))
+        .unwrap(),
+        payload: None,
+    });
+    assert!(claimed.committed_now);
+    let before = store.snapshot().unwrap();
+    assert!(!before.outbound[&discarded].started);
+
+    // A restart between the claim and its discard.
+    let mut store = reopen(store);
+    let epoch = open(&mut store);
+    let recovered_claim = |store: &S| {
+        store
+            .recover(None, 64)
+            .unwrap()
+            .facts
+            .as_slice()
+            .iter()
+            .find_map(|fact| match fact {
+                RecoveredFact::OutboundDelivery {
+                    delivery,
+                    claim,
+                    qos: found,
+                    ..
+                } if *delivery == discarded => {
+                    assert_eq!(*found, qos);
+                    Some(*claim)
+                }
+                _ => None,
+            })
+    };
+    assert_eq!(
+        recovered_claim(&store),
+        Some(Some(claim)),
+        "the claim survives the restart with its identity"
+    );
+    let offered = store.read_work(b, None, 8).unwrap();
+    let item = &offered.items.as_slice()[0];
+    assert_eq!(
+        (item.delivery, item.qos, item.claim, item.expiry),
+        (discarded, qos, Some(claim), expiry),
+        "the work item is offered again, to be discarded or sent"
+    );
+    assert_eq!(item.payload.as_slice(), b"oversized");
+
+    let finish = |sequence| Command {
+        recipe: FrozenRecipe::freeze(Recipe::FinishDelivery(FinishDelivery {
+            operation: operation_id(epoch, sequence),
+            delivery: discarded,
+            target: b,
+            target_revision: Revision::new(1),
+            packet_id: claim.packet_id,
+            claim: claim.operation,
+        }))
+        .unwrap(),
+        payload: None,
+    };
+    let discard = finish(1);
+    let applied = store.apply(&discard);
+    assert_eq!(
+        outcome(applied.reply),
+        StoreOutcome::Committed(CommitFacts::DeliveryFinished {
+            delivery: discarded,
+            target: b,
+            packet_id: claim.packet_id,
+            claim: claim.operation,
+        }),
+        "a claim that never started is finished by its guard alone"
+    );
+    assert!(applied.committed_now);
+    let after = store.snapshot().unwrap();
+    assert!(!after.obligations.contains_key(&discarded));
+    assert!(after.outbound.is_empty());
+    assert_eq!(after.obligations[&kept], before.obligations[&kept]);
+    let (held, shared) = after
+        .payloads
+        .iter()
+        .next()
+        .expect("the shared payload stays");
+    assert_eq!(after.payloads.len(), 1);
+    assert_eq!(
+        (shared.bytes.as_slice(), shared.references),
+        (
+            b"oversized".as_slice(),
+            before.payloads[held].references - 1
+        ),
+        "one reference of the shared payload is released, once"
+    );
+    assert_eq!(
+        after.accounts.references.get(),
+        before.accounts.references.get() - 1
+    );
+    assert_eq!(accounts_match_what_is_held(&after), Ok(()));
+    assert!(
+        !store.apply(&discard).committed_now,
+        "the repeated finish returns its receipt"
+    );
+    assert_eq!(store.snapshot().unwrap(), after);
+    assert_eq!(
+        outcome(store.apply(&finish(2)).reply),
+        StoreOutcome::RejectedCertain(RejectReason::PreconditionFailed),
+        "the delivery is ended once"
+    );
+    assert_eq!(
+        store.snapshot().unwrap().obligations,
+        after.obligations,
+        "a refused second finish ends nothing"
+    );
+
+    // A restart after the discard.
+    let mut store = reopen(store);
+    let _ = open(&mut store);
+    assert_eq!(recovered_claim(&store), None, "nothing is left to deliver");
+    assert!(store.read_work(b, None, 8).unwrap().items.is_empty());
+    let other = store.read_work(c, None, 8).unwrap();
+    assert_eq!(other.items.len(), 1);
+    assert_eq!(other.items.as_slice()[0].delivery, kept);
+    assert_eq!(other.items.as_slice()[0].payload.as_slice(), b"oversized");
+}
+
+/// Rebuilds a command around the admission of `command`.
+fn altered_into(command: &Command, wrap: impl FnOnce(AdmitPublication) -> Recipe) -> Command {
+    let mut bytes = Vec::new();
+    command
+        .recipe
+        .get()
+        .encode_canonical(&mut bytes)
+        .expect("well formed");
+    let Ok(Recipe::AdmitPublication(admit)) = Recipe::decode_canonical(&bytes, 64, 1024) else {
+        panic!("not an admission");
+    };
+    Command {
+        recipe: FrozenRecipe::freeze(wrap(admit)).expect("well formed"),
+        payload: command.payload.clone(),
+    }
+}

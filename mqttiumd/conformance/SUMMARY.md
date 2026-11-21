@@ -24,7 +24,7 @@ Applies to a server, and either no implementation and no deliberate refusal was 
 
 | MQTT | Statement | Note |
 | - | - | - |
-| 5.0 | `MQTT-3.1.2-25` | Non-conformant for QoS 1 and 2: `plan_delivery_emit` closes the connection (CapacityExceeded, no DISCONNECT) and keeps the delivery, so each reconnection of that session is closed at the same message; `product_pubsub_peer_maximum_packet_size_refuses_emission_and_preserves_claim` pins this. A QoS 0 copy is discarded as required (`qos0_fits`). |
+| 5.0 | `MQTT-3.1.2-25` | Non-conformant for QoS 1 and 2: `plan_delivery_emit` closes the connection (CapacityExceeded, no DISCONNECT) and keeps the delivery, so each reconnection of that session is closed at the same message; `product_pubsub_delivery_over_peer_maximum_packet_size_is_discarded_and_the_next_one_sent` states the required behaviour and fails on this code. A QoS 0 copy is discarded as required (`qos0_fits`). |
 
 ### message-ordering (7)
 

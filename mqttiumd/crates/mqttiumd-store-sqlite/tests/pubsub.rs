@@ -548,3 +548,26 @@ fn operation_fact_payloads_are_bounded_and_decoded_without_guessing() {
     );
     assert_eq!(store.snapshot(), Err(ReadError::InvalidData));
 }
+
+/// The discard of an oversized delivery (ADR 0025 as amended) on SQLite:
+/// each restart of the shared check closes the file and opens it again.
+#[test]
+fn a_never_started_claim_is_ended_once_by_its_guarded_finish_across_reopens() {
+    for (qos, timed) in [
+        (Qos::AtLeastOnce, false),
+        (Qos::ExactlyOnce, false),
+        (Qos::AtLeastOnce, true),
+        (Qos::ExactlyOnce, true),
+    ] {
+        let path = fresh_path("discard");
+        mqttiumd_lab::store::conformance::a_never_started_claim_is_ended_once_by_its_guarded_finish(
+            &|incarnation, limits| SqliteStore::create(&path, incarnation, limits).unwrap(),
+            &|store| {
+                drop(store);
+                SqliteStore::open(&path).unwrap()
+            },
+            qos,
+            timed,
+        );
+    }
+}

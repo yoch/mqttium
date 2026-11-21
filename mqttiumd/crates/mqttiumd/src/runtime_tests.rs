@@ -669,6 +669,141 @@ fn recipient_puback_preceding_disconnect_is_applied_before_generation_closes() {
     });
 }
 
+/// MQTT-3.1.2-25 on the wire: a QoS 1 delivery larger than the subscriber's
+/// Maximum Packet Size is discarded, and the persistent session keeps its
+/// connection, receives what fits and resumes without the discarded message.
+#[test]
+fn a_delivery_over_the_subscribers_maximum_packet_size_is_discarded_and_the_session_stays_usable() {
+    with_runtime(128, |runtime, directory| {
+        let discards = |directory: &Path| -> Vec<serde_json::Value> {
+            std::fs::read_to_string(directory.join("events.jsonl"))
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+                .filter(|event| event["kind"] == "delivery_discarded")
+                .collect()
+        };
+        let obligations = |directory: &Path| {
+            let state =
+                mqttiumd_store_sqlite::SqliteStore::inspect(&directory.join("store.sqlite"))
+                    .unwrap();
+            (state.obligations.len(), state.outbound.len())
+        };
+        let subscriber_connect = |max_packet_size| {
+            let mut connect = connect_packet(b"small-subscriber");
+            connect.max_packet_size = max_packet_size;
+            connect
+        };
+        let (subscriber, mut receiver) = peer(runtime);
+        runtime.connect(subscriber, subscriber_connect(64)).unwrap();
+        until(runtime, |r| r.session_requests.is_empty());
+        assert_eq!(read_frame(&mut receiver).0, 0x20);
+        runtime
+            .packet(subscriber, 0x82, vec![0, 1, 0, 0, 1, b't', 1])
+            .unwrap();
+        until(runtime, |r| r.inflight.is_empty() && r.inputs.is_empty());
+        assert_eq!(read_frame(&mut receiver).0, 0x90);
+        let session = runtime.sessions[b"small-subscriber".as_slice()].id;
+        let (publisher, mut sender) = peer(runtime);
+        runtime
+            .connect(publisher, connect_packet(b"large-publisher"))
+            .unwrap();
+        until(runtime, |r| r.session_requests.is_empty());
+        assert_eq!(read_frame(&mut sender).0, 0x20);
+
+        // A PUBLISH of 108 bytes for a client that accepts 64.
+        let mut large = publish_body(1);
+        large.truncate(6);
+        large.extend_from_slice(&[b'x'; 100]);
+        runtime.packet(publisher, 0x32, large).unwrap();
+        let (header, body) = served_frame(runtime, &mut sender);
+        assert_eq!(header, 0x40);
+        assert_eq!(&body[..2], &[0, 1]);
+        assert_eq!(
+            body.get(2).copied().unwrap_or(0),
+            0,
+            "the publisher's QoS 1 publication succeeds"
+        );
+        let open = |r: &Runtime<'_>| {
+            r.peers
+                .get(&subscriber)
+                .is_some_and(|p| p.closing.is_none())
+        };
+        until(runtime, |r| !discards(directory).is_empty() || !open(r));
+        assert!(
+            open(runtime),
+            "the connection of a persistent session was closed at a delivery it cannot accept"
+        );
+        let observed = discards(directory);
+        assert_eq!(observed.len(), 1, "{observed:?}");
+        assert_eq!(observed[0]["details"]["reason"], "packet_too_large");
+        assert_eq!(observed[0]["details"]["target"], session.get().to_string());
+        assert_eq!(observed[0]["command_kind"], "Finish");
+        assert!(observed[0]["operation"].is_object());
+        until(runtime, |r| r.inflight.is_empty() && r.inputs.is_empty());
+        assert_eq!(
+            obligations(directory),
+            (0, 0),
+            "the discarded delivery left no obligation and no claim"
+        );
+        runtime.packet(subscriber, 0xc0, vec![]).unwrap();
+        assert_eq!(
+            served_frame(runtime, &mut receiver).0,
+            0xd0,
+            "nothing was written to the subscriber for the discarded delivery"
+        );
+
+        // What fits is delivered and acknowledged on the same connection.
+        runtime.packet(publisher, 0x32, publish_body(2)).unwrap();
+        assert_eq!(served_frame(runtime, &mut sender).0, 0x40);
+        let (header, body) = served_frame(runtime, &mut receiver);
+        assert_eq!(header, 0x32);
+        assert_eq!(body.last(), Some(&b'v'));
+        receiver.write_all(&[0x40, 2, body[3], body[4]]).unwrap();
+        until(runtime, |r| {
+            r.inflight.is_empty() && r.inputs.is_empty() && obligations(directory) == (0, 0)
+        });
+
+        // The session resumes, under the same limit and under a larger one,
+        // without the discarded message.
+        let mut current = subscriber;
+        for max_packet_size in [64, 1024] {
+            runtime.close(current, "test_reconnect").unwrap();
+            runtime.drain_inputs().unwrap();
+            let (next, mut resumed) = peer(runtime);
+            runtime
+                .connect(next, subscriber_connect(max_packet_size))
+                .unwrap();
+            until(runtime, |r| r.session_requests.is_empty());
+            let (header, body) = read_frame(&mut resumed);
+            assert_eq!(header, 0x20);
+            assert_eq!(body[0] & 1, 1, "Session Present");
+            until(runtime, |r| {
+                r.inflight.is_empty() && r.inputs.is_empty() && r.work_reads.is_empty()
+            });
+            runtime.packet(next, 0xc0, vec![]).unwrap();
+            assert_eq!(
+                served_frame(runtime, &mut resumed).0,
+                0xd0,
+                "no redelivery at Maximum Packet Size {max_packet_size}"
+            );
+            current = next;
+            receiver = resumed;
+        }
+        let mut small = publish_body(3);
+        *small.last_mut().unwrap() = b'w';
+        runtime.packet(publisher, 0x32, small).unwrap();
+        assert_eq!(served_frame(runtime, &mut sender).0, 0x40);
+        let (header, body) = served_frame(runtime, &mut receiver);
+        assert_eq!(
+            header, 0x32,
+            "the first PUBLISH read is new and not a duplicate"
+        );
+        assert_eq!(body.last(), Some(&b'w'));
+        assert_eq!(discards(directory).len(), 1);
+    });
+}
+
 #[test]
 fn expiring_received_puback_disconnect_preserves_exact_durable_finish() {
     with_runtime(128, |runtime, path| {

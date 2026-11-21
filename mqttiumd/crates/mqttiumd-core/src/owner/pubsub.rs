@@ -5637,29 +5637,48 @@ mod tests {
             !owner.qos0_fits(key, &topic, &payload, Some(message_expiry())),
             "qos0_expiry_property_not_charged"
         );
-        queued(&mut owner, 0);
-        let d = &mut owner.pubsub.deliveries.as_mut_slice()[0];
-        d.expiry = Some(message_expiry());
-        d.payload = Some(payload);
-        let (effect, command) =
-            message_command(apply(&mut owner, Input::WorkAvailable { session: TARGET }));
-        let effects = known(&mut owner, effect, &command);
-        assert!(
-            effects.iter().any(|(_, e)| matches!(
-                e,
-                Effect::CloseConnection {
-                    reason: CloseReason::CapacityExceeded,
-                    ..
-                }
-            )),
-            "qos1_expiry_property_not_charged"
-        );
-        assert!(
-            !effects
-                .iter()
-                .any(|(_, e)| matches!(e, Effect::EmitPublish { .. }))
-        );
-        assert_eq!(owner.pubsub.free_packet_id(TARGET, 1), None);
+        // The QoS 1 half pinned the closure of the connection. Its purpose
+        // is unchanged: the Message Expiry property is charged. The same
+        // bytes fit without it (127 bytes) and are discarded with it (133).
+        for timed in [false, true] {
+            let mut owner = world();
+            message_clock(&mut owner, 10);
+            owner.pubsub.connections.as_mut_slice()[0].maximum_packet_size = 128;
+            queued(&mut owner, 0);
+            let d = &mut owner.pubsub.deliveries.as_mut_slice()[0];
+            d.expiry = timed.then(message_expiry);
+            d.payload = Some(payload.clone());
+            let (effect, command) =
+                message_command(apply(&mut owner, Input::WorkAvailable { session: TARGET }));
+            let effects = known(&mut owner, effect, &command);
+            assert!(
+                !effects
+                    .iter()
+                    .any(|(_, e)| matches!(e, Effect::CloseConnection { .. })),
+                "qos1_packet_limit_closed_the_connection"
+            );
+            assert_eq!(
+                effects
+                    .iter()
+                    .any(|(_, e)| matches!(e, Effect::EmitPublish { .. })),
+                !timed,
+                "qos1_expiry_property_not_charged"
+            );
+            assert_eq!(owner.pubsub.free_packet_id(TARGET, 1), None);
+            if !timed {
+                continue;
+            }
+            let (effect, discard) =
+                message_command(apply(&mut owner, Input::WorkAvailable { session: TARGET }));
+            assert!(
+                matches!(discard.recipe.get(), Recipe::FinishDelivery(f) if f.claim == command.recipe.operation()),
+                "qos1_expiry_property_not_charged"
+            );
+            assert_eq!(owner.pubsub.free_packet_id(TARGET, 1), None);
+            let _ = known(&mut owner, effect, &discard);
+            assert!(owner.pubsub.deliveries.is_empty());
+            assert_eq!(owner.pubsub.free_packet_id(TARGET, 1).unwrap().get(), 1);
+        }
     }
 
     #[test]
@@ -6644,6 +6663,503 @@ mod tests {
                 "retired_expiry_control_left_receipt_hole"
             );
             assert!(known(&mut owner, effect, &command).is_empty());
+        }
+    }
+
+    // Maximum Packet Size of the receiving client (MQTT-3.1.2-25, ADR 0025
+    // as amended): a QoS 1 or 2 delivery whose PUBLISH would exceed it is
+    // not sent and ends through the finish guarded by its claim.
+
+    const OTHER: SessionId = SessionId::new(2);
+
+    /// The name of each effect these tests expect, in order.
+    fn names(effects: &[(EffectId, Effect)]) -> Vec<&'static str> {
+        effects
+            .iter()
+            .map(|(_, effect)| match effect {
+                Effect::Persist { .. } => "Persist",
+                Effect::ArmDeadline { .. } => "ArmDeadline",
+                Effect::EmitPublish { .. } => "EmitPublish",
+                Effect::CloseConnection { .. } => "CloseConnection",
+                Effect::LoadWork { .. } => "LoadWork",
+                _ => "another effect",
+            })
+            .collect()
+    }
+
+    /// The world, its connection limited to `maximum` bytes per packet and
+    /// `receive_maximum` unacknowledged PUBLISH packets.
+    fn limited(maximum: u32, receive_maximum: u16) -> Owner {
+        let mut owner = world();
+        let settings = &mut owner.pubsub.connections.as_mut_slice()[0];
+        settings.maximum_packet_size = maximum;
+        settings.receive_maximum = receive_maximum;
+        owner
+    }
+
+    /// A loaded, unclaimed delivery of topic `topic`: 12 bytes of PUBLISH
+    /// besides its payload, 17 with a Message Expiry Interval.
+    fn sized(owner: &mut Owner, index: u32, qos: Qos, timed: bool, payload: usize) {
+        queued(owner, index);
+        let d = owner.pubsub.deliveries.as_mut_slice().last_mut().unwrap();
+        d.qos = qos;
+        d.expiry = timed.then(message_expiry);
+        d.payload = Some(SharedBytes::copy_from(&alloc::vec![7; payload], 128).unwrap());
+    }
+
+    /// Submits the claim the next work turn makes and applies its commit.
+    fn claim_next(owner: &mut Owner, session: SessionId) -> (Command, Vec<(EffectId, Effect)>) {
+        let (effect, command) = message_command(apply(owner, Input::WorkAvailable { session }));
+        assert!(matches!(command.recipe.get(), Recipe::ClaimDelivery(_)));
+        let effects = known(owner, effect, &command);
+        (command, effects)
+    }
+
+    /// The work turn that follows the claim of an oversized delivery: the
+    /// finish guarded by that claim and its deadline, nothing else.
+    fn discard_next(
+        owner: &mut Owner,
+        session: SessionId,
+        claim: &Command,
+    ) -> (EffectId, Command, DeadlineToken) {
+        assert!(owner.has_ready_work(session), "the discard is ready work");
+        let effects = apply(owner, Input::WorkAvailable { session });
+        assert_eq!(names(&effects), ["Persist", "ArmDeadline"]);
+        let Effect::ArmDeadline { token, .. } = effects[1].1 else {
+            panic!("deadline of the discard")
+        };
+        let (effect, command) = message_command(effects);
+        let Recipe::ClaimDelivery(claimed) = claim.recipe.get() else {
+            panic!("claim")
+        };
+        assert_eq!(
+            command.recipe.get(),
+            &Recipe::FinishDelivery(FinishDelivery {
+                operation: command.recipe.operation(),
+                delivery: claimed.delivery,
+                target: claimed.target,
+                target_revision: claimed.target_revision,
+                packet_id: claimed.packet_id,
+                claim: claimed.operation,
+            }),
+            "the discard is the finish guarded by the claim"
+        );
+        assert_ne!(command.recipe.operation(), claimed.operation);
+        (effect, command, token)
+    }
+
+    #[test]
+    fn a_delivery_is_sent_at_its_exact_packet_size_and_discarded_one_byte_below() {
+        for qos in [Qos::AtLeastOnce, Qos::ExactlyOnce] {
+            for timed in [false, true] {
+                let fixed = 12 + usize::from(timed) * 5;
+                // `payload`, then the two sides of the Remaining Length step:
+                // a body of 127 bytes has a 2-byte header, one of 128 has 3.
+                for (payload, exact) in [
+                    (7, fixed + 7),
+                    (127 - (fixed - 2), 129),
+                    (128 - (fixed - 2), 131),
+                ] {
+                    let case = (qos, timed, payload);
+                    let mut owner = limited(exact as u32, 8);
+                    message_clock(&mut owner, 10);
+                    sized(&mut owner, 0, qos, timed, payload);
+                    let (_, sent) = claim_next(&mut owner, TARGET);
+                    assert_eq!(names(&sent), ["EmitPublish"], "{case:?}");
+
+                    let mut owner = limited(exact as u32 - 1, 8);
+                    message_clock(&mut owner, 10);
+                    sized(&mut owner, 0, qos, timed, payload);
+                    let (claim, sent) = claim_next(&mut owner, TARGET);
+                    assert!(
+                        sent.is_empty(),
+                        "{case:?}: no PUBLISH, no acknowledgement frame, no close: {sent:?}"
+                    );
+                    let (effect, discard, _) = discard_next(&mut owner, TARGET, &claim);
+                    assert!(
+                        apply(&mut owner, Input::WorkAvailable { session: TARGET })
+                            .iter()
+                            .all(|(_, e)| matches!(e, Effect::LoadWork { .. })),
+                        "{case:?}: a pending discard is submitted once"
+                    );
+                    assert_eq!(
+                        names(&known(&mut owner, effect, &discard)),
+                        ["DeliveryDiscarded"],
+                        "{case:?}"
+                    );
+                    assert!(owner.pubsub.deliveries.is_empty(), "{case:?}");
+                    assert_eq!(owner.pubsub.active(CONNECTION), 0, "{case:?}");
+                    assert_eq!(owner.pubsub.free_packet_id(TARGET, 1).unwrap().get(), 1);
+                    assert!(
+                        known(&mut owner, effect, &discard).is_empty(),
+                        "{case:?}: a repeated result publishes no second observation"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn two_destinations_of_one_publication_are_decided_by_their_own_packet_limits() {
+        let mut owner = world();
+        let other = ConnectionGeneration::new(11);
+        let _ = apply(
+            &mut owner,
+            Input::Packet {
+                connection: other,
+                ingress_order: 0,
+                packet: InboundPacket::ConnectResume {
+                    client_id: bytes(b"other"),
+                },
+            },
+        );
+        assert!(
+            apply(
+                &mut owner,
+                Input::ConnectionSettings {
+                    connection: other,
+                    receive_maximum: 8,
+                    maximum_packet_size: 18,
+                }
+            )
+            .is_empty()
+        );
+        queued(&mut owner, 0);
+        queued(&mut owner, 1);
+        owner.pubsub.deliveries.as_mut_slice()[1].target = OTHER;
+        let (_, sent) = claim_next(&mut owner, TARGET);
+        assert!(matches!(
+            &sent[..],
+            [(_, Effect::EmitPublish { delivery: d, connection, .. })]
+                if *d == delivery(0) && connection.generation == CONNECTION
+        ));
+        let (claim, sent) = claim_next(&mut owner, OTHER);
+        assert!(sent.is_empty(), "{sent:?}");
+        let (effect, discard, _) = discard_next(&mut owner, OTHER, &claim);
+        assert_eq!(
+            names(&known(&mut owner, effect, &discard)),
+            ["DeliveryDiscarded"]
+        );
+        let left = owner.pubsub.deliveries.as_slice();
+        assert_eq!(left.len(), 1, "the other destination keeps its delivery");
+        assert_eq!((left[0].id, left[0].target), (delivery(0), TARGET));
+        assert!(left[0].frame.is_some() && left[0].phase == Phase::AwaitPuback);
+        assert_eq!(owner.pubsub.active(CONNECTION), 1);
+        assert_eq!(owner.pubsub.active(other), 0);
+    }
+
+    #[test]
+    fn a_pending_discard_holds_its_window_and_identifier_until_its_finish_is_known() {
+        for receive_maximum in [1, 2] {
+            let mut owner = limited(18, receive_maximum);
+            sized(&mut owner, 0, Qos::AtLeastOnce, false, 7);
+            sized(&mut owner, 1, Qos::AtLeastOnce, false, 1);
+            let (claim, sent) = claim_next(&mut owner, TARGET);
+            assert!(sent.is_empty(), "{sent:?}");
+            let (effect, discard, _) = discard_next(&mut owner, TARGET, &claim);
+            assert_eq!(owner.pubsub.active(CONNECTION), 1);
+            assert_eq!(owner.pubsub.free_packet_id(TARGET, 4).unwrap().get(), 2);
+            if receive_maximum == 1 {
+                assert!(
+                    apply(&mut owner, Input::WorkAvailable { session: TARGET }).is_empty(),
+                    "the full window admits no claim while the discard is pending"
+                );
+            } else {
+                let (next, sent) = claim_next(&mut owner, TARGET);
+                assert!(
+                    matches!(next.recipe.get(), Recipe::ClaimDelivery(c) if c.delivery == delivery(1) && c.packet_id.get() == 2),
+                    "the free window admits the next delivery beside the pending discard"
+                );
+                assert!(matches!(
+                    &sent[..],
+                    [(_, Effect::EmitPublish { delivery: d, dup: false, .. })] if *d == delivery(1)
+                ));
+            }
+            assert_eq!(
+                names(&known(&mut owner, effect, &discard)),
+                ["DeliveryDiscarded"]
+            );
+            if receive_maximum == 1 {
+                let (next, sent) = claim_next(&mut owner, TARGET);
+                assert!(
+                    matches!(next.recipe.get(), Recipe::ClaimDelivery(c) if c.delivery == delivery(1) && c.packet_id.get() == 1),
+                    "the commit of the discard returns the window and the identifier"
+                );
+                assert!(matches!(
+                    &sent[..],
+                    [(_, Effect::EmitPublish { delivery: d, dup: false, .. })] if *d == delivery(1)
+                ));
+            }
+            assert_eq!(owner.pubsub.deliveries.len(), 1);
+            assert_eq!(owner.pubsub.active(CONNECTION), 1);
+        }
+    }
+
+    /// A claim found in durable data, as after a crash between the commit of
+    /// the claim and the commit of its discard.
+    fn recovered_claim(owner: &mut Owner) -> DeliveryClaim {
+        let claim = DeliveryClaim {
+            operation: OperationId::new(
+                StoreIncarnation::new(1),
+                RunEpoch::new(1),
+                LogicalOwnerId::new(4),
+                OperationSeq::new(100),
+            ),
+            packet_id: OutboundPacketId::new(3).unwrap(),
+            started: false,
+            await_pubcomp: false,
+        };
+        owner
+            .add_outbound_fact(
+                delivery(0),
+                TARGET,
+                Revision::new(1),
+                (Qos::AtLeastOnce, Some(claim), None, false),
+            )
+            .unwrap();
+        let item = &mut owner.pubsub.deliveries.as_mut_slice()[0];
+        item.topic = Some(bytes(b"topic"));
+        item.payload = Some(bytes(b"payload"));
+        claim
+    }
+
+    #[test]
+    fn a_recovered_claim_is_discarded_again_under_its_identity_or_sent_as_a_duplicate() {
+        let mut owner = limited(18, 8);
+        let claim = recovered_claim(&mut owner);
+        assert!(owner.has_ready_work(TARGET));
+        let effects = apply(&mut owner, Input::WorkAvailable { session: TARGET });
+        assert_eq!(names(&effects), ["Persist", "ArmDeadline"]);
+        let (effect, discard) = message_command(effects);
+        let Recipe::FinishDelivery(finish) = discard.recipe.get() else {
+            panic!("the recovered claim is discarded again: {discard:?}")
+        };
+        assert_eq!(
+            (finish.delivery, finish.packet_id, finish.claim),
+            (delivery(0), claim.packet_id, claim.operation),
+            "the second discard is guarded by the same claim"
+        );
+        assert_ne!(finish.operation, claim.operation);
+        assert_eq!(
+            names(&known(&mut owner, effect, &discard)),
+            ["DeliveryDiscarded"]
+        );
+        assert!(owner.pubsub.deliveries.is_empty());
+
+        let mut owner = limited(19, 8);
+        let claim = recovered_claim(&mut owner);
+        let sent = apply(&mut owner, Input::WorkAvailable { session: TARGET });
+        assert!(
+            matches!(
+                &sent[..],
+                [(_, Effect::EmitPublish { packet_id, claim: op, dup: true, .. })]
+                    if *packet_id == claim.packet_id && *op == claim.operation
+            ),
+            "a recovered claim that fits is sent with DUP=1: {sent:?}"
+        );
+    }
+
+    /// The subscriber closes `CONNECTION` and resumes on a new generation
+    /// that accepts 65536 bytes per packet.
+    fn reconnect_larger(owner: &mut Owner) -> ConnectionGeneration {
+        let next = ConnectionGeneration::new(11);
+        let _ = apply(
+            owner,
+            Input::ConnectionClosed {
+                connection: CONNECTION,
+            },
+        );
+        let _ = apply(
+            owner,
+            Input::Packet {
+                connection: next,
+                ingress_order: 0,
+                packet: InboundPacket::ConnectResume {
+                    client_id: bytes(b"subscriber"),
+                },
+            },
+        );
+        assert!(
+            apply(
+                owner,
+                Input::ConnectionSettings {
+                    connection: next,
+                    receive_maximum: 8,
+                    maximum_packet_size: 65536,
+                }
+            )
+            .is_empty()
+        );
+        next
+    }
+
+    fn sends_nothing(effects: &[(EffectId, Effect)]) -> bool {
+        effects
+            .iter()
+            .all(|(_, e)| matches!(e, Effect::LoadWork { .. }))
+    }
+
+    #[test]
+    fn a_discard_of_unknown_outcome_is_resolved_and_never_sent_on_a_larger_connection() {
+        let mut owner = limited(18, 8);
+        sized(&mut owner, 0, Qos::AtLeastOnce, false, 7);
+        let (claim, _) = claim_next(&mut owner, TARGET);
+        let (effect, discard, deadline) = discard_next(&mut owner, TARGET, &claim);
+        let operation = discard.recipe.operation();
+        assert!(
+            apply(
+                &mut owner,
+                Input::StoreResult {
+                    effect,
+                    operation,
+                    reply: StoreReply::Outcome(StoreOutcome::PendingOrUnknown),
+                }
+            )
+            .is_empty()
+        );
+        let _ = reconnect_larger(&mut owner);
+        let work = apply(&mut owner, Input::WorkAvailable { session: TARGET });
+        assert!(
+            sends_nothing(&work),
+            "a discard that may have committed is never sent: {work:?}"
+        );
+        assert_eq!(owner.pubsub.free_packet_id(TARGET, 4).unwrap().get(), 2);
+        let resolution = apply(
+            &mut owner,
+            Input::Deadline {
+                token: deadline,
+                now: crate::contract::ids::LogicalTime::new(10),
+            },
+        );
+        assert!(
+            matches!(resolution[0].1, Effect::ResolveAndFence { operation: resolved } if resolved == operation)
+        );
+        assert_eq!(
+            names(&known(&mut owner, resolution[0].0, &discard)),
+            ["DeliveryDiscarded"]
+        );
+        assert!(owner.pubsub.deliveries.is_empty());
+        let work = apply(&mut owner, Input::WorkAvailable { session: TARGET });
+        assert!(sends_nothing(&work), "{work:?}");
+    }
+
+    #[test]
+    fn a_fenced_discard_closes_nothing_and_is_decided_again() {
+        for larger in [false, true] {
+            let mut owner = limited(18, 8);
+            sized(&mut owner, 0, Qos::AtLeastOnce, false, 7);
+            let (claim, _) = claim_next(&mut owner, TARGET);
+            let (_, discard, deadline) = discard_next(&mut owner, TARGET, &claim);
+            let resolution = apply(
+                &mut owner,
+                Input::Deadline {
+                    token: deadline,
+                    now: crate::contract::ids::LogicalTime::new(10),
+                },
+            );
+            assert!(matches!(resolution[0].1, Effect::ResolveAndFence { .. }));
+            let fenced = apply(
+                &mut owner,
+                Input::StoreResult {
+                    effect: resolution[0].0,
+                    operation: discard.recipe.operation(),
+                    reply: StoreReply::Outcome(StoreOutcome::RejectedCertain(RejectReason::Fenced)),
+                },
+            );
+            assert!(
+                fenced.is_empty(),
+                "a discard certainly not applied closes nothing: {fenced:?}"
+            );
+            assert_eq!(owner.pubsub.deliveries.len(), 1, "the claim stands");
+            assert_eq!(owner.pubsub.free_packet_id(TARGET, 4).unwrap().get(), 2);
+            if larger {
+                let _ = reconnect_larger(&mut owner);
+                let sent = apply(&mut owner, Input::WorkAvailable { session: TARGET });
+                assert!(
+                    matches!(&sent[..], [(_, Effect::EmitPublish { delivery: d, .. })] if *d == delivery(0)),
+                    "decided again against the connection of that moment: {sent:?}"
+                );
+            } else {
+                let (effect, again, _) = discard_next(&mut owner, TARGET, &claim);
+                assert_ne!(again.recipe.operation(), discard.recipe.operation());
+                assert_eq!(
+                    names(&known(&mut owner, effect, &again)),
+                    ["DeliveryDiscarded"]
+                );
+                assert!(owner.pubsub.deliveries.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn a_discard_refused_for_another_reason_keeps_the_rule_of_a_refused_finish() {
+        let mut owner = limited(18, 8);
+        sized(&mut owner, 0, Qos::AtLeastOnce, false, 7);
+        let (claim, _) = claim_next(&mut owner, TARGET);
+        let (effect, discard, _) = discard_next(&mut owner, TARGET, &claim);
+        let refused = apply(
+            &mut owner,
+            Input::StoreResult {
+                effect,
+                operation: discard.recipe.operation(),
+                reply: StoreReply::Outcome(StoreOutcome::RejectedCertain(
+                    RejectReason::PreconditionFailed,
+                )),
+            },
+        );
+        assert!(matches!(
+            &refused[..],
+            [(
+                _,
+                Effect::CloseConnection {
+                    reason: CloseReason::CapacityExceeded,
+                    ..
+                }
+            )]
+        ));
+        assert_eq!(owner.pubsub.deliveries.len(), 1);
+        assert_eq!(owner.pubsub.free_packet_id(TARGET, 4).unwrap().get(), 2);
+    }
+
+    #[test]
+    fn a_session_retired_during_a_discard_consumes_its_result_without_a_receipt_hole() {
+        let mut owner = limited(18, 8);
+        message_register_receipts(&mut owner);
+        sized(&mut owner, 0, Qos::AtLeastOnce, false, 7);
+        let (claim, _) = claim_next(&mut owner, TARGET);
+        let (effect, discard, _) = discard_next(&mut owner, TARGET, &claim);
+        owner.pubsub.retire_session(TARGET);
+        let _ = apply(
+            &mut owner,
+            Input::ConnectionClosed {
+                connection: CONNECTION,
+            },
+        );
+        assert_eq!(owner.receipt_status().unwrap().2, 1);
+        assert_eq!(
+            names(&known(&mut owner, effect, &discard)),
+            ["DeliveryDiscarded"]
+        );
+        assert!(owner.pubsub.deliveries.is_empty());
+        assert_eq!(
+            owner.receipt_status().unwrap().2,
+            0,
+            "retired_discard_left_receipt_hole"
+        );
+        assert!(known(&mut owner, effect, &discard).is_empty());
+    }
+
+    #[test]
+    fn an_absent_maximum_packet_size_sends_the_largest_admissible_delivery() {
+        // MQTT 3.1.1 and an MQTT 5 CONNECT without the property both reach
+        // the core as `u32::MAX`: nothing the limits admit is discarded.
+        for qos in [Qos::AtLeastOnce, Qos::ExactlyOnce] {
+            let mut owner = limited(u32::MAX, 8);
+            message_clock(&mut owner, 10);
+            sized(&mut owner, 0, qos, true, 128);
+            owner.pubsub.deliveries.as_mut_slice()[0].topic = Some(bytes(&[b't'; 128]));
+            let (_, sent) = claim_next(&mut owner, TARGET);
+            assert_eq!(names(&sent), ["EmitPublish"]);
         }
     }
 }
