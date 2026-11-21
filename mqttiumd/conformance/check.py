@@ -40,8 +40,22 @@ STATUSES = (
 )
 # Statuses whose claim rests on a place in the code.
 NEEDS_CODE = ("implemented-untested", "profile-refused")
-ENTRY_KEYS = {"id", "feature", "applies_to_server", "status", "evidence", "code", "note"}
-REQUIRED_KEYS = ENTRY_KEYS - {"code"}
+ENTRY_KEYS = {
+    "id",
+    "feature",
+    "applies_to_server",
+    "status",
+    "evidence",
+    "evidence_kind",
+    "code",
+    "note",
+}
+REQUIRED_KEYS = ENTRY_KEYS - {"code", "evidence_kind"}
+# What a reader who compared the cited tests with the statement found:
+# they assert the statement on its own precondition (direct), or part of
+# it, or something it has to be inferred from (partial). A covered row
+# without a kind has not been read that way.
+EVIDENCE_KINDS = ("direct", "partial")
 EVIDENCE_KEYS = {"file", "test"}
 # Frozen receptions (ADR 0044) are not maintained against the runtime:
 # they may be named in a note, never counted as evidence.
@@ -183,6 +197,16 @@ def check_fields(entry: dict, where: str, errors: list[str]) -> bool:
         errors.append(f"{where}: feature must be a lower-case slug such as 'topic-alias'")
     if not isinstance(entry["note"], str) or not entry["note"].strip():
         errors.append(f"{where}: note must be a non-empty sentence")
+    if "evidence_kind" in entry:
+        kind = entry["evidence_kind"]
+        if kind not in EVIDENCE_KINDS:
+            errors.append(
+                f"{where}: evidence_kind {kind!r}; expected one of {list(EVIDENCE_KINDS)}"
+            )
+        if status != "covered":
+            errors.append(
+                f"{where}: only a covered statement has an evidence_kind, not a {status} one"
+            )
     return True
 
 
@@ -310,6 +334,15 @@ def count(entries: list[dict], status: str) -> int:
     return sum(1 for entry in entries if entry["status"] == status)
 
 
+def count_kind(entries: list[dict], kind: str | None) -> int:
+    """Covered rows whose evidence has that kind; None counts those without one."""
+    return sum(
+        1
+        for entry in entries
+        if entry["status"] == "covered" and entry.get("evidence_kind") == kind
+    )
+
+
 SECTIONS = (
     (
         "open",
@@ -336,6 +369,14 @@ def render_counts(versions: dict) -> list[str]:
     for status in STATUSES:
         counts = [str(count(versions[version], status)) for version in SOURCES]
         lines.append(f"| `{status}` | " + " | ".join(counts) + " |")
+        if status != "covered":
+            continue
+        for label, kind in (
+            *((f"of which `{kind}`", kind) for kind in EVIDENCE_KINDS),
+            ("not reviewed", None),
+        ):
+            counts = [str(count_kind(versions[version], kind)) for version in SOURCES]
+            lines.append(f"| {label} | " + " | ".join(counts) + " |")
     totals = [str(len(versions[version])) for version in SOURCES]
     binding = [
         str(sum(1 for entry in versions[version] if entry["applies_to_server"]))
@@ -379,6 +420,11 @@ def render_summary(register: dict) -> str:
         "`server-statements.json`; do not edit. A `covered` row names a test that",
         "exercises the statement. It is not a proof of conformance: see `README.md`.",
         "",
+        "The covered rows are counted by the kind of their evidence where someone",
+        "compared the cited tests with the statement: `direct` when they assert it on",
+        "its own precondition, `partial` when they assert part of it or something it",
+        "is inferred from. The others are not reviewed, which is not a third kind.",
+        "",
     ]
     lines += render_counts(versions)
     for status, title, meaning in SECTIONS:
@@ -402,6 +448,12 @@ def run(root: Path, check_only: bool, out=sys.stdout) -> int:
         entries = register["versions"][version]
         counts = ", ".join(f"{status} {count(entries, status)}" for status in STATUSES)
         print(f"MQTT {version}: {len(entries)} statements: {counts}", file=out)
+        kinds = ", ".join(f"{kind} {count_kind(entries, kind)}" for kind in EVIDENCE_KINDS)
+        print(
+            f"MQTT {version}: evidence of the covered rows: {kinds}, "
+            f"not reviewed {count_kind(entries, None)}",
+            file=out,
+        )
     return 0
 
 

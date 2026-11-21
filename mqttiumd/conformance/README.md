@@ -15,7 +15,7 @@ there by its `id`.
 | - | - |
 | `server-statements.json` | The register. Maintained by hand |
 | `check.py` | Checks the register and every citation in it; rewrites `SUMMARY.md` |
-| `SUMMARY.md` | Generated: counts, then the `open` and `profile-refused` rows by feature. These two lists are the conformance backlog of version 0.1 |
+| `SUMMARY.md` | Generated: counts (the `covered` rows also by the kind of their evidence), then the `open` and `profile-refused` rows by feature. These two lists are the conformance backlog of version 0.1 |
 
 ## What it is not
 
@@ -24,6 +24,12 @@ It is a map of evidence, not a proof of conformance.
 - A `covered` row says that a named test exercises the statement. It does
   not say that every case of the statement is tested, and the note of the
   row often names the case that is not.
+- Most `covered` rows have no `evidence_kind`: nobody has yet compared
+  their tests with the statement a second time. An independent audit of
+  commit `8e4303d` sampled 30 of the 209 rows then covered and found 16
+  direct, 11 partial, and 3 whose test did not exercise the precondition
+  of the statement at all. The rows that were not sampled have not been
+  read that way, and nothing suggests that they would fare better.
 - The checker shows that each cited test and file exists. It runs no test
   and cannot tell whether a test is sufficient, or still asserts what the
   note says.
@@ -61,6 +67,7 @@ the source index.
 | `applies_to_server` | `false` when the statement only binds a client; the note says so, and the status is then `not-applicable`. It follows the reading recorded in `docs/spec/applicability.json` (`client` there is `false` here); a row that departs from it says why in its note |
 | `status` | One of the five values below |
 | `evidence` | For `covered` only: a list of `{"file", "test"}`, a repository-relative path and the exact name of a test function in it. Empty for every other status |
+| `evidence_kind` | Optional, for `covered` only: `direct` or `partial`, the result of comparing the cited tests with the statement (see below). Absent when the row has not been reviewed that way |
 | `code` | A list of `"path:symbol"`: a repository-relative file and a function or constant in it. Required for `implemented-untested` and `profile-refused`, optional elsewhere. The symbol may be omitted |
 | `note` | What the test asserts, what it leaves out, or what a client observes |
 
@@ -78,6 +85,23 @@ The register is deliberately conservative. Between `covered` and
 `implemented-untested`, choose the latter; between `implemented-untested`
 and `open`, choose `open`. One known non-conformant case makes a row
 `open`, even when the ordinary case is tested; the note then says both.
+
+### Direct and partial evidence
+
+`covered` says that a test exists; `evidence_kind` says how far it goes,
+for the rows where someone read the statement and the cited tests side by
+side.
+
+| Kind | Meaning |
+| - | - |
+| `direct` | A cited test sets up the precondition of the statement and asserts the behaviour it requires, at the component that decides it. Nothing has to be inferred |
+| `partial` | The cited tests assert part of the statement (some of its cases, one protocol version where the code is shared, a wide duration where the statement gives a bound), or the statement follows from what they assert by an inference. The note says what is asserted and what is inferred |
+| absent | Not reviewed. `SUMMARY.md` counts these rows apart; they are not a weaker or a stronger claim |
+
+A test that does not reach the precondition of the statement is not
+partial evidence: the row is `implemented-untested`, or `open`. Set the
+kind when a row is added to `covered` or read again, and remove it when
+the cited tests change and the row was not read again.
 
 ### What counts as evidence
 
@@ -132,7 +156,9 @@ when the summary is stale.
 refuses what it claims to check: a missing, repeated or unknown identifier,
 an invalid status, a cited test or file that does not exist, a helper
 function cited as a test, a frozen reception cited as evidence, a refusal
-without a code location, and a stale summary.
+without a code location, an evidence kind that is not one of the two or
+sits on a row that is not covered, and a stale summary. It also shows that
+the summary counts the covered rows by kind.
 
 ## What `--check` verifies
 
@@ -141,6 +167,8 @@ without a code location, and a stale summary.
 - every entry has the required fields, a valid status, and
   `applies_to_server: false` only together with `not-applicable`;
 - a `covered` entry has evidence and no other entry has any;
+- an `evidence_kind` is `direct` or `partial` and sits on a `covered`
+  entry;
 - every evidence file exists, is not a frozen reception, and contains a
   test function of exactly that name: for Rust, `fn name(` with `#[test]`
   among the attribute lines just above it; for Python, `def name(`;
