@@ -150,6 +150,83 @@ class Classification(unittest.TestCase):
         self.assertEqual(classify.check_statements(divergences, {}, None), [])
 
 
+def record_of(divergences, name):
+    """What a run observes when `name` reproduces exactly as it is classified."""
+    known = divergences.get(name)
+    return (classify.DIFFERENT, known["fingerprint"]) if known else (classify.SAME, None)
+
+
+class Incidents(unittest.TestCase):
+    """A broker that exits, hangs or panics never hides behind a classification."""
+
+    def problems(self, divergences, name, incidents):
+        classes, problems = classify.judge({name: record_of(divergences, name)}, divergences, {name})
+        self.assertEqual(problems, [], name)
+        return classify.judge_incidents({name: incidents}, classes, divergences)
+
+    def test_an_exit_recorded_in_the_fingerprint_fails_in_every_class(self):
+        reference = [{"conn": "a", "op": "until_close", "got": [], "end": "still-open"}]
+        broker = [{"conn": "a", "op": "until_close", "got": [], "end": "closed"}, {"op": "broker", "end": "exited"}]
+        fingerprint = normalize.fingerprint(reference, broker)
+        for kind in classify.CLASSES:
+            divergences = classify.check_divergences([
+                {**entry("a/1-v4", kind, statement="MQTT-3.1.4-2", mqttiumd="x"), "fingerprint": fingerprint}])
+            self.assertEqual([name for name, _ in self.problems(divergences, "a/1-v4", {"mqttiumd": ["exited"]})],
+                             ["a/1-v4"], kind)
+
+    def test_an_incident_with_unchanged_transcripts_fails_in_every_class(self):
+        for kind in (None, *classify.CLASSES):
+            listed = [] if kind is None else [entry("a/1-v4", kind, statement="MQTT-3.1.4-2", mqttiumd="x")]
+            divergences = classify.check_divergences(listed)
+            for backend in harness.BACKENDS:
+                for incident in classify.INCIDENTS:
+                    self.assertEqual(len(self.problems(divergences, "a/1-v4", {backend: [incident]})), 1,
+                                     (kind, backend, incident))
+            self.assertEqual(len(self.problems(divergences, "a/1-v4", {"mqttiumd": ["killed", "panic"]})), 2, kind)
+            self.assertEqual(self.problems(divergences, "a/1-v4", {}), [], kind)
+
+    def test_no_entry_checked_in_hides_an_incident(self):
+        divergences = classify.load_divergences(HERE / "divergences.json")
+        for name, known in divergences.items():
+            recorded = known.get("incident", {})
+            self.assertEqual(self.problems(divergences, name, recorded), [], name)
+            for backend in harness.BACKENDS:
+                for incident in classify.INCIDENTS:
+                    if incident in recorded.get(backend, ()):
+                        continue
+                    observed = {**recorded, backend: sorted([*recorded.get(backend, ()), incident])}
+                    self.assertEqual(len(self.problems(divergences, name, observed)), 1, (name, backend, incident))
+
+    def test_a_recorded_incident_is_expected_and_goes_stale(self):
+        divergences = classify.check_divergences([entry("a/1-v4", incident={"mqttiumd": ["exited", "panic"]})])
+        self.assertEqual(self.problems(divergences, "a/1-v4", {"mqttiumd": ["exited", "panic"]}), [])
+        # Only what is recorded: another kind, another backend.
+        self.assertEqual(len(self.problems(divergences, "a/1-v4", {"mqttiumd": ["exited", "killed", "panic"]})), 1)
+        self.assertEqual(len(self.problems(divergences, "a/1-v4",
+                                           {"mqttiumd": ["exited", "panic"], "reference": ["exited"]})), 1)
+        # A recorded incident that did not happen is a stale entry.
+        self.assertEqual(len(self.problems(divergences, "a/1-v4", {"mqttiumd": ["exited"]})), 1)
+        self.assertEqual(len(self.problems(divergences, "a/1-v4", {})), 2)
+
+    def test_a_scenario_that_was_not_played_is_not_judged(self):
+        divergences = classify.check_divergences([entry("a/1-v4", incident={"mqttiumd": ["exited"]}), entry("a/2-v4")])
+        classes, _ = classify.judge({"a/2-v4": (classify.DIFFERENT, "aaaa")}, divergences, {"a/1-v4", "a/2-v4"})
+        self.assertEqual(classify.judge_incidents({"a/2-v4": {}}, classes, divergences), [])
+
+    def test_recorded_incidents_are_checked(self):
+        for kind, incident in (("defect", {}), ("defect", []), ("defect", {"other": ["exited"]}),
+                               ("defect", {"mqttiumd": []}), ("defect", {"mqttiumd": "exited"}),
+                               ("defect", {"mqttiumd": ["crashed"]}), ("defect", {"mqttiumd": ["panic", "exited"]}),
+                               ("defect", {"mqttiumd": ["exited", "exited"]}),
+                               # A crash of mqttiumd is a defect, whatever else differs.
+                               ("profile-refused", {"mqttiumd": ["exited"]}),
+                               ("unspecified", {"reference": ["killed"], "mqttiumd": ["killed"]})):
+            with self.assertRaises(classify.DivergenceError, msg=(kind, incident)):
+                classify.check_divergences([entry("a/1-v4", kind, incident=incident)])
+        classify.check_divergences([entry("a/1-v4", "unspecified", incident={"reference": ["exited", "killed", "panic"]})])
+        classify.check_divergences([entry("a/1-v4", incident={"mqttiumd": ["killed"], "reference": ["panic"]})])
+
+
 class Repository(unittest.TestCase):
     """What is checked in is coherent, whatever the brokers do."""
 
