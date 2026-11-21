@@ -157,7 +157,7 @@
   {
     "id": "retained/forty-topics-v4",
     "class": "profile-refused",
-    "difference": "Mosquitto acknowledges forty retained publications; mqttiumd acknowledges thirty-two and closes the publisher's connection on the thirty-third. The messages that reach the subscription at QoS 0 compare equal (each one of the forty, none twice); how many reach it is measured and not compared: forty from Mosquitto, between 18 and 32 from mqttiumd in the runs read.",
+    "difference": "Mosquitto acknowledges forty retained publications; mqttiumd acknowledges thirty-two and closes the publisher's connection on the thirty-third. The messages that reach the subscription at QoS 0 compare equal (each one of the forty, none twice); how many reach it is measured and not compared: forty from Mosquitto, between 13 and 32 from mqttiumd in the runs read.",
     "lot": "Runtime limits of the bounded preview (ADR 0044), to be raised to Mosquitto's defaults or made configurable: 32 retained topics; the QoS 0 deliveries mqttiumd sheds go through the bounded volatile path (4 output slots per connection)",
     "fingerprint": "5b8352a9198b0cf8"
   },

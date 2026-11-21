@@ -44,15 +44,18 @@ scenarios at once (default 4). The whole bench takes about 40 seconds.
 
 The output directory receives:
 
-- `matrix.md` and `matrix.json` (format `mqttiumd-compat-matrix-v2`): one
+- `matrix.md` and `matrix.json` (format `mqttiumd-compat-matrix-v3`): one
   row per scenario (id, protocol version, result, note), the count per
-  class, the broker incidents, and one row per expectation with its result
-  on each broker;
+  class, the broker incidents, one row per expectation with its result
+  on each broker, and one row per step that counts (`tally`, `measure`)
+  with how many packets each broker sent, which is a measurement and
+  judges nothing;
 - `transcripts/<id>.reference.raw.json` and
   `transcripts/<id>.mqttiumd.raw.json`: what the player recorded from each
   broker, before any normalization: every packet received in the order it
-  came, how each read ended, the capabilities of each CONNACK, the packets
-  a `tally` counted;
+  came with the bytes it took on the wire (`wire_bytes`), how each read
+  ended, the capabilities of each CONNACK, the packets a `tally` or a
+  `measure` counted;
 - `transcripts/<id>.json`: both normalized transcripts, equal or not;
 - `transcripts/<id>.diff`: their difference, for a scenario that differs;
 - `transcripts/<id>.<backend>.incident.txt`: the end of the output and of
@@ -166,7 +169,9 @@ expectation does not apply (a MQTT 5 broker that announces a feature as
 available is not expected to refuse it). `expectations.py` documents the
 patterns: a mapping is matched on the keys it names, a list whole and in
 order, `one_of(...)` on one alternative, `Each(count, allowed)` on a list
-of return codes, `CLOSED` on `eof` or `reset`.
+of return codes, `in_any_order(...)` on a list whose packets each match a
+pattern of their own in any order, `at_most(bound)` on a number such as
+the `wire_bytes` of a packet, `CLOSED` on `eof` or `reset`.
 
 Each expectation is evaluated on the **raw** transcript of mqttiumd and
 gives `pass`, `fail` or `not-applicable`, with one line of what was
@@ -180,9 +185,12 @@ mqttiumd is known to fail:
 ```
 
 sorted by `id`. Fixing the broker makes the entry stale, and the run fails
-until the entry is removed in the change that fixes it. The list is empty
-today: the six expectations, all on SUBSCRIBE and UNSUBSCRIBE, pass on the
-broker of `MATRIX.md`.
+until the entry is removed in the change that fixes it. Twelve
+expectations are declared: six on SUBSCRIBE and UNSUBSCRIBE, two on the
+content of the retained store, four on a delivery larger than the
+subscriber's Maximum Packet Size. One is open on the broker of
+`MATRIX.md`: `retained/forty-topics-qos1-v4#store`, because the bounded
+profile keeps thirty-two retained topics.
 
 An expectation states what conformance requires, not what Mosquitto does
 and not what mqttiumd does today; write it from the statement, give every
@@ -216,6 +224,27 @@ stable:
   broker's work observable: `publish_ack` and `publish_sync` return when
   the broker has read the publication, and `quiet` itself makes a
   PINGREQ/PINGRESP round trip on the connection before its silent window.
+- The silent window of `quiet`, `collect`, `tally` and `measure` starts
+  again at each packet: the step ends once nothing has come for the
+  window, however long the answer took, and as `still-receiving` when
+  packets still come after ten seconds. The PINGRESP of the round trip
+  does not mark the end of an answer: a broker may answer PINGREQ before
+  it has finished a replay that goes through its store.
+- Keep apart what a broker owes and what it may shed, in two scenarios
+  when one exchange asks both questions:
+  - what it owes whatever the timing (QoS 1 deliveries, the content of
+    the retained store) is read with `drain`, which acknowledges each
+    QoS 1 PUBLISH as it reads it, so that the subscriber is never the
+    reason why a delivery is missing, and is judged by an expectation;
+  - what it may lawfully shed (QoS 0 deliveries to a subscriber it cannot
+    write to fast enough) is counted with `measure`: the transcript
+    compares that each message that came is one of those sent and came
+    once, and their order where the protocol guarantees one; how many
+    came is printed in the matrix for both brokers and never compared.
+    An equality on such a count fails on a slow machine: with a
+    subscription at QoS 0 and a fixed window, `retained/forty-topics-v4`
+    gave another transcript in 1 play of 30 without added load and in 5
+    of 30 beside eight busy loops on four cores.
 - Never write down a packet identifier the broker chooses: answer with
   `ack(conn, kind)`, which uses the identifier received.
 - One write, one read, when the question is what the broker does with a
@@ -225,7 +254,10 @@ stable:
   whether all the expected packets came and not how many; give it the
   `sequence` that was sent, and it also compares whether they came in that
   order (`as-sent`), in another (`permuted`), or with a repeated or foreign
-  value (`other`).
+  value (`other`). `tally` suits a count whose verdict does not depend on
+  timing (all twenty PUBACK, or always fewer than a hundred QoS 0
+  messages); where a broker sometimes sends all and sometimes fewer, use
+  `measure`.
 - A connection the broker closes ends by `eof` (end of stream) or `reset`,
   and the two are compared. Declare `closure="any"` only for a scenario in
   which the kind of closure depends on timing: the broker closes while the
@@ -265,22 +297,48 @@ connection was closed by end of stream (`eof`) or by a reset (`reset`). It
 replaces the packet identifiers the broker chooses by labels in order of
 use (`b1`, `b2` ...), the Assigned Client Identifier by `<assigned>`, and a
 remaining Message Expiry Interval by the interval it falls in; it removes
-Reason Strings and, except in `connect/connack-capabilities-v5`, the
-capabilities a broker announces in CONNACK; it reduces the packets a
-`tally` counted to the verdicts `arrived` and `order`. No time is recorded
-and property order is not compared (User Properties keep theirs).
+Reason Strings, the size of each packet on the wire and, except in
+`connect/connack-capabilities-v5`, the capabilities a broker announces in
+CONNACK; it reduces the packets a `tally` counted to the verdicts
+`arrived` and `order`, and those a `measure` counted to `values`
+(`distinct`, `repeated`, `foreign`) and, where asked, `order`, without
+their number; it gives each delivery of a `drain` a label of its own. No
+time is recorded and property order is not compared (User Properties keep
+theirs).
 
 The raw transcripts are written next to the normalized ones and are not
 compared. They are where to look for what normalization removes: the
 exact sequence of a permuted burst, how many messages a broker shed, the
-capabilities of a CONNACK. The PINGREQ and PINGRESP of the round trip that
-`quiet`, `collect` and `tally` make before their silent window belong to
-the harness and are in neither form.
+capabilities of a CONNACK, the size of a packet. The PINGREQ and PINGRESP
+of the round trip that `quiet`, `collect`, `tally` and `measure` make
+before their silent window belong to the harness and are in neither form.
+
+## Successor of the frozen reception F-packet-limit
+
+The system reception `tests/system/pubsub_reception.py`, criterion
+F-packet-limit, is frozen evidence of an earlier executable and asserts
+the rule that record 0025 has since replaced: a QoS 1 delivery larger than
+the subscriber's Maximum Packet Size closed the connection and kept the
+obligation. It is not repaired. The rule in force (the amendment of 21
+November 2026 to record 0025, MQTT-3.1.2-25 of MQTT 5.0) is that the
+delivery is discarded as completed, the connection stays open, the next
+delivery is sent, and a resumed session is owed nothing for the discarded
+message. Its active evidence is:
+
+- `publish/over-maximum-packet-size-qos1-v5` and
+  `publish/over-maximum-packet-size-qos2-v5`, each with the expectations
+  `discarded` and `not-redelivered` on mqttiumd's transcript. Mosquitto
+  2.0.21 answers the same packets the same way: both scenarios are `same`;
+- `crates/mqttiumd/tests/packet_limit.rs`, which plays the same story
+  against the product executable at QoS 1 and QoS 2 and also reads what
+  the wire does not show: the event `delivery_discarded` with the reason
+  `packet_too_large`, and a store that holds no obligation and no claim
+  after the discard.
 
 ## What the bench does not show
 
 - **Conformance.** Only the points that carry an expectation are checked
-  against the specification: six today. Everywhere else, scenarios on which
+  against the specification: twelve today. Everywhere else, scenarios on which
   both brokers agree are not checked against it, and a classified
   difference rests on the reading of the person who classified it.
 - **The network below TCP's interface.** `eof` and `reset` are what the
@@ -304,7 +362,10 @@ the harness and are in neither form.
   are not covered.
 - **Lawful non-determinism.** How a share group spreads messages between
   several members is left out (one member is covered). How many QoS 0
-  messages of a burst a broker sheds is reduced to "all" or "fewer".
+  messages of a burst a broker sheds is reduced to "all" or "fewer", and
+  how many retained messages reach a subscription at QoS 0 is not
+  compared at all; both counts are printed in the matrix as what one run
+  measured.
 - **MQTT 5 enhanced authentication, Server Keep Alive, Request/Response
   Information, flow control beyond Receive Maximum.** Not covered yet.
 
