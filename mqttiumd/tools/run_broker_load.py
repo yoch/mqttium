@@ -176,6 +176,10 @@ def broker_observations(directory):
         for row in events(path):
             kind = row["kind"]
             kinds[kind] += 1
+            if kind == "input_capacity_refused":
+                # Which resource the core lacked when it refused a packet.
+                details = row.get("details", {})
+                dispositions[f"{kind}:{details.get('resource')}/{details.get('wake')}"] += 1
             if kind in terminal:
                 code = row.get("details", {}).get("code", "unspecified")
                 dispositions[f"{kind}:{code}"] += 1

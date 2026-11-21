@@ -1301,6 +1301,33 @@ fn deliveries_keep_the_order_of_reception_when_an_earlier_store_result_is_late()
     }
 }
 
+/// A publication that finds every exchange credit lent to admissions in
+/// flight waits for one of them: the results of the store return the
+/// credits. It is pressure, not a fault of the client, and its connection
+/// stays open (record 0046). Here one credit serves three publications
+/// that arrive together; each is acknowledged, in order.
+#[test]
+fn a_publication_waits_for_the_exchange_credit_of_an_admission_in_flight() {
+    with_runtime(1, |runtime, _| {
+        let (generation, mut client) = connected(runtime, b"credit-waits");
+        for id in 1..=3u8 {
+            runtime
+                .packet(generation, 0x32, vec![0, 1, b't', 0, id, 0, b'v'])
+                .unwrap();
+        }
+        for id in 1..=3u8 {
+            let (kind, body) = served_frame(runtime, &mut client);
+            assert_eq!(
+                (kind, &body[..2]),
+                (0x40, &[0, id][..]),
+                "closing: {:?}",
+                runtime.peers.get(&generation).and_then(|peer| peer.closing)
+            );
+        }
+        assert!(runtime.peers[&generation].closing.is_none());
+    });
+}
+
 /// The one-pass bindings are what a lookup per cached session answered,
 /// for attached and detached sessions alike.
 #[test]
