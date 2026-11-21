@@ -3268,6 +3268,7 @@ mod tests {
             Effect::EmitPublish { .. } => "EmitPublish",
             Effect::EmitQos0 { .. } => "EmitQos0",
             Effect::Qos0Dropped { .. } => "Qos0Dropped",
+            Effect::DeliveryDiscarded { .. } => "DeliveryDiscarded",
             Effect::CloseConnection { .. } => "CloseConnection",
             Effect::ArmDeadline { .. } => "ArmDeadline",
             Effect::Continue { .. } => "Continue",
@@ -8109,7 +8110,18 @@ mod tests {
             "the window of the discarded delivery is held until its finish is known"
         );
         world.applied(committed(&discard));
-        assert_eq!(kinds(&world.drain()), ["DeliveryDiscarded"]);
+        let observed = world.drain();
+        assert_eq!(kinds(&observed), ["DeliveryDiscarded"]);
+        assert_eq!(
+            observed[0].1,
+            Effect::DeliveryDiscarded {
+                delivery: work_item(0).delivery,
+                target: session,
+                operation: discard.operation,
+                reason: crate::contract::pubsub::DeliveryDiscardReason::PacketTooLarge,
+            },
+            "the observation names the committed finish"
+        );
         assert!(world.owner.has_ready_work(session));
         let next = pubsub_flight(&mut world, work_available());
         assert_eq!(

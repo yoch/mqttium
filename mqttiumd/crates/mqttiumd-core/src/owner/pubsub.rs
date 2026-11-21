@@ -7,8 +7,8 @@ use crate::contract::command::{
 use crate::contract::ids::{ContinuationId, OutboundPacketId};
 use crate::contract::packet::Qos2Ack;
 use crate::contract::pubsub::{
-    DeliveryClaim, FilterResults, GrantedSubscriptionChange, MAX_FILTERS, PubackTarget,
-    Qos0DropReason, Qos0Origin, VolatilePublicationId, WORK_PAGE_LIMIT, WorkItem,
+    DeliveryClaim, DeliveryDiscardReason, FilterResults, GrantedSubscriptionChange, MAX_FILTERS,
+    PubackTarget, Qos0DropReason, Qos0Origin, VolatilePublicationId, WORK_PAGE_LIMIT, WorkItem,
 };
 
 // Isolated transition mutants. Production builds retain these false values.
@@ -59,6 +59,9 @@ enum Phase {
     ClaimPending(InFlight),
     AwaitPuback,
     FinishPending(InFlight),
+    /// The guarded finish of a claimed delivery whose PUBLISH would exceed
+    /// the Maximum Packet Size of its connection. Nothing was emitted.
+    DiscardPending(InFlight),
     PubrelPending(InFlight),
     StartPending(InFlight),
     ExpirePending(InFlight),
@@ -107,6 +110,7 @@ impl Delivery {
         }
         match self.phase {
             Phase::FinishPending(_)
+            | Phase::DiscardPending(_)
             | Phase::PubrelPending(_)
             | Phase::StartPending(_)
             | Phase::ExpirePending(_)
@@ -163,6 +167,7 @@ impl Delivery {
         match self.phase {
             Phase::ClaimPending(f)
             | Phase::FinishPending(f)
+            | Phase::DiscardPending(f)
             | Phase::PubrelPending(f)
             | Phase::StartPending(f)
             | Phase::ExpirePending(f)
@@ -303,6 +308,10 @@ pub(super) enum Change {
         connection: ConnectionKey,
     },
     Finish {
+        slot: usize,
+        in_flight: InFlight,
+    },
+    Discard {
         slot: usize,
         in_flight: InFlight,
     },
@@ -651,6 +660,43 @@ impl State {
             }
         }
     }
+}
+
+/// What the owner may do now with a claimed delivery.
+enum Emission {
+    /// The frame was published in the draft.
+    Frame(EffectId, ConnectionKey),
+    /// A gate holds the delivery; nothing was decided about it.
+    Held,
+    /// Its PUBLISH exceeds the Maximum Packet Size of its connection.
+    TooLarge,
+}
+
+/// The size of the PUBLISH the profile sends for these bytes. There is one
+/// encoding: fixed header, minimal Remaining Length, Topic Name, the Packet
+/// Identifier above QoS 0, a one-byte Property Length and the Message
+/// Expiry Interval when the message has one (MQTT-3.3.2-6), payload. No
+/// property is optional, so nothing can be left out to make a packet fit.
+/// `None` is an arithmetic overflow.
+fn publish_packet_size(
+    topic: usize,
+    payload: usize,
+    packet_identifier: bool,
+    expiry: bool,
+) -> Option<usize> {
+    let body = topic
+        .checked_add(payload)?
+        .checked_add(3 + usize::from(packet_identifier) * 2 + usize::from(expiry) * 5)?;
+    let remaining = if body < 128 {
+        1
+    } else if body < 16384 {
+        2
+    } else if body < 2097152 {
+        3
+    } else {
+        4
+    };
+    body.checked_add(remaining + 1)
 }
 
 fn changed(change: Change) -> super::Change {
@@ -1110,23 +1156,7 @@ impl Owner {
         else {
             return false;
         };
-        let Some(body) = topic
-            .len()
-            .checked_add(payload.len())
-            .and_then(|n| n.checked_add(3 + usize::from(expiry.is_some()) * 5))
-        else {
-            return false;
-        };
-        let remaining = if body < 128 {
-            1
-        } else if body < 16384 {
-            2
-        } else if body < 2097152 {
-            3
-        } else {
-            4
-        };
-        body.checked_add(remaining + 1)
+        publish_packet_size(topic.len(), payload.len(), false, expiry.is_some())
             .is_some_and(|n| n <= settings.maximum_packet_size as usize)
     }
 
@@ -1930,16 +1960,28 @@ impl Owner {
             && d.phase == Phase::AwaitPuback
             && d.ready_to_send(generation, room)
         {
-            let emission = self.plan_delivery_emit(d, draft)?;
-            if let Some((effect, connection)) = emission {
-                return Ok(changed(Change::Emit {
-                    slot,
-                    effect,
-                    connection,
-                }));
-            }
-            if draft.closed.is_some() {
-                return Ok(super::Change::Nothing);
+            match self.plan_delivery_emit(d, draft)? {
+                Emission::Frame(effect, connection) => {
+                    return Ok(changed(Change::Emit {
+                        slot,
+                        effect,
+                        connection,
+                    }));
+                }
+                Emission::TooLarge => {
+                    // MQTT-3.1.2-25: the PUBLISH is not sent and the delivery
+                    // ends as a completed one. The finish guarded by its
+                    // claim ends the claim and the obligation together, once.
+                    let operation = self.operation(draft)?;
+                    let in_flight = self.plan_submission(
+                        operation,
+                        Recipe::FinishDelivery(self.finish_recipe(d, operation)?),
+                        None,
+                        draft,
+                    )?;
+                    return Ok(changed(Change::Discard { slot, in_flight }));
+                }
+                Emission::Held => {}
             }
         }
         if let Some((slot, d)) = next
@@ -2147,26 +2189,25 @@ impl Owner {
             })
     }
 
-    fn plan_delivery_emit(
-        &self,
-        delivery: &Delivery,
-        draft: &mut Draft,
-    ) -> Result<Option<(EffectId, ConnectionKey)>, Stop> {
+    /// Every gate that holds a delivery stands ahead of the size test, so a
+    /// delivery is found too large exactly where its PUBLISH would have been
+    /// emitted, in delivery order and on the connection of that moment.
+    fn plan_delivery_emit(&self, delivery: &Delivery, draft: &mut Draft) -> Result<Emission, Stop> {
         if !delivery.expiry_allows_send(self.message_now) {
-            return Ok(None);
+            return Ok(Emission::Held);
         }
         let Some(generation) = self.connection_of(delivery.target) else {
-            return Ok(None);
+            return Ok(Emission::Held);
         };
         let Some(settings) = self
             .pubsub
             .connection(generation)
             .map(|i| self.pubsub.connections.as_slice()[i])
         else {
-            return Ok(None);
+            return Ok(Emission::Held);
         };
         let Some(claim) = delivery.claim else {
-            return Ok(None);
+            return Ok(Emission::Held);
         };
         let connection = ConnectionKey {
             session: delivery.target,
@@ -2181,12 +2222,12 @@ impl Owner {
                 publish_order: None,
                 pubrel: Some((delivery.id, claim.operation)),
             })?;
-            return Ok(Some((effect, connection)));
+            return Ok(Emission::Frame(effect, connection));
         }
         if delivery.window != Some(generation)
             && self.pubsub.active(generation) >= usize::from(settings.receive_maximum)
         {
-            return Ok(None);
+            return Ok(Emission::Held);
         }
         if self.pubsub.deliveries.as_slice().iter().any(|earlier| {
             earlier.target == delivery.target
@@ -2195,31 +2236,15 @@ impl Owner {
         }) {
             // This also protects a claim result delivered after takeover:
             // restored earlier exchanges are replayed before newer ones.
-            return Ok(None);
+            return Ok(Emission::Held);
         }
         let (Some(topic), Some(payload)) = (&delivery.topic, &delivery.payload) else {
-            return Ok(None);
+            return Ok(Emission::Held);
         };
-        let body = topic
-            .len()
-            .checked_add(payload.len())
-            .and_then(|n| n.checked_add(5 + usize::from(delivery.expiry.is_some()) * 5))
+        let size = publish_packet_size(topic.len(), payload.len(), true, delivery.expiry.is_some())
             .ok_or(IMPOSSIBLE)?;
-        let remaining = if body < 128 {
-            1
-        } else if body < 16384 {
-            2
-        } else if body < 2097152 {
-            3
-        } else {
-            4
-        };
-        if body
-            .checked_add(remaining + 1)
-            .is_none_or(|n| n > settings.maximum_packet_size as usize)
-        {
-            draft.close(generation, CloseReason::CapacityExceeded)?;
-            return Ok(None);
+        if size > settings.maximum_packet_size as usize {
+            return Ok(Emission::TooLarge);
         }
         let effect = draft.emit(Effect::EmitPublish {
             connection,
@@ -2235,7 +2260,7 @@ impl Owner {
             expiry: delivery.expiry,
             started: claim.started,
         })?;
-        Ok(Some((effect, connection)))
+        Ok(Emission::Frame(effect, connection))
     }
 
     pub(super) fn plan_pubsub_result(
@@ -2393,7 +2418,7 @@ impl Owner {
                                 claim: claim.operation,
                             }
                         }
-                        Phase::FinishPending(_) => {
+                        Phase::FinishPending(_) | Phase::DiscardPending(_) => {
                             let claim = d.claim.ok_or(IMPOSSIBLE)?;
                             CommitFacts::DeliveryFinished {
                                 delivery: d.id,
@@ -2406,6 +2431,14 @@ impl Owner {
                     };
                     if facts != expected {
                         return Err(Stop::Fatal(CoreFault::ContradictoryOutcome { operation }));
+                    }
+                    if matches!(d.phase, Phase::DiscardPending(_)) {
+                        draft.emit(Effect::DeliveryDiscarded {
+                            delivery: d.id,
+                            target: d.target,
+                            operation,
+                            reason: DeliveryDiscardReason::PacketTooLarge,
+                        })?;
                     }
                     if matches!(d.phase, Phase::ConsumePending(_, _)) {
                         draft.emit(Effect::Qos0Dropped {
@@ -2496,7 +2529,13 @@ impl Owner {
                     {
                         return Err(Stop::Fatal(CoreFault::ContradictoryOutcome { operation }));
                     }
-                    let emission = self.plan_delivery_emit(d, draft)?;
+                    // A delivery found too large is not decided here: it
+                    // keeps its claim and its window, and the work turn
+                    // that follows this commit submits its discard.
+                    let emission = match self.plan_delivery_emit(d, draft)? {
+                        Emission::Frame(effect, connection) => Some((effect, connection)),
+                        Emission::Held | Emission::TooLarge => None,
+                    };
                     Ok(Some(changed(Change::Claimed {
                         slot,
                         finished: done,
@@ -2512,6 +2551,14 @@ impl Owner {
                         })
                     {
                         return Err(Stop::Fatal(CoreFault::ContradictoryOutcome { operation }));
+                    }
+                    if matches!(d.phase, Phase::DiscardPending(_)) {
+                        draft.emit(Effect::DeliveryDiscarded {
+                            delivery: d.id,
+                            target: d.target,
+                            operation,
+                            reason: DeliveryDiscardReason::PacketTooLarge,
+                        })?;
                     }
                     Ok(Some(changed(Change::Finished {
                         slot,
@@ -2576,7 +2623,14 @@ impl Owner {
                         expiring: matches!(d.phase, Phase::ExpirePending(_)),
                     })));
                 }
-                if let Some(connection) = self.connection_of(d.target)
+                // A fenced discard was certainly not applied: the claim
+                // stands and the next work turn decides again, against the
+                // connection of that moment. The client did nothing wrong,
+                // so its connection is not closed.
+                let fenced_discard =
+                    matches!(d.phase, Phase::DiscardPending(_)) && reason == RejectReason::Fenced;
+                if !fenced_discard
+                    && let Some(connection) = self.connection_of(d.target)
                     && !matches!(d.phase,Phase::ConsumePending(_,key) if key.generation!=connection)
                 {
                     draft.close(connection, CloseReason::CapacityExceeded)?;
@@ -3120,6 +3174,14 @@ impl Owner {
                 d.early_pubrec = None;
                 d.phase = Phase::FinishPending(in_flight);
             }
+            Change::Discard { slot, in_flight } => {
+                self.pubsub
+                    .deliveries
+                    .as_mut_slice()
+                    .get_mut(slot)
+                    .ok_or(stale)?
+                    .phase = Phase::DiscardPending(in_flight);
+            }
             Change::PreparePubrel { slot, in_flight } => {
                 let d = self
                     .pubsub
@@ -3212,6 +3274,7 @@ impl Owner {
                     match &mut d.phase {
                         Phase::ClaimPending(f)
                         | Phase::FinishPending(f)
+                        | Phase::DiscardPending(f)
                         | Phase::PubrelPending(f)
                         | Phase::StartPending(f)
                         | Phase::ExpirePending(f)
@@ -6682,9 +6745,30 @@ mod tests {
                 Effect::EmitPublish { .. } => "EmitPublish",
                 Effect::CloseConnection { .. } => "CloseConnection",
                 Effect::LoadWork { .. } => "LoadWork",
+                Effect::DeliveryDiscarded { .. } => "DeliveryDiscarded",
                 _ => "another effect",
             })
             .collect()
+    }
+
+    /// The one observation a committed discard publishes: the delivery, its
+    /// target and the `FinishDelivery` that ended it.
+    fn discarded(effects: &[(EffectId, Effect)]) -> (DeliveryId, SessionId, OperationId) {
+        let [
+            (
+                _,
+                Effect::DeliveryDiscarded {
+                    delivery,
+                    target,
+                    operation,
+                    reason: DeliveryDiscardReason::PacketTooLarge,
+                },
+            ),
+        ] = effects
+        else {
+            panic!("one discard observation: {effects:?}")
+        };
+        (*delivery, *target, *operation)
     }
 
     /// The world, its connection limited to `maximum` bytes per packet and
@@ -6745,6 +6829,23 @@ mod tests {
             "the discard is the finish guarded by the claim"
         );
         assert_ne!(command.recipe.operation(), claimed.operation);
+        let held = owner
+            .pubsub
+            .deliveries
+            .as_slice()
+            .iter()
+            .find(|d| d.id == claimed.delivery)
+            .expect("the delivery is kept until its finish is known");
+        assert!(
+            matches!(held.phase, Phase::DiscardPending(flight) if flight.operation == command.recipe.operation()),
+            "{:?}",
+            held.phase
+        );
+        assert!(held.frame.is_none() && !held.retired);
+        assert_eq!(
+            held.claim.map(|claim| claim.operation),
+            Some(claimed.operation)
+        );
         (effect, command, token)
     }
 
@@ -6782,9 +6883,11 @@ mod tests {
                             .all(|(_, e)| matches!(e, Effect::LoadWork { .. })),
                         "{case:?}: a pending discard is submitted once"
                     );
+                    let observed = known(&mut owner, effect, &discard);
+                    assert_eq!(names(&observed), ["DeliveryDiscarded"], "{case:?}");
                     assert_eq!(
-                        names(&known(&mut owner, effect, &discard)),
-                        ["DeliveryDiscarded"],
+                        discarded(&observed),
+                        (delivery(0), TARGET, discard.recipe.operation()),
                         "{case:?}"
                     );
                     assert!(owner.pubsub.deliveries.is_empty(), "{case:?}");
@@ -6836,9 +6939,11 @@ mod tests {
         let (claim, sent) = claim_next(&mut owner, OTHER);
         assert!(sent.is_empty(), "{sent:?}");
         let (effect, discard, _) = discard_next(&mut owner, OTHER, &claim);
+        let observed = known(&mut owner, effect, &discard);
+        assert_eq!(names(&observed), ["DeliveryDiscarded"]);
         assert_eq!(
-            names(&known(&mut owner, effect, &discard)),
-            ["DeliveryDiscarded"]
+            discarded(&observed),
+            (delivery(1), OTHER, discard.recipe.operation())
         );
         let left = owner.pubsub.deliveries.as_slice();
         assert_eq!(left.len(), 1, "the other destination keeps its delivery");
@@ -6875,9 +6980,11 @@ mod tests {
                     [(_, Effect::EmitPublish { delivery: d, dup: false, .. })] if *d == delivery(1)
                 ));
             }
+            let observed = known(&mut owner, effect, &discard);
+            assert_eq!(names(&observed), ["DeliveryDiscarded"]);
             assert_eq!(
-                names(&known(&mut owner, effect, &discard)),
-                ["DeliveryDiscarded"]
+                discarded(&observed),
+                (delivery(0), TARGET, discard.recipe.operation())
             );
             if receive_maximum == 1 {
                 let (next, sent) = claim_next(&mut owner, TARGET);
@@ -6940,9 +7047,11 @@ mod tests {
             "the second discard is guarded by the same claim"
         );
         assert_ne!(finish.operation, claim.operation);
+        let observed = known(&mut owner, effect, &discard);
+        assert_eq!(names(&observed), ["DeliveryDiscarded"]);
         assert_eq!(
-            names(&known(&mut owner, effect, &discard)),
-            ["DeliveryDiscarded"]
+            discarded(&observed),
+            (delivery(0), TARGET, discard.recipe.operation())
         );
         assert!(owner.pubsub.deliveries.is_empty());
 
@@ -7034,9 +7143,11 @@ mod tests {
         assert!(
             matches!(resolution[0].1, Effect::ResolveAndFence { operation: resolved } if resolved == operation)
         );
+        let observed = known(&mut owner, resolution[0].0, &discard);
+        assert_eq!(names(&observed), ["DeliveryDiscarded"]);
         assert_eq!(
-            names(&known(&mut owner, resolution[0].0, &discard)),
-            ["DeliveryDiscarded"]
+            discarded(&observed),
+            (delivery(0), TARGET, discard.recipe.operation())
         );
         assert!(owner.pubsub.deliveries.is_empty());
         let work = apply(&mut owner, Input::WorkAvailable { session: TARGET });
@@ -7082,9 +7193,11 @@ mod tests {
             } else {
                 let (effect, again, _) = discard_next(&mut owner, TARGET, &claim);
                 assert_ne!(again.recipe.operation(), discard.recipe.operation());
+                let observed = known(&mut owner, effect, &again);
+                assert_eq!(names(&observed), ["DeliveryDiscarded"]);
                 assert_eq!(
-                    names(&known(&mut owner, effect, &again)),
-                    ["DeliveryDiscarded"]
+                    discarded(&observed),
+                    (delivery(0), TARGET, again.recipe.operation())
                 );
                 assert!(owner.pubsub.deliveries.is_empty());
             }
@@ -7136,9 +7249,11 @@ mod tests {
             },
         );
         assert_eq!(owner.receipt_status().unwrap().2, 1);
+        let observed = known(&mut owner, effect, &discard);
+        assert_eq!(names(&observed), ["DeliveryDiscarded"]);
         assert_eq!(
-            names(&known(&mut owner, effect, &discard)),
-            ["DeliveryDiscarded"]
+            discarded(&observed),
+            (delivery(0), TARGET, discard.recipe.operation())
         );
         assert!(owner.pubsub.deliveries.is_empty());
         assert_eq!(
