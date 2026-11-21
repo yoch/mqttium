@@ -2459,6 +2459,45 @@ fn keep_alive_expires_a_silent_peer_although_its_last_packet_is_still_held() {
     });
 }
 
+/// Taking an old packet from its lane is not hearing the peer. A packet
+/// heard 1.2 s ago and taken by the core only now leaves the deadline where
+/// the reception put it: with Keep Alive 1 the peer, silent since, is
+/// closed 1.5 s after that reception, not 1.5 s after the core took the
+/// packet (counter-audit of bbe1453).
+#[test]
+fn keep_alive_is_not_extended_by_taking_an_old_packet() {
+    with_runtime(128, |runtime, _| {
+        let (generation, mut client) = held_keep_alive_peer(runtime, b"old-packet");
+        client.write_all(&[0xc0, 0]).unwrap();
+        thread::sleep(Duration::from_millis(1200));
+        // Room returns and the core takes the packet it was holding.
+        runtime.inputs.clear();
+        let taken = runtime.peers[&generation].ingress;
+        runtime.connections().unwrap();
+        assert!(
+            runtime.inputs.iter().any(|input| matches!(input,
+                Input::Packet { connection, packet: InboundPacket::Pingreq, .. }
+                    if *connection == generation)),
+            "the held PINGREQ was not taken: ingress {taken} -> {}",
+            runtime.peers[&generation].ingress
+        );
+        assert!(
+            runtime.peers[&generation].closing.is_none(),
+            "closed 1.2 s after the last packet with Keep Alive 1"
+        );
+        thread::sleep(Duration::from_millis(500));
+        runtime.connections().unwrap();
+        let closing = runtime.peers.get(&generation).map(|peer| peer.closing);
+        assert!(
+            !matches!(closing, Some(None)),
+            "a peer silent for 1.7 s is still open because an old packet was taken 0.5 s ago"
+        );
+        if let Some(Some((code, _))) = closing {
+            assert_eq!(code, "keep_alive");
+        }
+    });
+}
+
 /// The same held lane, with a peer that keeps sending in time: the broker
 /// has heard it, so its Keep Alive does not expire although the core has
 /// taken none of its packets.
