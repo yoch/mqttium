@@ -525,6 +525,52 @@ fn a_publish_within_the_announced_maximum_packet_size_is_accepted() {
     );
 }
 
+/// The announced Maximum Packet Size is also a limit: an MQTT 5 packet one
+/// byte larger is not served, whatever it carries. The broker answers
+/// DISCONNECT 0x95 and closes. Sizes are the total on the wire, fixed
+/// header included.
+#[test]
+fn a_packet_over_the_announced_maximum_packet_size_is_refused() {
+    let broker = Broker::start("over-announced");
+
+    let (mut publisher, connack) = open(broker.address, "over-announced-publish");
+    let maximum = announced_maximum(&connack);
+    // One byte more than the largest PUBLISH the announcement allows: its
+    // payload is still within the payload limit of the profile.
+    let mut body = Vec::new();
+    text("wake/long-topic-name", &mut body);
+    body.extend_from_slice(&[0, 1, 0]);
+    body.resize(maximum + 1 - 4, b'x');
+    let over = packet(0x32, &body);
+    assert_eq!(over.len(), maximum + 1);
+    publisher.write_all(&over).unwrap();
+    assert_eq!(
+        read_until_close(&mut publisher),
+        [0xe0, 2, 0x95, 0],
+        "a PUBLISH of {} bytes after {maximum} were announced\n{}",
+        over.len(),
+        broker.refusals()
+    );
+
+    // Another kind of packet: a SUBSCRIBE made of long filters.
+    let (mut subscriber, _) = open(broker.address, "over-announced-subscribe");
+    let mut body = vec![0, 1, 0];
+    while body.len() + 4 <= maximum {
+        text(&"f".repeat(1_000), &mut body);
+        body.push(0);
+    }
+    let over = packet(0x82, &body);
+    assert!(over.len() > maximum && over.len() < 65_536);
+    subscriber.write_all(&over).unwrap();
+    assert_eq!(
+        read_until_close(&mut subscriber),
+        [0xe0, 2, 0x95, 0],
+        "a SUBSCRIBE of {} bytes\n{}",
+        over.len(),
+        broker.refusals()
+    );
+}
+
 /// A request the profile cannot serve is still owed its acknowledgement
 /// (MQTT-3.8.4-1, MQTT-3.10.4-4): a SUBSCRIBE whose Topic Filter is longer
 /// than the profile stores and an UNSUBSCRIBE with more filters than a
