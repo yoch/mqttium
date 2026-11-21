@@ -89,7 +89,20 @@ this way, so nothing of its connection passes it. The wait has a bound,
 because a credit can also be held by an exchange that a client never
 finishes: a connection whose packet has waited five seconds for a credit
 is closed with `input_capacity`. (Added on 21 November 2026, after the
-acceptance of this record, on the measurement below.)
+acceptance of this record, on the measurement below.) Whatever ends an
+exchange returns its credit: an answer of the store, the write receipt
+of an acknowledgement, a closed connection. An answer of the store takes
+every deferred packet up again, as before. A write receipt or a closed
+connection lets the oldest deferred packet be tried again, in place: it
+keeps its position if it still cannot be served, and nothing behind it
+moves. The first form of this rule woke the deferred packets on an
+answer of the store only; at QoS 1 the credit comes back with the write
+receipt of the PUBACK, so a publication could wait for a credit that was
+already free until the bound closed its connection
+(`a_write_confirmation_alone_takes_up_a_publication_that_waits_for_a_credit`).
+Taking every deferred packet up again on every such receipt was tried
+and withdrawn: under overload it spent the passes of the core on packets
+that still had no credit.
 
 **The budgets sized for sixteen connections grow with the limit.** The
 effect box, the ordinary input lane, the outgoing identifier bindings,

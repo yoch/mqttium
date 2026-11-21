@@ -324,6 +324,14 @@ struct Runtime<'a> {
     deferred_inputs: VecDeque<Input>,
     /// A packet waits in `deferred_inputs` for room in the effect box.
     effects_awaited: bool,
+    /// How many of the oldest deferred packets may be tried again because
+    /// a credit came back. An exchange ends, and returns its credit, on an
+    /// answer of the store (which takes every deferred packet up again),
+    /// on the write receipt of its acknowledgement or with its connection:
+    /// each of the last two allows one retry of the head of
+    /// `deferred_inputs`, which keeps its place when it still cannot be
+    /// served.
+    credit_retries: usize,
     timers: BTreeMap<DeadlineToken, Instant>,
     inflight: BTreeMap<EffectId, OperationId>,
     lifecycle_inflight: BTreeMap<EffectId, OperationId>,
@@ -811,6 +819,17 @@ impl Runtime<'_> {
                 .deferred_inputs
                 .iter()
                 .any(|input| business_connection(input) == Some(generation))
+    }
+    /// A packet the core handed back waits in order. One that was the
+    /// retried head goes back to the head, and the retries stop: what is
+    /// behind it waits for the same thing or for its turn.
+    fn defer(&mut self, packet: Input, retried: bool) {
+        if retried {
+            self.credit_retries = 0;
+            self.deferred_inputs.push_front(packet);
+        } else {
+            self.deferred_inputs.push_back(packet);
+        }
     }
     fn ordinary_room(&self) -> usize {
         ordinary_room(
@@ -1420,16 +1439,26 @@ impl Runtime<'_> {
             + closing_budget
             + terminal_budget
             + expiry_budget
-            + usize::from(self.message_expiry_input.is_some()))
-        .min(64)
+            + usize::from(self.message_expiry_input.is_some())
+            + self.credit_retries)
+            .min(64)
         {
-            let control = if control_budget > 0 {
+            // A returned credit serves the oldest packet that waits, ahead
+            // of everything else and without moving the others.
+            let retried = if self.credit_retries > 0 {
+                self.credit_retries -= 1;
+                self.deferred_inputs.pop_front()
+            } else {
+                None
+            };
+            let from_retry = retried.is_some();
+            let control = if !from_retry && control_budget > 0 {
                 self.control_inputs.pop_front()
             } else {
                 None
             };
-            let Some(input) = control
-                .inspect(|_| control_budget -= 1)
+            let Some(input) = retried
+                .or(control.inspect(|_| control_budget -= 1))
                 .or_else(|| {
                     if closing_budget > 0 {
                         closing_budget -= 1;
@@ -1459,7 +1488,8 @@ impl Runtime<'_> {
             else {
                 break;
             };
-            if let Some(connection) = business_connection(&input)
+            if !from_retry
+                && let Some(connection) = business_connection(&input)
                 && self
                     .deferred_inputs
                     .iter()
@@ -1692,6 +1722,12 @@ impl Runtime<'_> {
             let previous_lifecycle = self.owner.lifecycle_dispatch().map(|(op, _)| op);
             let mut applied = false;
             let business = business_connection(&input);
+            // What can end an inbound exchange without an answer of the
+            // store: the terminal receipt of a frame, a closed connection.
+            let closes = Self::closing_input(&input);
+            let returns_credit = closes
+                || matches!(&input, Input::FrameResult { progress, .. }
+                    if !matches!(progress, FrameProgress::Started));
             match self.owner.step(
                 input,
                 TurnGrant {
@@ -1739,6 +1775,11 @@ impl Runtime<'_> {
                         // while a durable routing mutation remains unresolved.
                         self.deferred_inputs.append(&mut self.inputs);
                         std::mem::swap(&mut self.inputs, &mut self.deferred_inputs);
+                    } else if returns_credit {
+                        let waiting = self.deferred_inputs.len();
+                        let allowed = if closes { waiting } else { 1 };
+                        self.credit_retries =
+                            self.credit_retries.saturating_add(allowed).min(waiting);
                     }
                 }
                 StepOutcome::NeedCapacity { input, need, .. } => {
@@ -1760,7 +1801,7 @@ impl Runtime<'_> {
                                     .unwrap_or((0, 0));
                                 self.events.emit("receipt_window_pressure",json!({"details":{"resource":"ReceiptSlots","code":"receipt_window_business_full","span":span,"unconsumed_holes":holes}})).map_err(event_failure)?;
                             }
-                            self.deferred_inputs.push_back(packet)
+                            self.defer(packet, from_retry)
                         }
                         // The effect box is emptied by the dispatch that
                         // follows this pass. The packet waits for it in
@@ -1777,7 +1818,7 @@ impl Runtime<'_> {
                                 && need.wake == WakeCondition::EffectAccepted =>
                         {
                             self.effects_awaited = true;
-                            self.deferred_inputs.push_back(packet)
+                            self.defer(packet, from_retry)
                         }
                         // A credit that an admission or an exchange in
                         // flight holds: the result of the store that ends
@@ -1793,7 +1834,7 @@ impl Runtime<'_> {
                             if let Some(peer) = business.and_then(|key| self.peers.get_mut(&key)) {
                                 peer.capacity_wait.get_or_insert_with(Instant::now);
                             }
-                            self.deferred_inputs.push_back(packet)
+                            self.defer(packet, from_retry)
                         }
                         Input::Packet { connection, .. } => {
                             // No transition applied and no effect was submitted for this packet.
@@ -5401,6 +5442,7 @@ fn run_inner(
         terminal_inputs: VecDeque::new(),
         deferred_inputs: VecDeque::new(),
         effects_awaited: false,
+        credit_retries: 0,
         timers: BTreeMap::new(),
         inflight: BTreeMap::new(),
         lifecycle_inflight: BTreeMap::new(),

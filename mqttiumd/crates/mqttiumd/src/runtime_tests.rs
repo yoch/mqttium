@@ -129,6 +129,7 @@ fn with_runtime_clock_hooks(
         terminal_inputs: VecDeque::new(),
         deferred_inputs: VecDeque::new(),
         effects_awaited: false,
+        credit_retries: 0,
         timers: BTreeMap::new(),
         inflight: BTreeMap::new(),
         lifecycle_inflight: BTreeMap::new(),
