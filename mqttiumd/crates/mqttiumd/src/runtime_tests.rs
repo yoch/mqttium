@@ -1480,6 +1480,91 @@ fn a_write_confirmation_alone_takes_up_a_publication_that_waits_for_a_credit() {
     });
 }
 
+/// A session that was offline reads what was published meanwhile in the
+/// order the broker received it, across the pages its window cuts the
+/// backlog into (twelve messages, a window of eight), and at QoS 2 the
+/// PUBRELs follow the order of the PUBRECs it sent (MQTT-4.6.0-5 of MQTT 5,
+/// MQTT-4.6.0-6 of 3.1.1). Both protocol versions, QoS 1 and 2.
+#[test]
+fn a_resumed_session_reads_its_backlog_in_the_order_of_reception() {
+    use codec::Version::{V5, V311};
+    const MESSAGES: u8 = 12;
+    for (version, qos) in [(V5, 1u8), (V5, 2), (V311, 1), (V311, 2)] {
+        with_runtime(128, |runtime, _| {
+            let case = format!("{version:?} QoS {qos}");
+            let properties: &[u8] = if version == V5 { &[0] } else { &[] };
+            let open = |runtime: &mut Runtime<'_>, client_id: &[u8]| {
+                let (generation, mut client) = peer(runtime);
+                let connect = codec::Connect {
+                    version,
+                    ..connect_packet(client_id)
+                };
+                runtime.connect(generation, connect).unwrap();
+                until(runtime, |r| r.session_requests.is_empty());
+                let (kind, body) = read_frame(&mut client);
+                assert_eq!(kind, 0x20, "{case}");
+                (generation, client, body[0] & 1 == 1)
+            };
+            let (first, mut old, _) = open(runtime, b"backlog-subscriber");
+            let subscribe = [&[0, 1][..], properties, &[0, 1, b't', qos]].concat();
+            runtime.packet(first, 0x82, subscribe).unwrap();
+            assert_eq!(served_frame(runtime, &mut old).0, 0x90, "{case}");
+            runtime.close(first, "test_offline").unwrap();
+            until(runtime, |r| !r.peers.contains_key(&first));
+
+            let (publisher, mut publishing, _) = open(runtime, b"backlog-publisher");
+            for id in 1..=MESSAGES {
+                let body = [&[0, 1, b't', 0, id][..], properties, &[id]].concat();
+                runtime.packet(publisher, 0x30 | (qos << 1), body).unwrap();
+                let (kind, answer) = served_frame(runtime, &mut publishing);
+                assert_eq!(&answer[..2], &[0, id], "{case}");
+                if qos == 1 {
+                    assert_eq!(kind, 0x40, "{case}");
+                } else {
+                    assert_eq!(kind, 0x50, "{case}");
+                    runtime.packet(publisher, 0x62, vec![0, id]).unwrap();
+                    assert_eq!(served_frame(runtime, &mut publishing).0, 0x70, "{case}");
+                }
+            }
+
+            let (resumed, mut subscriber, present) = open(runtime, b"backlog-subscriber");
+            assert!(present, "{case}: the session is resumed");
+            let (mut payloads, mut answered, mut released) = (Vec::new(), Vec::new(), Vec::new());
+            while payloads.len() < usize::from(MESSAGES) || released.len() < answered.len() {
+                let (kind, body) = served_frame(runtime, &mut subscriber);
+                match kind & 0xf0 {
+                    0x30 => {
+                        assert_eq!(kind & 0x06, qos << 1, "{case}: the granted QoS");
+                        payloads.push(*body.last().unwrap());
+                        let id = vec![body[3], body[4]];
+                        if qos == 1 {
+                            runtime.packet(resumed, 0x40, id).unwrap();
+                        } else {
+                            answered.push(id.clone());
+                            runtime.packet(resumed, 0x50, id).unwrap();
+                        }
+                    }
+                    0x60 => {
+                        let id = body[..2].to_vec();
+                        released.push(id.clone());
+                        runtime.packet(resumed, 0x70, id).unwrap();
+                    }
+                    other => panic!("{case}: unexpected packet {other:#x} {body:?}"),
+                }
+            }
+            assert_eq!(
+                payloads,
+                (1..=MESSAGES).collect::<Vec<_>>(),
+                "{case}: the order of reception"
+            );
+            assert_eq!(
+                released, answered,
+                "{case}: PUBREL in the order of the PUBRECs"
+            );
+        });
+    }
+}
+
 /// The one-pass bindings are what a lookup per cached session answered,
 /// for attached and detached sessions alike.
 #[test]
