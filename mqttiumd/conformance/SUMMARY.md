@@ -13,35 +13,27 @@ is inferred from. The others are not reviewed, which is not a third kind.
 
 | Status | MQTT 5.0 | MQTT 3.1.1 |
 | - | -: | -: |
-| `covered` | 138 | 77 |
-| of which `direct` | 13 | 4 |
-| of which `partial` | 8 | 10 |
-| not reviewed | 117 | 63 |
-| `implemented-untested` | 43 | 32 |
+| `covered` | 139 | 81 |
+| of which `direct` | 14 | 6 |
+| of which `partial` | 8 | 13 |
+| not reviewed | 117 | 62 |
+| `implemented-untested` | 42 | 31 |
 | `profile-refused` | 37 | 8 |
-| `open` | 0 | 5 |
+| `open` | 0 | 2 |
 | `not-applicable` | 33 | 17 |
 | statements | 251 | 139 |
 | of which bind a server | 221 | 125 |
 
-## Open (5)
+## Open (2)
 
 Applies to a server, and either no implementation and no deliberate refusal was found, or the behaviour looks non-conformant. The note says which.
 
-### message-ordering (4)
+### message-ordering (2)
 
 | MQTT | Statement | Note |
 | - | - | - |
 | 3.1.1 | `MQTT-4.6.0-2` | Written for the Client; MQTT-4.6.0-6 extends 'the rules listed above' to a Server. Looks non-conformant: a PUBACK leaves when the store result of its admission is applied, and no code or test states that PUBACKs keep the arrival order of their PUBLISH packets. The independent audit of 8e4303d, 21 November 2026, observed acknowledgements leaving in the order of the store results: 8 then 7 for publications received as 7 then 8. The compatibility scenario `publish/pipelined-qos1-v4` compares the order of twenty PUBACK with the order of their PUBLISH packets on one topic: as sent in every play read with the broker built from 81acd13, which does not show the order when a store result is late. |
 | 3.1.1 | `MQTT-4.6.0-3` | Written for the Client; MQTT-4.6.0-6 extends 'the rules listed above' to a Server. Looks non-conformant: a PUBREC leaves when the store result of its admission is applied, and no code or test states that PUBRECs keep the arrival order of their PUBLISH packets. The independent audit of 8e4303d, 21 November 2026, observed acknowledgements leaving in the order of the store results: 8 then 7 for publications received as 7 then 8. |
-| 3.1.1 | `MQTT-4.6.0-4` | Written for the Client; MQTT-4.6.0-6 extends 'the rules listed above' to a Server. No implementation found: the broker's PUBREL leaves after the durable commit of its PUBREC, and no code or test states that two PUBRELs keep the order of their PUBRECs. The independent audit of 8e4303d, 21 November 2026, did not observe the order of PUBREL packets. |
-| 3.1.1 | `MQTT-4.6.0-6` | Open for one of its two requirements. The order of deliveries is witnessed: with the committed result of a first admission kept unknown to the core by a test barrier, a second publication of the same client is admitted and acknowledged, and the subscriber still reads the first then the second: asserted on real sockets for both protocol versions at QoS 1 and 2 (instrumented build). Partial: one publisher and one subscriber, two messages; the order at a takeover, across a crash inside a group commit and when the write itself is late is not asserted. The independent audit of 8e4303d, 21 November 2026, also read twelve messages in order across two pages after a reconnection; no permanent test asserts that order. The compatibility scenario `publish/burst-qos0-v4` compares the order of the QoS 0 messages of a burst. The other requirement, 'the rules listed above when delivering messages to each of its subscribers', covers the order of PUBREL after PUBREC on a delivery: the broker's PUBREL leaves when the durable result of its PUBREC is applied, and the audit reversed two of them by reversing those results at the level of the core (see MQTT-4.6.0-4). |
-
-### unsubscribe (1)
-
-| MQTT | Statement | Note |
-| - | - | - |
-| 3.1.1 | `MQTT-3.10.4-4` | Still non-conformant in one case. The independent audit of 8e4303d, 21 November 2026, found an UNSUBSCRIBE of a `$share/` filter closed without an UNSUBACK; the 3.1.1 encoder now acknowledges the result 0x8F of such a filter (`an_unsubscribe_of_a_filter_that_cannot_be_subscribed_is_acknowledged_in_3_1_1`). An UNSUBSCRIBE with more than eight Topic Filters, or with a filter longer than 1,024 bytes, is still closed without an UNSUBACK (`pubsub_reasons_frames_and_filter_counts_have_packet_specific_bounds` asserts the closure): an UNSUBACK of 3.1.1 carries no result, and acknowledging a request that removed nothing would report a success that did not happen. Ordinary filters are answered with an UNSUBACK (core test, 3.1.1 encoder test); no Rust test compares its identifier with the request. |
 
 ## Refused by the profile (45)
 

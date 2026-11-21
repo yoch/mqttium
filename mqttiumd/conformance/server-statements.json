@@ -515,13 +515,17 @@
           {
             "file": "mqttiumd/crates/mqttiumd/src/runtime_tests.rs",
             "test": "keep_alive_does_not_expire_a_peer_the_broker_keeps_hearing"
+          },
+          {
+            "file": "mqttiumd/crates/mqttiumd/src/runtime_tests.rs",
+            "test": "keep_alive_is_not_extended_by_taking_an_old_packet"
           }
         ],
         "evidence_kind": "partial",
         "code": [
           "mqttiumd/crates/mqttiumd/src/runtime.rs:connections"
         ],
-        "note": "With Keep Alive 1, a peer that sent one PINGREQ and then nothing for 1.7 s is closing with the code `keep_alive` at the next check, also while the core has not taken that packet (`keep_alive_expires_a_silent_peer_although_its_last_packet_is_still_held`), and a peer heard every 0.4 s is not closed (`keep_alive_does_not_expire_a_peer_the_broker_keeps_hearing`). Any threshold between 0.4 s and 1.7 s passes both tests: the factor one and a half is read in the code (`keep_alive * 1500` ms since the last complete packet heard, in `connections`), not established by a test. That the closure is handled as a network failure, with the Will published, is not asserted there. Both tests drive MQTT 5 connections. The compatibility scenario `connect/keepalive-timeout-v4` observes a closure within 5 s of silence on a MQTT 3.1.1 socket, not timed."
+        "note": "With Keep Alive 1, a peer that sent one PINGREQ and then nothing for 1.7 s is closing with the code `keep_alive` at the next check, also while the core has not taken that packet (`keep_alive_expires_a_silent_peer_although_its_last_packet_is_still_held`), and a peer heard every 0.4 s is not closed (`keep_alive_does_not_expire_a_peer_the_broker_keeps_hearing`). Any threshold between 0.4 s and 1.7 s passes both tests: the factor one and a half is read in the code (`keep_alive * 1500` ms since the last complete packet heard, in `connections`), not established by a test. That the closure is handled as a network failure, with the Will published, is not asserted there. Both tests drive MQTT 5 connections. The compatibility scenario `connect/keepalive-timeout-v4` observes a closure within 5 s of silence on a MQTT 3.1.1 socket, not timed. The deadline belongs to the reception of a packet: a packet heard 1.2 s ago and taken by the core only now does not move it."
       },
       {
         "id": "MQTT-3.1.2-23",
@@ -1135,7 +1139,7 @@
         "applies_to_server": false,
         "status": "not-applicable",
         "evidence": [],
-        "note": "Binds the client only. The CONNACK announces 32,776 bytes, the size within which no PUBLISH exceeds the payload limit; a frame above the 65,536 bytes the transport reads is answered with DISCONNECT 0x95 and closed (`a_refused_header_is_named_before_the_close`)."
+        "note": "Binds the client only. The CONNACK announces 32,776 bytes, the size within which no PUBLISH exceeds the payload limit, and the announcement is a limit: a packet of exactly that size is served and one a byte larger, of any kind, is answered DISCONNECT 0x95 and closed (`a_packet_over_the_announced_maximum_packet_size_is_refused`, and the bench expectation `errors/packet-at-announced-maximum-v5#limit`)."
       },
       {
         "id": "MQTT-3.2.2-16",
@@ -2072,10 +2076,10 @@
           },
           {
             "file": "mqttiumd/crates/mqttiumd/tests/reactor_wake.rs",
-            "test": "a_request_beyond_the_profile_is_refused_in_its_acknowledgement"
+            "test": "a_request_with_many_filters_is_served_like_its_unit_requests"
           }
         ],
-        "note": "A SUBSCRIBE is answered with a SUBACK, after its durable commit. A request with more than eight filters or with a filter longer than the profile stores is answered too, with 0x97 for every filter, and the connection stays open."
+        "note": "A SUBSCRIBE is answered with a SUBACK, after its durable commit. A request with more than eight filters is served as unit requests and answered once; a filter longer than the profile stores is refused in the SUBACK (0x97) and its neighbours are granted."
       },
       {
         "id": "MQTT-3.8.4-2",
@@ -2136,10 +2140,18 @@
           {
             "file": "mqttiumd/crates/mqttiumd-store-sqlite/tests/retained.rs",
             "test": "thirty_two_topics_and_ordered_options"
+          },
+          {
+            "file": "mqttiumd/crates/mqttiumd/tests/reactor_wake.rs",
+            "test": "a_request_with_many_filters_is_served_like_its_unit_requests"
+          },
+          {
+            "file": "mqttiumd/crates/mqttiumd/tests/reactor_wake.rs",
+            "test": "a_request_of_sixty_five_filters_is_served_and_acknowledged_once"
           }
         ],
         "evidence_kind": "direct",
-        "note": "Several filters in one SUBSCRIBE are applied in order and answered by one SUBACK."
+        "note": "Several filters in one SUBSCRIBE are applied in order and answered by one SUBACK. A request with more filters than the core takes in one request is served as its unit requests, in order, and acknowledged once; the packet is the only bound. On real sockets, in both protocol versions: twelve filters are granted and a message on the twelfth is delivered; nine are removed and a message on the ninth is no longer delivered while one on a kept filter is. The compatibility bench holds the same as absolute expectations."
       },
       {
         "id": "MQTT-3.8.4-6",
@@ -2346,11 +2358,11 @@
           },
           {
             "file": "mqttiumd/crates/mqttiumd/tests/reactor_wake.rs",
-            "test": "a_request_beyond_the_profile_is_refused_in_its_acknowledgement"
+            "test": "a_request_with_many_filters_is_served_like_its_unit_requests"
           }
         ],
         "evidence_kind": "direct",
-        "note": "Core level: each UNSUBSCRIBE produces an UNSUBACK. On a socket, an UNSUBSCRIBE with more than eight filters is answered with an UNSUBACK that carries 0x83 for every filter."
+        "note": "Core level: each UNSUBSCRIBE produces an UNSUBACK. On a socket, an UNSUBSCRIBE of nine filters and one of sixty-five are each answered with one UNSUBACK that carries a code per filter."
       },
       {
         "id": "MQTT-3.10.4-5",
@@ -2369,12 +2381,26 @@
         "id": "MQTT-3.10.4-6",
         "feature": "unsubscribe",
         "applies_to_server": true,
-        "status": "implemented-untested",
-        "evidence": [],
+        "status": "covered",
+        "evidence": [
+          {
+            "file": "mqttiumd/crates/mqttiumd/tests/reactor_wake.rs",
+            "test": "a_request_with_many_filters_is_served_like_its_unit_requests"
+          },
+          {
+            "file": "mqttiumd/crates/mqttiumd/src/codec.rs",
+            "test": "pubsub_reasons_frames_and_filter_counts_have_packet_specific_bounds"
+          },
+          {
+            "file": "mqttiumd/crates/mqttiumd/tests/reactor_wake.rs",
+            "test": "a_request_of_sixty_five_filters_is_served_and_acknowledged_once"
+          }
+        ],
+        "evidence_kind": "direct",
         "code": [
           "mqttiumd/crates/mqttiumd-core/src/owner/pubsub.rs:subscription_changes"
         ],
-        "note": "The filters are applied in order into one UNSUBACK; no test sends an UNSUBSCRIBE with several filters."
+        "note": "A request with more filters than the core takes in one request is served as its unit requests, in order, and acknowledged once; the packet is the only bound. On real sockets, in both protocol versions: twelve filters are granted and a message on the twelfth is delivered; nine are removed and a message on the ninth is no longer delivered while one on a kept filter is. The compatibility bench holds the same as absolute expectations."
       },
       {
         "id": "MQTT-3.11.2-1",
@@ -4012,13 +4038,17 @@
           {
             "file": "mqttiumd/crates/mqttiumd/src/runtime_tests.rs",
             "test": "keep_alive_does_not_expire_a_peer_the_broker_keeps_hearing"
+          },
+          {
+            "file": "mqttiumd/crates/mqttiumd/src/runtime_tests.rs",
+            "test": "keep_alive_is_not_extended_by_taking_an_old_packet"
           }
         ],
         "evidence_kind": "partial",
         "code": [
           "mqttiumd/crates/mqttiumd/src/runtime.rs:connections"
         ],
-        "note": "With Keep Alive 1, a peer that sent one PINGREQ and then nothing for 1.7 s is closing with the code `keep_alive` at the next check, also while the core has not taken that packet (`keep_alive_expires_a_silent_peer_although_its_last_packet_is_still_held`), and a peer heard every 0.4 s is not closed (`keep_alive_does_not_expire_a_peer_the_broker_keeps_hearing`). Any threshold between 0.4 s and 1.7 s passes both tests: the factor one and a half is read in the code (`keep_alive * 1500` ms since the last complete packet heard, in `connections`), not established by a test. That the closure is handled as a network failure, with the Will published, is not asserted there. Both tests drive MQTT 5 connections; the check has no branch on the protocol version. The compatibility scenario `connect/keepalive-timeout-v4` observes a closure within 5 s of silence on a MQTT 3.1.1 socket, not timed."
+        "note": "With Keep Alive 1, a peer that sent one PINGREQ and then nothing for 1.7 s is closing with the code `keep_alive` at the next check, also while the core has not taken that packet (`keep_alive_expires_a_silent_peer_although_its_last_packet_is_still_held`), and a peer heard every 0.4 s is not closed (`keep_alive_does_not_expire_a_peer_the_broker_keeps_hearing`). Any threshold between 0.4 s and 1.7 s passes both tests: the factor one and a half is read in the code (`keep_alive * 1500` ms since the last complete packet heard, in `connections`), not established by a test. That the closure is handled as a network failure, with the Will published, is not asserted there. Both tests drive MQTT 5 connections; the check has no branch on the protocol version. The compatibility scenario `connect/keepalive-timeout-v4` observes a closure within 5 s of silence on a MQTT 3.1.1 socket, not timed. The deadline belongs to the reception of a packet: a packet heard 1.2 s ago and taken by the core only now does not move it."
       },
       {
         "id": "MQTT-3.1.3-1",
@@ -4656,6 +4686,10 @@
           {
             "file": "mqttiumd/crates/mqttiumd/src/codec.rs",
             "test": "pubsub_reasons_frames_and_filter_counts_have_packet_specific_bounds"
+          },
+          {
+            "file": "mqttiumd/crates/mqttiumd/tests/reactor_wake.rs",
+            "test": "a_request_with_many_filters_is_served_like_its_unit_requests"
           }
         ],
         "evidence_kind": "partial",
@@ -4663,7 +4697,7 @@
           "mqttiumd/crates/mqttiumd/src/codec.rs:filter",
           "mqttiumd/crates/mqttiumd/src/codec.rs:subscribe"
         ],
-        "note": "The independent audit of 8e4303d, 21 November 2026, found a SUBSCRIBE to `$share/x`, a valid 3.1.1 filter, closed without a SUBACK, and the reading of this register then found the same for a filter longer than 1,024 bytes. The three valid requests the profile cannot serve are now answered: a `$share/` filter is an ordinary filter the core refuses in the SUBACK (0x80), and a request with more than eight filters or with a filter longer than the profile stores is answered with one 0x80 per filter. Partial: the tests decode the request and encode the SUBACK; the answer on a socket is asserted by the compatibility bench (`subscribe/share-literal-filter-v4`, `subscribe/twelve-filters-v4`) and, for the long filter, on an MQTT 5 connection only."
+        "note": "The independent audit of 8e4303d, 21 November 2026, found a SUBSCRIBE to `$share/x`, a valid 3.1.1 filter, closed without a SUBACK, and the reading of this register then found the same for a filter longer than 1,024 bytes. The three valid requests the profile cannot serve are now answered: a `$share/` filter is an ordinary filter the core refuses in the SUBACK (0x80), a request with more than eight filters is served as unit requests and answered once, and a filter longer than the profile stores is answered 0x80 while its neighbours are granted. Partial: the tests decode the request and encode the SUBACK; the answer on a socket is asserted by the compatibility bench (`subscribe/share-literal-filter-v4`, `subscribe/twelve-filters-v4`) and, for the long filter, on an MQTT 5 connection only."
       },
       {
         "id": "MQTT-3.8.4-2",
@@ -4706,9 +4740,18 @@
           {
             "file": "mqttiumd/crates/mqttiumd-core/src/owner/routing.rs",
             "test": "duplicate_filter_last_options_win_only_after_known_commit_and_before_suback"
+          },
+          {
+            "file": "mqttiumd/crates/mqttiumd/tests/reactor_wake.rs",
+            "test": "a_request_with_many_filters_is_served_like_its_unit_requests"
+          },
+          {
+            "file": "mqttiumd/crates/mqttiumd/src/codec.rs",
+            "test": "pubsub_reasons_frames_and_filter_counts_have_packet_specific_bounds"
           }
         ],
-        "note": "Core level: two filters in one SUBSCRIBE are applied in order and answered by one SUBACK."
+        "evidence_kind": "direct",
+        "note": "Core level: two filters in one SUBSCRIBE are applied in order and answered by one SUBACK. A request with more filters than the core takes in one request is served as its unit requests, in order, and acknowledged once; the packet is the only bound. On real sockets, in both protocol versions: twelve filters are granted and a message on the twelfth is delivered; nine are removed and a message on the ninth is no longer delivered while one on a kept filter is. The compatibility bench holds the same as absolute expectations."
       },
       {
         "id": "MQTT-3.8.4-5",
@@ -4851,14 +4894,28 @@
         "id": "MQTT-3.10.4-4",
         "feature": "unsubscribe",
         "applies_to_server": true,
-        "status": "open",
-        "evidence": [],
+        "status": "covered",
+        "evidence": [
+          {
+            "file": "mqttiumd/crates/mqttiumd/tests/mqtt311_codec.rs",
+            "test": "an_unsubscribe_of_a_filter_that_cannot_be_subscribed_is_acknowledged_in_3_1_1"
+          },
+          {
+            "file": "mqttiumd/crates/mqttiumd/tests/reactor_wake.rs",
+            "test": "a_request_with_many_filters_is_served_like_its_unit_requests"
+          },
+          {
+            "file": "mqttiumd/crates/mqttiumd/src/codec.rs",
+            "test": "pubsub_reasons_frames_and_filter_counts_have_packet_specific_bounds"
+          }
+        ],
+        "evidence_kind": "partial",
         "code": [
           "mqttiumd/crates/mqttiumd/src/codec.rs:subscribe",
           "mqttiumd/crates/mqttiumd/src/codec.rs:encode_for",
           "mqttiumd/crates/mqttiumd-core/src/owner/pubsub.rs:subscription_changes"
         ],
-        "note": "Still non-conformant in one case. The independent audit of 8e4303d, 21 November 2026, found an UNSUBSCRIBE of a `$share/` filter closed without an UNSUBACK; the 3.1.1 encoder now acknowledges the result 0x8F of such a filter (`an_unsubscribe_of_a_filter_that_cannot_be_subscribed_is_acknowledged_in_3_1_1`). An UNSUBSCRIBE with more than eight Topic Filters, or with a filter longer than 1,024 bytes, is still closed without an UNSUBACK (`pubsub_reasons_frames_and_filter_counts_have_packet_specific_bounds` asserts the closure): an UNSUBACK of 3.1.1 carries no result, and acknowledging a request that removed nothing would report a success that did not happen. Ordinary filters are answered with an UNSUBACK (core test, 3.1.1 encoder test); no Rust test compares its identifier with the request."
+        "note": "The independent audit of 8e4303d and the reading of this register found three UNSUBSCRIBE requests closed without an UNSUBACK: a `$share/` filter, more than eight filters, a filter longer than 1,024 bytes. All three are now acknowledged: the first by the result 0x8F the 3.1.1 encoder accepts, the second served as unit requests, the third answered as a filter that holds no subscription. Partial: the socket test sends nine and ten filters, among them one that cannot be stored; no Rust test compares the identifier of an ordinary single-filter UNSUBACK with its request (the bench does)."
       },
       {
         "id": "MQTT-3.10.4-5",
@@ -4881,12 +4938,22 @@
         "id": "MQTT-3.10.4-6",
         "feature": "unsubscribe",
         "applies_to_server": true,
-        "status": "implemented-untested",
-        "evidence": [],
+        "status": "covered",
+        "evidence": [
+          {
+            "file": "mqttiumd/crates/mqttiumd/tests/reactor_wake.rs",
+            "test": "a_request_with_many_filters_is_served_like_its_unit_requests"
+          },
+          {
+            "file": "mqttiumd/crates/mqttiumd/src/codec.rs",
+            "test": "pubsub_reasons_frames_and_filter_counts_have_packet_specific_bounds"
+          }
+        ],
+        "evidence_kind": "direct",
         "code": [
           "mqttiumd/crates/mqttiumd-core/src/owner/pubsub.rs:subscription_changes"
         ],
-        "note": "The filters are applied in order into one UNSUBACK; no test sends an UNSUBSCRIBE with several filters."
+        "note": "A request with more filters than the core takes in one request is served as its unit requests, in order, and acknowledged once; the packet is the only bound. On real sockets, in both protocol versions: twelve filters are granted and a message on the twelfth is delivered; nine are removed and a message on the ninth is no longer delivered while one on a kept filter is. The compatibility bench holds the same as absolute expectations."
       },
       {
         "id": "MQTT-3.12.4-1",
@@ -5148,9 +5215,15 @@
         "id": "MQTT-4.6.0-4",
         "feature": "message-ordering",
         "applies_to_server": true,
-        "status": "open",
-        "evidence": [],
-        "note": "Written for the Client; MQTT-4.6.0-6 extends 'the rules listed above' to a Server. No implementation found: the broker's PUBREL leaves after the durable commit of its PUBREC, and no code or test states that two PUBRELs keep the order of their PUBRECs. The independent audit of 8e4303d, 21 November 2026, did not observe the order of PUBREL packets."
+        "status": "covered",
+        "evidence": [
+          {
+            "file": "mqttiumd/crates/mqttiumd-core/src/owner/pubsub.rs",
+            "test": "pubrel_leaves_in_the_order_of_the_pubrecs_whatever_the_order_of_the_results"
+          }
+        ],
+        "evidence_kind": "partial",
+        "note": "Written for the Client; MQTT-4.6.0-6 extends 'the rules listed above' to a Server for its deliveries. The core sends the PUBREL of a delivery only when no PUBREL of an earlier PUBREC of the same session is still being prepared: asserted in the core with two preparations answered by the store in reverse order (the probe of the independent audit, which showed 2 then 1 before the correction). Partial: not yet asserted on a socket with a held preparation, nor across a resumed session."
       },
       {
         "id": "MQTT-4.6.0-5",
@@ -5174,13 +5247,23 @@
         "id": "MQTT-4.6.0-6",
         "feature": "message-ordering",
         "applies_to_server": true,
-        "status": "open",
-        "evidence": [],
+        "status": "covered",
+        "evidence": [
+          {
+            "file": "mqttiumd/crates/mqttiumd/src/runtime_tests.rs",
+            "test": "deliveries_keep_the_order_of_reception_when_an_earlier_store_result_is_late"
+          },
+          {
+            "file": "mqttiumd/crates/mqttiumd-core/src/owner/pubsub.rs",
+            "test": "pubrel_leaves_in_the_order_of_the_pubrecs_whatever_the_order_of_the_results"
+          }
+        ],
+        "evidence_kind": "partial",
         "code": [
           "mqttiumd/crates/mqttiumd-core/src/owner/pubsub.rs:plan_work",
           "mqttiumd/crates/mqttiumd-core/src/owner.rs:plan_admission"
         ],
-        "note": "Open for one of its two requirements. The order of deliveries is witnessed: with the committed result of a first admission kept unknown to the core by a test barrier, a second publication of the same client is admitted and acknowledged, and the subscriber still reads the first then the second: asserted on real sockets for both protocol versions at QoS 1 and 2 (instrumented build). Partial: one publisher and one subscriber, two messages; the order at a takeover, across a crash inside a group commit and when the write itself is late is not asserted. The independent audit of 8e4303d, 21 November 2026, also read twelve messages in order across two pages after a reconnection; no permanent test asserts that order. The compatibility scenario `publish/burst-qos0-v4` compares the order of the QoS 0 messages of a burst. The other requirement, 'the rules listed above when delivering messages to each of its subscribers', covers the order of PUBREL after PUBREC on a delivery: the broker's PUBREL leaves when the durable result of its PUBREC is applied, and the audit reversed two of them by reversing those results at the level of the core (see MQTT-4.6.0-4)."
+        "note": "Both requirements have a witness, each partial. The order of deliveries: with the committed result of a first admission kept unknown to the core by a test barrier, a second publication of the same client is admitted and acknowledged, and the subscriber still reads the first then the second: asserted on real sockets for both protocol versions at QoS 1 and 2 (instrumented build). Partial: one publisher and one subscriber, two messages; the order at a takeover, across a crash inside a group commit and when the write itself is late is not asserted. The independent audit of 8e4303d, 21 November 2026, also read twelve messages in order across two pages after a reconnection; no permanent test asserts that order. The compatibility scenario `publish/burst-qos0-v4` compares the order of the QoS 0 messages of a burst. The other requirement, 'the rules listed above when delivering messages to each of its subscribers', covers the order of PUBREL after PUBREC on a delivery: see MQTT-4.6.0-4."
       },
       {
         "id": "MQTT-4.7.1-1",
