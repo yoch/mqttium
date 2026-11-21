@@ -62,10 +62,6 @@ pub struct Connect {
     pub request_problem_information: bool,
 }
 
-/// The filters one SUBSCRIBE or UNSUBSCRIBE may carry: eight requests of
-/// the core. A larger one is refused filter by filter.
-pub const MAX_REQUEST_FILTERS: usize = 8 * MAX_FILTERS;
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Packet {
     Connect(Connect),
@@ -81,23 +77,16 @@ pub enum Packet {
     },
     /// A valid SUBSCRIBE or UNSUBSCRIBE the core does not take as one
     /// request: more filters than its request holds, or a filter longer
-    /// than the profile stores beside others. It is served as the unit
-    /// requests `parts`, in order, and acknowledged once. `answers` has one
-    /// entry per filter of the request: the code of a filter the profile
-    /// cannot store, or `None` for a filter given to the core.
+    /// than the profile stores. It is served as the unit requests `parts`,
+    /// in order, and acknowledged once. `answers` has one entry per filter
+    /// of the request: the code of a filter the profile cannot store, or
+    /// `None` for a filter given to the core. The size of the packet is the
+    /// only bound on the number of filters.
     Requests {
         packet_id: InboundPacketId,
         unsubscribe: bool,
         parts: Vec<InboundPacket>,
         answers: Vec<Option<u8>>,
-    },
-    /// A valid SUBSCRIBE or UNSUBSCRIBE with more filters than
-    /// [`MAX_REQUEST_FILTERS`]. It is answered with one failure per filter
-    /// and changes nothing.
-    RequestBeyondProfile {
-        packet_id: InboundPacketId,
-        filters: usize,
-        unsubscribe: bool,
     },
 }
 
@@ -908,10 +897,6 @@ fn subscribe(
     }
     let mut parsed = Vec::with_capacity(MAX_FILTERS);
     let outside = props.unsupported;
-    // A SUBACK and an MQTT 5 UNSUBACK say what happened to each filter. An
-    // UNSUBACK of 3.1.1 carries no result: it cannot say that nothing was
-    // removed, so a request beyond the bound still ends the connection.
-    let answerable = !unsubscribe || version == Version::V5;
     // What a filter longer than the profile stores is answered: it holds
     // no subscription and can hold none.
     let unstorable = match (unsubscribe, version) {
@@ -919,7 +904,6 @@ fn subscribe(
         (false, Version::V311) => 0x80,
         (true, _) => 0x11,
     };
-    // Every filter is validated; those beyond the bound are only counted.
     let mut count = 0usize;
     let mut answers = Vec::with_capacity(MAX_FILTERS);
     while !input.is_empty() {
@@ -952,12 +936,6 @@ fn subscribe(
                 .ok_or_else(|| protocol("InvalidSubscriptionOptions"))?;
         }
         count += 1;
-        if count > MAX_REQUEST_FILTERS {
-            if !answerable {
-                return Err(oversized("TooManyFilters"));
-            }
-            continue;
-        }
         if text.len() > bounds.max_topic {
             answers.push(Some(unstorable));
         } else {
@@ -967,13 +945,6 @@ fn subscribe(
     }
     if outside {
         return Err(unsupported("SubscriptionOptionsOutsideProfile"));
-    }
-    if count > MAX_REQUEST_FILTERS {
-        return Ok(Packet::RequestBeyondProfile {
-            packet_id,
-            filters: count,
-            unsubscribe,
-        });
     }
     let whole = parsed.len() == count && count <= MAX_FILTERS;
     let mut parts = Vec::with_capacity(parsed.len().div_ceil(MAX_FILTERS));
@@ -1283,31 +1254,6 @@ pub fn encode_for(version: Version, frame: OutboundFrame) -> Result<Vec<u8>, Err
         }
         _ => Err(unsupported("AckNotEncodableInMqtt311")),
     }
-}
-
-/// The acknowledgement of a request the profile cannot serve: one failure
-/// per filter. A SUBACK refuses with 0x97 (quota exceeded) in MQTT 5 and
-/// with 0x80 in 3.1.1; an MQTT 5 UNSUBACK with 0x83 (implementation
-/// specific error). An UNSUBACK of 3.1.1 carries no result and cannot say
-/// that nothing was removed: it is not built.
-pub fn encode_request_refusal(
-    version: Version,
-    packet_id: InboundPacketId,
-    filters: usize,
-    unsubscribe: bool,
-) -> Result<Vec<u8>, Error> {
-    let code = match (unsubscribe, version) {
-        (false, Version::V5) => 0x97,
-        (false, Version::V311) => 0x80,
-        (true, Version::V5) => 0x83,
-        (true, Version::V311) => return Err(unsupported("UnsubackCarriesNoResult")),
-    };
-    let mut codes = Vec::new();
-    codes
-        .try_reserve_exact(filters)
-        .map_err(|_| oversized("AckTooLarge"))?;
-    codes.resize(filters, code);
-    encode_filter_ack(version, packet_id, unsubscribe, &codes)
 }
 
 /// One SUBACK or UNSUBACK with a code per filter, of any length. An
@@ -1906,34 +1852,20 @@ mod tests {
             split(super::decode(0xa2, &gone, BOUNDS).unwrap()),
             (true, vec![], vec![Some(0x11)])
         );
-        // Beyond the bound of a request: refused filter by filter where the
-        // acknowledgement can say so, closed in an UNSUBSCRIBE of 3.1.1.
-        let over = super::MAX_REQUEST_FILTERS + 1;
-        let many = [&[0u8, 1, 0][..], &[0, 1, b't', 1].repeat(over)].concat();
+        // The size of the packet is the only bound: sixty-five filters are
+        // nine unit requests.
+        let many = [&[0u8, 1, 0][..], &[0, 1, b't', 1].repeat(65)].concat();
         assert_eq!(
-            super::decode(0x82, &many, BOUNDS).unwrap(),
-            Packet::RequestBeyondProfile {
-                packet_id: id,
-                filters: over,
-                unsubscribe: false
-            }
+            split(super::decode(0x82, &many, BOUNDS).unwrap()),
+            (false, vec![8, 8, 8, 8, 8, 8, 8, 8, 1], vec![None; 65])
         );
+        let legacy = [&[0u8, 1][..], &[0, 1, b't'].repeat(65)].concat();
         assert_eq!(
-            super::encode_request_refusal(Version::V5, id, 9, false).unwrap(),
-            [&[0x90, 12, 0, 1, 0][..], &[0x97; 9]].concat()
+            split(super::decode_for(Version::V311, 0xa2, &legacy, BOUNDS).unwrap())
+                .1
+                .len(),
+            9
         );
-        assert_eq!(
-            super::encode_request_refusal(Version::V5, id, 9, true).unwrap(),
-            [&[0xb0, 12, 0, 1, 0][..], &[0x83; 9]].concat()
-        );
-        let legacy = [&[0u8, 1][..], &[0, 1, b't'].repeat(over)].concat();
-        assert_eq!(
-            super::decode_for(Version::V311, 0xa2, &legacy, BOUNDS)
-                .unwrap_err()
-                .code(),
-            "TooManyFilters"
-        );
-        assert!(super::encode_request_refusal(Version::V311, id, 9, true).is_err());
         let bytes = super::encode_publish(
             OutboundPacketId::new(4).unwrap(),
             &SharedBytes::copy_from(b"t", 1).unwrap(),

@@ -418,54 +418,33 @@ fn a_fan_in_burst_closes_no_publisher() {
     );
 }
 
-/// A request with more filters than the broker serves in one request
-/// (sixty-four) is still owed its acknowledgement (MQTT-3.8.4-1,
-/// MQTT-3.10.4-4): it changes nothing and is answered with a failure for
-/// every filter, and the connection stays open.
+/// The size of the packet is the only bound on the filters of a request:
+/// sixty-five are served as nine unit requests and acknowledged once
+/// (MQTT-3.8.4-5, MQTT-3.10.4-6), and the connection goes on.
 #[test]
-fn a_request_beyond_the_bound_of_a_request_is_refused_per_filter() {
-    let broker = Broker::start("beyond-bound");
-    let mut client = connect(broker.address, "beyond-bound");
-    const FILTERS: usize = 65;
-
-    let mut body = vec![0, 7, 0];
-    for index in 0..FILTERS {
-        text(&format!("wake/filter/{index}"), &mut body);
-        body.push(0);
-    }
-    client.write_all(&packet(0x82, &body)).unwrap();
-    let (first, answer) = read_packet(&mut client);
-    assert_eq!(first, 0x90, "SUBACK expected\n{}", broker.refusals());
+fn a_request_of_sixty_five_filters_is_served_and_acknowledged_once() {
+    let broker = Broker::start("sixty-five");
+    let mut client = Peer::connect(broker.address, "sixty-five", true);
+    let filters: Vec<String> = (0..65)
+        .map(|index| format!("wake/filter/{index}"))
+        .collect();
     assert_eq!(
-        &answer[..3],
-        &[0, 7, 0],
-        "packet identifier and no property"
+        client.subscribe(7, &filters),
+        [0; 65],
+        "every filter granted\n{}",
+        broker.refusals()
     );
     assert_eq!(
-        &answer[3..],
-        &[0x97; FILTERS],
-        "every filter refused for quota"
+        client.unsubscribe(8, &filters),
+        [0; 65],
+        "every filter removed\n{}",
+        broker.refusals()
     );
-
-    let mut body = vec![0, 8, 0];
-    for index in 0..FILTERS {
-        text(&format!("wake/filter/{index}"), &mut body);
-    }
-    client.write_all(&packet(0xa2, &body)).unwrap();
-    let (first, answer) = read_packet(&mut client);
-    assert_eq!(first, 0xb0, "UNSUBACK expected\n{}", broker.refusals());
+    client.stream.write_all(&[0xc0, 0]).unwrap();
     assert_eq!(
-        &answer[..3],
-        &[0, 8, 0],
-        "packet identifier and no property"
-    );
-    assert_eq!(&answer[3..], &[0x83; FILTERS], "one failure per filter");
-
-    client.write_all(&[0xc0, 0]).unwrap();
-    assert_eq!(
-        read_packet(&mut client).0,
+        read_packet(&mut client.stream).0,
         0xd0,
-        "the connection stays open"
+        "the connection goes on"
     );
 }
 

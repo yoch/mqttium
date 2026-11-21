@@ -270,18 +270,15 @@ what the peer still sends until the connection closes, with
 names no protocol version and MQTT 3.1.1 has no packet for it: both are closed
 without one.
 
-A SUBSCRIBE or an UNSUBSCRIBE may carry up to sixty-four filters. The core
-takes eight in one request, so a larger one is served as the sequence of its
-unit requests, in order, each authorized as a request of its own, and
+A SUBSCRIBE or an UNSUBSCRIBE may carry as many filters as its packet holds.
+The core takes eight in one request, so a larger one is served as the sequence
+of its unit requests, in order, each authorized as a request of its own, and
 acknowledged once with one code per filter: what it leaves subscribed or
-removed is what the unit requests would leave. No other packet of the
-connection is taken while it lasts. A filter longer than 1,024 bytes holds no
-subscription and can hold none: it is answered for itself (0x97 in a SUBACK,
-0x80 in MQTT 3.1.1, 0x11 in an MQTT 5 UNSUBACK) and its neighbours are served.
-Beyond sixty-four filters the request changes nothing and every filter is
-answered with a failure (0x97, 0x80 in MQTT 3.1.1, 0x83 in an MQTT 5
-UNSUBACK); an UNSUBACK of MQTT 3.1.1 carries no result, so such an
-UNSUBSCRIBE ends the connection.
+removed is what the unit requests would leave (MQTT-3.8.4-5, MQTT-3.10.4-6).
+No other packet of the connection is taken while it lasts. A filter longer
+than 1,024 bytes holds no subscription and can hold none: it is answered for
+itself (0x97 in a SUBACK, 0x80 in MQTT 3.1.1, 0x11 in an MQTT 5 UNSUBACK) and
+its neighbours are served.
 
 ## Bounds and transport
 
