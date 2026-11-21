@@ -20,7 +20,7 @@
     "difference": "Mosquitto accepts a zero-length ClientID with Clean Session 1 (CONNACK 0); mqttiumd refuses it with return code 2 (Identifier rejected) and closes.",
     "statement": "MQTT-3.1.3-6 makes accepting it optional; MQTT-3.1.3-9 is how mqttiumd refuses",
     "lot": "Server-assigned Client Identifier for a zero-length ClientID",
-    "fingerprint": "e594866b42e1c75c"
+    "fingerprint": "fe2dce2e4484b2b2"
   },
   {
     "id": "connect/empty-clientid-v5",
@@ -28,56 +28,56 @@
     "difference": "Mosquitto accepts a zero-length ClientID and returns an Assigned Client Identifier; mqttiumd refuses it with CONNACK 0x85 (Client Identifier not valid) and closes.",
     "statement": "MQTT-3.1.3-6 makes accepting it optional",
     "lot": "Server-assigned Client Identifier for a zero-length ClientID",
-    "fingerprint": "88c294ed611a1eac"
+    "fingerprint": "2affe3825567206a"
   },
   {
     "id": "connect/legacy-mqtt31",
     "class": "profile-refused",
     "difference": "Mosquitto accepts a MQTT 3.1 CONNECT (protocol name MQIsdp, level 3) with CONNACK 0; mqttiumd closes the connection without CONNACK.",
     "lot": "MQTT 3.1 (MQIsdp): a separate extension, outside the v0.1 profile (chapter 1, section 3)",
-    "fingerprint": "c10bb4d968dfdad2"
+    "fingerprint": "9deea20bbff11a05"
   },
   {
     "id": "connect/user-property-v5",
     "class": "profile-refused",
     "difference": "Mosquitto accepts a CONNECT that carries a User Property; mqttiumd refuses it with CONNACK 0x83 (Implementation specific error) and closes.",
     "lot": "MQTT 5 properties a broker may ignore but must accept: User Property on CONNECT, SUBSCRIBE and UNSUBSCRIBE",
-    "fingerprint": "19b168869d81e059"
+    "fingerprint": "09ea6c71e6dc4c7e"
   },
   {
     "id": "connect/username-password-v4",
     "class": "profile-refused",
     "difference": "Mosquitto, which accepts anonymous clients here, accepts a CONNECT with User Name and Password; mqttiumd refuses any credentials with return code 4 (Bad user name or password) and closes.",
     "lot": "Authentication: user name and password checked against a password file (chapter 1, section 3, row Authentification; CFG-004, CFG-005)",
-    "fingerprint": "5bebfb15062eba30"
+    "fingerprint": "9551f31d70c05831"
   },
   {
     "id": "connect/username-password-v5",
     "class": "profile-refused",
     "difference": "Mosquitto, which accepts anonymous clients here, accepts a CONNECT with User Name and Password; mqttiumd refuses any credentials with CONNACK 0x83 (Implementation specific error) and closes.",
     "lot": "Authentication: user name and password checked against a password file (chapter 1, section 3, row Authentification; CFG-004, CFG-005)",
-    "fingerprint": "4fdf7c4997e6e370"
+    "fingerprint": "551665967d28f40f"
   },
   {
     "id": "errors/oversized-packet-v4",
     "class": "profile-refused",
     "difference": "Mosquitto, whose default limit is the protocol maximum, acknowledges a 70 000-byte PUBLISH; mqttiumd accepts packets up to 65 536 bytes and closes the connection.",
     "lot": "Runtime limits of the bounded preview (ADR 0044), to be raised to Mosquitto's defaults or made configurable: 65 536-byte packets",
-    "fingerprint": "bdd7e89f0fb7a10a"
+    "fingerprint": "1ccaa34a000e94b5"
   },
   {
     "id": "errors/oversized-packet-v5",
     "class": "profile-refused",
     "difference": "Mosquitto, whose default limit is the protocol maximum, acknowledges a 70 000-byte PUBLISH; mqttiumd announced Maximum Packet Size 65 536 and closes the connection (without DISCONNECT: see errors/packet-over-announced-maximum-v5).",
     "lot": "Runtime limits of the bounded preview (ADR 0044), to be raised to Mosquitto's defaults or made configurable: 65 536-byte packets",
-    "fingerprint": "10abbbd4d67a2330"
+    "fingerprint": "b9154116ff3314d5"
   },
   {
     "id": "errors/packet-over-announced-maximum-v5",
     "class": "defect",
-    "difference": "With the same announced Maximum Packet Size, Mosquitto sends DISCONNECT 0x95 (Packet too large) before closing; mqttiumd closes without sending anything.",
+    "difference": "With the same announced Maximum Packet Size, Mosquitto sends DISCONNECT 0x95 (Packet too large) and resets the connection, which it closes with the rest of the packet unread; mqttiumd sends nothing and closes by end of stream.",
     "lot": "MQTT 5 error reporting: send CONNACK or DISCONNECT with the Reason Code that names the cause before closing",
-    "fingerprint": "19bc8bc677d8232d"
+    "fingerprint": "0eb7aa3f00ccccf3"
   },
   {
     "id": "properties/content-type-v5",
@@ -109,7 +109,7 @@
     "difference": "Mosquitto (Topic Alias Maximum 10) resolves the alias and delivers both messages; mqttiumd (Topic Alias Maximum 0) answers the first PUBLISH with DISCONNECT 0x94 (Topic Alias invalid) and closes.",
     "statement": "MQTT-3.2.2-18: with Topic Alias Maximum 0 the client is the one at fault",
     "lot": "Topic Alias from client to server (Topic Alias Maximum above 0)",
-    "fingerprint": "e404c1b509d5abd4"
+    "fingerprint": "36e59be75d5309a5"
   },
   {
     "id": "properties/user-properties-v5",
@@ -124,7 +124,7 @@
     "class": "profile-refused",
     "difference": "Mosquitto delivers all one hundred QoS 0 messages written at once to an online subscriber; mqttiumd delivers fewer (about thirty) and drops the others silently.",
     "lot": "Runtime limits of the bounded preview (ADR 0044), to be raised to Mosquitto's defaults or made configurable: the bounded volatile path of QoS 0 messages (8 outgoing messages per connection, 32 writer slots)",
-    "fingerprint": "5faa36a902cf9b5e"
+    "fingerprint": "737eee3aa9a2785b"
   },
   {
     "id": "publish/no-matching-subscribers-v5",
@@ -138,7 +138,7 @@
     "class": "defect",
     "difference": "Mosquitto acknowledges and delivers a 40 000-byte message; mqttiumd answers DISCONNECT 0x95 (Packet too large) although the packet is below the Maximum Packet Size 65 536 it announced: its payload limit is 32 768 bytes.",
     "lot": "Runtime limits of the bounded preview (ADR 0044), to be raised to Mosquitto's defaults or made configurable: 32 768-byte payloads; meanwhile announce the limit that is enforced",
-    "fingerprint": "d17213c9dad9d837"
+    "fingerprint": "4def2420df805cd8"
   },
   {
     "id": "publish/pubrel-retransmit-v5",
@@ -153,7 +153,7 @@
     "difference": "Both close the connection on a QoS 0 PUBLISH with DUP 1; Mosquitto first sends DISCONNECT 0x81 (Malformed Packet), mqttiumd sends nothing.",
     "statement": "MQTT-3.3.1-2 is what the client violates",
     "lot": "MQTT 5 error reporting: send CONNACK or DISCONNECT with the Reason Code that names the cause before closing",
-    "fingerprint": "fd31f54396b2d95a"
+    "fingerprint": "659fd3c9742486e8"
   },
   {
     "id": "publish/receive-maximum-inbound-v5",
@@ -161,35 +161,35 @@
     "difference": "On a ninth QoS 2 PUBLISH while eight exchanges are open, Mosquitto answers PUBREC 0x97 (Quota exceeded) and keeps the connection open; mqttiumd sends DISCONNECT 0x93 (Receive Maximum exceeded) and closes.",
     "statement": "MQTT-4.13.1-1, with section 3.3.4: a client that exceeds Receive Maximum (MQTT-3.3.4-7) makes a Protocol Error for which the Reason Code 0x93 is given, so the server must close the connection",
     "mqttiumd": "Sends DISCONNECT 0x93 (Receive Maximum exceeded) and closes the network connection.",
-    "fingerprint": "f5acd98a89441a3e"
+    "fingerprint": "967d3cf1ba4eb6a1"
   },
   {
     "id": "publish/topic-with-wildcard-v5",
     "class": "unspecified",
     "difference": "Both close the connection on a Topic Name with a wildcard; Mosquitto with DISCONNECT 0x81 (Malformed Packet), mqttiumd with DISCONNECT 0x90 (Topic Name invalid).",
     "statement": "MQTT-3.3.2-2 is what the client violates; the Reason Code is not prescribed",
-    "fingerprint": "dac508f8ba7fb836"
+    "fingerprint": "3d5fe5d94ba4a6cf"
   },
   {
     "id": "retained/forty-topics-v4",
     "class": "profile-refused",
     "difference": "Mosquitto keeps forty retained messages and sends them all to a new subscriber; mqttiumd keeps thirty-two, closes the publisher's connection on the thirty-third and sends thirty-two.",
     "lot": "Runtime limits of the bounded preview (ADR 0044), to be raised to Mosquitto's defaults or made configurable: 32 retained topics",
-    "fingerprint": "315b18d1b96ba12e"
+    "fingerprint": "7579302c42a02d99"
   },
   {
     "id": "subscribe/invalid-empty-filter-v5",
     "class": "unspecified",
     "difference": "Both close the connection on the invalid Topic Filter; Mosquitto with DISCONNECT 0x81 (Malformed Packet), mqttiumd with DISCONNECT 0x82 (Protocol Error).",
     "statement": "MQTT-4.13.1-1: both close; the Reason Code is not prescribed",
-    "fingerprint": "3fbf57b5f0eae340"
+    "fingerprint": "624dc40dd9b77310"
   },
   {
     "id": "subscribe/invalid-hash-not-last-v5",
     "class": "unspecified",
     "difference": "Both close the connection on the invalid Topic Filter; Mosquitto with DISCONNECT 0x81 (Malformed Packet), mqttiumd with DISCONNECT 0x82 (Protocol Error).",
     "statement": "MQTT-4.13.1-1: both close; the Reason Code is not prescribed",
-    "fingerprint": "066b3090c2050d62"
+    "fingerprint": "6a79447df4524ecc"
   },
   {
     "id": "subscribe/many-subscriptions-v4",
@@ -239,7 +239,7 @@
     "class": "profile-refused",
     "difference": "Mosquitto answers a SUBSCRIBE that carries a User Property with SUBACK; mqttiumd answers DISCONNECT 0x83 (Implementation specific error) and closes.",
     "lot": "MQTT 5 properties a broker may ignore but must accept: User Property on CONNECT, SUBSCRIBE and UNSUBSCRIBE",
-    "fingerprint": "5ef1040c6f020805"
+    "fingerprint": "d7623c4ffa9154d7"
   },
   {
     "id": "will/abrupt-close-qos0-v4",

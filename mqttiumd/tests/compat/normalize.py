@@ -1,9 +1,14 @@
 """Turn a raw transcript into the form the two brokers are compared in.
 
+The raw transcript is what the player recorded: every packet received, in
+the order it came, and how each read ended. It is written next to the
+comparable form (`<id>.<backend>.raw.json`) and never compared.
+
 Kept as observed: packet types and their order per step, flags, QoS,
 topics, payloads, reason codes, the packet identifiers the client chose
 (and their echo in the broker's acknowledgements), property values,
-whether a connection was closed.
+whether a connection was closed, and how: by end of stream (`eof`) or by
+a reset (`reset`).
 
 Normalized, because the value cannot be equal or is not what a scenario
 compares:
@@ -20,8 +25,15 @@ compares:
   them; every MQTT 5 scenario would differ otherwise);
 - a numeric property named in `Scenario.buckets` becomes the interval it
   falls in (the remaining Message Expiry Interval depends on the clock);
-- a closure by end of stream and one by reset are both `closed`
-  (done by the player);
+- the packets a `tally` step counted become two verdicts: whether all the
+  expected ones came (`arrived`: `all`, `fewer`, `more`) and, when the
+  step declares the sequence sent, in which order (`order`: `as-sent`,
+  `permuted`, `other`). How many came and which permutation are in the
+  raw transcript; they may vary from one run to the next;
+- the packets of a step declared with `sort=True` are put in one order;
+- in a scenario declared with `closure="any"`, `eof` and `reset` both
+  become `closed`: the kind of closure depends there on how much of the
+  client's writing the broker had read when it closed;
 - no time is recorded;
 - properties are a mapping, so their wire order is not compared; user
   properties keep their order, which the specification makes significant.
@@ -33,6 +45,7 @@ import hashlib
 import json
 
 ASSIGNED = "<assigned>"
+CLOSED = ("eof", "reset")
 
 # CONNACK properties that describe the broker, not the exchange.
 CAPABILITIES = frozenset({
@@ -98,11 +111,45 @@ def normalize_received(packet: dict, *, buckets: dict, capabilities: bool) -> No
         del packet["properties"]
 
 
+def packet_order(packet: dict):
+    """A total order of decoded packets, for steps that ask for one. It
+    ignores packet identifiers, which the broker may choose."""
+    rest = {key: value for key, value in packet.items() if key != "packet_id"}
+    return packet["type"], json.dumps(rest, sort_keys=True), str(packet.get("packet_id"))
+
+
+def order(seen, sequence) -> str:
+    """How the values `seen` stand against the `sequence` that was sent:
+    `as-sent` when they come in its order (some may be missing),
+    `permuted` when they are all of it and distinct but not in its order,
+    `other` when one is repeated or is not of the sequence."""
+    if any(value not in sequence for value in seen) or any(value in seen[:index] for index, value in enumerate(seen)):
+        return "other"
+    places = [sequence.index(value) for value in seen]
+    return "as-sent" if places == sorted(places) else "permuted"
+
+
+def tally(record: dict) -> dict:
+    """The comparable form of a raw `tally` record: its verdicts, and the
+    packets of another type than the one counted."""
+    kind, expected = record["kind"], record["expected"]
+    counted = [packet for packet in record["got"] if packet["type"] == kind]
+    out = {"conn": record["conn"], "op": "tally", "kind": kind, "expected": expected,
+           "arrived": "all" if len(counted) == expected else "fewer" if len(counted) < expected else "more"}
+    if "sequence" in record:
+        out["order"] = order([packet.get(record["field"]) for packet in counted], record["sequence"])
+    return {**out, "got": [packet for packet in record["got"] if packet["type"] != kind], "end": record["end"]}
+
+
 def normalize(transcript, scenario) -> list:
     """A deep copy of `transcript` in comparable form."""
-    out = copy.deepcopy(transcript)
+    out = [tally(record) if record["op"] == "tally" else record for record in copy.deepcopy(transcript)]
     identifiers: dict[str, BrokerIdentifiers] = {}
     for record in out:
+        if record.pop("sort", False):
+            record["got"].sort(key=packet_order)
+        if scenario.closure == "any" and record.get("end") in CLOSED:
+            record["end"] = "closed"
         ids = identifiers.setdefault(record.get("conn"), BrokerIdentifiers())
         for packet in record.get("got", ()):
             normalize_received(packet, buckets=scenario.buckets, capabilities=scenario.capabilities)

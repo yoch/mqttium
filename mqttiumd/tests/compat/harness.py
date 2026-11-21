@@ -8,7 +8,6 @@ not come is an observation, not a hang.
 from __future__ import annotations
 
 from contextlib import contextmanager
-import json
 import os
 from pathlib import Path
 import re
@@ -208,7 +207,8 @@ class Connection:
         self.sock = sock
         self.level = level
         self.buffer = b""
-        self.ended = False      # the peer closed or reset
+        self.ended = None       # how the peer closed: `eof` or `reset`
+        self.reset = False      # a read or a write met a connection reset
         self.broken = False     # the peer sent bytes that cannot be framed
 
     def close(self) -> None:
@@ -226,14 +226,11 @@ def describe(data: bytes, level: int) -> dict:
         return {"type": "UNDECODABLE", "error": str(error), "hex": data.hex()}
 
 
-def packet_order(packet: dict):
-    """A total order of decoded packets, for steps that ask for one. It
-    ignores packet identifiers, which the broker may choose."""
-    rest = {key: value for key, value in packet.items() if key != "packet_id"}
-    return packet["type"], json.dumps(rest, sort_keys=True), str(packet.get("packet_id"))
-
-
 ACKS = {"puback": wire.puback, "pubrec": wire.pubrec, "pubcomp": wire.pubcomp}
+# How a read can find the connection closed by the peer.
+CLOSED = ("eof", "reset")
+# A step that asks for an order says so in its record; `normalize` sorts.
+SORT = {False: {}, True: {"sort": True}}
 
 
 class Player:
@@ -271,7 +268,11 @@ class Player:
         """Collect packets until `count` of them, `until(packet)`, the end of
         the stream, or `deadline`.
 
-        Returns `(packets, end)` with end one of `ok`, `timeout`, `closed`.
+        Returns `(packets, end)` with end one of `ok`, `timeout`, `eof` (the
+        peer closed its end of the stream) and `reset` (a read or an earlier
+        write on this connection met a connection reset). An end of stream
+        seen first stays `eof`: what the peer's system answers to the
+        client's later writes is not a reset by the peer.
         """
         connection = self.connections[name]
         got: list[dict] = []
@@ -292,7 +293,7 @@ class Player:
                         connection.buffer = b"".join(packets[index + 1:]) + connection.buffer
                         return got, "ok"
             if connection.ended:
-                return got, "closed"
+                return got, connection.ended
             now = time.monotonic()
             if now >= deadline:
                 return got, "timeout"
@@ -301,12 +302,15 @@ class Player:
                 continue
             try:
                 chunk = connection.sock.recv(65536)
+            except ConnectionResetError:
+                connection.reset = True
+                chunk = b""
             except OSError:
                 chunk = b""
             if chunk:
                 connection.buffer += chunk
             else:
-                connection.ended = True
+                connection.ended = "reset" if connection.reset else "eof"
 
     # -- steps --------------------------------------------------------------
 
@@ -326,6 +330,10 @@ class Player:
         try:
             connection.sock.settimeout(2.0)
             connection.sock.sendall(data)
+        except ConnectionResetError:
+            # The write took the error off the socket: the next read would
+            # see an end of stream.
+            connection.reset = True
         except OSError:
             # Whether a write to a closing socket fails depends on timing;
             # the next read of this connection shows the closure.
@@ -364,16 +372,15 @@ class Player:
         if step["conn"] not in self.connections:
             return {**record, "got": [], "end": "not-open"}
         got, end = self.read(step["conn"], count=step["count"], deadline=time.monotonic() + step["timeout"])
-        if step["sort"]:
-            got.sort(key=packet_order)
-        return {**record, "got": got, "end": end}
+        return {**record, "got": got, "end": end, **SORT[bool(step["sort"])]}
 
     def do_quiet(self, step):
         """Record what arrives although nothing more is expected.
 
         With `ping`, a PINGREQ is sent first and everything up to its
         PINGRESP is read before the silent window starts, so that a slow
-        broker is given the time of one round trip more.
+        broker is given the time of one round trip more. That PINGREQ and
+        its PINGRESP belong to the harness and are not recorded.
         """
         name = step["conn"]
         connection = self.connections.get(name)
@@ -390,28 +397,24 @@ class Player:
                 got.pop()
             elif end == "timeout":
                 return {**record, "got": got, "end": "no-pingresp"}
-        if end != "closed":
+        if end not in CLOSED:
             more, end = self.read(name, deadline=time.monotonic() + step["window"])
             got += more
-        if step["sort"]:
-            got.sort(key=packet_order)
-        return {**record, "got": got, "end": "quiet" if end == "timeout" else end}
+        return {**record, "got": got, "end": "quiet" if end == "timeout" else end, **SORT[bool(step["sort"])]}
 
     def do_tally(self, step):
-        """Count the packets of one type; the transcript keeps the verdict only."""
+        """Record every packet that arrives, with what the step declares:
+        `normalize.tally` reduces the record to its verdicts."""
         record = self.do_quiet({**step, "ping": True, "sort": False})
-        count = sum(1 for packet in record["got"] if packet["type"] == step["kind"])
-        others = [packet for packet in record["got"] if packet["type"] != step["kind"]]
-        verdict = "all" if count == step["expected"] else "fewer" if count < step["expected"] else "more"
-        return {"conn": step["conn"], "op": "tally", "kind": step["kind"], "expected": step["expected"],
-                "arrived": verdict, "got": others, "end": record["end"]}
+        declared = {key: step[key] for key in ("kind", "expected", "field", "sequence") if step.get(key) is not None}
+        return {"conn": step["conn"], "op": "tally", **declared, "got": record["got"], "end": record["end"]}
 
     def do_until_close(self, step):
         record = {"conn": step["conn"], "op": "until_close"}
         if step["conn"] not in self.connections:
             return {**record, "got": [], "end": "not-open"}
         got, end = self.read(step["conn"], deadline=time.monotonic() + step["timeout"])
-        return {**record, "got": got, "end": "closed" if end == "closed" else "still-open"}
+        return {**record, "got": got, "end": end if end in CLOSED else "still-open"}
 
     def do_close(self, step):
         record = {"conn": step["conn"], "op": "close"}
@@ -432,7 +435,8 @@ class Player:
 def run_scenario(scenario, backend: str, binary: Path, directory: Path):
     """Play `scenario` against a fresh broker.
 
-    Returns `(transcript, running)`: the raw transcript and the ended
+    Returns `(transcript, running)`: the raw transcript (every packet
+    received, in the order it came; `normalize` makes the comparable form) and the ended
     process, whose `incidents()` say whether it crashed or hung.
     """
     config = scenario.reference_config if backend == REFERENCE else ()

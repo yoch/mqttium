@@ -8,7 +8,7 @@
 Each scenario is played against a fresh instance of each broker. The two
 normalized transcripts are compared and the pair is joined with
 `divergences.json`. The run writes `matrix.md`, `matrix.json` and the
-transcripts in the output directory.
+transcripts, raw and normalized, in the output directory.
 
 Exit status: 0 when every difference is classified and every classified
 difference still reproduces as it was read; 1 otherwise; 2 for a wrong
@@ -80,11 +80,12 @@ def select(names, patterns):
 
 def play(scenario, binaries: dict, scratch: Path) -> dict:
     """Both normalized transcripts of one scenario, or the error met."""
-    out = {"name": scenario.name, "incidents": {}, "fingerprint": None}
+    out = {"name": scenario.name, "incidents": {}, "fingerprint": None, "raw": {}}
     try:
         for backend in harness.BACKENDS:
             with tempfile.TemporaryDirectory(dir=scratch, prefix="compat-") as directory:
                 raw, running = harness.run_scenario(scenario, backend, binaries[backend], Path(directory))
+            out["raw"][backend] = raw
             out[backend] = normalize.normalize(raw, scenario)
             kinds = running.incidents()
             if kinds:
@@ -101,19 +102,21 @@ def play(scenario, binaries: dict, scratch: Path) -> dict:
     return out
 
 
-def render_transcripts(result) -> str:
-    """One step per line, so that two runs read well in a diff."""
-    def block(key, transcript):
+def render(head: dict, transcripts: dict) -> str:
+    """A JSON object with one step per line, so that two runs read well in a diff."""
+    parts = [f"  {json.dumps(key)}: {json.dumps(value)}" for key, value in head.items()]
+    for key, transcript in transcripts.items():
         rows = ",\n".join("    " + json.dumps(row, sort_keys=True, ensure_ascii=True) for row in transcript)
-        return f'  {json.dumps(key)}: [\n{rows}\n  ]' if transcript else f'  {json.dumps(key)}: []'
-
-    parts = [f'  "scenario": {json.dumps(result["name"])}', f'  "status": {json.dumps(result["status"])}']
-    if result["status"] == classify.SAME:
-        parts.append(block("both", result[harness.REFERENCE]))
-    else:
-        parts += [f'  "fingerprint": {json.dumps(result["fingerprint"])}',
-                  block(harness.REFERENCE, result[harness.REFERENCE]), block(harness.BROKER, result[harness.BROKER])]
+        parts.append(f"  {json.dumps(key)}: [\n{rows}\n  ]" if transcript else f"  {json.dumps(key)}: []")
     return "{\n" + ",\n".join(parts) + "\n}\n"
+
+
+def render_transcripts(result) -> str:
+    """Both normalized transcripts of one scenario, equal or not."""
+    head = {"scenario": result["name"], "status": result["status"]}
+    if result["status"] != classify.SAME:
+        head["fingerprint"] = result["fingerprint"]
+    return render(head, {backend: result[backend] for backend in harness.BACKENDS})
 
 
 def transcript_diff(result) -> str:
@@ -126,11 +129,16 @@ def transcript_diff(result) -> str:
 
 def write_transcripts(directory: Path, result) -> str | None:
     """Write the files of one played scenario under `directory`:
-    `<id>.json`, and for a pair that differs `<id>.diff`, for a broker
-    incident `<id>.<backend>.incident.txt`, for a scenario that could not
-    be played `<id>.error.txt` only. Returns the diff, or None."""
+    `<id>.<backend>.raw.json` (what the player recorded from each broker)
+    and `<id>.json` (both normalized transcripts), for a pair that differs
+    `<id>.diff`, for a broker incident `<id>.<backend>.incident.txt`, and
+    for a scenario that could not be played `<id>.error.txt` with the raw
+    transcripts obtained before the failure. Returns the diff, or None."""
     target = directory / (result["name"] + ".json")
     target.parent.mkdir(parents=True, exist_ok=True)
+    for backend, raw in result["raw"].items():
+        target.with_suffix(f".{backend}.raw.json").write_text(
+            render({"scenario": result["name"], "backend": backend}, {"transcript": raw}))
     if result["status"] == classify.ERROR:
         target.with_suffix(".error.txt").write_text(result["error"])
         return None
