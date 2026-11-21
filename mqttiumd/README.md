@@ -25,6 +25,9 @@ peer instead of disconnecting it. The first measurements on that runtime
 are in [report 0027](docs/reports/0027-reactor-runtime-load.md): they
 replace the figures of report 0024 for the current executable, which
 remains behind Mosquitto, by a factor of two or more on durable QoS 1.
+[Report 0028](docs/reports/0028-input-pressure-reconciliation.md) accounts
+for every publication offered beyond what the store commits (submitted,
+refused, acknowledged, delivered) and for the return to a nominal load.
 
 What the broker accepts of MQTT is still the bounded profile described in
 [the product guide](docs/product-tcp.md). The gap to the pinned Mosquitto
