@@ -412,6 +412,59 @@ for level_of_service in (1, 2):
     name = f"publish/over-maximum-packet-size-qos{level_of_service}-v5#"
     CASES[name + "discarded"], CASES[name + "not-redelivered"] = limit_cases(level_of_service)
 del level_of_service, name
+# Requests with many filters: what the broker did before it served them as
+# unit requests comes first among the failures.
+for version in (4, 5):
+    refused = 0x80 if version == 4 else 0x97
+    name = f"subscribe/many-filters-effective-v{version}#"
+    CASES[name + "granted"] = {
+        PASS: [[record("answer", wire.suback(1, [0] * 12, level=version), level=version)]],
+        FAIL: [[record("answer", wire.suback(1, [refused] * 12, level=version), level=version)],
+               [record("answer", wire.suback(1, [0] * 8, level=version), level=version)],
+               [record("answer", wire.suback(1, [0] * 11 + [refused], level=version), level=version)],
+               [record("answer", end="eof", level=version)]],
+    }
+    CASES[name + "effective"] = {
+        PASS: [[record("delivered", wire.publish("eff/11", "twelfth", level=version), level=version)]],
+        FAIL: [[record("delivered", end="timeout", level=version)],
+               [record("delivered", wire.publish("eff/10", "twelfth", level=version), level=version)],
+               [record("delivered", end="eof", level=version)]],
+    }
+    name = f"subscribe/unsubscribe-nine-filters-v{version}#"
+    CASES[name + "acknowledged"] = {
+        PASS: [[record("answer", wire.unsuback(3, [0] * 9 if version == 5 else (), level=version), level=version)]],
+        FAIL: [[record("answer", end="eof", level=version)],
+               [record("answer", wire.unsuback(4, [0] * 9 if version == 5 else (), level=version), level=version)],
+               [record("answer", wire.suback(3, [0] * 9, level=version), level=version)]],
+    }
+    if version == 5:
+        CASES[name + "acknowledged"][FAIL].insert(
+            0, [record("answer", wire.unsuback(3, [0x83] * 9, level=5), level=5)])
+    CASES[name + "effective"] = {
+        PASS: [[record("next", wire.publish("nine/9", "kept", level=version), level=version)]],
+        FAIL: [[record("next", wire.publish("nine/8", "removed", level=version), level=version)],
+               [record("next", end="timeout", level=version)]],
+    }
+del version, refused, name
+LIMIT = "errors/packet-at-announced-maximum-v5#limit"
+ANNOUNCING = wire.connack(level=5, props={"maximum_packet_size": 32_776})
+CASES[LIMIT] = {
+    PASS: [[record("connack", ANNOUNCING), record("exact", wire.puback(1, level=5)),
+            closed_with("over", disconnect(0x95))],
+           [record("connack", ANNOUNCING), record("exact", wire.puback(1, level=5, reason=0x10)),
+            closed_with("over", disconnect(0x95), end="reset")]],
+    # What the broker did before the announcement was also a limit, then
+    # other wrong answers.
+    FAIL: [[record("connack", ANNOUNCING), record("exact", wire.puback(1, level=5)),
+            closed_with("over", wire.puback(2, level=5), end="still-open")],
+           [record("connack", ANNOUNCING), closed_with("exact", disconnect(0x95), op="recv"),
+            closed_with("over")],
+           [record("connack", ANNOUNCING), record("exact", wire.puback(1, level=5)), closed_with("over")],
+           [record("connack", ANNOUNCING), record("exact", wire.puback(1, level=5)),
+            closed_with("over", disconnect(0x83))]],
+    NOT_APPLICABLE: [[record("connack", V5["plain"]), record("exact", wire.puback(1, level=5)),
+                      closed_with("over", wire.puback(2, level=5), end="still-open")]],
+}
 
 
 class Repository(unittest.TestCase):
@@ -429,7 +482,13 @@ class Repository(unittest.TestCase):
                  **{f"publish/over-maximum-packet-size-qos{qos}-v5#discarded": {"MQTT-3.1.2-25", "MQTT-3.1.2-24"}
                     for qos in (1, 2)},
                  **{f"publish/over-maximum-packet-size-qos{qos}-v5#not-redelivered": {"MQTT-3.1.2-25", "MQTT-3.2.2-3"}
-                    for qos in (1, 2)}}
+                    for qos in (1, 2)},
+                 **{f"subscribe/many-filters-effective-v{version}#{name}":
+                    {"MQTT-3.8.4-4" if version == 4 else "MQTT-3.8.4-5"}
+                    for version in (4, 5) for name in ("granted", "effective")},
+                 **{f"subscribe/unsubscribe-nine-filters-v{version}#{name}": {"MQTT-3.10.4-6"}
+                    for version in (4, 5) for name in ("acknowledged", "effective")},
+                 LIMIT: {"MQTT-4.13.1-1"}}
         self.assertEqual(sorted(cited), sorted(CASES))
         for name, statements in cited.items():
             found = {match.group(0) for match in classify.STATEMENT.finditer(self.declared[name].statement)}

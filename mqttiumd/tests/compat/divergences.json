@@ -65,6 +65,14 @@
     "fingerprint": "a6c0e8adc59c1e58"
   },
   {
+    "id": "errors/packet-at-announced-maximum-v5",
+    "class": "reference-nonconformant",
+    "difference": "Both acknowledge a PUBLISH of exactly the announced 32 776 bytes (Mosquitto with Reason Code 0x10, no matching subscribers; mqttiumd with 0x00). Mosquitto also acknowledges the next one, of 32 777 bytes, and keeps the connection; mqttiumd answers DISCONNECT 0x95 (Packet too large) and closes.",
+    "statement": "MQTT-4.13.1-1, with section 3.2.2.3.6: the size is the whole packet, and a larger one is a Protocol Error with 0x95",
+    "mqttiumd": "Measures the whole packet, fixed header included: acknowledges 32 776 bytes, answers 32 777 with DISCONNECT 0x95 (Packet too large) and closes the network connection.",
+    "fingerprint": "1111667a218eb399"
+  },
+  {
     "id": "properties/content-type-v5",
     "class": "profile-refused",
     "difference": "Mosquitto acknowledges the PUBLISH and forwards the Content Type to the subscriber; mqttiumd answers the PUBLISH with DISCONNECT 0x83 (Implementation specific error), closes the publisher's connection and delivers nothing.",
@@ -219,14 +227,6 @@
     "difference": "Mosquitto sends its retained `$SYS/broker/version` message; mqttiumd grants the subscription and publishes nothing under `$SYS`.",
     "lot": "Operations: metrics published under `$SYS` (chapter 1, section 3, row Exploitation)",
     "fingerprint": "b026513ceb42f74a"
-  },
-  {
-    "id": "subscribe/twelve-filters-v4",
-    "class": "profile-refused",
-    "difference": "Mosquitto answers a SUBSCRIBE of twelve Topic Filters with twelve granted QoS; mqttiumd accepts at most eight Topic Filters per SUBSCRIBE, answers with a SUBACK of twelve return codes 0x80 (Failure), subscribes nothing and keeps the connection.",
-    "statement": "MQTT-3.8.4-5: a return code per Topic Filter, which may say that the subscription failed",
-    "lot": "Runtime limits of the bounded preview (ADR 0044), to be raised to Mosquitto's defaults or made configurable: 8 Topic Filters per SUBSCRIBE or UNSUBSCRIBE",
-    "fingerprint": "38474a5e39a147c1"
   },
   {
     "id": "will/abrupt-close-qos0-v4",

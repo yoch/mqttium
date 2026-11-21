@@ -237,4 +237,67 @@ scenario(
            recv("a"), quiet("a")],
 )
 
-del level, v
+for level in (4, 5):
+    v = f"v{level}"
+    multiple = "MQTT-3.8.4-4" if level == 4 else "MQTT-3.8.4-5"
+    scenario(
+        f"subscribe/many-filters-effective-{v}",
+        doc="""A SUBSCRIBE with twelve Topic Filters is handled as twelve SUBSCRIBE packets
+        would be, with one SUBACK: every filter is granted, and a message published on the
+        twelfth is delivered.""",
+        steps=[
+            connect("sub", f"s-eff-sub-{v}", level=level),
+            subscribe("sub", 1, [(f"eff/{index}", 0) for index in range(12)], level=level), mark("answer"),
+            connect("pub", f"s-eff-pub-{v}", level=level),
+            publish("pub", "eff/11", "twelfth", level=level), recv("sub"), mark("delivered"),
+            quiet("sub"),
+        ],
+        expectations=[
+            expectation(
+                "granted", statement=f"{multiple}: the responses of the sequence are combined into a single SUBACK",
+                requires="One SUBACK with twelve codes, each the grant of QoS 0 that a SUBSCRIBE of that filter "
+                         "alone receives",
+                then=[at("answer", {"got": [{"type": "SUBACK", "packet_id": 1, "codes": [0] * 12}], "end": "ok"})]),
+            expectation(
+                "effective", statement=f"{multiple}: every filter is handled as a SUBSCRIBE of its own",
+                requires="The twelfth filter is a subscription: the message published on it is delivered",
+                then=[at("delivered", {"got": [{"type": "PUBLISH", "topic": "eff/11", "payload": "twelfth"}],
+                                       "end": "ok"})]),
+        ],
+    )
+
+    removed = {"type": "UNSUBACK", "packet_id": 3}
+    if level == 5:
+        removed["codes"] = [0] * 9
+    scenario(
+        f"subscribe/unsubscribe-nine-filters-{v}",
+        doc="""An UNSUBSCRIBE with nine Topic Filters is handled as nine UNSUBSCRIBE packets
+        would be, with one UNSUBACK: the ninth subscription is removed like the first. Of two
+        messages published afterwards, one on the ninth filter and one on a filter that was
+        kept, the subscriber reads the second only.""",
+        steps=[
+            connect("sub", f"s-nine-sub-{v}", level=level),
+            subscribe("sub", 1, [(f"nine/{index}", 0) for index in range(5)], level=level),
+            subscribe("sub", 2, [(f"nine/{index}", 0) for index in range(5, 10)], level=level),
+            send("sub", wire.unsubscribe(3, [f"nine/{index}" for index in range(9)], level=level)), recv("sub"),
+            mark("answer"),
+            connect("pub", f"s-nine-pub-{v}", level=level),
+            publish("pub", "nine/8", "removed", level=level), publish("pub", "nine/9", "kept", level=level),
+            recv("sub"), mark("next"), quiet("sub"),
+        ],
+        expectations=[
+            expectation(
+                "acknowledged", statement="MQTT-3.10.4-6: one UNSUBACK for the sequence",
+                requires="One UNSUBACK for the nine filters" + (", each with Reason Code 0x00 (Success)"
+                                                                 if level == 5 else ""),
+                then=[at("answer", {"got": [removed], "end": "ok"})]),
+            expectation(
+                "effective", statement="MQTT-3.10.4-6: every filter is handled as an UNSUBSCRIBE of its own",
+                requires="The ninth subscription is removed: the next message the subscriber reads is the one "
+                         "published on the filter it kept",
+                then=[at("next", {"got": [{"type": "PUBLISH", "topic": "nine/9", "payload": "kept"}],
+                                  "end": "ok"})]),
+        ],
+    )
+
+del level, v, multiple, removed

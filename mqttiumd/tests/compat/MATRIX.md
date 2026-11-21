@@ -3,9 +3,9 @@
 Written by `tests/compat/run.py`: regenerate it with the command in
 `tests/compat/README.md` and copy `matrix.md` here; do not edit it by hand.
 
-- broker: `mqttiumd` built from commit `2d98f85c89beaf38a95813db013d79a45ab4e7d1`
+- broker: `mqttiumd` built from commit `782927fbd37b5b137c1ba29023f3c1f5183bb0d3 with uncommitted changes`
 - reference: Mosquitto 2.0.21, the version `preview/build-mosquitto-reference.sh` builds
-- scenarios played: 121
+- scenarios played: 126
 
 `same` means equal normalized transcripts on the scenario played, nothing
 more. A difference is not a failure of mqttiumd by itself: Mosquitto is not
@@ -19,19 +19,19 @@ the oracle, the MQTT specification is. Each difference is classified in
 
 ## Summary
 
-121 scenarios: 86 `same`, 27 `profile-refused`, 1 `reference-nonconformant`, 7 `unspecified`.
+126 scenarios: 91 `same`, 26 `profile-refused`, 2 `reference-nonconformant`, 7 `unspecified`.
 
 | Area | same | profile-refused | reference-nonconformant | defect | unspecified | total |
 | - | -: | -: | -: | -: | -: | -: |
 | connect | 20 | 6 | 0 | 0 | 0 | 26 |
 | session | 9 | 0 | 0 | 0 | 0 | 9 |
-| subscribe | 13 | 6 | 0 | 0 | 3 | 22 |
+| subscribe | 18 | 5 | 0 | 0 | 3 | 26 |
 | publish | 18 | 2 | 1 | 0 | 3 | 24 |
 | retained | 12 | 2 | 0 | 0 | 0 | 14 |
 | properties | 4 | 5 | 0 | 0 | 0 | 9 |
 | will | 8 | 4 | 0 | 0 | 0 | 12 |
-| errors | 2 | 2 | 0 | 0 | 1 | 5 |
-| **all** | 86 | 27 | 1 | 0 | 7 | 121 |
+| errors | 2 | 2 | 1 | 0 | 1 | 6 |
+| **all** | 91 | 26 | 2 | 0 | 7 | 126 |
 
 ## Expectations on mqttiumd's transcript
 
@@ -39,21 +39,30 @@ What a normative statement requires of the broker in a scenario, whatever Mosqui
 does there. A `fail` is listed in `expectations-open.json` or fails the run; the
 column of the reference is information.
 
-12 expectations: 11 `pass`, 1 `fail` (1 listed as open), 0 `not-applicable`.
+21 expectations: 20 `pass`, 1 `fail` (1 listed as open), 0 `not-applicable`.
 
 | Expectation | MQTT | Statement | Requires | mqttiumd | Observed on mqttiumd | Mosquitto |
 | - | - | - | - | - | - | - |
+| `errors/packet-at-announced-maximum-v5#limit` | 5.0 | MQTT-4.13.1-1, with section 3.2.2.3.6: a packet larger than the announced Maximum Packet Size is a Protocol Error with the Reason Code 0x95 | Where CONNACK announces Maximum Packet Size 32776: a PUBLISH of exactly that size is acknowledged, and one a byte larger is answered DISCONNECT 0x95 and the connection is closed | pass | connack: recv [CONNACK reason=0x00 maximum_packet_size=32776] ok; exact: recv [PUBACK packet_id=1 reason=0x00] ok; over: until_close [DISCONNECT reason=0x95] eof | fail |
 | `publish/over-maximum-packet-size-qos1-v5#discarded` | 5.0 | MQTT-3.1.2-25, with MQTT-3.1.2-24 for the size of what is sent | Nothing is sent for the message that would take 114 bytes and the connection stays open; the next message is delivered in a packet of at most 64 bytes, and nothing follows it | pass | large: quiet [] quiet; small: recv [PUBLISH packet_id=1 dup=false payload="small" topic="limit/t" wire_bytes=19] ok; after-small: quiet [] quiet | pass |
 | `publish/over-maximum-packet-size-qos1-v5#not-redelivered` | 5.0 | MQTT-3.1.2-25, with MQTT-3.2.2-3 for Session Present | The resumed session (Session Present 1), which now accepts 1024 bytes, is sent nothing for the discarded message: the first PUBLISH it reads is a new message, with DUP 0 | pass | resumed: recv [CONNACK reason=0x00 session_present=true] ok; no-redelivery: quiet [] quiet; next: recv [PUBLISH packet_id=1 dup=false payload="next" topic="limit/t"] ok | pass |
 | `publish/over-maximum-packet-size-qos2-v5#discarded` | 5.0 | MQTT-3.1.2-25, with MQTT-3.1.2-24 for the size of what is sent | Nothing is sent for the message that would take 114 bytes and the connection stays open; the next message is delivered in a packet of at most 64 bytes, and nothing follows it | pass | large: quiet [] quiet; small: recv [PUBLISH packet_id=1 dup=false payload="small" topic="limit/t" wire_bytes=19] ok; after-small: quiet [] quiet | pass |
 | `publish/over-maximum-packet-size-qos2-v5#not-redelivered` | 5.0 | MQTT-3.1.2-25, with MQTT-3.2.2-3 for Session Present | The resumed session (Session Present 1), which now accepts 1024 bytes, is sent nothing for the discarded message: the first PUBLISH it reads is a new message, with DUP 0 | pass | resumed: recv [CONNACK reason=0x00 session_present=true] ok; no-redelivery: quiet [] quiet; next: recv [PUBLISH packet_id=1 dup=false payload="next" topic="limit/t"] ok | pass |
 | `retained/forty-topics-qos1-v4#store` | 3.1.1 | MQTT-3.3.1-6, with MQTT-3.3.1-5 for the store and MQTT-3.3.1-8 for the RETAIN flag | The SUBACK and the 40 retained messages, one for each topic, with its payload and RETAIN 1, each once and in any order; then nothing | fail (open) | retained: drain [33 packets: 1 SUBACK, 32 PUBLISH] idle; after: quiet [] quiet | pass |
 | `retained/thirty-two-topics-qos1-v4#store` | 3.1.1 | MQTT-3.3.1-6, with MQTT-3.3.1-5 for the store and MQTT-3.3.1-8 for the RETAIN flag | The SUBACK and the 32 retained messages, one for each topic, with its payload and RETAIN 1, each once and in any order; then nothing | pass | retained: drain [33 packets: 1 SUBACK, 32 PUBLISH] ok; after: quiet [] quiet | pass |
+| `subscribe/many-filters-effective-v4#granted` | 3.1.1 | MQTT-3.8.4-4: the responses of the sequence are combined into a single SUBACK | One SUBACK with twelve codes, each the grant of QoS 0 that a SUBSCRIBE of that filter alone receives | pass | answer: recv [SUBACK packet_id=1 codes=0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00] ok | pass |
+| `subscribe/many-filters-effective-v4#effective` | 3.1.1 | MQTT-3.8.4-4: every filter is handled as a SUBSCRIBE of its own | The twelfth filter is a subscription: the message published on it is delivered | pass | delivered: recv [PUBLISH payload="twelfth" topic="eff/11"] ok | pass |
+| `subscribe/many-filters-effective-v5#granted` | 5.0 | MQTT-3.8.4-5: the responses of the sequence are combined into a single SUBACK | One SUBACK with twelve codes, each the grant of QoS 0 that a SUBSCRIBE of that filter alone receives | pass | answer: recv [SUBACK packet_id=1 codes=0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00] ok | pass |
+| `subscribe/many-filters-effective-v5#effective` | 5.0 | MQTT-3.8.4-5: every filter is handled as a SUBSCRIBE of its own | The twelfth filter is a subscription: the message published on it is delivered | pass | delivered: recv [PUBLISH payload="twelfth" topic="eff/11"] ok | pass |
 | `subscribe/reserved-option-bits-v5#closure` | 5.0 | MQTT-3.8.3-5, with MQTT-4.13.1-1 for the closure | The connection is closed, and a DISCONNECT sent before closing carries 0x81 (Malformed Packet) | pass | closure: until_close [DISCONNECT reason=0x81] eof | pass |
 | `subscribe/share-literal-filter-v4#suback` | 3.1.1 | MQTT-3.8.4-1, with MQTT-3.8.4-2 for the Packet Identifier and MQTT-3.8.4-5 for the return code | A SUBACK with the Packet Identifier of the SUBSCRIBE and one return code, a granted QoS or 0x80 (Failure) | pass | answer: recv [SUBACK packet_id=2561 codes=0x80] ok | pass |
 | `subscribe/shared-subscription-v5#refusal` | 5.0 | MQTT-4.13.1-1, with section 3.2.2.3.13: the Protocol Error has the Reason Code 0x9E | Where CONNACK announces Shared Subscription Available 0: the connection is closed, and a DISCONNECT sent before closing carries 0x9E | pass | connack: recv [CONNACK reason=0x00 shared_subscription_available=0] ok; answer: recv [DISCONNECT reason=0x9e] ok; after: quiet [] eof | not-applicable |
 | `subscribe/subscription-identifier-v5#refusal` | 5.0 | MQTT-4.13.1-1, with section 3.2.2.3.12: the Protocol Error has the Reason Code 0xA1 | Where CONNACK announces Subscription Identifier Available 0: the connection is closed, and a DISCONNECT sent before closing carries 0xA1 | pass | connack: recv [CONNACK reason=0x00 subscription_identifier_available=0] ok; answer: recv [DISCONNECT reason=0xa1] ok; after: quiet [] eof | not-applicable |
-| `subscribe/twelve-filters-v4#suback` | 3.1.1 | MQTT-3.8.4-5 | A SUBACK with twelve return codes, each a granted QoS or 0x80 (Failure) | pass | answer: recv [SUBACK packet_id=1 codes=0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80] ok | pass |
+| `subscribe/twelve-filters-v4#suback` | 3.1.1 | MQTT-3.8.4-5 | A SUBACK with twelve return codes, each a granted QoS or 0x80 (Failure) | pass | answer: recv [SUBACK packet_id=1 codes=0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00] ok | pass |
+| `subscribe/unsubscribe-nine-filters-v4#acknowledged` | 3.1.1 | MQTT-3.10.4-6: one UNSUBACK for the sequence | One UNSUBACK for the nine filters | pass | answer: recv [UNSUBACK packet_id=3] ok | pass |
+| `subscribe/unsubscribe-nine-filters-v4#effective` | 3.1.1 | MQTT-3.10.4-6: every filter is handled as an UNSUBSCRIBE of its own | The ninth subscription is removed: the next message the subscriber reads is the one published on the filter it kept | pass | next: recv [PUBLISH payload="kept" topic="nine/9"] ok | pass |
+| `subscribe/unsubscribe-nine-filters-v5#acknowledged` | 5.0 | MQTT-3.10.4-6: one UNSUBACK for the sequence | One UNSUBACK for the nine filters, each with Reason Code 0x00 (Success) | pass | answer: recv [UNSUBACK packet_id=3 codes=0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00] ok | pass |
+| `subscribe/unsubscribe-nine-filters-v5#effective` | 5.0 | MQTT-3.10.4-6: every filter is handled as an UNSUBSCRIBE of its own | The ninth subscription is removed: the next message the subscriber reads is the one published on the filter it kept | pass | next: recv [PUBLISH payload="kept" topic="nine/9"] ok | pass |
 | `subscribe/unsubscribe-share-filter-v4#unsuback` | 3.1.1 | MQTT-3.10.4-5, with MQTT-3.10.4-4 for the Packet Identifier | An UNSUBACK with the Packet Identifier of the UNSUBSCRIBE, although no subscription is deleted | pass | answer: recv [UNSUBACK packet_id=2562] ok | pass |
 
 ## Counts measured, not compared
@@ -65,7 +74,7 @@ this run and may differ in the next: where a broker may lawfully shed messages
 
 | Scenario | Connection | Counted | Named | Mosquitto | mqttiumd |
 | - | - | - | -: | -: | -: |
-| `publish/burst-qos0-v4` | sub | PUBLISH | 100 | 100 | 24 |
+| `publish/burst-qos0-v4` | sub | PUBLISH | 100 | 100 | 42 |
 | `publish/pipelined-qos1-v4` | pub | PUBACK | 20 | 20 | 20 |
 | `retained/forty-topics-v4` | sub | PUBLISH | 40 | 40 | 32 |
 
@@ -103,6 +112,7 @@ this run and may differ in the next: where a broker may lawfully shed messages
 | `errors/malformed-remaining-length-v5` | 5.0 | unspecified | Both close the connection on a Remaining Length of five bytes; Mosquitto without a packet, mqttiumd after DISCONNECT 0x81 (Malformed Packet). |
 | `errors/oversized-packet-v4` | 3.1.1 | profile-refused | Mosquitto, whose default limit is the protocol maximum, acknowledges a 70 000-byte PUBLISH; mqttiumd accepts packets up to 65 536 bytes and closes the connection. |
 | `errors/oversized-packet-v5` | 5.0 | profile-refused | Mosquitto, whose default limit is the protocol maximum, acknowledges a 70 000-byte PUBLISH; mqttiumd announced Maximum Packet Size 32 776, reads frames up to 65 536 bytes, and answers DISCONNECT 0x95 (Packet too large) before closing. |
+| `errors/packet-at-announced-maximum-v5` | 5.0 | reference-nonconformant | Both acknowledge a PUBLISH of exactly the announced 32 776 bytes (Mosquitto with Reason Code 0x10, no matching subscribers; mqttiumd with 0x00). Mosquitto also acknowledges the next one, of 32 777 bytes, and keeps the connection; mqttiumd answers DISCONNECT 0x95 (Packet too large) and closes. |
 | `errors/packet-over-announced-maximum-v5` | 5.0 | same | Both brokers announce Maximum Packet Size 32 776 (the reference by `max_packet_size 32776`) and the client sends a PUBLISH of 70 000 bytes. Both answer DISCONNECT 0x95. The reference then closes with the rest of the packet unread, which resets the connection; mqttiumd reads and drops it and ends the stream. How the connection ends after the DISCONNECT is outside the protocol and depends on what was still in flight: the closure is compared as `any`. |
 | `properties/client-maximum-packet-size-v5` | 5.0 | same | The subscriber announces Maximum Packet Size 40: a PUBLISH that would exceed it is not sent to it, and a smaller one is. |
 | `properties/content-type-v5` | 5.0 | profile-refused | Mosquitto acknowledges the PUBLISH and forwards the Content Type to the subscriber; mqttiumd answers the PUBLISH with DISCONNECT 0x83 (Implementation specific error), closes the publisher's connection and delivers nothing. |
@@ -165,6 +175,8 @@ this run and may differ in the next: where a broker may lawfully shed messages
 | `subscribe/invalid-empty-filter-v5` | 5.0 | unspecified | Both close the connection on the invalid Topic Filter; Mosquitto with DISCONNECT 0x81 (Malformed Packet), mqttiumd with DISCONNECT 0x82 (Protocol Error). |
 | `subscribe/invalid-hash-not-last-v4` | 3.1.1 | same | SUBSCRIBE with the invalid Topic Filter `bad/#/x`: the connection is closed. |
 | `subscribe/invalid-hash-not-last-v5` | 5.0 | unspecified | Both close the connection on the invalid Topic Filter; Mosquitto with DISCONNECT 0x81 (Malformed Packet), mqttiumd with DISCONNECT 0x82 (Protocol Error). |
+| `subscribe/many-filters-effective-v4` | 3.1.1 | same | A SUBSCRIBE with twelve Topic Filters is handled as twelve SUBSCRIBE packets would be, with one SUBACK: every filter is granted, and a message published on the twelfth is delivered. |
+| `subscribe/many-filters-effective-v5` | 5.0 | same | A SUBSCRIBE with twelve Topic Filters is handled as twelve SUBSCRIBE packets would be, with one SUBACK: every filter is granted, and a message published on the twelfth is delivered. |
 | `subscribe/many-subscriptions-v4` | 3.1.1 | profile-refused | Mosquitto grants all 150 subscriptions; mqttiumd grants 128 and answers the other 22 with SUBACK return code 0x80 (Failure). |
 | `subscribe/no-local-v5` | 5.0 | same | No Local: a client does not receive its own publication and receives another client's. |
 | `subscribe/overlapping-subscriptions-v4` | 3.1.1 | same | Two subscriptions of one client, granted QoS 0 and QoS 1, match one QoS 2 message: how many copies are sent, and at which QoS. |
@@ -177,7 +189,9 @@ this run and may differ in the next: where a broker may lawfully shed messages
 | `subscribe/shared-subscription-v5` | 5.0 | profile-refused | Mosquitto grants `$share/group/shared/t` and delivers to it; mqttiumd, whose CONNACK announces Shared Subscription Available 0, answers the SUBSCRIBE with DISCONNECT 0x9E (Shared Subscriptions not supported) and closes; the plain subscription of the other client is served by both. |
 | `subscribe/subscription-identifier-v5` | 5.0 | profile-refused | Mosquitto accepts the Subscription Identifier and returns it in the PUBLISH; mqttiumd, whose CONNACK announces Subscription Identifier Available 0, answers the SUBSCRIBE with DISCONNECT 0xA1 (Subscription Identifiers not supported) and closes. |
 | `subscribe/sys-explicit-filter-v4` | 3.1.1 | profile-refused | Mosquitto sends its retained `$SYS/broker/version` message; mqttiumd grants the subscription and publishes nothing under `$SYS`. |
-| `subscribe/twelve-filters-v4` | 3.1.1 | profile-refused | Mosquitto answers a SUBSCRIBE of twelve Topic Filters with twelve granted QoS; mqttiumd accepts at most eight Topic Filters per SUBSCRIBE, answers with a SUBACK of twelve return codes 0x80 (Failure), subscribes nothing and keeps the connection. |
+| `subscribe/twelve-filters-v4` | 3.1.1 | same | One SUBSCRIBE packet with twelve Topic Filters is answered by a SUBACK with twelve granted QoS. |
+| `subscribe/unsubscribe-nine-filters-v4` | 3.1.1 | same | An UNSUBSCRIBE with nine Topic Filters is handled as nine UNSUBSCRIBE packets would be, with one UNSUBACK: the ninth subscription is removed like the first. Of two messages published afterwards, one on the ninth filter and one on a filter that was kept, the subscriber reads the second only. |
+| `subscribe/unsubscribe-nine-filters-v5` | 5.0 | same | An UNSUBSCRIBE with nine Topic Filters is handled as nine UNSUBSCRIBE packets would be, with one UNSUBACK: the ninth subscription is removed like the first. Of two messages published afterwards, one on the ninth filter and one on a filter that was kept, the subscriber reads the second only. |
 | `subscribe/unsubscribe-share-filter-v4` | 3.1.1 | same | A MQTT 3.1.1 UNSUBSCRIBE of `$share/group/lit/t`, which was never subscribed, is acknowledged like the one of any other Topic Filter. |
 | `subscribe/unsubscribe-v4` | 3.1.1 | same | UNSUBSCRIBE removes exactly the filter named, compared character by character: `unsub/#` goes, `unsub/a` stays; an unknown filter is acknowledged too. |
 | `subscribe/unsubscribe-v5` | 5.0 | same | An UNSUBSCRIBE with an existing and an unknown filter: one Reason Code each, in order, then no more delivery. |
@@ -195,7 +209,7 @@ this run and may differ in the next: where a broker may lawfully shed messages
 | `will/retain-v5` | 5.0 | same | A QoS 1 Will with Will Retain 1 is published on abrupt close and kept as the retained message of its topic: a later subscriber receives it with RETAIN 1. |
 | `will/takeover-v5` | 5.0 | same | A client with a Will is taken over by a new connection with the same ClientID and Clean Start 1: the Will of the first connection is published. |
 
-## profile-refused (27)
+## profile-refused (26)
 
 - `connect/connack-capabilities-v5` (MQTT 5.0): Mosquitto announces Receive Maximum 20 and Topic Alias Maximum 10 and leaves every other capability at its default; mqttiumd announces Receive Maximum 8, Maximum Packet Size 32 776, Topic Alias Maximum 0, and shared subscriptions and Subscription Identifiers not available.
   - Lot: The capabilities of the v0.1 profile: Topic Alias from client to server (Topic Alias Maximum above 0); Shared subscriptions (CMP-002); Subscription Identifiers; Receive Maximum and Maximum Packet Size of the bounded preview
@@ -251,9 +265,6 @@ this run and may differ in the next: where a broker may lawfully shed messages
   - Lot: Subscription Identifiers
 - `subscribe/sys-explicit-filter-v4` (MQTT 3.1.1): Mosquitto sends its retained `$SYS/broker/version` message; mqttiumd grants the subscription and publishes nothing under `$SYS`.
   - Lot: Operations: metrics published under `$SYS` (chapter 1, section 3, row Exploitation)
-- `subscribe/twelve-filters-v4` (MQTT 3.1.1): Mosquitto answers a SUBSCRIBE of twelve Topic Filters with twelve granted QoS; mqttiumd accepts at most eight Topic Filters per SUBSCRIBE, answers with a SUBACK of twelve return codes 0x80 (Failure), subscribes nothing and keeps the connection.
-  - Statement: MQTT-3.8.4-5: a return code per Topic Filter, which may say that the subscription failed
-  - Lot: Runtime limits of the bounded preview (ADR 0044), to be raised to Mosquitto's defaults or made configurable: 8 Topic Filters per SUBSCRIBE or UNSUBSCRIBE
 - `will/abrupt-close-qos0-v4` (MQTT 3.1.1): Mosquitto accepts a QoS 0 Will and publishes it on abrupt close; mqttiumd supports QoS 1 Wills only and refuses the CONNECT with return code 3 (Server unavailable).
   - Lot: Will messages beyond QoS 1 without delay: Will QoS 0 and 2, Will Delay Interval
 - `will/abrupt-close-qos2-v4` (MQTT 3.1.1): Mosquitto accepts a QoS 2 Will and publishes it on abrupt close; mqttiumd supports QoS 1 Wills only and refuses the CONNECT with return code 3 (Server unavailable).
@@ -263,8 +274,11 @@ this run and may differ in the next: where a broker may lawfully shed messages
 - `will/delay-interval-v5` (MQTT 5.0): Mosquitto accepts Will Delay Interval 1 and publishes the Will after the delay; mqttiumd refuses the CONNECT with CONNACK 0x83 (Implementation specific error).
   - Lot: Will messages beyond QoS 1 without delay: Will QoS 0 and 2, Will Delay Interval
 
-## reference-nonconformant (1)
+## reference-nonconformant (2)
 
+- `errors/packet-at-announced-maximum-v5` (MQTT 5.0): Both acknowledge a PUBLISH of exactly the announced 32 776 bytes (Mosquitto with Reason Code 0x10, no matching subscribers; mqttiumd with 0x00). Mosquitto also acknowledges the next one, of 32 777 bytes, and keeps the connection; mqttiumd answers DISCONNECT 0x95 (Packet too large) and closes.
+  - Statement: MQTT-4.13.1-1, with section 3.2.2.3.6: the size is the whole packet, and a larger one is a Protocol Error with 0x95
+  - mqttiumd: Measures the whole packet, fixed header included: acknowledges 32 776 bytes, answers 32 777 with DISCONNECT 0x95 (Packet too large) and closes the network connection.
 - `publish/receive-maximum-inbound-v5` (MQTT 5.0): On a ninth QoS 2 PUBLISH while eight exchanges are open, Mosquitto answers PUBREC 0x97 (Quota exceeded) and keeps the connection open; mqttiumd sends DISCONNECT 0x93 (Receive Maximum exceeded) and closes.
   - Statement: MQTT-4.13.1-1, with section 3.3.4: a client that exceeds Receive Maximum (MQTT-3.3.4-7) makes a Protocol Error for which the Reason Code 0x93 is given, so the server must close the connection
   - mqttiumd: Sends DISCONNECT 0x93 (Receive Maximum exceeded) and closes the network connection.
