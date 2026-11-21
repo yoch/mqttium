@@ -2,9 +2,13 @@
 //! commands in one transaction and answers each as `apply` would have,
 //! one command after the other, on the same starting state.
 //!
-//! The reference of every comparison is a second SQLite store that receives
-//! the same commands through `apply`, one transaction each: the replies, the
-//! bounded snapshot and the raw rows of every table must be equal. What a
+//! Every comparison has two references that receive the same commands
+//! through `apply`, one after the other. The first is a second SQLite
+//! store, one transaction each: the replies, the bounded snapshot and the
+//! raw rows of every table must be equal. The second is the deterministic
+//! store of the lab, which shares no code with the SQLite adapter: its
+//! replies and its snapshot must be equal too, so a defect common to
+//! `apply` and `apply_group` in the adapter does not judge itself. What a
 //! group changes is the crash granularity only, shown at the end with a
 //! process killed at the two kill points of the store (feature
 //! `kill-points`).
@@ -34,6 +38,7 @@ use mqttiumd_lab::store::conformance::{
     TOPIC, World, accounts_match_what_is_held, admission_in, altered, fixture_limits, operation_id,
     publication_id,
 };
+use mqttiumd_lab::store::durable::MemoryStore;
 use mqttiumd_store_api::{Applied, Decision, Durability, DurableStore, Limits, Resolved};
 use mqttiumd_store_sqlite::{GroupRefused, MAX_GROUP, SqliteStore};
 
@@ -123,11 +128,13 @@ fn tables(path: &Path) -> BTreeMap<String, Vec<String>> {
         .collect()
 }
 
-/// Two SQLite stores prepared alike. One receives groups, the other the
-/// same commands one transaction each.
+/// Two SQLite stores and the deterministic store of the lab, prepared
+/// alike. One SQLite store receives groups; the other and the model
+/// receive the same commands one after the other.
 struct Twin {
     grouped: World<SqliteStore>,
     sequential: World<SqliteStore>,
+    model: World<MemoryStore>,
     grouped_path: PathBuf,
     sequential_path: PathBuf,
 }
@@ -147,6 +154,7 @@ impl Twin {
         let twin = Self {
             grouped: world(&grouped_path),
             sequential: world(&sequential_path),
+            model: World::with_limits(&MemoryStore::create, limits),
             grouped_path,
             sequential_path,
         };
@@ -161,6 +169,7 @@ impl Twin {
             .map(|command| {
                 let applied = self.sequential.store.apply(command);
                 assert_eq!(self.grouped.store.apply(command), applied);
+                assert_eq!(self.model.store.apply(command), applied, "the model");
                 applied
             })
             .collect()
@@ -180,8 +189,39 @@ impl Twin {
             .map(|command| self.sequential.store.apply(command))
             .collect();
         assert_eq!(grouped, sequential, "the replies of the group");
+        let model: Vec<Applied> = commands
+            .iter()
+            .map(|command| self.model.store.apply(command))
+            .collect();
+        assert_eq!(grouped, model, "the replies of the model");
         self.same_state();
         grouped
+    }
+
+    /// The medium of the three stores at once.
+    fn durability(&mut self, durability: Durability) {
+        self.grouped.store.set_durability(durability);
+        self.sequential.store.set_durability(durability);
+        self.model.store.set_durability(durability);
+    }
+
+    /// What nothing certain is known about on the three stores.
+    fn nothing_established(&self, operation: OperationId) {
+        assert_eq!(self.grouped.store.established(operation), Ok(None));
+        assert_eq!(self.sequential.store.established(operation), Ok(None));
+        assert_eq!(self.model.store.established(operation), Ok(None));
+    }
+
+    /// One resolution on the three stores: the same answer.
+    fn resolve(&mut self, operation: OperationId) -> Resolved {
+        let resolved = self.grouped.store.resolve_and_fence(operation);
+        assert_eq!(self.sequential.store.resolve_and_fence(operation), resolved);
+        assert_eq!(
+            self.model.store.resolve_and_fence(operation),
+            resolved,
+            "the model"
+        );
+        resolved
     }
 
     fn same_state(&self) {
@@ -189,6 +229,11 @@ impl Twin {
         let sequential = self.sequential.store.snapshot().expect("healthy snapshot");
         assert_eq!(accounts_match_what_is_held(&sequential), Ok(()));
         assert_eq!(grouped, sequential, "the durable state");
+        assert_eq!(
+            self.model.store.snapshot().expect("healthy snapshot"),
+            grouped,
+            "the state of the model"
+        );
         assert_eq!(
             tables(&self.grouped_path),
             tables(&self.sequential_path),
@@ -773,8 +818,7 @@ fn a_group_of_one_equals_apply() {
     assert_eq!(wrote(&replies), [true, false, true, false, true]);
     // The medium fails: a committed identity is still recognised, a new
     // one is unknown, exactly as `apply` answers.
-    twin.grouped.store.set_durability(Durability::Failing);
-    twin.sequential.store.set_durability(Durability::Failing);
+    twin.durability(Durability::Failing);
     let fresh = twin
         .sequential
         .admission(4, 9, b"payload", &[twin.sequential.b]);
@@ -835,8 +879,7 @@ fn a_group_on_a_failing_medium_leaves_nothing_and_says_nothing_certain() {
     commands.push(prefix[0].clone());
     let members: Vec<&Command> = commands.iter().collect();
 
-    twin.grouped.store.set_durability(Durability::Failing);
-    twin.sequential.store.set_durability(Durability::Failing);
+    twin.durability(Durability::Failing);
     let replies = twin
         .grouped
         .store
@@ -850,8 +893,14 @@ fn a_group_on_a_failing_medium_leaves_nothing_and_says_nothing_certain() {
         .iter()
         .map(|command| twin.sequential.store.apply(command))
         .collect();
-    // A failed `apply` says the same of every member that had to write.
+    // A failed `apply` says the same of every member that had to write,
+    // on the adapter and on the model.
     assert_eq!(sequential[..5], [UNKNOWN; 5]);
+    let model: Vec<Applied> = commands
+        .iter()
+        .map(|command| twin.model.store.apply(command))
+        .collect();
+    assert_eq!(model, sequential, "the model on a failing medium");
     assert_eq!(twin.grouped.store.snapshot().expect("healthy"), before);
     twin.same_state();
     // A group that has nothing to write reads what is durable, as `apply`
@@ -863,16 +912,11 @@ fn a_group_on_a_failing_medium_leaves_nothing_and_says_nothing_certain() {
         StoreReply::Outcome(StoreOutcome::Committed(_))
     ) && !applied.wrote));
 
-    twin.grouped.store.set_durability(Durability::Available);
-    twin.sequential.store.set_durability(Durability::Available);
+    twin.durability(Durability::Available);
     // Nothing is established about a member of the failed group, the one
     // that would have been refused included: absence is not rejection.
     for command in &commands[..5] {
-        assert_eq!(twin.grouped.store.established(operation(command)), Ok(None));
-        assert_eq!(
-            twin.sequential.store.established(operation(command)),
-            Ok(None)
-        );
+        twin.nothing_established(operation(command));
     }
     // Resolving one of them fences it, as after a failed `apply`.
     let fenced = Resolved {
@@ -880,8 +924,7 @@ fn a_group_on_a_failing_medium_leaves_nothing_and_says_nothing_certain() {
         fenced_now: true,
     };
     let first = operation(&commands[0]);
-    assert_eq!(twin.grouped.store.resolve_and_fence(first), fenced);
-    assert_eq!(twin.sequential.store.resolve_and_fence(first), fenced);
+    assert_eq!(twin.resolve(first), fenced);
     twin.same_state();
     // Presented again on a healthy medium, the group is decided as its
     // sequential twin decides it: the fenced member stays refused.
@@ -892,6 +935,170 @@ fn a_group_on_a_failing_medium_leaves_nothing_and_says_nothing_certain() {
         [false, false, true, true, false, false]
     );
     assert_eq!(replies[4].reply, rejected(RejectReason::PreconditionFailed));
+}
+
+/// The bytes of a group are bounded by its members, not by a limit of its
+/// own (ARC-020): at most `MAX_GROUP` commands, each within the limits of
+/// the store. The largest group of the largest admissions commits as its
+/// sequential application does, and the payload account refuses the one
+/// member that does not fit without touching its neighbours.
+#[test]
+fn the_largest_group_of_the_largest_admissions_is_bounded_by_the_accounts() {
+    // The largest payload of the fixture; the product's is 32 768 bytes.
+    const PAYLOAD: usize = 1024;
+    let limits = Limits {
+        payload_bytes: PayloadBytes::new((MAX_GROUP * PAYLOAD - 1) as u64),
+        exchange_slots: ExchangeSlots::new(MAX_GROUP as u64),
+        ..roomy()
+    };
+    assert_eq!(limits.max_payload_bytes, PAYLOAD);
+    let mut twin = Twin::new("largest", limits);
+    let world = &twin.sequential;
+    let payload = vec![0x5a; PAYLOAD];
+    let commands: Vec<Command> = (1..=MAX_GROUP as u64)
+        .map(|n| world.admission(n, u16::try_from(n).expect("fits"), &payload, &[world.c]))
+        .collect();
+    let replies = twin.compare(&commands);
+    let mut expected = [true; MAX_GROUP];
+    expected[MAX_GROUP - 1] = false;
+    assert_eq!(committed_now(&replies), expected);
+    assert_eq!(
+        replies[MAX_GROUP - 1].reply,
+        rejected(RejectReason::CapacityExceeded(Resource::PayloadBytes))
+    );
+    let state = twin.grouped.store.snapshot().expect("healthy");
+    assert_eq!(
+        state.accounts.payload_bytes,
+        PayloadBytes::new(((MAX_GROUP - 1) * PAYLOAD) as u64)
+    );
+}
+
+/// One statement on the file of a store, from a connection of its own.
+fn on_file(path: &Path, statement: &str) {
+    rusqlite::Connection::open(path)
+        .expect("a second connection")
+        .execute_batch(statement)
+        .expect("the statement");
+}
+
+/// The engine can drop a whole transaction under a member: here a trigger
+/// raises ROLLBACK at the second admission of the group, after the first
+/// admission and its release were staged. Nothing of the group may be
+/// committed or answered, the members staged before the fault included,
+/// and no statement after the fault may be committed on its own. Once the
+/// fault is gone the same group commits as its sequential application
+/// does on a store, and on the model, that never saw the fault.
+#[test]
+fn a_transaction_the_engine_drops_under_a_member_leaves_nothing_of_the_group() {
+    let mut twin = Twin::new("dropped", roomy());
+    let prefix = pairs(&twin.sequential, 1..=1);
+    twin.both(&prefix);
+    let before = twin.grouped.store.snapshot().expect("healthy");
+    assert_eq!(before.publications.len(), 1);
+    let commands = pairs(&twin.sequential, 2..=3);
+    let members: Vec<&Command> = commands.iter().collect();
+
+    on_file(
+        &twin.grouped_path,
+        "CREATE TRIGGER drops_the_group BEFORE INSERT ON publications
+         WHEN (SELECT count(*) FROM publications) = 2
+         BEGIN SELECT RAISE(ROLLBACK, 'the transaction is dropped'); END;",
+    );
+    assert_eq!(
+        twin.grouped.store.apply_group(&members),
+        Ok(vec![UNKNOWN; 4]),
+        "no member of a dropped transaction is answered"
+    );
+    assert_eq!(twin.grouped.store.snapshot().expect("healthy"), before);
+    for command in &commands {
+        assert_eq!(twin.grouped.store.established(operation(command)), Ok(None));
+    }
+    on_file(&twin.grouped_path, "DROP TRIGGER drops_the_group;");
+    twin.same_state();
+
+    // The other way a group is lost: every member is staged and the COMMIT
+    // itself fails, here on a deferred constraint that a trigger violates
+    // under the same member.
+    on_file(
+        &twin.grouped_path,
+        "CREATE TABLE fault_parent (k INTEGER PRIMARY KEY);
+         CREATE TABLE fault_child
+           (f INTEGER REFERENCES fault_parent (k) DEFERRABLE INITIALLY DEFERRED);
+         CREATE TRIGGER fails_the_commit BEFORE INSERT ON publications
+         WHEN (SELECT count(*) FROM publications) = 2
+         BEGIN INSERT INTO fault_child VALUES (99); END;",
+    );
+    assert_eq!(
+        twin.grouped.store.apply_group(&members),
+        Ok(vec![UNKNOWN; 4]),
+        "no member of a group whose commit failed is answered"
+    );
+    assert_eq!(twin.grouped.store.snapshot().expect("healthy"), before);
+    for command in &commands {
+        assert_eq!(twin.grouped.store.established(operation(command)), Ok(None));
+    }
+    on_file(
+        &twin.grouped_path,
+        "DROP TRIGGER fails_the_commit; DROP TABLE fault_child; DROP TABLE fault_parent;",
+    );
+    twin.same_state();
+
+    let replies = twin.compare(&commands);
+    assert_eq!(committed_now(&replies), [true; 4]);
+}
+
+/// The answers of a committed group can be lost on their way: the caller
+/// dies after the commit, or the engine reports an error for a commit that
+/// is durable. The caller then knows nothing of any member and resolves
+/// each by its identity. A member that committed is found with its outcome
+/// and is not fenced; a member that was refused is found refused; nothing
+/// is written; and the group presented again is recognised member by
+/// member, without a second admission or a second release. The adapter
+/// and the model agree on every answer.
+#[test]
+fn a_committed_group_whose_answers_were_lost_is_found_again_by_identity() {
+    let mut twin = Twin::new("lost-answers", roomy());
+    let world = &twin.sequential;
+    let stale = altered(
+        &world.admission(8, 20, b"payload", &[world.b, world.c]),
+        |admit| admit.targets.as_mut_slice()[1].session_revision = Revision::new(9),
+    );
+    let mut commands = pairs(world, 1..=3);
+    commands.insert(3, stale);
+    let lost = twin.compare(&commands);
+    assert_eq!(
+        committed_now(&lost),
+        [true, true, true, false, true, true, true]
+    );
+    let committed = twin.grouped.store.snapshot().expect("healthy");
+
+    for (command, applied) in commands.iter().zip(&lost) {
+        let StoreReply::Outcome(outcome) = &applied.reply else {
+            panic!("a member of this group has an outcome: {applied:?}");
+        };
+        assert_eq!(
+            twin.resolve(operation(command)),
+            Resolved {
+                outcome: *outcome,
+                fenced_now: false,
+            },
+            "what the lost answer said"
+        );
+    }
+    assert_eq!(
+        twin.grouped.store.snapshot().expect("healthy"),
+        committed,
+        "a resolution of what is decided writes nothing"
+    );
+    twin.same_state();
+
+    let again = twin.compare(&commands);
+    assert_eq!(wrote(&again), [false; 7]);
+    assert_eq!(committed_now(&again), [false; 7]);
+    for (again, lost) in again.iter().zip(&lost) {
+        assert_eq!(again.reply, lost.reply);
+    }
+    assert_eq!(twin.grouped.store.snapshot().expect("healthy"), committed);
 }
 
 /// A process killed at the two kill points of the store while it commits a
@@ -906,7 +1113,6 @@ mod killed {
     use std::sync::Arc;
     use std::sync::atomic::AtomicU64;
 
-    use mqttiumd_lab::store::durable::MemoryStore;
     use mqttiumd_store_sqlite::kill_points::KillPoint;
 
     use super::*;
