@@ -296,3 +296,21 @@ fn reserved_subscription_bits_are_malformed_in_3_1_1() {
         );
     }
 }
+
+/// MQTT 3.1.1 has the same duty (MQTT-3.8.4-1): a SUBSCRIBE whose filter
+/// the profile cannot store is answered with a failure for every filter,
+/// not closed.
+#[test]
+fn a_subscribe_with_a_filter_longer_than_the_profile_is_answered_in_3_1_1() {
+    let mut body = vec![0, 7];
+    body.extend_from_slice(&2_000u16.to_be_bytes());
+    body.extend_from_slice(&[b'f'; 2_000]);
+    body.push(0);
+    body.extend_from_slice(&[0, 1, b't', 1]);
+    let decoded = codec::decode_for(V311, 0x82, &body, BOUNDS)
+        .unwrap_or_else(|error| panic!("the request is closed: {error:?}"));
+    assert!(
+        !matches!(decoded, Packet::Core(_)),
+        "a filter the profile cannot store reached the core"
+    );
+}

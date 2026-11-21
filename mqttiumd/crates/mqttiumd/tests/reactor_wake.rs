@@ -524,3 +524,45 @@ fn a_publish_within_the_announced_maximum_packet_size_is_accepted() {
         "the publication is accepted: {answer:?}"
     );
 }
+
+/// A request the profile cannot serve is still owed its acknowledgement
+/// (MQTT-3.8.4-1, MQTT-3.10.4-4): a SUBSCRIBE whose Topic Filter is longer
+/// than the profile stores and an UNSUBSCRIBE with more filters than a
+/// request may carry are answered filter by filter, as failures, and the
+/// connection stays open.
+#[test]
+fn a_request_beyond_the_profile_is_refused_in_its_acknowledgement() {
+    let broker = Broker::start("beyond-profile");
+    let mut client = connect(broker.address, "beyond-profile");
+
+    let mut body = vec![0, 7, 0];
+    text(&"f".repeat(2_000), &mut body);
+    body.push(0);
+    text("wake/short", &mut body);
+    body.push(0);
+    client.write_all(&packet(0x82, &body)).unwrap();
+    let (first, answer) = read_packet(&mut client);
+    assert_eq!(first, 0x90, "SUBACK expected\n{}", broker.refusals());
+    assert_eq!(answer, [0, 7, 0, 0x97, 0x97], "both filters refused");
+
+    let mut body = vec![0, 8, 0];
+    for index in 0..9u8 {
+        text(&format!("wake/filter/{index}"), &mut body);
+    }
+    client.write_all(&packet(0xa2, &body)).unwrap();
+    let (first, answer) = read_packet(&mut client);
+    assert_eq!(first, 0xb0, "UNSUBACK expected\n{}", broker.refusals());
+    assert_eq!(
+        &answer[..3],
+        &[0, 8, 0],
+        "packet identifier and no property"
+    );
+    assert_eq!(&answer[3..], &[0x83; 9], "one failure per filter");
+
+    client.write_all(&[0xc0, 0]).unwrap();
+    assert_eq!(
+        read_packet(&mut client).0,
+        0xd0,
+        "the connection stays open"
+    );
+}
