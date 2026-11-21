@@ -612,3 +612,181 @@ fn a_request_beyond_the_profile_is_refused_in_its_acknowledgement() {
         "the connection stays open"
     );
 }
+
+/// One client of either protocol version for the request tests below.
+struct Peer {
+    stream: TcpStream,
+    v5: bool,
+}
+
+impl Peer {
+    fn connect(address: SocketAddr, client_id: &str, v5: bool) -> Self {
+        if v5 {
+            return Self {
+                stream: connect(address, client_id),
+                v5,
+            };
+        }
+        let mut stream = TcpStream::connect(address).unwrap();
+        stream.set_nodelay(true).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        let mut body = Vec::new();
+        text("MQTT", &mut body);
+        // Level 4, Clean Session, Keep Alive 60 s.
+        body.extend_from_slice(&[4, 0x02, 0, 60]);
+        text(client_id, &mut body);
+        stream.write_all(&packet(0x10, &body)).unwrap();
+        assert_eq!(read_packet(&mut stream), (0x20, vec![0, 0]), "CONNACK");
+        Self { stream, v5 }
+    }
+
+    /// The Packet Identifier and, in MQTT 5, the empty property list.
+    fn head(&self, id: u16) -> Vec<u8> {
+        let mut body = id.to_be_bytes().to_vec();
+        if self.v5 {
+            body.push(0);
+        }
+        body
+    }
+
+    /// Sends a SUBSCRIBE at QoS 0 and returns the codes of its SUBACK.
+    fn subscribe(&mut self, id: u16, filters: &[String]) -> Vec<u8> {
+        let mut body = self.head(id);
+        for filter in filters {
+            text(filter, &mut body);
+            body.push(0);
+        }
+        self.stream.write_all(&packet(0x82, &body)).unwrap();
+        self.acknowledged(0x90, id)
+    }
+
+    /// Sends an UNSUBSCRIBE and returns the codes of its UNSUBACK (none in
+    /// MQTT 3.1.1, whose UNSUBACK carries no result).
+    fn unsubscribe(&mut self, id: u16, filters: &[String]) -> Vec<u8> {
+        let mut body = id.to_be_bytes().to_vec();
+        if self.v5 {
+            body.push(0);
+        }
+        for filter in filters {
+            text(filter, &mut body);
+        }
+        self.stream.write_all(&packet(0xa2, &body)).unwrap();
+        self.acknowledged(0xb0, id)
+    }
+
+    fn acknowledged(&mut self, kind: u8, id: u16) -> Vec<u8> {
+        let (first, answer) = read_packet(&mut self.stream);
+        assert_eq!(
+            first, kind,
+            "acknowledgement {kind:#x} expected, got {answer:?}"
+        );
+        let head = self.head(id);
+        assert_eq!(
+            &answer[..head.len()],
+            &head[..],
+            "identifier and properties"
+        );
+        answer[head.len()..].to_vec()
+    }
+
+    fn publish(&mut self, topic: &str, payload: &[u8]) {
+        let mut body = Vec::new();
+        text(topic, &mut body);
+        if self.v5 {
+            body.push(0);
+        }
+        body.extend_from_slice(payload);
+        self.stream.write_all(&packet(0x30, &body)).unwrap();
+    }
+
+    /// The topic and payload of the next PUBLISH this client receives.
+    fn delivered(&mut self) -> (String, Vec<u8>) {
+        let (first, body) = read_packet(&mut self.stream);
+        assert_eq!(
+            first & 0xf0,
+            0x30,
+            "PUBLISH expected, got {first:#x} {body:?}"
+        );
+        let length = usize::from(u16::from_be_bytes([body[0], body[1]]));
+        let topic = String::from_utf8(body[2..2 + length].to_vec()).unwrap();
+        let payload = body[2 + length + usize::from(self.v5)..].to_vec();
+        (topic, payload)
+    }
+}
+
+/// A SUBSCRIBE or an UNSUBSCRIBE with more filters than the core takes in
+/// one request is served as the sequence of its unit requests would be,
+/// and acknowledged once: every filter of a twelve-filter SUBSCRIBE is
+/// granted and effective, and every filter of a nine-filter UNSUBSCRIBE is
+/// really removed. What a client reads afterwards proves it: a message on
+/// a removed filter does not arrive, the next one on a kept filter does.
+/// Both protocol versions (counter-audit of bbe1453).
+#[test]
+fn a_request_with_many_filters_is_served_like_its_unit_requests() {
+    for v5 in [true, false] {
+        let name = if v5 { "many-v5" } else { "many-v4" };
+        let broker = Broker::start(name);
+        let mut subscriber = Peer::connect(broker.address, &format!("{name}-sub"), v5);
+        let mut publisher = Peer::connect(broker.address, &format!("{name}-pub"), v5);
+        let filters: Vec<String> = (0..12).map(|index| format!("many/{index}")).collect();
+
+        assert_eq!(
+            subscriber.subscribe(1, &filters),
+            [0; 12],
+            "{name}: twelve filters granted at QoS 0\n{}",
+            broker.refusals()
+        );
+        // The last filter is beyond the first unit request: it is effective.
+        publisher.publish("many/11", b"granted");
+        assert_eq!(
+            subscriber.delivered(),
+            ("many/11".to_owned(), b"granted".to_vec()),
+            "{name}"
+        );
+
+        let removed = subscriber.unsubscribe(2, &filters[..9]);
+        if v5 {
+            assert_eq!(
+                removed,
+                [0; 9],
+                "{name}: nine filters removed\n{}",
+                broker.refusals()
+            );
+        } else {
+            assert!(
+                removed.is_empty(),
+                "{name}: an UNSUBACK of 3.1.1 has no payload"
+            );
+        }
+        // Filter 8 was the ninth of the request: it is really gone. The
+        // message on a kept filter is the next one the subscriber reads.
+        publisher.publish("many/8", b"removed");
+        publisher.publish("many/9", b"kept");
+        assert_eq!(
+            subscriber.delivered(),
+            ("many/9".to_owned(), b"kept".to_vec()),
+            "{name}: a removed filter still delivered"
+        );
+
+        // A filter longer than the profile stores is refused for itself;
+        // its neighbour is granted and effective.
+        let mixed = ["f".repeat(2_000), "many/mixed".to_owned()];
+        let refusal = if v5 { 0x97 } else { 0x80 };
+        assert_eq!(subscriber.subscribe(3, &mixed), [refusal, 0], "{name}");
+        publisher.publish("many/mixed", b"mixed");
+        assert_eq!(
+            subscriber.delivered(),
+            ("many/mixed".to_owned(), b"mixed".to_vec()),
+            "{name}"
+        );
+        // An UNSUBSCRIBE of filters that were never subscribed, and of one
+        // that cannot be: acknowledged, and it says so in MQTT 5.
+        let absent: Vec<String> = (0..9).map(|index| format!("absent/{index}")).collect();
+        let answer = subscriber.unsubscribe(4, &[&absent[..], &mixed[..1]].concat());
+        if v5 {
+            assert_eq!(answer, [0x11; 10], "{name}: no subscription existed");
+        }
+    }
+}
