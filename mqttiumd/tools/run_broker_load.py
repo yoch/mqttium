@@ -278,6 +278,38 @@ def summarize_events(raw, window, pairs, qos):
             "submit_to_positive_puback_ms": distribution(ack), "per_pair": per_pair}
 
 
+def summarize_phase(rows, start_ns, end_ns, qos):
+    """One phase of a two-phase run, by the instant each publication was
+    scheduled: what was offered, what the broker answered and delivered,
+    and the same account second by second, which shows how long the broker
+    takes to serve a nominal load again after an overload."""
+    def account(events):
+        submitted = [e for e in events if e["submitted_ns"] and not e["send_rc"]]
+        positive = [e for e in submitted if e["ack_ns"] and e["ack_reason"] < 128]
+        delivered = [e for e in submitted if e["received_ns"]]
+        return {"scheduled": len(events), "submitted": len(submitted),
+                "acknowledged": len(positive),
+                "refused": sum(1 for e in submitted if e["ack_ns"] and e["ack_reason"] >= 128),
+                "unanswered": sum(1 for e in submitted if qos and not e["ack_ns"]),
+                "delivered": len(delivered),
+                "acknowledged_and_not_delivered": sum(1 for e in positive if not e["received_ns"]),
+                "submit_to_subscriber_ms": distribution([e["received_ns"] - e["submitted_ns"] for e in delivered]),
+                "submit_to_positive_puback_ms": distribution([e["ack_ns"] - e["submitted_ns"] for e in positive])}
+    inside = [e for e in rows if start_ns <= e["scheduled_ns"] < end_ns]
+    seconds = []
+    for second in range(math.ceil((end_ns - start_ns) / NS)):
+        low = start_ns + second * NS
+        seconds.append(account([e for e in inside if low <= e["scheduled_ns"] < low + NS]))
+    return {"duration_ms": (end_ns - start_ns) / 1e6, **account(inside), "seconds": seconds}
+
+
+def summarize_phases(raw, window, qos):
+    with raw.open() as source:
+        rows = [{name: int(value) for name, value in line.items()} for line in csv.DictReader(source)]
+    return {"first": summarize_phase(rows, window["start_ns"], window["switch_ns"], qos),
+            "then": summarize_phase(rows, window["switch_ns"], window["end_ns"], qos)}
+
+
 def summarize_process(samples, window, role):
     rows = [(s["at_ns"], s[role]) for s in samples if window["start_ns"] <= s["at_ns"] <= window["end_ns"] and s[role]]
     first, last, states = {}, {}, {}
@@ -339,6 +371,9 @@ def run_case(args, root, pki, driver, kind, binary, cores, pairs, qos, rate, ind
             broker = ["strace", "--kill-on-exit", "-e", "trace=clock_nanosleep", "-ttt", "-T", "-o", trace, *broker]
         raw = directory / "messages.csv"
         gen = [driver, port, pki, pairs, qos, rate, args.duration_ms, args.payload_bytes, raw]
+        if args.then:
+            # The driver's two-phase form: idle, drain, next rate, next duration.
+            gen += [50, 500, *args.then]
         samples = []
         with process(broker, directory / "broker.log", broker_cpus) as server:
             readiness = ready(server, directory, kind)
@@ -348,7 +383,7 @@ def run_case(args, root, pki, driver, kind, binary, cores, pairs, qos, rate, ind
             before = counter(current_group() / "cpu.stat")
             realtime_offset = time.time_ns() - time.monotonic_ns()
             with process(gen, directory / "driver.log", generator_cpus) as client:
-                deadline = time.monotonic() + args.duration_ms / 1000 + 15
+                deadline = time.monotonic() + (args.duration_ms + (args.then[1] if args.then else 0)) / 1000 + 15
                 while client.poll() is None and time.monotonic() < deadline:
                     samples.append({"at_ns": time.monotonic_ns(), "broker": proc_sample(broker_pid),
                                     "generator": proc_sample(client.pid)})
@@ -382,6 +417,9 @@ def run_case(args, root, pki, driver, kind, binary, cores, pairs, qos, rate, ind
                          "brokercpu": summarize_process(samples, window, "broker"),
                          "generatorcpu": summarize_process(samples, window, "generator"),
                          **summarize_events(raw, window, pairs, qos)}
+        if args.then:
+            result_record["then"] = {"target_mps": args.then[0], "duration_ms": args.then[1]}
+            result_record["phases"] = summarize_phases(raw, window, qos)
         if witness:
             absent = witness.get("first_absent_ns")
             witness["expired_inside_send_window"] = absent is not None and window["start_ns"] <= absent <= window["end_ns"]
@@ -433,6 +471,9 @@ def main():
     parser.add_argument("--duration-ms", type=int, default=2200)
     parser.add_argument("--payload-bytes", type=int, default=256)
     parser.add_argument("--repeats", type=int, default=3, help="total runs of each point at the knee")
+    parser.add_argument("--then", type=lambda text: [int(part) for part in text.split(",")], metavar="RATE,DURATION_MS",
+                        help="a second phase on the same connections, at this rate for this long; "
+                             "the result then accounts for each phase, second by second")
     parser.add_argument("--only-broker", choices=("mqttiumd", "mosquitto"))
     parser.add_argument("--candidate", type=Path, help="compare the baseline and a second mqttiumd executable on alternating cases")
     parser.add_argument("--candidate-source", help="source identity of the second executable")
@@ -441,6 +482,8 @@ def main():
     args = parser.parse_args()
     if args.candidate and (args.only_broker or not args.candidate_source):
         parser.error("--candidate requires --candidate-source and a paired run")
+    if args.then and (len(args.then) != 2 or min(args.then) < 1 or args.then[1] > 60000):
+        parser.error("--then takes a rate and a duration of at most 60000 ms")
     if args.trace_main and args.only_broker != "mqttiumd":
         parser.error("--trace-main requires --only-broker mqttiumd")
     if args.expiry_witness and (not (args.candidate or args.only_broker == "mqttiumd") or args.duration_ms < 3000):
