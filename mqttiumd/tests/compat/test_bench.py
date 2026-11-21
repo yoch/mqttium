@@ -12,6 +12,7 @@ import struct
 import sys
 import tempfile
 import threading
+import time
 import unittest
 
 HERE = Path(__file__).resolve().parent
@@ -313,7 +314,65 @@ def retained_after(connection, packet):
         connection.sendall(wire.suback(packet["packet_id"], [0]) + wire.publish("t", "kept", retain=True))
 
 
-PLAIN = dsl.Scenario(name="x/y-v4", area="x", version="3.1.1", doc="", steps=())
+def trickling(count, gap):
+    """Sends the SUBACK of a subscription, then `count` retained messages
+    `gap` seconds apart, and answers PINGREQ at once: the round trip of a
+    `collect` ends long before the replay does."""
+    def later(connection):
+        for index in range(count):
+            time.sleep(gap)
+            try:
+                connection.sendall(wire.publish(f"t/{index}", f"r{index}", retain=True))
+            except OSError:
+                return
+
+    def answer(connection, packet):
+        if packet["type"] == "CONNECT":
+            connection.sendall(wire.connack())
+        elif packet["type"] == "PINGREQ":
+            connection.sendall(wire.pingresp())
+        elif packet["type"] == "SUBSCRIBE":
+            connection.sendall(wire.suback(packet["packet_id"], [0]))
+            threading.Thread(target=later, args=(connection,), daemon=True).start()
+    return answer
+
+
+def one_at_a_time(payloads, *, packet_id=1):
+    """Sends the SUBACK of a subscription and one retained QoS 1 message,
+    and each next one only when the one before is acknowledged, all under
+    the same Packet Identifier: a client that does not acknowledge gets one."""
+    pending = list(payloads)
+
+    def send_next(connection):
+        if pending:
+            payload = pending.pop(0)
+            connection.sendall(wire.publish("t/" + payload, payload, qos=1, packet_id=packet_id, retain=True))
+
+    def answer(connection, packet):
+        if packet["type"] == "CONNECT":
+            connection.sendall(wire.connack())
+        elif packet["type"] == "PINGREQ":
+            connection.sendall(wire.pingresp())
+        elif packet["type"] == "SUBSCRIBE":
+            connection.sendall(wire.suback(packet["packet_id"], [1]))
+            send_next(connection)
+        elif packet["type"] == "PUBACK" and packet["packet_id"] == packet_id:
+            send_next(connection)
+    return answer
+
+
+SUBSCRIBED = [dsl.open_("a"), dsl.send("a", wire.connect("c")), dsl.recv("a"),
+              dsl.send("a", wire.subscribe(1, [("t/#", 1)]))]
+
+
+def measured(*payloads, sequence=("m0", "m1", "m2"), ordered=True):
+    """The raw record of a `measure` step that counted these payloads."""
+    return {"conn": "sub", "op": "measure", "kind": "PUBLISH", "field": "payload", "sequence": list(sequence),
+            "ordered": ordered, "end": "quiet",
+            "got": [wire.decode(wire.publish("burst/t", payload), 4) for payload in payloads]}
+
+
+PLAIN =dsl.Scenario(name="x/y-v4", area="x", version="3.1.1", doc="", steps=())
 
 
 class BlindSpots(unittest.TestCase):
@@ -408,6 +467,121 @@ class BlindSpots(unittest.TestCase):
         normalized = normalize.normalize(raw, PLAIN)
         self.assertEqual([packet["type"] for packet in normalized[-1]["got"]], ["PUBLISH", "SUBACK"])
         self.assertEqual(sorted(normalized[-1]), ["conn", "end", "got", "op"])
+
+
+class Stability(unittest.TestCase):
+    """What made a transcript depend on the speed of the machine; played
+    against a peer of this process, without a broker."""
+
+    def peer(self, answer):
+        peer = FakePeer(answer)
+        self.addCleanup(peer.stop)
+        return peer
+
+    def play(self, answer, steps):
+        return harness.Player(self.peer(answer).port).play(steps)
+
+    def payloads(self, record):
+        return [packet["payload"] for packet in record["got"] if packet["type"] == "PUBLISH"]
+
+    def test_a_replay_slower_than_the_silent_window_is_read_to_its_end(self):
+        # Eight messages 0.1 s apart take longer than the window of 0.3 s
+        # that follows the PINGRESP, and no gap between two of them does.
+        raw = self.play(trickling(8, 0.1), [*SUBSCRIBED, dsl.collect("a", window=0.3)])
+        self.assertEqual(self.payloads(raw[-1]), [f"r{index}" for index in range(8)])
+        self.assertEqual(raw[-1]["end"], "quiet")
+
+    def test_a_peer_that_never_falls_silent_is_recorded_as_such(self):
+        raw = self.play(trickling(200, 0.05), [*SUBSCRIBED, dsl.quiet("a", window=0.2, limit=0.6)])
+        self.assertEqual(raw[-1]["end"], "still-receiving")
+        self.assertLess(len(self.payloads(raw[-1])), 200)
+
+    def test_a_drain_acknowledges_each_delivery_it_collects(self):
+        raw = self.play(one_at_a_time("abcde"), [*SUBSCRIBED, dsl.drain("a", 5)])
+        last = raw[-1]
+        self.assertEqual((last["op"], last["expected"], last["acknowledged"], last["end"]), ("drain", 5, 5, "ok"))
+        self.assertEqual([packet["type"] for packet in last["got"]], ["SUBACK", *["PUBLISH"] * 5])
+        self.assertEqual(self.payloads(last), list("abcde"))
+        # Each delivery was acknowledged before the next was read: the
+        # identifier the peer reuses names a new delivery every time.
+        normalized = normalize.normalize(raw, PLAIN)[-1]
+        self.assertEqual([packet["packet_id"] for packet in normalized["got"] if packet["type"] == "PUBLISH"],
+                         ["b1", "b2", "b3", "b4", "b5"])
+        self.assertEqual((normalized["acknowledged"], normalized["end"]), (5, "ok"))
+
+    def test_a_drain_that_is_owed_more_ends_idle(self):
+        raw = self.play(one_at_a_time("ab"), [*SUBSCRIBED, dsl.drain("a", 3, idle=0.2)])
+        self.assertEqual((raw[-1]["acknowledged"], raw[-1]["end"]), (2, "idle"))
+        self.assertEqual(self.payloads(raw[-1]), ["a", "b"])
+        raw = self.play(trickling(200, 0.05), [*SUBSCRIBED, dsl.drain("a", 300, idle=0.2, timeout=0.5)])
+        self.assertEqual((raw[-1]["acknowledged"], raw[-1]["end"]), (0, "timeout"))
+
+    def test_a_sorted_drain_compares_the_deliveries_and_not_their_order(self):
+        def played(order, *, packet_id=1, sort=True):
+            raw = self.play(one_at_a_time(order, packet_id=packet_id), [*SUBSCRIBED, dsl.drain("a", 3, sort=sort)])
+            return normalize.normalize(raw, PLAIN)
+
+        self.assertTrue(normalize.same(played("abc"), played("cab", packet_id=7)))
+        self.assertFalse(normalize.same(played("abc"), played("cab", sort=False)))
+        self.assertFalse(normalize.same(played("abc"), played("abb")))
+
+    def test_a_measured_count_is_not_compared(self):
+        def form(*payloads, **more):
+            return normalize.normalize([measured(*payloads, **more)], PLAIN)
+
+        self.assertEqual(form("m0", "m1", "m2"), [{"conn": "sub", "op": "measure", "kind": "PUBLISH",
+                                                  "values": "distinct", "order": "as-sent", "got": [], "end": "quiet"}])
+        # How many came is lawful either way: three, two or none compare equal.
+        self.assertEqual(form("m0", "m1", "m2"), form("m0", "m2"))
+        self.assertEqual(form("m0", "m1", "m2"), form())
+        # What the protocol does guarantee is compared.
+        self.assertEqual(form("m0", "m0")[0]["values"], "repeated")
+        self.assertEqual(form("m0", "m9")[0]["values"], "foreign")
+        self.assertEqual(form("m2", "m0")[0]["order"], "permuted")
+        # Where no order is guaranteed (retained messages of several
+        # topics), none is compared.
+        self.assertEqual(form("m2", "m0", ordered=False), form("m0", ordered=False))
+        self.assertNotIn("order", form("m2", "m0", ordered=False)[0])
+        self.assertEqual(form("m2", "m2", ordered=False)[0]["values"], "repeated")
+
+    def test_a_measure_step_records_what_it_counted(self):
+        step = dsl.measure("a", [f"r{index}" for index in range(8)], ordered=False, window=0.3)
+        raw = self.play(trickling(8, 0.1), [*SUBSCRIBED, step])
+        last = raw[-1]
+        self.assertEqual((last["op"], last["kind"], last["field"], last["ordered"], last["end"]),
+                         ("measure", "PUBLISH", "payload", False, "quiet"))
+        self.assertEqual(last["sequence"], [f"r{index}" for index in range(8)])
+        self.assertEqual([packet["type"] for packet in last["got"]], ["SUBACK", *["PUBLISH"] * 8])
+        self.assertEqual(normalize.normalize(raw, PLAIN)[-1],
+                         {"conn": "a", "op": "measure", "kind": "PUBLISH", "values": "distinct", "end": "quiet",
+                          "got": [{"type": "SUBACK", "packet_id": 1, "codes": [0]}]})
+
+    def test_the_counts_of_both_brokers_are_reported_side_by_side(self):
+        tallied = {"conn": "pub", "op": "tally", "kind": "PUBACK", "expected": 2, "end": "quiet",
+                   "got": [wire.decode(wire.puback(1), 4), wire.decode(wire.pingresp(), 4)]}
+        result = {"name": "x/y-v4", "raw": {"reference": [tallied, measured("m0", "m1", "m2")],
+                                            "mqttiumd": [tallied, measured("m1")]}}
+        rows = run.counted(result)
+        self.assertEqual(rows, [
+            {"scenario": "x/y-v4", "conn": "pub", "op": "tally", "kind": "PUBACK", "sent": 2, "reference": 1,
+             "mqttiumd": 1},
+            {"scenario": "x/y-v4", "conn": "sub", "op": "measure", "kind": "PUBLISH", "sent": 3, "reference": 3,
+             "mqttiumd": 1}])
+        self.assertIn("| `x/y-v4` | sub | PUBLISH | 3 | 3 | 1 |", run.count_lines(rows))
+        # A scenario that could not be played on one broker reports what it has.
+        self.assertEqual(run.counted({"name": "x/y-v4", "raw": {"reference": [tallied]}}),
+                         [{"scenario": "x/y-v4", "conn": "pub", "op": "tally", "kind": "PUBACK", "sent": 2,
+                           "reference": 1, "mqttiumd": None}])
+
+    def test_the_raw_transcript_keeps_the_size_of_each_packet_on_the_wire(self):
+        steps = [dsl.open_("a"), dsl.send("a", wire.connect("c")), dsl.recv("a"),
+                 dsl.send("a", wire.subscribe(1, [("t", 0)])), dsl.recv("a", 2)]
+        raw = self.play(retained_after, steps)
+        self.assertEqual([packet["wire_bytes"] for packet in raw[-1]["got"]],
+                         [len(wire.suback(1, [0])), len(wire.publish("t", "kept", retain=True))])
+        self.assertEqual(raw[2]["got"][0]["wire_bytes"], len(wire.connack()))
+        normalized = normalize.normalize(raw, PLAIN)
+        self.assertTrue(all("wire_bytes" not in packet for record in normalized for packet in record.get("got", ())))
 
 
 class Files(unittest.TestCase):
