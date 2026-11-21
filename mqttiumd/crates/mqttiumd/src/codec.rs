@@ -2366,6 +2366,76 @@ mod tests {
         );
     }
 
+    /// MQTT 5 gives no meaning to a User Property outside a publication,
+    /// to a Reason String, or to a request for Response Information the
+    /// server is free not to answer: a broker that does not use them must
+    /// still take the packet. What the packet says is what it says
+    /// without them.
+    #[test]
+    fn information_the_broker_may_leave_unused_does_not_refuse_its_packet() {
+        const USER: &[u8] = &[0x26, 0, 1, b'k', 0, 1, b'v'];
+        const REASON: &[u8] = &[0x1f, 0, 3, b'w', b'h', b'y'];
+        let with = |properties: &[&[u8]]| -> Vec<u8> {
+            let joined = properties.concat();
+            let mut out = vec![u8::try_from(joined.len()).unwrap()];
+            out.extend_from_slice(&joined);
+            out
+        };
+        // CONNECT: a repeated User Property and Request Response Information 1.
+        let plain = decode(0x10, &connect(EXPIRY, b"plain"), BOUNDS).unwrap();
+        let informed = decode(
+            0x10,
+            &connect(&[EXPIRY, USER, USER, &[0x19, 1]].concat(), b"plain"),
+            BOUNDS,
+        )
+        .unwrap();
+        assert_eq!(format!("{informed:?}"), format!("{plain:?}"));
+        // SUBSCRIBE and UNSUBSCRIBE.
+        for (first, tail) in [(0x82, &[0, 1, b't', 1][..]), (0xa2, &[0, 1, b't'][..])] {
+            let body = |properties: &[&[u8]]| [&[0, 9][..], &with(properties), tail].concat();
+            assert_eq!(
+                decode(first, &body(&[USER, USER]), BOUNDS).unwrap(),
+                decode(first, &body(&[]), BOUNDS).unwrap()
+            );
+        }
+        // The four acknowledgements a client sends, with their Reason Code.
+        for first in [0x40, 0x50, 0x62, 0x70] {
+            let body = |properties: &[&[u8]]| [&[0, 9, 0][..], &with(properties)].concat();
+            assert_eq!(
+                decode(first, &body(&[REASON, USER]), BOUNDS).unwrap(),
+                decode(first, &[0, 9], BOUNDS).unwrap(),
+                "packet {first:#x}"
+            );
+        }
+        // DISCONNECT.
+        assert_eq!(
+            decode(0xe0, &[&[0][..], &with(&[REASON, USER])].concat(), BOUNDS).unwrap(),
+            decode(0xe0, &[], BOUNDS).unwrap()
+        );
+        // A Reason String stays single, and a publication still carries
+        // what it must forward or is refused.
+        assert_eq!(
+            decode(
+                0x40,
+                &[&[0, 9, 0][..], &with(&[REASON, REASON])].concat(),
+                BOUNDS
+            )
+            .unwrap_err()
+            .code(),
+            "DuplicateProperty"
+        );
+        assert_eq!(
+            decode(
+                0x30,
+                &[&[0, 1, b't'][..], &with(&[USER]), b"x"].concat(),
+                BOUNDS
+            )
+            .unwrap_err()
+            .kind(),
+            ErrorKind::Unsupported
+        );
+    }
+
     #[test]
     fn duplicate_unsupported_properties_are_still_a_protocol_error() {
         let body = b"\0\x03a/b\0\x07\x08\x03\0\x01x\x03\0\x01ypayload";
