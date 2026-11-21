@@ -96,6 +96,11 @@ pub(super) struct Delivery {
     certain_never_started: bool,
     early_puback: bool,
     early_pubrec: Option<u8>,
+    /// The preparation of this delivery's PUBREL, submitted when its PUBREC
+    /// was received: operations are numbered as they are submitted, so it
+    /// orders the PUBRECs of a subscriber. `None` for a PUBREL recovered
+    /// from an earlier run, which precedes those of this one.
+    pubrec: Option<OperationId>,
     retired: bool,
 }
 
@@ -206,6 +211,7 @@ impl Delivery {
             certain_never_started: claim.is_none(),
             early_puback: false,
             early_pubrec: None,
+            pubrec: None,
             retired: false,
         }
     }
@@ -539,17 +545,38 @@ impl State {
     ) -> Option<(usize, &Delivery)> {
         let mut publish: Option<(usize, &Delivery)> = None;
         let mut pubrel: Option<(usize, &Delivery)> = None;
+        // PUBREL leaves in the order of the PUBRECs (MQTT-4.6.0-4). The
+        // earliest PUBREC of this session whose PUBREL is still being
+        // prepared holds the PUBRELs of the later ones, whenever their own
+        // preparations became known.
+        let preparing = self
+            .deliveries
+            .as_slice()
+            .iter()
+            .filter(|delivery| delivery.target == session)
+            .filter_map(|delivery| match delivery.phase {
+                Phase::PubrelPending(in_flight) => Some(in_flight.operation.sequence()),
+                _ => None,
+            })
+            .min();
+        let received = |delivery: &Delivery| delivery.pubrec.map(OperationId::sequence);
         for (index, delivery) in self.deliveries.as_slice().iter().enumerate() {
             if delivery.target != session || !delivery.waiting_to_send(generation, now) {
                 continue;
             }
-            let first = if delivery.awaits_pubcomp() {
-                &mut pubrel
-            } else {
-                &mut publish
-            };
-            if first.is_none_or(|(_, previous)| delivery.id < previous.id) {
-                *first = Some((index, delivery));
+            if delivery.awaits_pubcomp() {
+                if received(delivery)
+                    .is_some_and(|own| preparing.is_some_and(|earlier| earlier < own))
+                {
+                    continue;
+                }
+                if pubrel.is_none_or(|(_, previous)| {
+                    (received(delivery), delivery.id) < (received(previous), previous.id)
+                }) {
+                    pubrel = Some((index, delivery));
+                }
+            } else if publish.is_none_or(|(_, previous)| delivery.id < previous.id) {
+                publish = Some((index, delivery));
             }
         }
         // Keep PUBLISH order even when the first claim is unresolved. PUBREL
@@ -3190,6 +3217,7 @@ impl Owner {
                     .get_mut(slot)
                     .ok_or(stale)?;
                 d.early_pubrec = None;
+                d.pubrec = Some(in_flight.operation);
                 d.phase = Phase::PubrelPending(in_flight);
             }
             Change::PubrelReady { slot, finished } => {
