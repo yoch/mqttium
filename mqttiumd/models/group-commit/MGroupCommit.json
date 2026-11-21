@@ -1,0 +1,27 @@
+{
+  "module": "MGroupCommit.tla",
+  "status": "refinement",
+  "summary": "Group commit of the SQLite store (group.rs, record 0045; delivered by group_responses in writer.rs): the members of a group run in one transaction with a savepoint each, a refused member is undone alone, the answers leave only after the one COMMIT, a kill before it loses the whole group with no answer handed over, and a commit that failed makes every member unknown.",
+  "issues": [648],
+  "tests": ["mqttiumd/crates/mqttiumd-store-sqlite/tests/group_commit.rs", "mqttiumd/crates/mqttiumd-store-sqlite/src/lib.rs"],
+  "replays": [{"file": "mqttiumd/crates/mqttiumd-store-sqlite/tests/group_commit.rs", "test": "a_refused_member_is_recorded_and_its_neighbours_still_apply"}, {"file": "mqttiumd/crates/mqttiumd-store-sqlite/tests/group_commit.rs", "test": "a_member_without_a_receipt_slot_is_unknown_inside_a_group_too"}, {"file": "mqttiumd/crates/mqttiumd-store-sqlite/tests/group_commit.rs", "test": "an_operation_presented_twice_in_one_group_is_decided_once"}, {"file": "mqttiumd/crates/mqttiumd-store-sqlite/tests/group_commit.rs", "test": "a_group_on_a_failing_medium_leaves_nothing_and_says_nothing_certain"}, {"file": "mqttiumd/crates/mqttiumd-store-sqlite/tests/group_commit.rs", "test": "a_kill_before_the_commit_of_a_group_leaves_no_member"}, {"file": "mqttiumd/crates/mqttiumd-store-sqlite/tests/group_commit.rs", "test": "a_kill_once_the_commit_of_a_group_is_logged_keeps_every_member"}, {"file": "mqttiumd/crates/mqttiumd-store-sqlite/src/lib.rs", "test": "a_member_whose_read_fails_is_unknown_and_the_group_still_commits"}],
+  "not_replayed": "No test replays a mutant that releases an answer early (mut-release-before-commit, mut-release-at-savepoint): apply_group returns its answers only after the commit, so the defect cannot be driven without changing the function. No test drops the transaction of the engine in the middle of a group (EngineDrops), and no test of the product crate exercises group_responses with a kill or a failed commit.",
+  "configs": [
+    {"config": "MGroupCommit-safety.cfg", "expect": "pass", "invariants": ["TypeOK", "AckAfterCommit", "NothingReleasedInTransaction", "GroupAtomic", "CrashBeforeCommitLosesGroup", "CommitFailureSaysNothingCertain", "NoPartialMemberCommitted", "RefusalIsolated"]},
+    {"config": "MGroupCommit-safety-repeat.cfg", "expect": "pass", "invariants": ["TypeOK", "AckAfterCommit", "NothingReleasedInTransaction", "GroupAtomic", "CrashBeforeCommitLosesGroup", "CommitFailureSaysNothingCertain", "NoPartialMemberCommitted", "RefusalIsolated"]},
+    {"config": "MGroupCommit-safety-settled.cfg", "expect": "pass", "invariants": ["TypeOK", "AckAfterCommit", "NothingReleasedInTransaction", "GroupAtomic", "CrashBeforeCommitLosesGroup", "CommitFailureSaysNothingCertain", "NoPartialMemberCommitted", "RefusalIsolated"]},
+    {"config": "MGroupCommit-safety-no-fault.cfg", "expect": "pass", "invariants": ["TypeOK", "AckAfterCommit", "NothingReleasedInTransaction", "GroupAtomic", "CrashBeforeCommitLosesGroup", "CommitFailureSaysNothingCertain", "NoPartialMemberCommitted", "RefusalIsolated"]},
+    {"config": "MGroupCommit-liveness.cfg", "expect": "pass", "property": "EveryMemberAnswered"},
+    {"config": "MGroupCommit-reach-mixed-group.cfg", "expect": "violation", "invariant": "NoMixedGroupWitness"},
+    {"config": "MGroupCommit-reach-crash-after-partial-release.cfg", "expect": "violation", "invariant": "NoCrashAfterPartialReleaseWitness"},
+    {"config": "MGroupCommit-reach-recognised-in-group.cfg", "expect": "violation", "invariant": "NoRecognisedInGroupWitness"},
+    {"config": "MGroupCommit-reach-nothing-to-commit.cfg", "expect": "violation", "invariant": "NoNothingToCommitWitness"},
+    {"config": "MGroupCommit-reach-commit-failure.cfg", "expect": "violation", "invariant": "NoCommitFailureWitness"},
+    {"config": "MGroupCommit-mut-release-before-commit.cfg", "expect": "violation", "invariant": "CommitFailureSaysNothingCertain"},
+    {"config": "MGroupCommit-mut-release-before-commit-ack.cfg", "expect": "violation", "invariant": "AckAfterCommit"},
+    {"config": "MGroupCommit-mut-refusal-aborts-group.cfg", "expect": "violation", "invariant": "RefusalIsolated"},
+    {"config": "MGroupCommit-mut-refusal-aborts-group-ack.cfg", "expect": "violation", "invariant": "AckAfterCommit"},
+    {"config": "MGroupCommit-mut-release-at-savepoint.cfg", "expect": "violation", "invariant": "CrashBeforeCommitLosesGroup"},
+    {"config": "MGroupCommit-mut-release-at-savepoint-open.cfg", "expect": "violation", "invariant": "NothingReleasedInTransaction"}
+  ]
+}

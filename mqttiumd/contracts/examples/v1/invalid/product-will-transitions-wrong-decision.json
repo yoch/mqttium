@@ -1,0 +1,242 @@
+{
+  "format": "mqttiumd.product-transition-registry",
+  "schema_version": 1,
+  "id": "tcp-durable-will-v1",
+  "decision": "0033",
+  "status": "Proposed",
+  "scope": "product-system-tests",
+  "partition_complete": false,
+  "description": "The Proposed0034 zero-delay QoS1 Will machine with Proposed0037 retained admission. The registry describes system-test scope.",
+  "authority": "Durable Open commits the immutable Will before CONNACK. Exact End decides cancellation or pending publication. Kind17 and kind18 consume Pending atomically with admission.",
+  "limitations": [
+    "Will QoS0/2, nonzero delay, Message Expiry and other Will properties beyond delay0 remain unsupported.",
+    "A normal DISCONNECT observed only in volatile memory before cancellation commits can be lost with the process; recovery follows the surviving durable intention.",
+    "Server failure can defer publication until restart. Capacity pressure retains a bounded Pending intention, without a universal publication-latency claim."
+  ],
+  "rules": [
+    {
+      "id": "will.install",
+      "machine": "Will",
+      "state_class": "Absent",
+      "event_class": "Connect",
+      "guard": "Validated Will QoS1, either Retain value, absent or zero delay and bounded topic/payload belong to the exact Open recipe.",
+      "next_state_class": "OpenPending",
+      "required_actions": [
+        "PersistOpenWithWill"
+      ],
+      "forbidden_actions": [
+        "SendSuccessBeforeDurableInstallation"
+      ],
+      "reception_groups": [
+        "A",
+        "C"
+      ]
+    },
+    {
+      "id": "will.installed",
+      "machine": "Will",
+      "state_class": "OpenPending",
+      "event_class": "Committed",
+      "guard": "Apply the authentic Open result only to its still-live original transport. An Open committed before lost CONNACK is accepted durable state.",
+      "next_state_class": "Armed",
+      "required_actions": [
+        "CorrelateOriginalAttachment",
+        "SendConnackAfterCommit"
+      ],
+      "forbidden_actions": [
+        "InferRejectionFromLostReply"
+      ],
+      "reception_groups": [
+        "A",
+        "C"
+      ]
+    },
+    {
+      "id": "will.cancel",
+      "machine": "Will",
+      "state_class": "Armed",
+      "event_class": "NormalDisconnect",
+      "guard": "Exact attachment End with publish=false atomically removes its Will and applies the captured retention policy.",
+      "next_state_class": "Terminal",
+      "required_actions": [
+        "PersistExactCancellation",
+        "ReturnIntentResourcesOnce"
+      ],
+      "forbidden_actions": [
+        "PublishCancelledWill",
+        "LookupNewClientBinding"
+      ],
+      "reception_groups": [
+        "B",
+        "F"
+      ]
+    },
+    {
+      "id": "will.loss",
+      "machine": "Will",
+      "state_class": "Armed",
+      "event_class": "TransportLost",
+      "guard": "EOF, RST, Keep Alive, accepted-connection protocol error and explicit DISCONNECT0x04 make this occurrence pending.",
+      "next_state_class": "WillPending",
+      "required_actions": [
+        "PersistPendingDecision",
+        "CaptureOriginalCloseObservation"
+      ],
+      "forbidden_actions": [
+        "DiscardOnPeerRemoval",
+        "UseDisconnectAsTransportLoss"
+      ],
+      "reception_groups": [
+        "B",
+        "C"
+      ]
+    },
+    {
+      "id": "will.takeover",
+      "machine": "Will",
+      "state_class": "Armed",
+      "event_class": "Takeover",
+      "guard": "Delay0 decides the old attachment for publication before replacement Open installs its own Will or explicit absence.",
+      "next_state_class": "WillPending",
+      "required_actions": [
+        "DecideOldOccurrenceBeforeOpen",
+        "PinOriginalAttachment"
+      ],
+      "forbidden_actions": [
+        "InheritOldWill",
+        "RetargetOldClose"
+      ],
+      "reception_groups": [
+        "B",
+        "E"
+      ]
+    },
+    {
+      "id": "will.source.cleanup",
+      "machine": "Will",
+      "state_class": "WillPending",
+      "event_class": "SourceEnded",
+      "guard": "The independent intention, original producer ClientID and payload survive zero-expiry or replacement cleanup.",
+      "next_state_class": "WillPending",
+      "required_actions": [
+        "PreservePendingIntent",
+        "PreserveIndependentTargetReferences"
+      ],
+      "forbidden_actions": [
+        "DiscardIntentWithSession",
+        "CancelOtherDestination"
+      ],
+      "reception_groups": [
+        "C",
+        "D"
+      ]
+    },
+    {
+      "id": "will.admit",
+      "machine": "Will",
+      "state_class": "WillPending",
+      "event_class": "CapacityAvailable",
+      "guard": "Freeze the complete eligible canonical fanout and live RAP mask. Kind17 covers non-retained and kind18 retained intent. Capacity refusal preserves the intent.",
+      "next_state_class": "AdmitPending",
+      "required_actions": [
+        "PersistNormalAtomicAdmission",
+        "RetainUnknownOperation"
+      ],
+      "forbidden_actions": [
+        "TruncateFanout",
+        "EmitBeforeCommit"
+      ],
+      "reception_groups": [
+        "C",
+        "E"
+      ]
+    },
+    {
+      "id": "will.unknown",
+      "machine": "Will",
+      "state_class": "AdmitPending",
+      "event_class": "UnknownResult",
+      "guard": "An unknown admission retains the same OperationId and exact canonical recipe until resolution; absence cannot authorize a new attempt.",
+      "next_state_class": "AdmitPending",
+      "required_actions": [
+        "ResolveSameOperation",
+        "PreservePendingKnowledge"
+      ],
+      "forbidden_actions": [
+        "ReadmitUnderFreshIdentity",
+        "UseAbsenceAsCertainRefusal"
+      ],
+      "reception_groups": [
+        "C",
+        "F"
+      ]
+    },
+    {
+      "id": "will.admitted",
+      "machine": "Will",
+      "state_class": "AdmitPending",
+      "event_class": "Committed",
+      "guard": "The transaction consumes the exact Pending intention, admits the live obligations, applies any retained change and writes the correlated result independently of the source session.",
+      "next_state_class": "Queued",
+      "required_actions": [
+        "ConsumeIntentAtomically",
+        "QueueOrdinaryDestinationWork"
+      ],
+      "forbidden_actions": [
+        "CreateSecondAdmission",
+        "RequireLiveSource"
+      ],
+      "reception_groups": [
+        "A",
+        "C",
+        "D"
+      ]
+    },
+    {
+      "id": "will.startup",
+      "machine": "Will",
+      "state_class": "Armed",
+      "event_class": "Startup",
+      "guard": "After process loss surviving Armed intentions become Pending before source cleanup. Already consumed intentions do not resurrect.",
+      "next_state_class": "WillPending",
+      "required_actions": [
+        "DiscoverDurableIntent",
+        "PreserveCommittedObligations"
+      ],
+      "forbidden_actions": [
+        "ForgetAcceptedWill",
+        "PublishUncommittedOpen"
+      ],
+      "reception_groups": [
+        "C",
+        "F"
+      ]
+    },
+    {
+      "id": "will.retained_barrier",
+      "machine": "Will",
+      "state_class": "WillPending",
+      "event_class": "Connect",
+      "guard": "An existing Will for the same ClientID remains in the durable inventory.",
+      "next_state_class": "WillPending",
+      "required_actions": [
+        "WaitForDurableWillBarrier",
+        "KeepOtherConnectionsProgressing"
+      ],
+      "forbidden_actions": [
+        "AcceptReplacementBeforeWillIsSettled",
+        "DropDeferredIntent"
+      ],
+      "reception_groups": [
+        "E",
+        "F"
+      ]
+    }
+  ],
+  "hooks": [
+    "will.admission.prepared",
+    "will.admission.committed",
+    "will.end.prepared",
+    "will.end.committed"
+  ]
+}

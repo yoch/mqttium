@@ -4,6 +4,10 @@ Status: **Accepted with amendments** (15 November 2026, third review of
 PR yoch/mqttium#647). Applied by lots L1, L2, L4 and L7; see "Obligations
 by lot".
 
+Amended by 0011 and 0012 (record 0047): the opening of an epoch is one
+conditional, idempotent command with an identity, and a fifth refusal of
+creation is added to the four below.
+
 ## Context
 
 An `Outbox` is a primitive with a precondition: one box per owner and run
@@ -143,6 +147,41 @@ older operation or an older reply.
 For S0 it is enough to keep the counters of the owner when its box is
 replaced, and to open a new epoch after a restart. No identifier changes
 its layout for this.
+
+### Replacement, at once (amendment, review of the second wave, R2)
+
+```rust
+fn replace_outbox(
+    &mut self,
+    outbox: &mut Outbox,
+    capacity: NonZeroUsize,
+    max_reservations: NonZeroU32,
+) -> Result<(), ReplaceRefusal>
+```
+
+The box of an owner is replaced in one step. The box is checked as
+`retire` checks it, the new box as `create_outbox` checks it, and the new
+box is allocated, before anything changes; then the active entry of the
+owner takes the new serial and the old box is dropped. The owner stays
+active throughout, and no other box can be created for its identity in
+between. `ReplaceRefusal` is `Retire(RetireRefusal)` or
+`Create(CreateRefused)`; on any refusal, a failed allocation included,
+the box and the authority are unchanged. `OwnerAlreadyActive` and
+`TableFull` are never answered: the new box takes the entry of the old
+one.
+
+`retire` then `create_outbox` does not renew a box. Between the two calls
+the identity is free: when the creation fails, for the size of the box or
+for lack of memory, the authority accepts another box for the same owner,
+and a second owner of that identity issues the identities the first one
+already issued (`review_failed_renewal_must_not_reopen_the_owner_identity`,
+lot L1). `retire` stays for the end of an owner; a renewal goes through
+`replace_outbox`.
+
+`Owner::renew_box` in `mqttiumd-core` uses it, so an owner never lives
+without a box: a refused renewal keeps its box, its effects, its counters
+and its state (`a_failed_renewal_keeps_the_box_the_state_and_the_authority`,
+`a_valid_renewal_after_refused_ones_keeps_the_counters`).
 
 ## Obligations by lot
 

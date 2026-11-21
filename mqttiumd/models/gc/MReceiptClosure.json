@@ -1,0 +1,83 @@
+{
+  "module": "MReceiptClosure.tla",
+  "status": "specification",
+  "summary": "Bounded confirmed per-origin closure, separate publication/payload guards and exact receipt collection credits under lost and reordered maintenance answers.",
+  "issues": [
+    648
+  ],
+  "tests": [],
+  "configs": [
+    {
+      "config": "MReceiptClosure-safety.cfg",
+      "expect": "pass",
+      "invariants": [
+        "TypeOK",
+        "ClosedResultsConsumed",
+        "DeletedOnlyAfterClosure",
+        "CreditsExact",
+        "WithinWindow",
+        "OriginMetadataBounded",
+        "ClosureKnowledgeSound",
+        "AdmissionIdentityUnique",
+        "PublicationIdentityUnique",
+        "PayloadIdentityUnique"
+      ]
+    },
+    {
+      "config": "MReceiptClosure-two-origins.cfg",
+      "expect": "pass",
+      "invariants": [
+        "TypeOK",
+        "ClosedResultsConsumed",
+        "DeletedOnlyAfterClosure",
+        "CreditsExact",
+        "WithinWindow",
+        "OriginMetadataBounded",
+        "ClosureKnowledgeSound",
+        "AdmissionIdentityUnique",
+        "PublicationIdentityUnique",
+        "PayloadIdentityUnique"
+      ]
+    },
+    {
+      "config": "MReceiptClosure-reach-gap.cfg",
+      "expect": "violation",
+      "invariant": "NoUnknownGap"
+    },
+    {
+      "config": "MReceiptClosure-reach-window-reuse.cfg",
+      "expect": "violation",
+      "invariant": "NoWindowReuse"
+    },
+    {
+      "config": "MReceiptClosure-reach-live-after-close.cfg",
+      "expect": "violation",
+      "invariant": "NoClosedLiveObject"
+    },
+    {
+      "config": "MReceiptClosure-mut-cross-hole.cfg",
+      "expect": "violation",
+      "invariant": "ClosedResultsConsumed"
+    },
+    {
+      "config": "MReceiptClosure-mut-delete-unclosed.cfg",
+      "expect": "violation",
+      "invariant": "DeletedOnlyAfterClosure"
+    },
+    {
+      "config": "MReceiptClosure-mut-old-publication.cfg",
+      "expect": "violation",
+      "invariant": "PublicationIdentityUnique"
+    },
+    {
+      "config": "MReceiptClosure-mut-old-payload.cfg",
+      "expect": "violation",
+      "invariant": "PayloadIdentityUnique"
+    },
+    {
+      "config": "MReceiptClosure-mut-double-credit.cfg",
+      "expect": "violation",
+      "invariant": "CreditsExact"
+    }
+  ]
+}

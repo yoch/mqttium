@@ -1,0 +1,122 @@
+{
+  "format": "mqttiumd.product-profile",
+  "schema_version": 1,
+  "id": "tcp-will-pubsub-v1",
+  "mqtt_version": 5,
+  "client_id": "explicit",
+  "clean_start": [
+    false,
+    true
+  ],
+  "session_expiry_interval": {
+    "minimum": 0,
+    "maximum": 4294967295
+  },
+  "incoming_qos": [
+    0,
+    1,
+    2
+  ],
+  "retain": true,
+  "will": true,
+  "authentication": false,
+  "subscriptions": true,
+  "outgoing_delivery": true,
+  "mqtt_conformant": false,
+  "max_connections": 16,
+  "max_sessions": 128,
+  "max_packet_bytes": 65536,
+  "max_client_id_bytes": 1024,
+  "max_topic_bytes": 1024,
+  "max_payload_bytes": 32768,
+  "per_connection_input_slots": 4,
+  "per_connection_output_slots": 4,
+  "writer_queue_slots": 32,
+  "max_commands_in_flight": 16,
+  "max_timers": 512,
+  "receipt_slots": 8192,
+  "partial_packet_timeout_ms": 5000,
+  "connect_timeout_ms": 3000,
+  "write_timeout_ms": 250,
+  "receive_maximum": 8,
+  "remembered_connections": 8,
+  "max_filters_per_packet": 8,
+  "max_subscriptions": 128,
+  "max_outgoing_per_connection": 8,
+  "work_page_items": 8,
+  "max_targets_per_admission": 16,
+  "outgoing_qos": [
+    0,
+    1
+  ],
+  "granted_subscription_qos": [
+    0,
+    1
+  ],
+  "max_volatile_deliveries": 128,
+  "volatile_payload_reference_bytes": 4194304,
+  "outbox_slots": 128,
+  "receipt_window": 1024,
+  "receipt_data_window": 512,
+  "receipt_control_reserve": 512,
+  "receipt_collection_rows": 128,
+  "receipt_collection_trigger": 64,
+  "max_receipt_origins": 64,
+  "receipt_collection_bytes": 2097152,
+  "outgoing_packet_identifier_max": 65535,
+  "outgoing_packet_identifier_probe_limit": 129,
+  "session_expiry_default": 0,
+  "disconnect_session_expiry_interval": {
+    "minimum": 0,
+    "maximum": 4294967295
+  },
+  "lifecycle_transition_effect_slots": 3,
+  "closing_input_slots": 32,
+  "terminal_input_slots": 544,
+  "frame_registration_slots": 208,
+  "pre_connack_packet_slots": 1,
+  "session_shutdown_timeout_ms": 2000,
+  "session_clock": "CLOCK_BOOTTIME",
+  "session_time_unit": "nanoseconds",
+  "session_clock_checkpoint_period_ms": 30000,
+  "session_clock_degraded_after_ms": 31000,
+  "max_session_expiry_timers": 128,
+  "session_expiry_batch": 4,
+  "sqlite_schema_version": 12,
+  "wildcard_subscriptions": true,
+  "no_local": true,
+  "shared_subscriptions": false,
+  "subscription_identifiers": false,
+  "retain_as_published": true,
+  "retain_handling": [
+    0,
+    1,
+    2
+  ],
+  "max_retained_topics": 32,
+  "max_retained_bytes": 1048576,
+  "max_replay_candidates": 256,
+  "live_overlap_policy": "one-per-session",
+  "retained_replay_overlap_policy": "one-per-filter-occurrence-and-topic",
+  "message_expiry": true,
+  "message_expiry_interval": {
+    "minimum": 0,
+    "maximum": 4294967295
+  },
+  "message_expiry_scan_ms": 100,
+  "message_expiry_batch": 4,
+  "message_expiry_policy": "quarantine-on-unknown-origin",
+  "message_expiry_time_unit": "unsupported",
+  "will_qos": [
+    1
+  ],
+  "will_retain": true,
+  "will_delay_interval": [
+    0
+  ],
+  "will_message_expiry": false,
+  "max_will_intents": 256,
+  "max_will_bytes": 8388608,
+  "max_will_topic_bytes": 1024,
+  "max_will_payload_bytes": 32768
+}

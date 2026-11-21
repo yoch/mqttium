@@ -3,13 +3,64 @@
 //! An observed absence is not a certain rejection: a command may still sit in
 //! a queue while a read finds no receipt. Only a durable fence ordered with
 //! the writer turns "absent" into `RejectedCertain`.
+//!
+//! The outcomes of opening an epoch, and what start-up does with them,
+//! are in `opening` (ADR 0009).
 
 use crate::capacity::Resource;
-use crate::ids::{ExchangeId, PublicationId};
+use crate::ids::{
+    DeliveryId, ExchangeId, OperationId, OutboundPacketId, PublicationId, Revision, SessionId,
+};
 
 /// The durable facts established by a committed command.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum CommitFacts {
+    WillPublished {
+        will: OperationId,
+        publication: PublicationId,
+    },
+    RetainedQos0Stored {
+        publication: PublicationId,
+    },
+    SessionLifecycle(crate::session::SessionChange),
+    DeliveryConsumed {
+        delivery: DeliveryId,
+        target: SessionId,
+    },
+    SubscriptionsChanged {
+        session: SessionId,
+        route_revision: Revision,
+    },
+    DeliveryClaimed {
+        delivery: DeliveryId,
+        target: SessionId,
+        packet_id: OutboundPacketId,
+        claim: OperationId,
+    },
+    DeliveryFinished {
+        delivery: DeliveryId,
+        target: SessionId,
+        packet_id: OutboundPacketId,
+        claim: OperationId,
+    },
+    DeliveryStarted {
+        delivery: DeliveryId,
+        target: SessionId,
+        packet_id: OutboundPacketId,
+        claim: OperationId,
+    },
+    DeliveryPubrelReady {
+        delivery: DeliveryId,
+        target: SessionId,
+        packet_id: OutboundPacketId,
+        claim: OperationId,
+    },
+    DeliveryExpired {
+        delivery: DeliveryId,
+        target: SessionId,
+        packet_id: OutboundPacketId,
+        claim: OperationId,
+    },
     /// Publication, obligations, inbound QoS 2 state, accounts and receipt
     /// were committed together.
     PublicationAdmitted {
@@ -17,12 +68,17 @@ pub enum CommitFacts {
         exchange: ExchangeId,
     },
     /// The inbound QoS 2 exchange was durably terminated after PUBREL.
-    InboundReleased { exchange: ExchangeId },
+    InboundReleased {
+        exchange: ExchangeId,
+    },
 }
 
 /// Why a command was certainly not executed.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum RejectReason {
+    /// The active-session quota has no free slot. Replacement may reuse its
+    /// own slot atomically; this is not an exhaustion of SessionId identity.
+    SessionCapacityExceeded,
     /// A guard on identities or revisions failed; nothing was admitted.
     PreconditionFailed,
     /// A durable capacity was insufficient; nothing was admitted.
@@ -107,6 +163,10 @@ impl Knowledge {
     /// A late `PendingOrUnknown` never replaces a terminal result, an answer
     /// after collection reopens nothing, a repeated terminal result changes
     /// nothing, and two different terminal results are a fault.
+    #[expect(
+        clippy::result_large_err,
+        reason = "a contradiction preserves both complete terminal facts without allocation"
+    )]
     pub fn observe(self, reported: StoreOutcome) -> Result<Self, ContradictoryOutcome> {
         let conflict = ContradictoryOutcome {
             established: self,
@@ -131,6 +191,11 @@ impl Knowledge {
         }
     }
 }
+
+pub use crate::opening::{
+    EpochGrant, EpochOpened, EpochOpening, HandOverRefused, NotAwaiting, Observed, OpeningOutcome,
+    OpeningReply, OpeningStage, RecoveredEpochCheck, ReplyRefused, SubmitRefused,
+};
 
 #[cfg(test)]
 mod tests {

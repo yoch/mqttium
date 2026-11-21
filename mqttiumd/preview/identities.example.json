@@ -1,0 +1,19 @@
+{
+  "version": 1,
+  "principals": [
+    {
+      "name": "sensor-1",
+      "certificates": ["0000000000000000000000000000000000000000000000000000000000000001"],
+      "client_ids": ["capteur-1"],
+      "publish": ["atelier/capteur-1"],
+      "subscribe": ["atelier/capteur-1/command"]
+    },
+    {
+      "name": "dashboard",
+      "certificates": ["0000000000000000000000000000000000000000000000000000000000000002"],
+      "client_ids": ["dashboard", "dashboard-check"],
+      "publish": [],
+      "subscribe": ["atelier"]
+    }
+  ]
+}

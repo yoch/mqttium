@@ -1,0 +1,17 @@
+{
+  "format": "mqttiumd.product-event",
+  "schema_version": 1,
+  "seq": "10",
+  "kind": "session_close_replayed",
+  "pid": 1,
+  "connection": "4",
+  "operation": {
+    "incarnation": "1",
+    "epoch": "1",
+    "owner": "0",
+    "sequence": "26"
+  },
+  "details": {
+    "session": "9"
+  }
+}

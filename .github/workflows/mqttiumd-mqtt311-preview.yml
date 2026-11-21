@@ -1,0 +1,141 @@
+name: mqttiumd MQTT 3.1.1 interoperability
+
+# Frozen by mqttiumd ADR 0044: historical evidence of the bounded preview,
+# run on demand only. See mqttiumd/docs/reports/0026-frozen-receptions.md.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: mqttiumd-mqtt311-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  preview:
+    name: Build and receive the MQTT 3.1.1 preview (${{ matrix.machine }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            machine: x86_64
+          - runner: ubuntu-24.04-arm
+            machine: aarch64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 22
+    defaults:
+      run:
+        working-directory: mqttiumd
+    env:
+      MACHINE: ${{ matrix.machine }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+      - id: build
+        name: Build the normal native binary and record the independent TAR digest
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = "$MACHINE"
+          channel="$(sed -n 's/^channel = "\(.*\)"$/\1/p' rust-toolchain.toml)"
+          rustup toolchain install "$channel" --profile minimal
+          out="$RUNNER_TEMP/mqtt311-build"
+          if ! archive=$(python3 tools/build_preview.py "$out" --target-dir "$RUNNER_TEMP/mqtt311-target" --mqtt311); then
+            if test -f "$out/build.log"; then tail -80 "$out/build.log"; fi
+            exit 1
+          fi
+          cp tools/preview_archive.py "$out/"
+          printf 'archive=%s\nsha256=%s\n' "$(basename "$archive")" "$(sha256sum "$archive" | cut -d ' ' -f1)" >> "$GITHUB_OUTPUT"
+          cat "$archive.sha256" >> "$GITHUB_STEP_SUMMARY"
+      - name: Publish the downloadable candidate
+        id: upload
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: mqttiumd-mqtt311-preview-linux-${{ matrix.machine }}
+          path: |
+            ${{ runner.temp }}/mqtt311-build/*.tar.gz
+            ${{ runner.temp }}/mqtt311-build/*.tar.gz.sha256
+            ${{ runner.temp }}/mqtt311-build/preview_archive.py
+          if-no-files-found: error
+      - name: Download the published ZIP by ID and verify its digest
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ARTIFACT_ID: ${{ steps.upload.outputs.artifact-id }}
+          ZIP_SHA256: ${{ steps.upload.outputs.artifact-digest }}
+          ARCHIVE_NAME: ${{ steps.build.outputs.archive }}
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/mqtt311-downloaded"
+          mkdir "$out"
+          archive="$out/artifact.zip"
+          found=false
+          for delay in 0 2 4 8 16; do
+            sleep "$delay"
+            if timeout 30s gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$ARTIFACT_ID/zip" > "$archive" 2> "$out/download.log"; then
+              found=true
+              break
+            fi
+          done
+          if [[ "$found" != true ]]; then
+            echo "Published artifact $ARTIFACT_ID was unavailable after bounded retries" >&2
+            exit 1
+          fi
+          printf '%s  %s\n' "${ZIP_SHA256#sha256:}" "$archive" | sha256sum -c -
+          python3 - "$archive" "$ARCHIVE_NAME" <<'PY'
+          from pathlib import Path
+          import shutil
+          import sys
+          import zipfile
+
+          archive, name = Path(sys.argv[1]), sys.argv[2]
+          assert Path(name).name == name and name.endswith(".tar.gz")
+          with zipfile.ZipFile(archive) as uploaded, uploaded.open(name) as source:
+              with archive.with_name(name).open("xb") as destination:
+                  shutil.copyfileobj(source, destination)
+          PY
+      - name: Run the independently verified download with the reference clients
+        env:
+          ARCHIVE_NAME: ${{ steps.build.outputs.archive }}
+          ARCHIVE_SHA256: ${{ steps.build.outputs.sha256 }}
+          SOURCE_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          observation="$RUNNER_TEMP/mqtt311-extracted"
+          python3 tools/preview_archive.py "$RUNNER_TEMP/mqtt311-downloaded/$ARCHIVE_NAME" \
+            --sha256 "$ARCHIVE_SHA256" --out "$observation"
+          package="$observation/${ARCHIVE_NAME%.tar.gz}"
+          cd "$package"
+          sh build-mosquitto-reference.sh "$RUNNER_TEMP/mqtt311-reference"
+          python3 -m venv "$RUNNER_TEMP/mqtt311-clients"
+          python="$RUNNER_TEMP/mqtt311-clients/bin/python"
+          "$python" -m pip install --disable-pip-version-check -r requirements.txt
+          "$python" mqtt311-demo.py "$RUNNER_TEMP/mqtt311-reception" \
+            "$RUNNER_TEMP/mqtt311-reference/mosquitto-2.0.21" "$ARCHIVE_SHA256"
+          "$python" - "$observation/preflight.json" "$RUNNER_TEMP/mqtt311-reception/mqtt311.json" <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import sys
+          preflight, receipt = (json.loads(Path(path).read_text()) for path in sys.argv[1:])
+          assert receipt["status"] == "PASS"
+          assert receipt["archive_sha256"] == preflight["archive_sha256"] == os.environ["ARCHIVE_SHA256"]
+          assert receipt["broker_source_sha"] == preflight["broker_source_sha"] == os.environ["SOURCE_SHA"]
+          assert receipt["binary_sha256"] == preflight["binary_sha256"]
+          assert all(start["binary_sha256"] == preflight["binary_sha256"] for start in receipt["starts"])
+          assert receipt["machine"] == preflight["machine"] == os.environ["MACHINE"]
+          PY
+      - name: Publish the wire observations and commit evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: mqttiumd-mqtt311-receipt-linux-${{ matrix.machine }}
+          path: |
+            ${{ runner.temp }}/mqtt311-extracted/preflight.json
+            ${{ runner.temp }}/mqtt311-reception/*.json
+            ${{ runner.temp }}/mqtt311-reception/*.jsonl
+            ${{ runner.temp }}/mqtt311-reception/*.log
+          if-no-files-found: warn

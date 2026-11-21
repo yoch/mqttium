@@ -1,0 +1,13 @@
+--- a/mqttiumd/crates/mqttiumd-core/src/owner/will.rs
++++ b/mqttiumd/crates/mqttiumd-core/src/owner/will.rs
+@@ -317,8 +317,9 @@
+         else {
+             return Err(IMPOSSIBLE);
+         };
++        let resolution_operation = self.operation(draft)?;
+         let effect = draft.emit(Effect::ResolveAndFence {
+-            operation: flight.in_flight.operation,
++            operation: resolution_operation,
+         })?;
+         let deadline = draw(&mut draft.counters.deadline, DeadlineToken::checked_next)?;
+         draft.emit(Effect::ArmDeadline {

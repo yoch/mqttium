@@ -1,0 +1,35 @@
+{
+  "format": "mqttiumd.will-core-mutants",
+  "schema_version": 1,
+  "scope": "pure Owner transition controls; not network or independent oracle qualification",
+  "mutants": [
+    {
+      "name": "early-connack",
+      "source": "mqttiumd/crates/mqttiumd-core/src/owner/sessions.rs",
+      "patch": "early-connack.mutant",
+      "test": "owner::will::tests::will_open_waits_for_known_installation_and_closed_transport_keeps_its_disposition",
+      "reason": "connack_before_durable_will_install"
+    },
+    {
+      "name": "old-close-rebound",
+      "source": "mqttiumd/crates/mqttiumd-core/src/owner/sessions.rs",
+      "patch": "old-close-rebound.mutant",
+      "test": "owner::will::tests::an_old_will_close_cannot_cancel_a_new_attachment",
+      "reason": "old_close_affected_new_will_attachment"
+    },
+    {
+      "name": "unknown-new-operation",
+      "source": "mqttiumd/crates/mqttiumd-core/src/owner/will.rs",
+      "patch": "unknown-new-operation.mutant",
+      "test": "owner::will::tests::will_unknown_result_resolves_the_same_operation_and_consumes_once",
+      "reason": "will_resolution_changed_operation_identity"
+    },
+    {
+      "name": "no-local-lost",
+      "source": "mqttiumd/crates/mqttiumd-core/src/owner/routing.rs",
+      "patch": "no-local-lost.mutant",
+      "test": "owner::will::tests::pending_will_admits_after_source_cleanup_without_a_fabricated_exchange",
+      "reason": "no_local_must_compare_frozen_client_id_after_source_cleanup"
+    }
+  ]
+}

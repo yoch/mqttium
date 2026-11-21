@@ -1,0 +1,464 @@
+{
+  "format": "mqttiumd.product-transition-registry",
+  "schema_version": 1,
+  "id": "tcp-qos0-exact-pubsub-v1",
+  "decision": "0026",
+  "scope": "qualifying",
+  "partition_complete": false,
+  "description": "Exact persistent subscriptions with QoS 0/1 grants, outgoing QoS 1, volatile QoS 0 and consumed durable QoS 0. This descriptive subset is incomplete. Existing subscription/QoS 1 rules refer to pubsub reception; QoS 0 rules refer to the separate A-H QoS 0 system reception. No execution, full P1/P2, fixture qualification, accepted ADR or formal runtime proof is inferred.",
+  "rules": [
+    {
+      "id": "subscription.idle.change",
+      "machine": "SubscriptionMutation",
+      "state_class": "Idle",
+      "event_class": "SubscribeOrUnsubscribe",
+      "guard": "Current durable session and revision; bounded exact filters; packet identifier is available in the client sender space.",
+      "next_state_class": "ChangePending",
+      "required_actions": [
+        "PersistChangeSubscriptions",
+        "ArmDeadline"
+      ],
+      "forbidden_actions": [
+        "PositiveSubscriptionAck"
+      ],
+      "reception_groups": [
+        "A",
+        "G",
+        "F"
+      ]
+    },
+    {
+      "id": "subscription.pending.unknown",
+      "machine": "SubscriptionMutation",
+      "state_class": "ChangePending",
+      "event_class": "UnknownOutcome",
+      "guard": "The operation is still uncertain; preserve its canonical recipe and OperationId.",
+      "next_state_class": "ChangePending",
+      "required_actions": [
+        "ResolveAndFence"
+      ],
+      "forbidden_actions": [
+        "NewOperationIdentity",
+        "PositiveSubscriptionAck"
+      ],
+      "reception_groups": [
+        "D"
+      ]
+    },
+    {
+      "id": "subscription.pending.committed",
+      "machine": "SubscriptionMutation",
+      "state_class": "ChangePending",
+      "event_class": "KnownCommit",
+      "guard": "Correlated commit. Install the committed route projection before making the ordered per-filter acknowledgement eligible; reply only to the original live connection generation.",
+      "next_state_class": "Committed",
+      "required_actions": [
+        "InstallRouteProjection",
+        "EligibleSubscriptionAck"
+      ],
+      "forbidden_actions": [
+        "AckBeforeProjection"
+      ],
+      "reception_groups": [
+        "A",
+        "G"
+      ]
+    },
+    {
+      "id": "subscription.pending.rejected",
+      "machine": "SubscriptionMutation",
+      "state_class": "ChangePending",
+      "event_class": "CertainRejection",
+      "guard": "Correlated certain rejection. Existing route projection remains unchanged.",
+      "next_state_class": "Idle",
+      "required_actions": [
+        "NegativeSubscriptionAck"
+      ],
+      "forbidden_actions": [
+        "InstallUncommittedProjection"
+      ],
+      "reception_groups": [
+        "G",
+        "H"
+      ]
+    },
+    {
+      "id": "delivery.queued.claim",
+      "machine": "OutgoingQos1",
+      "state_class": "Queued",
+      "event_class": "WorkDiscovered",
+      "guard": "Bounded durable QoS 1 work; current destination session/revision and available destination/local window. Packet size does not guard the claim: it is checked where the PUBLISH would be emitted, and a claimed delivery larger than the peer Maximum Packet Size is discarded through its guarded FinishDelivery while the connection stays open (record 0025 as amended). No rule of this subset describes that discard.",
+      "next_state_class": "ClaimPending",
+      "required_actions": [
+        "PersistClaimDelivery",
+        "ArmDeadline"
+      ],
+      "forbidden_actions": [
+        "EmitPublish"
+      ],
+      "reception_groups": [
+        "B",
+        "D",
+        "H"
+      ]
+    },
+    {
+      "id": "delivery.claim.unknown",
+      "machine": "OutgoingQos1",
+      "state_class": "ClaimPending",
+      "event_class": "UnknownOutcome",
+      "guard": "The original claim operation remains uncertain; no fresh identity may bypass it.",
+      "next_state_class": "ClaimPending",
+      "required_actions": [
+        "ResolveAndFence"
+      ],
+      "forbidden_actions": [
+        "EmitPublish",
+        "ReleaseOutboundCredit"
+      ],
+      "reception_groups": [
+        "D"
+      ]
+    },
+    {
+      "id": "delivery.claim.committed",
+      "machine": "OutgoingQos1",
+      "state_class": "ClaimPending",
+      "event_class": "KnownCommit",
+      "guard": "Matching delivery, target revision, packet identifier and claim operation are durably known; current connection generation is authorized and the PUBLISH fits the peer Maximum Packet Size. A delivery that does not fit emits nothing at this commit and is discarded at the next work turn.",
+      "next_state_class": "AwaitPuback",
+      "required_actions": [
+        "EligiblePublish"
+      ],
+      "forbidden_actions": [
+        "EndObligation"
+      ],
+      "reception_groups": [
+        "A",
+        "D"
+      ]
+    },
+    {
+      "id": "delivery.await.written",
+      "machine": "OutgoingQos1",
+      "state_class": "AwaitPuback",
+      "event_class": "LocalWriteComplete",
+      "guard": "A matching local write receipt records socket progress; it is not MQTT acknowledgement or proof of client receipt.",
+      "next_state_class": "AwaitPuback",
+      "required_actions": [],
+      "forbidden_actions": [
+        "EndObligation",
+        "ReleaseOutboundCredit",
+        "PeriodicPublishRetry"
+      ],
+      "reception_groups": [
+        "C",
+        "F"
+      ]
+    },
+    {
+      "id": "delivery.await.puback",
+      "machine": "OutgoingQos1",
+      "state_class": "AwaitPuback",
+      "event_class": "DestinationPuback",
+      "guard": "Current connection generation, packet identifier and claim slot match. A valid positive or negative PUBACK terminates the delivery conditionally.",
+      "next_state_class": "FinishPending",
+      "required_actions": [
+        "PersistFinishDelivery",
+        "ArmDeadline"
+      ],
+      "forbidden_actions": [
+        "ReleaseOutboundCredit"
+      ],
+      "reception_groups": [
+        "C",
+        "F"
+      ]
+    },
+    {
+      "id": "delivery.finish.unknown",
+      "machine": "OutgoingQos1",
+      "state_class": "FinishPending",
+      "event_class": "UnknownOutcome",
+      "guard": "The original finish operation remains uncertain; preserve slot and credits while reconciling.",
+      "next_state_class": "FinishPending",
+      "required_actions": [
+        "ResolveAndFence"
+      ],
+      "forbidden_actions": [
+        "ReleaseOutboundCredit",
+        "ReusePacketIdentifier"
+      ],
+      "reception_groups": [
+        "D"
+      ]
+    },
+    {
+      "id": "delivery.finish.committed",
+      "machine": "OutgoingQos1",
+      "state_class": "FinishPending",
+      "event_class": "KnownCommit",
+      "guard": "Correlated conditional finish committed. The store ends the obligation and decrements its payload reference exactly once; the final reference releases the payload.",
+      "next_state_class": "Terminal",
+      "required_actions": [
+        "EndObligation",
+        "ReleaseOutboundCredit"
+      ],
+      "forbidden_actions": [
+        "RecreateObligation"
+      ],
+      "reception_groups": [
+        "D",
+        "G",
+        "H"
+      ]
+    },
+    {
+      "id": "delivery.recovery.claimed",
+      "machine": "OutgoingQos1",
+      "state_class": "AwaitPuback",
+      "event_class": "RecoveredClaim",
+      "guard": "Same durable obligation, claim operation and packet identifier; a new live connection authorizes retransmission with DUP=true. No timer retries PUBLISH on a continuously live MQTT 5 connection.",
+      "next_state_class": "AwaitPuback",
+      "required_actions": [
+        "EligibleDuplicatePublish"
+      ],
+      "forbidden_actions": [
+        "NewClaimIdentity",
+        "RecreateObligation",
+        "PeriodicPublishRetry"
+      ],
+      "reception_groups": [
+        "B",
+        "E",
+        "F",
+        "H"
+      ]
+    },
+    {
+      "id": "delivery.await.closed",
+      "machine": "OutgoingQos1",
+      "state_class": "AwaitPuback",
+      "event_class": "ConnectionClosed",
+      "guard": "Closing or taking over a connection preserves the durable claim. Old generations cannot emit or finish a different occurrence.",
+      "next_state_class": "AwaitPuback",
+      "required_actions": [
+        "PreserveDeliveryIdentity"
+      ],
+      "forbidden_actions": [
+        "EmitOnClosedConnection",
+        "EndObligation"
+      ],
+      "reception_groups": [
+        "E",
+        "F"
+      ]
+    },
+    {
+      "id": "qos0.volatile.input",
+      "machine": "VolatileQos0",
+      "state_class": "Idle",
+      "event_class": "PublishQos0",
+      "guard": "Current source session/connection; non-retained QoS 0, no Packet Identifier and DUP=0; bounded routing cut and immutable shared payload.",
+      "next_state_class": "EmissionPending",
+      "required_actions": [
+        "DrawVolatileOccurrence",
+        "SnapshotDestinations"
+      ],
+      "forbidden_actions": [
+        "PersistPublication",
+        "CreateMqttIdentifier",
+        "ReserveReceiveMaximum",
+        "CreateClaim"
+      ],
+      "reception_groups": [
+        "A",
+        "B",
+        "H"
+      ]
+    },
+    {
+      "id": "qos0.volatile.absent",
+      "machine": "VolatileQos0",
+      "state_class": "EmissionPending",
+      "event_class": "DestinationAbsent",
+      "guard": "The captured target has no authorized live connection; initially QoS 0 publications do not enter its durable queue.",
+      "next_state_class": "Dropped",
+      "required_actions": [
+        "ObserveQos0Drop"
+      ],
+      "forbidden_actions": [
+        "PersistPublication",
+        "ReplayOnReconnect",
+        "SilentEffectLoss"
+      ],
+      "reception_groups": [
+        "B",
+        "C"
+      ]
+    },
+    {
+      "id": "qos0.volatile.pressure",
+      "machine": "VolatileQos0",
+      "state_class": "EmissionPending",
+      "event_class": "BoundedRefusal",
+      "guard": "Capacity, destination size or output pressure refuses the bounded attempt. The owner decides and records a reason; an Outbox effect is retained until the adapter accepts its transfer/refusal protocol.",
+      "next_state_class": "Dropped",
+      "required_actions": [
+        "ObserveQos0Drop"
+      ],
+      "forbidden_actions": [
+        "InventMqttAcknowledgement",
+        "ReplayOnAnotherConnection",
+        "SilentEffectLoss"
+      ],
+      "reception_groups": [
+        "C",
+        "H"
+      ]
+    },
+    {
+      "id": "qos0.volatile.accepted",
+      "machine": "VolatileQos0",
+      "state_class": "EmissionPending",
+      "event_class": "AdapterAccepted",
+      "guard": "One emission responsibility transfers on the captured connection generation. A started TCP frame completes or closes; no periodic or reconnect retry is authorized.",
+      "next_state_class": "Terminal",
+      "required_actions": [
+        "TransferVolatileEmission"
+      ],
+      "forbidden_actions": [
+        "AwaitPuback",
+        "PersistPublication",
+        "ReplayOnReconnect"
+      ],
+      "reception_groups": [
+        "A",
+        "B",
+        "C"
+      ]
+    },
+    {
+      "id": "qos0.durable.consume",
+      "machine": "ConsumedQos0",
+      "state_class": "Queued",
+      "event_class": "WorkDiscovered",
+      "guard": "An admitted QoS 0 obligation and payload have been loaded within volatile budgets. Capture its original destination generation; create no QoS 1 claim or outgoing Packet Identifier.",
+      "next_state_class": "ConsumePending",
+      "required_actions": [
+        "PersistConsumeDelivery",
+        "ArmDeadline"
+      ],
+      "forbidden_actions": [
+        "EmitQos0",
+        "CreateClaim",
+        "AwaitPuback"
+      ],
+      "reception_groups": [
+        "D",
+        "F",
+        "H"
+      ]
+    },
+    {
+      "id": "qos0.durable.unknown",
+      "machine": "ConsumedQos0",
+      "state_class": "ConsumePending",
+      "event_class": "UnknownOutcome",
+      "guard": "The original consumption operation remains uncertain. Absence, timeout and closure neither establish consumption nor authorize emission.",
+      "next_state_class": "ConsumePending",
+      "required_actions": [
+        "ResolveAndFence"
+      ],
+      "forbidden_actions": [
+        "EmitQos0",
+        "NewOperationIdentity"
+      ],
+      "reception_groups": [
+        "D",
+        "E"
+      ]
+    },
+    {
+      "id": "qos0.durable.consumed",
+      "machine": "ConsumedQos0",
+      "state_class": "ConsumePending",
+      "event_class": "KnownCommit",
+      "guard": "The correlated conditional consumption ended the obligation and decremented its reference exactly once. Retain the necessary bytes in RAM; eligibility names only the original live generation.",
+      "next_state_class": "EmissionPending",
+      "required_actions": [
+        "RetainVolatilePayload",
+        "EligibleSingleQos0Emission"
+      ],
+      "forbidden_actions": [
+        "CreateClaim",
+        "ReleaseUnconsumedReference",
+        "ReplayOnReconnect"
+      ],
+      "reception_groups": [
+        "D",
+        "E",
+        "F"
+      ]
+    },
+    {
+      "id": "qos0.durable.closed",
+      "machine": "ConsumedQos0",
+      "state_class": "EmissionPending",
+      "event_class": "OriginalGenerationClosed",
+      "guard": "Consumption is known but its captured destination generation is no longer authorized. Loss is permitted and explicit; another connection gains no emission permission.",
+      "next_state_class": "Dropped",
+      "required_actions": [
+        "ObserveQos0Drop"
+      ],
+      "forbidden_actions": [
+        "EmitOnNewConnection",
+        "RecreateObligation"
+      ],
+      "reception_groups": [
+        "C",
+        "D",
+        "E"
+      ]
+    },
+    {
+      "id": "qos0.durable.transferred",
+      "machine": "ConsumedQos0",
+      "state_class": "EmissionPending",
+      "event_class": "AdapterAccepted",
+      "guard": "The one volatile emission has transferred. Neither a local write receipt nor a repeated store answer recreates this consumed permission.",
+      "next_state_class": "Terminal",
+      "required_actions": [
+        "TransferVolatileEmission"
+      ],
+      "forbidden_actions": [
+        "AwaitPuback",
+        "EmitAgain",
+        "RecreateObligation"
+      ],
+      "reception_groups": [
+        "D",
+        "E",
+        "H"
+      ]
+    },
+    {
+      "id": "qos0.durable.recovery",
+      "machine": "ConsumedQos0",
+      "state_class": "Terminal",
+      "event_class": "RecoveredReceipt",
+      "guard": "Historical consumed operation knowledge is not live work. Only obligations still present before consumption can reappear in bounded work reads.",
+      "next_state_class": "Terminal",
+      "required_actions": [],
+      "forbidden_actions": [
+        "EmitQos0",
+        "RecreateObligation",
+        "CreateClaim"
+      ],
+      "reception_groups": [
+        "E",
+        "H"
+      ]
+    }
+  ]
+}

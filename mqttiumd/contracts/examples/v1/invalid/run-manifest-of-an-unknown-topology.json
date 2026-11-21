@@ -1,0 +1,47 @@
+{
+  "format": "mqttiumd.run-manifest",
+  "schema_version": 1,
+  "artifact": {
+    "sha256": "5555555555555555555555555555555555555555555555555555555555555555",
+    "bytes": "4194304",
+    "built_with": {
+      "rustc": "rustc 1.97.0 (2d8144b78 2026-07-07)",
+      "target": "x86_64-unknown-linux-gnu",
+      "profile": "release",
+      "opt_level": "3",
+      "debug_assertions": false,
+      "rustflags": ""
+    }
+  },
+  "checkout": {
+    "observed": "at-execution",
+    "revision": "0000000000000000000000000000000000000000",
+    "tree_state": "clean",
+    "modified_paths": [],
+    "modifications_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "lockfile_sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+    "workspace_manifest_sha256": "2222222222222222222222222222222222222222222222222222222222222222"
+  },
+  "tools_at_execution": {
+    "rustc": "rustc 1.97.0 (2d8144b78 2026-07-07)",
+    "cargo": "cargo 1.97.0 (c980f4866 2026-06-30)"
+  },
+  "contracts": [
+    {
+      "path": "contracts/schema/v1/primitives.schema.json",
+      "sha256": "3333333333333333333333333333333333333333333333333333333333333333",
+      "bytes": "5382"
+    },
+    {
+      "path": "contracts/v1/profiles.json",
+      "sha256": "4444444444444444444444444444444444444444444444444444444444444444",
+      "bytes": "921"
+    }
+  ],
+  "contracts_digest": "b192b9abd1c9cb1de566d4d15bc471ac1d89c794de1b5af6e0fe11c77a27e2a2",
+  "platform": {
+    "os": "linux",
+    "arch": "x86_64"
+  },
+  "broker": "container"
+}

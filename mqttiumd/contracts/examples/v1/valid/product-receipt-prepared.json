@@ -1,0 +1,17 @@
+{
+  "format": "mqttiumd.product-event",
+  "schema_version": 1,
+  "seq": "9",
+  "kind": "barrier_hit",
+  "pid": 1,
+  "point": "receipt.close.prepared",
+  "command_kind": "ReceiptCollection",
+  "details": {
+    "incarnation": "1",
+    "epoch": "1",
+    "owner": "0",
+    "through": "64",
+    "publication_through": "32",
+    "payload_through": "32"
+  }
+}

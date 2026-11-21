@@ -3,8 +3,10 @@
 //!
 //! This crate is `no_std + alloc` and has no dependency, so it cannot reach
 //! the network, the disk, the system clock, ambient randomness or an async
-//! runtime (DEM-003, ADR 0007). It defines data and ownership rules only; the
-//! transitions live in `mqttiumd-core`.
+//! runtime (DEM-003, ADR 0007). It defines data and ownership rules, and the
+//! two pure decisions of opening an epoch that every store and every
+//! start-up must share: `EpochLedger::open` and the `EpochOpening` state
+//! machine (ADR 0009). The transitions of owners live in `mqttiumd-core`.
 //!
 //! Everything here is contract revision 1, strict but not frozen until the S0
 //! reception (ADR 0004).
@@ -19,6 +21,16 @@ pub mod command;
 pub mod decimal;
 pub mod effects;
 pub mod ids;
+pub mod message_expiry;
+pub mod opening;
 pub mod outcome;
 pub mod packet;
+pub mod pubsub;
+pub mod receipts;
+pub mod session;
 pub mod step;
+pub mod will;
+
+pub mod topic;
+
+pub mod retained;

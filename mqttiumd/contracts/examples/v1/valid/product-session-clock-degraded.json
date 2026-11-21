@@ -1,0 +1,11 @@
+{
+  "format": "mqttiumd.product-event",
+  "schema_version": 1,
+  "seq": "21",
+  "kind": "session_clock_degraded",
+  "pid": 1,
+  "details": {
+    "code": "checkpoint_late",
+    "age_ms": "31001"
+  }
+}

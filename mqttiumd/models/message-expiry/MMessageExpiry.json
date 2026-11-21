@@ -1,0 +1,136 @@
+{
+  "module": "MMessageExpiry.tla",
+  "status": "specification",
+  "summary": "Finite original-publication Message Expiry: immutable domain/tick/interval, guarded first send, started QoS1 ownership through durable Finish, ambiguous-claim recovery and unknown-continuity quarantine.",
+  "issues": [
+    648
+  ],
+  "tests": [],
+  "configs": [
+    {
+      "config": "MMessageExpiry-safety.cfg",
+      "expect": "pass",
+      "invariants": [
+        "TypeOK",
+        "PublicationExpiryFixed",
+        "ReferencesExact",
+        "PayloadLifetimeExact",
+        "ClaimOwnershipExact",
+        "NoStaleFirstSend",
+        "StartedReferenceHeld",
+        "NoAssumedContinuity",
+        "NoLostObligations"
+      ]
+    },
+    {
+      "config": "MMessageExpiry-recovery.cfg",
+      "expect": "pass",
+      "invariants": [
+        "TypeOK",
+        "PublicationExpiryFixed",
+        "ReferencesExact",
+        "PayloadLifetimeExact",
+        "ClaimOwnershipExact",
+        "NoStaleFirstSend",
+        "StartedReferenceHeld",
+        "NoAssumedContinuity",
+        "NoLostObligations"
+      ]
+    },
+    {
+      "config": "MMessageExpiry-domain-change.cfg",
+      "expect": "pass",
+      "invariants": [
+        "TypeOK",
+        "PublicationExpiryFixed",
+        "ReferencesExact",
+        "PayloadLifetimeExact",
+        "ClaimOwnershipExact",
+        "NoStaleFirstSend",
+        "StartedReferenceHeld",
+        "NoAssumedContinuity",
+        "NoLostObligations"
+      ]
+    },
+    {
+      "config": "MMessageExpiry-zero.cfg",
+      "expect": "pass",
+      "invariants": [
+        "TypeOK",
+        "PublicationExpiryFixed",
+        "ReferencesExact",
+        "PayloadLifetimeExact",
+        "ClaimOwnershipExact",
+        "NoStaleFirstSend",
+        "StartedReferenceHeld",
+        "NoAssumedContinuity",
+        "NoLostObligations"
+      ]
+    },
+    {
+      "config": "MMessageExpiry-maximum.cfg",
+      "expect": "pass",
+      "invariants": [
+        "TypeOK",
+        "PublicationExpiryFixed",
+        "ReferencesExact",
+        "PayloadLifetimeExact",
+        "ClaimOwnershipExact",
+        "NoStaleFirstSend",
+        "StartedReferenceHeld",
+        "NoAssumedContinuity",
+        "NoLostObligations"
+      ]
+    },
+    {
+      "config": "MMessageExpiry-mut-ttl-reset.cfg",
+      "expect": "violation",
+      "invariant": "PublicationExpiryFixed"
+    },
+    {
+      "config": "MMessageExpiry-mut-retry-ttl-reset.cfg",
+      "expect": "violation",
+      "invariant": "PublicationExpiryFixed"
+    },
+    {
+      "config": "MMessageExpiry-mut-stale-send.cfg",
+      "expect": "violation",
+      "invariant": "NoStaleFirstSend"
+    },
+    {
+      "config": "MMessageExpiry-mut-free-started-ref.cfg",
+      "expect": "violation",
+      "invariant": "StartedReferenceHeld"
+    },
+    {
+      "config": "MMessageExpiry-mut-domain-assumption.cfg",
+      "expect": "violation",
+      "invariant": "NoAssumedContinuity"
+    },
+    {
+      "config": "MMessageExpiry-reach-past-ttl-finish.cfg",
+      "expect": "violation",
+      "invariant": "NoPastTTLFinishWitness"
+    },
+    {
+      "config": "MMessageExpiry-reach-ambiguous-expiry.cfg",
+      "expect": "violation",
+      "invariant": "NoAmbiguousExpiryWitness"
+    },
+    {
+      "config": "MMessageExpiry-reach-domain-quarantine.cfg",
+      "expect": "violation",
+      "invariant": "NoDomainQuarantineWitness"
+    },
+    {
+      "config": "MMessageExpiry-reach-zero.cfg",
+      "expect": "violation",
+      "invariant": "NoFiniteBoundaryWitness"
+    },
+    {
+      "config": "MMessageExpiry-reach-maximum.cfg",
+      "expect": "violation",
+      "invariant": "NoFiniteBoundaryWitness"
+    }
+  ]
+}

@@ -6,7 +6,16 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use mqttiumd_contract::capacity::PayloadBytes;
 use mqttiumd_contract::decimal::{DecimalError, parse_u64};
+use mqttiumd_contract::effects::{InboundPhase, OrderRefused, RecoveredFact, RecoveryOrder};
+use mqttiumd_contract::ids::{
+    ExchangeGeneration, ExchangeId, InboundPacketId, LogicalOwnerId, OperationId, OperationSeq,
+    PublicationId, PublicationSeq, Revision, RunEpoch, SessionId, StoreIncarnation,
+};
+use mqttiumd_contract::outcome::Knowledge;
+use mqttiumd_contract::packet::{Qos, SharedBytes};
+use mqttiumd_contract::receipts::{ReceiptClosure, ReceiptOrigin};
 use serde_json::Value;
 
 use crate::diagnostic::{Diagnostic, MAX_DIAGNOSTICS, Report, code};
@@ -14,6 +23,42 @@ use crate::manifest::contracts_digest;
 use crate::workspace::{
     REGISTRY_CATALOG, RESULT_MANIFEST, RESULT_SCENARIO, SCENARIO_FIXTURE, Workspace,
 };
+
+/// The first occurrence a fault selects, and whether it selects every
+/// later one (record 0018). An occurrence that is not a 64-bit decimal is
+/// reported by the range check; here it compares as its text.
+fn occurrences(fault: &Value) -> (Option<u64>, &str, bool) {
+    let (key, every) = if fault.get("from_occurrence").is_some() {
+        ("from_occurrence", true)
+    } else {
+        ("occurrence", false)
+    };
+    let raw = text(fault, key);
+    (raw.parse().ok(), raw, every)
+}
+
+/// Whether two faults can select the same occurrence.
+fn same_occurrence(fault: &Value, earlier: &Value) -> bool {
+    let (first, first_raw, every) = occurrences(fault);
+    let (other, other_raw, every_other) = occurrences(earlier);
+    match (every, every_other, first, other) {
+        (true, true, _, _) => true,
+        (true, false, Some(first), Some(other)) => other >= first,
+        (false, true, Some(first), Some(other)) => first >= other,
+        (false, false, _, _) => first_raw == other_raw,
+        _ => true,
+    }
+}
+
+/// How often a fault of a scenario or a result is expected: exactly, or
+/// at least (record 0018).
+fn expectation(fault: &Value) -> (&'static str, &str) {
+    if fault.get("expected_hits_at_least").is_some() {
+        ("at_least", text(fault, "expected_hits_at_least"))
+    } else {
+        ("exactly", text(fault, "expected_hits"))
+    }
+}
 
 fn text<'a>(value: &'a Value, key: &str) -> &'a str {
     value.get(key).and_then(Value::as_str).unwrap_or_default()
@@ -91,13 +136,170 @@ fn requirements_known(
 /// Runs the semantic pass that matches the format of `document`.
 pub fn check(workspace: &Workspace, document: &Value, report: &mut Report) {
     match text(document, "format") {
+        "mqttiumd.product-event" => {
+            u64_at(document, "/seq", &mut report.diagnostics);
+            if document.get("connection").is_some() {
+                u64_at(document, "/connection", &mut report.diagnostics);
+            }
+            for identity in ["operation", "will"] {
+                if document.get(identity).is_some_and(Value::is_object) {
+                    for member in ["incarnation", "epoch", "owner", "sequence"] {
+                        u64_at(
+                            document,
+                            &format!("/{identity}/{member}"),
+                            &mut report.diagnostics,
+                        );
+                    }
+                }
+            }
+            if let Some(puback) = document.get("puback") {
+                decimal_strings(Some(puback), "/puback", &mut report.diagnostics);
+                let outer = document.get("connection").and_then(Value::as_str);
+                let inner = puback
+                    .pointer("/connection/generation")
+                    .and_then(Value::as_str);
+                if let (Some(outer), Some(inner)) = (outer, inner)
+                    && let (Ok(outer), Ok(inner)) = (parse_u64(outer), parse_u64(inner))
+                    && outer != inner
+                {
+                    report.diagnostics.push(Diagnostic::new(
+                        code::EVIDENCE_MISMATCH,
+                        "/connection",
+                        "the envelope generation contradicts its immutable PUBACK observation",
+                    ));
+                }
+            }
+            for member in [
+                "returned_incarnation",
+                "returned_epoch",
+                "returned_owner",
+                "returned_through",
+                "returned_publication_through",
+                "returned_payload_through",
+            ] {
+                let pointer = format!("/details/{member}");
+                if document.pointer(&pointer).is_some() {
+                    u64_at(document, &pointer, &mut report.diagnostics);
+                }
+            }
+            if matches!(
+                text(document, "kind"),
+                "session_changed"
+                    | "will_decided"
+                    | "session_clock_checkpoint"
+                    | "session_clock_degraded"
+                    | "message_expiry_received"
+                    | "message_expiry_sweep"
+                    | "message_expiry_clock"
+                    | "message_transmission_started"
+                    | "message_transmission_not_started"
+                    | "message_expiry_quarantined"
+                    | "message_expiry_applied"
+                    | "message_expiry_result_dropped"
+            ) {
+                for member in ["deadline", "logical", "tick", "age_ms"] {
+                    let pointer = format!("/details/{member}");
+                    if document.pointer(&pointer).is_some_and(Value::is_string) {
+                        u64_at(document, &pointer, &mut report.diagnostics);
+                    }
+                }
+                if let Some(detached) = document.pointer("/details/detached_by") {
+                    if let Some(raw) = detached.as_str() {
+                        for member in raw.split('/') {
+                            if let Err(error) = parse_u64(member) {
+                                let code = if matches!(
+                                    error,
+                                    DecimalError::Overflow | DecimalError::TooLong
+                                ) {
+                                    code::U64_OUT_OF_RANGE
+                                } else {
+                                    code::U64_NOT_CANONICAL
+                                };
+                                report.diagnostics.push(Diagnostic::new(
+                                    code,
+                                    "/details/detached_by",
+                                    "the bounded detachment identity has an invalid component",
+                                ));
+                                break;
+                            }
+                        }
+                    } else {
+                        decimal_strings(
+                            Some(detached),
+                            "/details/detached_by",
+                            &mut report.diagnostics,
+                        );
+                    }
+                }
+            }
+            if text(document, "kind") == "command_submitted"
+                && document
+                    .pointer("/details/expected_session")
+                    .is_some_and(Value::is_string)
+            {
+                u64_at(
+                    document,
+                    "/details/expected_session",
+                    &mut report.diagnostics,
+                );
+            }
+            if matches!(
+                text(document, "kind"),
+                "session_changed"
+                    | "will_decided"
+                    | "session_change_copied"
+                    | "session_change_replayed"
+                    | "session_close_copied"
+                    | "session_close_replayed"
+            ) {
+                for member in ["session", "route_revision", "revision", "retired_session"] {
+                    let pointer = format!("/details/{member}");
+                    if document.pointer(&pointer).is_some_and(Value::is_string) {
+                        u64_at(document, &pointer, &mut report.diagnostics);
+                    }
+                }
+            }
+            if matches!(
+                text(document, "kind"),
+                "receipt_collection_submitted"
+                    | "receipt_collection_result"
+                    | "receipt_collection_applied"
+                    | "log_rotated"
+            ) || text(document, "command_kind") == "ReceiptCollection"
+            {
+                for member in [
+                    "incarnation",
+                    "epoch",
+                    "owner",
+                    "through",
+                    "publication_through",
+                    "payload_through",
+                    "retained",
+                    "retained_from",
+                    "previous_last_seq",
+                    "discarded_through",
+                ] {
+                    let pointer = format!("/details/{member}");
+                    if document.pointer(&pointer).is_some() {
+                        u64_at(document, &pointer, &mut report.diagnostics);
+                    }
+                }
+            }
+        }
         "mqttiumd.scenario" => scenario(workspace, document, &mut report.diagnostics),
         "mqttiumd.fixture" => fixture(workspace, document, &mut report.diagnostics),
         "mqttiumd.transition-registry" => registry(workspace, document, report),
+        "mqttiumd.product-transition-registry" => unique(
+            &entry_names(document, "rules", "id"),
+            "product rule",
+            code::DUPLICATE_NAME,
+            &mut report.diagnostics,
+        ),
         "mqttiumd.transition-catalog" => transition_catalog(document, &mut report.diagnostics),
         "mqttiumd.run-result" => run_result(workspace, document, &mut report.diagnostics),
         "mqttiumd.run-manifest" => run_manifest(document, &mut report.diagnostics),
         "mqttiumd.trace-record" => trace_record(document, &mut report.diagnostics),
+        "mqttiumd.store-snapshot" => store_snapshot(document, &mut report.diagnostics),
         "mqttiumd.requirement-register" => {
             let entries = entry_names(document, "entries", "id");
             unique(
@@ -133,6 +335,25 @@ pub fn check(workspace: &Workspace, document: &Value, report: &mut Report) {
                 code::DUPLICATE_NAME,
                 &mut report.diagnostics,
             );
+            // A point offers only actions that act on what it carries.
+            for (index, point) in items(document, "points").iter().enumerate() {
+                for (action_index, action) in names(point, "actions").into_iter().enumerate() {
+                    let fits = match acts_on(action) {
+                        None => false,
+                        Some(subject) => subject.is_none_or(|item| item == text(point, "carries")),
+                    };
+                    if !fits {
+                        report.diagnostics.push(Diagnostic::new(
+                            code::FAULT_ACTION_UNKNOWN,
+                            format!("/points/{index}/actions/{action_index}"),
+                            format!(
+                                "{action:?} is not an action on a {}",
+                                text(point, "carries")
+                            ),
+                        ));
+                    }
+                }
+            }
         }
         "mqttiumd.profile-catalog" => {
             let entries = entry_names(document, "profiles", "id");
@@ -156,6 +377,43 @@ fn entry_names<'a>(document: &'a Value, list: &str, key: &str) -> Vec<(String, &
 }
 
 // ------------------------------------------------------------------ scenario
+
+/// What an action of an injection point acts on: `Some(None)` for an action
+/// that fits any point, `None` for a name outside the vocabulary.
+fn acts_on(action: &str) -> Option<Option<&'static str>> {
+    match action {
+        "barrier" => Some(None),
+        "hold_command" | "refuse_fence" => Some(Some("command")),
+        "drop_result" | "delay_result" | "duplicate_result" => Some(Some("result")),
+        _ => None,
+    }
+}
+
+/// What a fault keeps until a step hands it over, if its action holds
+/// anything. A barrier keeps the adapter where it stopped until
+/// `LeaveBarrier`.
+fn held_item(action: &str) -> Option<&'static str> {
+    match action {
+        "hold_command" => Some("command"),
+        "delay_result" => Some("result"),
+        "barrier" => Some("barrier"),
+        _ => None,
+    }
+}
+
+/// Whether a fault holds the command or result it stopped, as the steps
+/// read so far establish it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Held {
+    /// No step has driven the broker until the fault was hit.
+    NotYet,
+    /// The fault was hit and nothing took the item away.
+    Yes,
+    /// A step released or delivered it.
+    Handed,
+    /// The broker crashed while the fault held it.
+    Destroyed,
+}
 
 fn scenario(workspace: &Workspace, document: &Value, out: &mut Vec<Diagnostic>) {
     let catalogs = workspace.catalogs();
@@ -191,12 +449,55 @@ fn scenario(workspace: &Workspace, document: &Value, out: &mut Vec<Diagnostic>) 
     // One namespace for everything a scenario binds.
     let mut definitions: Vec<(String, &str)> = Vec::new();
     let mut fault_ids = BTreeSet::new();
+    // What each fault keeps once a step waited for its hit (a command, a
+    // result, or nothing), whether it still keeps it, and whether the
+    // scenario expects it to be reached at all.
+    let mut holds: BTreeMap<&str, (Option<&str>, Held, bool)> = BTreeMap::new();
     for (index, fault) in faults.iter().enumerate() {
         let base = format!("/faults/{index}");
-        u64_at(document, &format!("{base}/occurrence"), out);
-        u64_at(document, &format!("{base}/expected_hits"), out);
+        // Record 0018: a repeated fault is reached at least so often; a
+        // repeated delay delivers each answer by its lag, so it holds no
+        // one item a step could hand over.
+        let repeated = fault.get("from_occurrence").is_some();
+        let expected = if repeated {
+            u64_at(document, &format!("{base}/from_occurrence"), out);
+            u64_at(document, &format!("{base}/expected_hits_at_least"), out)
+        } else {
+            u64_at(document, &format!("{base}/occurrence"), out);
+            u64_at(document, &format!("{base}/expected_hits"), out)
+        };
         definitions.push((format!("{base}/id"), text(fault, "id")));
         fault_ids.insert(text(fault, "id"));
+        let item = if repeated {
+            None
+        } else {
+            held_item(text(fault, "action"))
+        };
+        holds
+            .entry(text(fault, "id"))
+            .or_insert((item, Held::NotYet, expected != Some(0)));
+        if item.is_some() && expected.is_some_and(|hits| hits > 1) {
+            out.push(Diagnostic::new(
+                code::HELD_ITEM_MISMATCH,
+                format!("{base}/expected_hits"),
+                "a fault that holds something holds one item: it is reached at most once",
+            ));
+        }
+        if fault.pointer("/match/result_of").is_some()
+            && catalogs
+                .fault_points
+                .get(text(fault, "point"))
+                .is_some_and(|point| point.carries != "result")
+        {
+            out.push(Diagnostic::new(
+                code::FAULT_MATCH_INVALID,
+                format!("{base}/match/result_of"),
+                format!(
+                    "{:?} carries a command; `result_of` selects among results",
+                    text(fault, "point")
+                ),
+            ));
+        }
         if let Some(binding) = fault.get("bind_operation_as").and_then(Value::as_str) {
             definitions.push((format!("{base}/bind_operation_as"), binding));
         }
@@ -207,9 +508,9 @@ fn scenario(workspace: &Workspace, document: &Value, out: &mut Vec<Diagnostic>) 
                 format!("{base}/point"),
                 format!("{point:?} is not a contractual injection point"),
             )),
-            Some(actions) => {
+            Some(offered) => {
                 let action = text(fault, "action");
-                if !actions.contains(action) {
+                if !offered.actions.contains(action) {
                     out.push(Diagnostic::new(
                         code::FAULT_ACTION_UNKNOWN,
                         format!("{base}/action"),
@@ -224,6 +525,76 @@ fn scenario(workspace: &Workspace, document: &Value, out: &mut Vec<Diagnostic>) 
                 code::COMMAND_KIND_UNKNOWN,
                 format!("{base}/match/command_kind"),
                 format!("{kind:?} is not a command kind"),
+            ));
+        }
+    }
+    // Two faults must not select the same command or result: which of them
+    // acts would depend on the store. Selections of one point, one command
+    // kind and compatible bindings overlap when they name the same
+    // occurrence, or when only one of them names the effect or the
+    // publication, because the two then count occurrences over different
+    // sets.
+    let member = |fault: &'_ Value, pointer: &str| -> Option<String> {
+        fault
+            .pointer(pointer)
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+    };
+    let compatible = |left: &Option<String>, right: &Option<String>| {
+        left.is_none() || right.is_none() || left == right
+    };
+    for (index, fault) in faults.iter().enumerate() {
+        for earlier in &faults[..index] {
+            let same = |pointer: &str| member(fault, pointer) == member(earlier, pointer);
+            let effects = (
+                member(fault, "/match/result_of"),
+                member(earlier, "/match/result_of"),
+            );
+            let bindings = (
+                member(fault, "/match/publication_binding"),
+                member(earlier, "/match/publication_binding"),
+            );
+            if same("/point")
+                && same("/match/command_kind")
+                && compatible(&bindings.0, &bindings.1)
+                && compatible(&effects.0, &effects.1)
+                && (same_occurrence(fault, earlier)
+                    || effects.0.is_some() != effects.1.is_some()
+                    || bindings.0.is_some() != bindings.1.is_some())
+            {
+                out.push(Diagnostic::new(
+                    code::FAULT_MATCH_INVALID,
+                    format!("/faults/{index}/match"),
+                    format!(
+                        "{:?} and {:?} can select the same item",
+                        text(earlier, "id"),
+                        text(fault, "id")
+                    ),
+                ));
+            }
+        }
+    }
+    // A fence fault names the resolved operation by its command as the
+    // bench knows it: some fault at the command point selects that command
+    // kind and that publication (record 0015, the fault catalogue).
+    for (index, fault) in faults.iter().enumerate() {
+        if text(fault, "point") != "store.fence.transit" {
+            continue;
+        }
+        let selected = faults.iter().any(|other| {
+            text(other, "point") == "store.command.transit"
+                && member(other, "/match/command_kind") == member(fault, "/match/command_kind")
+                && member(other, "/match/publication_binding")
+                    == member(fault, "/match/publication_binding")
+        });
+        if !selected {
+            out.push(Diagnostic::new(
+                code::FAULT_MATCH_INVALID,
+                format!("/faults/{index}/match"),
+                format!(
+                    "{:?} names a command no fault at store.command.transit selects",
+                    text(fault, "id")
+                ),
             ));
         }
     }
@@ -264,9 +635,79 @@ fn scenario(workspace: &Workspace, document: &Value, out: &mut Vec<Diagnostic>) 
                 reason,
             ));
         }
+        // A step that is already refused where it stands is not judged
+        // further: one misplaced step is one diagnostic.
         match kind {
-            "CrashBroker" => broker_up = false,
+            _ if order_error.is_some() => {}
+            "CrashBroker" => {
+                broker_up = false;
+                // A held command or result lives in the broker process.
+                for (_, state, _) in holds.values_mut() {
+                    if *state == Held::Yes {
+                        *state = Held::Destroyed;
+                    }
+                }
+            }
             "RestartBroker" => broker_up = true,
+            "DriveUntil" => {
+                let binding = step.get("binding").and_then(Value::as_str);
+                if let Some((item, state, expected)) =
+                    binding.and_then(|binding| holds.get_mut(binding))
+                {
+                    if !*expected {
+                        out.push(Diagnostic::new(
+                            code::STEP_ORDER_INVALID,
+                            base.clone(),
+                            "the scenario waits for a fault it expects never to reach",
+                        ));
+                    } else if item.is_some() && *state != Held::NotYet {
+                        out.push(Diagnostic::new(
+                            code::STEP_ORDER_INVALID,
+                            base.clone(),
+                            "a fault that holds something is waited for once",
+                        ));
+                    } else if item.is_some() {
+                        *state = Held::Yes;
+                    }
+                }
+            }
+            "ReleaseHeldCommand" | "DeliverHeldResult" | "LeaveBarrier" => {
+                let wanted = match kind {
+                    "ReleaseHeldCommand" => "command",
+                    "LeaveBarrier" => "barrier",
+                    _ => "result",
+                };
+                let name = text(step, "fault");
+                let pointer = format!("{base}/fault");
+                match holds.get_mut(name) {
+                    None => out.push(Diagnostic::new(
+                        code::BINDING_UNDEFINED,
+                        pointer,
+                        format!("no fault is declared as {name:?}"),
+                    )),
+                    Some((item, _, _)) if *item != Some(wanted) => out.push(Diagnostic::new(
+                        code::HELD_ITEM_MISMATCH,
+                        pointer,
+                        format!("{name:?} holds no {wanted}"),
+                    )),
+                    Some((_, state, _)) => {
+                        let reason = match *state {
+                            Held::Yes => None,
+                            Held::NotYet => Some("no earlier step drives until this fault is hit"),
+                            Held::Handed => Some("an earlier step already handed it over"),
+                            Held::Destroyed => Some("a crash destroyed what the fault held"),
+                        };
+                        match reason {
+                            None => *state = Held::Handed,
+                            Some(reason) => out.push(Diagnostic::new(
+                                code::STEP_ORDER_INVALID,
+                                base.clone(),
+                                format!("the {wanted} of {name:?} cannot be handed over: {reason}"),
+                            )),
+                        }
+                    }
+                }
+            }
             _ => {}
         }
 
@@ -336,7 +777,17 @@ fn fixture(workspace: &Workspace, document: &Value, out: &mut Vec<Diagnostic>) {
     u64_at(document, "/store/incarnation", out);
     if let Some(capacities) = document.get("capacities").and_then(Value::as_object) {
         for name in capacities.keys() {
-            u64_at(document, &format!("/capacities/{name}"), out);
+            let pointer = format!("/capacities/{name}");
+            let value = u64_at(document, &pointer, out);
+            if U32_COMPONENTS.contains(&name.as_str())
+                && value.is_some_and(|value| value > u64::from(u32::MAX))
+            {
+                out.push(Diagnostic::new(
+                    code::U32_OUT_OF_RANGE,
+                    pointer,
+                    "the value exceeds 4294967295",
+                ));
+            }
         }
     }
     let profile = text(document, "profile");
@@ -914,14 +1365,44 @@ fn run_result(workspace: &Workspace, document: &Value, out: &mut Vec<Diagnostic>
         .map(|assertion| text(assertion, "status"))
         .collect();
     let mut injections_reached = true;
-    for index in 0..items(document, "faults").len() {
-        let expected = u64_at(document, &format!("/faults/{index}/expected_hits"), out);
+    for (index, fault) in items(document, "faults").iter().enumerate() {
         let hits = u64_at(document, &format!("/faults/{index}/hits"), out);
         // An injection that was not reached as announced proves nothing.
-        injections_reached &= expected.is_some() && expected == hits;
+        if fault.get("expected_hits_at_least").is_some() {
+            let least = u64_at(
+                document,
+                &format!("/faults/{index}/expected_hits_at_least"),
+                out,
+            );
+            injections_reached &=
+                matches!((least, hits), (Some(least), Some(hits)) if hits >= least);
+        } else {
+            let expected = u64_at(document, &format!("/faults/{index}/expected_hits"), out);
+            injections_reached &= expected.is_some() && expected == hits;
+        }
     }
     for index in 0..items(document, "artifacts").len() {
         u64_at(document, &format!("/artifacts/{index}/bytes"), out);
+    }
+    if document.get("failure_count").is_some() {
+        let count = u64_at(document, "/failure_count", out);
+        let failures = items(document, "failures");
+        for (index, failure) in failures.iter().enumerate() {
+            for member in ["process_incarnation", "record_sequence", "page"] {
+                if failure.get(member).is_some() {
+                    u64_at(document, &format!("/failures/{index}/{member}"), out);
+                }
+            }
+        }
+        if count.is_some_and(|total| {
+            u64::try_from(failures.len()).map_or(true, |length| length != total.min(64))
+        }) {
+            out.push(Diagnostic::new(
+                code::RESULT_INCOMPLETE,
+                "/failures",
+                "the failure list must contain exactly min(failure_count, 64) contexts",
+            ));
+        }
     }
 
     let qualifying = text(document, "qualification") == "qualifying";
@@ -994,9 +1475,13 @@ fn run_result(workspace: &Workspace, document: &Value, out: &mut Vec<Diagnostic>
         }
     };
 
-    // Every assertion of the scenario is mandatory for a run of it: none
-    // may be missing, added, or declared out of scope.
-    let required: BTreeSet<&str> = names(&scenario, "assertions").into_iter().collect();
+    // Every assertion of the scenario is mandatory for a run of it, and so
+    // is every assertion that every run owes: none may be missing, added,
+    // or declared out of scope.
+    let required: BTreeSet<&str> = names(&scenario, "assertions")
+        .into_iter()
+        .chain(workspace.catalogs().every_run.iter().map(String::as_str))
+        .collect();
     let reported: BTreeSet<&str> = items(document, "assertions")
         .iter()
         .map(|assertion| text(assertion, "name"))
@@ -1019,13 +1504,13 @@ fn run_result(workspace: &Workspace, document: &Value, out: &mut Vec<Diagnostic>
             ));
         }
     }
-    let declared: BTreeMap<&str, &str> = items(&scenario, "faults")
+    let declared: BTreeMap<&str, (&str, &str)> = items(&scenario, "faults")
         .iter()
-        .map(|fault| (text(fault, "id"), text(fault, "expected_hits")))
+        .map(|fault| (text(fault, "id"), expectation(fault)))
         .collect();
-    let observed: BTreeMap<&str, &str> = items(document, "faults")
+    let observed: BTreeMap<&str, (&str, &str)> = items(document, "faults")
         .iter()
-        .map(|fault| (text(fault, "id"), text(fault, "expected_hits")))
+        .map(|fault| (text(fault, "id"), expectation(fault)))
         .collect();
     if declared != observed {
         out.push(Diagnostic::new(
@@ -1040,6 +1525,9 @@ fn run_result(workspace: &Workspace, document: &Value, out: &mut Vec<Diagnostic>
 
 fn run_manifest(document: &Value, out: &mut Vec<Diagnostic>) {
     u64_at(document, "/artifact/bytes", out);
+    if document.pointer("/artifact/built_from").is_some() {
+        u64_at(document, "/artifact/built_from/source/bytes", out);
+    }
     for index in 0..items(document, "contracts").len() {
         u64_at(document, &format!("/contracts/{index}/bytes"), out);
     }
@@ -1062,6 +1550,36 @@ fn run_manifest(document: &Value, out: &mut Vec<Diagnostic>) {
             format!("/contracts/{}", index + 1),
             "contract files are listed once each, in path order",
         ));
+    }
+    // The oracle and the generators are identified the same way.
+    for member in ["oracle", "generators"] {
+        let Some(identity) = document.get(member) else {
+            continue;
+        };
+        let files = items(identity, "files");
+        for index in 0..files.len() {
+            u64_at(document, &format!("/{member}/files/{index}/bytes"), out);
+        }
+        let paths: Vec<&str> = files.iter().map(|file| text(file, "path")).collect();
+        if let Some(index) = paths.windows(2).position(|pair| pair[0] >= pair[1]) {
+            out.push(Diagnostic::new(
+                code::EVIDENCE_MISMATCH,
+                format!("/{member}/files/{}", index + 1),
+                "the files of an identity are listed once each, in path order",
+            ));
+        }
+        let listed = contracts_digest(
+            files
+                .iter()
+                .map(|file| (text(file, "sha256"), text(file, "path"))),
+        );
+        if listed != text(identity, "sha256") {
+            out.push(Diagnostic::new(
+                code::EVIDENCE_MISMATCH,
+                format!("/{member}/sha256"),
+                format!("the listed files have the digest {listed}"),
+            ));
+        }
     }
     // The digest must be the digest of the files the manifest lists.
     let listed = contracts_digest(
@@ -1100,31 +1618,428 @@ fn trace_record(document: &Value, out: &mut Vec<Diagnostic>) {
         );
     }
     decimal_strings(document.get("payload"), "/payload", out);
+    message_expiries(document.get("payload"), "/payload", out);
+    if matches!(
+        document.get("kind").and_then(Value::as_str),
+        Some("RecoveryPageRead" | "RecoveryPageDelivered")
+    ) {
+        recovered_facts_order(document, out);
+    }
 }
+
+/// A fact of the given kind for `RecoveryOrder::admit`, which reads only
+/// the kind and, for a route, the topic: the other members are neutral.
+/// `topic_hex` is the topic of a route in lower-case hexadecimal. `None`
+/// for a kind the contract does not know, or a topic that is not hex.
+#[must_use]
+pub fn representative_fact(kind: &str, topic_hex: &str) -> Option<RecoveredFact> {
+    let zero = OperationId::new(
+        StoreIncarnation::new(0),
+        RunEpoch::new(0),
+        LogicalOwnerId::new(0),
+        OperationSeq::new(0),
+    );
+    let publication = PublicationId::new(
+        StoreIncarnation::new(0),
+        RunEpoch::new(0),
+        LogicalOwnerId::new(0),
+        PublicationSeq::new(0),
+    );
+    Some(match kind {
+        "ReceiptFrontier" => {
+            RecoveredFact::ReceiptFrontier(ReceiptClosure::empty(ReceiptOrigin::of(zero)))
+        }
+        "Epoch" => RecoveredFact::Epoch {
+            incarnation: StoreIncarnation::new(0),
+            epoch: RunEpoch::new(0),
+        },
+        "Limits" => RecoveredFact::Limits {
+            max_targets_per_admission: 0,
+            max_topic_bytes: 0,
+            max_payload_bytes: PayloadBytes::new(0),
+        },
+        "RouteTable" => RecoveredFact::RouteTable {
+            revision: Revision::new(0),
+        },
+        "Route" => {
+            let mut topic = Vec::with_capacity(topic_hex.len() / 2);
+            for pair in topic_hex.as_bytes().chunks(2) {
+                let text = core::str::from_utf8(pair).ok()?;
+                topic.push(u8::from_str_radix(text, 16).ok()?);
+            }
+            RecoveredFact::Route {
+                topic: SharedBytes::copy_from(&topic, topic.len()).ok()?,
+                target: SessionId::new(0),
+                target_revision: Revision::new(0),
+                max_qos: Qos::AtMostOnce,
+                options: mqttiumd_contract::pubsub::SubscriptionOptions::DEFAULT,
+            }
+        }
+        "Session" => RecoveredFact::Session {
+            session: SessionId::new(0),
+            client_id: SharedBytes::copy_from(&[], 0).ok()?,
+            revision: Revision::new(0),
+            expiry: mqttiumd_contract::session::SessionExpiry::Never,
+            opened_by: None,
+            detached: None,
+        },
+        "InboundExchange" => RecoveredFact::InboundExchange {
+            exchange: ExchangeId {
+                session: SessionId::new(0),
+                generation: ExchangeGeneration::new(0),
+            },
+            packet_id: InboundPacketId::new(1)?,
+            publication,
+            phase: InboundPhase::AwaitPubrel,
+        },
+        "OutboundDelivery" => RecoveredFact::OutboundDelivery {
+            delivery: mqttiumd_contract::ids::DeliveryId {
+                publication,
+                index: 0,
+            },
+            target: SessionId::new(0),
+            target_revision: Revision::new(0),
+            qos: mqttiumd_contract::packet::Qos::AtLeastOnce,
+            claim: None,
+            expiry: None,
+            started: false,
+        },
+        "Operation" => RecoveredFact::Operation {
+            operation: zero,
+            knowledge: Knowledge::Unknown,
+        },
+        _ => return None,
+    })
+}
+
+/// The facts of one recovery page follow the order of an inventory. The
+/// rule is `RecoveryOrder::admit` of the contract crate (record 0014),
+/// applied here as it is: ranks never decrease, the epoch, the limits and
+/// the route table appear at most once, and routes are sorted by the bytes
+/// of their topic. A refused fact changes nothing for those that follow.
+fn recovered_facts_order(document: &Value, out: &mut Vec<Diagnostic>) {
+    let facts = document
+        .pointer("/payload/facts")
+        .and_then(Value::as_array)
+        .map_or(&[][..], Vec::as_slice);
+    let mut order = RecoveryOrder::new();
+    for (index, fact) in facts.iter().enumerate() {
+        let kind = fact.get("kind").and_then(Value::as_str).unwrap_or_default();
+        let topic = fact
+            .get("topic_hex")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let Some(fact) = representative_fact(kind, topic) else {
+            continue;
+        };
+        let at = format!("/payload/facts/{index}");
+        match order.admit(&fact) {
+            Ok(()) => {}
+            Err(OrderRefused::RankDecreased { previous, found }) => out.push(Diagnostic::new(
+                code::ROWS_OUT_OF_ORDER,
+                format!("{at}/kind"),
+                format!("a {found:?} fact follows a {previous:?} fact"),
+            )),
+            Err(OrderRefused::Repeated(rank)) => out.push(Diagnostic::new(
+                code::DUPLICATE_NAME,
+                format!("{at}/kind"),
+                format!("a second {rank:?} fact"),
+            )),
+            Err(OrderRefused::RoutesUnsorted) => out.push(Diagnostic::new(
+                code::ROWS_OUT_OF_ORDER,
+                format!("{at}/topic_hex"),
+                "the topic of the route sorts before the topic of the route before it",
+            )),
+        }
+    }
+}
+
+/// One component of the key of a snapshot row: a number, or bytes in
+/// hexadecimal, which sort like the bytes they spell.
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
+enum KeyPart {
+    Number(u64),
+    Bytes(String),
+}
+
+/// How one member of a row key is read. The schema says what a member is;
+/// its value never does: topic bytes made of decimal digits are bytes.
+#[derive(Clone, Copy)]
+enum KeyKind {
+    /// A 64-bit quantity as a decimal string.
+    Decimal,
+    /// A small JSON integer.
+    Integer,
+    /// Bytes in lower-case hexadecimal, which sort like the bytes.
+    Bytes,
+    /// A scoped identity: incarnation, epoch, owner, sequence.
+    Scoped,
+}
+
+/// Appends the key components of `value` read as `kind`. `None` when a
+/// number is not one: the range check reports it, and the row is left out
+/// of the order check.
+fn key_parts(value: &Value, kind: KeyKind, out: &mut Vec<KeyPart>) -> Option<()> {
+    match kind {
+        KeyKind::Decimal => out.push(KeyPart::Number(parse_u64(value.as_str()?).ok()?)),
+        KeyKind::Integer => out.push(KeyPart::Number(value.as_u64()?)),
+        KeyKind::Bytes => out.push(KeyPart::Bytes(value.as_str()?.to_owned())),
+        KeyKind::Scoped => {
+            for name in ["incarnation", "epoch", "owner", "sequence"] {
+                key_parts(value.get(name)?, KeyKind::Decimal, out)?;
+            }
+        }
+    }
+    Some(())
+}
+
+/// A store snapshot is checked for form only: every 64-bit member is in
+/// range, no row is listed twice under its key, and rows are in key
+/// order. Whether the rows are sound together is what the oracle asserts,
+/// not what makes a snapshot readable.
+fn store_snapshot(document: &Value, out: &mut Vec<Diagnostic>) {
+    // Table, the members that form its key, and where a diagnostic points
+    // inside a row.
+    /// A table, the members of its row key, and where a diagnostic points.
+    type Table = (
+        &'static str,
+        &'static [(&'static str, KeyKind)],
+        &'static str,
+    );
+    const TABLES: [Table; 12] = [
+        (
+            "/receipt_frontiers",
+            &[
+                ("/origin/incarnation", KeyKind::Decimal),
+                ("/origin/epoch", KeyKind::Decimal),
+                ("/origin/owner", KeyKind::Decimal),
+            ],
+            "/origin",
+        ),
+        ("/sessions", &[("/session", KeyKind::Decimal)], "/session"),
+        ("/wills", &[("/will_id", KeyKind::Scoped)], "/will_id"),
+        ("/retained", &[("/topic_hex", KeyKind::Bytes)], "/topic_hex"),
+        (
+            "/route_table/routes",
+            &[("/topic_hex", KeyKind::Bytes)],
+            "/topic_hex",
+        ),
+        (
+            "/operations",
+            &[("/operation_id", KeyKind::Scoped)],
+            "/operation_id",
+        ),
+        (
+            "/fences",
+            &[("/operation_id", KeyKind::Scoped)],
+            "/operation_id",
+        ),
+        (
+            "/payloads",
+            &[("/payload_id", KeyKind::Scoped)],
+            "/payload_id",
+        ),
+        (
+            "/publications",
+            &[("/publication_id", KeyKind::Scoped)],
+            "/publication_id",
+        ),
+        (
+            "/obligations",
+            &[
+                ("/publication_id", KeyKind::Scoped),
+                ("/index", KeyKind::Integer),
+            ],
+            "",
+        ),
+        (
+            "/inbound_exchanges",
+            &[
+                ("/exchange/session", KeyKind::Decimal),
+                ("/packet_id", KeyKind::Integer),
+            ],
+            "",
+        ),
+        (
+            "/outbound",
+            &[
+                ("/delivery_id/publication_id", KeyKind::Scoped),
+                ("/delivery_id/index", KeyKind::Integer),
+            ],
+            "/delivery_id",
+        ),
+    ];
+    decimal_strings(Some(document), "", out);
+    message_expiries(Some(document), "", out);
+    for (table, key, suffix) in TABLES {
+        let rows = document
+            .pointer(table)
+            .and_then(Value::as_array)
+            .map_or(&[][..], Vec::as_slice);
+        let mut previous: Option<Vec<KeyPart>> = None;
+        for (index, row) in rows.iter().enumerate() {
+            let mut parts = Vec::new();
+            let readable = key.iter().all(|(member, kind)| {
+                row.pointer(member)
+                    .is_some_and(|value| key_parts(value, *kind, &mut parts).is_some())
+            });
+            if !readable {
+                continue;
+            }
+            let problem = match &previous {
+                Some(before) if *before == parts => Some((code::DUPLICATE_NAME, "is listed twice")),
+                Some(before) if *before > parts => Some((
+                    code::ROWS_OUT_OF_ORDER,
+                    "comes after a row of a greater key",
+                )),
+                _ => None,
+            };
+            if let Some((code, what)) = problem {
+                out.push(Diagnostic::new(
+                    code,
+                    format!("{table}/{index}{suffix}"),
+                    format!("the row {what}"),
+                ));
+            }
+            // A row out of order does not move the mark: one misplaced row
+            // is one diagnostic.
+            if previous.as_ref().is_none_or(|before| *before < parts) {
+                previous = Some(parts);
+            }
+        }
+    }
+}
+
+/// Message deadlines must fit the durable nanosecond domain. This checks only
+/// their representation, without deciding freshness or inventing clock authority.
+fn message_expiries(value: Option<&Value>, pointer: &str, out: &mut Vec<Diagnostic>) {
+    match value {
+        Some(Value::Object(members)) => {
+            if let (Some(tick), Some(interval)) = (
+                members
+                    .get("observed")
+                    .and_then(|v| v.get("tick"))
+                    .and_then(Value::as_str),
+                members.get("interval").and_then(Value::as_u64),
+            ) && let Ok(tick) = parse_u64(tick)
+                && interval
+                    .checked_mul(1_000_000_000)
+                    .and_then(|n| tick.checked_add(n))
+                    .is_none()
+            {
+                out.push(Diagnostic::new(
+                    code::U64_OUT_OF_RANGE,
+                    pointer,
+                    "the message expiry deadline exceeds 18446744073709551615 nanoseconds",
+                ));
+            }
+            for (name, member) in members {
+                message_expiries(Some(member), &format!("{pointer}/{name}"), out);
+            }
+        }
+        Some(Value::Array(values)) => {
+            for (index, member) in values.iter().enumerate() {
+                message_expiries(Some(member), &format!("{pointer}/{index}"), out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Names of the members that hold a 64-bit decimal string, in a trace
+/// payload or a snapshot. A test walks the schemas and fails when one of
+/// their 64-bit members is missing here.
+const COMPONENTS: [&str; 51] = [
+    "deadline",
+    "tick",
+    "logical",
+    "source_observation_sequence",
+    "through",
+    "publication_through",
+    "payload_through",
+    "incarnation",
+    "process_incarnation",
+    "epoch",
+    "owner",
+    "sequence",
+    "session",
+    "generation",
+    "record_count",
+    "bytes_confirmed",
+    "bytes_total",
+    "occurrence",
+    "from_occurrence",
+    "expected_hits_at_least",
+    "run_epoch",
+    "time_value",
+    "connection_generation",
+    "ingress_order",
+    "token",
+    "after",
+    "now",
+    "page",
+    "revision",
+    "length",
+    "payload_bytes",
+    "references",
+    "exchange_slots",
+    "receipt_slots",
+    "bytes",
+    "last_opened_epoch",
+    "ticket",
+    "collected_through",
+    "state_revision",
+    "target",
+    "step",
+    "armed_deadlines",
+    "next_session",
+    "source_session",
+    "target_revision",
+    "target_session",
+    "route_revision",
+    "retired",
+    "max_payload_bytes",
+    "max_sessions",
+    "max_route_targets",
+];
+
+/// Names of the members that hold a 32-bit quantity as a decimal string.
+/// The schema-walk test holds this list to the members that refer to the
+/// `u32` primitive.
+const U32_COMPONENTS: [&str; 2] = ["max_targets_per_admission", "max_topic_bytes"];
 
 /// Checks every decimal-looking identity component below `value`. Payload
 /// members that hold 64-bit components are objects of decimal strings.
 fn decimal_strings(value: Option<&Value>, pointer: &str, out: &mut Vec<Diagnostic>) {
-    const COMPONENTS: [&str; 12] = [
-        "incarnation",
-        "epoch",
-        "owner",
-        "sequence",
-        "session",
-        "generation",
-        "record_count",
-        "bytes_confirmed",
-        "bytes_total",
-        "occurrence",
-        "run_epoch",
-        "time_value",
-    ];
-    let Some(Value::Object(members)) = value else {
-        return;
+    let members = match value {
+        Some(Value::Object(members)) => members,
+        // The facts of a recovery page are objects in a list.
+        Some(Value::Array(items)) => {
+            for (index, item) in items.iter().enumerate() {
+                decimal_strings(Some(item), &format!("{pointer}/{index}"), out);
+            }
+            return;
+        }
+        _ => return,
     };
     for (key, member) in members {
         let child = format!("{pointer}/{key}");
         match member {
+            Value::String(raw) if U32_COMPONENTS.contains(&key.as_str()) => match parse_u64(raw) {
+                Ok(value) if value <= u64::from(u32::MAX) => {}
+                Ok(_) | Err(DecimalError::Overflow | DecimalError::TooLong) => {
+                    out.push(Diagnostic::new(
+                        code::U32_OUT_OF_RANGE,
+                        child,
+                        format!("{raw:?} exceeds 4294967295"),
+                    ));
+                }
+                Err(error) => out.push(Diagnostic::new(
+                    code::U64_NOT_CANONICAL,
+                    child,
+                    format!("{raw:?} is not a canonical decimal string ({error:?})"),
+                )),
+            },
             Value::String(raw) if COMPONENTS.contains(&key.as_str()) => match parse_u64(raw) {
                 Ok(_) => {}
                 Err(DecimalError::Overflow | DecimalError::TooLong) => out.push(Diagnostic::new(
@@ -1138,7 +2053,7 @@ fn decimal_strings(value: Option<&Value>, pointer: &str, out: &mut Vec<Diagnosti
                     format!("{raw:?} is not a canonical decimal string ({error:?})"),
                 )),
             },
-            Value::Object(_) => decimal_strings(Some(member), &child, out),
+            Value::Object(_) | Value::Array(_) => decimal_strings(Some(member), &child, out),
             _ => {}
         }
     }
@@ -1146,7 +2061,754 @@ fn decimal_strings(value: Option<&Value>, pointer: &str, out: &mut Vec<Diagnosti
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use super::*;
+
+    #[test]
+    fn message_deadline_overflow_is_not_freshness_or_expiration() {
+        let mut value = serde_json::json!({"expiry": {
+            "observed": {"domain_hex": "ab".repeat(32), "tick": "100"},
+            "interval": u32::MAX,
+        }});
+        let mut out = Vec::new();
+        message_expiries(Some(&value), "", &mut out);
+        assert!(out.is_empty());
+        value["expiry"]["observed"]["tick"] = Value::String(u64::MAX.to_string());
+        message_expiries(Some(&value), "", &mut out);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].code, code::U64_OUT_OF_RANGE);
+        assert_eq!(out[0].pointer, "/expiry");
+    }
+
+    #[test]
+    fn expiry_deadlines_and_anchor_ticks_are_canonical_u64_strings() {
+        for name in ["deadline", "tick", "logical"] {
+            let mut out = Vec::new();
+            decimal_strings(
+                Some(&serde_json::json!({(name): "18446744073709551615"})),
+                "",
+                &mut out,
+            );
+            assert!(out.is_empty());
+            decimal_strings(
+                Some(&serde_json::json!({(name): "18446744073709551616"})),
+                "",
+                &mut out,
+            );
+            assert_eq!(out.len(), 1);
+            assert_eq!(out[0].code, code::U64_OUT_OF_RANGE);
+            out.clear();
+            decimal_strings(Some(&serde_json::json!({(name): "01"})), "", &mut out);
+            assert_eq!(out.len(), 1);
+            assert_eq!(out[0].code, code::U64_NOT_CANONICAL);
+        }
+    }
+
+    /// The rules of the P1 registry and the notes of its validation.
+    fn p1_registry() -> (Value, Report) {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let workspace = Workspace::open(&root, Path::new("contracts/v1")).expect("contracts");
+        let path = "contracts/v1/p1.transitions.json";
+        let bytes = std::fs::read(root.join(path)).expect("registry");
+        let document: Value = serde_json::from_slice(&bytes).expect("JSON");
+        let report = workspace.check_file(Path::new(path));
+        (document, report)
+    }
+
+    /// The rules of one cell, as (guard partition, disposition, required
+    /// effects, forbidden effects).
+    fn cell<'a>(
+        registry: &'a Value,
+        state: &str,
+        event: &str,
+    ) -> Vec<(&'a Value, &'a str, Vec<&'a str>, Vec<&'a str>)> {
+        items(registry, "rules")
+            .iter()
+            .filter(|rule| text(rule, "state_class") == state && text(rule, "event_class") == event)
+            .map(|rule| {
+                (
+                    &rule["guard_partition"],
+                    text(rule, "disposition"),
+                    names(rule, "required_effects"),
+                    names(rule, "forbidden_effects"),
+                )
+            })
+            .collect()
+    }
+
+    fn has_hole(report: &Report, cell: &str) -> bool {
+        report.notes.iter().any(|note| note.contains(cell))
+            || report
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains(cell))
+    }
+
+    /// The Rust reader finds 64-bit members by name. Every member that a
+    /// trace or snapshot schema declares as a `u64` must be in its list:
+    /// one added to a schema and forgotten here would go unchecked.
+    #[test]
+    fn every_64_bit_member_of_the_schemas_is_range_checked() {
+        fn walk(schema: &Value, primitive: &str, found: &mut BTreeSet<String>) {
+            match schema {
+                Value::Object(members) => {
+                    if let Some(Value::Object(properties)) = members.get("properties") {
+                        for (name, property) in properties {
+                            let reference = property.get("$ref").and_then(Value::as_str);
+                            if reference.is_some_and(|target| target.ends_with(primitive)) {
+                                found.insert(name.clone());
+                            }
+                        }
+                    }
+                    members
+                        .values()
+                        .for_each(|value| walk(value, primitive, found));
+                }
+                Value::Array(items) => items.iter().for_each(|value| walk(value, primitive, found)),
+                _ => {}
+            }
+        }
+        let directory = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../contracts/schema/v1");
+        let mut found = BTreeSet::new();
+        let mut narrow = BTreeSet::new();
+        for file in [
+            "trace-record.schema.json",
+            "store-snapshot.schema.json",
+            "fixture.schema.json",
+            "primitives.schema.json",
+        ] {
+            let bytes = std::fs::read(directory.join(file)).expect("schema");
+            let schema: Value = serde_json::from_slice(&bytes).expect("JSON");
+            // The 64-bit capacities of a fixture are checked by pointer,
+            // not by this list.
+            if file != "fixture.schema.json" {
+                walk(&schema, "#/$defs/u64", &mut found);
+            }
+            walk(&schema, "#/$defs/u32", &mut narrow);
+        }
+        assert!(found.len() >= 30, "{found:?}");
+        // Envelope members of a record are checked by pointer.
+        for name in ["record_sequence", "origin_incarnation", "origin_sequence"] {
+            found.remove(name);
+        }
+        let missing: Vec<&String> = found
+            .iter()
+            .filter(|name| !COMPONENTS.contains(&name.as_str()))
+            .collect();
+        assert!(missing.is_empty(), "not range-checked: {missing:?}");
+        // A 32-bit member is bounded by its own list, and only it.
+        let listed: BTreeSet<String> = U32_COMPONENTS
+            .iter()
+            .map(|name| (*name).to_owned())
+            .collect();
+        assert_eq!(narrow, listed);
+        assert!(
+            found.is_disjoint(&narrow),
+            "{:?}",
+            found.intersection(&narrow)
+        );
+    }
+
+    #[test]
+    fn retained_inventory_keys_are_sorted_and_never_repeated() {
+        let row = serde_json::json!({
+            "topic_hex": "7a",
+            "publication_id": {"incarnation":"1", "epoch":"1", "owner":"0", "sequence":"1"},
+            "producer_client_id_hex": "70"
+        });
+        let mut document = serde_json::json!({"retained": [row.clone(), row]});
+        let mut diagnostics = Vec::new();
+        store_snapshot(&document, &mut diagnostics);
+        assert!(
+            diagnostics
+                .iter()
+                .any(|problem| problem.code == code::DUPLICATE_NAME
+                    && problem.pointer.starts_with("/retained/1/"))
+        );
+        document["retained"][1]["topic_hex"] = serde_json::json!("61");
+        diagnostics.clear();
+        store_snapshot(&document, &mut diagnostics);
+        assert!(
+            diagnostics
+                .iter()
+                .any(|problem| problem.code == code::ROWS_OUT_OF_ORDER
+                    && problem.pointer.starts_with("/retained/1/"))
+        );
+        document["retained"][0]["topic_hex"] = serde_json::json!("30");
+        diagnostics.clear();
+        store_snapshot(&document, &mut diagnostics);
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    }
+
+    #[test]
+    fn will_intent_keys_keep_scoped_order_and_reject_duplicates() {
+        let row = serde_json::json!({
+            "will_id": {"incarnation":"1", "epoch":"1", "owner":"0", "sequence":"9"},
+            "source_session": "4"
+        });
+        let mut document = serde_json::json!({"wills": [row.clone(), row]});
+        let mut diagnostics = Vec::new();
+        store_snapshot(&document, &mut diagnostics);
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].code, code::DUPLICATE_NAME);
+        assert_eq!(diagnostics[0].pointer, "/wills/1/will_id");
+        document["wills"][1]["will_id"]["sequence"] = serde_json::json!("8");
+        diagnostics.clear();
+        store_snapshot(&document, &mut diagnostics);
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].code, code::ROWS_OUT_OF_ORDER);
+        document["wills"][1]["will_id"]["sequence"] = serde_json::json!("10");
+        diagnostics.clear();
+        store_snapshot(&document, &mut diagnostics);
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    }
+
+    /// The recipe of the snapshot example is what the contract crate
+    /// calls canonical: decoding and encoding it again gives the same bytes.
+    #[test]
+    fn the_recipe_of_the_snapshot_example_is_canonical() {
+        use mqttiumd_contract::command::Recipe;
+
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let path = "contracts/examples/v1/valid/store-snapshot-after-commit.json";
+        let bytes = std::fs::read(root.join(path)).expect("example");
+        let snapshot: Value = serde_json::from_slice(&bytes).expect("JSON");
+        let hex = snapshot["operations"][0]["recipe_hex"]
+            .as_str()
+            .expect("hex");
+        let recipe: Vec<u8> = (0..hex.len())
+            .step_by(2)
+            .map(|at| u8::from_str_radix(&hex[at..at + 2], 16).expect("hex digit"))
+            .collect();
+        let decoded = Recipe::decode_canonical(&recipe, 4, 256).expect("canonical recipe");
+        let mut encoded = Vec::new();
+        decoded.encode_canonical(&mut encoded).expect("encodes");
+        assert_eq!(encoded, recipe);
+        let Recipe::AdmitPublication(admit) = decoded else {
+            panic!("an admission");
+        };
+        assert_eq!(
+            admit.targets.len(),
+            snapshot["obligations"].as_array().map_or(0, Vec::len)
+        );
+        assert_eq!(admit.source.packet_id.get(), 7);
+    }
+
+    /// ADR 0001, "Replayed PUBLISH": while the outcome of the admission is
+    /// unknown, a PUBLISH of the exchange creates no command and no
+    /// acknowledgement, after a reconnect and on a live connection.
+    #[test]
+    fn a_publish_replayed_while_the_outcome_is_unknown_admits_and_acknowledges_nothing() {
+        let (registry, report) = p1_registry();
+        assert!(report.is_accepted(), "{:?}", report.diagnostics);
+        assert!(!has_hole(
+            &report,
+            "inbound_qos2 AdmissionPending x PublishQos2"
+        ));
+        let rules = cell(&registry, "AdmissionPending", "PublishQos2");
+        let connections: BTreeSet<&str> = rules
+            .iter()
+            .flat_map(|(guard, ..)| names(guard, "connection"))
+            .collect();
+        assert_eq!(
+            connections,
+            BTreeSet::from(["resumed", "same"]),
+            "one row after a reconnect and one on a live connection"
+        );
+        for (guard, disposition, required, forbidden) in rules {
+            assert_eq!(disposition, "TRANSITION", "{guard}");
+            assert!(required.is_empty(), "{guard}: nothing is emitted");
+            assert!(forbidden.contains(&"Persist"), "{guard}: no command");
+            assert!(forbidden.contains(&"EmitPubrec"), "{guard}: no ack");
+        }
+    }
+
+    /// The rule of a cell that covers one guard point, given as
+    /// (dimension, value) pairs. Panics unless exactly one rule covers it.
+    fn rule_at<'a>(
+        registry: &'a Value,
+        state: &str,
+        event: &str,
+        point: &[(&str, &str)],
+    ) -> &'a Value {
+        let covering: Vec<&Value> = items(registry, "rules")
+            .iter()
+            .filter(|rule| text(rule, "state_class") == state && text(rule, "event_class") == event)
+            .filter(|rule| {
+                point.iter().all(|(dimension, value)| {
+                    match rule["guard_partition"].get(*dimension) {
+                        None => true,
+                        Some(values) => values
+                            .as_array()
+                            .is_some_and(|values| values.iter().any(|item| item == value)),
+                    }
+                })
+            })
+            .collect();
+        assert_eq!(
+            covering.len(),
+            1,
+            "{state} x {event} {point:?}: {} rules",
+            covering.len()
+        );
+        covering[0]
+    }
+
+    /// One obligation the specification puts on a cell: the disposition,
+    /// the next state, effects that must be required and effects that must
+    /// be forbidden.
+    struct Expected {
+        state: &'static str,
+        event: &'static str,
+        point: &'static [(&'static str, &'static str)],
+        disposition: &'static str,
+        next: &'static str,
+        required: &'static [&'static str],
+        forbidden: &'static [&'static str],
+    }
+
+    fn check_expectations(expectations: &[Expected]) {
+        let (registry, report) = p1_registry();
+        assert!(report.is_accepted(), "{:?}", report.diagnostics);
+        for expected in expectations {
+            let Expected {
+                state,
+                event,
+                point,
+                ..
+            } = expected;
+            let rule = rule_at(&registry, state, event, point);
+            let context = format!("{state} x {event} {point:?} ({})", text(rule, "id"));
+            assert_eq!(text(rule, "disposition"), expected.disposition, "{context}");
+            assert_eq!(text(rule, "next_state_class"), expected.next, "{context}");
+            assert_eq!(
+                names(rule, "required_effects"),
+                expected.required,
+                "{context}"
+            );
+            for effect in expected.forbidden {
+                assert!(
+                    names(rule, "forbidden_effects").contains(effect),
+                    "{context}: {effect} must be forbidden"
+                );
+            }
+        }
+    }
+
+    const SUFFICIENT: (&str, &str) = ("effect_capacity", "sufficient");
+    const INSUFFICIENT: (&str, &str) = ("effect_capacity", "insufficient");
+    const CURRENT: (&str, &str) = ("identity", "current");
+    const STALE: (&str, &str) = ("identity", "stale");
+    const COMMITTED: (&str, &str) = ("outcome", "committed");
+    const REJECTED: (&str, &str) = ("outcome", "rejected_certain");
+    const UNKNOWN: (&str, &str) = ("outcome", "unknown");
+    const RETIRED: (&str, &str) = ("outcome", "retired");
+
+    /// ARC-011, ADM-005, ADM-006, ACK-001, DEM-010: what the inbound QoS 2
+    /// machine owes outside the nominal path.
+    #[test]
+    fn the_inbound_machine_follows_the_specification_off_the_nominal_path() {
+        check_expectations(&[
+            // An unknown PUBREL never makes a publication (ARC-011).
+            Expected {
+                state: "Absent",
+                event: "Pubrel",
+                point: &[SUFFICIENT],
+                disposition: "REJECT",
+                next: "Absent",
+                required: &["EmitPubcompNotFound"],
+                forbidden: &["Persist", "EmitPubcomp"],
+            },
+            Expected {
+                state: "Absent",
+                event: "Pubrel",
+                point: &[INSUFFICIENT],
+                disposition: "DEFER",
+                next: "Absent",
+                required: &[],
+                forbidden: &["Persist", "EmitPubcompNotFound"],
+            },
+            // A late return of an old operation does not touch the slot.
+            Expected {
+                state: "Absent",
+                event: "AdmissionResult",
+                point: &[STALE, COMMITTED, SUFFICIENT],
+                disposition: "IGNORE_STALE",
+                next: "Absent",
+                required: &[],
+                forbidden: &["Persist", "EmitPubrec"],
+            },
+            Expected {
+                state: "Absent",
+                event: "ReleaseResult",
+                point: &[STALE, COMMITTED, SUFFICIENT],
+                disposition: "IGNORE_STALE",
+                next: "Absent",
+                required: &[],
+                forbidden: &["Persist", "EmitPubcomp"],
+            },
+            // A certain refusal ends the exchange without distribution and
+            // answers as the protocol says (ARC-011).
+            Expected {
+                state: "AdmissionPending",
+                event: "AdmissionResult",
+                point: &[CURRENT, REJECTED, SUFFICIENT],
+                disposition: "TRANSITION",
+                next: "Absent",
+                required: &["EmitPubrecRefusal"],
+                forbidden: &["Persist", "EmitPubrec"],
+            },
+            Expected {
+                state: "AdmissionPending",
+                event: "AdmissionResult",
+                point: &[CURRENT, REJECTED, INSUFFICIENT],
+                disposition: "DEFER",
+                next: "AdmissionPending",
+                required: &[],
+                forbidden: &["EmitPubrecRefusal", "EmitPubrec"],
+            },
+            // An unknown result keeps the operation and reconciles.
+            Expected {
+                state: "AdmissionPending",
+                event: "AdmissionResult",
+                point: &[CURRENT, UNKNOWN, SUFFICIENT],
+                disposition: "TRANSITION",
+                next: "AdmissionPending",
+                required: &[],
+                forbidden: &["Persist", "EmitPubrec", "EmitPubrecRefusal"],
+            },
+            // The commit of an older exchange does not acknowledge this one.
+            Expected {
+                state: "AdmissionPending",
+                event: "AdmissionResult",
+                point: &[STALE, COMMITTED, SUFFICIENT],
+                disposition: "IGNORE_STALE",
+                next: "AdmissionPending",
+                required: &[],
+                forbidden: &["Persist", "EmitPubrec"],
+            },
+            // PUBREL never creates the initial distribution (ADM-005).
+            Expected {
+                state: "AdmissionPending",
+                event: "Pubrel",
+                point: &[SUFFICIENT],
+                disposition: "CLOSE",
+                next: "AdmissionPending",
+                required: &["CloseConnection"],
+                forbidden: &["Persist", "EmitPubcomp", "EmitPubcompNotFound"],
+            },
+            // Terminal knowledge never regresses; a contradiction is a fault.
+            Expected {
+                state: "AwaitPubrel",
+                event: "AdmissionResult",
+                point: &[CURRENT, COMMITTED, SUFFICIENT],
+                disposition: "IGNORE_STALE",
+                next: "AwaitPubrel",
+                required: &[],
+                forbidden: &["Persist", "EmitPubrec"],
+            },
+            Expected {
+                state: "AwaitPubrel",
+                event: "AdmissionResult",
+                point: &[CURRENT, REJECTED, SUFFICIENT],
+                disposition: "FAULT",
+                next: "AwaitPubrel",
+                required: &[],
+                forbidden: &["Persist", "EmitPubrec", "EmitPubrecRefusal"],
+            },
+            Expected {
+                state: "ReleasePending",
+                event: "AdmissionResult",
+                point: &[CURRENT, REJECTED, INSUFFICIENT],
+                disposition: "FAULT",
+                next: "ReleasePending",
+                required: &[],
+                forbidden: &["Persist", "EmitPubcomp"],
+            },
+            // A replayed PUBREL asks for no second release (ADM-005).
+            Expected {
+                state: "ReleasePending",
+                event: "Pubrel",
+                point: &[SUFFICIENT],
+                disposition: "TRANSITION",
+                next: "ReleasePending",
+                required: &[],
+                forbidden: &["Persist", "EmitPubcomp"],
+            },
+            // No second admission during the exchange (ADM-006).
+            Expected {
+                state: "ReleasePending",
+                event: "PublishQos2",
+                point: &[("connection", "same"), SUFFICIENT],
+                disposition: "CLOSE",
+                next: "ReleasePending",
+                required: &["CloseConnection"],
+                forbidden: &["Persist", "EmitPubrec"],
+            },
+            // A fenced release is prepared again under a new identity
+            // (DEM-009); PUBCOMP still waits for a commit (ACK-001).
+            Expected {
+                state: "ReleasePending",
+                event: "ReleaseResult",
+                point: &[CURRENT, REJECTED, ("refusal", "fenced"), SUFFICIENT],
+                disposition: "TRANSITION",
+                next: "ReleasePending",
+                required: &["Persist"],
+                forbidden: &["EmitPubcomp"],
+            },
+            // Any other refusal, or a fence at the bound, stops the owner
+            // (record 0013, line 4): preparing again could loop for ever.
+            Expected {
+                state: "ReleasePending",
+                event: "ReleaseResult",
+                point: &[
+                    CURRENT,
+                    REJECTED,
+                    ("refusal", "fenced_at_bound"),
+                    SUFFICIENT,
+                ],
+                disposition: "FAULT",
+                next: "ReleasePending",
+                required: &[],
+                forbidden: &["Persist", "EmitPubcomp"],
+            },
+            Expected {
+                state: "ReleasePending",
+                event: "ReleaseResult",
+                point: &[CURRENT, REJECTED, ("refusal", "definitive"), INSUFFICIENT],
+                disposition: "FAULT",
+                next: "ReleasePending",
+                required: &[],
+                forbidden: &["Persist", "EmitPubcomp"],
+            },
+            Expected {
+                state: "ReleasePending",
+                event: "ReleaseResult",
+                point: &[CURRENT, UNKNOWN, INSUFFICIENT],
+                disposition: "TRANSITION",
+                next: "ReleasePending",
+                required: &[],
+                forbidden: &["Persist", "EmitPubcomp"],
+            },
+            Expected {
+                state: "ReleasePending",
+                event: "ReleaseResult",
+                point: &[STALE, COMMITTED, SUFFICIENT],
+                disposition: "IGNORE_STALE",
+                next: "ReleasePending",
+                required: &[],
+                forbidden: &["Persist", "EmitPubcomp"],
+            },
+        ]);
+    }
+
+    /// V3-006, DEM-009, DEM-010: an identity is executed at most once, a
+    /// different recipe under it is a fault, and nothing reopens.
+    #[test]
+    fn the_command_machine_never_executes_an_identity_twice() {
+        let mut expectations = Vec::new();
+        for state in [
+            "Submitted",
+            "Indeterminate",
+            "Committed",
+            "RejectedCertain",
+            "Consumed",
+            "ReceiptClosed",
+        ] {
+            expectations.push(Expected {
+                state,
+                event: "Submit",
+                point: &[SUFFICIENT],
+                disposition: "REJECT",
+                next: state,
+                required: &[],
+                forbidden: &["Persist"],
+            });
+        }
+        for state in [
+            "Submitted",
+            "Indeterminate",
+            "Committed",
+            "RejectedCertain",
+            "Consumed",
+        ] {
+            expectations.push(Expected {
+                state,
+                event: "Replay",
+                point: &[("recipe", "different")],
+                disposition: "FAULT",
+                next: state,
+                required: &[],
+                forbidden: &["Persist"],
+            });
+        }
+        for (state, disposition) in [
+            ("Submitted", "IGNORE_STALE"),
+            ("Indeterminate", "IGNORE_STALE"),
+            ("Committed", "IGNORE_STALE"),
+            ("Consumed", "IGNORE_STALE"),
+            ("RejectedCertain", "REJECT"),
+        ] {
+            expectations.push(Expected {
+                state,
+                event: "Replay",
+                point: &[("recipe", "same")],
+                disposition,
+                next: state,
+                required: &[],
+                forbidden: &["Persist"],
+            });
+        }
+        // An identity whose result was collected is closed, not guessed.
+        for state in ["Submitted", "Indeterminate"] {
+            expectations.push(Expected {
+                state,
+                event: "StoreResult",
+                point: &[RETIRED],
+                disposition: "TRANSITION",
+                next: "ReceiptClosed",
+                required: &[],
+                forbidden: &["Persist"],
+            });
+        }
+        for outcome in [COMMITTED, REJECTED, UNKNOWN, RETIRED] {
+            let point: &'static [(&str, &str)] = Box::leak(Box::new([outcome]));
+            expectations.push(Expected {
+                state: "ReceiptClosed",
+                event: "StoreResult",
+                point,
+                disposition: "IGNORE_STALE",
+                next: "ReceiptClosed",
+                required: &[],
+                forbidden: &["Persist"],
+            });
+        }
+        expectations.push(Expected {
+            state: "Consumed",
+            event: "StoreResult",
+            point: &[REJECTED],
+            disposition: "FAULT",
+            next: "Consumed",
+            required: &[],
+            forbidden: &["Persist"],
+        });
+        expectations.push(Expected {
+            state: "RejectedCertain",
+            event: "StoreResult",
+            point: &[REJECTED],
+            disposition: "IGNORE_STALE",
+            next: "RejectedCertain",
+            required: &[],
+            forbidden: &["Persist"],
+        });
+        for event in ["StoreResult", "ResultTimeout", "Replay"] {
+            expectations.push(Expected {
+                state: "Prepared",
+                event,
+                point: &[],
+                disposition: "UNREACHABLE",
+                next: "Prepared",
+                required: &[],
+                forbidden: &["Persist"],
+            });
+        }
+        check_expectations(&expectations);
+    }
+
+    /// A result is current only for a state that waits for it.
+    #[test]
+    fn a_state_that_waits_for_no_operation_has_no_current_result() {
+        let (registry, _) = p1_registry();
+        for (state, event) in [
+            ("Absent", "AdmissionResult"),
+            ("Absent", "ReleaseResult"),
+            ("AdmissionPending", "ReleaseResult"),
+            ("AwaitPubrel", "ReleaseResult"),
+        ] {
+            for outcome in [COMMITTED, REJECTED, UNKNOWN, RETIRED] {
+                for capacity in [SUFFICIENT, INSUFFICIENT] {
+                    let rule = rule_at(&registry, state, event, &[CURRENT, outcome, capacity]);
+                    assert_eq!(
+                        text(rule, "disposition"),
+                        "UNREACHABLE",
+                        "{state} x {event}"
+                    );
+                    let rule = rule_at(&registry, state, event, &[STALE, outcome, capacity]);
+                    assert_eq!(
+                        text(rule, "disposition"),
+                        "IGNORE_STALE",
+                        "{state} x {event}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// V3-006: an old command presented again after its receipt was
+    /// closed is refused, whatever recipe it carries: the stored result is
+    /// gone, and none is invented.
+    #[test]
+    fn a_command_replayed_after_its_receipt_was_closed_is_refused() {
+        let expectations: Vec<Expected> = ["same", "different"]
+            .into_iter()
+            .map(|recipe| Expected {
+                state: "ReceiptClosed",
+                event: "Replay",
+                point: Box::leak(Box::new([("recipe", recipe)])),
+                disposition: "REJECT",
+                next: "ReceiptClosed",
+                required: &[],
+                forbidden: &["Persist"],
+            })
+            .collect();
+        check_expectations(&expectations);
+    }
+
+    /// ADR 0001, "Guards": a deadline for an operation that became terminal
+    /// is ignored as stale; for an unresolved one it starts a resolution
+    /// and arms the next deadline.
+    #[test]
+    fn a_deadline_resolves_an_unresolved_operation_and_is_stale_for_a_terminal_one() {
+        let (registry, report) = p1_registry();
+        for state in ["Committed", "RejectedCertain", "Consumed", "ReceiptClosed"] {
+            assert!(!has_hole(
+                &report,
+                &format!("command {state} x ResultTimeout")
+            ));
+            let rules = cell(&registry, state, "ResultTimeout");
+            assert_eq!(rules.len(), 1, "{state}");
+            let (_, disposition, required, forbidden) = &rules[0];
+            assert_eq!(*disposition, "IGNORE_STALE", "{state}");
+            assert!(required.is_empty(), "{state}");
+            for effect in ["Persist", "ResolveAndFence", "ArmDeadline"] {
+                assert!(forbidden.contains(&effect), "{state}: {effect}");
+            }
+        }
+        for state in ["Submitted", "Indeterminate"] {
+            assert!(!has_hole(
+                &report,
+                &format!("command {state} x ResultTimeout")
+            ));
+            let rules = cell(&registry, state, "ResultTimeout");
+            let resolving: Vec<_> = rules
+                .iter()
+                .filter(|(guard, ..)| names(guard, "effect_capacity") == ["sufficient"])
+                .collect();
+            assert_eq!(resolving.len(), 1, "{state}");
+            let (_, disposition, required, forbidden) = resolving[0];
+            assert_eq!(*disposition, "TRANSITION", "{state}");
+            assert!(required.contains(&"ResolveAndFence"), "{state}");
+            assert!(required.contains(&"ArmDeadline"), "{state}");
+            assert!(forbidden.contains(&"Persist"), "{state}");
+            let deferred: Vec<_> = rules
+                .iter()
+                .filter(|(guard, ..)| names(guard, "effect_capacity") == ["insufficient"])
+                .collect();
+            assert_eq!(deferred.len(), 1, "{state}");
+            assert_eq!(deferred[0].1, "DEFER", "{state}");
+        }
+    }
 
     #[test]
     fn the_size_of_a_guard_domain_is_computed_without_building_it() {

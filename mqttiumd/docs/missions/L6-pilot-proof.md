@@ -91,11 +91,11 @@ bounds covered. A proof that was not run is not reported as run.
 The proof may be developed locally. It is received on a reproducible run
 in CI.
 
-Two defects of `tools/install-tools.sh` are corrected when this lot
-starts, through the integration owner: `present()` ignores the exit code
-of the command it runs and accepts the pinned version as a substring of
-any output; and nothing checks that the tool found is the one `PATH`
-selects for the proof.
+Two defects of `tools/install-tools.sh` were corrected when this lot
+started, on its proposal: the presence check ignored the exit code of the
+command it ran and accepted the pinned version as a substring of any
+output, and nothing checked that the tool found was the one `PATH`
+selects. `tools/test-install-tools.sh` holds the cases.
 
 No change of network settings is needed.
 

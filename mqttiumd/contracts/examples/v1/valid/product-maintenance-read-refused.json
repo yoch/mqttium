@@ -1,0 +1,12 @@
+{
+  "format": "mqttiumd.product-event",
+  "schema_version": 1,
+  "seq": "10",
+  "kind": "runtime_refused",
+  "pid": 1,
+  "cause": "Io",
+  "phase": "Maintenance",
+  "details": {
+    "code": "durable_read"
+  }
+}

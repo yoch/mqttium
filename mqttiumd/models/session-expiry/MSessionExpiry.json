@@ -1,0 +1,72 @@
+{
+  "module": "MSessionExpiry.tla",
+  "status": "specification",
+  "summary": "Finite session expiry: frozen detachment deadlines, monotone boot-domain progress, conservative reanchor and conditional expiry versus reconnect.",
+  "issues": [
+    648
+  ],
+  "tests": [],
+  "configs": [
+    {
+      "config": "MSessionExpiry-safety.cfg",
+      "expect": "pass",
+      "invariants": [
+        "TypeOK",
+        "FixedDetachDeadline",
+        "NoStaleTimer",
+        "NoExpiredResume",
+        "ContinuousDomainProgress",
+        "ActiveSessionPreserved"
+      ]
+    },
+    {
+      "config": "MSessionExpiry-continuity.cfg",
+      "expect": "pass",
+      "invariants": [
+        "TypeOK",
+        "FixedDetachDeadline",
+        "NoStaleTimer",
+        "NoExpiredResume",
+        "ContinuousDomainProgress",
+        "ActiveSessionPreserved"
+      ]
+    },
+    {
+      "config": "MSessionExpiry-domain-change.cfg",
+      "expect": "pass",
+      "invariants": [
+        "TypeOK",
+        "FixedDetachDeadline",
+        "NoStaleTimer",
+        "NoExpiredResume",
+        "ContinuousDomainProgress",
+        "ActiveSessionPreserved"
+      ]
+    },
+    {
+      "config": "MSessionExpiry-mut-deadline-at-commit.cfg",
+      "expect": "violation",
+      "invariant": "FixedDetachDeadline"
+    },
+    {
+      "config": "MSessionExpiry-mut-stale-timer.cfg",
+      "expect": "violation",
+      "invariant": "NoStaleTimer"
+    },
+    {
+      "config": "MSessionExpiry-mut-wait-for-timer.cfg",
+      "expect": "violation",
+      "invariant": "NoExpiredResume"
+    },
+    {
+      "config": "MSessionExpiry-mut-lose-progress.cfg",
+      "expect": "violation",
+      "invariant": "ContinuousDomainProgress"
+    },
+    {
+      "config": "MSessionExpiry-reach-boundary.cfg",
+      "expect": "violation",
+      "invariant": "NoBoundaryWitness"
+    }
+  ]
+}

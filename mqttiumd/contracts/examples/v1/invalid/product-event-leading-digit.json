@@ -1,0 +1,12 @@
+{
+  "format": "mqttiumd.product-event",
+  "schema_version": 1,
+  "seq": "2",
+  "kind": "0qos_dropped",
+  "pid": 1,
+  "details": {
+    "origin": "volatile/1/1/3",
+    "reason": "no_subscribers",
+    "target": ""
+  }
+}

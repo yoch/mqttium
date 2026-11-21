@@ -4,6 +4,8 @@ Status: **Accepted with amendments** (14 November 2026, review of PR yoch/mqttiu
 Applied by lots L1 (transitions), L3 (registry rows, oracle) and L4
 (scenario). Amends DEM-017 and DEM-024; completes DEM-015.
 
+Amended by 0015 (record 0047): step 3 of scenario P1-02b is corrected there.
+
 ## Context
 
 P1-02 as written in DEM-017 drops the commit result and crashes the broker

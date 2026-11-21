@@ -1,0 +1,36 @@
+{
+  "retained_before": "candidate-state",
+  "stored_qos": 1,
+  "database_before_sha256": "cd4d9415e25a0b07472fc200c4b5c031aa1c6c00764db3cf7eb55bf5ff3ceba4",
+  "trials": {
+    "missing": {
+      "check_exit_status": 0,
+      "decision": "ready",
+      "diagnostics": [],
+      "start": {
+        "mtls_connected": true
+      },
+      "unchanged": false,
+      "retained_after_unexpected_start": 0
+    },
+    "empty": {
+      "check_exit_status": 0,
+      "decision": "ready",
+      "diagnostics": [],
+      "start": {
+        "exit_status": 2,
+        "response": {
+          "diagnostics": [],
+          "output": "mqttiumd refused: {\"cause\":\"InvalidData\",\"details\":{\"code\":\"durable_read\"},\"phase\":\"Open\"}\n"
+        },
+        "mtls_connected": false
+      },
+      "unchanged": false
+    }
+  },
+  "status": "FAIL",
+  "failure": "partial_restore_did_not_refuse:candidate_database_missing",
+  "archive_sha256": "d1ca61450d4c969e55f03640543949a0a6f1eb39c1c2de5ae438d8df946fd830",
+  "binary_sha256": "e24c4943767c867b06a92f63f71ef4ff01bdbaa30957808ac856625eb43c9038",
+  "broker_source_sha": "038bfa51c29260cea6f25b21f798e87f1fbc1840"
+}

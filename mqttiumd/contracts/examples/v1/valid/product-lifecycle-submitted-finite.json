@@ -1,0 +1,22 @@
+{
+  "format": "mqttiumd.product-event",
+  "schema_version": 1,
+  "seq": "15",
+  "pid": 1,
+  "kind": "command_submitted",
+  "operation": {
+    "incarnation": "1",
+    "epoch": "1",
+    "owner": "0",
+    "sequence": "28"
+  },
+  "command_kind": "SessionLifecycle",
+  "details": {
+    "action": "Open",
+    "clean_start": false,
+    "expected_session": null,
+    "expiry": {
+      "After": 1
+    }
+  }
+}

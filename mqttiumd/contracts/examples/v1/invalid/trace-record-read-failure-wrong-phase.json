@@ -1,0 +1,19 @@
+{
+  "format": "mqttiumd.trace-record",
+  "schema_version": 1,
+  "run_id": "p1-02-example",
+  "record_sequence": "14",
+  "origin_component": "bench-supervisor",
+  "origin_incarnation": "1",
+  "origin_sequence": "2",
+  "causal_parents": [],
+  "time_domain": "logical-step",
+  "time_value": "14",
+  "kind": "DurableReadFailed",
+  "payload": {
+    "code": "InvalidData",
+    "phase": "KillDrain",
+    "process_incarnation": "2",
+    "page": "1"
+  }
+}

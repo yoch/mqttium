@@ -1,0 +1,12 @@
+{
+  "format": "mqttiumd.product-event",
+  "schema_version": 1,
+  "seq": "10",
+  "kind": "session_change_replayed",
+  "pid": 1,
+  "connection": "4",
+  "details": {
+    "session": "9",
+    "action": "Opened"
+  }
+}

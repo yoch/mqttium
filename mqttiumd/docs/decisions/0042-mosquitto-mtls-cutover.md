@@ -1,0 +1,46 @@
+# ADR 0042 — Checked single-listener Mosquitto cutover
+
+Status: **Accepted** (21 November 2026, decided under the repository owner's
+delegation on the advice of the independent audit of `8e4303d`), as a
+historical decision: it binds the frozen kit and the executable built from
+`51be4079`. A claim for version 0.1 needs the reader of real configurations
+and a reception of its own.
+
+The Linux operator tool accepts an explicit Mosquitto 2.0.21 source profile
+and emits a file/line decision for each directive, identity and ACL grant.
+The supported subset is the loopback mTLS configuration exercised by the
+packaged reference. CFG-001/002/003/006 govern this subset. The operator
+supplies certificate leaves and authorized ClientIDs for each ACL username.
+The checker validates them with the CA and presents their fingerprints.
+The verified start recomputes the plan and passes the checked credentials
+and policy to the native TLS loader using sealed memory files.
+
+Native policies may add exact publish and subscribe topic grants. The prior
+prefix-only fingerprint remains byte-identical for all prefix-only policies.
+A nonempty exact list selects a distinct fingerprint domain and adds both
+sorted exact lists per principal. The offline monotonicity check can cover
+an old exact topic by the same literal or by a new encompassing subtree.
+Replacing a subtree by its root alone reduces the policy and is refused.
+
+Mosquitto may grant a broad subscription and suppress individual forbidden
+deliveries. mqttiumd requires one rule to cover the complete filter at
+SUBACK. The operator can subscribe to the permitted branches separately.
+Each broker retains a private, independent store across the same-address
+handoff. The procedure provides service rollback with the original stored
+state. Application reconciliation governs messages produced during the trial.
+The demonstration and wire comparisons are in preview/CUTOVER.md.
+
+For MIG-001/005/006, plan format v2 inventories the original Mosquitto
+persistence snapshot. The reader distinguishes message records from
+client and retained references. Pending source exchanges block start until
+drained. The final decision binds the plan to a shutdown save and the
+operator's stop confirmation. The source bytes and configuration are checked
+again before opening the candidate. Existing cutover directory markers keep
+their original representation and can reopen their own SQLite database.
+First creation reserves a durable initialization marker and installs the
+secure schema offline. Only after successful initialization does the
+launcher publish the original-format marker and start the broker with an
+existing-database requirement. An incomplete marker, missing database or
+zero-byte database blocks reuse. An incomplete directory can be inspected
+and kept intact while an operator selects a fresh destination. A valid
+existing site is opened without SQLite's create flag.

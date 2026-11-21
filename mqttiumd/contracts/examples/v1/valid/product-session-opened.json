@@ -1,0 +1,26 @@
+{
+  "format": "mqttiumd.product-event",
+  "schema_version": 1,
+  "seq": "11",
+  "kind": "session_changed",
+  "pid": 1,
+  "operation": {
+    "incarnation": "1",
+    "epoch": "1",
+    "owner": "0",
+    "sequence": "26"
+  },
+  "connection": "1",
+  "details": {
+    "action": "Opened",
+    "session": "4",
+    "route_revision": "2",
+    "revision": "1",
+    "session_present": false,
+    "expiry": "OnDisconnect",
+    "retired_session": null,
+    "cancelled_inbound": 0,
+    "cancelled_deliveries": 0,
+    "cancelled_routes": 0
+  }
+}

@@ -1,0 +1,119 @@
+{
+  "format": "mqttiumd.reduced-receive-maximum.v1",
+  "machine": "x86_64",
+  "broker_source_sha": "a675412206c47b491bf15b918ec10f268d18537e",
+  "binary_sha256": "9cffb18fb5cb4ed63e17a5d3d73138a32251cc6d27ab6c6e66e328aa5350d5ec",
+  "starts": [
+    {
+      "name": "reduced-window-AB-cut",
+      "pid": 2153454,
+      "port": 36727,
+      "binary_sha256": "9cffb18fb5cb4ed63e17a5d3d73138a32251cc6d27ab6c6e66e328aa5350d5ec",
+      "sqlite": [
+        26,
+        321057
+      ],
+      "exit_status": -9
+    },
+    {
+      "name": "reduced-window-AB-resume",
+      "pid": 2153474,
+      "port": 46693,
+      "binary_sha256": "9cffb18fb5cb4ed63e17a5d3d73138a32251cc6d27ab6c6e66e328aa5350d5ec",
+      "sqlite": [
+        26,
+        321057
+      ]
+    },
+    {
+      "name": "reduced-window-BA-cut",
+      "pid": 2153485,
+      "port": 39605,
+      "binary_sha256": "9cffb18fb5cb4ed63e17a5d3d73138a32251cc6d27ab6c6e66e328aa5350d5ec",
+      "sqlite": [
+        26,
+        321072
+      ],
+      "exit_status": -9
+    },
+    {
+      "name": "reduced-window-BA-resume",
+      "pid": 2153495,
+      "port": 43481,
+      "binary_sha256": "9cffb18fb5cb4ed63e17a5d3d73138a32251cc6d27ab6c6e66e328aa5350d5ec",
+      "sqlite": [
+        26,
+        321072
+      ]
+    }
+  ],
+  "reduced_receive_maximum": {
+    "reduced-window-AB": {
+      "initial_receive_maximum": 2,
+      "resumed_receive_maximum": 1,
+      "session_present": true,
+      "before_cut": [
+        [
+          "2CB6A9E0A6BA6942000000000000000100000000000000000000000000000101",
+          0,
+          2,
+          1,
+          1,
+          "2CB6A9E0A6BA6942000000000000000100000000000000000000000000000005",
+          0
+        ],
+        [
+          "2CB6A9E0A6BA6942000000000000000100000000000000000000000000000102",
+          0,
+          2,
+          2,
+          2,
+          "2CB6A9E0A6BA694200000000000000010000000000000000000000000000000A",
+          0
+        ]
+      ],
+      "frames": [
+        "3c:0001",
+        "62:0002"
+      ],
+      "second_frame_before_ack": false,
+      "obligations_after_completion": 0
+    },
+    "reduced-window-BA": {
+      "initial_receive_maximum": 2,
+      "resumed_receive_maximum": 1,
+      "session_present": true,
+      "before_cut": [
+        [
+          "B9277E27F9F77271000000000000000100000000000000000000000000000101",
+          0,
+          2,
+          2,
+          1,
+          "B9277E27F9F77271000000000000000100000000000000000000000000000005",
+          0
+        ],
+        [
+          "B9277E27F9F77271000000000000000100000000000000000000000000000102",
+          0,
+          2,
+          1,
+          2,
+          "B9277E27F9F7727100000000000000010000000000000000000000000000000B",
+          0
+        ]
+      ],
+      "frames": [
+        "62:0001",
+        "3c:0002"
+      ],
+      "second_frame_before_ack": false,
+      "obligations_after_completion": 0
+    }
+  },
+  "status": "FAIL",
+  "archive_sha256": "fb4ab860a604bf3a6dd62ed4c7af402b6f7c0ab9139022b0601bd12cf084b95d",
+  "archive_artifact_id": 14563078666,
+  "probe": "preview/rm-pubrel-probe.py",
+  "exit_status": 1
+}

@@ -40,12 +40,16 @@ CONTRACTS = ROOT / "contracts" / "v1"
 INDEX = ROOT / "contracts" / "examples" / "v1" / "index.json"
 
 FORMATS = {
+    "mqttiumd.product-event": "product-event.schema.json",
+    "mqttiumd.product-profile": "product-profile.schema.json",
+    "mqttiumd.product-transition-registry": "product-transitions.schema.json",
     "mqttiumd.scenario": "scenario.schema.json",
     "mqttiumd.fixture": "fixture.schema.json",
     "mqttiumd.trace-record": "trace-record.schema.json",
     "mqttiumd.transition-registry": "transition-registry.schema.json",
     "mqttiumd.run-manifest": "run-manifest.schema.json",
     "mqttiumd.run-result": "run-result.schema.json",
+    "mqttiumd.store-snapshot": "store-snapshot.schema.json",
     "mqttiumd.fault-catalog": "catalogs.schema.json",
     "mqttiumd.profile-catalog": "catalogs.schema.json",
     "mqttiumd.assertion-catalog": "catalogs.schema.json",

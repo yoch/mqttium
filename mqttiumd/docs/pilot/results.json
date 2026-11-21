@@ -1,0 +1,931 @@
+{
+  "clock": {
+    "batch": 4,
+    "domain": "2c74263352407562f400febe38da62ad2b9ee1e95beb1b296e90ebaf42503031",
+    "origin_status": "boottime_namespace_unavailable",
+    "policy": "quarantine-on-unknown-origin",
+    "scan_ms": 100,
+    "socket_write_receipt_slots": 18,
+    "started_proof": "positive-socket-write-then-durable-marker",
+    "terminal_input_slots": 544,
+    "tick": "245429262705096",
+    "time_unit": "nanoseconds"
+  },
+  "comparisons": {
+    "mosquitto": {
+      "binary_sha256": "0929d45b1db70cf3d2b63fa1f6828863518b1d46a26eacdf53f56e937a45a199",
+      "latency": {
+        "acked": 6000,
+        "client_counts": {
+          "received_MQTT_DUP": 0,
+          "submitted": 6000
+        },
+        "client_pending": 0,
+        "deliveries": [
+          {
+            "max_ms": 33.769717,
+            "p50_ms": 0.629816,
+            "p95_ms": 1.187443,
+            "p99_ms": 3.590721,
+            "samples": 6000
+          },
+          {
+            "max_ms": 33.134247,
+            "p50_ms": 0.552795,
+            "p95_ms": 1.082701,
+            "p99_ms": 3.407981,
+            "samples": 6000
+          }
+        ],
+        "errors": [],
+        "puback": {
+          "max_ms": 36.009113,
+          "p50_ms": 0.657908,
+          "p95_ms": 1.217093,
+          "p99_ms": 3.746805,
+          "samples": 6000
+        },
+        "received": [
+          6000,
+          6000
+        ]
+      },
+      "parameters": {
+        "keep_alive_s": 15,
+        "mqtt": 5,
+        "paho_queue_bound": 16,
+        "payload_bytes": 256,
+        "publications_per_second": 50.0,
+        "qos": 1,
+        "receive_maximum": 8,
+        "retained_update_each": 1991,
+        "seconds": 120,
+        "sensors": 8,
+        "subscribers_per_publication": 2,
+        "tls": "TLS 1.3"
+      },
+      "status": "PASS"
+    },
+    "mqttiumd": {
+      "binary_sha256": "9ef097977c2cb86669e11e98d7fbceeac87a4f86fd6a24c7deb76ea9c31bf119",
+      "latency": {
+        "acked": 6000,
+        "client_counts": {
+          "received_MQTT_DUP": 0,
+          "submitted": 6000
+        },
+        "client_pending": 0,
+        "deliveries": [
+          {
+            "max_ms": 27.253548,
+            "p50_ms": 6.806559,
+            "p95_ms": 9.094053,
+            "p99_ms": 11.78166,
+            "samples": 6000
+          },
+          {
+            "max_ms": 27.52591,
+            "p50_ms": 6.992775,
+            "p95_ms": 9.759669,
+            "p99_ms": 12.648927,
+            "samples": 6000
+          }
+        ],
+        "errors": [],
+        "puback": {
+          "max_ms": 16.667277,
+          "p50_ms": 3.256109,
+          "p95_ms": 5.04496,
+          "p99_ms": 6.754868,
+          "samples": 6000
+        },
+        "received": [
+          6000,
+          6000
+        ]
+      },
+      "parameters": {
+        "keep_alive_s": 15,
+        "mqtt": 5,
+        "paho_queue_bound": 16,
+        "payload_bytes": 256,
+        "publications_per_second": 50.0,
+        "qos": 1,
+        "receive_maximum": 8,
+        "retained_update_each": 1991,
+        "seconds": 120,
+        "sensors": 8,
+        "subscribers_per_publication": 2,
+        "tls": "TLS 1.3"
+      },
+      "status": "PASS"
+    }
+  },
+  "crash_comparison": {
+    "mosquitto": {
+      "backend": "mosquitto",
+      "backlog_received": [
+        0,
+        0
+      ],
+      "binary_sha256": "0929d45b1db70cf3d2b63fa1f6828863518b1d46a26eacdf53f56e937a45a199",
+      "burst_duration_ms": 380.501815,
+      "burst_positive_pubacks": 20,
+      "final_process": {
+        "argv": [
+          "/workspace/pilot-qualification/inputs/mosquitto/usr/sbin/mosquitto",
+          "-c",
+          "/workspace/pilot-qualification/mosquitto-crash-compare/mosquitto.conf"
+        ],
+        "pid": 1968200,
+        "requested_signal": "SIGINT",
+        "signalled": true,
+        "wait_status": 0
+      },
+      "kill": {
+        "argv": [
+          "/workspace/pilot-qualification/inputs/mosquitto/usr/sbin/mosquitto",
+          "-c",
+          "/workspace/pilot-qualification/mosquitto-crash-compare/mosquitto.conf"
+        ],
+        "pid": 1968113,
+        "requested_signal": "SIGKILL",
+        "signalled": true,
+        "wait_status": -9
+      },
+      "parameters": {
+        "burst_publications": 20,
+        "burst_rate": 50,
+        "destinations": 2,
+        "payload_bytes": 256,
+        "seconds_before_burst": 31
+      },
+      "retained_is_latest_burst": false,
+      "retained_sha256": "3d741274c5a4f156e80a6580e6afdbb691c1953e3875ec1c6b3b5862e1422ebf",
+      "session_present": [
+        true,
+        true
+      ],
+      "status": "PASS"
+    },
+    "mqttiumd": {
+      "after_drain": {
+        "accounts": {
+          "exchange_slots": 0,
+          "payload_bytes": 256,
+          "receipt_slots": 58,
+          "references": 1
+        },
+        "backlog_by_session": {},
+        "broken_references": 0,
+        "counts": {
+          "fences": 0,
+          "inbound": 0,
+          "obligations": 0,
+          "operations": 58,
+          "outbound": 0,
+          "payloads": 1,
+          "publications": 1,
+          "receipt_origins": 2,
+          "retained": 1,
+          "routes": 3,
+          "sessions": 10,
+          "wills": 0
+        },
+        "freelist_count": 4,
+        "invariants_ok": true,
+        "limits": {
+          "exchange_slots": 128,
+          "payload_bytes": 4194304,
+          "receipt_slots": 8192,
+          "references": 128
+        },
+        "measured": {
+          "exchange_slots": 0,
+          "payload_bytes": 256,
+          "receipt_slots": 58,
+          "references": 1
+        },
+        "page_count": 32,
+        "page_size": 4096,
+        "user_version": 13
+      },
+      "backend": "mqttiumd",
+      "backlog_received": [
+        20,
+        20
+      ],
+      "before_kill": {
+        "accounts": {
+          "exchange_slots": 0,
+          "payload_bytes": 5120,
+          "receipt_slots": 37,
+          "references": 41
+        },
+        "backlog_by_session": {
+          "1": 20,
+          "2": 20
+        },
+        "broken_references": 0,
+        "counts": {
+          "fences": 0,
+          "inbound": 0,
+          "obligations": 40,
+          "operations": 37,
+          "outbound": 0,
+          "payloads": 20,
+          "publications": 20,
+          "receipt_origins": 1,
+          "retained": 1,
+          "routes": 2,
+          "sessions": 10,
+          "wills": 0
+        },
+        "freelist_count": 0,
+        "invariants_ok": true,
+        "limits": {
+          "exchange_slots": 128,
+          "payload_bytes": 4194304,
+          "receipt_slots": 8192,
+          "references": 128
+        },
+        "measured": {
+          "exchange_slots": 0,
+          "payload_bytes": 5120,
+          "receipt_slots": 37,
+          "references": 41
+        },
+        "page_count": 29,
+        "page_size": 4096,
+        "user_version": 13
+      },
+      "binary_sha256": "9ef097977c2cb86669e11e98d7fbceeac87a4f86fd6a24c7deb76ea9c31bf119",
+      "burst_duration_ms": 385.187569,
+      "burst_positive_pubacks": 20,
+      "final_process": {
+        "argv": [
+          "/workspace/pilot-qualification/ci-execution-51be4079/extracted/mqttiumd-preview-51be4079-x86_64-linux/mqttiumd",
+          "--listen",
+          "127.0.0.1:0",
+          "--db",
+          "/workspace/pilot-qualification/mqttiumd-crash-compare/broker.sqlite",
+          "--events",
+          "/workspace/pilot-qualification/mqttiumd-crash-compare/after-crash.jsonl",
+          "--tls-cert",
+          "/tmp/mqttiumd-persistence-compare-0qduhsun/pki/server.crt",
+          "--tls-key",
+          "/tmp/mqttiumd-persistence-compare-0qduhsun/pki/server.key",
+          "--client-ca",
+          "/tmp/mqttiumd-persistence-compare-0qduhsun/pki/ca.crt",
+          "--identities",
+          "/tmp/mqttiumd-persistence-compare-0qduhsun/pki/identities.json"
+        ],
+        "pid": 1968047,
+        "requested_signal": "SIGINT",
+        "signalled": true,
+        "wait_status": 0
+      },
+      "kill": {
+        "argv": [
+          "/workspace/pilot-qualification/ci-execution-51be4079/extracted/mqttiumd-preview-51be4079-x86_64-linux/mqttiumd",
+          "--listen",
+          "127.0.0.1:0",
+          "--db",
+          "/workspace/pilot-qualification/mqttiumd-crash-compare/broker.sqlite",
+          "--events",
+          "/workspace/pilot-qualification/mqttiumd-crash-compare/before-crash.jsonl",
+          "--tls-cert",
+          "/tmp/mqttiumd-persistence-compare-0qduhsun/pki/server.crt",
+          "--tls-key",
+          "/tmp/mqttiumd-persistence-compare-0qduhsun/pki/server.key",
+          "--client-ca",
+          "/tmp/mqttiumd-persistence-compare-0qduhsun/pki/ca.crt",
+          "--identities",
+          "/tmp/mqttiumd-persistence-compare-0qduhsun/pki/identities.json"
+        ],
+        "pid": 1968014,
+        "requested_signal": "SIGKILL",
+        "signalled": true,
+        "wait_status": -9
+      },
+      "parameters": {
+        "burst_publications": 20,
+        "burst_rate": 50,
+        "destinations": 2,
+        "payload_bytes": 256,
+        "seconds_before_burst": 31
+      },
+      "retained_is_latest_burst": true,
+      "retained_sha256": "730a5f859c8f2a6eb1a3b8dbaa78594f6c1c6078c2ad8bd9cb6518ac90c771a3",
+      "session_present": [
+        true,
+        true
+      ],
+      "status": "PASS"
+    }
+  },
+  "decision": "NO-GO",
+  "decision_scope": "50 QoS1 publications/s with the requested persistent offline-dashboard operation",
+  "machine": {
+    "affinity": [
+      0,
+      1,
+      2,
+      3,
+      4
+    ],
+    "cgroup_io": "259:0 rbytes=119058432 wbytes=0 rios=28840 wios=0 dbytes=0 dios=0\n254:0 rbytes=63939231744 wbytes=625425666048 rios=2912617 wios=14754218 dbytes=0 dios=0",
+    "cpu_max": "400000 100000",
+    "cpu_model": "AMD EPYC 9V74 80-Core Processor",
+    "cpuset": "0-4",
+    "free_bytes": 3532959744,
+    "fs": "overlayfs",
+    "glibc": [
+      "glibc",
+      "2.41"
+    ],
+    "inspector_sqlite": "3.46.1",
+    "memory_current": "4507426816",
+    "memory_max": "17179869184",
+    "paho": "2.1.0",
+    "paho_module_sha256": "5a3f0f73b344541828586a90f79a6beecb8e4396d8b81064bc2920c1a853618a",
+    "platform": "Linux-6.18.57-x86_64-with-glibc2.41",
+    "python": "3.13.5",
+    "storage": "overlay[/workspace] overlay",
+    "uname": [
+      "Linux",
+      "92430b1a8840",
+      "6.18.57",
+      "#1 SMP Tue Oct 20 21:56:04 UTC 2026",
+      "x86_64"
+    ]
+  },
+  "normal_end": {
+    "accounts": {
+      "exchange_slots": 0,
+      "payload_bytes": 2048,
+      "receipt_slots": 36,
+      "references": 8
+    },
+    "backlog_by_session": {},
+    "broken_references": 0,
+    "counts": {
+      "fences": 0,
+      "inbound": 0,
+      "obligations": 0,
+      "operations": 36,
+      "outbound": 0,
+      "payloads": 8,
+      "publications": 8,
+      "receipt_origins": 1,
+      "retained": 8,
+      "routes": 11,
+      "sessions": 10,
+      "wills": 0
+    },
+    "freelist_count": 4,
+    "invariants_ok": true,
+    "limits": {
+      "exchange_slots": 128,
+      "payload_bytes": 4194304,
+      "receipt_slots": 8192,
+      "references": 128
+    },
+    "measured": {
+      "exchange_slots": 0,
+      "payload_bytes": 2048,
+      "receipt_slots": 36,
+      "references": 8
+    },
+    "page_count": 31,
+    "page_size": 4096,
+    "user_version": 13
+  },
+  "normal_event_counts": {
+    "Admission_committed": 90000,
+    "Claim_committed": 180000,
+    "Finish_committed": 180000,
+    "SessionOpen_committed": 10,
+    "Subscriptions_committed": 3,
+    "WillEnd_committed": 8,
+    "command_submitted": 450021,
+    "connect_validated": 10,
+    "connection_closed": 10,
+    "connection_opened": 10,
+    "core_finish_observed": 180000,
+    "expiry_inventory": 1,
+    "frame_queued": 270013,
+    "frame_written": 270013,
+    "log_rotated": 79,
+    "message_expiry_clock": 1,
+    "puback_observed": 180000,
+    "publish_validated": 90000,
+    "ready": 1,
+    "receipt_collection_applied": 6980,
+    "receipt_collection_result": 6980,
+    "receipt_collection_submitted": 6980,
+    "receipt_policy": 1,
+    "receive_credit": 90000,
+    "session_cardinality": 1888451,
+    "session_changed": 18,
+    "session_clock_anchor": 1,
+    "session_established": 10,
+    "session_shutdown_completed": 1,
+    "sqlite_configuration": 1,
+    "starting": 1,
+    "stopped": 1,
+    "store_result": 450021,
+    "tls_authenticated": 10,
+    "tls_profile": 1,
+    "will_capabilities": 1,
+    "will_decided": 8,
+    "will_installed": 8,
+    "wire_receive_credit": 89999,
+    "writer_operations_with_write": 450021
+  },
+  "normal_metrics": {
+    "all_samples_invariants": true,
+    "binary": "9ef097977c2cb86669e11e98d7fbceeac87a4f86fd6a24c7deb76ea9c31bf119",
+    "claims_max": 2,
+    "cpu_system_s": 165.08,
+    "cpu_user_s": 341.86,
+    "db_max": 126976,
+    "latency": {
+      "acked": 90000,
+      "client_counts": {
+        "received_MQTT_DUP": 0,
+        "submitted": 90000
+      },
+      "client_pending": 0,
+      "deliveries": [
+        {
+          "max_ms": 327.723314,
+          "p50_ms": 6.837331,
+          "p95_ms": 9.304482,
+          "p99_ms": 12.495478,
+          "samples": 90000
+        },
+        {
+          "max_ms": 328.776731,
+          "p50_ms": 7.052763,
+          "p95_ms": 10.049232,
+          "p99_ms": 13.523203,
+          "samples": 90000
+        }
+      ],
+      "errors": [],
+      "puback": {
+        "max_ms": 308.471753,
+        "p50_ms": 3.295142,
+        "p95_ms": 5.26212,
+        "p99_ms": 7.293008,
+        "samples": 90000
+      },
+      "received": [
+        90000,
+        90000
+      ]
+    },
+    "receipts_max": 64,
+    "refs_max": 10,
+    "rss": {
+      "first": 9452,
+      "last": 8652,
+      "max": 9724,
+      "min": 8648
+    },
+    "samples": 1782,
+    "source": "51be4079f7ee42f46500e993315eddc971f0a8d4",
+    "wal_max": 4169472,
+    "wchar": 14430802882,
+    "write_bytes": 16302505984
+  },
+  "perturbation": {
+    "binary_sha256": "9ef097977c2cb86669e11e98d7fbceeac87a4f86fd6a24c7deb76ea9c31bf119",
+    "broker_crash": {
+      "argv": [
+        "/workspace/pilot-qualification/ci-execution-51be4079/extracted/mqttiumd-preview-51be4079-x86_64-linux/mqttiumd",
+        "--listen",
+        "127.0.0.1:0",
+        "--db",
+        "/workspace/pilot-qualification/corrected-perturb-complete/broker.sqlite",
+        "--events",
+        "/workspace/pilot-qualification/corrected-perturb-complete/broker.jsonl",
+        "--tls-cert",
+        "/tmp/mqttiumd-pilot-faults-dpqx00c4/pki/server.crt",
+        "--tls-key",
+        "/tmp/mqttiumd-pilot-faults-dpqx00c4/pki/server.key",
+        "--client-ca",
+        "/tmp/mqttiumd-pilot-faults-dpqx00c4/pki/ca.crt",
+        "--identities",
+        "/tmp/mqttiumd-pilot-faults-dpqx00c4/pki/identities.json"
+      ],
+      "pid": 1967842,
+      "requested_signal": "SIGKILL",
+      "signalled": true,
+      "wait_status": -9
+    },
+    "children": [
+      {
+        "device": "capteur-8",
+        "event": "application_offline_and_disconnect",
+        "pid": 1967870,
+        "wait": 0
+      },
+      {
+        "device": "capteur-1",
+        "event": "SIGKILL",
+        "pid": 1967849,
+        "wait": -9
+      },
+      {
+        "device": "capteur-2",
+        "event": "SIGKILL",
+        "pid": 1967852,
+        "wait": -9
+      },
+      {
+        "device": "capteur-3",
+        "event": "old_client_after_broker_crash",
+        "pid": 1967855,
+        "wait": -9
+      },
+      {
+        "device": "capteur-4",
+        "event": "old_client_after_broker_crash",
+        "pid": 1967858,
+        "wait": -9
+      },
+      {
+        "device": "capteur-5",
+        "event": "old_client_after_broker_crash",
+        "pid": 1967861,
+        "wait": -9
+      },
+      {
+        "device": "capteur-6",
+        "event": "old_client_after_broker_crash",
+        "pid": 1967864,
+        "wait": -9
+      },
+      {
+        "device": "capteur-7",
+        "event": "old_client_after_broker_crash",
+        "pid": 1967867,
+        "wait": -9
+      }
+    ],
+    "connected": {
+      "accounts": {
+        "exchange_slots": 1,
+        "payload_bytes": 48,
+        "receipt_slots": 35,
+        "references": 17
+      },
+      "backlog_by_session": {
+        "1": 1,
+        "2": 8
+      },
+      "broken_references": 0,
+      "counts": {
+        "fences": 0,
+        "inbound": 0,
+        "obligations": 9,
+        "operations": 35,
+        "outbound": 1,
+        "payloads": 8,
+        "publications": 8,
+        "receipt_origins": 1,
+        "retained": 8,
+        "routes": 2,
+        "sessions": 10,
+        "wills": 8
+      },
+      "freelist_count": 0,
+      "invariants_ok": true,
+      "limits": {
+        "exchange_slots": 128,
+        "payload_bytes": 4194304,
+        "receipt_slots": 8192,
+        "references": 128
+      },
+      "measured": {
+        "exchange_slots": 1,
+        "payload_bytes": 48,
+        "receipt_slots": 35,
+        "references": 17
+      },
+      "page_count": 27,
+      "page_size": 4096,
+      "user_version": 13
+    },
+    "final": {
+      "accounts": {
+        "exchange_slots": 0,
+        "payload_bytes": 55,
+        "receipt_slots": 56,
+        "references": 8
+      },
+      "backlog_by_session": {},
+      "broken_references": 0,
+      "counts": {
+        "fences": 0,
+        "inbound": 0,
+        "obligations": 0,
+        "operations": 56,
+        "outbound": 0,
+        "payloads": 8,
+        "publications": 8,
+        "receipt_origins": 2,
+        "retained": 8,
+        "routes": 2,
+        "sessions": 10,
+        "wills": 0
+      },
+      "freelist_count": 3,
+      "invariants_ok": true,
+      "limits": {
+        "exchange_slots": 128,
+        "payload_bytes": 4194304,
+        "receipt_slots": 8192,
+        "references": 128
+      },
+      "measured": {
+        "exchange_slots": 0,
+        "payload_bytes": 55,
+        "receipt_slots": 56,
+        "references": 8
+      },
+      "page_count": 31,
+      "page_size": 4096,
+      "user_version": 13
+    },
+    "final_process": {
+      "argv": [
+        "/workspace/pilot-qualification/ci-execution-51be4079/extracted/mqttiumd-preview-51be4079-x86_64-linux/mqttiumd",
+        "--listen",
+        "127.0.0.1:0",
+        "--db",
+        "/workspace/pilot-qualification/corrected-perturb-complete/broker.sqlite",
+        "--events",
+        "/workspace/pilot-qualification/corrected-perturb-complete/restarted.jsonl",
+        "--tls-cert",
+        "/tmp/mqttiumd-pilot-faults-dpqx00c4/pki/server.crt",
+        "--tls-key",
+        "/tmp/mqttiumd-pilot-faults-dpqx00c4/pki/server.key",
+        "--client-ca",
+        "/tmp/mqttiumd-pilot-faults-dpqx00c4/pki/ca.crt",
+        "--identities",
+        "/tmp/mqttiumd-pilot-faults-dpqx00c4/pki/identities.json"
+      ],
+      "pid": 1967873,
+      "requested_signal": "SIGINT",
+      "signalled": true,
+      "wait_status": 0
+    },
+    "initial_pid": 1967842,
+    "offline_dashboard_deliveries": 16,
+    "recovered_counts": [
+      6,
+      16
+    ],
+    "recovered_identity_hashes": [
+      [
+        "6b3a1c6765fe4f2edfc32c187ddc2f3bfbd02a71512d0e240db342a31e29bc36",
+        "487dda010c72a23b1a28ef75a317df83ca61b1d6f195ea9052347ef9460d7875",
+        "6e36eca658e0341eafff70fe49d8e001d7cf0cde9286a81891ca9f247d4518bf",
+        "26c3cfff619e4ab784ad9d5e5eb38354237d75d05353f930f77bf0d6a19c7b73",
+        "e767fed947d10d8eea596f755b83b1eb354c80f2a66f8aea4b9d486ca85a1e0f",
+        "0e0044aa7c92e0b55b7c155a050d7a36f75193a13f9abbd5d4760f7b87a95316"
+      ],
+      [
+        "b15079b439d32674ccde83f32f5751e2a04a62cdcdccb60dfdd0079e9ef8676c",
+        "4e0e7ae79f3ffd28abaf18f35a5bf3059f99c910be121e9c2f6845fddc281732",
+        "70b5199b6a86bca34662e41ddb37b19c0dcbf754f0c5aa40a994b4e0a3c3db3d",
+        "f3b70a2524585cb72116ab5cb86860ecadfa1350700546d7f105a90d36dcb00d",
+        "4d31b3079c369f73fd2ac4d4018e1a9ca098af46a49a99250404b3032653f07b",
+        "d15dd137332df2a0fcdf2b0e96763daeed82709d81c780a799ce231e3cfeeaeb",
+        "099cd16205530202ce31bd37df28ba3b2d861a099d644e7350ec5e240c58b4a9",
+        "04f25610e74c609fae8d619693561d8a25befc2e414f4ac4eac8acdd6ed9e482",
+        "0b1710b9c78260e281563223ef997e8e96db2b598429b4c81aaccc3bc003facb",
+        "f68fa01e49c38d2cdcc97d1984e2942b663a98f3930e0ad5da57aa6507b02503",
+        "6b3a1c6765fe4f2edfc32c187ddc2f3bfbd02a71512d0e240db342a31e29bc36",
+        "487dda010c72a23b1a28ef75a317df83ca61b1d6f195ea9052347ef9460d7875",
+        "6e36eca658e0341eafff70fe49d8e001d7cf0cde9286a81891ca9f247d4518bf",
+        "26c3cfff619e4ab784ad9d5e5eb38354237d75d05353f930f77bf0d6a19c7b73",
+        "e767fed947d10d8eea596f755b83b1eb354c80f2a66f8aea4b9d486ca85a1e0f",
+        "0e0044aa7c92e0b55b7c155a050d7a36f75193a13f9abbd5d4760f7b87a95316"
+      ]
+    ],
+    "source_sha": "51be4079f7ee42f46500e993315eddc971f0a8d4",
+    "status": "PASS",
+    "will_admissions": 7
+  },
+  "presence_distributions": {
+    "cleartext": {
+      "keep_alive": {
+        "detection_ms": 1493.178571,
+        "negotiated_seconds": 1
+      },
+      "latencies": {
+        "commit_to_notification_ms": {
+          "max": 20.127539,
+          "p50": 6.741463,
+          "p95": 7.870162,
+          "p99": 9.149172
+        },
+        "end_to_commit_ms": {
+          "max": 9.48676,
+          "p50": 7.335791,
+          "p95": 8.269531,
+          "p99": 9.378781
+        },
+        "qos1_ms": {
+          "max": 6.950021,
+          "p50": 3.340329,
+          "p95": 3.763428,
+          "p99": 4.281028
+        },
+        "tcp_tls_connack_ms": {
+          "max": 10.16179,
+          "p50": 7.801849,
+          "p95": 9.468612,
+          "p99": 10.001734
+        }
+      },
+      "samples": 100
+    },
+    "tls": {
+      "keep_alive": {
+        "detection_ms": 1494.035878,
+        "negotiated_seconds": 1
+      },
+      "latencies": {
+        "commit_to_notification_ms": {
+          "max": 19.80118,
+          "p50": 7.558925,
+          "p95": 9.553242,
+          "p99": 10.23375
+        },
+        "end_to_commit_ms": {
+          "max": 24.182952,
+          "p50": 7.129245,
+          "p95": 8.871339,
+          "p99": 11.309344
+        },
+        "qos1_ms": {
+          "max": 6.59145,
+          "p50": 4.135983,
+          "p95": 5.474352,
+          "p99": 6.513814
+        },
+        "tcp_tls_connack_ms": {
+          "max": 61.441852,
+          "p50": 53.107732,
+          "p95": 57.426858,
+          "p99": 58.696229
+        }
+      },
+      "samples": 100
+    }
+  },
+  "pressure": {
+    "after_drain": {
+      "accounts": {
+        "exchange_slots": 0,
+        "payload_bytes": 0,
+        "receipt_slots": 61,
+        "references": 0
+      },
+      "backlog_by_session": {},
+      "broken_references": 0,
+      "counts": {
+        "fences": 0,
+        "inbound": 0,
+        "obligations": 0,
+        "operations": 61,
+        "outbound": 0,
+        "payloads": 0,
+        "publications": 0,
+        "receipt_origins": 1,
+        "retained": 0,
+        "routes": 2,
+        "sessions": 4,
+        "wills": 0
+      },
+      "freelist_count": 24,
+      "invariants_ok": true,
+      "limits": {
+        "exchange_slots": 128,
+        "payload_bytes": 4194304,
+        "receipt_slots": 8192,
+        "references": 128
+      },
+      "measured": {
+        "exchange_slots": 0,
+        "payload_bytes": 0,
+        "receipt_slots": 61,
+        "references": 0
+      },
+      "page_count": 52,
+      "page_size": 4096,
+      "user_version": 13
+    },
+    "at_pressure": {
+      "accounts": {
+        "exchange_slots": 0,
+        "payload_bytes": 32512,
+        "receipt_slots": 57,
+        "references": 127
+      },
+      "backlog_by_session": {
+        "1": 127
+      },
+      "broken_references": 0,
+      "counts": {
+        "fences": 0,
+        "inbound": 0,
+        "obligations": 127,
+        "operations": 57,
+        "outbound": 0,
+        "payloads": 127,
+        "publications": 127,
+        "receipt_origins": 1,
+        "retained": 0,
+        "routes": 2,
+        "sessions": 4,
+        "wills": 0
+      },
+      "freelist_count": 1,
+      "invariants_ok": true,
+      "limits": {
+        "exchange_slots": 128,
+        "payload_bytes": 4194304,
+        "receipt_slots": 8192,
+        "references": 128
+      },
+      "measured": {
+        "exchange_slots": 0,
+        "payload_bytes": 32512,
+        "receipt_slots": 57,
+        "references": 127
+      },
+      "page_count": 52,
+      "page_size": 4096,
+      "user_version": 13
+    },
+    "binary_sha256": "9ef097977c2cb86669e11e98d7fbceeac87a4f86fd6a24c7deb76ea9c31bf119",
+    "first_rejection_s": 2.54,
+    "independent_control_puback": true,
+    "negative_pubacks": 373,
+    "ordered_sequences": true,
+    "parameters": {
+      "payload_bytes": 256,
+      "published": 500,
+      "rate": 50,
+      "reference_limit": 128,
+      "seconds": 10
+    },
+    "positive_pubacks": 127,
+    "process": {
+      "argv": [
+        "/workspace/pilot-qualification/ci-execution-51be4079/extracted/mqttiumd-preview-51be4079-x86_64-linux/mqttiumd",
+        "--listen",
+        "127.0.0.1:0",
+        "--db",
+        "/workspace/pilot-qualification/corrected-pressure/broker.sqlite",
+        "--events",
+        "/workspace/pilot-qualification/corrected-pressure/broker.jsonl",
+        "--tls-cert",
+        "/tmp/mqttiumd-pilot-pressure-g_2nunpk/pki/server.crt",
+        "--tls-key",
+        "/tmp/mqttiumd-pilot-pressure-g_2nunpk/pki/server.key",
+        "--client-ca",
+        "/tmp/mqttiumd-pilot-pressure-g_2nunpk/pki/ca.crt",
+        "--identities",
+        "/tmp/mqttiumd-pilot-pressure-g_2nunpk/pki/identities.json"
+      ],
+      "pid": 1967917,
+      "requested_signal": "SIGINT",
+      "signalled": true,
+      "wait_status": 0
+    },
+    "puback_max_ms": 29.869951,
+    "reason": 151,
+    "status": "PASS"
+  },
+  "qualified_binary_sha256": "9ef097977c2cb86669e11e98d7fbceeac87a4f86fd6a24c7deb76ea9c31bf119",
+  "qualified_broker_source_sha": "51be4079f7ee42f46500e993315eddc971f0a8d4",
+  "sqlite": {
+    "checkpoint_policy": "sqlite-autocheckpoint",
+    "hooks_active": false,
+    "install_order": "sqlite-autocheckpoint-before-optional-business-hook",
+    "journal_mode": "wal",
+    "kill_points": false,
+    "page_size": 4096,
+    "sqlite_version": "3.54.1",
+    "synchronous": 2,
+    "user_version": 13,
+    "wal_autocheckpoint": 1000
+  }
+}

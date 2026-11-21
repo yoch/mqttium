@@ -2,11 +2,13 @@
 //!
 //! The decoder turns bytes into these values only after validation; a
 //! malformed scenario supplies bytes and never builds an impossible value
-//! here. The subset is closed: resume of a prepared session, inbound QoS 2.
+//! here. The subset includes durable incoming QoS 1 and QoS 2.
 
 use alloc::sync::Arc;
 
-use crate::ids::InboundPacketId;
+use crate::ids::{InboundPacketId, OutboundPacketId};
+use crate::outcome::RejectReason;
+use crate::pubsub::{FilterList, FilterResults, SubscriptionFilter};
 
 /// MQTT quality of service.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
@@ -100,10 +102,55 @@ pub enum InboundPacket {
         retain: bool,
         dup: bool,
         packet_id: Option<InboundPacketId>,
+        /// Original receipt observation, anchored by the clock adapter.
+        expiry: Option<crate::message_expiry::MessageExpiry>,
         payload: SharedBytes,
     },
     /// PUBREL of an inbound QoS 2 exchange.
     Pubrel { packet_id: InboundPacketId },
+    /// A validated MQTT PINGREQ, without a body.
+    Pingreq,
+    Subscribe {
+        packet_id: InboundPacketId,
+        filters: FilterList<SubscriptionFilter>,
+        /// Authorization facts attached by the transport adapter. Bit i
+        /// denies filter i; the wire decoder starts with an empty mask.
+        denied: u8,
+    },
+    Unsubscribe {
+        packet_id: InboundPacketId,
+        filters: FilterList<SharedBytes>,
+    },
+    /// The decoder accepts only the MQTT 5 PUBACK reason-code domain.
+    Puback {
+        packet_id: OutboundPacketId,
+        reason: u8,
+    },
+    /// Acknowledgement of a broker-originated QoS 2 exchange.
+    Qos2Ack {
+        kind: Qos2Ack,
+        packet_id: OutboundPacketId,
+        reason: u8,
+    },
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Qos2Ack {
+    Pubrec,
+    Pubcomp,
+}
+
+impl Qos2Ack {
+    #[must_use]
+    pub const fn accepts(self, reason: u8) -> bool {
+        match self {
+            Self::Pubrec => matches!(
+                reason,
+                0 | 0x10 | 0x80 | 0x83 | 0x87 | 0x90 | 0x91 | 0x97 | 0x99
+            ),
+            Self::Pubcomp => matches!(reason, 0 | 0x92),
+        }
+    }
 }
 
 /// Outcome carried by a PUBREC or PUBCOMP of the subset.
@@ -112,8 +159,69 @@ pub enum AckReason {
     Success,
     /// PUBCOMP for a PUBREL whose identifier is not in use.
     PacketIdentifierNotFound,
-    /// PUBREC refusing the admission for lack of capacity.
+    /// PUBREC refusing the admission for lack of capacity (MQTT 5
+    /// section 3.5.2.1, reason code 0x97). It answers a certain rejection
+    /// for `CapacityExceeded` and no other: it tells the client that a
+    /// quota is the cause.
     QuotaExceeded,
+    /// PUBREC refusing an admission that is valid and that the broker
+    /// does not accept (MQTT 5 section 3.5.2.1, reason code 0x83,
+    /// "Implementation specific error: the PUBLISH is valid but the
+    /// receiver does not accept it"). It answers the certain rejections
+    /// in which no quota is involved: `Fenced`, `PreconditionFailed` and
+    /// `EpochClosed`.
+    ImplementationSpecificError,
+}
+
+impl AckReason {
+    /// The reason of the PUBREC that refuses an admission the store
+    /// certainly rejected. Nothing was admitted, the exchange ends and the
+    /// Packet Identifier is free again (MQTT 5 section 4.3.3).
+    #[must_use]
+    pub const fn refusing(rejection: RejectReason) -> Self {
+        match rejection {
+            RejectReason::CapacityExceeded(_) | RejectReason::SessionCapacityExceeded => {
+                Self::QuotaExceeded
+            }
+            RejectReason::Fenced | RejectReason::PreconditionFailed | RejectReason::EpochClosed => {
+                Self::ImplementationSpecificError
+            }
+        }
+    }
+}
+
+/// PUBACK reasons implemented by the incoming QoS 1 receiver. Kept separate
+/// from PUBCOMP: Packet Identifier not found (0x92) is not valid in PUBACK.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PubackReason {
+    Success,
+    QuotaExceeded,
+    ImplementationSpecificError,
+}
+
+impl PubackReason {
+    #[must_use]
+    pub const fn refusing(rejection: RejectReason) -> Self {
+        match rejection {
+            RejectReason::CapacityExceeded(_) | RejectReason::SessionCapacityExceeded => {
+                Self::QuotaExceeded
+            }
+            RejectReason::Fenced | RejectReason::PreconditionFailed | RejectReason::EpochClosed => {
+                Self::ImplementationSpecificError
+            }
+        }
+    }
+
+    /// MQTT 5 section 3.4.2.1. No reason belonging only to another ACK can
+    /// be represented by this type.
+    #[must_use]
+    pub const fn to_wire(self) -> u8 {
+        match self {
+            Self::Success => 0,
+            Self::QuotaExceeded => 0x97,
+            Self::ImplementationSpecificError => 0x83,
+        }
+    }
 }
 
 /// A frame the core may make eligible on a connection.
@@ -122,8 +230,22 @@ pub enum AckReason {
 /// client's Packet Identifier space.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum OutboundFrame {
+    Suback {
+        packet_id: InboundPacketId,
+        results: FilterResults,
+    },
+    Unsuback {
+        packet_id: InboundPacketId,
+        results: FilterResults,
+    },
+    /// Response to a validated PINGREQ on a connected session.
+    Pingresp,
     Connack {
         session_present: bool,
+    },
+    Puback {
+        packet_id: InboundPacketId,
+        reason: PubackReason,
     },
     Pubrec {
         packet_id: InboundPacketId,
@@ -133,11 +255,44 @@ pub enum OutboundFrame {
         packet_id: InboundPacketId,
         reason: AckReason,
     },
+    Pubrel {
+        packet_id: OutboundPacketId,
+    },
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::capacity::Resource;
+
+    // MQTT 5 section 3.5.2.1: a refusal says that a quota is exceeded only
+    // when one is.
+    #[test]
+    fn a_refusal_names_a_quota_only_for_a_lack_of_capacity() {
+        for resource in [
+            Resource::PayloadBytes,
+            Resource::References,
+            Resource::ExchangeSlots,
+            Resource::ReceiptSlots,
+        ] {
+            assert_eq!(
+                AckReason::refusing(RejectReason::CapacityExceeded(resource)),
+                AckReason::QuotaExceeded,
+                "{resource:?}"
+            );
+        }
+        for rejection in [
+            RejectReason::Fenced,
+            RejectReason::PreconditionFailed,
+            RejectReason::EpochClosed,
+        ] {
+            assert_eq!(
+                AckReason::refusing(rejection),
+                AckReason::ImplementationSpecificError,
+                "{rejection:?}: no quota is involved"
+            );
+        }
+    }
 
     #[test]
     fn qos_wire_values_are_closed() {

@@ -1,0 +1,24 @@
+{
+  "about": "Cases of the order of a recovery inventory (record 0014). The Rust test runs them through RecoveryOrder::admit of the contract crate, the Python test through the oracle's own InventoryOrder; both must find the refusals listed, by index of the fact and kind of refusal. A refused fact changes nothing for those that follow.",
+  "cases": [
+    {
+      "name": "an inventory in order",
+      "facts": [["Epoch"], ["Limits"], ["RouteTable"], ["Route", "7031"], ["Route", "7031"], ["Route", "70312f61"], ["Session"], ["Session"], ["InboundExchange"], ["OutboundDelivery"], ["Operation"]],
+      "refused": []
+    },
+    {"name": "a route after a session", "facts": [["Epoch"], ["Session"], ["Route", "7031"]], "refused": [[2, "RankDecreased"]]},
+    {"name": "two epochs", "facts": [["Epoch"], ["Epoch"]], "refused": [[1, "Repeated"]]},
+    {"name": "two limits", "facts": [["Limits"], ["Limits"]], "refused": [[1, "Repeated"]]},
+    {"name": "two route tables", "facts": [["RouteTable"], ["RouteTable"]], "refused": [[1, "Repeated"]]},
+    {"name": "routes out of order", "facts": [["RouteTable"], ["Route", "62"], ["Route", "61"]], "refused": [[2, "RoutesUnsorted"]]},
+    {"name": "a prefix after what it prefixes", "facts": [["Route", "70312f61"], ["Route", "7031"]], "refused": [[1, "RoutesUnsorted"]]},
+    {"name": "a prefix before what it prefixes", "facts": [["Route", "7031"], ["Route", "70312f61"]], "refused": []},
+    {"name": "0xff after every ASCII byte", "facts": [["Route", "ff"], ["Route", "7a"]], "refused": [[1, "RoutesUnsorted"]]},
+    {"name": "a refused fact changes nothing", "facts": [["Epoch"], ["Session"], ["Limits"], ["Session"]], "refused": [[2, "RankDecreased"]]},
+    {"name": "an empty topic first", "facts": [["Route", ""], ["Route", "00"]], "refused": []},
+    {"name": "no fact is required", "facts": [["Operation"], ["Operation"]], "refused": []},
+    {"name": "outgoing metadata before operation knowledge", "facts": [["InboundExchange"], ["OutboundDelivery"], ["OutboundDelivery"], ["Operation"]], "refused": []},
+    {"name": "inbound exchange after outgoing metadata", "facts": [["OutboundDelivery"], ["InboundExchange"], ["Operation"]], "refused": [[1, "RankDecreased"]]},
+    {"name": "outgoing metadata after operation knowledge", "facts": [["Operation"], ["OutboundDelivery"]], "refused": [[1, "RankDecreased"]]}
+  ]
+}

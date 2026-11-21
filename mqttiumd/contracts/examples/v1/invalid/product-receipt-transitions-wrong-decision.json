@@ -1,0 +1,206 @@
+{
+  "format": "mqttiumd.product-transition-registry",
+  "schema_version": 1,
+  "id": "tcp-receipt-maintenance-v1",
+  "decision": "0026",
+  "scope": "product-system-tests",
+  "partition_complete": false,
+  "description": "Descriptive bounded live receipt retirement subset for Proposed ADR 0027. Group B covers consumed cycles; C holes and pressure; D independent live objects; E retirement and identity guards; F uncertain maintenance and crash boundaries; G bounded passes/accounts; H exact controls. This is not a complete guard partition, universal liveness proof, accepted ADR or extension of fixture-based K1/K2b/K3 qualification. Group A is historical regression rather than a new transition.",
+  "rules": [
+    {
+      "id": "receipt.window.issue",
+      "machine": "ReceiptMaintenance",
+      "state_class": "WindowOpen",
+      "event_class": "CommandPrepared",
+      "guard": "Checked never-reused sequence and recipe identity boundaries. Issued span is at most 1024; new business is limited to 640, leaving 384 positions for bounded inbound, outgoing and lifecycle continuations. Register issuance before exposing the command.",
+      "next_state_class": "WindowOpen",
+      "required_actions": [
+        "RegisterIssuance"
+      ],
+      "forbidden_actions": [
+        "IssuePastWindow",
+        "ReuseIdentity"
+      ],
+      "reception_groups": [
+        "B",
+        "C"
+      ]
+    },
+    {
+      "id": "receipt.window.consume",
+      "machine": "ReceiptMaintenance",
+      "state_class": "WindowOpen",
+      "event_class": "TerminalResultApplied",
+      "guard": "The owner applied a correlated validated terminal result and retained its consequences in owner state or Outbox. MQTT ACK, writer arrival, timeout, socket closure and history-ring eviction are not consumption.",
+      "next_state_class": "WindowOpen",
+      "required_actions": [
+        "MarkResultConsumed",
+        "AdvanceContiguousPrefix"
+      ],
+      "forbidden_actions": [
+        "ConfirmUnknown",
+        "ConfirmFromNetworkAck"
+      ],
+      "reception_groups": [
+        "B"
+      ]
+    },
+    {
+      "id": "receipt.window.gap",
+      "machine": "ReceiptMaintenance",
+      "state_class": "GapBlocked",
+      "event_class": "LaterResultConsumed",
+      "guard": "An earlier issued operation remains unknown. Later consumption never closes the hole; preserve the operation identity, exact recipe, deadline and control reserve.",
+      "next_state_class": "GapBlocked",
+      "required_actions": [
+        "RetainUncertainRecipe",
+        "ReserveControlCapacity"
+      ],
+      "forbidden_actions": [
+        "AdvanceAcrossGap"
+      ],
+      "reception_groups": [
+        "C"
+      ]
+    },
+    {
+      "id": "receipt.window.release_retry",
+      "machine": "ReceiptMaintenance",
+      "state_class": "ControlWindowFull",
+      "event_class": "FencedReleaseResultApplied",
+      "guard": "A correlated certainly fenced Release result is consumed without allocating another operation at the full window. Retain its exchange, lease and known terminal identity. Only after durable closure creates room does one counted continuation prepare the retry. An unknown operation is never retried under a new identity.",
+      "next_state_class": "ReleaseRetryDeferred",
+      "required_actions": [
+        "MarkResultConsumed",
+        "RetainReleaseIntent",
+        "ContinueAfterKnownClosure"
+      ],
+      "forbidden_actions": [
+        "IssuePastWindow",
+        "DropLease",
+        "RetryUnknownUnderNewIdentity"
+      ],
+      "reception_groups": [
+        "C",
+        "H"
+      ]
+    },
+    {
+      "id": "receipt.collection.submit",
+      "machine": "ReceiptMaintenance",
+      "state_class": "WindowOpen",
+      "event_class": "CollectionTriggered",
+      "guard": "Contiguous consumed work exists. One correlated control is in flight, carrying an origin and all three issuance boundaries. Each new prefix and physical sweep is bounded by 128; no receipt is allocated for maintenance.",
+      "next_state_class": "CollectionPending",
+      "required_actions": [
+        "EmitReceiptCollection"
+      ],
+      "forbidden_actions": [
+        "AllocateOperationId",
+        "CreateMaintenanceReceipt"
+      ],
+      "reception_groups": [
+        "F"
+      ]
+    },
+    {
+      "id": "receipt.collection.known",
+      "machine": "ReceiptMaintenance",
+      "state_class": "CollectionPending",
+      "event_class": "KnownDurableClosure",
+      "guard": "The correlated committed absolute closure has the same origin and monotone operation/publication/payload boundaries. Removed rows describe this pass, not repeatable credits. Business objects remain independent of receipt retention.",
+      "next_state_class": "FrontierKnown",
+      "required_actions": [
+        "ApplyAbsoluteClosure",
+        "ReleaseIssuanceWindow",
+        "ContinueBoundedSweep"
+      ],
+      "forbidden_actions": [
+        "AddRepeatedRemovalCredits",
+        "DeleteBusinessState"
+      ],
+      "reception_groups": [
+        "F",
+        "G"
+      ]
+    },
+    {
+      "id": "receipt.collection.unknown",
+      "machine": "ReceiptMaintenance",
+      "state_class": "CollectionPending",
+      "event_class": "UnknownCollectionResult",
+      "guard": "Commit knowledge is unavailable. Keep the same closure and correlation, with bounded active attempt history and externally scheduled deadlines; no absence or timeout proves rejection. Startup has its own finite deadline.",
+      "next_state_class": "CollectionPending",
+      "required_actions": [
+        "ReconcileSameClosure"
+      ],
+      "forbidden_actions": [
+        "InferCertainRejection",
+        "InventNewOperationIdentity"
+      ],
+      "reception_groups": [
+        "F"
+      ]
+    },
+    {
+      "id": "receipt.frontier.guard",
+      "machine": "ReceiptMaintenance",
+      "state_class": "FrontierKnown",
+      "event_class": "RetiredOperationOrIdentity",
+      "guard": "An exact-origin operation at or below through is retired without execution or a claim of certain rejection. A fresh operation carrying an old publication/payload identity needs its own durable rejection/fence. Retained physical rows may still exist below the frontier.",
+      "next_state_class": "FrontierKnown",
+      "required_actions": [
+        "ReportRetiredKnowledge",
+        "RefuseIdentityReuse"
+      ],
+      "forbidden_actions": [
+        "ExecuteRetiredOperation",
+        "InferCertainRejection"
+      ],
+      "reception_groups": [
+        "E",
+        "H"
+      ]
+    },
+    {
+      "id": "receipt.frontier.liveobjects",
+      "machine": "ReceiptMaintenance",
+      "state_class": "FrontierKnown",
+      "event_class": "PhysicalRowsSwept",
+      "guard": "The atomic bounded sweep removes only eligible receipt/fence rows and subtracts exactly their actual count. Inbound QoS 2 state, queued/claimed obligations and payload references retain their independent continuation state.",
+      "next_state_class": "FrontierKnown",
+      "required_actions": [
+        "PreserveBusinessRows",
+        "AccountActualRemovedRows"
+      ],
+      "forbidden_actions": [
+        "RecreateFinishedObligation",
+        "DeleteLiveResponsibility"
+      ],
+      "reception_groups": [
+        "D",
+        "G",
+        "H"
+      ]
+    },
+    {
+      "id": "receipt.closed.sweep",
+      "machine": "ReceiptMaintenance",
+      "state_class": "ClosedEpochPending",
+      "event_class": "StartupSweep",
+      "guard": "Existing durable startup authority has closed the selected epochs. A bounded pass may remove old receipts and compact origins behind collected_through, without opening another epoch or clearing business state.",
+      "next_state_class": "ClosedEpochPending",
+      "required_actions": [
+        "SweepClosedRowsBoundedly"
+      ],
+      "forbidden_actions": [
+        "RotateLiveEpoch",
+        "ResetPartialRecovery"
+      ],
+      "reception_groups": [
+        "F",
+        "G"
+      ]
+    }
+  ]
+}

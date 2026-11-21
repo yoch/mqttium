@@ -16,6 +16,122 @@ cargo test --workspace --locked
 cargo run -q -p mqttiumd-lab -- validate --contracts contracts/v1 --scenario tests/scenarios/p1/P1-02.json
 ```
 
+The oracle under `tests/oracle/` is a second reader of the semantic level
+and the judge of a run. A change to a contract, to the corpus or to the
+oracle also runs it, with its pinned versions; CI runs it in the job
+`contracts`:
+
+```bash
+python -m pip install -r tests/oracle/requirements.txt
+python tests/oracle/build_traces.py          # rewrite the derived traces
+python tests/oracle/build_traces.py --check
+python -m unittest discover -t tests/oracle -s tests/oracle/tests
+```
+
+A campaign runs one scenario through the real core, the deterministic
+store and their adapters (`crates/mqttiumd-lab/src/bench/`), then has the
+oracle judge the directory the runner wrote. The runner computes no
+verdict, and its `run-result` is provisional. The exit status is the
+oracle's: 0 PASS, 1 FAIL, 2 INCONCLUSIVE, 3 OUT_OF_SCOPE. Campaign
+directories are generated and never committed.
+
+```bash
+tools/run_campaign.sh tests/scenarios/p1/P1-02.json /tmp/p1-02        # seed 1
+tools/run_campaign.sh tests/scenarios/qabs/QABS-B.json /tmp/qabs-b 7  # another seed
+tools/run_campaign.sh tests/scenarios/p1/P1-02.json /tmp/p1-02-sqlite 1 sqlite
+```
+
+The fourth argument names the store: `sim-store` (the default) or
+`sqlite`, the store of `crates/mqttiumd-store-sqlite` in one file of the
+campaign. On both, a crash of a scenario is simulated inside one
+process: the adapter is dropped and the store recovered or reopened. No
+process is killed and nothing is shown about `fsync` or power loss.
+
+A result of the oracle is qualifying only for a run whose binary the
+runner rebuilt from an archive of the recorded content, kept in the
+campaign (`run --rebuild`, record 0017); any other result is provisional
+and never PASS. The script below plays such a run on a clean checkout,
+has the oracle produce the result, requires it to be qualifying, accepted
+by `validate` and standing at `recompute`, and rebuilds the binary a
+second time from the archive to compare it with the one the manifest
+names. The campaign directory must be outside the work tree:
+
+```bash
+tools/run_qualifying_campaign.sh tests/scenarios/p1/P1-02.json /tmp/p1-02-q 1 sqlite
+```
+
+By default the process under test runs inside the runner and a crash is
+simulated. On the SQLite store it can run in a child process
+(`--process child`, the fifth argument of the two scripts above): the
+supervisor then kills that child with SIGKILL where the scenario crashes
+the broker, waits for its end by that signal, and starts another child on
+the same database file. The script below plays such a run rebuilt from
+its source, which must qualify, and plays it again under `strace` to keep
+the kernel's account of the kill; `tools/check_campaign_kill.py` checks
+both. It shows the loss of the process after a commit, outside any
+transaction, and the recovery; nothing about a transaction cut by a kill,
+`fsync` or a power loss:
+
+```bash
+tools/run_killed_campaign.sh tests/scenarios/p1/P1-02.json /tmp/p1-02-killed
+```
+
+Only `recompute` says that a result is evidence: it recomputes the
+assertions and the faults from the trace and checks again every condition
+of a qualifying run, so a qualifying result whose source archive, oracle
+or kept modification no longer matches is refused. `validate` checks the
+document only. The reception below produces a qualifying campaign from
+the clean tree and one from a modified worktree, degrades independent
+copies, and requires each refusal for its own reason:
+
+```bash
+tools/run_recompute_reception.sh /tmp/recompute-reception sqlite
+```
+
+The command a campaign records in `campaign.json` (`commands.replay`)
+names every parameter of the run, its store included, and
+`commands.replay_scope` says what that replay is: an ordinary replay
+plays with the lab binary of the checkout it is run in and gives a
+provisional result; only a rebuilt run can qualify.
+
+Build directories are per agent: run the suites with `env -u
+CARGO_TARGET_DIR -u CARGO_ENCODED_RUSTFLAGS` or an explicit
+`--target-dir`, and campaigns in directories of their own. The binary
+check unpacks and builds in a directory of its own; `run --rebuild` uses
+the directory its archive names under `TMPDIR` and takes its turn on a
+lock, so two rebuilds of the same source wait for each other.
+
+Run normal and instrumented full suites sequentially in one checkout, or use
+separate worktrees. Separate Cargo targets alone do not isolate the legacy
+source-relative `target/workspace-tests/one-snapshot` fixture.
+
+The loop is shown to reject a defect by mutations kept as diffs under
+`tests/mutants/loop/` (`*.mutant`: the root `.gitignore` ignores `*.patch`
+and `*.diff`). The script applies each one in a temporary worktree, never
+in the current tree, plays the campaign with the mutated binary, has the
+oracle of the unmodified tree judge it, and compares the verdict, the
+failing assertion and its reason with `expected.json`:
+
+```bash
+tools/run_loop_mutants.sh
+tools/run_loop_mutants.sh --backend sqlite
+```
+
+`proofs/` is a workspace of its own, so the four commands above do not see
+it. Its scripts are its only verification, and CI runs them in the job
+`pilot proof`; they need Kani (`tools/install-tools.sh kani`):
+
+```bash
+proofs/credits/run.sh                    # preflight, harnesses, witnesses, coverage, digests
+python3 proofs/credits/mutants.py        # each mutant caught as aimed
+python3 proofs/credits/selftest.py       # the scripts refuse what they claim to check
+```
+
+`run.sh` fails when `crates/mqttiumd-core/src/credits.rs`,
+`crates/mqttiumd-contract/src/capacity.rs` or `ids.rs`, or a file of the
+proof, differs from `proofs/credits/BODY.sha256`. After such a change the
+owner of the proof reviews it, runs `run.sh --record` and says so.
+
 The requirement register and the example corpus are derived files. After
 changing a decision record, a chapter digest, scenario P1-02 or the fixture,
 rebuild them; CI fails when they are not up to date:
@@ -70,6 +186,31 @@ python tools/check_schemas.py
 9. **Every reader is bounded.** Sizes are computed with checked arithmetic
    and compared to a budget before anything is allocated or enumerated.
 
+## Evidence tiers (ADR 0044)
+
+| Tier | Paths | Regime |
+| - | - | - |
+| Core | `contracts/`, `crates/mqttiumd-contract/`, `crates/mqttiumd-core/`, `crates/mqttiumd-store-api/`, `crates/mqttiumd-store-sqlite/`, the deterministic store in `crates/mqttiumd-lab/`, `tests/oracle/`, `tests/scenarios/`, `proofs/` | Everything in this guide |
+| Runtime | `crates/mqttiumd/`, `tests/compat/`, the runtime models under `models/`, load tools | Test first; differential scenarios against the pinned Mosquitto; TLA+ models of the thread and queue protocol with mutant configurations; property tests of the codec; load measurements with their commands. No sealed reception per increment |
+
+A runtime change that alters a public type, a durable encoding or an
+injection point of the core tier follows the core regime. The product
+tests run in both configurations:
+
+```bash
+cargo test -p mqttiumd --locked
+cargo test -p mqttiumd --features test-hooks --locked
+```
+
+The system receptions under `tests/system/`, the `tools/run_*_reception.sh`
+scripts, `preview/` and the pilot kits are frozen evidence of the
+executable built from `51be4079` (report 0026). They run on demand
+(`mqttiumd-frozen-receptions.yml`) and are not repaired when the runtime or
+a limit changes; cover the behaviour with a runtime test or a compatibility
+scenario first. The distributed executable is built with
+`cargo build -p mqttiumd --profile dist --locked`; `[profile.release]` is
+the profile the run manifests record and stays unchanged.
+
 ## Roles and file ownership
 
 One lot per branch. A lot touches only its own paths. The lots of the
@@ -81,7 +222,7 @@ before you start.
 | - | - | - |
 | Contracts and oracle | `contracts/`, `tests/oracle/`, `tests/scenarios/` | Core behaviour to match an expectation |
 | Core | `crates/mqttiumd-core/` | `contracts/`, `tests/oracle/`, assertions |
-| Store | `crates/mqttiumd-store-sqlite/`, the deterministic store in `crates/mqttiumd-lab/` | Admission guarantees |
+| Store | `crates/mqttiumd-store-api/` (the interface every store realises), `crates/mqttiumd-store-sqlite/`, the deterministic store in `crates/mqttiumd-lab/` | Admission guarantees |
 | Bench and adversarial | `crates/mqttiumd-lab/`, mutations, injectors | An assertion, to turn a run green |
 
 A change of public type, durable encoding, injection point or schema is a

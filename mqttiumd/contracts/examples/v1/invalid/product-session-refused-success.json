@@ -1,0 +1,11 @@
+{
+  "format": "mqttiumd.product-event",
+  "schema_version": 1,
+  "seq": "13",
+  "kind": "session_refused",
+  "pid": 1,
+  "connection": "2",
+  "details": {
+    "reason_code": 0
+  }
+}

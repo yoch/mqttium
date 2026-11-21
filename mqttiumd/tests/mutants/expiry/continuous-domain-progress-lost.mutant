@@ -1,0 +1,11 @@
+diff --git a/mqttiumd/crates/mqttiumd-store-api/src/lib.rs b/mqttiumd/crates/mqttiumd-store-api/src/lib.rs
+--- a/mqttiumd/crates/mqttiumd-store-api/src/lib.rs
++++ b/mqttiumd/crates/mqttiumd-store-api/src/lib.rs
+@@ -181,6 +181,6 @@ impl SessionClockAnchor {
+     ) -> Result<Self, ReadError> {
+         let logical = match previous {
+-            Some(anchor) if anchor.reading.domain == reading.domain => anchor.observe(reading)?,
++            Some(anchor) if anchor.reading.domain == reading.domain => anchor.logical,
+             Some(anchor) => anchor.logical,
+             None => 0,
+         };

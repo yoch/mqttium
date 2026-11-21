@@ -1,0 +1,15 @@
+{
+  "format": "mqttiumd.product-event",
+  "schema_version": 1,
+  "seq": "1",
+  "pid": 1,
+  "kind": "barrier_hit",
+  "operation": {
+    "incarnation": "1",
+    "epoch": "1",
+    "owner": "0",
+    "sequence": "40"
+  },
+  "point": "will.admission.prepared",
+  "command_kind": "WillAdmission"
+}

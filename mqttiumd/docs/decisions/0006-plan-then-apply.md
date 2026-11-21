@@ -5,6 +5,9 @@ Applied in lot L0 for the contract types (`PlanStamp`,
 `EffectReservation`); by lot L1 for the transitions and L6 for the pilot
 proof. Completes DEM-006.
 
+Amended by 0012 (record 0047): a step can end in `StepOutcome::Exhausted`;
+the shape of a transition stated below is otherwise unchanged.
+
 ## Context
 
 DEM-006 requires that an input is applied or handed back intact, and lists

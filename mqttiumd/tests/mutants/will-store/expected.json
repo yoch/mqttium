@@ -1,0 +1,14 @@
+{
+  "mutations": [
+    {
+      "name": "forget-on-startup",
+      "test": "both_stores_publish_after_restart_and_cancel_normal_disconnect",
+      "reason": "will_forgotten_on_restart"
+    },
+    {
+      "name": "publish-normal",
+      "test": "both_stores_publish_after_restart_and_cancel_normal_disconnect",
+      "reason": "normal_disconnect_published_will"
+    }
+  ]
+}

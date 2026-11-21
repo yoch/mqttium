@@ -1,0 +1,25 @@
+{
+  "format": "mqttiumd.product-event",
+  "schema_version": 1,
+  "seq": "3",
+  "pid": 1,
+  "kind": "will_admitted",
+  "operation": {
+    "incarnation": "1",
+    "epoch": "1",
+    "owner": "0",
+    "sequence": "40"
+  },
+  "will": {
+    "incarnation": "1",
+    "epoch": "1",
+    "owner": "0",
+    "sequence": "40"
+  },
+  "details": {
+    "publication": "1/1/0/43",
+    "targets": 0,
+    "authority": "durable_admission_commit",
+    "retained": true
+  }
+}

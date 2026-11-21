@@ -1,0 +1,5 @@
+# What the proof tool brings, recorded so that a silent change is a failure
+# of the preflight. The Kani version itself is pinned once, in
+# ../tools/install-tools.sh; changing any of these changes the evidence.
+CBMC_VERSION=6.11.0
+KANI_RUST_TOOLCHAIN=nightly-2026-08-21-x86_64-unknown-linux-gnu

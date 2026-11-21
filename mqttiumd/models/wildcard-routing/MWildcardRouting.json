@@ -1,0 +1,53 @@
+{
+  "module": "MWildcardRouting.tla",
+  "status": "specification",
+  "summary": "Finite wildcard routing: independently tabulated matches, per-match No Local before maximum QoS reduction, unique destinations, atomic subscription cuts and immutable admitted responsibilities.",
+  "issues": [
+    648
+  ],
+  "tests": [],
+  "configs": [
+    {
+      "config": "MWildcardRouting-safety.cfg",
+      "expect": "pass",
+      "invariants": [
+        "TypeOK",
+        "OnePerDestination",
+        "EligibleRecipients",
+        "EligibleMaximumQoS",
+        "CurrentRoutingCut",
+        "FrozenResponsibilities"
+      ]
+    },
+    {
+      "config": "MWildcardRouting-mut-duplicate-target.cfg",
+      "expect": "violation",
+      "invariant": "OnePerDestination"
+    },
+    {
+      "config": "MWildcardRouting-mut-local-after-max.cfg",
+      "expect": "violation",
+      "invariant": "EligibleMaximumQoS"
+    },
+    {
+      "config": "MWildcardRouting-mut-last-qos-wins.cfg",
+      "expect": "violation",
+      "invariant": "EligibleMaximumQoS"
+    },
+    {
+      "config": "MWildcardRouting-mut-ignore-cut.cfg",
+      "expect": "violation",
+      "invariant": "CurrentRoutingCut"
+    },
+    {
+      "config": "MWildcardRouting-mut-retroactive.cfg",
+      "expect": "violation",
+      "invariant": "FrozenResponsibilities"
+    },
+    {
+      "config": "MWildcardRouting-reach-overlap.cfg",
+      "expect": "violation",
+      "invariant": "NoOverlapWitness"
+    }
+  ]
+}

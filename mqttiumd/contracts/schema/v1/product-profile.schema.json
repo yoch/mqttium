@@ -1,0 +1,401 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "format",
+    "schema_version",
+    "id",
+    "mqtt_version",
+    "client_id",
+    "clean_start",
+    "session_expiry_interval",
+    "incoming_qos",
+    "retain",
+    "will",
+    "authentication",
+    "subscriptions",
+    "outgoing_delivery",
+    "mqtt_conformant",
+    "max_connections",
+    "max_sessions",
+    "max_packet_bytes",
+    "max_client_id_bytes",
+    "max_topic_bytes",
+    "max_payload_bytes",
+    "per_connection_input_slots",
+    "per_connection_output_slots",
+    "writer_queue_slots",
+    "max_commands_in_flight",
+    "max_timers",
+    "receipt_slots",
+    "partial_packet_timeout_ms",
+    "connect_timeout_ms",
+    "write_timeout_ms",
+    "receive_maximum",
+    "remembered_connections",
+    "max_filters_per_packet",
+    "max_subscriptions",
+    "max_outgoing_per_connection",
+    "work_page_items",
+    "max_targets_per_admission",
+    "outgoing_qos",
+    "granted_subscription_qos",
+    "max_volatile_deliveries",
+    "volatile_payload_reference_bytes",
+    "outbox_slots",
+    "receipt_window",
+    "receipt_data_window",
+    "receipt_control_reserve",
+    "receipt_collection_rows",
+    "receipt_collection_trigger",
+    "max_receipt_origins",
+    "receipt_collection_bytes",
+    "outgoing_packet_identifier_max",
+    "outgoing_packet_identifier_probe_limit",
+    "session_expiry_default",
+    "disconnect_session_expiry_interval",
+    "lifecycle_transition_effect_slots",
+    "closing_input_slots",
+    "terminal_input_slots",
+    "frame_registration_slots",
+    "pre_connack_packet_slots",
+    "session_shutdown_timeout_ms",
+    "session_clock",
+    "session_time_unit",
+    "session_clock_checkpoint_period_ms",
+    "session_clock_degraded_after_ms",
+    "max_session_expiry_timers",
+    "session_expiry_batch",
+    "sqlite_schema_version",
+    "wildcard_subscriptions",
+    "no_local",
+    "shared_subscriptions",
+    "subscription_identifiers",
+    "retain_as_published",
+    "retain_handling",
+    "max_retained_topics",
+    "max_retained_bytes",
+    "max_replay_candidates",
+    "live_overlap_policy",
+    "retained_replay_overlap_policy",
+    "message_expiry",
+    "message_expiry_interval",
+    "message_expiry_scan_ms",
+    "message_expiry_batch",
+    "message_expiry_policy",
+    "message_expiry_time_unit",
+    "will_qos",
+    "will_retain",
+    "will_delay_interval",
+    "will_message_expiry",
+    "max_will_intents",
+    "max_will_bytes",
+    "max_will_topic_bytes",
+    "max_will_payload_bytes"
+  ],
+  "properties": {
+    "format": {
+      "const": "mqttiumd.product-profile"
+    },
+    "schema_version": {
+      "const": 1
+    },
+    "id": {
+      "const": "tcp-will-pubsub-v1"
+    },
+    "mqtt_version": {
+      "const": 5
+    },
+    "client_id": {
+      "const": "explicit"
+    },
+    "clean_start": {
+      "const": [
+        false,
+        true
+      ]
+    },
+    "session_expiry_interval": {
+      "const": {
+        "minimum": 0,
+        "maximum": 4294967295
+      }
+    },
+    "incoming_qos": {
+      "const": [
+        0,
+        1,
+        2
+      ]
+    },
+    "retain": {
+      "const": true
+    },
+    "will": {
+      "const": true
+    },
+    "authentication": {
+      "const": false
+    },
+    "subscriptions": {
+      "const": true
+    },
+    "outgoing_delivery": {
+      "const": true
+    },
+    "mqtt_conformant": {
+      "const": false
+    },
+    "max_connections": {
+      "const": 16
+    },
+    "max_sessions": {
+      "const": 128
+    },
+    "max_packet_bytes": {
+      "const": 65536
+    },
+    "max_client_id_bytes": {
+      "const": 1024
+    },
+    "max_topic_bytes": {
+      "const": 1024
+    },
+    "max_payload_bytes": {
+      "const": 32768
+    },
+    "per_connection_input_slots": {
+      "const": 4
+    },
+    "per_connection_output_slots": {
+      "const": 4
+    },
+    "writer_queue_slots": {
+      "const": 32
+    },
+    "max_commands_in_flight": {
+      "const": 16
+    },
+    "max_timers": {
+      "const": 512
+    },
+    "receipt_slots": {
+      "const": 8192
+    },
+    "partial_packet_timeout_ms": {
+      "const": 5000
+    },
+    "connect_timeout_ms": {
+      "const": 3000
+    },
+    "write_timeout_ms": {
+      "const": 250
+    },
+    "receive_maximum": {
+      "const": 8
+    },
+    "remembered_connections": {
+      "const": 8
+    },
+    "max_filters_per_packet": {
+      "const": 8
+    },
+    "max_subscriptions": {
+      "const": 128
+    },
+    "max_outgoing_per_connection": {
+      "const": 8
+    },
+    "work_page_items": {
+      "const": 8
+    },
+    "max_targets_per_admission": {
+      "const": 16
+    },
+    "outgoing_qos": {
+      "const": [
+        0,
+        1
+      ]
+    },
+    "granted_subscription_qos": {
+      "const": [
+        0,
+        1
+      ]
+    },
+    "max_volatile_deliveries": {
+      "const": 128
+    },
+    "volatile_payload_reference_bytes": {
+      "const": 4194304
+    },
+    "outbox_slots": {
+      "const": 128
+    },
+    "receipt_window": {
+      "const": 1024
+    },
+    "receipt_data_window": {
+      "const": 512
+    },
+    "receipt_control_reserve": {
+      "const": 512
+    },
+    "receipt_collection_rows": {
+      "const": 128
+    },
+    "receipt_collection_trigger": {
+      "const": 64
+    },
+    "max_receipt_origins": {
+      "const": 64
+    },
+    "receipt_collection_bytes": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 2147483647
+    },
+    "outgoing_packet_identifier_max": {
+      "const": 65535
+    },
+    "outgoing_packet_identifier_probe_limit": {
+      "const": 129
+    },
+    "session_expiry_default": {
+      "const": 0
+    },
+    "disconnect_session_expiry_interval": {
+      "const": {
+        "minimum": 0,
+        "maximum": 4294967295
+      }
+    },
+    "lifecycle_transition_effect_slots": {
+      "const": 3
+    },
+    "closing_input_slots": {
+      "const": 32
+    },
+    "terminal_input_slots": {
+      "const": 544
+    },
+    "frame_registration_slots": {
+      "const": 208
+    },
+    "pre_connack_packet_slots": {
+      "const": 1
+    },
+    "session_shutdown_timeout_ms": {
+      "const": 2000
+    },
+    "session_clock": {
+      "const": "CLOCK_BOOTTIME"
+    },
+    "session_time_unit": {
+      "const": "nanoseconds"
+    },
+    "session_clock_checkpoint_period_ms": {
+      "const": 30000
+    },
+    "session_clock_degraded_after_ms": {
+      "const": 31000
+    },
+    "max_session_expiry_timers": {
+      "const": 128
+    },
+    "session_expiry_batch": {
+      "const": 4
+    },
+    "sqlite_schema_version": {
+      "const": 12
+    },
+    "wildcard_subscriptions": {
+      "const": true
+    },
+    "no_local": {
+      "const": true
+    },
+    "shared_subscriptions": {
+      "const": false
+    },
+    "subscription_identifiers": {
+      "const": false
+    },
+    "retain_as_published": {
+      "const": true
+    },
+    "retain_handling": {
+      "const": [
+        0,
+        1,
+        2
+      ]
+    },
+    "max_retained_topics": {
+      "const": 32
+    },
+    "max_retained_bytes": {
+      "const": 1048576
+    },
+    "max_replay_candidates": {
+      "const": 256
+    },
+    "live_overlap_policy": {
+      "const": "one-per-session"
+    },
+    "retained_replay_overlap_policy": {
+      "const": "one-per-filter-occurrence-and-topic"
+    },
+    "message_expiry": {
+      "const": true
+    },
+    "message_expiry_interval": {
+      "const": {
+        "minimum": 0,
+        "maximum": 4294967295
+      }
+    },
+    "message_expiry_scan_ms": {
+      "const": 100
+    },
+    "message_expiry_batch": {
+      "const": 4
+    },
+    "message_expiry_policy": {
+      "const": "quarantine-on-unknown-origin"
+    },
+    "message_expiry_time_unit": {
+      "const": "nanoseconds"
+    },
+    "will_qos": {
+      "const": [
+        1
+      ]
+    },
+    "will_retain": {
+      "const": true
+    },
+    "will_delay_interval": {
+      "const": [
+        0
+      ]
+    },
+    "will_message_expiry": {
+      "const": false
+    },
+    "max_will_intents": {
+      "const": 256
+    },
+    "max_will_bytes": {
+      "const": 8388608
+    },
+    "max_will_topic_bytes": {
+      "const": 1024
+    },
+    "max_will_payload_bytes": {
+      "const": 32768
+    }
+  }
+}

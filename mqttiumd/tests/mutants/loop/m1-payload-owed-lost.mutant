@@ -1,0 +1,12 @@
+diff --git a/mqttiumd/crates/mqttiumd-lab/src/store/durable.rs b/mqttiumd/crates/mqttiumd-lab/src/store/durable.rs
+--- a/mqttiumd/crates/mqttiumd-lab/src/store/durable.rs
++++ b/mqttiumd/crates/mqttiumd-lab/src/store/durable.rs
+@@ -673,6 +673,8 @@
+             _ => return Err(failed),
+         };
+         self.inbound.remove(&slot);
++        // MUTANT M1: the payload still owed by its obligations is lost.
++        self.payloads.clear();
+         self.accounts.exchange_slots = self
+             .accounts
+             .exchange_slots

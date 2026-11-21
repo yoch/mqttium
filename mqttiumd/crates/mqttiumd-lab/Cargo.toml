@@ -9,6 +9,11 @@ publish.workspace = true
 
 [dependencies]
 mqttiumd-contract.workspace = true
+# The runner of lot L4 drives the real core (DEM-024).
+mqttiumd-core = { path = "../mqttiumd-core" }
+# The interface of the store, and the SQLite store the bench runs on.
+mqttiumd-store-api = { path = "../mqttiumd-store-api" }
+mqttiumd-store-sqlite = { path = "../mqttiumd-store-sqlite" }
 # Offline only: no HTTP or file retriever is compiled in, so a schema can
 # never be downloaded during a run (DEM-014).
 jsonschema = { version = "0.61.2", default-features = false }
@@ -17,9 +22,15 @@ serde_json = "1"
 sha2 = "0.11"
 
 [dev-dependencies]
+# The reception mutates isolated SQLite copies, without changing dependency features.
+rusqlite = { version = "=0.43.0", default-features = false, features = ["bundled", "cache"] }
 # Lexes the sources of the pure crates for the boundary test. Already a
 # transitive dependency of the workspace.
 proc-macro2 = "1"
 
 [lints]
 workspace = true
+
+[features]
+# Test instrumentation is explicit and is reproduced by run --rebuild.
+kill-points = ["mqttiumd-store-sqlite/kill-points"]

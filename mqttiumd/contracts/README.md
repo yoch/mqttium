@@ -15,12 +15,17 @@ it. The examples illustrate the contract and are not part of the digest.
 | Path | Content |
 | - | - |
 | `schema/v1/*.schema.json` | JSON Schema 2020-12. No `$id`; references are file-relative and never fetched |
-| `v1/fault-points.json` | Contractual injection points and the actions each offers |
+| `schema/v1/store-snapshot.schema.json` | The durable state of a store at one checkpoint, as `InspectDurableState` writes it |
+| `v1/fault-points.json` | Contractual injection points, what each carries (a command or a result) and the actions it offers |
 | `v1/profiles.json` | Profiles and their perimeter |
+| `v1/product-profile.json` | Fixed bounds and MQTT feature restrictions of the experimental TCP broker |
+| `v1/sessions.transitions.json` | Partial lifecycle transitions under Proposed0029, with product-system-test scope |
+| `v1/expiry.transitions.json` | Partial finite expiry/time transitions under Proposed0030, with product-system-test scope |
+| `schema/v1/product-event.schema.json` | Bounded product observations; separate from fixture-based qualifying campaign traces |
 | `v1/assertions.json` | Assertion names, their meaning and the requirements they serve |
 | `v1/requirements.json` | Every identifier the specification defines, each with its source: a chapter or an accepted decision record |
 | `v1/p1.catalog.json` | Vocabulary of the transition registry: machines, state classes, event classes, guard dimensions, effects |
-| `v1/p1.transitions.json` | Transition registry of P1. Status `seed`: its holes are listed, not hidden |
+| `v1/p1.transitions.json` | Transition registry of P1. Status `complete`: every guard point of every cell has exactly one rule |
 | `examples/v1/index.json` | Every example, and for each invalid one the code and pointer it must be refused with |
 
 ## Rules every v1 document follows
@@ -53,6 +58,322 @@ and the coverage of a transition registry. A report keeps at most 64
 diagnostics and 64 notes and counts the others exactly; a truncated report
 still refuses.
 
+### Held commands, held results and deadlines
+
+Three steps let a scenario order a race without a crash (ADR 0001):
+
+| Step | What the bench does |
+| - | - |
+| `FireDeadline` | Drives the broker, within `max_steps`, until no effect waits in an effect box; then lets the timer adapter deliver the armed deadline that is due first, and drives until the core has consumed it. Two deadlines due at the same logical time fire in the order they were armed. If no deadline is armed the step fails and the run is inconclusive: it is never a no-op. Logical time advances in no other way: a deadline never fires by itself between two steps |
+| `ReleaseHeldCommand` | Lets the command that the named fault holds enter the writer |
+| `DeliverHeldResult` | Hands the result that the named fault delays to the core, and drives, within `max_steps`, until the core has consumed it |
+| `LeaveBarrier` | Lets the adapter that the named `barrier` fault stopped leave its point. Until then it stays there, whatever the following steps are: an inspection taken before `LeaveBarrier` sees the state at the barrier |
+
+**What a fault holds.** The action `hold_command` holds a command,
+`delay_result` holds a result, and `barrier` holds the adapter at its
+point. Such a fault holds one item in the life of a
+scenario:
+
+- it holds it once a `DriveUntil` step has waited for its hit, and a
+  scenario waits for it once, so its `expected_hits` is at most 1;
+- what is held is handed over at most once, by the step of its kind;
+- a crash of the broker destroys it, and the fault holds nothing again. A
+  fault that no step waited for before a crash may still be reached, and
+  waited for, after the restart;
+- a held command or result that no step hands over stays held to the end
+  of the run (QABS-C keeps its command held).
+
+A scenario does not wait for a fault whose `expected_hits` is 0.
+
+**A permanent delay** (record 0018, proposed). A fault names one
+`occurrence`, or every occurrence `from_occurrence` on: a repeated fault.
+How often a repeated fault is reached depends on the product, so it
+states `expected_hits_at_least` (at least 1) instead of `expected_hits`,
+and it binds no operation. A repeated `delay_result` has a `lag`, from 1
+to 64, and only it has one: each delayed answer is delivered to the core
+once `lag` newer answers of the same selection are held. It holds no one
+item, so no step hands one over (`held-item-mismatch`). Two faults of one
+selection overlap when the occurrences they select meet: a repeated one
+from n meets every occurrence from n on (`fault-match-invalid`).
+`DriveUntil` may set `fire_deadlines`: while the awaited event has not
+happened and nothing else is eligible, the bench fires the armed
+deadline due first, within the step's `max_steps`. A run result reports
+each fault with the expectation of its scenario, `expected_hits` or
+`expected_hits_at_least`; a fault expected at least so often is reached
+when its hits are at least that.
+
+QABS-A inspects at the barrier of the applied commit and then leaves
+it: `after_commit` sees the commit and no result, and the result becomes
+ready only after `LeaveBarrier`. A barrier no step leaves holds the
+adapter to the end of the run (QABS-B and QABS-C end at theirs).
+
+**What a point carries.** Each injection point `carries` a command or a
+result, and offers only actions that act on it: `hold_command` on a
+command; `drop_result`, `delay_result` and `duplicate_result` on a result;
+`refuse_fence` on the fence of a resolution, which is a command of the
+writer; `barrier` on either. On a point that carries a result, `match.result_of`
+selects the result of a `Persist` or of a `ResolveAndFence` about a
+matching operation; without it, every result about a matching operation
+counts, in the order they become ready.
+
+**Inside the transaction** (record 0020, proposed). Two points of the
+SQLite store carry the command and offer only a barrier:
+`store.commit.prepared`, before the commit of the transaction, and
+`store.commit.logged`, SQLite WAL hook after commit and release of its
+write lock, before the outcome is available to the adapter. These in-flight
+command barriers require the broker to run as a child process. The WAL hook
+observes an already committed transaction; it does not locate a kill inside
+the SQLite COMMIT call.
+
+**Typed read and collection failures** (record 0021, proposed).
+`DurableReadFailed` preserves a stable code, read phase, process incarnation
+and optional page. `ProcessControlFailed` preserves the corresponding
+control code and phase, including a truncated frame after an observed kill.
+Both originate at the surviving bench supervisor. Optional messages are
+bounded and carry no offending durable value. Run results retain the first
+64 structured contexts and the total `failure_count`; the oracle recomputes
+them from the trace. `durable_reads_complete` is required for every run.
+Missing durable evidence makes the affected business exchange INCONCLUSIVE;
+an already established safety violation remains FAIL. A test that receives
+this refusal successfully is not a qualifying PASS of that exchange.
+
+**Where a fence waits.** A resolution enters the writer and reads what is
+established for its operation. A receipt, a fence or a retired identity
+answers it. An absence brings it to the point `store.fence.transit`, the
+`occurrence` being counted over the resolutions of the operation that read
+an absence. There:
+
+- `hold_command` sets the fence aside until `ReleaseHeldCommand`. The
+  read of the absence is not a decision: the fence is written only if the
+  operation is still absent when the held fence enters the writer. If the
+  command committed meanwhile (QABS-A) the resolution answers `Committed`
+  and writes no fence; otherwise it fences (QABS-B), and the command
+  released afterwards is refused without effect;
+- `refuse_fence` makes the write of this one fence impossible: the
+  resolution answers `PendingOrUnknown` (QABS-C), nothing else changes and
+  the store stays available. The trace records it as `StoreFenceRefused`,
+  so that a refused fence is never inferred from a missing
+  `StoreFenceStable`.
+
+A held command does not by itself prevent a fence: a store fences whenever
+it can write the fence.
+
+**What selects a resolution.** A store that reads an absence does not
+know the command of the operation: neither its kind nor its publication.
+At `store.fence.transit`, `match.command_kind` and
+`match.publication_binding` name the resolved operation by its command as
+the bench knows it, from the fault that selected that command earlier in
+the scenario (`store.command.transit` in QABS-A, B and C). The runner of
+the bench maps the selection to the operation; the store is handed only
+the identity. Both readers refuse a fence fault whose command kind and
+publication no fault at `store.command.transit` selects
+(`fault-match-invalid`).
+
+**One fault per item.** Two faults of a scenario never select the same
+command or result. Two selections on one point, for one command kind, with
+compatible publication bindings and compatible `result_of`, are refused
+when they name the same occurrence, and also when only one of them names
+`result_of` or only one of them names `publication_binding`: they would
+count occurrences over different sets, and which fault acts would depend
+on the store.
+
+These steps give the broker nothing it could not know (ADR 0003): a fired
+deadline carries the token the core armed, a released command is the one
+the adapter accepted, a delivered result answers an effect still in flight.
+
+### Perimeter
+
+A trace header declares the `perimeter` of its run: `full`, or
+`core-without-bytes` when the core is driven with validated packets and no
+transport or peer observes anything. A scenario may require a perimeter;
+absent, it requires `full`.
+
+A run is judged only against a scenario of its own perimeter: for any
+other, every assertion is out of scope, and a qualifying result that holds
+an out-of-scope assertion is refused. A run without bytes therefore never
+passes a full scenario. It has its own scenario, which declares
+`core-without-bytes` and lists the assertions that perimeter can decide;
+an assertion that needs what the peers observed stays out of scope there.
+
+### Trace records and the provenance of broker inputs
+
+Every kind of record is stated by one origin only. The audit of ADR 0003
+reads the trace as chains, from what happened outside the core to what the
+core consumed:
+
+| Input of the core | Record of the core | What must precede it |
+| - | - | - |
+| Packet | `PacketDelivered` | `ClientBytesReceived` of the transport whose bytes are exactly that packet, itself caused by the `PeerPacketSent` of the peer with the same bytes |
+| Store result | `StoreResultDelivered` | `StoreResultHandedOver` of the store adapter with the same content, itself after the `StoreResultReady` the store produced with the same content; and `CommandSubmitted` or `ResolveSubmitted` with the same effect and operation, not answered before |
+| Opening reply | `OpeningReplyDelivered` | `OpeningSubmitted` of the store adapter with the same command; a committed reply names an epoch `StoreEpochOpened` records for that attempt |
+| Deadline | `DeadlineDelivered` | `DeadlineArmed` of the timer with the same token, not delivered before |
+| Recovery page | `RecoveryPageDelivered` | `RecoveryPageRead` of the store adapter with the same content |
+
+A recovery page lists its facts. Besides the epoch, the sessions, the
+inbound exchanges and the operations, an inventory holds what the core
+needs to prepare an admission (record 0014): `Limits`, `RouteTable` and
+one `Route` per target of a topic. Every quantity is a decimal string;
+the two 32-bit bounds of an admission (`max_targets_per_admission`,
+`max_topic_bytes`) refer to the `u32` primitive, in a trace, a snapshot
+and a fixture alike, and the semantic pass refuses a value above
+4294967295 (`u32-out-of-range`). The facts of a page follow the order
+of an inventory, which is the rule of `RecoveryOrder::admit`: `Epoch`,
+`Limits`, `RouteTable`, `Route`, `Session`, `InboundExchange`,
+`OutboundDelivery`, `ReceiptFrontier`, `Operation`, ranks never decreasing; the first three at most once
+(`duplicate-name`); routes sorted by the bytes of their topic, equal
+topics accepted (`rows-out-of-order` for a rank or a topic out of place).
+A reader of documents sees one page. That the pages of one recovery form
+one inventory, and that a route has its table before it, is checked by
+the oracle on the whole trace.
+
+`FrameEligible` carries the reason of an acknowledgement. A certain
+rejection in `StoreResultReady` and `StoreResultDelivered` names its
+`reject_reason`, and no other outcome has one. The reason a refusing
+PUBREC carries is a function of it, stated once by the transition
+catalogue as the `refusal_reasons` of the effect `EmitPubrecRefusal`:
+`QuotaExceeded` for `CapacityExceeded`, `ImplementationSpecificError`
+(0x83) for `Fenced`, `PreconditionFailed` and `EpochClosed` (record 0013,
+line 10). A test holds that table to `AckReason::refusing` of the
+contract crate, and the assertion
+`refusal_carries_the_reason_of_its_rejection` holds a run to it: the
+rejection a refusing frame answers is the latest certain rejection among
+its causes, delivered to the same incarnation of the core.
+
+A store may answer with no outcome at all: a contract violation
+(`StoreReply::Violation`), today only `RecipeMismatch`, for an
+`OperationId` presented again with a different recipe. The three result
+records then carry the outcome `Violation` and name it in `violation`,
+which no other outcome has. A violation is not a commit: an
+acknowledgement that follows from it fails
+`no_positive_ack_before_confirmed_commit`, and it is no terminal
+knowledge. The store adapter hands it over unchanged, as any result.
+
+A `CommandSubmitted` or `ResolveSubmitted` has as a parent the record of
+the core, in the same incarnation, that consumed the input the effect
+comes from (`PacketDelivered` for an admission or a release,
+`DeadlineDelivered` for a resolution). The other links have their
+parents already: commit, fence and ready result their cause in the
+store, the handover its ready result, the consumed result its handover.
+
+The result chain is closed on content (finding K1 of the audit): what the
+core consumed is what the adapter handed over, and that is what the store
+produced, effect, operation, outcome and reason of a rejection alike. A
+hold or a delay changes nothing of it; a result is handed over twice only
+under a declared `duplicate_result`; a dropped result is produced and
+never handed over.
+
+Start-up opens an epoch (records 0009 and 0011): `OpeningSubmitted` is
+the whole `OpenEpoch` the adapter submits; `StoreEpochOpened` the hidden
+truth of the ledger, at most once per epoch; `OpeningReplyDelivered` the
+reply the core takes, which names the command it answers, the epoch when
+committed and the reason when rejected; `OpeningAbandoned` that start-up
+stopped waiting, which is not terminal; `EpochGrantHandedOver` the one
+creation authority. `one_grant_per_opened_epoch`, owed by every run,
+holds when each epoch is granted at most once, after a committed reply
+the ledger confirms.
+
+A run the bench stops before the last step of its scenario ends with
+`StepBlocked {step, step_kind, cause, armed_deadlines, holding_faults}`
+of the bench supervisor, before the footer: `quiescent` when no action
+was eligible and the awaited event had not happened, `budget` when the
+steps ran out. The assertion `scenario_reaches_its_end`, owed by every
+run, fails on `quiescent` and is inconclusive on `budget`. The FAIL says
+what one finished run establishes: a `DriveUntil` step asserts that the
+awaited event comes with no stimulus beyond what the scenario has already
+injected, and nothing eligible with the wait unmet refutes that for this
+run (no missing record undoes it). It does not say the product is stuck
+for ever. For diagnosis only, the record counts the deadlines armed and
+not fired and names the faults that still hold an item, so that a reader
+can tell a stopped product from a scenario that did not fire a deadline
+it armed or release what it holds; the verdict depends on `cause` alone.
+
+A real kill (record 0019, proposed): when the broker runs as a child
+process, the trace header and the manifest say `broker: child-process`
+(absent means in-process), and the supervisor writes `BrokerKilled
+{signal_sent: SIGKILL, wait_status: {signal}}` once `wait()` has returned
+the child's status, before `BrokerCrashed`. No pid enters the trace.
+
+`InputRefused` is what the dispatcher records when it refuses a result
+that answers no effect in flight. `StoreCommitStable`, `StoreFenceStable`,
+`StoreFenceRefused` and `StoreResultReady` are hidden truth of the store: they judge a run and
+are never an input. `FaultHit` names the operation and effect it stopped,
+when there is one, and `HeldItemReleased` the fault whose command or
+result a step handed over.
+
+A record says what its emitter claims. Checking a trace as a whole, and
+the assertion `broker_inputs_have_provenance`, is the oracle's work.
+
+### The oracle and the generators of a campaign
+
+A run manifest may name, apart from the lab binary, the `oracle` that
+judges the campaign and the `generators` that wrote its inputs (V3-002).
+Each is `{sha256, files}`: the files with their digest and size, in path
+order and once each, and the digest of one `<sha256>  <path>` line per
+file, as the contract digest is. Both readers refuse a digest that is
+not that of the files listed, and files out of order (`evidence-mismatch`).
+
+### Store snapshots
+
+`InspectDurableState` writes one document of the format
+`mqttiumd.store-snapshot` per checkpoint, and records it in the trace as
+`DurableStateInspected`, cited by path, digest and size. A snapshot is
+read from the store independently of the broker; it is evidence for the
+oracle and never an input of the broker.
+
+| Table | Rows, in the order of their key |
+| - | - |
+| `meta` | Store incarnation; the last opened epoch (every earlier one is closed) and the attempt that opened it; the revision frontier; the next session |
+| `sessions` | Retained SessionId, ClientID bytes, revision, state, expiry policy and opening attachment OperationId. Current termination physically removes its row; `next_session` preserves non-reuse |
+| `route_table` | Its revision, and each exact topic with its target sessions and their QoS |
+| `receipt_frontiers` | At most 64 committed producer-origin guards, ordered by incarnation, epoch, owner; explicit operation/publication/payload boundaries, distinct from rejection receipts |
+| `operations` | Receipts: OperationId, the exact canonical bytes of the recipe, the terminal decision with its content (commit facts, or the reason of a certain rejection) |
+| `fences` | Identities fenced without a recipe: definitively not executable |
+| `payloads` | PayloadId, length, digest, count of live obligations that refer to it |
+| `publications` | PublicationId, the admission that created it, source session, topic, QoS, retain, PayloadId |
+| `obligations` | DeliveryId (`publication_id`, `index`), target session and its revision, cause, effective QoS, phase |
+| `inbound_exchanges` | ExchangeId, Packet Identifier, publication, phase; a released exchange has no row |
+| `account` | Usage and limits of the one account of S0 |
+
+Every table is present, even empty: an absent table is not an empty one.
+What is volatile (a command in transit, a transaction in preparation, a
+result not yet delivered, the control state of an opening) is not in a
+snapshot; the trace shows it.
+
+ADR 0027 adds compact receipt frontiers. A frontier is committed durable
+non-execution knowledge, even while a bounded sweep leaves physical receipt
+rows below it. It does not say that an old operation had no effect. Historical
+recipes can be unavailable after collection; retained canonical bytes are still
+compared. Positive live frontiers remain outside the existing fixture-based
+qualifier. Empty frontiers and zero registration do not extend that scope.
+
+Product events for Proposed ADR 0028 carry an explicit `puback` observation:
+the full connection key, nonzero u16 Packet Identifier, PUBACK reason and
+either null or the complete delivery/claim/frame target. The authoritative
+boundary is runtime reader-channel dequeue and codec validation before the
+owner-input queue. Reader-channel and socket bytes are upstream. Delayed
+internal copies retain this association; a null target cannot acquire one
+later. A historical target is readable descriptive evidence, not a format
+error or permission to finish a current delivery. The optional
+`source_observation_sequence` names an original observation within that
+process; it does not establish wire causality or an ordering against event
+`seq`. An optional envelope connection generation must agree with the nested
+connection. These product system tests do not extend fixture qualification.
+
+The revision of the route table is what the store writes; the oracle
+never computes it. The store advances it at each `AddRoute`, so the
+fixture of P1, whose one route has two targets, is at revision 2 in the
+examples, the recipes and the traces of the corpus.
+
+Rows are in the order of their key, numbers numerically, identities
+component by component and bytes as bytes, so that two stores in the same
+state write the same bytes. What a key member is comes from the schema,
+never from its value: a topic whose bytes are all decimal digits is bytes,
+and an empty topic is a key like another. A snapshot shows what the store holds, sound or not. The
+reader checks its form only: 64-bit ranges, no row listed twice under its
+key (`duplicate-name`) and rows in order (`rows-out-of-order`). An
+obligation without its publication, or two admissions for one exchange, is
+a finding the oracle asserts on, not a malformed document.
+
 ### Registry coverage
 
 For each machine, state class and event class, the guard domain is the
@@ -78,8 +399,15 @@ A result is `provisional` or `qualifying`.
 - A **qualifying** result is offered as evidence. It names its scenario,
   manifest and trace by path, digest and size, and the contract digest. The
   files must exist with those digests, the contracts must be the ones in
-  use, its assertions and faults must be exactly those of the scenario, and
-  none of them may be out of scope.
+  use, its faults must be exactly those of the scenario, its assertions
+  exactly those of the scenario and those every run owes, and none of them
+  may be out of scope.
+
+Each entry of the assertion catalogue says whether `every_run` owes it.
+`trace_complete` and `broker_inputs_have_provenance` are owed by every
+run: a scenario cannot opt out of them by not listing them, and P1-02,
+which is the text of the specification and lists only the first, owes
+both (ADR 0003).
 
 For both, the verdict must equal the one the assertions and injections
 determine: FAIL if any assertion failed; otherwise INCONCLUSIVE if any is
@@ -109,6 +437,15 @@ clone, and the file-mode and line-ending settings of the repository. The
 contract files are listed once each, in path order, which is the order
 their digest is defined by.
 
+`artifact.built_from` is present only when the bench rebuilt the binary
+from a source it keeps in the campaign (`run --rebuild`, record 0017):
+`source` names that archive as a file of the campaign, by relative path,
+digest and size, and `build` is the command that built it. It is the
+bench's declaration that the binary which ran is the one this source
+builds; `tools/check_campaign_binary.sh` checks it by building the source
+again and comparing digests, outside the oracle. That a build on another
+machine gives the same binary is not established.
+
 ## Example corpus
 
 The examples and their index are derived: `../tools/build_corpus.py` writes
@@ -136,3 +473,255 @@ and repeats no semantic rule. A second reader of the semantic rules is an
 open condition. Its strict parsing matches the Rust reader on the cases the
 corpus holds, including `NaN`, a lone surrogate escape, an integer beyond
 64 bits and the lexeme `-0`.
+
+### Explicit bounded session lifecycle (Proposed0029)
+
+ClientID is a reusable name; SessionId, opening OperationId and transport
+generation retain separate identities. JSON snapshot/recovery fields `expiry`
+and `opened_by` are optional only for historical fixture compatibility: omitted
+means `Never` and null respectively. New emitters always carry both. SQLite
+schema6 always persists and validates both; formats1--5 are refused before
+write-affecting pragmas. `Terminal` session rows remain readable historical
+format evidence, but current atomic cleanup removes them and never resets the
+monotone `next_session` counter. A publication's historical producer SessionId
+may outlive its row while obligations toward other destinations remain due.
+
+Canonical format1 adds kind8 `SessionLifecycle`, leaving kind1--7 bytes
+unchanged. Its OperationId precedes action0(Open) or1(Close). Open holds a strict
+boolean Clean Start, policy0(OnDisconnect)/1(Never), an optional expected guard,
+and a u16-length UTF-8 ClientID of1--1024 bytes without NUL. An optional
+expected guard starts with a presence bit. Its contents are SessionId followed
+by a strict opening-token presence bit and optional opening OperationId.
+Close holds that exact guard and reason0(Disconnect),1(TransportLost),2(Replaced)
+or3(Startup). No result loss authorizes a new request identity. Close is a
+control; Open consumes the business window. The window remains1024; its
+business threshold512 reserves512 positions for bounded continuation needs,
+including detach and expiry controls for128 sessions.
+Physical receipt quota8192/control reserve512 are unchanged.
+
+Committed facts are `{kind: "SessionLifecycle", change: ...}`. Opened identifies
+the durable session/revision, Session Present, policy, optional retired identity,
+route revision and bounded cancelled inbound/delivery/route counts. Closed
+identifies the cancelled session, route revision and cancellation counts.
+Cancellations are not successful deliveries. Product `session_changed` carries
+the original OperationId and the applied facts; an Open's attachment is this
+OperationId. `session_refused` carries a negative CONNACK reason and no invented
+SessionId. `session_cardinality` records bounded live/cleanup inventories without
+historical ClientIDs. Only `command_submitted.details.expected_session` and
+`session_changed.details.retired_session` admit null optional identities. Their
+nonnull forms remain checked u64 strings; arbitrary null or object-valued
+diagnostics are refused by the independent product reader. Current snapshot
+examples emit explicit Never/null defaults, while a separate historical example
+preserves omitted-field compatibility.
+
+Absent CONNECT expiry means0. Clean Start0 may resume a persistent incarnation
+and set policy0, retaining its business state until later closure. Clean Start1
+creates a new incarnation. DISCONNECT may retain policy, set0, or request the
+supported infinity value; CONNECT0 to nonzero DISCONNECT is Protocol Error0x82.
+Finite intermediate intervals are represented by the Proposed0030 extension below. Ephemeral sessions
+from a previous process are atomically terminated on actual epoch opening before
+readiness. Duplicate opening replay does not repeat startup expiry.
+
+The partial lifecycle registry describes product-system tests only. The fixture
+qualifier refuses lifecycle receipts, new policies or attachments; decoding their
+format is not independent qualification of session lifecycle behavior. Legacy
+Never/null fixture inventories preserve their previous qualification scope.
+Lifecycle transitions requiring takeover/control chaining reserve three effects;
+the historical two-slot constructor minimum remains valid for old inputs only.
+
+### Final lifecycle transport bounds and test controls
+
+The product profile declares 32 `closing_input_slots`, 208
+`frame_registration_slots` and 336 `terminal_input_slots`. Each of the 16
+transports can retain four queued writes, one active write and eight terminal
+write receipts: 16 x (4 + 1 + 8) = 208. The terminal-input lane also reserves
+128 positions for an Outbox-sized set of synchronously refused effects:
+208 + 128 = 336. These finite control/terminal lanes do not borrow the ordinary
+128 input positions. They are bounds on retained work, not historical counters.
+The reactor's pre-CONNACK staging retains at most one bounded packet per
+transport (`pre_connack_packet_slots`); this gate lets the lifecycle input
+progress while preventing later application packets from consuming the ordinary
+owner queue. This is separate from the bounded reader channel and socket bytes
+that the reactor has not yet collected.
+
+Orderly shutdown gives accepted work and zero-policy session ends at most
+`session_shutdown_timeout_ms = 2000` before writer release. The bounded
+`session_shutdown_completed` inventory reports at most 128 persistent sessions
+and zero owner bindings. `shutdown_incomplete` with `code=pending_or_unknown`
+retains phase Shutdown, the lifecycle-pending flag, bounded retired/in-flight/
+closing counts and the original operation when a lifecycle is pending. It does
+not claim certain rejection or complete cleanup. The older writer-deadline
+shape (`code=writer_deadline`, `accepted_outcome=unknown`) remains readable.
+These observations remain product-system facts, outside fixture qualification.
+
+The following control-file catalogue is product-system instrumentation behind
+`mqttiumd/test-hooks`, absent from the normal build. It does not add selectors
+to the fixture-based fault catalogue or widen that qualifier. Capture controls
+are consumed once, and each retains at most one copied fact. Replay controls
+submit that exact existing observation to its real guard, not a new lookup by
+ClientID. No captured fact creates an independent permission to emit.
+
+| Control file | Retained or injected fact | Product observation |
+| - | - | - |
+| `capture-next-session-change` | The next applied lifecycle result, with its original OperationId, SessionId and optional transport generation | `session_change_copied` |
+| `replay-session-change` | A retained copy of that same result enters the actual lifecycle result adapter; old results are refused as `stale_lifecycle_result` | `session_change_replayed`, followed by the applicable result or `session_change_ignored` |
+| `capture-next-session-close` | An original transport close, retaining its confirmed SessionId, generation and optional opening token | `session_close_copied` |
+| `replay-session-close` | That original generation's close enters the real closing-input lane | `session_close_replayed` |
+| `hold-session-open-result`, `hold-session-close-result` | A genuinely committed result remains unknown to the owner, including same-operation resolutions, until the file is removed | `store_result_held` |
+| `drop-next-session-open-result`, `drop-next-session-close-result` | One genuinely committed response is replaced with unknown knowledge; resolution retains its OperationId | `store_result_dropped` |
+| `hold-work-pages` | At most 16 correlated successful reads are retained until release; typed read errors are not hidden by a retired destination | `work_page_held`, then its normal application or `work_page_ignored` |
+
+Copied change observations require the original `operation`, `details.action`
+(Opened/Closed) and `details.session`; a connection generation is optional.
+Copied close observations require the original `connection` and
+`details.session`; `operation`, when present, is the original opening token.
+An absent legacy Admin attachment is represented by omission, never a fabricated
+operation. These compact copied/replayed details are closed scalar shapes and
+never contain a ClientID. All their durable/transport identity components retain
+the checked u64 domain. Their format records which fact was injected; system
+assertions separately decide whether the actual stale-event guard held.
+
+
+### Finite session expiry (Proposed0030)
+
+The product accepts every u32 Session Expiry Interval. Zero and infinity retain
+JSON strings `OnDisconnect` and `Never`; finite values use `{"After": seconds}`
+with seconds in1..4294967294. Legacy omitted policy/attachment/detachment remain
+Never/null/null. A detached fact is `{operation: OperationId, deadline: u64|null}`;
+the deadline is logical nanoseconds. Snapshot `meta.session_clock`, when present,
+is `{reading: {domain: 64lowerhex, tick: u64}, logical: u64}`. Only one anchor is
+stored. These are descriptive facts, not an extension of fixture qualification. Snapshot
+readers deliberately accept well-formed but unsound combinations so that evidence
+can describe corruption. Storage and core separately reject incoherent policy/
+deadline combinations before cleanup.
+
+Canonical kind8 preserves actions0/1 byte-for-byte and adds2(OpenAt),3(Detach),
+and4(Expire). OpenAt replaces legacy policy encoding with0/1/2, where2 is followed
+by finite u32 seconds, and appends logical `now`. Detach holds the exact opening
+guard, that policy encoding and the original logical close observation. Expire
+holds the guard, detached OperationId, a strict deadline-present bit and optional
+u64 deadline, then logical `now`. All identity/presence booleans remain strict;
+truncations, trailing bytes, finite aliases0/MAX and deadline overflow are refused.
+The independent Python recipe reader decodes these bytes without product help.
+
+Known `SessionLifecycle` facts add `Detached` with session, policy and immutable
+detachment. Product `session_changed` uses actionDetached, session, policy,
+`detached_by` and nullable deadline. An old attachment or timer cannot be retargeted
+through ClientID. Same-operation reconciliation retains the original recipe/time.
+OpenAt and conditional expiry share the writer order: a due Open cannot resume
+expired state merely because timer processing is delayed. Attached sessions never
+expire from their offline retention policy.
+
+The Linux provider uses safe CLOCK_BOOTTIME, identified by boot UUID and verified
+effective time-namespace offset. Unknown continuity creates a conservative new
+domain anchored at committed progress; UTC never authorizes deletion. Same-domain
+process downtime counts. Changed-domain unknown downtime does not. Previously
+durable deadlines remain unchanged; startup detaches a previously attached finite
+session from its first reliable new observation. Schema6 is explicit and old
+formats are refused without reset or implicit migration.
+
+One keyed timer per finite offline session, four due requests per reactor turn,
+and at most one checkpoint in flight bound maintenance. A single anchor is
+checkpointed every30s while such sessions exist. Commitment/scheduling delay is
+additional; `session_clock_degraded` with code`checkpoint_late` and actual decimal
+`age_ms` reports crossing31s. `expiry_inventory` records finite_timers<=128,
+checkpoint_inflight, queued<=128 and period_ms30000. `session_clock_checkpoint`
+records logical/tick; the writer additionally records same_domain and
+source`maintenance_commit`. Neither checkpoint allocates an operation receipt.
+
+| Test point/control | Authority exercised | Observation |
+| - | - | - |
+| `session.detach.prepared`, `session.expire.prepared` | Actual SQLite writes before COMMIT | `barrier_hit` with exact OperationId and SessionDetach/SessionExpire |
+| `session.detach.committed`, `session.expire.committed` | Actual COMMIT before result delivery | `barrier_hit` retaining that same operation |
+| `hold-session-detach-result`, `hold-session-expire-result` | Hold authentic committed result and same-operation resolutions | `store_result_held` |
+| `drop-next-session-detach-result`, `drop-next-session-expire-result` | Lose one authentic committed response, preserve uncertainty | `store_result_dropped` |
+
+These product hooks remain feature-gated and outside the fixture fault catalogue.
+A compiled mutation or process witness belongs to its own identified run. The
+partial expiry registry, finite model and system tests do not qualify arbitrary
+session time behavior through the fixture oracle.
+
+
+### Hierarchical routes and options (Proposed0031)
+
+`UpdateSubscriptions` keeps kind7 byte for byte for default options. Kind9 uses
+that same operation type, with one options byte after each granted-QoS byte and
+before the filter length. At least one entry must be nondefault; unsubscribe
+entries must use default options. Legacy kind3 retains its exact-topic format.
+The shared option domain is `{0,4,8,12,16,20,24,28,32,36,40,44}`: No Local,
+Retain As Published and Retain Handling0/1/2, excluding QoS and reserved bits.
+RAP/RH are retained facts in this non-retained profile, not a retained-store claim.
+
+Snapshot route targets and recovered `Route` facts may carry integer `options`.
+Omission means the historical default0. Writers omit0 so existing exact/default
+traces keep their bytes; nondefault values are always explicit. The administrative
+fixture remains default-only and refuses extra option fields. Literal filter
+bytes remain the route key; removing a filter does not remove a different match.
+SQLite schema7 is explicit; older formats are refused without mutation.
+
+The independent Python reader decodes kind9 and validates filter/options grammar.
+This is descriptive format support. Wildcard routes, nondefault options and all
+subscription mutations remain outside the fixture-based qualifier; its historical
+exact/default QoS2 campaigns keep their scope. New system routing receptions do
+not become qualifying through this reader extension.
+
+The product profile `tcp-hierarchical-pubsub-v1` advertises wildcard subscriptions
+and No Local, with shared subscriptions and Subscription Identifiers unavailable.
+Six bounded startup capability fields fit within the event details limit40;
+unknown fields remain subject to the existing bounded primitive representation.
+
+### Durable zero-delay Will (Proposed0034)
+
+The product profile `tcp-will-pubsub-v1` supports non-retained QoS1 Will,
+with Will Delay absent or zero. Other Will properties, including Message
+Expiry, are explicitly refused. SQLite schema10 is a new explicit format;
+old formats remain refused without modification or implicit migration.
+The separate reserve is 256 installed/pending intentions and 8 MiB of Will
+bytes; each topic is at most1024 bytes and payload at most32768 bytes.
+
+Canonical format1/kind8 retains action subtags0–4 byte for byte. Action5
+`OpenWillAt` carries clean-start, the existing expiry encoding, optional
+expected session guard, u16-length ClientID, u64 logical observation and
+one Will-presence boolean. A present Will has u16-length topic followed by
+u32-length payload. Action6 `EndWill` carries the exact session guard,
+expiry, original u64 closure observation and publication boolean.
+
+New kind17 `WillPublication` carries OperationId, installing Open OperationId
+(Will occurrence), PublicationId, route revision, u16-length topic, PayloadId,
+u64 payload length, the four u64 costs, then one u8 target count. Each target
+contains SessionId, revision, u32 delivery index, effective QoS and cause.
+There are at most16 targets, strictly increasing by SessionId with consecutive
+indices; only live cause1 and effective QoS0/1 are valid. There is no inbound
+MQTT Packet Identifier or fabricated inbound exchange. Retry and resolution
+preserve all original bytes, including the fixed complete target set.
+
+An optional snapshot `wills` array describes only Armed/Pending intentions,
+in installing OperationId order. Absence means no intention rows. Each row
+preserves its source SessionId, producer ClientID, topic and payload even
+after the source session is removed. Published/cancelled intentions leave no
+terminal Will row. `WillPublished` commit facts retain both `will_id` and
+`publication_id`. Product events carry the immutable `will` identity and
+bounded metadata; their installed/decided/admitted shapes forbid logging
+Will topic or payload bytes. Snapshots remain descriptive evidence and can
+show semantically invalid state; successful decoding is not a business verdict.
+
+The independent reader understands actions5/6, kind17, the optional inventory
+and commit facts. The fixture-based qualifier explicitly excludes Will
+intentions/publications; this format support does not qualify Will semantics.
+Historical K1/K2b/K3 retain their exact profile, reconstruction requirements
+and source/oracle identities.
+
+### Retained Will (Proposed0037)
+
+Kind8 action7 has the body of action5 and requires the descriptor. It
+declares `WillSpec.retain`. Kind18 has the body of kind17 followed by a u16
+live RETAIN mask in big-endian order. Bit i is the frozen RAP decision for
+canonical target i. Unused bits are invalid. Kind17 and kind8 actions0–6
+keep their exact bytes. Retained Will admission and consumption of its intent
+share the transaction that adds the live obligations and retained reference.
+
+Snapshot `wills` entries can carry the boolean `retain`. Historical omission
+means false. `will_admitted` can report the boolean `retained` without topic
+or payload bytes. The separate loopback/mTLS SQLite profile versions are
+12/13. The independent reader decodes both new tags. Neither the new layout
+nor the system reception expands fixture-based qualification.

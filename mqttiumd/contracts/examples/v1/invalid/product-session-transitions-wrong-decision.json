@@ -1,0 +1,299 @@
+{
+  "format": "mqttiumd.product-transition-registry",
+  "schema_version": 1,
+  "id": "tcp-session-lifecycle-v1",
+  "decision": "0028",
+  "scope": "product-system-tests",
+  "partition_complete": false,
+  "description": "Descriptive subset of Proposed ADR0029: zero/infinite retention, exact opening attachments, atomic replacement/target cancellation and bounded physical cleanup. Groups A-G are finite product-system reception. This is not a complete guard partition, finite-interval expiry implementation, accepted ADR, general MQTT conformance or fixture-oracle qualification.",
+  "rules": [
+    {
+      "id": "session.absent.open",
+      "machine": "SessionLifecycle",
+      "state_class": "Absent",
+      "event_class": "OpenRequested",
+      "guard": "Current connection generation; explicit bounded ClientID; Clean Start0/1 and expiry0/infinity. Reserve business receipt and lifecycle effect capacity before mutation. Expected absent guard, not a ClientID-derived invented SessionId.",
+      "next_state_class": "OpenPending",
+      "required_actions": [
+        "PersistSessionOpen",
+        "RetainLifecycleIdentity"
+      ],
+      "forbidden_actions": [
+        "SuccessConnackBeforeKnownOpen"
+      ],
+      "reception_groups": [
+        "A",
+        "B",
+        "C"
+      ]
+    },
+    {
+      "id": "session.persistent.resume",
+      "machine": "SessionLifecycle",
+      "state_class": "ActivePersistent",
+      "event_class": "ResumeRequested",
+      "guard": "CS0 retains existing SessionId and business revision, but establishes a new opening OperationId attachment and requested policy. Expiry0 changes retention after closure; it does not erase the resumed state.",
+      "next_state_class": "OpenPending",
+      "required_actions": [
+        "PersistSessionPolicy",
+        "PreserveBusinessState"
+      ],
+      "forbidden_actions": [
+        "EraseOnZeroConnect",
+        "BypassWriterWithClientCache"
+      ],
+      "reception_groups": [
+        "A"
+      ]
+    },
+    {
+      "id": "session.replace",
+      "machine": "SessionLifecycle",
+      "state_class": "ActivePersistent",
+      "event_class": "CleanStartRequested",
+      "guard": "Close and detach the previous transport before clean-start handling. Atomically cancel only old-incarnation responsibilities, remove its physical row and create fresh monotone SessionId, including at full128 capacity.",
+      "next_state_class": "OpenPending",
+      "required_actions": [
+        "PersistAtomicReplacement",
+        "PreserveOtherDestinations"
+      ],
+      "forbidden_actions": [
+        "AllocateTemporaryExtraSession",
+        "ReuseSessionId"
+      ],
+      "reception_groups": [
+        "A",
+        "C",
+        "D"
+      ]
+    },
+    {
+      "id": "session.takeover.zero",
+      "machine": "SessionLifecycle",
+      "state_class": "ActiveEphemeral",
+      "event_class": "TakeoverRequested",
+      "guard": "Previous expiry0 attachment ends before CS0 lookup. New generation is established with new SessionId/SP0 after known atomic replacement. Peer identity remains that of its original confirmed transport.",
+      "next_state_class": "OpenPending",
+      "required_actions": [
+        "ClosePreviousTransport",
+        "PersistAtomicReplacement"
+      ],
+      "forbidden_actions": [
+        "ResumeExpiredAttachment",
+        "RetargetOldPeerFromCache"
+      ],
+      "reception_groups": [
+        "A",
+        "E"
+      ]
+    },
+    {
+      "id": "session.open.unknown",
+      "machine": "SessionLifecycle",
+      "state_class": "OpenPending",
+      "event_class": "UnknownResult",
+      "guard": "Retain original OperationId, expected incarnation/token and canonical bytes. No success CONNACK, retry under a new identity or arbitrary certainty from absence. Same-operation resolution uses reserved control capacity.",
+      "next_state_class": "OpenPending",
+      "required_actions": [
+        "ResolveSameOperation",
+        "RetainReservation"
+      ],
+      "forbidden_actions": [
+        "CreateReplacementAgain",
+        "ReportRejectedFromUnknown"
+      ],
+      "reception_groups": [
+        "E",
+        "F"
+      ]
+    },
+    {
+      "id": "session.open.known",
+      "machine": "SessionLifecycle",
+      "state_class": "OpenPending",
+      "event_class": "KnownOpenApplied",
+      "guard": "For an Open with Never policy, apply the correlated committed result to owner and adapter before success CONNACK. A quota refusal has negative CONNACK0x97 and no invented session. The analogous zero policy is a separate state.",
+      "next_state_class": "ActivePersistent",
+      "required_actions": [
+        "ApplySessionProjection",
+        "FenceAdapterInstallation"
+      ],
+      "forbidden_actions": [
+        "ReplyOnRetiredGeneration"
+      ],
+      "reception_groups": [
+        "A",
+        "B",
+        "C",
+        "E"
+      ]
+    },
+    {
+      "id": "session.open.known.zero",
+      "machine": "SessionLifecycle",
+      "state_class": "OpenPending",
+      "event_class": "KnownOpenApplied",
+      "guard": "For an Open with OnDisconnect policy, apply the correlated committed result and projection before success CONNACK. If its original transport already closed, chain guarded Close without readiness, retaining the exact opening token.",
+      "next_state_class": "ActiveEphemeral",
+      "required_actions": [
+        "ApplySessionProjection",
+        "FenceAdapterInstallation"
+      ],
+      "forbidden_actions": [
+        "ReplyOnRetiredGeneration"
+      ],
+      "reception_groups": [
+        "A",
+        "B",
+        "C",
+        "E"
+      ]
+    },
+    {
+      "id": "session.close.persistent",
+      "machine": "SessionLifecycle",
+      "state_class": "ActivePersistent",
+      "event_class": "TransportClosed",
+      "guard": "No explicit policy change: detach only matching original ConnectionKey/opening token, preserving durable session, subscriptions and responsibilities. Old-generation close cannot modify a current attachment.",
+      "next_state_class": "ActivePersistent",
+      "required_actions": [
+        "DetachCurrentTransport"
+      ],
+      "forbidden_actions": [
+        "DeletePersistentSession",
+        "ApplyOldCloseToNewAttachment"
+      ],
+      "reception_groups": [
+        "A",
+        "C",
+        "E"
+      ]
+    },
+    {
+      "id": "session.close.zero",
+      "machine": "SessionLifecycle",
+      "state_class": "ActiveEphemeral",
+      "event_class": "TransportClosed",
+      "guard": "Current original opening token, or explicit DISCONNECT0 for a persistent attachment. Reserve control window and persist Close before reclaiming capacity. CONNECT0 to nonzero DISCONNECT is Protocol Error0x82, not a policy upgrade.",
+      "next_state_class": "ClosePending",
+      "required_actions": [
+        "PersistGuardedClose",
+        "RetainCapacityUntilKnown"
+      ],
+      "forbidden_actions": [
+        "ReturnSessionSlotBeforeCommit",
+        "UpgradeZeroFromDisconnect"
+      ],
+      "reception_groups": [
+        "A",
+        "B",
+        "E"
+      ]
+    },
+    {
+      "id": "session.close.explicit.zero",
+      "machine": "SessionLifecycle",
+      "state_class": "ActivePersistent",
+      "event_class": "DisconnectZeroRequested",
+      "guard": "A supported DISCONNECT expiry0 changes the current infinite attachment into explicit guarded Close. Persist its exact SessionId/opening token before reclaiming resources; no MQTT acknowledgement exists for DISCONNECT.",
+      "next_state_class": "ClosePending",
+      "required_actions": [
+        "PersistGuardedClose",
+        "RetainCapacityUntilKnown"
+      ],
+      "forbidden_actions": [
+        "ReturnSessionSlotBeforeCommit",
+        "UpgradeZeroFromDisconnect"
+      ],
+      "reception_groups": [
+        "A",
+        "B",
+        "E"
+      ]
+    },
+    {
+      "id": "session.close.unknown",
+      "machine": "SessionLifecycle",
+      "state_class": "ClosePending",
+      "event_class": "UnknownResult",
+      "guard": "The guarded original Close remains unresolved and cannot free owner capacity or be rebound through a reused ClientID. Unknown retired business flights remain bounded until their own terminal consumption closes receipt holes.",
+      "next_state_class": "ClosePending",
+      "required_actions": [
+        "ResolveSameOperation",
+        "RetainDetachedFlights"
+      ],
+      "forbidden_actions": [
+        "ForgetUnknownCommand",
+        "DoubleReturnCredits"
+      ],
+      "reception_groups": [
+        "D",
+        "E",
+        "F"
+      ]
+    },
+    {
+      "id": "session.close.known",
+      "machine": "SessionLifecycle",
+      "state_class": "ClosePending",
+      "event_class": "KnownCloseApplied",
+      "guard": "Known committed target cleanup cancels own inbound/routes/destination obligations/claims and releases each reference once. Other destination obligations survive producer closure. Remove physical row and bounded owner/cache/work/emission metadata; next_session never resets.",
+      "next_state_class": "Absent",
+      "required_actions": [
+        "ReclaimExactSessionResources",
+        "RecordCancellations",
+        "PreserveOtherDestinations"
+      ],
+      "forbidden_actions": [
+        "CountCancellationAsDelivery",
+        "RetainHistoricalTerminalRows"
+      ],
+      "reception_groups": [
+        "B",
+        "C",
+        "D",
+        "G"
+      ]
+    },
+    {
+      "id": "session.result.stale",
+      "machine": "SessionLifecycle",
+      "state_class": "RetiredDetached",
+      "event_class": "OldResultOrObservation",
+      "guard": "An already associated operation, work page, PUBACK, frame callback or old attachment/connection may resolve its own uncertainty but cannot install routes, terminate or emit to a later incarnation sharing ClientID.",
+      "next_state_class": "RetiredDetached",
+      "required_actions": [
+        "PreserveImmutableCorrelation",
+        "ConsumeOwnTerminalOutcome"
+      ],
+      "forbidden_actions": [
+        "RebindThroughClientId",
+        "FinishNewIncarnation"
+      ],
+      "reception_groups": [
+        "E",
+        "G"
+      ]
+    },
+    {
+      "id": "session.startup.zero",
+      "machine": "SessionLifecycle",
+      "state_class": "ActiveEphemeral",
+      "event_class": "NewEpochOpened",
+      "guard": "Initial bounded typed validation precedes actual epoch-opening cleanup. Its transaction ends all previous-process expiry0 attachments before grant/recovery. Idempotent replay of already-opened epoch does not expire current sessions again.",
+      "next_state_class": "Absent",
+      "required_actions": [
+        "ExpirePreviousZeroSessions",
+        "PreserveInfiniteSessions"
+      ],
+      "forbidden_actions": [
+        "ResumeEphemeralAfterCrash",
+        "ResetDatabaseOnFailure"
+      ],
+      "reception_groups": [
+        "F",
+        "G"
+      ]
+    }
+  ]
+}

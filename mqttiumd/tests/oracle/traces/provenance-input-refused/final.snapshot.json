@@ -1,0 +1,194 @@
+{
+  "format": "mqttiumd.store-snapshot",
+  "schema_version": 1,
+  "run_id": "provenance-input-refused",
+  "checkpoint": "final",
+  "backend": "sim-store",
+  "meta": {
+    "incarnation": "1",
+    "last_opened_epoch": "2",
+    "opened_by": {
+      "startup_hex": "02020202020202020202020202020202",
+      "ticket": "1"
+    },
+    "collected_through": "0",
+    "state_revision": "2",
+    "next_session": "4"
+  },
+  "sessions": [
+    {
+      "session": "1",
+      "client_id_hex": "70312d70726f6475636572",
+      "revision": "1",
+      "state": "Active"
+    },
+    {
+      "session": "2",
+      "client_id_hex": "70312d62",
+      "revision": "1",
+      "state": "Active"
+    },
+    {
+      "session": "3",
+      "client_id_hex": "70312d63",
+      "revision": "1",
+      "state": "Active"
+    }
+  ],
+  "route_table": {
+    "revision": "2",
+    "routes": [
+      {
+        "topic_hex": "70312f6578616d706c65",
+        "targets": [
+          {
+            "session": "2",
+            "qos": 1
+          },
+          {
+            "session": "3",
+            "qos": 1
+          }
+        ]
+      }
+    ]
+  },
+  "receipt_frontiers": [],
+  "operations": [
+    {
+      "operation_id": {
+        "incarnation": "1",
+        "epoch": "1",
+        "owner": "0",
+        "sequence": "1"
+      },
+      "recipe_hex": "4d514452000101000000000000000100000000000000010000000000000000000000000000000100000000000000010000000000000001000000000000000000000000000000010000000000000001000000000000000100000000000000000000000000000001000000000000000100000000000000010007000000000000000100000000000000020200000a70312f6578616d706c6500000000000000010000000000000001000000000000000000000000000000010000000000000007000000000000000700000000000000020000000000000001000000000000000100020000000000000002000000000000000100000000010100000000000000030000000000000001000000010101",
+      "decision": {
+        "kind": "Committed",
+        "facts": {
+          "kind": "PublicationAdmitted",
+          "publication_id": {
+            "incarnation": "1",
+            "epoch": "1",
+            "owner": "0",
+            "sequence": "1"
+          },
+          "exchange": {
+            "session": "1",
+            "generation": "1"
+          }
+        }
+      }
+    },
+    {
+      "operation_id": {
+        "incarnation": "1",
+        "epoch": "2",
+        "owner": "0",
+        "sequence": "1"
+      },
+      "recipe_hex": "4d5144520001020000000000000001000000000000000200000000000000000000000000000001000000000000000100070000000000000001",
+      "decision": {
+        "kind": "Committed",
+        "facts": {
+          "kind": "InboundReleased",
+          "exchange": {
+            "session": "1",
+            "generation": "1"
+          }
+        }
+      }
+    }
+  ],
+  "fences": [],
+  "payloads": [
+    {
+      "payload_id": {
+        "incarnation": "1",
+        "epoch": "1",
+        "owner": "0",
+        "sequence": "1"
+      },
+      "length": "7",
+      "sha256": "239f59ed55e737c77147cf55ad0c1b030b6d7ee748a7426952f9b852d5a935e5",
+      "references": "2"
+    }
+  ],
+  "publications": [
+    {
+      "publication_id": {
+        "incarnation": "1",
+        "epoch": "1",
+        "owner": "0",
+        "sequence": "1"
+      },
+      "operation_id": {
+        "incarnation": "1",
+        "epoch": "1",
+        "owner": "0",
+        "sequence": "1"
+      },
+      "source_session": "1",
+      "topic_hex": "70312f6578616d706c65",
+      "qos": 2,
+      "retain": false,
+      "payload_id": {
+        "incarnation": "1",
+        "epoch": "1",
+        "owner": "0",
+        "sequence": "1"
+      }
+    }
+  ],
+  "obligations": [
+    {
+      "publication_id": {
+        "incarnation": "1",
+        "epoch": "1",
+        "owner": "0",
+        "sequence": "1"
+      },
+      "index": 0,
+      "session": "2",
+      "target_revision": "1",
+      "cause": "LiveExact",
+      "effective_qos": 1,
+      "phase": "Queued"
+    },
+    {
+      "publication_id": {
+        "incarnation": "1",
+        "epoch": "1",
+        "owner": "0",
+        "sequence": "1"
+      },
+      "index": 1,
+      "session": "3",
+      "target_revision": "1",
+      "cause": "LiveExact",
+      "effective_qos": 1,
+      "phase": "Queued"
+    }
+  ],
+  "inbound_exchanges": [],
+  "outbound": [],
+  "account": {
+    "used": {
+      "payload_bytes": "7",
+      "references": "2",
+      "exchange_slots": "0",
+      "receipt_slots": "2"
+    },
+    "limits": {
+      "payload_bytes": "4096",
+      "references": "16",
+      "exchange_slots": "4",
+      "receipt_slots": "8",
+      "max_targets_per_admission": "4",
+      "max_topic_bytes": "256",
+      "max_payload_bytes": "1024",
+      "max_sessions": "8",
+      "max_route_targets": "8"
+    }
+  }
+}

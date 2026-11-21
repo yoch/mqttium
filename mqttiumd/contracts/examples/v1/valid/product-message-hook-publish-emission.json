@@ -1,0 +1,13 @@
+{
+  "format": "mqttiumd.product-event",
+  "schema_version": 1,
+  "seq": "10",
+  "pid": 1,
+  "kind": "barrier_hit",
+  "point": "publish.emission",
+  "details": {
+    "domain": "abababababababababababababababababababababababababababababababab",
+    "tick": "100",
+    "after": "Some(PublicationId { incarnation: StoreIncarnation(1), epoch: RunEpoch(1), owner: LogicalOwnerId(0), sequence: PublicationSeq(1) })"
+  }
+}

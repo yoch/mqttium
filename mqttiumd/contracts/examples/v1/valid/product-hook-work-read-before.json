@@ -1,0 +1,12 @@
+{
+  "format": "mqttiumd.product-event",
+  "schema_version": 1,
+  "seq": "1",
+  "pid": 1,
+  "kind": "barrier_hit",
+  "point": "work.read.before",
+  "details": {
+    "session": "4",
+    "effect": "1/0/26"
+  }
+}

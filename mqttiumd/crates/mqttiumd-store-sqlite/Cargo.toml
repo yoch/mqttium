@@ -1,0 +1,40 @@
+[package]
+name = "mqttiumd-store-sqlite"
+description = "The SQLite store of mqttiumd: one file, one writer, WAL and synchronous FULL read back (DEM-011)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+mqttiumd-contract.workspace = true
+# The interface of the store, and nothing of the bench.
+mqttiumd-store-api = { path = "../mqttiumd-store-api" }
+# `bundled` compiles the SQLite amalgamation pinned by libsqlite3-sys: the
+# same engine on every machine and in CI, whatever the system provides
+# (DEM-011). The binding holds the `unsafe`; this crate forbids it.
+rusqlite = { version = "=0.43.0", default-features = false, features = ["bundled", "cache", "backup"] }
+sha2 = "=0.11.1"
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+# The contract tests and the deterministic store, for the conformance and
+# differential tests and the measurement. A dev-dependency only: the bench
+# depends on this crate.
+mqttiumd-lab = { path = "../mqttiumd-lab" }
+# Writes a foreign schema version into a file, for the refusal test.
+rusqlite = { version = "=0.43.0", default-features = false, features = ["bundled", "cache"] }
+# The measurement example writes its report as JSON.
+serde_json = "1"
+
+[features]
+# The kill points of the bench (plan L7-kill-inside-a-transaction). Off by
+# default; a build of the product never enables it.
+kill-points = ["rusqlite/hooks"]
+
+[[test]]
+name = "kill_points"
+required-features = ["kill-points"]
