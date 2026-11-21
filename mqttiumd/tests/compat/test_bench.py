@@ -579,7 +579,7 @@ class Stability(unittest.TestCase):
         raw = self.play(retained_after, steps)
         self.assertEqual([packet["wire_bytes"] for packet in raw[-1]["got"]],
                          [len(wire.suback(1, [0])), len(wire.publish("t", "kept", retain=True))])
-        self.assertEqual(raw[2]["got"][0]["wire_bytes"], len(wire.connack()))
+        self.assertEqual(raw[1]["got"][0]["wire_bytes"], len(wire.connack()))
         normalized = normalize.normalize(raw, PLAIN)
         self.assertTrue(all("wire_bytes" not in packet for record in normalized for packet in record.get("got", ())))
 

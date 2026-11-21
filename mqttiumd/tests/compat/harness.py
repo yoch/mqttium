@@ -288,6 +288,8 @@ class Player:
                     got.append({"type": "UNDECODABLE", "error": str(error), "hex": connection.buffer.hex()})
                 for index, data in enumerate(packets):
                     packet = describe(data, connection.level)
+                    # What the packet took on the wire, fixed header included.
+                    packet["wire_bytes"] = len(data)
                     self.note(name, packet)
                     got.append(packet)
                     if (count is not None and len(got) >= count) or (until is not None and until(packet)):
@@ -313,6 +315,27 @@ class Player:
                 connection.buffer += chunk
             else:
                 connection.ended = "reset" if connection.reset else "eof"
+
+    def silent(self, name: str, *, window: float, limit: float):
+        """Collect packets until none has come for `window` seconds.
+
+        Returns `(packets, end)` with end `timeout` once the connection
+        fell silent, `eof` or `reset` when the peer closed it, and
+        `still-receiving` when packets kept coming for `limit` seconds. A
+        window that starts again at each packet reads a slow answer to its
+        end: one of a fixed length cut it wherever the machine was slower
+        than the window.
+        """
+        got: list[dict] = []
+        overall = time.monotonic() + limit
+        while True:
+            silent_at = time.monotonic() + window
+            packets, end = self.read(name, count=1, deadline=min(silent_at, overall))
+            got += packets
+            if end == "timeout":
+                return got, "timeout" if silent_at <= overall else "still-receiving"
+            if end != "ok":
+                return got, end
 
     # -- steps --------------------------------------------------------------
 
@@ -382,7 +405,9 @@ class Player:
         With `ping`, a PINGREQ is sent first and everything up to its
         PINGRESP is read before the silent window starts, so that a slow
         broker is given the time of one round trip more. That PINGREQ and
-        its PINGRESP belong to the harness and are not recorded.
+        its PINGRESP belong to the harness and are not recorded. The step
+        ends once nothing has come for `window` seconds (`quiet`), or
+        after `limit` seconds of packets (`still-receiving`).
         """
         name = step["conn"]
         connection = self.connections.get(name)
@@ -400,7 +425,7 @@ class Player:
             elif end == "timeout":
                 return {**record, "got": got, "end": "no-pingresp"}
         if end not in CLOSED:
-            more, end = self.read(name, deadline=time.monotonic() + step["window"])
+            more, end = self.silent(name, window=step["window"], limit=step["limit"])
             got += more
         return {**record, "got": got, "end": "quiet" if end == "timeout" else end, **SORT[bool(step["sort"])]}
 
@@ -410,6 +435,46 @@ class Player:
         record = self.do_quiet({**step, "ping": True, "sort": False})
         declared = {key: step[key] for key in ("kind", "expected", "field", "sequence") if step.get(key) is not None}
         return {"conn": step["conn"], "op": "tally", **declared, "got": record["got"], "end": record["end"]}
+
+    def do_measure(self, step):
+        """Record every packet that arrives, with what the step declares:
+        `normalize.measure` keeps what the protocol guarantees about the
+        counted packets and leaves out how many came."""
+        record = self.do_quiet({**step, "ping": True, "sort": False})
+        declared = {key: step[key] for key in ("kind", "field", "sequence", "ordered")}
+        return {"conn": step["conn"], "op": "measure", **declared, "got": record["got"], "end": record["end"]}
+
+    def do_drain(self, step):
+        """Read packets and answer each QoS 1 PUBLISH with its PUBACK at
+        once, until `count` PUBLISH packets came (`ok`), nothing has come
+        for `idle` seconds (`idle`), `timeout` seconds passed in all
+        (`timeout`), or the peer closed. A PUBLISH at another QoS is
+        recorded and not answered."""
+        name = step["conn"]
+        connection = self.connections.get(name)
+        record = {"conn": name, "op": "drain", "expected": step["count"]}
+        if connection is None:
+            return {**record, "got": [], "acknowledged": 0, "end": "not-open"}
+        got: list[dict] = []
+        publishes = acknowledged = 0
+        end = "ok"
+        overall = time.monotonic() + step["timeout"]
+        while publishes < step["count"]:
+            idle_at = time.monotonic() + step["idle"]
+            packets, end = self.read(name, count=1, deadline=min(idle_at, overall))
+            got += packets
+            for packet in packets:
+                if packet["type"] != "PUBLISH":
+                    continue
+                publishes += 1
+                if packet["qos"] == 1:
+                    self.write(connection, wire.puback(packet["packet_id"], level=connection.level))
+                    acknowledged += 1
+            if end == "timeout":
+                end = "idle" if idle_at <= overall else "timeout"
+            if end != "ok":
+                break
+        return {**record, "got": got, "acknowledged": acknowledged, "end": end, **SORT[bool(step["sort"])]}
 
     def do_until_close(self, step):
         record = {"conn": step["conn"], "op": "until_close"}

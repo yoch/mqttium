@@ -21,6 +21,13 @@ VERSIONS = {"v4": "3.1.1", "v5": "5.0"}
 # over QUIET seconds after a PINGREQ/PINGRESP round trip on the connection.
 WAIT = 3.0
 QUIET = 0.3
+# The silent window starts again at each packet; a connection on which
+# packets keep coming is given up after LIMIT seconds.
+LIMIT = 10.0
+# A `drain` gives up when nothing has come for IDLE seconds, or after
+# DRAIN seconds in all.
+IDLE = 1.0
+DRAIN = 15.0
 
 
 @dataclass(frozen=True)
@@ -146,23 +153,74 @@ def recv(conn, count=1, *, timeout=WAIT, sort=False):
     return {"op": "recv", "conn": conn, "count": count, "timeout": timeout, "sort": sort}
 
 
-def quiet(conn, *, window=QUIET, ping=True, timeout=WAIT, sort=False):
+def quiet(conn, *, window=QUIET, ping=True, timeout=WAIT, sort=False, limit=LIMIT):
     """State that nothing more arrives; whatever does is recorded.
 
-    The step sends PINGREQ, reads up to the PINGRESP and then for `window`
-    seconds more. `ping=False` is for a connection that cannot answer
-    PINGREQ (not connected yet, or expected to be closed).
+    The step sends PINGREQ, reads up to the PINGRESP and then until
+    nothing has come for `window` seconds: the window starts again at each
+    packet, so that an answer in several packets is read to its end
+    however slow the machine is. A connection on which packets still come
+    after `limit` seconds ends the step as `still-receiving`. `ping=False`
+    is for a connection that cannot answer PINGREQ (not connected yet, or
+    expected to be closed).
     """
-    return {"op": "quiet", "conn": conn, "window": window, "ping": ping, "timeout": timeout, "sort": sort}
+    if limit < window:
+        raise ValueError("the limit of a silent window is at least the window")
+    return {"op": "quiet", "conn": conn, "window": window, "ping": ping, "timeout": timeout, "sort": sort,
+            "limit": limit}
 
 
-def collect(conn, *, sort=False, window=QUIET, timeout=WAIT):
+def collect(conn, *, sort=False, window=QUIET, timeout=WAIT, limit=LIMIT):
     """Read whatever the broker has for `conn`, when how many packets come
-    is part of the question: the same round trip and window as `quiet`."""
-    return quiet(conn, window=window, timeout=timeout, sort=sort)
+    is part of the question: the same round trip and window as `quiet`.
+
+    Only where the count cannot depend on timing. What a broker may shed
+    (QoS 0) is counted with `measure`; what it owes (QoS 1) is read with
+    `drain`."""
+    return quiet(conn, window=window, timeout=timeout, sort=sort, limit=limit)
 
 
-def tally(conn, expected, *, kind="PUBLISH", sequence=None, field=None, window=QUIET, timeout=WAIT):
+def drain(conn, count, *, idle=IDLE, timeout=DRAIN, sort=False):
+    """Read until `count` PUBLISH packets came, acknowledging each QoS 1
+    PUBLISH with its PUBACK as it is read.
+
+    For deliveries the broker owes whatever the timing: a subscriber that
+    acknowledges is never the reason why one is missing, and a broker that
+    sends only a window of unacknowledged messages at a time goes on. The
+    step ends as `ok` at the last expected PUBLISH, as `idle` when nothing
+    has come for `idle` seconds, as `timeout` after `timeout` seconds in
+    all; every packet read is recorded. `sort` when the order of the
+    deliveries is not the question (retained messages of several topics).
+    Follow it with `quiet` to state that nothing comes twice.
+    """
+    return {"op": "drain", "conn": conn, "count": count, "idle": idle, "timeout": timeout, "sort": sort}
+
+
+def measure(conn, sequence, *, kind="PUBLISH", field=None, ordered=True, window=QUIET, timeout=WAIT, limit=LIMIT):
+    """Count the packets of type `kind` that arrive, where how many do is
+    lawful either way and depends on timing: QoS 0 deliveries, which a
+    broker may shed for a subscriber it cannot write to fast enough.
+
+    The count is a measurement. It is kept in the raw transcript and
+    printed in the matrix for both brokers, and never compared: a
+    scenario does not fail because a machine was slow. What is compared
+    is what the protocol guarantees whatever the count. `sequence` is
+    what could lawfully arrive, as the counted packets show it in `field`
+    (`payload` for PUBLISH, else `packet_id`): the transcript says whether
+    each value that came is one of them and came once (`values`:
+    `distinct`, `repeated`, `foreign`) and, with `ordered`, whether they
+    came in the order of `sequence` (`order`, as for `tally`). `ordered`
+    is False where no order is guaranteed, as between the retained
+    messages of several topics. The same round trip and window as `quiet`.
+    """
+    if limit < window:
+        raise ValueError("the limit of a silent window is at least the window")
+    return {"op": "measure", "conn": conn, "kind": kind, "sequence": list(sequence),
+            "field": field or ("payload" if kind == "PUBLISH" else "packet_id"), "ordered": ordered,
+            "window": window, "timeout": timeout, "limit": limit}
+
+
+def tally(conn, expected, *, kind="PUBLISH", sequence=None, field=None, window=QUIET, timeout=WAIT, limit=LIMIT):
     """Count the packets of type `kind` that arrive, and compare only whether
     all `expected` came (`all`), fewer (`fewer`) or more (`more`).
 
@@ -177,7 +235,8 @@ def tally(conn, expected, *, kind="PUBLISH", sequence=None, field=None, window=Q
     with a repeated or foreign value (`other`). The raw transcript keeps
     every packet.
     """
-    step = {"op": "tally", "conn": conn, "expected": expected, "kind": kind, "window": window, "timeout": timeout}
+    step = {"op": "tally", "conn": conn, "expected": expected, "kind": kind, "window": window, "timeout": timeout,
+            "limit": limit}
     if sequence is not None:
         step.update(sequence=list(sequence), field=field or ("payload" if kind == "PUBLISH" else "packet_id"))
     return step

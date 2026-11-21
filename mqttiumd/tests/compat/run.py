@@ -45,7 +45,7 @@ import harness  # noqa: E402
 import normalize  # noqa: E402
 import scenarios  # noqa: E402,F401  (fills dsl.REGISTRY)
 
-FORMAT = "mqttiumd-compat-matrix-v2"
+FORMAT = "mqttiumd-compat-matrix-v3"
 RESULTS = (classify.SAME, *classify.CLASSES, classify.UNCLASSIFIED, classify.ERROR)
 # What the broker is built from: the last commit that changed one of these
 # names the content under test better than HEAD does.
@@ -195,6 +195,43 @@ def expectation_lines(rows) -> list:
     return [*lines, ""]
 
 
+COUNTING = ("tally", "measure")
+
+
+def counted(result) -> list:
+    """One row per `tally` or `measure` step of a played scenario: how
+    many packets of the counted type each broker sent, out of how many the
+    step names. A measurement: no verdict rests on these numbers, which
+    may change from one run to the next."""
+    found = {backend: [record for record in result["raw"].get(backend, ()) if record["op"] in COUNTING]
+             for backend in harness.BACKENDS}
+    rows = []
+    for index in range(max(map(len, found.values()))):
+        records = {backend: steps[index] if index < len(steps) else None for backend, steps in found.items()}
+        step = next(record for record in records.values() if record is not None)
+        row = {"scenario": result["name"], "conn": step["conn"], "op": step["op"], "kind": step["kind"],
+               "sent": step["expected"] if step["op"] == "tally" else len(step["sequence"])}
+        for backend, record in records.items():
+            row[backend] = None if record is None else sum(1 for packet in record["got"]
+                                                           if packet["type"] == step["kind"])
+        rows.append(row)
+    return rows
+
+
+def count_lines(rows) -> list:
+    lines = ["## Counts measured, not compared", "",
+             "How many packets of the counted type each broker sent in the steps that count",
+             "(`tally`, `measure`), out of how many the step names. These are the numbers of",
+             "this run and may differ in the next: where a broker may lawfully shed messages",
+             "(QoS 0), how many it sheds depends on timing. No result above rests on them.", "",
+             "| Scenario | Connection | Counted | Named | Mosquitto | mqttiumd |", "| - | - | - | -: | -: | -: |"]
+    for row in rows:
+        shown = ["-" if row[backend] is None else str(row[backend]) for backend in harness.BACKENDS]
+        lines.append(f"| `{row['scenario']}` | {row['conn']} | {row['kind']} | {row['sent']} | "
+                     + " | ".join(shown) + " |")
+    return [*lines, ""]
+
+
 def summarize(rows) -> dict:
     by_result = {result: 0 for result in RESULTS}
     by_area = {area: {result: 0 for result in RESULTS} for area in dsl.AREAS}
@@ -253,6 +290,8 @@ def markdown(matrix) -> str:
         lines.append("")
     if matrix["expectations"]:
         lines += expectation_lines(matrix["expectations"])
+    if matrix["counts"]:
+        lines += count_lines(matrix["counts"])
     lines += ["## Scenarios", "", "| Scenario | MQTT | Result | Note |", "| - | - | - | - |"]
     for row in rows:
         note = row["difference"] or row["doc"]
@@ -359,7 +398,7 @@ def main(argv=None) -> int:
 
     args.out.mkdir(parents=True, exist_ok=True)
     transcripts = args.out / "transcripts"
-    rows, incidents, expected = [], [], []
+    rows, incidents, expected, counts = [], [], [], []
     for result in results:
         name = result["name"]
         scenario = registry[name]
@@ -377,6 +416,7 @@ def main(argv=None) -> int:
         if diff is not None and args.verbose:
             print(f"--- {name} [{classes[name]}] fingerprint {result['fingerprint']}\n{diff}\n")
         expected += evaluate_expectations(scenario, result, listed)
+        counts += counted(result)
         for backend, incident in result["incidents"].items():
             recorded = set(entry.get("incident", {}).get(backend, ()))
             incidents.append({"scenario": name, "backend": backend, "kinds": incident["kinds"],
@@ -393,7 +433,8 @@ def main(argv=None) -> int:
               "broker": {"commit": broker_commit(), "sha256": sha256(broker)},
               "complete": not args.only, "scenario_count": len(rows), "summary": summary,
               "problems": [list(item) for item in problems], "incidents": incidents,
-              "expectations": expected, "expectation_summary": summarize_expectations(expected), "scenarios": rows}
+              "expectations": expected, "expectation_summary": summarize_expectations(expected), "counts": counts,
+              "scenarios": rows}
     (args.out / "matrix.json").write_text(json.dumps(matrix, indent=1, sort_keys=True) + "\n")
     (args.out / "matrix.md").write_text(markdown(matrix))
 
