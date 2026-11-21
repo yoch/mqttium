@@ -25,6 +25,19 @@
 //!
 //! A crash keeps the wrapped store and the evidence already recorded,
 //! and loses everything else.
+//!
+//! Group commit (record 0045). By default each command enters the writer
+//! alone: one action, one transaction. An adapter told to commit in
+//! groups (`commit_in_groups`) lets the action that moves a command into
+//! the writer take with it the commands waiting around it: the
+//! consecutive `Persist` commands of the transit, in their order of
+//! acceptance, that no fault holds, up to a bound. A resolution, an
+//! opening or a held command ends the group, as any other request ends
+//! the group of the store worker of the product. The members are handed
+//! to the store in one call, which commits them together; then the
+//! evidence of each is recorded as for a command alone, every commit
+//! before any result, and each result travels alone from there. Nothing
+//! of a member exists outside the store before that call returned.
 
 use std::collections::{BTreeMap, VecDeque};
 
@@ -37,7 +50,7 @@ use mqttiumd_contract::outcome::{
     EpochOpened, EpochOpening, OpeningOutcome, OpeningReply, StoreOutcome, StoreReply,
 };
 
-use mqttiumd_store_api::ReadError;
+use mqttiumd_store_api::{Applied, ReadError};
 
 use super::durable::{DurableStore, RecoveryCursor, RecoveryPage, RecoveryRefused, Resolved};
 
@@ -443,10 +456,57 @@ struct Origin {
     source: Source,
 }
 
-/// Where a barrier stopped the adapter, and what is left to do there.
+/// A result the writer produced and that is not ready yet.
+struct Produced {
+    origin: Origin,
+    answer: Answer,
+    /// It wrote, and has not passed the point after its commit yet.
+    applied: bool,
+}
+
+/// Where a barrier stopped the adapter, and what is left to do there:
+/// the result it stopped on, then those of the members of its group that
+/// come after it.
 struct Halt {
     point: FaultPoint,
-    pending: Option<(Origin, Answer)>,
+    pending: VecDeque<Produced>,
+}
+
+/// Commits several commands together and answers each, in their order,
+/// as `DurableStore::apply` would have answered them one after the other:
+/// as many answers as commands. `SqliteStore::apply_group` is one.
+pub type ApplyGroup<S> = fn(&mut S, &[&Command]) -> Vec<Applied>;
+
+/// What an adapter that commits in groups did, counted. It is evidence of
+/// the bench about itself: no trace record carries it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct GroupEvidence {
+    /// Groups handed to the store, those of one command included.
+    pub groups: u64,
+    /// Groups of more than one command.
+    pub shared: u64,
+    /// Commands those groups held, in all.
+    pub commands: u64,
+    /// The commands of the largest group.
+    pub largest: u64,
+}
+
+impl GroupEvidence {
+    fn count(&mut self, members: usize) {
+        let members = u64::try_from(members).unwrap_or(u64::MAX);
+        self.groups = self.groups.saturating_add(1);
+        self.shared = self.shared.saturating_add(u64::from(members > 1));
+        self.commands = self.commands.saturating_add(members);
+        self.largest = self.largest.max(members);
+    }
+
+    /// Adds what another adapter of the same run counted.
+    pub fn absorb(&mut self, other: Self) {
+        self.groups = self.groups.saturating_add(other.groups);
+        self.shared = self.shared.saturating_add(other.shared);
+        self.commands = self.commands.saturating_add(other.commands);
+        self.largest = self.largest.max(other.largest);
+    }
 }
 
 /// The deterministic store adapter. See the module documentation.
@@ -468,6 +528,11 @@ pub struct SimStore<S> {
     recovery_page: u64,
     /// The fault reached by the last passage that reached one.
     last_hit: Option<FaultId>,
+    /// How the writer commits several commands together and the most it
+    /// takes at once, when the adapter commits in groups.
+    group: Option<(ApplyGroup<S>, usize)>,
+    /// What it committed that way, not taken yet.
+    grouped: GroupEvidence,
 }
 
 /// What a crash leaves: the store and the evidence already recorded.
@@ -576,7 +641,23 @@ impl<S: DurableStore> SimStore<S> {
             evidence_lost: false,
             recovery_page: 0,
             last_hit: None,
+            group: None,
+            grouped: GroupEvidence::default(),
         }
+    }
+
+    /// Makes the writer commit in groups from now on: the action that
+    /// moves a command into the writer takes with it the `Persist`
+    /// commands waiting around it, at most `max` in all, and `apply`
+    /// commits them together. A bound of zero is a bound of one.
+    pub fn commit_in_groups(&mut self, apply: ApplyGroup<S>, max: usize) {
+        self.group = Some((apply, max.max(1)));
+    }
+
+    /// Takes the count of what was committed in groups since the last
+    /// call.
+    pub fn take_group_evidence(&mut self) -> GroupEvidence {
+        core::mem::take(&mut self.grouped)
     }
 
     /// The wrapped store, for inspection and for the commands that do
@@ -897,6 +978,9 @@ impl<S: DurableStore> SimStore<S> {
                     .iter()
                     .position(|transit| transit.id == id)
                     .ok_or(ActionRefused::NotEligible)?;
+                if let Some((apply, members)) = self.group_around(index) {
+                    return self.run_group(apply, members);
+                }
                 let transit = self
                     .transit
                     .remove(index)
@@ -919,6 +1003,126 @@ impl<S: DurableStore> SimStore<S> {
                 Ok(self.deliver(ready.id, ready.answer, Some(origin)))
             }
         }
+    }
+
+    /// The group the command at `index` of the transit enters the writer
+    /// with, when the adapter commits in groups and that command is a
+    /// `Persist` no fault holds: the consecutive commands of that kind
+    /// around it, in their order of acceptance, at most the bound, the
+    /// command itself among them.
+    fn group_around(&self, index: usize) -> Option<(ApplyGroup<S>, core::ops::Range<usize>)> {
+        let (apply, max) = self.group?;
+        let member = |index: usize| {
+            self.transit.get(index).is_some_and(|transit| {
+                transit.held.is_none() && matches!(transit.work, Work::Persist(_))
+            })
+        };
+        if !member(index) {
+            return None;
+        }
+        let mut start = index;
+        while start > 0 && member(start - 1) {
+            start -= 1;
+        }
+        let mut end = index + 1;
+        while member(end) {
+            end += 1;
+        }
+        // A run longer than the bound is cut to hold the chosen command.
+        if end - start > max {
+            start = start.max((index + 1).saturating_sub(max));
+            end = start + max;
+        }
+        Some((apply, start..end))
+    }
+
+    /// Runs the commands of `members` in the writer as one group: one
+    /// call of the store, then the evidence of each member, every commit
+    /// before any result.
+    fn run_group(
+        &mut self,
+        apply: ApplyGroup<S>,
+        members: core::ops::Range<usize>,
+    ) -> Result<Performed, ActionRefused> {
+        let commands: Vec<&Command> = self
+            .transit
+            .range(members.clone())
+            .filter_map(|transit| match &transit.work {
+                Work::Persist(command) => Some(command),
+                Work::Resolve(_) | Work::Open(_) => None,
+            })
+            .collect();
+        if commands.len() != members.len() {
+            return Err(ActionRefused::NotEligible);
+        }
+        let applied = apply(&mut self.store, &commands);
+        // A store that answers another number of members than it was
+        // given broke `ApplyGroup`: nothing can be attributed.
+        if applied.len() != commands.len() {
+            return Err(ActionRefused::Read(ReadError::InvalidData));
+        }
+        self.grouped.count(commands.len());
+        let entered: Vec<Transit> = self.transit.drain(members).collect();
+        let mut produced = VecDeque::with_capacity(entered.len());
+        for (transit, applied) in entered.iter().zip(applied) {
+            let (kind, operation, source) = describe(&transit.work);
+            let Some(named) = operation else {
+                continue;
+            };
+            if applied.committed_now {
+                self.record(StoreEvent::CommitStable {
+                    id: transit.id,
+                    operation,
+                    opened: None,
+                });
+            }
+            produced.push_back(Produced {
+                origin: Origin {
+                    id: transit.id,
+                    ticket: transit.ticket,
+                    kind,
+                    source,
+                },
+                answer: Answer::Operation {
+                    operation: named,
+                    reply: applied.reply,
+                },
+                applied: applied.wrote,
+            });
+        }
+        Ok(self.finish(produced))
+    }
+
+    /// Makes the results of the writer ready, in order. Each one that
+    /// wrote passes the point after its commit first, once; a barrier
+    /// there stops the adapter with that result and those after it left
+    /// to do.
+    fn finish(&mut self, mut produced: VecDeque<Produced>) -> Performed {
+        while let Some(mut next) = produced.pop_front() {
+            if next.applied {
+                next.applied = false;
+                let Origin {
+                    id, kind, source, ..
+                } = next.origin;
+                if self.pass(
+                    FaultPoint::CommitApplied,
+                    id,
+                    kind,
+                    operation_of(next.answer),
+                    source,
+                ) == Some(FaultAction::Barrier)
+                {
+                    produced.push_front(next);
+                    self.halt = Some(Halt {
+                        point: FaultPoint::CommitApplied,
+                        pending: produced,
+                    });
+                    return Performed::Halted(FaultPoint::CommitApplied);
+                }
+            }
+            self.make_ready(next.origin, next.answer);
+        }
+        Performed::Executed
     }
 
     /// Runs one command in the writer and makes its result ready.
@@ -1036,18 +1240,11 @@ impl<S: DurableStore> SimStore<S> {
                 opened,
             });
         }
-        if wrote
-            && self.pass(FaultPoint::CommitApplied, id, kind, operation, source)
-                == Some(FaultAction::Barrier)
-        {
-            self.halt = Some(Halt {
-                point: FaultPoint::CommitApplied,
-                pending: Some((origin, answer)),
-            });
-            return Ok(Performed::Halted(FaultPoint::CommitApplied));
-        }
-        self.make_ready(origin, answer);
-        Ok(Performed::Executed)
+        Ok(self.finish(VecDeque::from([Produced {
+            origin,
+            answer,
+            applied: wrote,
+        }])))
     }
 
     fn make_ready(&mut self, origin: Origin, answer: Answer) {
@@ -1138,7 +1335,7 @@ impl<S: DurableStore> SimStore<S> {
         if barrier {
             self.halt = Some(Halt {
                 point: FaultPoint::ResultConsume,
-                pending: None,
+                pending: VecDeque::new(),
             });
         }
         Performed::Delivered { delivery, barrier }
@@ -1192,12 +1389,12 @@ impl<S: DurableStore> SimStore<S> {
         Ok(page)
     }
 
-    /// Leaves a barrier and goes on from the point it stopped at.
+    /// Leaves a barrier and goes on from the point it stopped at. The
+    /// results left to do there are made ready in order; one of them may
+    /// reach a barrier of its own, and the adapter is then stopped again.
     pub fn resume(&mut self) -> Option<FaultPoint> {
         let halt = self.halt.take()?;
-        if let Some((origin, answer)) = halt.pending {
-            self.make_ready(origin, answer);
-        }
+        let _ = self.finish(halt.pending);
         Some(halt.point)
     }
 

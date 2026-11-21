@@ -114,6 +114,8 @@ pub struct Outcome {
     pub elementary: u64,
     /// The kills of child processes, as the supervisor observed them.
     pub kills: Vec<Killed>,
+    /// What the store adapters committed in groups, counted.
+    pub groups: crate::store::adapter::GroupEvidence,
 }
 
 /// The fixture as the runner needs it: clients and their sessions.
@@ -299,6 +301,7 @@ impl<B: Backend> Runner<'_, B> {
     fn start(&mut self) -> Result<(), Stop> {
         let faults = self.faults()?;
         let mut startup = Vec::new();
+        let group = self.backend.group_commit();
         let started = match &self.child {
             None => {
                 let store = self
@@ -314,9 +317,16 @@ impl<B: Backend> Runner<'_, B> {
                     &mut self.books,
                     &mut startup,
                 )
-                .map(|process| Broker::Local {
-                    process: Box::new(process),
-                    offered: Vec::new(),
+                .map(|mut process| {
+                    // Start-up submits no command: the writer commits in
+                    // groups from the first one on.
+                    if let Some((apply, max)) = group {
+                        process.commit_in_groups(apply, max);
+                    }
+                    Broker::Local {
+                        process: Box::new(process),
+                        offered: Vec::new(),
+                    }
                 })
             }
             Some(config) => {
@@ -960,6 +970,7 @@ pub(crate) fn failed_before_start(
         steps_played: 0,
         elementary: 0,
         kills: Vec::new(),
+        groups: crate::store::adapter::GroupEvidence::default(),
     }
 }
 
@@ -1112,5 +1123,6 @@ pub fn run<B: Backend>(plan: Plan<'_, B>) -> Outcome {
         steps_played: played,
         elementary,
         kills,
+        groups: books.groups,
     }
 }

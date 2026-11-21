@@ -11,9 +11,11 @@ use std::path::PathBuf;
 
 use serde_json::{Value, json};
 
+use mqttiumd_contract::command::Command;
 use mqttiumd_contract::ids::StoreIncarnation;
-use mqttiumd_store_api::ReadError;
+use mqttiumd_store_api::{Applied, ReadError};
 
+use crate::store::adapter::ApplyGroup;
 use crate::store::durable::{DurableState, DurableStore, Limits, MemoryStore};
 
 /// A durable store the runner can play a campaign on.
@@ -46,6 +48,19 @@ pub trait Backend {
 
     /// What a crash is on this backend, for the coverage of a campaign.
     fn crash(&self) -> &'static str;
+
+    /// How the writer of this backend commits several commands together
+    /// and the most it takes at once (record 0045). `None`: each command
+    /// is a transaction of its own.
+    fn group_commit(&self) -> Option<(ApplyGroup<Self::Store>, usize)> {
+        None
+    }
+
+    /// The name a campaign is asked for and replayed by. It is the name
+    /// of the store unless a mode of the writer has a name of its own.
+    fn requested_as(&self) -> &'static str {
+        self.name()
+    }
 }
 
 /// The deterministic store of the bench, in memory (lot L2).
@@ -115,6 +130,26 @@ pub struct Sqlite {
     pub path: PathBuf,
     /// The settings the engine read back at the last opening.
     settings: Option<Value>,
+    /// Whether the writer commits the commands waiting together in one
+    /// transaction (`SqliteStore::apply_group`, record 0045).
+    grouped: bool,
+}
+
+/// The name of the SQLite backend whose writer commits in groups. The
+/// store, the trace header, the manifest and the snapshots say `sqlite`:
+/// the engine and the file are the same.
+pub const SQLITE_GROUP: &str = "sqlite-group";
+
+/// What the campaign of a grouped writer says of its commits.
+pub const GROUP_COMMIT: &str = "groups (record 0045): the action that moves a command into the writer takes with it the consecutive Persist commands waiting in the transit of the store adapter that no fault holds, and SqliteStore::apply_group commits them in one transaction; the evidence of each member is recorded after that call returned, every commit before any result";
+
+/// `SqliteStore::apply_group` as the store adapter calls it. A group the
+/// store refuses is answered by no member: the adapter then stops.
+fn apply_group(
+    store: &mut mqttiumd_store_sqlite::SqliteStore,
+    commands: &[&Command],
+) -> Vec<Applied> {
+    store.apply_group(commands).unwrap_or_default()
 }
 
 impl Sqlite {
@@ -124,6 +159,16 @@ impl Sqlite {
         Self {
             path,
             settings: None,
+            grouped: false,
+        }
+    }
+
+    /// The same store, with a writer that commits in groups.
+    #[must_use]
+    pub fn grouped(path: PathBuf) -> Self {
+        Self {
+            grouped: true,
+            ..Self::new(path)
         }
     }
 
@@ -184,5 +229,16 @@ impl Backend for Sqlite {
 
     fn crash(&self) -> &'static str {
         "simulated: the store adapter and its connection are dropped and the same file is opened again, in the same operating-system process; no process is killed"
+    }
+
+    fn group_commit(&self) -> Option<(ApplyGroup<Self::Store>, usize)> {
+        self.grouped.then_some((
+            apply_group as ApplyGroup<Self::Store>,
+            mqttiumd_store_sqlite::MAX_GROUP,
+        ))
+    }
+
+    fn requested_as(&self) -> &'static str {
+        if self.grouped { SQLITE_GROUP } else { "sqlite" }
     }
 }

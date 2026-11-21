@@ -47,8 +47,8 @@ use mqttiumd_core::owner::{Owner, OwnerConfig};
 use super::collector::{Cause, Collector, Origin};
 use super::mqtt::transport;
 use crate::store::adapter::{
-    AdapterLimits, Delivery, FaultAction, FaultId, FaultSpec, Performed, SimStore, StoreAction,
-    StoreEvent, WorkId, startup_nonce,
+    AdapterLimits, ApplyGroup, Delivery, FaultAction, FaultId, FaultSpec, GroupEvidence, Performed,
+    SimStore, StoreAction, StoreEvent, WorkId, startup_nonce,
 };
 use crate::store::durable::DurableStore;
 use crate::store::evidence::{Cause as EvidenceCause, TraceWriter, outcome_fields, recovered_fact};
@@ -275,6 +275,9 @@ pub struct Books {
     pub barrier: Option<usize>,
     /// Events no record of the formats carries, by kind, counted.
     pub unwritten: BTreeMap<String, u64>,
+    /// What the store adapters of the run committed in groups, when the
+    /// writer of the backend commits that way.
+    pub groups: GroupEvidence,
 }
 
 /// What a frame written by the transport showed a peer.
@@ -395,6 +398,7 @@ fn flush<S: DurableStore>(
     if store.evidence_lost() {
         return Err(Stop::new("the store adapter lost evidence"));
     }
+    books.groups.absorb(store.take_group_evidence());
     let mut page = None;
     for event in store.take_events() {
         // A submission names, as its cause, the record of the core input
@@ -683,6 +687,12 @@ impl<S: DurableStore> Process<S> {
     #[cfg(feature = "kill-points")]
     pub fn store_mut_for_kill_hook(&mut self) -> &mut S {
         self.store.store_mut()
+    }
+
+    /// Makes the store adapter of this process commit in groups, as the
+    /// backend of the campaign says its writer does (record 0045).
+    pub fn commit_in_groups(&mut self, apply: ApplyGroup<S>, max: usize) {
+        self.store.commit_in_groups(apply, max);
     }
     /// Starts the process on `store` by the real path, arms the faults
     /// `faults` (scenario index and specification), and recovers.

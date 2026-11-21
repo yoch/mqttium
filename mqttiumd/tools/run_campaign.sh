@@ -2,7 +2,11 @@
 # Runs one campaign with the runner of the bench, then has the oracle
 # judge the directory it wrote (lot L4). Run from the mqttiumd directory:
 #
-#   tools/run_campaign.sh <scenario> <empty campaign directory> [seed] [sim-store|sqlite] [in-process|child]
+#   tools/run_campaign.sh <scenario> <empty campaign directory> [seed] [sim-store|sqlite|sqlite-group] [in-process|child]
+#
+# sqlite-group is the SQLite store with a writer that commits the commands
+# waiting together in one transaction (record 0045); it runs in-process
+# only. The scenarios of tests/scenarios/group/ reach a group of two.
 #
 # The fifth argument is where the process under test runs: inside the
 # runner (the default: a crash is simulated), or in a child process on
@@ -16,7 +20,7 @@
 set -euo pipefail
 
 if [[ $# -lt 2 || $# -gt 5 ]]; then
-    echo "usage: tools/run_campaign.sh <scenario> <empty campaign directory> [seed] [sim-store|sqlite] [in-process|child]" >&2
+    echo "usage: tools/run_campaign.sh <scenario> <empty campaign directory> [seed] [sim-store|sqlite|sqlite-group] [in-process|child]" >&2
     exit 2
 fi
 scenario=$1

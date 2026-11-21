@@ -406,6 +406,12 @@ pub fn execute(request: &Request) -> Result<Report, String> {
     refuse_inside_work_tree(&request.root, &request.out)?;
     match (request.process.as_str(), request.backend.as_str()) {
         ("in-process", _) | ("child", "sqlite") => {}
+        ("child", super::backend::SQLITE_GROUP) => {
+            return Err(format!(
+                "--process child runs on sqlite only; the writer of {} commits in groups in the process of the bench, and a group is not played across the control protocol",
+                super::backend::SQLITE_GROUP
+            ));
+        }
         ("child", other) => {
             return Err(format!(
                 "--process child runs on sqlite only; {other} lives in the process that runs it"
@@ -419,7 +425,14 @@ pub fn execute(request: &Request) -> Result<Report, String> {
             request,
             super::backend::Sqlite::new(request.out.join("store").join("mqttiumd.sqlite")),
         ),
-        other => Err(format!("unknown backend {other}: sim-store or sqlite")),
+        super::backend::SQLITE_GROUP => execute_with(
+            request,
+            super::backend::Sqlite::grouped(request.out.join("store").join("mqttiumd.sqlite")),
+        ),
+        other => Err(format!(
+            "unknown backend {other}: sim-store, sqlite or {}",
+            super::backend::SQLITE_GROUP
+        )),
     }
 }
 
@@ -600,6 +613,8 @@ fn execute_with<B: Backend>(request: &Request, mut backend: B) -> Result<Report,
     let collector = Collector::new(&run_id, kinds, scenario.max_trace_bytes);
     let backend_name = backend.name();
     let backend_crash = backend.crash();
+    let requested_as = backend.requested_as();
+    let grouped = backend.group_commit().is_some();
     let setup = Setup::from_fixture(
         &mut backend,
         &fixture_document,
@@ -773,7 +788,7 @@ fn execute_with<B: Backend>(request: &Request, mut backend: B) -> Result<Report,
         "run_id": run_id,
         "verdict": "INCONCLUSIVE",
         "exit_code": 2,
-        "scope": format!("{} on the backend {backend_name}, seed {}", scenario.id, request.seed),
+        "scope": format!("{} on the backend {requested_as}, seed {}", scenario.id, request.seed),
         "reasons": reasons,
         "assertions": assertions,
         "faults": faults,
@@ -847,12 +862,27 @@ fn execute_with<B: Backend>(request: &Request, mut backend: B) -> Result<Report,
         "scenario": scenario.id,
         "covers": {
             "backend": backend_name,
+            "commit": if grouped {
+                super::backend::GROUP_COMMIT
+            } else {
+                "one transaction for each command"
+            },
             "process": request.process,
             "crash": crash_statement(in_child, &outcome.kills, backend_crash),
             "perimeter": "full: client bytes through the transport of the bench, decoded by independent peers",
             "start_up": "the real path: EpochOpening through the store adapter, EpochGrant, OwnerAuthority::from_grant, one box for owner 0, Owner::new",
         },
         "backend_settings": backend_settings,
+        // What the store adapters counted of their own groups: evidence of
+        // the bench about itself, which no trace record carries.
+        "store_groups": if grouped { json!({
+            "requested_as": requested_as,
+            "max_commands": mqttiumd_store_sqlite::MAX_GROUP.to_string(),
+            "groups": outcome.groups.groups.to_string(),
+            "groups_of_more_than_one": outcome.groups.shared.to_string(),
+            "commands": outcome.groups.commands.to_string(),
+            "largest_group": outcome.groups.largest.to_string(),
+        }) } else { Value::Null },
         "recovery_page": RECOVERY_PAGE_FACTS.to_string(),
         "durable_read_budgets": super::failure::read_budgets(),
         "build_features": super::rebuild::BUILD_FEATURES,
