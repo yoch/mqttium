@@ -1,7 +1,16 @@
 # 0022 — First product TCP composition, durable incoming QoS 2
 
-Status: **Proposed**. Experimental implementation choice, not acceptance of
-the historical proposed records or permission to merge main.
+Status: **Accepted with amendments** (21 November 2026, decided under the
+repository owner's delegation on the advice of the independent audit of
+`8e4303d`). Experimental implementation choice, not acceptance of the
+historical proposed records or permission to merge main.
+
+Amendment of acceptance (21 November 2026).
+The handed-back packet rule describes the first TCP profile. Proposed record
+0046 changes the effect-slot case in the implementation. Its end-to-end
+progress claim requires separate qualification. Record 0048 states the
+capacities of the runtime and their derivation; the sixteen-connection
+numbers below describe the bounded qualification profile.
 
 Note (21 November 2026): the budgets this record states for sixteen connections are
 the bounded profile of `runtime::Limits`. The connection limit is an option

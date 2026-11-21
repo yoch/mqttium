@@ -1,8 +1,18 @@
 # 0029 — Explicit bounded session lifecycle
 
-Status: **Proposed**. This adds zero/infinite session retention to the existing
-experimental MQTT 5 profile. Finite intermediate intervals remain unsupported.
-It does not accept historical proposals or change the immutable chapters.
+Status: **Accepted with amendments** (21 November 2026, decided under the
+repository owner's delegation on the advice of the independent audit of
+`8e4303d`). This adds zero/infinite session retention to the existing
+experimental MQTT 5 profile. Finite intermediate intervals remain
+unsupported. It does not accept historical proposals or change the immutable
+chapters.
+
+Amendment of acceptance (21 November 2026).
+Amended by 0033. At sixteen connections reserve 544 terminal inputs for 208
+frame registrations, including the two facts of an expiring frame. Record
+0030 governs finite session expiry and the receipt-window threshold. Record
+0048 states the capacities of the runtime and their derivation; the sixteen-
+connection numbers below describe the bounded qualification profile.
 
 Amended by 0030 (record 0047): finite session expiry intervals are
 supported, and the business threshold of the receipt window is 512 where

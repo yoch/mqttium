@@ -50,6 +50,10 @@ two records by this one.
 
 ## Left open
 
-- Records 0001 to 0009 are "Accepted with amendments" and are amended by
-  0011, 0012 and 0015, which name them. They carry no "Amended by" line
-  yet.
+- The cases were found by two readings of the records, the second by an
+  independent audit, which added 0001 (by 0015), 0006 (by 0012), 0009 (by
+  0011 and 0012), 0025 (by 0026 and 0041), 0029 (by 0033), 0034 (by 0037),
+  0035 (by 0039) and 0038 (by 0040). Others may exist.
+- No index lists the clauses with their status, date and amendment. Two
+  concurrent behaviours serving as oracle for gate G0 would make a
+  missing line blocking.

@@ -27,7 +27,7 @@ its source; a test fails when the register and the records drift apart.
 | [0010](0010-credits-interface.md) | Accepted | Credits: the order of the guards of `release_if_current`, `Account::reserve`, unchecked constructors, one record per held lease | L1, L6 |
 | [0011](0011-epoch-opening.md) | Accepted | The opening of an epoch: one conditional, idempotent command with an identity; amends 0009 | L1, L2, L3, L4, L7 |
 | [0012](0012-reservation-refusals.md) | Accepted | Refusals of a reservation and their wake-ups; `StepOutcome::Exhausted`; a fifth refusal of creation; amends 0006, adds to 0009 | L1, L3, L4 |
-| [0013](0013-broker-behaviours-left-open.md) | Proposed | Twelve behaviours of the broker that the chapters leave open: replays on a live connection, closures, the refusal of an admission and its reason, what happens without a receipt slot | L1, L3, L4 |
+| [0013](0013-broker-behaviours-left-open.md) | Accepted with amendments | Twelve behaviours of the broker that the chapters leave open: replays on a live connection, closures, the refusal of an admission and its reason, what happens without a receipt slot | L1, L3, L4 |
 | [0014](0014-recovered-facts-order.md) | Accepted | Routes and limits among the recovered facts; the order of an inventory | L1, L2, L3, L7 |
 | [0015](0015-scenario-vocabulary-and-fence-point.md) | Accepted | Scenario steps of P1-02b, what a fault holds, the fence point; corrects step 3 of P1-02b in 0001 | L2, L3, L4, L5 |
 | [0016](0016-evidence-formats.md) | Accepted | Trace records of the input audit, what every run owes, the perimeter of a run, the store snapshot | L2, L3, L4, L7 |
@@ -36,32 +36,33 @@ its source; a test fails when the register and the records drift apart.
 | [0019](0019-real-kill-of-the-broker.md) | Accepted | The record `BrokerKilled` of a real kill of the broker, and the member `broker` of the trace header and of the run manifest: where the broker ran | L3, L4 |
 | [0020](0020-kill-inside-a-transaction.md) | Accepted | Deterministic transaction points, acknowledged in-flight barriers and identity-based recovery evidence | L3, L4, L7 |
 | [0021](0021-typed-bounded-durable-reads.md) | Accepted | Typed bounded durable reads, lifecycle evidence and action termination through the surviving supervisor | L3, L4, L7 |
-| [0022](0022-product-tcp-qos2.md) | Proposed | Product TCP incoming QoS 2, durable session facts, bounded transport and system evidence | Product |
+| [0022](0022-product-tcp-qos2.md) | Accepted with amendments | Product TCP incoming QoS 2, durable session facts, bounded transport and system evidence | Product |
 | [0023](0023-incoming-qos1.md) | Accepted | Incoming QoS 1 occurrences and acknowledgement receipts | Product |
 | [0024](0024-receive-wire-progress.md) | Accepted | Receive credits follow bounded transport progress | Product |
 | [0025](0025-exact-pubsub.md) | Proposed | Exact persistent subscriptions and outgoing QoS 1 | Product |
-| [0026](0026-qos0-volatile-and-consumed.md) | Proposed | Volatile QoS 0 and consumed durable obligations | Product |
+| [0026](0026-qos0-volatile-and-consumed.md) | Accepted with amendments | Volatile QoS 0 and consumed durable obligations | Product |
 | [0027](0027-live-receipt-retirement.md) | Accepted | Live bounded receipt retirement | Product |
 | [0028](0028-outgoing-packet-identifier-reuse.md) | Accepted | Recyclable outgoing Packet Identifiers and immutable PUBACK observations | Product |
-| [0029](0029-explicit-session-lifecycle.md) | Proposed | Explicit bounded zero/infinite session lifecycle, receipted attachments, target-only cancellation and physical cleanup | Product |
+| [0029](0029-explicit-session-lifecycle.md) | Accepted with amendments | Explicit bounded zero/infinite session lifecycle, receipted attachments, target-only cancellation and physical cleanup | Product |
 | [0030](0030-finite-session-expiry.md) | Accepted | Finite session expiry with a durable temporal anchor | Product |
 | [0031](0031-hierarchical-subscriptions.md) | Accepted | Hierarchical subscriptions and per-destination aggregation | Product |
 | [0032](0032-durable-retained.md) | Accepted | Topic-owned retained references, atomic frozen replay, ordered RH and live RAP | Product |
-| [0033](0033-message-expiry.md) | Proposed | Original message lifetime, bounded expiry and temporal quarantine | Product/system reception |
-| [0034](0034-durable-will.md) | Proposed | Durable zero-delay QoS1 Will and source-independent intentions | Product and bounded system reception |
-| [0035](0035-private-mtls-profile.md) | Proposed | TLS 1.3, durable ClientID ownership and topic grants | Product |
+| [0033](0033-message-expiry.md) | Accepted with amendments | Original message lifetime, bounded expiry and temporal quarantine | Product/system reception |
+| [0034](0034-durable-will.md) | Accepted with amendments | Durable zero-delay QoS1 Will and source-independent intentions | Product and bounded system reception |
+| [0035](0035-private-mtls-profile.md) | Accepted with amendments | TLS 1.3, durable ClientID ownership and topic grants | Product |
 | [0036](0036-offline-monotone-policy.md) | Accepted | Offline inventory, checked backup and atomic monotone authority transition | Product and SQLite |
 | [0037](0037-retained-will.md) | Accepted | Retained zero-delay Will | Product |
 | [0038](0038-mqtt311-wire-profile.md) | Accepted | MQTT 3.1.1 wire profile | Product |
 | [0039](0039-per-filter-subscribe-authorization.md) | Accepted | Per-filter SUBSCRIBE authorization | Product |
 | [0040](0040-mqtt311-incoming-qos2.md) | Accepted | Incoming QoS 2 on MQTT 3.1.1 | Product |
 | [0041](0041-outgoing-qos2.md) | Accepted | Durable outgoing QoS 2 | Product |
-| [0042](0042-mosquitto-mtls-cutover.md) | Proposed | Checked single-listener Mosquitto cutover | Frozen kit (report 0026) |
-| [0043](0043-bounded-reactor-pressure.md) | Proposed | Bounded reactor progress under transport pressure | Product |
+| [0042](0042-mosquitto-mtls-cutover.md) | Accepted | Checked single-listener Mosquitto cutover | Frozen kit (report 0026) |
+| [0043](0043-bounded-reactor-pressure.md) | Accepted with amendments | Bounded reactor progress under transport pressure | Product |
 | [0044](0044-reactor-runtime-and-evidence-tiers.md) | Accepted | Target profile of version 0.1, readiness-driven reactor runtime without `async` (departs from ARC-021), two evidence tiers, frozen receptions | Runtime lots |
 | [0045](0045-group-commit.md) | Proposed | Group commit in the SQLite store: up to 64 commands in one transaction, each a savepoint running the code of `apply`; answers after the commit; crash granularity of one group; trait and durable encodings unchanged | Store and store worker; model `MGroupCommit` is another lot |
 | [0046](0046-input-backpressure.md) | Proposed | Input pressure slows a peer instead of disconnecting it: a packet refused for effect slots waits in order, a full input lane holds its packet without a deadline; receipts keep theirs | Runtime tier; model `MTransportCredit` to follow |
 | [0047](0047-precedence-between-records.md) | Accepted | Precedence between decision records: the later record prevails on the point it states and the earlier one carries an "Amended by" line | All records |
+| [0048](0048-runtime-limits.md) | Accepted | Capacities of the runtime and their derivation: the sixteen-connection numbers of eight records describe the bounded profile | Runtime |
 
 What each record leaves open is tracked in
 [`../reception/open-conditions.md`](../reception/open-conditions.md).

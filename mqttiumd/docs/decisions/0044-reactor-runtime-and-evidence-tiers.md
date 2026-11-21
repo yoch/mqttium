@@ -3,6 +3,14 @@
 Status: **Accepted** (20 November 2026, decided with the repository owner
 after the audit of `bf9f702`). Applied by the runtime lots that follow it.
 
+Amended on 21 November 2026 after the independent audit of `8e4303d`: two
+statements of the paragraph "Runtime" below describe an intention the
+executable does not meet. MQTT decoding and encoding run on the core thread;
+the I/O threads own sockets, TLS and framing. Three bounded 100 ms rescans
+remain (pending work, Wills, message expiry); the first is needed until a
+mark per session replaces it, because a full ordinary lane makes the runtime
+forget which session has work. No loop sleeps between two passes any more.
+
 ## Context
 
 The audit of `bf9f702` compared the product executable with the profile of

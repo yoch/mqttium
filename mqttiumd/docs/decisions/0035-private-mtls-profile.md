@@ -1,7 +1,17 @@
 # 0035 — TLS 1.3, durable session ownership and static topic grants
 
-Status: **Proposed**. This decision applies to the private-network MQTT 5
-product and preserves the existing clear-text loopback profile.
+Status: **Accepted with amendments** (21 November 2026, decided under the
+repository owner's delegation on the advice of the independent audit of
+`8e4303d`). This decision applies to the private-network MQTT 5 product and
+preserves the existing clear-text loopback profile.
+
+Amendment of acceptance (21 November 2026).
+Amended by 0039. Authorize each SUBSCRIBE filter independently, encode one
+SUBACK result per position and apply the commit fence to granted changes.
+Size unauthenticated handshakes, certificate chains, policies and durable
+ownership independently of total transport capacity. Record 0048 states the
+capacities of the runtime and their derivation; the sixteen-connection
+numbers below describe the bounded qualification profile.
 
 Amended by 0037 (record 0047): schemas 10 and 11 are refused without
 migration; "Schema 10 continues to serve the loopback profile" below no

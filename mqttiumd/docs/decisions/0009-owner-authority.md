@@ -4,6 +4,10 @@ Status: **Accepted with amendments** (15 November 2026, third review of
 PR yoch/mqttium#647). Applied by lots L1, L2, L4 and L7; see "Obligations
 by lot".
 
+Amended by 0011 and 0012 (record 0047): the opening of an epoch is one
+conditional, idempotent command with an identity, and a fifth refusal of
+creation is added to the four below.
+
 ## Context
 
 An `Outbox` is a primitive with a precondition: one box per owner and run

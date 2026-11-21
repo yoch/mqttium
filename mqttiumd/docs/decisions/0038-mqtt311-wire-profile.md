@@ -2,6 +2,9 @@
 
 Status: **Accepted** (21 November 2026, by the repository owner).
 
+Amended by 0040 (record 0047): incoming QoS 2 is part of the MQTT 3.1.1
+profile.
+
 The product accepts protocol levels 4 and 5 on the same listener. The TCP
 adapter records the protocol level in `connect_validated` and uses it
 until that exact connection generation closes. Authentication, ownership,

@@ -1,4 +1,4 @@
-# Decision records 0010 to 0046: what the owner decided
+# Decision records 0010 to 0048: what was decided
 
 On 21 November 2026 the repository owner answered, record by record, a
 page that stated for each of the thirty-six proposed records what it
@@ -16,17 +16,28 @@ Each now reads "Accepted (21 November 2026, by the repository owner)".
 Three of them extend a record that stays proposed and say so in their
 status: 0028 (0025), 0030 (0029) and 0036 (0035).
 
-## Left proposed until a second opinion (13)
+## After the second opinion
 
-The owner will put these to an independent reviewer before deciding.
+Thirteen records waited for an independent reviewer, who audited the tree
+at `8e4303d` and recommended a decision for each with the exact text of
+its amendments. The owner then delegated the decisions. They follow the
+audit, with one difference: 0025 stays proposed until its amendment is
+implemented.
 
-| Record | Why it waits |
-| - | - |
-| 0013 | It expects a line-by-line answer and leaves lines 9 and 12 undecided; line 12 is a stated disagreement between the transition registry and models M1a/M1b, which blocks gate G0 |
-| 0018 | No campaign plays its vocabulary: the bench refuses such a scenario. Accepting it would accept a format, not an execution |
-| 0022, 0025, 0026, 0029, 0033, 0034, 0035, 0043 | Each states budgets or a limit for sixteen connections that `runtime::Limits` now derives from an option; 0025 and 0026 also state rules that 0028 and 0041 replace. Each carries a dated note and, where it applies, an "Amended by" line |
-| 0042 | Its kit is frozen evidence of the executable built from `51be4079` (record 0044, report 0026) |
-| 0045, 0046 | Written with the runtime of record 0044. Their models pass in CI and have been read by nobody but their authors |
+| Record | Decision | Why |
+| - | - | - |
+| 0013 | Accepted with amendments | The amendment is the line-by-line answer the record asked for. On line 12 it chooses the transition registry: after a certain refusal a new attempt gets a fresh identity. Gate G0 closes after the registry, M1a, M1b and an executable witness agree |
+| 0022, 0026, 0029, 0033, 0034, 0035, 0043 | Accepted with amendments | Each states numbers of the sixteen-connection profile, now governed by record 0048, and each amendment says which of its rules a later record replaced or what it still owes (0026 keeps its 100 ms rescan until a replacement is shown; 0043 owes an executable progress test) |
+| 0042 | Accepted as a historical decision | It binds the frozen kit and the executable built from `51be4079`; a version 0.1 claim needs a new reader and a new reception |
+| 0025 | Proposed | Its amendment requires that a delivery larger than the peer's Maximum Packet Size be discarded and its obligation completed with the connection kept open (MQTT-3.1.2-25). The core closes the connection and keeps the claim. The record is accepted with the change that implements it |
+| 0018 | Proposed | The bench refuses to play its vocabulary; accepted when a campaign qualifies a scenario and rejects its mutant, withdrawn if none uses it |
+| 0045 | Proposed | An unknown answer can hide a commit or an earlier diagnostic, and no oracle campaign runs a group |
+| 0046 | Proposed | A quarter of the lane does not reserve the way of an acknowledgement; its Keep Alive rule was corrected after the audit |
+
+Records 0047 (precedence) and 0048 (capacities of the runtime) were
+accepted with these decisions. Record 0044 carries an amendment line: two
+statements of its paragraph "Runtime" describe an intention the executable
+does not meet.
 
 ## Three decisions on the records as a whole
 
@@ -48,10 +59,8 @@ The owner will put these to an independent reviewer before deciding.
   `conformance/` is the map of that evidence.
 - That a frozen reception still passes on the current executable: they
   are not repaired (record 0044).
-- That an accepted record is free of stale text. Record 0044, accepted
-  on 20 November, says no loop polls on a timer for work; the runtime
-  keeps three 100 ms scans (pending work, Will, message expiry). The
-  sentence or the code is still to be adjusted.
+- That an accepted record is free of stale text. Record 0044 carries an
+  amendment line for two statements the executable does not meet.
 
 ## Corrections to the earlier proposal
 

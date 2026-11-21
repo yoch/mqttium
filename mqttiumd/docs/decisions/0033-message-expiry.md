@@ -1,7 +1,17 @@
 # 0033 — Message lifetime, transmission authority and temporal quarantine
 
-Status: **Proposed**. This extends the implemented profile without accepting
-0030, 0032 or other proposed decisions.
+Status: **Accepted with amendments** (21 November 2026, decided under the
+repository owner's delegation on the advice of the independent audit of
+`8e4303d`). This extends the implemented profile without accepting 0030,
+0032 or other proposed decisions.
+
+Amendment of acceptance (21 November 2026).
+At sixteen connections the terminal-input bound is 544. Derive it from two
+facts per registered frame plus the effect-box bound. Payload bytes,
+retained topics, target count and receipt-store quotas have independent
+limits. Record 0048 states the capacities of the runtime and their
+derivation; the sixteen-connection numbers below describe the bounded
+qualification profile.
 
 Note (21 November 2026): the budgets this record states for sixteen connections are
 the bounded profile of `runtime::Limits`. The connection limit is an option

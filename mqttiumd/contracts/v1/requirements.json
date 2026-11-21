@@ -32,7 +32,7 @@
     {
       "decision": "0001",
       "path": "docs/decisions/0001-live-indeterminate-path.md",
-      "sha256": "cde61e64e2d2445f78315bf431a25241c376755066058e506990e2c58e6d0c96"
+      "sha256": "15310da20e073608b940909b1df47af2537603588a1a433e274f755d61f34fd4"
     },
     {
       "decision": "0002",
@@ -57,7 +57,7 @@
     {
       "decision": "0006",
       "path": "docs/decisions/0006-plan-then-apply.md",
-      "sha256": "5b3a0789a24bfa8e4157b73b1fcd96393657d57772d299f0ec86637e2e9a0a21"
+      "sha256": "3dd8ac5594bb876f5aa42140083ec55822be074aa07c52e73d6cf0cdb5a98a89"
     },
     {
       "decision": "0007",
@@ -72,7 +72,7 @@
     {
       "decision": "0009",
       "path": "docs/decisions/0009-owner-authority.md",
-      "sha256": "9df1bf2b547bcbc02bdbf9ce58057a09ecd981bb1a3c3f87b42a2153c1f8b8fc"
+      "sha256": "182d01822e3f6c3c5fec05f3d8fe2b55daba83e005b896121e0e10530d030107"
     },
     {
       "decision": "0010",
@@ -88,6 +88,11 @@
       "decision": "0012",
       "path": "docs/decisions/0012-reservation-refusals.md",
       "sha256": "909a1e6886b8115220a6081f90e78d45eb628413f3d1f7fa9a2ee1a58f25ec1b"
+    },
+    {
+      "decision": "0013",
+      "path": "docs/decisions/0013-broker-behaviours-left-open.md",
+      "sha256": "bbde877a1c7b3db0f5a6111716907c7610fc3192051407255dded82ffab8ab39"
     },
     {
       "decision": "0014",
@@ -125,6 +130,11 @@
       "sha256": "e32ff2a160a055f2561d7ec6079870af4bab162722d3213fe2e2fd13abb01e25"
     },
     {
+      "decision": "0022",
+      "path": "docs/decisions/0022-product-tcp-qos2.md",
+      "sha256": "562176f54e6c5b64af42233c6d73308e20bb5a74645fc4b7c49d25454bf82041"
+    },
+    {
       "decision": "0023",
       "path": "docs/decisions/0023-incoming-qos1.md",
       "sha256": "d53af5a60e7fbbe46d1fd4a917418df9a23b1f874eafff44ab797a9a8461ca40"
@@ -135,6 +145,11 @@
       "sha256": "f62529a9634cda6a305acb805118b63f378b262300aeee03df0eb8bfcc8d9ef0"
     },
     {
+      "decision": "0026",
+      "path": "docs/decisions/0026-qos0-volatile-and-consumed.md",
+      "sha256": "ff41182e0f5c5f9592f2f0c6f0972324d31326ec1348450fe5b6c53e2e5a7275"
+    },
+    {
       "decision": "0027",
       "path": "docs/decisions/0027-live-receipt-retirement.md",
       "sha256": "bd2215b96e85b53ea5150bbc1442a9863900f426764d6fc0f6cf28ffea4c24f2"
@@ -143,6 +158,11 @@
       "decision": "0028",
       "path": "docs/decisions/0028-outgoing-packet-identifier-reuse.md",
       "sha256": "51a07bcc785540af45ea209772fd4c0df65bcc52961681970990d3bd1ee018bc"
+    },
+    {
+      "decision": "0029",
+      "path": "docs/decisions/0029-explicit-session-lifecycle.md",
+      "sha256": "84e58357ca50ef13e7e5d519a7e9eed74b28f855865d4486e3dabd5589e64d56"
     },
     {
       "decision": "0030",
@@ -160,6 +180,21 @@
       "sha256": "126dcbc0f7447c1f4fa9e4cbe0ff770d4c3a4d19558d8a6e05231ccc78d80f13"
     },
     {
+      "decision": "0033",
+      "path": "docs/decisions/0033-message-expiry.md",
+      "sha256": "a9327913722e031c163843c43b864157bfeb7bb383d6546b7cba2571d9fa6eb9"
+    },
+    {
+      "decision": "0034",
+      "path": "docs/decisions/0034-durable-will.md",
+      "sha256": "da07e9b28e79abac0bd0840defc593cd9ac610f18d366baef977a9a91880f377"
+    },
+    {
+      "decision": "0035",
+      "path": "docs/decisions/0035-private-mtls-profile.md",
+      "sha256": "657ab09220b08a4c599803045097973102cfb221fd1773dfa097280fa6de4ef1"
+    },
+    {
       "decision": "0036",
       "path": "docs/decisions/0036-offline-monotone-policy.md",
       "sha256": "fa212391cfb279012f60fc26428c7c3f72d4720ece22dd492c398cfd583d29b5"
@@ -172,7 +207,7 @@
     {
       "decision": "0038",
       "path": "docs/decisions/0038-mqtt311-wire-profile.md",
-      "sha256": "95815f28419b331b2116ad0eead177b792fafa54135058a8c0fed432c284e22a"
+      "sha256": "1cd5cc2f71a0e3f9e7facfa3f06e2b156459d24c46c6c7acc93a056db935c57e"
     },
     {
       "decision": "0039",
@@ -190,14 +225,29 @@
       "sha256": "435b0d11b1a20b3b1925492fb9c97f3c2149a254e99d2a1c5df66a4008b2fbe4"
     },
     {
+      "decision": "0042",
+      "path": "docs/decisions/0042-mosquitto-mtls-cutover.md",
+      "sha256": "f7d57b9169417df6b57657e0afea31e1f2333fe9d570b94873f2412e00dad208"
+    },
+    {
+      "decision": "0043",
+      "path": "docs/decisions/0043-bounded-reactor-pressure.md",
+      "sha256": "2b24a3dded94b64730cc2a09a8140b7fb3187acf2d33c55e913a1ebe2ed21cfb"
+    },
+    {
       "decision": "0044",
       "path": "docs/decisions/0044-reactor-runtime-and-evidence-tiers.md",
-      "sha256": "c16a5ecc81dbb1c860669f1c27b02bbc8cd07534c9be266b2492c80a2f109825"
+      "sha256": "7f2ac6b8eea8d8f55bff64afc25fa9341cd0dc3e825ae134bb6a054735b8d763"
     },
     {
       "decision": "0047",
       "path": "docs/decisions/0047-precedence-between-records.md",
-      "sha256": "57d5d76c7973a6332babfb51ba116b89c5fc0bffccd67c3d6971c3ab4106a728"
+      "sha256": "82c170d7eacd3ab54226049780253314e72599a92baa667ab1c01e9d1f354baf"
+    },
+    {
+      "decision": "0048",
+      "path": "docs/decisions/0048-runtime-limits.md",
+      "sha256": "19afc0dc2b9fb34ddc644e3a52df313c58e80c26ea7ed31b9485c28e5e66c832"
     }
   ],
   "entries": [

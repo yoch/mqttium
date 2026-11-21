@@ -1,6 +1,10 @@
 # ADR 0042 — Checked single-listener Mosquitto cutover
 
-Status: **Proposed**
+Status: **Accepted** (21 November 2026, decided under the repository owner's
+delegation on the advice of the independent audit of `8e4303d`), as a
+historical decision: it binds the frozen kit and the executable built from
+`51be4079`. A claim for version 0.1 needs the reader of real configurations
+and a reception of its own.
 
 The Linux operator tool accepts an explicit Mosquitto 2.0.21 source profile
 and emits a file/line decision for each directive, identity and ACL grant.

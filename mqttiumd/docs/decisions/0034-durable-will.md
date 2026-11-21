@@ -1,6 +1,15 @@
 # 0034 — Durable zero-delay QoS1 Will
 
-Status: **Proposed**
+Status: **Accepted with amendments** (21 November 2026, decided under the
+repository owner's delegation on the advice of the independent audit of
+`8e4303d`).
+
+Amendment of acceptance (21 November 2026).
+Amended by 0037. The zero-delay QoS 1 Will supports both Retain values. Size
+durable intentions and their payloads independently of the number of
+connected transports. Record 0048 states the capacities of the runtime and
+their derivation; the sixteen-connection numbers below describe the bounded
+qualification profile.
 
 Note (21 November 2026): the budgets this record states for sixteen connections are
 the bounded profile of `runtime::Limits`. The connection limit is an option

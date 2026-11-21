@@ -3,6 +3,9 @@
 Status: **Proposed**. A bounded product increment, not full P1/P2 reception,
 complete MQTT conformance or acceptance of historical proposed decisions.
 
+Amended by 0026 and 0041 (record 0047): QoS 0 subscriptions are granted and
+a QoS 2 request is granted QoS 2; the grant rule below no longer holds.
+
 Amended by 0028 (record 0047): an outgoing Packet Identifier is reused after
 its durable Finish; the rule "never reused within a live connection" below
 no longer holds.

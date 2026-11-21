@@ -1,7 +1,16 @@
 # 0026 — Volatile QoS 0 and consumed durable obligations
 
-Status: **Proposed**. This bounded product increment preserves ARC-025 and
-does not qualify all MQTT/P1/P2 semantics or accept historical proposals.
+Status: **Accepted with amendments** (21 November 2026, decided under the
+repository owner's delegation on the advice of the independent audit of
+`8e4303d`). This bounded product increment preserves ARC-025 and does not
+qualify all MQTT/P1/P2 semantics or accept historical proposals.
+
+Amendment of acceptance (21 November 2026).
+Keep the bounded 100 ms durable-work rescan until a replacement preserves or
+rediscovers every outstanding obligation across a full input queue and
+restart. Measure the fallback's cost and maximum detection delay. Record
+0048 states the capacities of the runtime and their derivation; the sixteen-
+connection numbers below describe the bounded qualification profile.
 
 Amended by 0041 (record 0047): a QoS 2 request is granted QoS 2; "QoS 2
 requests grant 1" below no longer holds.

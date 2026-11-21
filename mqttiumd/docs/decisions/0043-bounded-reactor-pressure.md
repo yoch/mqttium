@@ -1,6 +1,16 @@
 # ADR 0043 — Bounded reactor progress under transport pressure
 
-Status: **Proposed**
+Status: **Accepted with amendments** (21 November 2026, decided under the
+repository owner's delegation on the advice of the independent audit of
+`8e4303d`).
+
+Amendment of acceptance (21 November 2026).
+Stopping socket input on a blocked generation can also delay unread
+acknowledgements. Reserve writer and terminal capacity. Require an
+executable progress test that covers ingress, effect admission and output
+before claiming end-to-end control progress. Record 0048 states the
+capacities of the runtime and their derivation; the sixteen-connection
+numbers below describe the bounded qualification profile.
 
 Note (21 November 2026): the budgets this record states for sixteen connections are
 the bounded profile of `runtime::Limits`. The connection limit is an option

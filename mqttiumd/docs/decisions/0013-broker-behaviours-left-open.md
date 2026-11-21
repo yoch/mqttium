@@ -1,13 +1,23 @@
 # 0013 — Behaviours of the broker that the chapters leave open
 
-Status: **Proposed** (15 November 2026, lots L1 and L3, first wave).
-Recorded by the integration owner from what the lots decided while writing
-the transition registry and the contract of acknowledgements. Each line is
-a behaviour a client or an operator can observe; none is settled by the
-chapters or by an accepted record. It becomes a requirement only when the
-owner of the repository accepts it, line by line if need be. Until then
-the rules stay in the registry of lot L3 as written, marked as depending
-on this record.
+Status: **Accepted with amendments** (21 November 2026, decided under the
+repository owner's delegation on the advice of the independent audit of
+`8e4303d`). Proposed 15 November 2026, lots L1 and L3, first wave. Recorded
+by the integration owner from what the lots decided while writing the
+transition registry and the contract of acknowledgements. Each line is a
+behaviour a client or an operator can observe; none is settled by the
+chapters or by an accepted record. The amendment below is the line-by-line
+answer the record asked for.
+
+Amendment of acceptance (21 November 2026).
+Accept rows 1 to 7 and 9 to 11 within their specified profile. In row 8, S0
+never collects a receipt. In the product, an awaited unresolved identity
+blocks retirement across its position. A late result for an already consumed
+identity can be retired. In row 12, a certain refusal ends the attempt
+without distribution. A subsequent eligible PUBLISH can create a new
+admission with a fresh OperationId. After sending a negative MQTT 5 PUBREC,
+treat a later PUBLISH with the same Packet Identifier as new. Align the
+transition register, M1a, M1b and the executable witness before closing G0.
 
 ## Context
 
