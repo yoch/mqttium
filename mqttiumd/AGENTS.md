@@ -47,6 +47,12 @@ campaign. On both, a crash of a scenario is simulated inside one
 process: the adapter is dropped and the store recovered or reopened. No
 process is killed and nothing is shown about `fsync` or power loss.
 
+A third value, `sqlite-group`, is the SQLite store behind a writer of the
+bench that commits the commands waiting together in one transaction
+(record 0045). It runs in-process only, and only the scenarios of
+`tests/scenarios/group/` reach a group of more than one command; their
+README states what such a run shows and what it does not.
+
 A result of the oracle is qualifying only for a run whose binary the
 runner rebuilt from an archive of the recorded content, kept in the
 campaign (`run --rebuild`, record 0017); any other result is provisional

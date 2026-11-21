@@ -184,13 +184,15 @@ be told what was written, and that is a fault, not pressure.
   clock while any framed packet was untaken; the independent audit of
   `8e4303d` showed that one held packet then hid any silence.
 - The reserve protects places in a lane, not a deadline: the packets it
-  lets through are those at the head of their connection's stream. What a
-  deferred packet waits for (result, receipt and effect slots) is
-  released by the store's results and by the dispatch, never by a packet
-  from the network, so neither rule can close a cycle; the audit of
-  `8e4303d` observed none either. The tests
+  lets through are those at the head of their connection's stream. Result,
+  receipt and effect slots are released by the store's results and by the
+  dispatch, never by a packet from the network. An exchange credit is
+  not: at QoS 2 it comes back with the PUBREL of the client that holds
+  it. The first form of the window rule closed that cycle, as the
+  counter-audit of `bbe1453` showed; with the window, the PUBREL of a
+  client that respects Receive Maximum is always read. The tests
   `the_last_places_of_the_lane_are_kept_for_packets_that_release_capacity`
-  and `a_connection_with_a_deferred_packet_adds_no_further_business_packet`
+  and `a_connection_keeps_at_most_its_window_of_business_packets_waiting`
   state the two rules on the runtime. Under the load of report 0027 with
   64 pairs, alternated with the previous build on a machine that other
   jobs were using, the two builds are not distinguishable beyond the
@@ -230,20 +232,23 @@ be told what was written, and that is a fault, not pressure.
   another. Credits that match the promise belong to the scaling of the
   core.
 - With Keep Alive 0 a held packet has no bound in time.
-- Acknowledgements follow the results of the store. When the result of an
-  earlier publication of a connection is known after that of a later one,
-  the later PUBACK or PUBREC leaves first; a PUBREL can likewise leave
-  before that of an earlier PUBREC. The single store writer answers in
-  order, so this needs a result that stays unknown and is resolved later;
-  the audit forced it with a test barrier and at the level of the core.
-  MQTT 5 states these three orders as rules of the client (MQTT-4.6.0-2
-  to -4). MQTT 3.1.1 extends its rules to a server "when delivering
-  messages to each of its subscribers" (MQTT-4.6.0-6): that covers the
-  order of PUBREL on a delivery, not the acknowledgement of a received
-  publication. The order of the deliveries themselves (MQTT-4.6.0-5 in
-  MQTT 5, -6 in 3.1.1) held in every probe. The order of PUBREL under a
-  reordered result is an open deviation in MQTT 3.1.1; the rest is
-  recorded as behaviour a client may observe.
+- The broker's own PUBACK and PUBREC follow the results of the store.
+  When the result of an earlier publication of a connection is known
+  after that of a later one, the later acknowledgement leaves first. The
+  single store writer answers in order, so this needs a result that
+  stays unknown and is resolved later; the audit forced it with a test
+  barrier. MQTT 5 states the order of acknowledgements as rules of the
+  client (MQTT-4.6.0-2 to -4). MQTT 3.1.1 extends its rules to a server
+  "when delivering messages to each of its subscribers" (MQTT-4.6.0-6):
+  that covers the order of PUBREL on a delivery, not the acknowledgement
+  of a received publication. It is recorded as behaviour a client may
+  observe, and the reading of MQTT-4.6.0-2 and -3 stays to be decided.
+  The two orders a server owes are kept and have their witnesses: the
+  order of the deliveries (MQTT-4.6.0-5 in MQTT 5, -6 in 3.1.1), under a
+  late result and across a resumed session; and the order of PUBREL
+  after PUBREC on a delivery, which the counter-audit of `bbe1453` found
+  reversed under a late result and which the core has kept since
+  (`pubrels_keep_the_order_of_the_pubrecs_when_an_earlier_store_result_is_late`).
 
 - The model `MLaneOwed` (`models/reactor-wake`) states that a held
   packet is eventually delivered or its task cancelled, and keeps the old

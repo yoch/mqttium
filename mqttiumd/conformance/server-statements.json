@@ -3100,6 +3100,10 @@
           {
             "file": "mqttiumd/crates/mqttiumd/src/runtime_tests.rs",
             "test": "deliveries_keep_the_order_of_reception_when_an_earlier_store_result_is_late"
+          },
+          {
+            "file": "mqttiumd/crates/mqttiumd/src/runtime_tests.rs",
+            "test": "a_resumed_session_reads_its_backlog_in_the_order_of_reception"
           }
         ],
         "evidence_kind": "partial",
@@ -3107,7 +3111,7 @@
           "mqttiumd/crates/mqttiumd-core/src/owner/pubsub.rs:plan_work",
           "mqttiumd/crates/mqttiumd-core/src/owner.rs:plan_admission"
         ],
-        "note": "With the committed result of a first admission kept unknown to the core by a test barrier, a second publication of the same client is admitted and acknowledged, and the subscriber still reads the first then the second: asserted on real sockets for both protocol versions at QoS 1 and 2 (instrumented build). Partial: one publisher and one subscriber, two messages; the order at a takeover, across a crash inside a group commit and when the write itself is late is not asserted. The independent audit of 8e4303d, 21 November 2026, also read twelve messages in order across two pages after a reconnection; no permanent test asserts that order. The compatibility scenario `publish/burst-qos0-v4` compares the order of the QoS 0 messages of a burst."
+        "note": "With the committed result of a first admission kept unknown to the core by a test barrier, a second publication of the same client is admitted and acknowledged, and the subscriber still reads the first then the second: asserted on real sockets for both protocol versions at QoS 1 and 2 (instrumented build). Partial: one publisher and one subscriber, two messages; the order at a takeover, across a crash inside a group commit and when the write itself is late is not asserted. A session that was offline reads twelve messages in order across the two pages its window cuts them into, in both versions at QoS 1 and 2 (`a_resumed_session_reads_its_backlog_in_the_order_of_reception`). The compatibility scenario `publish/burst-qos0-v4` compares the order of the QoS 0 messages of a burst."
       },
       {
         "id": "MQTT-4.6.0-6",
@@ -3118,6 +3122,10 @@
           {
             "file": "mqttiumd/crates/mqttiumd/src/runtime_tests.rs",
             "test": "deliveries_keep_the_order_of_reception_when_an_earlier_store_result_is_late"
+          },
+          {
+            "file": "mqttiumd/crates/mqttiumd/src/runtime_tests.rs",
+            "test": "a_resumed_session_reads_its_backlog_in_the_order_of_reception"
           }
         ],
         "evidence_kind": "partial",
@@ -5220,10 +5228,18 @@
           {
             "file": "mqttiumd/crates/mqttiumd-core/src/owner/pubsub.rs",
             "test": "pubrel_leaves_in_the_order_of_the_pubrecs_whatever_the_order_of_the_results"
+          },
+          {
+            "file": "mqttiumd/crates/mqttiumd/src/runtime_tests.rs",
+            "test": "pubrels_keep_the_order_of_the_pubrecs_when_an_earlier_store_result_is_late"
+          },
+          {
+            "file": "mqttiumd/crates/mqttiumd/src/runtime_tests.rs",
+            "test": "a_resumed_session_reads_its_backlog_in_the_order_of_reception"
           }
         ],
         "evidence_kind": "partial",
-        "note": "Written for the Client; MQTT-4.6.0-6 extends 'the rules listed above' to a Server for its deliveries. The core sends the PUBREL of a delivery only when no PUBREL of an earlier PUBREC of the same session is still being prepared: asserted in the core with two preparations answered by the store in reverse order (the probe of the independent audit, which showed 2 then 1 before the correction). Partial: not yet asserted on a socket with a held preparation, nor across a resumed session."
+        "note": "Written for the Client; MQTT-4.6.0-6 extends 'the rules listed above' to a Server for its deliveries. The core sends the PUBREL of a delivery only when no PUBREL of an earlier PUBREC of the same session is still being prepared: asserted in the core with two preparations answered by the store in reverse order (the probe of the independent audit, which showed 2 then 1 before the correction). On real sockets, with the committed result of the first preparation kept unknown by a test barrier and then resolved by the SQLite store, no PUBREL leaves while the earlier one is unknown and the two leave in the order of the PUBRECs, in both versions (instrumented build; the test fails on the core before the correction). A resumed session that answers a backlog of twelve QoS 2 deliveries receives its PUBRELs in the order of its PUBRECs. Partial: two deliveries of one session under the barrier; not asserted at a takeover nor across a crash between two preparations."
       },
       {
         "id": "MQTT-4.6.0-5",
@@ -5234,6 +5250,10 @@
           {
             "file": "mqttiumd/crates/mqttiumd/src/runtime_tests.rs",
             "test": "deliveries_keep_the_order_of_reception_when_an_earlier_store_result_is_late"
+          },
+          {
+            "file": "mqttiumd/crates/mqttiumd/src/runtime_tests.rs",
+            "test": "a_resumed_session_reads_its_backlog_in_the_order_of_reception"
           }
         ],
         "evidence_kind": "partial",
@@ -5256,6 +5276,14 @@
           {
             "file": "mqttiumd/crates/mqttiumd-core/src/owner/pubsub.rs",
             "test": "pubrel_leaves_in_the_order_of_the_pubrecs_whatever_the_order_of_the_results"
+          },
+          {
+            "file": "mqttiumd/crates/mqttiumd/src/runtime_tests.rs",
+            "test": "a_resumed_session_reads_its_backlog_in_the_order_of_reception"
+          },
+          {
+            "file": "mqttiumd/crates/mqttiumd/src/runtime_tests.rs",
+            "test": "pubrels_keep_the_order_of_the_pubrecs_when_an_earlier_store_result_is_late"
           }
         ],
         "evidence_kind": "partial",
@@ -5263,7 +5291,7 @@
           "mqttiumd/crates/mqttiumd-core/src/owner/pubsub.rs:plan_work",
           "mqttiumd/crates/mqttiumd-core/src/owner.rs:plan_admission"
         ],
-        "note": "Both requirements have a witness, each partial. The order of deliveries: with the committed result of a first admission kept unknown to the core by a test barrier, a second publication of the same client is admitted and acknowledged, and the subscriber still reads the first then the second: asserted on real sockets for both protocol versions at QoS 1 and 2 (instrumented build). Partial: one publisher and one subscriber, two messages; the order at a takeover, across a crash inside a group commit and when the write itself is late is not asserted. The independent audit of 8e4303d, 21 November 2026, also read twelve messages in order across two pages after a reconnection; no permanent test asserts that order. The compatibility scenario `publish/burst-qos0-v4` compares the order of the QoS 0 messages of a burst. The other requirement, 'the rules listed above when delivering messages to each of its subscribers', covers the order of PUBREL after PUBREC on a delivery: see MQTT-4.6.0-4."
+        "note": "Both requirements have a witness, each partial. The order of deliveries: with the committed result of a first admission kept unknown to the core by a test barrier, a second publication of the same client is admitted and acknowledged, and the subscriber still reads the first then the second: asserted on real sockets for both protocol versions at QoS 1 and 2 (instrumented build). Partial: one publisher and one subscriber, two messages; the order at a takeover, across a crash inside a group commit and when the write itself is late is not asserted. A session that was offline reads twelve messages in order across the two pages its window cuts them into, in both versions at QoS 1 and 2 (`a_resumed_session_reads_its_backlog_in_the_order_of_reception`). The compatibility scenario `publish/burst-qos0-v4` compares the order of the QoS 0 messages of a burst. The other requirement, 'the rules listed above when delivering messages to each of its subscribers', covers the order of PUBREL after PUBREC on a delivery: see MQTT-4.6.0-4."
       },
       {
         "id": "MQTT-4.7.1-1",
