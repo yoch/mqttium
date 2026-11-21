@@ -50,6 +50,8 @@
 #![forbid(unsafe_code)]
 
 mod codec;
+#[cfg(all(test, feature = "kill-points"))]
+mod commit_error_tests;
 mod group;
 mod message_expiry;
 mod policy_transition;
