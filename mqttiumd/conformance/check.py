@@ -442,6 +442,7 @@ def _fixture(root: Path) -> dict:
                     {"file": DEMO + "lib.rs", "test": "a_real_test"},
                     {"file": "mqttiumd/tools/test_demo.py", "test": "test_python"},
                 ],
+                "evidence_kind": "direct",
                 "note": "Exercised.",
             },
             {
@@ -565,6 +566,16 @@ CASES = (
         lambda r: _second(r).update(evidence=list(_first(r)["evidence"])),
         "only a covered statement carries evidence",
     ),
+    (
+        "an evidence kind that is not direct or partial",
+        _set(_first, "evidence_kind", "indirect"),
+        "evidence_kind 'indirect'; expected one of ['direct', 'partial']",
+    ),
+    (
+        "an evidence kind on a statement that is not covered",
+        _set(_second, "evidence_kind", "partial"),
+        "only a covered statement has an evidence_kind",
+    ),
 )
 
 
@@ -586,6 +597,23 @@ def _stale_summary(root: Path, good: dict, quiet) -> list[str]:
     return []
 
 
+def _evidence_kind_counts(good: dict) -> list[str]:
+    """The summary counts the covered rows by the kind of their evidence."""
+    register = json.loads(json.dumps(good))
+    summary = render_summary(register)
+    wanted = ["| of which `direct` | 1 | 1 |", "| of which `partial` | 0 | 0 |", "| not reviewed | 0 | 0 |"]
+    _first(register)["evidence_kind"] = "partial"
+    del register["versions"]["3.1.1"][0]["evidence_kind"]
+    changed = render_summary(register)
+    wanted_changed = ["| of which `direct` | 0 | 0 |", "| of which `partial` | 1 | 0 |", "| not reviewed | 0 | 1 |"]
+    return [
+        f"the counts by evidence kind: the summary has no line {line!r}"
+        for text, lines in ((summary, wanted), (changed, wanted_changed))
+        for line in lines
+        if line not in text.splitlines()
+    ]
+
+
 def _selftest_failures(root: Path, quiet) -> list[str]:
     failures = []
     good = _fixture(root)
@@ -594,6 +622,7 @@ def _selftest_failures(root: Path, quiet) -> list[str]:
         run(root, check_only=True, out=quiet)
     except Refused as error:
         failures.append(f"the valid fixture was refused: {error}")
+    failures += _evidence_kind_counts(good)
     for name, mutate, expected in CASES:
         register = json.loads(json.dumps(good))
         mutate(register)
@@ -626,6 +655,7 @@ def selftest() -> int:
     print("selftest: the valid fixture passes, and the checker refuses:")
     for name in [name for name, _, _ in CASES] + ["a stale summary", "a repeated JSON key"]:
         print(f"  - {name}")
+    print("selftest: the summary counts the covered rows by the kind of their evidence")
     return 0
 
 
