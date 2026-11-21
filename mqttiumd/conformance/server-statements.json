@@ -3065,25 +3065,37 @@
         "id": "MQTT-4.6.0-5",
         "feature": "message-ordering",
         "applies_to_server": true,
-        "status": "open",
-        "evidence": [],
+        "status": "covered",
+        "evidence": [
+          {
+            "file": "mqttiumd/crates/mqttiumd/src/runtime_tests.rs",
+            "test": "deliveries_keep_the_order_of_reception_when_an_earlier_store_result_is_late"
+          }
+        ],
+        "evidence_kind": "partial",
         "code": [
           "mqttiumd/crates/mqttiumd-core/src/owner/pubsub.rs:plan_work",
           "mqttiumd/crates/mqttiumd-core/src/owner.rs:plan_admission"
         ],
-        "note": "Not established. Core tests show that an earlier outgoing claim is not overtaken by a later one, but nothing read or tested shows that deliveries keep the publisher's order when the store result of an earlier admission is late or unknown; no test compares the order a subscriber reads with the order a publisher sent at QoS 1 or 2. The independent audit of 8e4303d, 21 November 2026, observed deliveries to a subscriber in the order published (A then B, and twelve messages in order across two pages after a reconnection); the compatibility scenario `publish/burst-qos0-v4` compares the order of the QoS 0 messages of a burst with the order sent (as sent, among those the broker did not shed, in every play read with the broker built from 81acd13). Neither shows the order when the store result of an earlier admission is late or unknown."
+        "note": "With the committed result of a first admission kept unknown to the core by a test barrier, a second publication of the same client is admitted and acknowledged, and the subscriber still reads the first then the second: asserted on real sockets for both protocol versions at QoS 1 and 2 (instrumented build). Partial: one publisher and one subscriber, two messages; the order at a takeover, across a crash inside a group commit and when the write itself is late is not asserted. The independent audit of 8e4303d, 21 November 2026, also read twelve messages in order across two pages after a reconnection; no permanent test asserts that order. The compatibility scenario `publish/burst-qos0-v4` compares the order of the QoS 0 messages of a burst."
       },
       {
         "id": "MQTT-4.6.0-6",
         "feature": "message-ordering",
         "applies_to_server": true,
-        "status": "open",
-        "evidence": [],
+        "status": "covered",
+        "evidence": [
+          {
+            "file": "mqttiumd/crates/mqttiumd/src/runtime_tests.rs",
+            "test": "deliveries_keep_the_order_of_reception_when_an_earlier_store_result_is_late"
+          }
+        ],
+        "evidence_kind": "partial",
         "code": [
           "mqttiumd/crates/mqttiumd-core/src/owner/pubsub.rs:plan_work",
           "mqttiumd/crates/mqttiumd-core/src/owner.rs:plan_admission"
         ],
-        "note": "Not established. Every topic takes one path and there is no unordered mode, but whether that path is ordered is the open point of MQTT-4.6.0-5. The observations are in the note of MQTT-4.6.0-5."
+        "note": "Every topic takes one path and there is no unordered mode. That the path keeps the order of reception is the evidence of MQTT-4.6.0-5, with its limits."
       },
       {
         "id": "MQTT-4.7.0-1",
@@ -5140,13 +5152,19 @@
         "id": "MQTT-4.6.0-5",
         "feature": "message-ordering",
         "applies_to_server": true,
-        "status": "open",
-        "evidence": [],
+        "status": "covered",
+        "evidence": [
+          {
+            "file": "mqttiumd/crates/mqttiumd/src/runtime_tests.rs",
+            "test": "deliveries_keep_the_order_of_reception_when_an_earlier_store_result_is_late"
+          }
+        ],
+        "evidence_kind": "partial",
         "code": [
           "mqttiumd/crates/mqttiumd-core/src/owner/pubsub.rs:plan_work",
           "mqttiumd/crates/mqttiumd-core/src/owner.rs:plan_admission"
         ],
-        "note": "Not established. Every topic takes one path and there is no unordered mode, but whether that path is ordered is the open point of MQTT-4.6.0-6. The observations are in the note of MQTT-4.6.0-6."
+        "note": "Every topic takes one path and there is no unordered mode. That the path keeps the order of reception is the evidence described under MQTT-4.6.0-6, with its limits."
       },
       {
         "id": "MQTT-4.6.0-6",
@@ -5158,7 +5176,7 @@
           "mqttiumd/crates/mqttiumd-core/src/owner/pubsub.rs:plan_work",
           "mqttiumd/crates/mqttiumd-core/src/owner.rs:plan_admission"
         ],
-        "note": "Not established. Core tests show that an earlier outgoing claim is not overtaken by a later one, but nothing read or tested shows that deliveries keep the publisher's order when the store result of an earlier admission is late or unknown; no test compares the order a subscriber reads with the order a publisher sent at QoS 1 or 2. The independent audit of 8e4303d, 21 November 2026, observed deliveries to a subscriber in the order published (A then B, and twelve messages in order across two pages after a reconnection); the compatibility scenario `publish/burst-qos0-v4` compares the order of the QoS 0 messages of a burst with the order sent (as sent, among those the broker did not shed, in every play read with the broker built from 81acd13). Neither shows the order when the store result of an earlier admission is late or unknown."
+        "note": "Open for one of its two requirements. The order of deliveries is witnessed: with the committed result of a first admission kept unknown to the core by a test barrier, a second publication of the same client is admitted and acknowledged, and the subscriber still reads the first then the second: asserted on real sockets for both protocol versions at QoS 1 and 2 (instrumented build). Partial: one publisher and one subscriber, two messages; the order at a takeover, across a crash inside a group commit and when the write itself is late is not asserted. The independent audit of 8e4303d, 21 November 2026, also read twelve messages in order across two pages after a reconnection; no permanent test asserts that order. The compatibility scenario `publish/burst-qos0-v4` compares the order of the QoS 0 messages of a burst. The other requirement, 'the rules listed above when delivering messages to each of its subscribers', covers the order of PUBREL after PUBREC on a delivery: the broker's PUBREL leaves when the durable result of its PUBREC is applied, and the audit reversed two of them by reversing those results at the level of the core (see MQTT-4.6.0-4)."
       },
       {
         "id": "MQTT-4.7.1-1",

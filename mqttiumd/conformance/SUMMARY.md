@@ -13,32 +13,29 @@ is inferred from. The others are not reviewed, which is not a third kind.
 
 | Status | MQTT 5.0 | MQTT 3.1.1 |
 | - | -: | -: |
-| `covered` | 136 | 76 |
+| `covered` | 138 | 77 |
 | of which `direct` | 13 | 4 |
-| of which `partial` | 6 | 9 |
+| of which `partial` | 8 | 10 |
 | not reviewed | 117 | 63 |
 | `implemented-untested` | 43 | 32 |
 | `profile-refused` | 37 | 8 |
-| `open` | 2 | 6 |
+| `open` | 0 | 5 |
 | `not-applicable` | 33 | 17 |
 | statements | 251 | 139 |
 | of which bind a server | 221 | 125 |
 
-## Open (8)
+## Open (5)
 
 Applies to a server, and either no implementation and no deliberate refusal was found, or the behaviour looks non-conformant. The note says which.
 
-### message-ordering (7)
+### message-ordering (4)
 
 | MQTT | Statement | Note |
 | - | - | - |
-| 5.0 | `MQTT-4.6.0-5` | Not established. Core tests show that an earlier outgoing claim is not overtaken by a later one, but nothing read or tested shows that deliveries keep the publisher's order when the store result of an earlier admission is late or unknown; no test compares the order a subscriber reads with the order a publisher sent at QoS 1 or 2. The independent audit of 8e4303d, 21 November 2026, observed deliveries to a subscriber in the order published (A then B, and twelve messages in order across two pages after a reconnection); the compatibility scenario `publish/burst-qos0-v4` compares the order of the QoS 0 messages of a burst with the order sent (as sent, among those the broker did not shed, in every play read with the broker built from 81acd13). Neither shows the order when the store result of an earlier admission is late or unknown. |
-| 5.0 | `MQTT-4.6.0-6` | Not established. Every topic takes one path and there is no unordered mode, but whether that path is ordered is the open point of MQTT-4.6.0-5. The observations are in the note of MQTT-4.6.0-5. |
 | 3.1.1 | `MQTT-4.6.0-2` | Written for the Client; MQTT-4.6.0-6 extends 'the rules listed above' to a Server. Looks non-conformant: a PUBACK leaves when the store result of its admission is applied, and no code or test states that PUBACKs keep the arrival order of their PUBLISH packets. The independent audit of 8e4303d, 21 November 2026, observed acknowledgements leaving in the order of the store results: 8 then 7 for publications received as 7 then 8. The compatibility scenario `publish/pipelined-qos1-v4` compares the order of twenty PUBACK with the order of their PUBLISH packets on one topic: as sent in every play read with the broker built from 81acd13, which does not show the order when a store result is late. |
 | 3.1.1 | `MQTT-4.6.0-3` | Written for the Client; MQTT-4.6.0-6 extends 'the rules listed above' to a Server. Looks non-conformant: a PUBREC leaves when the store result of its admission is applied, and no code or test states that PUBRECs keep the arrival order of their PUBLISH packets. The independent audit of 8e4303d, 21 November 2026, observed acknowledgements leaving in the order of the store results: 8 then 7 for publications received as 7 then 8. |
 | 3.1.1 | `MQTT-4.6.0-4` | Written for the Client; MQTT-4.6.0-6 extends 'the rules listed above' to a Server. No implementation found: the broker's PUBREL leaves after the durable commit of its PUBREC, and no code or test states that two PUBRELs keep the order of their PUBRECs. The independent audit of 8e4303d, 21 November 2026, did not observe the order of PUBREL packets. |
-| 3.1.1 | `MQTT-4.6.0-5` | Not established. Every topic takes one path and there is no unordered mode, but whether that path is ordered is the open point of MQTT-4.6.0-6. The observations are in the note of MQTT-4.6.0-6. |
-| 3.1.1 | `MQTT-4.6.0-6` | Not established. Core tests show that an earlier outgoing claim is not overtaken by a later one, but nothing read or tested shows that deliveries keep the publisher's order when the store result of an earlier admission is late or unknown; no test compares the order a subscriber reads with the order a publisher sent at QoS 1 or 2. The independent audit of 8e4303d, 21 November 2026, observed deliveries to a subscriber in the order published (A then B, and twelve messages in order across two pages after a reconnection); the compatibility scenario `publish/burst-qos0-v4` compares the order of the QoS 0 messages of a burst with the order sent (as sent, among those the broker did not shed, in every play read with the broker built from 81acd13). Neither shows the order when the store result of an earlier admission is late or unknown. |
+| 3.1.1 | `MQTT-4.6.0-6` | Open for one of its two requirements. The order of deliveries is witnessed: with the committed result of a first admission kept unknown to the core by a test barrier, a second publication of the same client is admitted and acknowledged, and the subscriber still reads the first then the second: asserted on real sockets for both protocol versions at QoS 1 and 2 (instrumented build). Partial: one publisher and one subscriber, two messages; the order at a takeover, across a crash inside a group commit and when the write itself is late is not asserted. The independent audit of 8e4303d, 21 November 2026, also read twelve messages in order across two pages after a reconnection; no permanent test asserts that order. The compatibility scenario `publish/burst-qos0-v4` compares the order of the QoS 0 messages of a burst. The other requirement, 'the rules listed above when delivering messages to each of its subscribers', covers the order of PUBREL after PUBREC on a delivery: the broker's PUBREL leaves when the durable result of its PUBREC is applied, and the audit reversed two of them by reversing those results at the level of the core (see MQTT-4.6.0-4). |
 
 ### unsubscribe (1)
 

@@ -1196,6 +1196,111 @@ fn a_connection_with_a_deferred_packet_adds_no_further_business_packet() {
     });
 }
 
+/// The order a subscriber reads is the order the broker received the
+/// publications in, whenever the answers of the store reach the core
+/// (MQTT-4.6.0-5 in MQTT 5, MQTT-4.6.0-6 in 3.1.1). The test barrier keeps
+/// the committed result of the first admission unknown to the core while a
+/// second publication of the same client is admitted and answered. The
+/// subscriber still reads the first, then the second.
+///
+/// The acknowledgements follow the answers of the store: the second
+/// publication is acknowledged first, and the first once its result is
+/// resolved. That order is recorded here as what a client observes under
+/// this barrier, not as a rule (record 0046, "Left open").
+#[cfg(feature = "test-hooks")]
+#[test]
+fn deliveries_keep_the_order_of_reception_when_an_earlier_store_result_is_late() {
+    use codec::Version::{V5, V311};
+    for (version, qos) in [(V5, 1u8), (V5, 2), (V311, 1), (V311, 2)] {
+        let controls = Directory::new();
+        let hold = controls.0.join("hold-admission-result");
+        with_runtime_clock_hooks(
+            128,
+            Arc::new(crate::session_time::SystemClock::new().unwrap()),
+            Hooks {
+                directory: Some(controls.0.clone()),
+                pause: vec![],
+            },
+            |runtime, _| {
+                let case = format!("{version:?} QoS {qos}");
+                let properties: &[u8] = if version == V5 { &[0] } else { &[] };
+                let open = |runtime: &mut Runtime<'_>, client_id: &[u8]| {
+                    let (generation, mut client) = peer(runtime);
+                    let connect = codec::Connect {
+                        version,
+                        ..connect_packet(client_id)
+                    };
+                    runtime.connect(generation, connect).unwrap();
+                    until(runtime, |r| r.session_requests.is_empty());
+                    assert_eq!(read_frame(&mut client).0, 0x20, "{case}");
+                    (generation, client)
+                };
+                let (subscriber, mut subscribed) = open(runtime, b"order-subscriber");
+                let (publisher, mut publishing) = open(runtime, b"order-publisher");
+                let subscribe = [&[0, 1][..], properties, &[0, 1, b't', qos]].concat();
+                runtime.packet(subscriber, 0x82, subscribe).unwrap();
+                assert_eq!(served_frame(runtime, &mut subscribed).0, 0x90, "{case}");
+
+                let publication = |id: u8, payload: u8| {
+                    [&[0, 1, b't', 0, id][..], properties, &[payload]].concat()
+                };
+                let (header, acknowledgement) =
+                    (0x30 | (qos << 1), if qos == 1 { 0x40 } else { 0x50 });
+                std::fs::write(&hold, []).unwrap();
+                runtime
+                    .packet(publisher, header, publication(7, b'A'))
+                    .unwrap();
+                runtime
+                    .packet(publisher, header, publication(8, b'B'))
+                    .unwrap();
+
+                let (kind, body) = served_frame(runtime, &mut publishing);
+                assert_eq!(
+                    (kind, &body[..2]),
+                    (acknowledgement, &[0, 8][..]),
+                    "{case}: the publication whose result is known is answered"
+                );
+                let mut read = Vec::new();
+                for _ in 0..2 {
+                    let (kind, body) = served_frame(runtime, &mut subscribed);
+                    assert_eq!(kind & 0xf0, 0x30, "{case}: PUBLISH expected, got {kind:#x}");
+                    read.push(*body.last().unwrap());
+                }
+                assert_eq!(read, b"AB", "{case}: the order of reception");
+
+                // The core resolves an unknown result on a deadline of
+                // seconds: one case waits for it, with whole turns and not
+                // only the passes of `pump`.
+                std::fs::remove_file(&hold).unwrap();
+                if (version, qos) != (V5, 1) {
+                    return;
+                }
+                let deadline = Instant::now() + Duration::from_secs(20);
+                let mut first = [0u8; 1];
+                publishing
+                    .set_read_timeout(Some(Duration::from_millis(2)))
+                    .unwrap();
+                while publishing.peek(&mut first).is_err() {
+                    assert!(
+                        Instant::now() < deadline,
+                        "{case}: the held result never resolved"
+                    );
+                    runtime.turn().unwrap();
+                }
+                publishing
+                    .set_read_timeout(Some(Duration::from_secs(1)))
+                    .unwrap();
+                let (kind, body) = read_frame(&mut publishing);
+                assert_eq!(
+                    (kind, &body[..2]),
+                    (acknowledgement, &[0, 7][..]),
+                    "{case}: the held publication is answered once resolved"
+                );
+            },
+        );
+    }
+}
+
 /// The one-pass bindings are what a lookup per cached session answered,
 /// for attached and detached sessions alike.
 #[test]
