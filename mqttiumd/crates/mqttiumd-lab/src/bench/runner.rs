@@ -516,9 +516,13 @@ impl<B: Backend> Runner<'_, B> {
     }
 
     /// Drives until `done` holds, within `max_steps` choices.
+    /// With `fire`, a wait that nothing eligible can meet fires the armed
+    /// deadline due first instead of stopping, each firing counted against
+    /// `max_steps` (decision 0018).
     fn drive_until(
         &mut self,
         max_steps: u64,
+        fire: bool,
         mut done: impl FnMut(&mut Self) -> bool,
     ) -> Result<(), Stop> {
         let mut budget = max_steps;
@@ -526,12 +530,26 @@ impl<B: Backend> Runner<'_, B> {
             if done(self) {
                 return Ok(());
             }
-            if !self.choose(&mut budget)? {
-                return Err(self.blocked(
-                    "quiescent",
-                    "nothing is eligible and the awaited event did not happen",
-                ));
+            if self.choose(&mut budget)? {
+                continue;
             }
+            if fire && self.process()?.armed_deadlines() > 0 {
+                if budget == 0 {
+                    return Err(self.blocked("budget", "the step exhausted its max_steps"));
+                }
+                budget -= 1;
+                let process = self
+                    .process
+                    .as_mut()
+                    .ok_or_else(|| Stop::new("the broker is not running"))?;
+                process.fire_deadline(&mut self.collector, &mut self.books)?;
+                process.settle(&mut self.collector, &mut self.books)?;
+                continue;
+            }
+            return Err(self.blocked(
+                "quiescent",
+                "nothing is eligible and the awaited event did not happen",
+            ));
         }
     }
 
@@ -595,7 +613,7 @@ impl<B: Backend> Runner<'_, B> {
                 self.connect(client)?;
                 let name = client.clone();
                 let mut connack = None;
-                self.drive_until(*max_steps, |runner| {
+                self.drive_until(*max_steps, false, |runner| {
                     connack = runner.take_observed(&name, Kind::Connack, None);
                     connack.is_some()
                 })?;
@@ -661,11 +679,15 @@ impl<B: Backend> Runner<'_, B> {
                 let bytes = peer::pubrel(*packet_id).map_err(Stop::new)?;
                 self.send(client, Kind::Pubrel, Some(*packet_id), None, bytes)
             }
-            Step::DriveUntil { event, max_steps } => match event {
+            Step::DriveUntil {
+                event,
+                max_steps,
+                fire_deadlines,
+            } => match event {
                 Event::FaultHit { fault } => {
                     let index = self.fault_index(fault)?;
                     let wanted = self.awaited.get(index).copied().unwrap_or(0) + 1;
-                    self.drive_until(*max_steps, |runner| {
+                    self.drive_until(*max_steps, *fire_deadlines, |runner| {
                         runner.books.hits.get(index).copied().unwrap_or(0) >= wanted
                     })?;
                     if let Some(awaited) = self.awaited.get_mut(index) {
@@ -682,7 +704,7 @@ impl<B: Backend> Runner<'_, B> {
                         .ok_or_else(|| Stop::new(format!("no packet kind {packet_kind}")))?;
                     let name = client.clone();
                     let packet_id = *packet_id;
-                    self.drive_until(*max_steps, |runner| {
+                    self.drive_until(*max_steps, *fire_deadlines, |runner| {
                         runner.take_observed(&name, kind, packet_id).is_some()
                     })
                 }
