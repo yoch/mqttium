@@ -1884,6 +1884,17 @@ fn fill_ordinary_inputs(runtime: &mut Runtime<'_>, generation: ConnectionGenerat
     assert!(count > 0 && count <= INPUTS);
 }
 
+/// Every limit builds a runtime with room for at least one connection and
+/// no more than the store has sessions.
+#[test]
+fn limits_are_brought_within_their_bounds() {
+    assert_eq!(Limits::new(0), Limits::new(1));
+    assert_eq!(Limits::new(usize::MAX), Limits::DEFAULT);
+    assert_eq!(Limits::DEFAULT.connections, Limits::MAX_CONNECTIONS);
+    assert_eq!(Limits::new(16), Limits::BOUNDED);
+    assert!(Limits::new(1).effect_box >= 1);
+}
+
 /// A connection with Keep Alive 1 whose input lane the core does not take.
 fn held_keep_alive_peer(
     runtime: &mut Runtime<'_>,

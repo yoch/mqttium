@@ -107,8 +107,17 @@ impl Limits {
 
     /// `connections` is between 1 and [`Limits::MAX_CONNECTIONS`]; the
     /// command line checks it.
+    /// A value outside that range is brought to its nearest bound: no
+    /// limit builds a runtime without room for one connection.
     #[must_use]
     pub const fn new(connections: usize) -> Self {
+        let connections = if connections == 0 {
+            1
+        } else if connections > Self::MAX_CONNECTIONS {
+            Self::MAX_CONNECTIONS
+        } else {
+            connections
+        };
         let frames = connections * (net::OUTPUT_SLOTS + 9);
         // The first profile sized these for sixteen connections; they grow
         // with every further sixteen.
@@ -3128,13 +3137,7 @@ impl Runtime<'_> {
                             body,
                             observed,
                         }),
-                        None => {
-                            let incoming = p.io.incoming.try_recv();
-                            if matches!(incoming, Ok(net::Incoming::Packet { .. })) {
-                                p.io.packet_taken();
-                            }
-                            incoming
-                        }
+                        None => p.io.incoming.try_recv(),
                     },
                     None => break,
                 };
@@ -3234,11 +3237,16 @@ impl Runtime<'_> {
                 {
                     Some("connect_deadline")
                 } else if p.keep_alive != 0
-                    && p.last_packet.elapsed()
+                    // The clock runs from the last complete packet the
+                    // transport received, taken by the core or not: a peer
+                    // the broker keeps hearing is not silent, and a packet
+                    // the broker holds does not stop the clock.
+                    && p
+                        .io
+                        .last_heard()
+                        .map_or(p.last_packet, |heard| heard.max(p.last_packet))
+                        .elapsed()
                         > Duration::from_millis(u64::from(p.keep_alive) * 1500)
-                    // Keep Alive measures the silence of the peer. A packet
-                    // it sent and the core has not taken yet is not silence.
-                    && !p.io.has_unread_input()
                 {
                     Some("keep_alive")
                 } else {

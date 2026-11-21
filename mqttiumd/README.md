@@ -12,9 +12,10 @@ a bounded product, not a complete MQTT broker or a conformance or performance cl
 
 ## Runtime since record 0044
 
-The product executable no longer polls. Each connection is one
+The product executable no longer sleeps a millisecond in every loop. Each connection is one
 non-blocking task on a small pool of `mio` reactor threads, the core and
-the store worker wait for a signal, and the store commits the commands
+the store worker wait for a signal (three 100 ms rescans remain: pending
+work, Wills, message expiry), and the store commits the commands
 waiting in its lane as one transaction
 ([0044](docs/decisions/0044-reactor-runtime-and-evidence-tiers.md),
 [0045](docs/decisions/0045-group-commit.md),

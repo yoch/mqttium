@@ -196,10 +196,9 @@ struct Control {
     cancelled: Arc<AtomicBool>,
     terminal: Arc<Mutex<Option<Terminal>>>,
     wake: Wake,
-    /// Packets the task framed, and packets the core took from the lane.
-    /// Their difference is input the broker holds and has not looked at.
-    parsed: Arc<AtomicU64>,
-    taken: Arc<AtomicU64>,
+    /// When the task framed its last complete packet: nanoseconds since
+    /// the process epoch, plus one; zero while it has framed none.
+    heard: Arc<AtomicU64>,
     #[cfg(test)]
     pause_progress: Arc<AtomicBool>,
     #[cfg(test)]
@@ -218,8 +217,7 @@ impl Control {
             cancelled: Arc::new(AtomicBool::new(false)),
             terminal: Arc::new(Mutex::new(None)),
             wake,
-            parsed: Arc::new(AtomicU64::new(0)),
-            taken: Arc::new(AtomicU64::new(0)),
+            heard: Arc::new(AtomicU64::new(0)),
             #[cfg(test)]
             pause_progress: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
@@ -271,8 +269,8 @@ pub struct Connection {
 /// Defers the wake-ups of the reactor threads until the guard is dropped.
 /// A caller that serves many lanes in one pass pays one wake-up per thread
 /// instead of one per lane. A deferred wake-up is late, never lost.
-pub(crate) fn hold_wakes() -> reactor::Held<'static> {
-    Reactors::shared().hold()
+pub(crate) fn hold_wakes() -> Option<reactor::Held<'static>> {
+    Reactors::shared().ok().map(Reactors::hold)
 }
 
 pub fn spawn(stream: TcpStream) -> io::Result<Connection> {
@@ -291,7 +289,7 @@ fn open(stream: &TcpStream, wake: Wake) -> io::Result<(Lanes, Connection)> {
     let socket = socket2::SockRef::from(stream);
     socket.set_send_buffer_size(4096)?;
     let send_buffer = socket.send_buffer_size()?;
-    let link = Reactors::shared().link(wake.clone());
+    let link = Reactors::shared()?.link(wake.clone());
     let (input, incoming) = lane(INPUT_SLOTS, &wake);
     let (outgoing, output) = mpsc::sync_channel(OUTPUT_SLOTS);
     let (written_tx, written) = lane(WRITTEN_SLOTS, &wake);
@@ -326,7 +324,7 @@ fn open(stream: &TcpStream, wake: Wake) -> io::Result<(Lanes, Connection)> {
         written: written_tx,
         progress,
         link,
-        parsed: control.parsed.clone(),
+        heard: control.heard.clone(),
         held: None,
         reports: VecDeque::new(),
         stalled: None,
@@ -356,7 +354,7 @@ pub fn spawn_with_wake(
         #[cfg(test)]
         paused: None,
     };
-    Reactors::shared().register(&connection.link, Box::new(task));
+    Reactors::shared()?.register(&connection.link, Box::new(task));
     Ok(connection)
 }
 
@@ -386,7 +384,7 @@ pub(crate) fn spawn_tls(
     task.state
         .set_buffer_limit(Some(crate::security::TLS_BUFFER_BYTES));
     connection.principal = Some(principal);
-    Reactors::shared().register(&connection.link, Box::new(task));
+    Reactors::shared()?.register(&connection.link, Box::new(task));
     Ok(connection)
 }
 
@@ -415,18 +413,15 @@ impl Connection {
         self.control.progress_waiting.load(Ordering::Acquire)
     }
 
-    /// The core took one packet of this connection from its input lane.
-    pub fn packet_taken(&self) {
-        self.control.taken.fetch_add(1, Ordering::Relaxed);
-    }
-
-    /// The task framed a packet the core has not taken yet. The peer sent
-    /// it; the broker is the one that has not looked.
-    pub fn has_unread_input(&self) -> bool {
-        let parsed = self.control.parsed.load(Ordering::Relaxed);
-        let taken = self.control.taken.load(Ordering::Relaxed);
-        // A lane a test fed by hand counts takes without framed packets.
-        parsed.wrapping_sub(taken).cast_signed() > 0
+    /// When the transport received its last complete packet, whether or
+    /// not the core has taken it. Keep Alive runs from this instant: what
+    /// the peer sent counts when the broker hears it, and a packet the
+    /// broker holds does not stop the clock.
+    pub fn last_heard(&self) -> Option<Instant> {
+        match self.control.heard.load(Ordering::Relaxed) {
+            0 => None,
+            since => epoch().checked_add(Duration::from_nanos(since - 1)),
+        }
     }
 
     pub fn close(&self) {
@@ -473,6 +468,12 @@ impl Drop for Connection {
     }
 }
 
+/// One instant all the transports of the process count from.
+fn epoch() -> Instant {
+    static EPOCH: OnceLock<Instant> = OnceLock::new();
+    *EPOCH.get_or_init(Instant::now)
+}
+
 fn retryable(error: &io::Error) -> bool {
     matches!(
         error.kind(),
@@ -495,7 +496,7 @@ struct Lanes {
     written: Tx<Written>,
     progress: Tx<WireProgress>,
     link: Arc<Link>,
-    parsed: Arc<AtomicU64>,
+    heard: Arc<AtomicU64>,
     held: Option<Incoming>,
     /// Receipts in publication order. At most three per frame, and no frame
     /// is taken while one is pending.
@@ -528,7 +529,8 @@ impl Lanes {
     /// previous one first.
     fn hold(&mut self, incoming: Incoming) {
         debug_assert!(self.held.is_none());
-        self.parsed.fetch_add(1, Ordering::Relaxed);
+        let since = u64::try_from(epoch().elapsed().as_nanos()).unwrap_or(u64::MAX - 1);
+        self.heard.store(since + 1, Ordering::Relaxed);
         self.held = Some(incoming);
     }
 

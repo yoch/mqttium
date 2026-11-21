@@ -99,6 +99,9 @@ enum Message {
     Register(Arc<Link>, Box<dyn Driven>),
     Run(Arc<Link>),
     Stop,
+    /// Leaves the loop as an unrecoverable poll error does.
+    #[cfg(test)]
+    Fail,
 }
 
 struct Shared {
@@ -111,6 +114,8 @@ struct Shared {
     held: AtomicBool,
     /// A message was queued and its wake-up not given yet.
     owing: AtomicBool,
+    /// The thread left its loop: nothing queued from now on is served.
+    dead: AtomicBool,
 }
 
 impl Shared {
@@ -121,6 +126,7 @@ impl Shared {
             waker,
             held: AtomicBool::new(false),
             owing: AtomicBool::new(false),
+            dead: AtomicBool::new(false),
         }
     }
 
@@ -131,8 +137,29 @@ impl Shared {
         // The debt is recorded before the hold is read, and the release
         // clears the hold before it reads the debt: one of them pays it.
         self.owing.store(true, Ordering::SeqCst);
-        if !self.held.load(Ordering::SeqCst) {
+        // Checked after the push, as the thread sets it before its last
+        // sweep: one of the two finds the message.
+        if self.dead.load(Ordering::SeqCst) {
+            self.abandon();
+        } else if !self.held.load(Ordering::SeqCst) {
             self.kick();
+        }
+    }
+
+    /// Ends every task still waiting to be registered. A thread that left
+    /// its loop serves nothing: a task handed to it is finished at once,
+    /// so that its connection is refused instead of left without a driver.
+    fn abandon(&self) {
+        let messages = match self.queue.lock() {
+            Ok(mut queue) => std::mem::take(&mut *queue),
+            Err(_) => return,
+        };
+        for message in messages {
+            if let Message::Register(link, task) = message {
+                let _ = catch_unwind(AssertUnwindSafe(move || task.finish("reactor_unavailable")));
+                link.finished.store(true, Ordering::SeqCst);
+                link.wake.wake();
+            }
         }
     }
 
@@ -182,7 +209,11 @@ impl Reactors {
             let worker = shared.clone();
             let handle = thread::Builder::new()
                 .name(format!("mqttiumd-io-{index}"))
-                .spawn(move || run(poll, &worker))?;
+                .spawn(move || {
+                    run(poll, &worker);
+                    worker.dead.store(true, Ordering::SeqCst);
+                    worker.abandon();
+                })?;
             started.push((shared, Some(handle)));
         }
         Ok(Self {
@@ -191,10 +222,14 @@ impl Reactors {
         })
     }
 
-    /// The pool of a process that did not configure one: the unit tests.
-    pub fn shared() -> &'static Self {
-        static SHARED: OnceLock<Reactors> = OnceLock::new();
-        SHARED.get_or_init(|| Self::new(2).expect("reactor threads"))
+    /// The pool of the process. A pool that could not be started is an
+    /// error every caller sees, never a panic.
+    pub fn shared() -> io::Result<&'static Self> {
+        static SHARED: OnceLock<Result<Reactors, io::ErrorKind>> = OnceLock::new();
+        SHARED
+            .get_or_init(|| Self::new(2).map_err(|error| error.kind()))
+            .as_ref()
+            .map_err(|kind| io::Error::from(*kind))
     }
 
     /// Creates the link of a task before the task itself exists, so that
@@ -303,6 +338,13 @@ fn run(mut poll: Poll, shared: &Shared) {
                         entry.queued = true;
                         ready.push_back(slot);
                     }
+                }
+                #[cfg(test)]
+                Message::Fail => {
+                    for entry in slots.drain(..).flatten() {
+                        retire(&poll, entry, "reactor_poll");
+                    }
+                    return;
                 }
                 Message::Stop => {
                     for entry in slots.drain(..).flatten() {
@@ -547,6 +589,31 @@ mod tests {
         fixture.link.consumed();
         thread::sleep(Duration::from_millis(50));
         assert!(fixture.turns.load(Ordering::SeqCst) > settled);
+    }
+
+    /// A reactor that left its loop on an unrecoverable error finishes the
+    /// tasks it had and refuses the ones registered afterwards: none is
+    /// left without a driver.
+    #[test]
+    fn a_dead_reactor_finishes_what_is_registered_with_it() {
+        let pool = Reactors::new(1).unwrap();
+        let before = echo(&pool);
+        pool.threads[0].0.send(Message::Fail);
+        assert_eq!(
+            before.ended.recv_timeout(Duration::from_secs(5)).unwrap(),
+            "reactor_poll"
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !pool.threads[0].0.dead.load(Ordering::SeqCst) {
+            assert!(Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(1));
+        }
+        let after = echo(&pool);
+        assert_eq!(
+            after.ended.recv_timeout(Duration::from_secs(5)).unwrap(),
+            "reactor_unavailable"
+        );
+        assert!(after.link.is_finished());
     }
 
     #[test]
