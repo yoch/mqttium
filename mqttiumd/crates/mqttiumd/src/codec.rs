@@ -845,9 +845,26 @@ fn legacy_connack_refusal(reason: u8) -> Vec<u8> {
 /// around its payload once the Remaining Length takes three. A client that
 /// honours it never sends a payload over the limit. The transport still
 /// reads frames up to its own bound, which a CONNECT with a large Will
-/// needs before any announcement.
+/// needs before any announcement; the runtime refuses every later MQTT 5
+/// packet larger than the announcement.
 pub const ANNOUNCED_PACKET_BYTES: u32 = 32_768 + 8;
 const ANNOUNCED: [u8; 4] = ANNOUNCED_PACKET_BYTES.to_be_bytes();
+
+/// The size of a packet on the wire: its first byte, the bytes of its
+/// Remaining Length and its body.
+#[must_use]
+pub const fn wire_size(remaining: usize) -> usize {
+    let length = if remaining < 128 {
+        1
+    } else if remaining < 16_384 {
+        2
+    } else if remaining < 2_097_152 {
+        3
+    } else {
+        4
+    };
+    1 + length + remaining
+}
 
 pub fn disconnect_reason(reason: u8) -> Vec<u8> {
     vec![0xe0, 2, reason, 0]

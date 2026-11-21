@@ -248,8 +248,11 @@ no alias or diagnostic string is emitted. CONNACK advertises Receive Maximum 8,
 Maximum Packet Size 32,776, wildcard and retained availability, and no subscription-identifier, shared
 or topic-alias support. The announced size follows the payload limit: no
 PUBLISH within it carries more than 32,768 bytes of payload, so none is refused
-for its size. The transport itself reads frames up to 65,536 bytes, which a
-CONNECT with a large Will needs before any announcement. Maximum QoS is omitted: that property can
+for its size. The announcement is also a limit: an MQTT 5 packet larger than
+it, of any kind, is answered DISCONNECT 0x95 and the connection is closed.
+The transport itself reads frames up to 65,536 bytes, which a CONNECT with a
+large Will needs before any announcement, and which bounds an MQTT 3.1.1
+packet, to whose client nothing is announced. Maximum QoS is omitted: that property can
 only encode 0 or 1, while this profile accepts incoming QoS 2.
 
 Malformed encodings, invalid protocol/context and valid unsupported features

@@ -2818,6 +2818,14 @@ impl Runtime<'_> {
         if first >> 4 == 1 && version.is_some() {
             return self.close(generation, "second_connect");
         }
+        // The Maximum Packet Size of the CONNACK binds every later packet
+        // of an MQTT 5 client, not only a PUBLISH whose payload is too
+        // large (MQTT-3.2.2-15). The CONNECT came before any announcement.
+        if version == Some(codec::Version::V5)
+            && codec::wire_size(body.len()) > codec::ANNOUNCED_PACKET_BYTES as usize
+        {
+            return self.header_refused(generation, "packet_too_large");
+        }
         let mut decoded = match codec::decode_for(version.unwrap_or_default(), first, &body, BOUNDS)
         {
             Ok(v) => v,
