@@ -781,7 +781,9 @@ fn clients_that_fill_their_announced_window_together_all_complete() {
     // later publications waiting and its PUBRELs behind them in its stream.
     const CLIENTS: usize = 100;
     const WINDOW: u16 = 8;
-    let broker = Broker::start("duplex-window");
+    // The instrumented build defaults to the sixteen connections of the
+    // bounded profile.
+    let broker = Broker::start_with("duplex-window", &["--max-connections", "128"]);
     let start = std::sync::Arc::new(std::sync::Barrier::new(CLIENTS));
     let clients: Vec<_> = (0..CLIENTS)
         .map(|index| {

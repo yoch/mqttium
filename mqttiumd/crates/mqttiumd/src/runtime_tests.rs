@@ -1,5 +1,9 @@
 //! Regressions of the real product reactor and its socket/writer adapters.
 use super::*;
+
+/// The ordinary lane of the bounded profile these tests run with: the
+/// share of sixteen connections and the window of each.
+const ORDINARY_INPUTS: usize = Limits::BOUNDED.ordinary_inputs;
 use mqttiumd_contract::ids::InboundPacketId;
 use mqttiumd_contract::packet::SharedBytes;
 use mqttiumd_core::owner::ExchangePhase;
@@ -129,7 +133,8 @@ fn with_runtime_clock_hooks(
         terminal_inputs: VecDeque::new(),
         deferred_inputs: VecDeque::new(),
         effects_awaited: false,
-        credit_retries: 0,
+        deferred_retries: 0,
+        credit_progress: Instant::now(),
         timers: BTreeMap::new(),
         inflight: BTreeMap::new(),
         lifecycle_inflight: BTreeMap::new(),
@@ -1160,25 +1165,56 @@ fn the_last_places_of_the_lane_are_kept_for_packets_that_release_capacity() {
     });
 }
 
-/// While a business packet of a connection waits for capacity in the
-/// core, the next business packet of that connection waits with its
-/// transport: one connection cannot fill the lane with its own backlog.
-/// Another connection is still read.
+/// A connection has at most its announced window of business packets
+/// waiting for capacity in the core: the next one waits with its
+/// transport, so one connection cannot fill the lane with its backlog.
+/// Within the window nothing is held: a client that respects Receive
+/// Maximum has all its publications taken, and the control packet it sends
+/// after them (the PUBREL that returns a credit) is read. Another
+/// connection is still read.
 #[test]
-fn a_connection_with_a_deferred_packet_adds_no_further_business_packet() {
+fn a_connection_keeps_at_most_its_window_of_business_packets_waiting() {
+    const WINDOW: usize = crate::receiving::MAXIMUM;
     with_runtime(128, |runtime, _| {
         let (waiting, mut first) = connected(runtime, b"deferred-waiting");
         let (other, mut second) = connected(runtime, b"deferred-other");
         until(runtime, |r| {
             r.inputs.is_empty() && r.deferred_inputs.is_empty()
         });
-        first.write_all(&[0x30, 4, 0, 1, b't', 0]).unwrap();
-        read_until(runtime, |r| business_packets(&r.inputs, waiting) == 1);
-        // The core found no capacity for it: it waits, in order.
-        let deferred = runtime.inputs.pop_back().unwrap();
+        let pings = |r: &Runtime<'_>, generation| {
+            r.inputs
+                .iter()
+                .filter(|input| {
+                    matches!(input, Input::Packet { connection, packet: InboundPacket::Pingreq, .. }
+                        if *connection == generation)
+                })
+                .count()
+        };
+        // One publication short of the window waits for capacity.
+        for _ in 1..WINDOW {
+            first.write_all(&[0x30, 4, 0, 1, b't', 0]).unwrap();
+        }
+        read_until(runtime, |r| {
+            business_packets(&r.inputs, waiting) == WINDOW - 1
+        });
+        while let Some(deferred) = runtime.inputs.pop_front() {
+            runtime.deferred_inputs.push_back(deferred);
+        }
+        // The last publication of the window and the control packet behind
+        // it are both taken.
+        first.write_all(&[0x30, 4, 0, 1, b'u', 0, 0xc0, 0]).unwrap();
+        read_until(runtime, |r| pings(r, waiting) == 1);
+        assert_eq!(business_packets(&runtime.inputs, waiting), 1);
+        // The window waits now: one more publication stays with its
+        // transport, and so does what follows it.
+        let last = runtime
+            .inputs
+            .iter()
+            .position(|input| business_connection(input) == Some(waiting))
+            .unwrap();
+        let deferred = runtime.inputs.remove(last).unwrap();
         runtime.deferred_inputs.push_back(deferred);
-
-        first.write_all(&[0x30, 4, 0, 1, b'u', 0]).unwrap();
+        first.write_all(&[0x30, 4, 0, 1, b'w', 0, 0xc0, 0]).unwrap();
         second.write_all(&[0x30, 4, 0, 1, b'v', 0]).unwrap();
         read_until(runtime, |r| business_packets(&r.inputs, other) == 1);
         for _ in 0..20 {
@@ -1188,14 +1224,20 @@ fn a_connection_with_a_deferred_packet_adds_no_further_business_packet() {
         assert_eq!(
             business_packets(&runtime.inputs, waiting),
             0,
-            "a second packet joined the backlog of its connection"
+            "a publication beyond the window joined the backlog of its connection"
+        );
+        assert_eq!(
+            pings(runtime, waiting),
+            1,
+            "a packet overtook a held publication"
         );
         assert!(runtime.peers[&waiting].closing.is_none());
 
-        // The first packet is taken up again: the second follows it.
+        // One waiting publication is taken up again: the held one follows.
         let resumed = runtime.deferred_inputs.pop_front().unwrap();
         runtime.inputs.push_front(resumed);
-        read_until(runtime, |r| business_packets(&r.inputs, waiting) == 2);
+        read_until(runtime, |r| pings(r, waiting) == 2);
+        assert_eq!(business_packets(&runtime.inputs, waiting), 2);
     });
 }
 
@@ -2389,7 +2431,8 @@ fn a_slow_transport_holds_its_acks_while_an_independent_exchange_progresses() {
 }
 
 fn fill_ordinary_inputs(runtime: &mut Runtime<'_>, generation: ConnectionGeneration) {
-    let count = (0..=INPUTS)
+    let lane = runtime.limits.ordinary_inputs;
+    let count = (0..=lane)
         .take_while(|order| {
             runtime
                 .queue(Input::Packet {
@@ -2400,7 +2443,7 @@ fn fill_ordinary_inputs(runtime: &mut Runtime<'_>, generation: ConnectionGenerat
                 .is_ok()
         })
         .count();
-    assert!(count > 0 && count <= INPUTS);
+    assert!(count > 0 && count <= lane);
 }
 
 /// Every limit builds a runtime with room for at least one connection and

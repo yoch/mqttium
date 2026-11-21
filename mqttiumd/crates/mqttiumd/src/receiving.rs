@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 
 use mqttiumd_contract::packet::Qos;
 
-const MAXIMUM: usize = 8;
+pub const MAXIMUM: usize = 8;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Terminal {

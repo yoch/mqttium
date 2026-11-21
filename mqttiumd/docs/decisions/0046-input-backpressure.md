@@ -12,9 +12,20 @@ the rules of the text below, which differ from its first form on three
 points. Keep Alive runs from the last packet the transport heard; it is
 not suspended while a packet is held. The last eighth of the ordinary
 lane is kept for the packets that release capacity, and a connection
-adds no business packet behind one of its own that waits. No count of
-deferred packets closes a connection: the quarter rule is withdrawn.
-What "Left open" lists stays owed.
+has at most its announced window of business packets waiting in the
+core. No count of deferred packets closes a connection: the quarter rule
+is withdrawn. What "Left open" lists stays owed.
+
+Amendment of 21 November 2026, after the counter-audit of `bbe1453`.
+Three rules of the text accepted that day did not hold and are replaced
+below. A connection was allowed one waiting business packet; it is
+allowed its window, because one was enough to hold the PUBREL of a
+client behind its own publications and to stop the broker. Deferred
+packets were all taken up again on every answer of the store; they are
+tried from the oldest until one cannot be served, because the former
+cost grew with their number and brought the broker to a standstill. The
+five-second bound of a wait for a credit ran from the start of the wait;
+it runs from the last credit the broker returned.
 
 ## Context
 
@@ -65,44 +76,67 @@ reserve the lane could fill with new work up to those two places, and the
 acknowledgement that frees a window, an identifier or a payload waited
 behind it.
 
-**A connection adds no business packet behind one of its own that
-waits.** While a business packet of a connection is deferred, its next
-business packet stays with its transport. The backlog of a connection
-is then in its socket, where TCP slows its peer, and not in the lane it
-shares with every other connection.
+**A connection has at most its window of business packets waiting.**
+Receive Maximum is a promise to every client: eight publications may be
+unacknowledged at once. While fewer than eight business packets of a
+connection wait for capacity in the core, the next one is taken too, so
+a client that respects its window has all its publications in the core
+and the PUBREL or PUBACK it sends after them is read. From the eighth
+on, the next business packet stays with its transport: the rest of the
+backlog is in the socket, where TCP slows its peer, and not in the lane
+the connection shares with every other. The lane has a place for the
+window of every connection beside its ordinary share, so the control
+reserve is never what keeps such a client waiting.
+
+The first form of this rule allowed one waiting packet. The broker holds
+128 exchange credits and announces eight to each client: with enough
+clients that fill their window together, the first publications read
+took every credit, the next of each client waited for one, and the one
+after it was held in front of the PUBRELs that would have returned the
+credits. No exchange completed, and every client was closed
+(`clients_that_fill_their_announced_window_together_all_complete`).
 
 In both cases the packet has already left the transport's lane, because
 its kind is known only once it is taken. The runtime keeps it as the
 connection's one held packet, the place a packet behind an unfinished
 CONNECT already used, and offers it again on its next turn. Nothing of
-that connection passes it: an acknowledgement behind a publication of
-its own connection waits with it. Holding a packet is not progress, so a
-runtime with nothing else to do still rests.
+that connection passes it: an acknowledgement behind a held publication
+of its own connection waits with it. Holding a packet is not progress,
+so a runtime with nothing else to do still rests.
 
 **A packet that finds a credit lent waits for it.** The core lends an
 exchange credit and the bytes of a payload to every admission in flight
 and asks to be called again when one is released. The runtime used to
 close the connection of such a packet with `input_capacity`; it now
-keeps the packet with the deferred ones, and the result of the store
-that returns a credit takes them up again. Only a business packet waits
-this way, so nothing of its connection passes it. The wait has a bound,
-because a credit can also be held by an exchange that a client never
-finishes: a connection whose packet has waited five seconds for a credit
-is closed with `input_capacity`. (Added on 21 November 2026, after the
-acceptance of this record, on the measurement below.) Whatever ends an
-exchange returns its credit: an answer of the store, the write receipt
-of an acknowledgement, a closed connection. An answer of the store takes
-every deferred packet up again, as before. A write receipt or a closed
-connection lets the oldest deferred packet be tried again, in place: it
-keeps its position if it still cannot be served, and nothing behind it
-moves. The first form of this rule woke the deferred packets on an
-answer of the store only; at QoS 1 the credit comes back with the write
-receipt of the PUBACK, so a publication could wait for a credit that was
-already free until the bound closed its connection
-(`a_write_confirmation_alone_takes_up_a_publication_that_waits_for_a_credit`).
-Taking every deferred packet up again on every such receipt was tried
-and withdrawn: under overload it spent the passes of the core on packets
-that still had no credit.
+keeps the packet with the deferred ones. Only a business packet waits
+this way, so nothing of its connection passes it. (Added on 21 November
+2026, after the acceptance of this record.)
+
+**A wake tries the deferred packets from the oldest.** What a deferred
+packet waits for can arrive with an answer of the store, with the
+terminal receipt of a frame or a closed connection (each can end an
+exchange and return its credit), or with effects the adapters accepted.
+On each of these the oldest deferred packet is served ahead of
+everything else, then the next, until one still cannot be served: that
+one keeps its place and the others are not touched. A wake costs one
+failed attempt whatever the number of packets that wait, and no packet
+overtakes an older one. Two earlier forms are withdrawn. The first took
+every deferred packet up again on an answer of the store and on nothing
+else: at QoS 1 the credit comes back with the write receipt of the
+PUBACK, so a publication waited for a credit that was already free
+(`a_write_confirmation_alone_takes_up_a_publication_that_waits_for_a_credit`),
+and with several hundred packets waiting each answer of the store put
+them all in front of the next answer: a hundred clients filling their
+window completed nothing in five seconds, where they now complete in
+less than two. The second did the same on every receipt as well.
+
+**A wait for a credit is bounded by the broker's silence.** A credit can
+be held by an exchange that a client never finishes. A connection whose
+packet waits for a credit is closed with `input_capacity` when the
+broker has returned no credit and applied no answer of the store for
+five seconds. While exchanges end, the wait is pressure, however long
+it lasts: its first form measured the wait itself and closed clients
+that were being served slowly.
 
 **The budgets sized for sixteen connections grow with the limit.** The
 effect box, the ordinary input lane, the outgoing identifier bindings,
@@ -182,10 +216,19 @@ be told what was written, and that is a fault, not pressure.
   reservation of effect slots for the packets that release resources
   belongs to the core's cost model and to another record. The places of
   the lane are reserved; the slots of the effect box are not.
-- Before a business packet of a connection is first deferred, the
-  connection may have several queued in the lane: reading is fair between
-  connections (four packets a turn each, in rotation) but has no bound
-  per connection.
+- The window bounds the business packets of a connection that wait
+  deferred; those it has queued in the lane and not yet seen by the core
+  are bounded only by the fairness of reading (four packets a turn each,
+  in rotation).
+- The oldest deferred packet is tried first and holds the others while
+  it cannot be served, whatever each of them waits for. A publication
+  that waits for a credit can so delay one that waits only for the
+  effect box. Nothing a deferred packet waits for is released by another
+  business packet, so this delays and does not block.
+- The broker announces eight exchanges to each client and holds 128
+  credits for all: clients that fill their window together wait for one
+  another. Credits that match the promise belong to the scaling of the
+  core.
 - With Keep Alive 0 a held packet has no bound in time.
 - Acknowledgements follow the results of the store. When the result of an
   earlier publication of a connection is known after that of a later one,

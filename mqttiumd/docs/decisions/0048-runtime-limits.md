@@ -32,7 +32,7 @@ of sixteens that hold `c`:
 
 | Capacity | Derivation | At 16 | At 128 |
 | - | - | -: | -: |
-| Ordinary inputs | 92 per sixteen; the 32 places of the writer and the 4 of the deadlines are apart | 92 | 736 |
+| Ordinary inputs | 92 per sixteen, and eight per connection for the publications its announced window lets wait at once (record 0046); the 32 places of the writer and the 4 of the deadlines are apart | 220 | 1,760 |
 | Effect box | 128 per sixteen | 128 | 1,024 |
 | Outgoing identifier bindings | 128 per sixteen, eight per connection | 128 | 1,024 |
 | Timers | 512 per sixteen | 512 | 4,096 |

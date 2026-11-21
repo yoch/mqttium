@@ -64,9 +64,9 @@ const PASS_FACTS: usize = 16;
 /// Upper bound of an idle wait: connection deadlines and expiry scans are
 /// wall-clock checks without a producer to signal them.
 const IDLE_TICK: Duration = Duration::from_millis(20);
-/// How long a packet may wait for a credit that other work holds before
-/// its connection is closed with `input_capacity`: as long as the budget
-/// of a partial packet.
+/// How long a packet may wait for a credit while the broker returns none
+/// and applies no answer of the store, before its connection is closed
+/// with `input_capacity`: as long as the budget of a partial packet.
 const CAPACITY_WAIT: Duration = Duration::from_secs(5);
 /// A busy reactor reports its suppressed observations at this interval.
 const COUNTERS_INTERVAL: Duration = Duration::from_secs(1);
@@ -138,7 +138,11 @@ impl Limits {
             closing_inputs: 2 * connections,
             frames,
             terminal_inputs: 2 * frames + 128 * scale,
-            ordinary_inputs: ORDINARY_INPUTS * scale,
+            // Every connection may have its announced window of
+            // publications waiting for a credit at once; the lane holds
+            // them all beside its ordinary share, so its control reserve
+            // is never what keeps a window-respecting client waiting.
+            ordinary_inputs: ORDINARY_INPUTS * scale + connections * crate::receiving::MAXIMUM,
             effect_box: 128 * scale,
             outgoing_bindings: OUTGOING_BINDINGS * scale,
             timers: TIMERS * scale,
@@ -205,9 +209,9 @@ struct Peer {
     /// packets behind it stay with the transport, in order.
     held_packet: Option<(u8, Vec<u8>, net::FrameObservation)>,
     /// Since when a packet of this connection waits for a credit that
-    /// other work holds. The results of the store return such credits
-    /// within milliseconds; a wait that outlasts [`CAPACITY_WAIT`] is not
-    /// pressure any more and ends the connection.
+    /// other work holds. The results of the store return such credits; a
+    /// wait during which the broker returned none for [`CAPACITY_WAIT`] is
+    /// not pressure any more and ends the connection.
     capacity_wait: Option<Instant>,
     requests: Option<Requests>,
     pending: bool,
@@ -342,14 +346,20 @@ struct Runtime<'a> {
     deferred_inputs: VecDeque<Input>,
     /// A packet waits in `deferred_inputs` for room in the effect box.
     effects_awaited: bool,
-    /// How many of the oldest deferred packets may be tried again because
-    /// a credit came back. An exchange ends, and returns its credit, on an
-    /// answer of the store (which takes every deferred packet up again),
-    /// on the write receipt of its acknowledgement or with its connection:
-    /// each of the last two allows one retry of the head of
-    /// `deferred_inputs`, which keeps its place when it still cannot be
-    /// served.
-    credit_retries: usize,
+    /// How many deferred packets may be tried again, from the oldest,
+    /// because what they wait for may be there: an answer of the store, the
+    /// terminal receipt of a frame or a closed connection (each can end an
+    /// exchange and return its credit), or effects the adapters accepted.
+    /// The head of `deferred_inputs` is served ahead of everything else;
+    /// when it still cannot be served it keeps its place and the retries
+    /// stop, so a wake costs one failed attempt whatever the number of
+    /// packets that wait, and nothing behind the head overtakes it.
+    deferred_retries: usize,
+    /// When the broker last ended an exchange or applied an answer of the
+    /// store. A connection that waits for a credit is closed only when
+    /// nothing of the kind happened for [`CAPACITY_WAIT`]: a wait behind
+    /// other work that progresses is pressure, however long it lasts.
+    credit_progress: Instant,
     timers: BTreeMap<DeadlineToken, Instant>,
     inflight: BTreeMap<EffectId, OperationId>,
     lifecycle_inflight: BTreeMap<EffectId, OperationId>,
@@ -828,16 +838,21 @@ impl Runtime<'_> {
     }
     /// Whether a business packet of this connection must wait with its
     /// transport. The last places of the ordinary lane are kept for the
-    /// packets that release capacity, and a connection adds no business
-    /// packet behind one of its own that already waits in the core: the
-    /// backlog of a connection stays in its socket, where it slows its
-    /// peer, and cannot fill the lane (record 0046).
+    /// packets that release capacity, and a connection has at most its
+    /// announced window of business packets waiting in the core: beyond
+    /// it the backlog stays in its socket, where it slows its peer, and
+    /// cannot fill the lane (record 0046). Within the window the
+    /// publications of a client that respects Receive Maximum are all
+    /// taken, so the PUBREL or PUBACK it sends after them is never held
+    /// behind one of them.
     fn business_waits(&self, generation: ConnectionGeneration) -> bool {
         self.ordinary_room() < self.limits.control_reserve()
             || self
                 .deferred_inputs
                 .iter()
-                .any(|input| business_connection(input) == Some(generation))
+                .filter(|input| business_connection(input) == Some(generation))
+                .count()
+                >= crate::receiving::MAXIMUM
     }
     /// Advances a SUBSCRIBE or UNSUBSCRIBE served as several requests of
     /// the core: gives the core the next unit request once the previous one
@@ -914,7 +929,7 @@ impl Runtime<'_> {
     /// behind it waits for the same thing or for its turn.
     fn defer(&mut self, packet: Input, retried: bool) {
         if retried {
-            self.credit_retries = 0;
+            self.deferred_retries = 0;
             self.deferred_inputs.push_front(packet);
         } else {
             self.deferred_inputs.push_back(packet);
@@ -1529,13 +1544,13 @@ impl Runtime<'_> {
             + terminal_budget
             + expiry_budget
             + usize::from(self.message_expiry_input.is_some())
-            + self.credit_retries)
+            + self.deferred_retries)
             .min(64)
         {
-            // A returned credit serves the oldest packet that waits, ahead
-            // of everything else and without moving the others.
-            let retried = if self.credit_retries > 0 {
-                self.credit_retries -= 1;
+            // A wake serves the oldest packet that waits, ahead of
+            // everything else and without moving the others.
+            let retried = if self.deferred_retries > 0 {
+                self.deferred_retries -= 1;
                 self.deferred_inputs.pop_front()
             } else {
                 None
@@ -1858,17 +1873,17 @@ impl Runtime<'_> {
                     if let Some((id, delivery)) = finish {
                         self.events.emit("core_finish_observed",json!({"operation":operation(id),"details":{"delivery":delivery_text(delivery)}})).map_err(event_failure)?;
                     }
-                    if wakes_business {
-                        // The earlier blocked packets stay ahead of later bytes
-                        // from their connections. Control packets can still pass
-                        // while a durable routing mutation remains unresolved.
-                        self.deferred_inputs.append(&mut self.inputs);
-                        std::mem::swap(&mut self.inputs, &mut self.deferred_inputs);
-                    } else if returns_credit {
-                        let waiting = self.deferred_inputs.len();
-                        let allowed = if closes { waiting } else { 1 };
-                        self.credit_retries =
-                            self.credit_retries.saturating_add(allowed).min(waiting);
+                    if wakes_business || returns_credit {
+                        self.credit_progress = Instant::now();
+                    }
+                    if wakes_business || returns_credit {
+                        // What the deferred packets wait for may be there
+                        // now. They are tried again from the oldest, each
+                        // ahead of later bytes of its connection, until one
+                        // still cannot be served. Control packets can still
+                        // pass while a durable routing mutation remains
+                        // unresolved.
+                        self.deferred_retries = self.deferred_inputs.len();
                     }
                 }
                 StepOutcome::NeedCapacity { input, need, .. } => {
@@ -2117,10 +2132,9 @@ impl Runtime<'_> {
         if report.accepted != 0 {
             self.progress = self.progress.wrapping_add(1);
             if std::mem::take(&mut self.effects_awaited) {
-                // The packets that found the box full stay ahead of later
-                // bytes from their connections.
-                self.deferred_inputs.append(&mut self.inputs);
-                std::mem::swap(&mut self.inputs, &mut self.deferred_inputs);
+                // The packets that found the box full are tried again, the
+                // oldest first.
+                self.deferred_retries = self.deferred_inputs.len();
             }
         }
         if let Some(error) = error {
@@ -3570,7 +3584,7 @@ impl Runtime<'_> {
                     Some("connect_deadline")
                 } else if p
                     .capacity_wait
-                    .is_some_and(|since| since.elapsed() > CAPACITY_WAIT)
+                    .is_some_and(|since| since.max(self.credit_progress).elapsed() > CAPACITY_WAIT)
                 {
                     Some("input_capacity")
                 } else if p.keep_alive != 0
@@ -5616,7 +5630,8 @@ fn run_inner(
         terminal_inputs: VecDeque::new(),
         deferred_inputs: VecDeque::new(),
         effects_awaited: false,
-        credit_retries: 0,
+        deferred_retries: 0,
+        credit_progress: Instant::now(),
         timers: BTreeMap::new(),
         inflight: BTreeMap::new(),
         lifecycle_inflight: BTreeMap::new(),
