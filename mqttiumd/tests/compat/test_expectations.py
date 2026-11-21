@@ -345,12 +345,73 @@ def store_cases(count, word):
     }
 
 
+def sized(packet, wire_bytes=None, level=5):
+    """A packet as the player records it, with its size on the wire."""
+    return {**wire.decode(packet, level), "wire_bytes": len(packet) if wire_bytes is None else wire_bytes}
+
+
+def read(mark, *packets, op="recv", end="ok"):
+    return {"conn": "sub", "op": op, "got": list(packets), "end": end, "mark": mark}
+
+
+def limit_cases(qos):
+    """Transcripts for a delivery over the subscriber's Maximum Packet Size."""
+    def delivery(payload, **more):
+        return sized(wire.publish("limit/t", payload, qos=qos, packet_id=1, level=5, **more))
+
+    large = delivery(b"x" * 100)
+    small, following = delivery("small"), delivery("next")
+    resumed = sized(wire.connack(True, level=5))
+    discarded = {
+        PASS: [[read("large", op="quiet", end="quiet"), read("small", small), read("after-small", op="quiet", end="quiet")]],
+        FAIL: [
+            # The frozen behaviour: the connection is closed and nothing more is delivered.
+            [read("large", sized(wire.disconnect(level=5, reason=0x95)), op="quiet", end="eof"),
+             read("small", end="eof"), read("after-small", op="quiet", end="eof")],
+            [read("large", op="quiet", end="eof"), read("small", end="eof"), read("after-small", op="quiet", end="eof")],
+            # The packet is sent although it exceeds the limit.
+            [read("large", large, op="quiet", end="quiet"), read("small", small),
+             read("after-small", op="quiet", end="quiet")],
+            [read("large", op="quiet", end="quiet"), read("small", large), read("after-small", small, op="quiet", end="quiet")],
+            # Nothing is delivered any more, or a packet over the limit is.
+            [read("large", op="quiet", end="quiet"), read("small", end="timeout"),
+             read("after-small", op="quiet", end="quiet")],
+            [read("large", op="quiet", end="quiet"), read("small", {**small, "wire_bytes": 65}),
+             read("after-small", op="quiet", end="quiet")],
+            [read("large", op="quiet", end="quiet"), read("small", delivery("small", dup=True)),
+             read("after-small", op="quiet", end="quiet")],
+            [read("large", op="quiet", end="quiet"), read("small", small), read("after-small", large, op="quiet", end="quiet")],
+        ],
+    }
+    kept_out = {
+        PASS: [[read("resumed", resumed), read("no-redelivery", op="quiet", end="quiet"), read("next", following)]],
+        FAIL: [
+            # The frozen behaviour: the obligation was kept and is delivered to the larger connection.
+            [read("resumed", resumed), read("no-redelivery", large, op="quiet", end="quiet"), read("next", following)],
+            [read("resumed", resumed), read("no-redelivery", delivery(b"x" * 100, dup=True), op="quiet", end="quiet"),
+             read("next", following)],
+            [read("resumed", resumed), read("no-redelivery", op="quiet", end="quiet"), read("next", large)],
+            [read("resumed", resumed), read("no-redelivery", op="quiet", end="quiet"),
+             read("next", delivery("next", dup=True))],
+            # The session was not kept.
+            [read("resumed", sized(wire.connack(False, level=5))), read("no-redelivery", op="quiet", end="quiet"),
+             read("next", end="timeout")],
+            [read("resumed", resumed), read("no-redelivery", op="quiet", end="quiet"), read("next", end="timeout")],
+        ],
+    }
+    return discarded, kept_out
+
+
 STORE_AT_CAPACITY = "retained/thirty-two-topics-qos1-v4#store"
 STORE_BEYOND = "retained/forty-topics-qos1-v4#store"
 CASES[STORE_AT_CAPACITY] = store_cases(32, "thirty-two")
 CASES[STORE_BEYOND] = store_cases(40, "forty")
 # What mqttiumd does today beyond the thirty-two topics it keeps.
 CASES[STORE_BEYOND][FAIL].insert(0, [drained(*kept(32, "forty"), end="idle"), silent("after")])
+for level_of_service in (1, 2):
+    name = f"publish/over-maximum-packet-size-qos{level_of_service}-v5#"
+    CASES[name + "discarded"], CASES[name + "not-redelivered"] = limit_cases(level_of_service)
+del level_of_service, name
 
 
 class Repository(unittest.TestCase):
@@ -364,7 +425,11 @@ class Repository(unittest.TestCase):
                  TWELVE: {"MQTT-3.8.4-5"}, SHARED: {"MQTT-4.13.1-1"}, SUBSCRIPTION_IDENTIFIER: {"MQTT-4.13.1-1"},
                  RESERVED: {"MQTT-3.8.3-5", "MQTT-4.13.1-1"},
                  STORE_AT_CAPACITY: {"MQTT-3.3.1-5", "MQTT-3.3.1-6", "MQTT-3.3.1-8"},
-                 STORE_BEYOND: {"MQTT-3.3.1-5", "MQTT-3.3.1-6", "MQTT-3.3.1-8"}}
+                 STORE_BEYOND: {"MQTT-3.3.1-5", "MQTT-3.3.1-6", "MQTT-3.3.1-8"},
+                 **{f"publish/over-maximum-packet-size-qos{qos}-v5#discarded": {"MQTT-3.1.2-25", "MQTT-3.1.2-24"}
+                    for qos in (1, 2)},
+                 **{f"publish/over-maximum-packet-size-qos{qos}-v5#not-redelivered": {"MQTT-3.1.2-25", "MQTT-3.2.2-3"}
+                    for qos in (1, 2)}}
         self.assertEqual(sorted(cited), sorted(CASES))
         for name, statements in cited.items():
             found = {match.group(0) for match in classify.STATEMENT.finditer(self.declared[name].statement)}
