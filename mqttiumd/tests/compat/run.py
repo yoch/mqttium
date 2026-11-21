@@ -197,7 +197,9 @@ def markdown(matrix) -> str:
         lines.append("")
     if matrix["incidents"]:
         lines += ["## Broker incidents (exit, hang or panic during a scenario)", ""]
-        lines += [f"- `{item['scenario']}`, {item['backend']}: {item['what']}" for item in matrix["incidents"]]
+        lines += [f"- `{item['scenario']}`, {item['backend']}: {item['what']}"
+                  + (" (recorded in `divergences.json`)" if item["recorded"] else " (**not recorded**)")
+                  for item in matrix["incidents"]]
         lines.append("")
     lines += ["## Scenarios", "", "| Scenario | MQTT | Result | Note |", "| - | - | - | - |"]
     for row in rows:
@@ -214,6 +216,8 @@ def markdown(matrix) -> str:
             for label, key in (("Statement", "statement"), ("mqttiumd", "mqttiumd"), ("Lot", "lot")):
                 if row.get(key):
                     lines.append(f"  - {label}: {row[key]}")
+            for backend, kinds in sorted(row.get("incident", {}).items()):
+                lines.append(f"  - Incident of {backend}: {', '.join(kinds)}")
         lines.append("")
     return "\n".join(lines)
 
@@ -303,7 +307,8 @@ def main(argv=None) -> int:
         row = {"id": name, "area": scenario.area, "version": scenario.version, "doc": scenario.doc,
                "status": result["status"], "result": classes[name], "fingerprint": result["fingerprint"],
                "difference": entry.get("difference", ""), "statement": entry.get("statement", ""),
-               "mqttiumd": entry.get("mqttiumd", ""), "lot": entry.get("lot", "")}
+               "mqttiumd": entry.get("mqttiumd", ""), "lot": entry.get("lot", ""),
+               "incident": entry.get("incident", {})}
         rows.append(row)
         diff = write_transcripts(transcripts, result)
         if result["status"] == classify.ERROR:
@@ -312,7 +317,9 @@ def main(argv=None) -> int:
         if diff is not None and args.verbose:
             print(f"--- {name} [{classes[name]}] fingerprint {result['fingerprint']}\n{diff}\n")
         for backend, incident in result["incidents"].items():
-            incidents.append({"scenario": name, "backend": backend, "what": incident["what"]})
+            recorded = set(entry.get("incident", {}).get(backend, ()))
+            incidents.append({"scenario": name, "backend": backend, "kinds": incident["kinds"],
+                              "what": incident["what"], "recorded": set(incident["kinds"]) <= recorded})
     problems += classify.judge_incidents(
         {result["name"]: {backend: incident["kinds"] for backend, incident in result["incidents"].items()}
          for result in results if result["status"] != classify.ERROR}, classes, divergences)
@@ -330,7 +337,8 @@ def main(argv=None) -> int:
     print("\n".join(summary_table(summary)))
     print(f"\n{len(rows)} scenarios in {elapsed:.1f} s; matrix in {args.out}")
     for item in incidents:
-        print(f"INCIDENT {item['scenario']}: {item['backend']} {item['what']}")
+        print(f"INCIDENT {item['scenario']}: {item['backend']} {item['what']}"
+              + (" (recorded)" if item["recorded"] else ""))
     for name, problem in problems:
         print(f"PROBLEM {name}: {problem}")
     return 1 if problems else 0

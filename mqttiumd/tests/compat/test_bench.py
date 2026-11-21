@@ -160,7 +160,7 @@ class Incidents(unittest.TestCase):
     """A broker that exits, hangs or panics never hides behind a classification."""
 
     def problems(self, divergences, name, incidents):
-        classes, problems = classify.judge({name: record_of(divergences, name)}, divergences, {name})
+        classes, problems = classify.judge({name: record_of(divergences, name)}, divergences, {name, *divergences})
         self.assertEqual(problems, [], name)
         return classify.judge_incidents({name: incidents}, classes, divergences)
 
@@ -239,6 +239,7 @@ class Repository(unittest.TestCase):
                 self.assertTrue(hasattr(harness.Player, "do_" + step["op"]), (name, step["op"]))
 
     def test_divergences(self):
+        self.assertEqual(classify.BACKENDS, harness.BACKENDS)
         divergences = classify.load_divergences(HERE / "divergences.json")
         self.assertEqual(sorted(divergences), list(divergences), "entries are sorted by id")
         self.assertEqual(set(divergences) - set(dsl.REGISTRY), set())
