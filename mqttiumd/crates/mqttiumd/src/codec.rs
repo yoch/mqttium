@@ -75,6 +75,12 @@ pub enum Packet {
         expiry: Option<SessionExpiry>,
         publish_will: bool,
     },
+    /// A valid SUBSCRIBE with more filters than one request takes. It is
+    /// answered with one refusal per filter and changes nothing.
+    SubscribeOverLimit {
+        packet_id: InboundPacketId,
+        filters: usize,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -314,11 +320,19 @@ pub(crate) fn topic(bytes: &[u8]) -> Result<(), Error> {
     Ok(())
 }
 
-fn filter(bytes: &[u8]) -> Result<bool, Error> {
+/// Validates a topic filter and says whether it is a shared subscription.
+/// The `$share/` form belongs to MQTT 5: in 3.1.1 such a filter is an
+/// ordinary one.
+fn filter(version: Version, bytes: &[u8]) -> Result<bool, Error> {
     if bytes.is_empty() {
         return Err(protocol("EmptyTopicFilter"));
     }
-    let (shared, bytes) = if let Some(rest) = bytes.strip_prefix(b"$share/") {
+    let shared_form = if version == Version::V5 {
+        bytes.strip_prefix(b"$share/")
+    } else {
+        None
+    };
+    let (shared, bytes) = if let Some(rest) = shared_form {
         let slash = rest
             .iter()
             .position(|b| *b == b'/')
@@ -448,6 +462,8 @@ struct Properties {
     alias_maximum: Option<u16>,
     problem_information: Option<bool>,
     unsupported: bool,
+    /// An Authentication Method was given: no method is supported.
+    authentication: bool,
 }
 
 fn properties(input: &mut Cursor<'_>, context: Context) -> Result<Properties, Error> {
@@ -491,8 +507,16 @@ fn properties(input: &mut Cursor<'_>, context: Context) -> Result<Properties, Er
                     ..protocol("TopicAliasesDisabled")
                 });
             }
+            (Context::Subscribe, 0x0b, _) => {
+                // Subscription Identifiers Available 0 was announced.
+                return Err(Error {
+                    reason: 0xa1,
+                    ..protocol("SubscriptionIdentifiersNotSupported")
+                });
+            }
             (_, 0x15, _) => {
                 auth_method = true;
+                result.authentication = true;
                 result.unsupported = true;
             }
             (_, 0x16, _) => {
@@ -582,6 +606,13 @@ fn client_connect(body: &[u8], bounds: Bounds) -> Result<Packet, Error> {
             || properties.will_delay.is_some_and(|delay| delay != 0)
             || properties.unsupported
     });
+    if props.authentication {
+        return Err(Error {
+            peer_maximum,
+            reason: 0x8c,
+            ..unsupported("AuthenticationMethodNotSupported")
+        });
+    }
     if flags & !(2 | 0x0c | 0x20) != 0
         || expiry.is_none()
         || props.unsupported
@@ -815,12 +846,15 @@ fn subscribe(
     }
     let mut parsed = Vec::with_capacity(MAX_FILTERS);
     let outside = props.unsupported;
+    // Every filter is validated; those beyond the limit are only counted.
+    let mut count = 0usize;
     while !input.is_empty() {
-        if parsed.len() == MAX_FILTERS {
+        if unsubscribe && parsed.len() == MAX_FILTERS {
+            // An UNSUBACK of 3.1.1 cannot say that nothing was removed.
             return Err(oversized("TooManyFilters"));
         }
         let text = input.string()?;
-        let shared = filter(text)?;
+        let shared = filter(version, text)?;
         if text.len() > bounds.max_topic {
             return Err(oversized("FilterTooLarge"));
         }
@@ -828,22 +862,41 @@ fn subscribe(
         let mut subscription_options = SubscriptionOptions::DEFAULT;
         if !unsubscribe {
             let options = input.byte()?;
-            if (version == Version::V311 && options & !3 != 0)
-                || options & 0xc0 != 0
-                || options & 3 == 3
-                || (options >> 4) & 3 == 3
-                || (shared && options & 4 != 0)
-            {
+            let reserved = if version == Version::V311 {
+                options & !3
+            } else {
+                options & 0xc0
+            };
+            if reserved != 0 {
+                return Err(malformed("ReservedSubscriptionOptionBits"));
+            }
+            if options & 3 == 3 || (options >> 4) & 3 == 3 || (shared && options & 4 != 0) {
                 return Err(protocol("InvalidSubscriptionOptions"));
+            }
+            if shared {
+                // Shared Subscription Available 0 was announced.
+                return Err(Error {
+                    reason: 0x9e,
+                    ..protocol("SharedSubscriptionsNotSupported")
+                });
             }
             qos = Qos::from_wire(options & 3).ok_or_else(|| protocol("InvalidSubscriptionQos"))?;
             subscription_options = SubscriptionOptions::from_bits(options & !3)
                 .ok_or_else(|| protocol("InvalidSubscriptionOptions"))?;
         }
-        parsed.push((text, qos, subscription_options));
+        count += 1;
+        if parsed.len() < MAX_FILTERS {
+            parsed.push((text, qos, subscription_options));
+        }
     }
     if outside {
         return Err(unsupported("SubscriptionOptionsOutsideProfile"));
+    }
+    if count > MAX_FILTERS {
+        return Ok(Packet::SubscribeOverLimit {
+            packet_id,
+            filters: count,
+        });
     }
     if unsubscribe {
         let mut filters = Vec::with_capacity(parsed.len());
@@ -1123,9 +1176,12 @@ pub fn encode_for(version: Version, frame: OutboundFrame) -> Result<Vec<u8>, Err
             );
             Ok(bytes)
         }
+        // 3.1.1 acknowledges the request, also where nothing is removed.
+        // A filter the broker refuses as invalid holds no subscription;
+        // any other failure could leave one and is not acknowledged.
         OutboundFrame::Unsuback { packet_id, results }
             if results.as_slice().is_some_and(|codes| {
-                !codes.is_empty() && codes.iter().all(|code| matches!(code, 0 | 0x11))
+                !codes.is_empty() && codes.iter().all(|code| matches!(code, 0 | 0x11 | 0x8f))
             }) =>
         {
             let [high, low] = packet_id.get().to_be_bytes();
@@ -1133,6 +1189,47 @@ pub fn encode_for(version: Version, frame: OutboundFrame) -> Result<Vec<u8>, Err
         }
         _ => Err(unsupported("AckNotEncodableInMqtt311")),
     }
+}
+
+/// The SUBACK of a request over the filter limit: one refusal per filter,
+/// Quota exceeded in MQTT 5 and the failure code in 3.1.1.
+pub fn encode_suback_refusal(
+    version: Version,
+    packet_id: InboundPacketId,
+    filters: usize,
+) -> Result<Vec<u8>, Error> {
+    let (properties, code) = match version {
+        Version::V5 => (1, 0x97),
+        Version::V311 => (0, 0x80),
+    };
+    let remaining = 2usize
+        .checked_add(properties)
+        .and_then(|n| n.checked_add(filters))
+        .filter(|n| *n <= 268_435_455)
+        .ok_or_else(|| oversized("AckTooLarge"))?;
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(remaining + 5)
+        .map_err(|_| oversized("AckTooLarge"))?;
+    bytes.push(0x90);
+    let mut length = remaining;
+    loop {
+        let mut byte = (length % 128) as u8;
+        length /= 128;
+        if length > 0 {
+            byte |= 0x80;
+        }
+        bytes.push(byte);
+        if length == 0 {
+            break;
+        }
+    }
+    bytes.extend_from_slice(&packet_id.get().to_be_bytes());
+    if properties == 1 {
+        bytes.push(0);
+    }
+    bytes.resize(bytes.len() + filters, code);
+    Ok(bytes)
 }
 
 pub fn refusal_for(version: Version, error: Error, before_connack: bool) -> Option<Vec<u8>> {
@@ -1579,8 +1676,31 @@ mod tests {
         for _ in 0..9 {
             too_many.extend_from_slice(&[0, 1, b't', 1]);
         }
+        // A valid request over the limit is answered per filter, not closed.
         assert_eq!(
-            super::decode(0x82, &too_many, BOUNDS).unwrap_err().code(),
+            super::decode(0x82, &too_many, BOUNDS).unwrap(),
+            Packet::SubscribeOverLimit {
+                packet_id: InboundPacketId::new(1).unwrap(),
+                filters: 9
+            }
+        );
+        assert_eq!(
+            super::encode_suback_refusal(Version::V5, InboundPacketId::new(1).unwrap(), 9).unwrap(),
+            [&[0x90, 12, 0, 1, 0][..], &[0x97; 9]].concat()
+        );
+        assert_eq!(
+            super::encode_suback_refusal(Version::V311, InboundPacketId::new(1).unwrap(), 9)
+                .unwrap(),
+            [&[0x90, 11, 0, 1][..], &[0x80; 9]].concat()
+        );
+        let mut unsubscribed = vec![0, 1, 0];
+        for _ in 0..9 {
+            unsubscribed.extend_from_slice(&[0, 1, b't']);
+        }
+        assert_eq!(
+            super::decode(0xa2, &unsubscribed, BOUNDS)
+                .unwrap_err()
+                .code(),
             "TooManyFilters"
         );
         let bytes = super::encode_publish(

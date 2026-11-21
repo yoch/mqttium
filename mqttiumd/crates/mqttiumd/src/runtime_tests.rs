@@ -1077,11 +1077,11 @@ fn closing_transport_reconciles_late_commit_without_acknowledging_after_disconne
             codec::decode(0x82, &subscription, BOUNDS)
                 .unwrap_err()
                 .kind(),
-            codec::ErrorKind::Unsupported
+            codec::ErrorKind::Protocol
         );
         runtime.packet(generation, 0x82, subscription).unwrap();
         assert!(runtime.peers[&generation].closing.is_some());
-        assert_eq!(read_frame(&mut client), (0xe0, vec![0x83, 0]));
+        assert_eq!(read_frame(&mut client), (0xe0, vec![0xa1, 0]));
 
         // Reconcile the actual commit without collecting the refusal's socket
         // receipt: this establishes the precise closing-but-not-removed phase.
@@ -2221,7 +2221,8 @@ fn concatenated_subscription_waits_for_connack(known: bool) {
         assert_eq!(kind, 0x20, "CONNACK must be the first server packet");
         assert_eq!(body[0], u8::from(known), "accurate Session Present");
         assert_eq!(body[1], 0);
-        assert_eq!(read_frame(&mut client), (0xe0, vec![0x83, 0]));
+        // Subscription Identifiers were announced as unavailable (0xA1).
+        assert_eq!(read_frame(&mut client), (0xe0, vec![0xa1, 0]));
     });
 }
 
