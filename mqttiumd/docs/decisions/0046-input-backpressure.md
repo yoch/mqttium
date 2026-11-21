@@ -34,12 +34,14 @@ earlier deferred one. The dispatch that follows the pass empties the
 effect box; when it accepted something, the deferred packets return to
 the head of the input lane.
 
-**Deferred packets never take more than a quarter of the ordinary lane.**
-The packets that release what a full box waits for (a PUBACK frees a
-delivery window) arrive on the same lane. A packet refused for effect
-slots while a quarter of the lane already waits is closed as before, with
-`input_capacity`: the lane stays open for the packets that end the
-pressure, and the broker stays live.
+**No count of deferred packets closes a connection.** An earlier form of
+this record closed, with `input_capacity`, a packet refused for effect
+slots while a quarter of the lane already waited, to keep the lane open
+for the packets that end the pressure. The reserve below keeps those
+places by not admitting new work into them, so the closure protects
+nothing more: with both rules together it closed publishers of a fan-in
+burst that the quarter alone left open, and it is removed. A deferred
+packet keeps its place in the lane until the dispatch accepts an effect.
 
 **The last places of the lane are kept for the packets that release
 capacity.** PUBLISH, SUBSCRIBE and UNSUBSCRIBE ask the broker for new
@@ -87,8 +89,9 @@ be told what was written, and that is a fault, not pressure.
 
 - `input_queue_full` is no longer a terminal reason. `input_capacity`
   remains for a packet refused for a resource other than effect, result
-  or receipt slots, and for a packet refused for effect slots beyond the
-  quarter of the lane. Measured with 32 publisher and subscriber pairs
+  or receipt slots. The figures that follow were measured while the
+  quarter rule still closed connections. Measured with 32 publisher and
+  subscriber pairs
   over mTLS: at 1,500 QoS 1 publications per second offered nothing is
   closed; at 3,000, beyond what the store commits, 8 of 64 connections
   are in one run of two (report 0027; 12 in an earlier run made while
@@ -131,7 +134,7 @@ be told what was written, and that is a fault, not pressure.
 ## Left open
 
 - Pressure on QoS 1 and 2 beyond the store's rate still ends in refusals
-  (reason 0x97) and, past the quarter of the lane, in closures. A
+  (reason 0x97). A
   reservation of effect slots for the packets that release resources
   belongs to the core's cost model and to another record. The places of
   the lane are reserved; the slots of the effect box are not.

@@ -64,6 +64,21 @@ impl Broker {
         }
     }
 
+    /// The refusals and closures the broker recorded, for a failure message.
+    fn refusals(&self) -> String {
+        std::fs::read_to_string(self.directory.join("events.jsonl"))
+            .unwrap_or_default()
+            .lines()
+            .filter(|line| {
+                line.contains("refused")
+                    || (line.contains("\"connection_closed\"")
+                        && !line.contains("client_disconnect"))
+            })
+            .take(8)
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     /// Voluntary context switches of every thread of the broker.
     fn wakeups(&self) -> u64 {
         let tasks = format!("/proc/{}/task", self.child.id());
@@ -389,10 +404,12 @@ fn a_fan_in_burst_closes_no_publisher() {
         })
         .collect();
     for (index, writer) in writers.into_iter().enumerate() {
-        let reply = writer
-            .join()
-            .unwrap()
-            .unwrap_or_else(|error| panic!("publisher {index} was closed: {error}"));
+        let reply = writer.join().unwrap().unwrap_or_else(|error| {
+            panic!(
+                "publisher {index} was closed: {error}\n{}",
+                broker.refusals()
+            )
+        });
         assert_eq!(reply, [0xd0, 0], "PINGRESP expected from publisher {index}");
     }
     assert!(

@@ -1751,14 +1751,16 @@ impl Runtime<'_> {
                         // The effect box is emptied by the dispatch that
                         // follows this pass. The packet waits for it in
                         // order, behind nothing of its own connection.
+                        //
+                        // A deferred packet keeps its place in the lane, and
+                        // the lane admits a business packet only above its
+                        // control reserve: the packets that wait can never
+                        // take the places of those that release what the
+                        // box waits for. No count of them closes a
+                        // connection (record 0046).
                         packet @ Input::Packet { .. }
                             if need.resource == Resource::EffectSlots
-                                && need.wake == WakeCondition::EffectAccepted
-                                // The packets that release what the box
-                                // waits for share the lane: deferred ones
-                                // never take more than a quarter of it.
-                                && self.deferred_inputs.len()
-                                    < self.limits.ordinary_inputs / 4 =>
+                                && need.wake == WakeCondition::EffectAccepted =>
                         {
                             self.effects_awaited = true;
                             self.deferred_inputs.push_back(packet)
