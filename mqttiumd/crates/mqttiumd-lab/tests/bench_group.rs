@@ -21,9 +21,8 @@
 mod bench_support;
 
 use std::path::PathBuf;
-use std::process::Command;
 
-use bench_support::{Campaign, records, root, run_scenario_on};
+use bench_support::{Campaign, judge, not_passing, records, root, run_scenario_on};
 use mqttiumd_lab::bench::campaign::{Request, execute};
 use serde_json::Value;
 
@@ -43,45 +42,6 @@ const ALONE: [&str; 6] = [
     "tests/scenarios/qabs/QABS-C.json",
     "tests/scenarios/audit/F3-steady-lag.json",
 ];
-
-/// The verdict of the oracle on a campaign of `scenario`.
-fn judge(campaign: &Campaign, scenario: &str) -> Value {
-    let root = root().canonicalize().expect("the checkout");
-    let result = Command::new("python3")
-        .current_dir(&root)
-        .env("PYTHONPATH", root.join("tests/oracle"))
-        .args(["-m", "mqttiumd_oracle", "--root"])
-        .arg(&campaign.out)
-        .args([
-            "--contracts",
-            "contracts/v1",
-            "judge",
-            "--scenario",
-            scenario,
-        ])
-        .args(["--trace", "trace.jsonl"])
-        .output()
-        .expect("python3 runs the oracle");
-    assert!(
-        result.status.code().is_some_and(|code| code < 4),
-        "the oracle could not judge {scenario}: {}\n{}",
-        String::from_utf8_lossy(&result.stdout),
-        String::from_utf8_lossy(&result.stderr)
-    );
-    serde_json::from_slice(&result.stdout).expect("a verdict")
-}
-
-fn not_passing(verdict: &Value) -> Vec<String> {
-    verdict["assertions"]
-        .as_object()
-        .expect("the assertions")
-        .iter()
-        .filter(|(_, assertion)| assertion["status"] != "PASS")
-        .map(|(name, assertion)| {
-            format!("{name} {}: {}", assertion["status"], assertion["reasons"])
-        })
-        .collect()
-}
 
 fn summary(campaign: &Campaign) -> Value {
     serde_json::from_slice(&campaign.file("campaign.json")).expect("the campaign")

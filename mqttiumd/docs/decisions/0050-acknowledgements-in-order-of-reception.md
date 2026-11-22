@@ -85,7 +85,13 @@ for a result applied without a connection.
 
 - The order is that of one connection. Across a takeover by another
   connection of the same client, each connection has its own order.
-- The scenarios of the bench that hold two exchanges of one client keep
-  their results in order; the rule is shown by tests of the core and of
-  the runtime, and by one scenario if the vocabulary allows it (see the
-  open conditions).
+- The oracle has no assertion on the order of two acknowledgements. The
+  scenario `tests/scenarios/order/ORDER-A.json` brings the results of two
+  exchanges of one connection to the core in reverse order, the oracle
+  judges that run as any other, and the order is read on the trace by a
+  test of the bench (`crates/mqttiumd-lab/tests/bench_order.rs`), on both
+  stores. An assertion of the oracle, and a mutation of the loop it
+  rejects, would make the bench judge the rule by itself.
+- A held answer is released by a transition, never by a timer: an answer
+  that nothing precedes any more waits for the next receipt of its
+  connection. Every acknowledgement the core makes eligible brings one.

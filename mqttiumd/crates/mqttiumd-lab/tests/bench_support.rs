@@ -4,6 +4,7 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use mqttiumd_lab::bench::campaign::{Report, Request, execute};
@@ -103,6 +104,45 @@ pub fn records(trace: &[u8]) -> Vec<Record> {
                 origin: value["origin_component"].as_str().unwrap().to_owned(),
                 payload: value["payload"].clone(),
             }
+        })
+        .collect()
+}
+
+/// The verdict of the oracle on a campaign of `scenario`.
+pub fn judge(campaign: &Campaign, scenario: &str) -> Value {
+    let root = root().canonicalize().expect("the checkout");
+    let result = Command::new("python3")
+        .current_dir(&root)
+        .env("PYTHONPATH", root.join("tests/oracle"))
+        .args(["-m", "mqttiumd_oracle", "--root"])
+        .arg(&campaign.out)
+        .args([
+            "--contracts",
+            "contracts/v1",
+            "judge",
+            "--scenario",
+            scenario,
+        ])
+        .args(["--trace", "trace.jsonl"])
+        .output()
+        .expect("python3 runs the oracle");
+    assert!(
+        result.status.code().is_some_and(|code| code < 4),
+        "the oracle could not judge {scenario}: {}\n{}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
+    serde_json::from_slice(&result.stdout).expect("a verdict")
+}
+
+pub fn not_passing(verdict: &Value) -> Vec<String> {
+    verdict["assertions"]
+        .as_object()
+        .expect("the assertions")
+        .iter()
+        .filter(|(_, assertion)| assertion["status"] != "PASS")
+        .map(|(name, assertion)| {
+            format!("{name} {}: {}", assertion["status"], assertion["reasons"])
         })
         .collect()
 }
