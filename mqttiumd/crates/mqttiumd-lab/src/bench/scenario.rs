@@ -6,7 +6,11 @@
 //! and `op_A` stay names of the bench: they select faults and exchanges
 //! and never reach the broker (ADR 0003).
 
+use std::sync::Arc;
+
 use mqttiumd_contract::decimal::parse_u64;
+use mqttiumd_contract::packet::SharedBytes;
+use mqttiumd_contract::properties::{MAX_PROPERTY_BYTES, PublishProperties};
 use serde_json::Value;
 
 use crate::store::adapter::{FaultAction, FaultPoint, WorkKind};
@@ -53,6 +57,7 @@ pub enum Step {
         retain: bool,
         packet_id: Option<u16>,
         payload: Vec<u8>,
+        properties: Option<PublishProperties>,
         bind_exchange_as: Option<String>,
     },
     ClientResumeExchange {
@@ -185,6 +190,8 @@ fn action(point: FaultPoint, name: &str) -> Result<FaultAction, String> {
 fn work_kind(name: &str) -> Result<WorkKind, String> {
     [
         WorkKind::AdmitPublication,
+        WorkKind::RetainedPublication,
+        WorkKind::AnnotatedPublication,
         WorkKind::ReleaseInbound,
         WorkKind::ChangeSubscriptions,
         WorkKind::ClaimDelivery,
@@ -197,6 +204,96 @@ fn work_kind(name: &str) -> Result<WorkKind, String> {
     .into_iter()
     .find(|kind| kind.name() == name)
     .ok_or_else(|| format!("the command kind {name} is unknown to the store adapter"))
+}
+
+fn publish_properties(value: &Value, payload: &[u8]) -> Result<Option<PublishProperties>, String> {
+    let Some(obj) = value.get("properties") else {
+        return Ok(None);
+    };
+    let copy_prop = |bytes: &[u8], name: &str| -> Result<SharedBytes, String> {
+        SharedBytes::copy_from(bytes, MAX_PROPERTY_BYTES)
+            .map_err(|_| format!("properties.{name} beyond {MAX_PROPERTY_BYTES} bytes"))
+    };
+    let payload_format_indicator = match small(obj, "payload_format_indicator")? {
+        None => None,
+        Some(v) => Some(u8::try_from(v).map_err(|_| "payload_format_indicator beyond a byte")?),
+    };
+    let content_type = match obj.get("content_type") {
+        None => None,
+        Some(v) => Some(copy_prop(
+            v.as_str()
+                .ok_or("properties.content_type is not a string")?
+                .as_bytes(),
+            "content_type",
+        )?),
+    };
+    let response_topic = match obj.get("response_topic") {
+        None => None,
+        Some(v) => Some(copy_prop(
+            v.as_str()
+                .ok_or("properties.response_topic is not a string")?
+                .as_bytes(),
+            "response_topic",
+        )?),
+    };
+    let correlation_data = match obj.get("correlation_data_hex") {
+        None => None,
+        Some(v) => {
+            let raw = hex(v
+                .as_str()
+                .ok_or("properties.correlation_data_hex is not a string")?)?;
+            Some(copy_prop(&raw, "correlation_data_hex")?)
+        }
+    };
+    let user_properties = match obj.get("user_properties") {
+        None => Arc::from([]),
+        Some(v) => {
+            let items = v
+                .as_array()
+                .ok_or("properties.user_properties is not an array")?;
+            let mut pairs = Vec::with_capacity(items.len());
+            for item in items {
+                let pair = item
+                    .as_array()
+                    .filter(|p| p.len() == 2)
+                    .ok_or("each user property must be a [name, value] pair")?;
+                let k = copy_prop(
+                    pair[0]
+                        .as_str()
+                        .ok_or("user property name is not a string")?
+                        .as_bytes(),
+                    "user_properties",
+                )?;
+                let val = copy_prop(
+                    pair[1]
+                        .as_str()
+                        .ok_or("user property value is not a string")?
+                        .as_bytes(),
+                    "user_properties",
+                )?;
+                pairs.push((k, val));
+            }
+            Arc::from(pairs)
+        }
+    };
+    let props = PublishProperties {
+        payload_format_indicator,
+        content_type,
+        response_topic,
+        correlation_data,
+        user_properties,
+    };
+    props
+        .check()
+        .map_err(|error| format!("invalid publish properties: {error:?}"))?;
+    props
+        .check_payload(payload)
+        .map_err(|error| format!("payload violates publish properties: {error:?}"))?;
+    if props.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(props))
+    }
 }
 
 /// Members of the scenario format the bench does not play yet: a fault
@@ -277,22 +374,27 @@ fn step(value: &Value) -> Result<Step, String> {
                 .ok_or("no expect_session_present")?,
             max_steps: decimal(value, "max_steps")?,
         },
-        "ClientPublish" => Step::ClientPublish {
-            client: client()?,
-            topic: text(value, "topic")?.as_bytes().to_vec(),
-            qos: u8::try_from(small(value, "qos")?.ok_or("no qos")?)
-                .map_err(|_| "qos beyond a byte")?,
-            retain: value
-                .get("retain")
-                .and_then(Value::as_bool)
-                .ok_or("no retain")?,
-            packet_id: packet_id(value, "packet_id")?,
-            payload: hex(text(value, "payload_hex")?)?,
-            bind_exchange_as: value
-                .get("bind_exchange_as")
-                .and_then(Value::as_str)
-                .map(str::to_owned),
-        },
+        "ClientPublish" => {
+            let payload = hex(text(value, "payload_hex")?)?;
+            let properties = publish_properties(value, &payload)?;
+            Step::ClientPublish {
+                client: client()?,
+                topic: text(value, "topic")?.as_bytes().to_vec(),
+                qos: u8::try_from(small(value, "qos")?.ok_or("no qos")?)
+                    .map_err(|_| "qos beyond a byte")?,
+                retain: value
+                    .get("retain")
+                    .and_then(Value::as_bool)
+                    .ok_or("no retain")?,
+                packet_id: packet_id(value, "packet_id")?,
+                payload,
+                properties,
+                bind_exchange_as: value
+                    .get("bind_exchange_as")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+            }
+        }
         "ClientResumeExchange" => Step::ClientResumeExchange {
             client: client()?,
             exchange: text(value, "exchange")?.to_owned(),
@@ -393,5 +495,13 @@ impl Scenario {
         } else {
             "none"
         }
+    }
+
+    /// Whether any step publishes with `retain: true`.
+    #[must_use]
+    pub fn uses_retained(&self) -> bool {
+        self.steps
+            .iter()
+            .any(|step| matches!(step, Step::ClientPublish { retain: true, .. }))
     }
 }

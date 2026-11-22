@@ -79,7 +79,7 @@ class RetainedCanonicalReader(unittest.TestCase):
         found = recipe.decode(subscription())
         self.assertEqual(found.kind, "ReplaySubscriptions")
         self.assertEqual(found.first_publication, (1, 1, 0, 60))
-        self.assertEqual(found.last_publication, (1, 1, 0, 315))
+        self.assertEqual(found.last_publication, (1, 1, 0, 60 + recipe.MAX_RETAINED_REPLAYS - 1))
         self.assertEqual([entry.options for entry in found.update.changes], [4, 32])
         self.assertEqual(found.operation, found.update.operation)
 
@@ -104,7 +104,8 @@ class RetainedCanonicalReader(unittest.TestCase):
     def test_flags_topics_and_identity_range_are_closed_domains(self):
         invalid = [retained_admission(qos=0), retained_admission(retain=0),
                    retained_admission(mask=2), qos0(mask=2), qos0(order=0),
-                   qos0(cause=99), subscription(first=0), subscription(first=2**64-255),
+                   qos0(cause=99), subscription(first=0),
+                   subscription(first=2**64 - (recipe.MAX_RETAINED_REPLAYS - 1)),
                    subscription(epoch=2)]
         invalid.extend(qos0(topic=topic) for topic in (b"", b"a/+", b"a/#", b"a\x00b", b"\xff"))
         for data in invalid:
@@ -180,6 +181,186 @@ class RetainedSnapshotAndScope(unittest.TestCase):
         self.assertIn(results.FIXTURE_RETAINED_SCOPE, self.unmet(value))
         record = SimpleNamespace(kind="CommandSubmitted", payload={"command_kind": "RetainedQos0"})
         self.assertIn(results.FIXTURE_RETAINED_SCOPE, self.unmet(records=[record]))
+
+
+def wide_admission(*, count=17, qos=2, retain=1):
+    topic = b"atelier/wide"
+    targets = b"".join(
+        be(2 + idx) + be(1) + be(idx, 4) + bytes([1, 1]) for idx in range(count)
+    )
+    return (
+        header(1) + scoped(20) + scoped(30) + scoped(40)
+        + be(1) + be(1) + be(7, 2) + be(1) + be(2)
+        + bytes([qos, retain]) + be(len(topic), 2) + topic
+        + scoped(50) + be(4) + be(4) + be(count + 1) + be(qos == 2) + be(1)
+        + be(count, 2) + targets
+    )
+
+
+def wide_mask_bytes(count, mask):
+    byte_len = (count + 7) // 8
+    return be(byte_len, 2) + mask.to_bytes(byte_len, "little")
+
+
+def wide_retained_publication(*, count=17, mask=None):
+    if mask is None:
+        mask = (1 << 0) | (1 << 16)
+    nested = wide_admission(count=count, qos=2, retain=1)
+    return header(20) + be(len(nested), 4) + nested + wide_mask_bytes(count, mask)
+
+
+def wide_retained_qos0(*, count=17, mask=None):
+    if mask is None:
+        mask = (1 << 0) | (1 << 16)
+    topic = b"atelier/wide0"
+    targets = b"".join(
+        be(2 + idx) + be(1) + be(idx, 4) + bytes([0, 1]) for idx in range(count)
+    )
+    return (
+        header(21) + scoped(20) + scoped(30) + scoped(40)
+        + be(1) + be(1) + be(3) + be(1) + be(2)
+        + be(len(topic), 2) + topic + scoped(50) + be(4)
+        + be(4) + be(count + 1) + be(0) + be(1)
+        + be(count, 2) + targets + wide_mask_bytes(count, mask)
+    )
+
+
+def wide_will_publication(*, count=17, live_retain=None):
+    topic = b"atelier/wide-will"
+    targets = b"".join(
+        be(2 + idx) + be(1) + be(idx, 4) + bytes([1, 1]) for idx in range(count)
+    )
+    body = (
+        header(22) + scoped(10) + scoped(8) + scoped(11) + be(1)
+        + be(len(topic), 2) + topic + scoped(12) + be(7)
+        + be(7) + be(count) + be(0) + be(1)
+        + be(count, 2) + targets
+    )
+    if live_retain is None:
+        return body + b"\x00"
+    return body + b"\x01" + wide_mask_bytes(count, live_retain)
+
+
+def encode_publish_props(
+    *,
+    pfi=1,
+    content_type=b"application/json",
+    response_topic=b"replies/1",
+    correlation_data=b"\x01\x02",
+    user_properties=((b"trace", b"a"), (b"trace", b"b")),
+):
+    flags = 0
+    out = bytearray()
+    if pfi is not None:
+        flags |= 0x01
+        out.append(pfi)
+    if content_type is not None:
+        flags |= 0x02
+        out += be(len(content_type), 2) + content_type
+    if response_topic is not None:
+        flags |= 0x04
+        out += be(len(response_topic), 2) + response_topic
+    if correlation_data is not None:
+        flags |= 0x08
+        out += be(len(correlation_data), 2) + correlation_data
+    if user_properties:
+        flags |= 0x10
+        out += be(len(user_properties), 2)
+        for k, v in user_properties:
+            out += be(len(k), 2) + k + be(len(v), 2) + v
+    return bytes([flags]) + bytes(out)
+
+
+def annotated_publication(inner=None, props_bytes=None):
+    inner = admission(qos=2, retain=0) if inner is None else inner
+    props_bytes = encode_publish_props() if props_bytes is None else props_bytes
+    return header(23) + be(len(props_bytes), 4) + props_bytes + be(len(inner), 4) + inner
+
+
+class Recipes20To23(unittest.TestCase):
+    def test_wide_retained_qos0_and_will_recipes_decode_canonically(self):
+        rp = recipe.decode(wide_retained_publication())
+        self.assertEqual(rp.kind, "RetainedPublication")
+        self.assertEqual(len(rp.admission.targets), 17)
+        self.assertEqual(rp.retain_targets, (1 << 0) | (1 << 16))
+
+        rq = recipe.decode(wide_retained_qos0())
+        self.assertEqual(rq.kind, "RetainedQos0")
+        self.assertEqual(len(rq.targets), 17)
+        self.assertEqual(rq.retain_targets, (1 << 0) | (1 << 16))
+
+        wp_plain = recipe.decode(wide_will_publication(live_retain=None))
+        self.assertEqual(wp_plain.kind, "WillPublication")
+        self.assertEqual(len(wp_plain.targets), 17)
+        self.assertIsNone(wp_plain.live_retain)
+
+        wp_ret = recipe.decode(wide_will_publication(live_retain=(1 << 16)))
+        self.assertEqual(wp_ret.live_retain, 1 << 16)
+
+    def test_annotated_publication_decodes_all_five_properties_in_order(self):
+        for inner in (admission(qos=2, retain=0), retained_admission(), wide_retained_publication(), wide_retained_qos0()):
+            raw = annotated_publication(inner=inner)
+            decoded = recipe.decode(raw)
+            self.assertEqual(decoded.kind, "AnnotatedPublication")
+            self.assertEqual(decoded.inner, recipe.decode(inner))
+            self.assertEqual(decoded.operation, decoded.inner.operation)
+            self.assertEqual(decoded.properties.payload_format_indicator, 1)
+            self.assertEqual(decoded.properties.content_type, b"application/json")
+            self.assertEqual(decoded.properties.response_topic, b"replies/1")
+            self.assertEqual(decoded.properties.correlation_data, b"\x01\x02")
+            self.assertEqual(decoded.properties.user_properties, ((b"trace", b"a"), (b"trace", b"b")))
+
+    def test_recipes_20_to_23_reject_noncanonical_truncation_and_bad_domains(self):
+        # Truncations & trailing bytes refused.
+        for valid in (
+            wide_retained_publication(),
+            wide_retained_qos0(),
+            wide_will_publication(),
+            wide_will_publication(live_retain=1),
+            annotated_publication(),
+        ):
+            for cut in (0, 6, 7, len(valid) - 1):
+                with self.assertRaises(recipe.RecipeError):
+                    recipe.decode(valid[:cut])
+            with self.assertRaises(recipe.RecipeError):
+                recipe.decode(valid + b"\x00")
+
+        # Noncanonical wide tags with <= 16 targets, invalid mask bits, empty/invalid props.
+        invalid = [
+            wide_retained_publication(count=16, mask=1),
+            wide_retained_publication(count=17, mask=1 << 17),
+            wide_retained_qos0(count=16, mask=1),
+            wide_retained_qos0(count=17, mask=1 << 17),
+            wide_will_publication(count=16, live_retain=None),
+            wide_will_publication(count=17, live_retain=1 << 17),
+            annotated_publication(props_bytes=b"\x00"),
+            annotated_publication(props_bytes=b"\x20"),
+            annotated_publication(props_bytes=encode_publish_props(pfi=2)),
+            annotated_publication(props_bytes=encode_publish_props(response_topic=b"bad/+")),
+            annotated_publication(props_bytes=encode_publish_props(content_type=b"\xff")),
+            annotated_publication(inner=subscription()),
+        ]
+        for raw in invalid:
+            with self.assertRaises(recipe.RecipeError):
+                recipe.decode(raw)
+
+    def test_recipes_20_to_23_stay_outside_historical_p1_qualification(self):
+        def unmet(snapshot=None, records=()):
+            run = SimpleNamespace(
+                snapshots={"first": (None, snapshot)} if snapshot is not None else {},
+                trace=SimpleNamespace(records=records),
+            )
+            with mock.patch.object(results.judge.Run, "load", return_value=run):
+                return results._scope_unmet(None, None, None)
+
+        for raw, expected in (
+            (wide_retained_publication(), results.FIXTURE_RETAINED_SCOPE),
+            (wide_retained_qos0(), results.FIXTURE_RETAINED_SCOPE),
+            (wide_will_publication(), results.FIXTURE_WILL_SCOPE),
+            (annotated_publication(), results.FIXTURE_PROPERTIES_SCOPE),
+        ):
+            snap = {"outbound": [], "operations": [{"recipe_hex": raw.hex(), "decision": {}}]}
+            self.assertIn(expected, unmet(snapshot=snap))
 
 
 if __name__ == "__main__":

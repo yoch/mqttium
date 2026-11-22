@@ -1,18 +1,20 @@
 diff --git a/mqttiumd/crates/mqttiumd-store-sqlite/src/group.rs b/mqttiumd/crates/mqttiumd-store-sqlite/src/group.rs
-index e9461e2..98b9a13 100644
 --- a/mqttiumd/crates/mqttiumd-store-sqlite/src/group.rs
 +++ b/mqttiumd/crates/mqttiumd-store-sqlite/src/group.rs
-@@ -117,9 +117,10 @@ impl SqliteStore {
+@@ -126,11 +126,11 @@ impl SqliteStore {
              &self.kill_hook,
              crate::kill_points::KillPoint::CommitPrepared,
          );
 -        if failing || tx.commit().is_err() {
+-            caches.clear_receipt_caches();
 -            return Ok(unknown());
 -        }
+-        group_delta.commit_into(caches);
 +        // MUTANT G1: the group is rolled back and its members are answered
 +        // as if it had committed.
-+        let _ = failing;
++        let _ = (failing, group_delta);
 +        drop(tx);
++        caches.clear_receipt_caches();
          Ok(replies)
      }
  }

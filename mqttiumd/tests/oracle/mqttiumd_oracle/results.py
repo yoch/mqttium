@@ -171,6 +171,7 @@ FIXTURE_ROUTING_SCOPE = "the fixture-based qualifier does not cover hierarchical
 FIXTURE_RETAINED_SCOPE = "the fixture-based qualifier does not cover retained storage or replay"
 FIXTURE_MESSAGE_EXPIRY_SCOPE = "the fixture-based qualifier does not cover message expiry, transmission start or temporal quarantine"
 FIXTURE_WILL_SCOPE = "the fixture-based qualifier does not cover product Will publication"
+FIXTURE_PROPERTIES_SCOPE = "the fixture-based qualifier does not cover MQTT 5 PUBLISH application properties"
 
 
 def _product_session(row):
@@ -209,6 +210,7 @@ def _scope_unmet(contracts, scenario_path, trace_path):
     retained = False
     message_expiry = False
     will = False
+    publish_properties = False
     # The independent fixture assertions intentionally retain their exact-topic
     # semantics. New readable route/options evidence must not broaden them.
     hierarchical_routing = any(
@@ -245,15 +247,29 @@ def _scope_unmet(contracts, scenario_path, trace_path):
                 unsupported |= recipe[6] in (3, 4, 5, 7, 9, 19)
                 qos0_delivery |= recipe[6] == 6
                 session_lifecycle |= recipe[6] == 8
-                retained |= recipe[6] in (10, 11, 12)
+                retained |= recipe[6] in (10, 11, 12, 20, 21)
                 message_expiry |= recipe[6] in (13, 14, 15, 16)
-                will |= recipe[6] == 17 or (recipe[6] == 8 and len(recipe) > 39 and recipe[39] in (5, 6))
+                will |= recipe[6] in (17, 18, 22) or (
+                    recipe[6] == 8 and len(recipe) > 39 and recipe[39] in (5, 6)
+                )
+                publish_properties |= recipe[6] == 23
             try:
                 decoded = recipes.decode(recipe)
             except recipes.RecipeError:
                 pass
             else:
-                non_qos2 |= isinstance(decoded, recipes.Admit) and decoded.qos != 2
+                inner = decoded
+                if isinstance(inner, recipes.AnnotatedPublication):
+                    publish_properties = True
+                    inner = inner.inner
+                if isinstance(inner, recipes.ExpiringPublication):
+                    message_expiry = True
+                    inner = inner.admission
+                if isinstance(inner, (recipes.RetainedPublication, recipes.RetainedQos0)):
+                    retained = True
+                if isinstance(inner, recipes.RetainedPublication):
+                    inner = inner.admission
+                non_qos2 |= isinstance(inner, recipes.Admit) and inner.qos != 2
             facts = operation["decision"].get("facts", {})
             unsupported |= facts.get("kind") in {
                 "SubscriptionsChanged", "DeliveryClaimed", "DeliveryFinished", "DeliveryPubrelReady"
@@ -272,12 +288,14 @@ def _scope_unmet(contracts, scenario_path, trace_path):
         session_lifecycle |= payload.get("command_kind") == "SessionLifecycle"
         will |= payload.get("command_kind") == "WillPublication"
         retained |= payload.get("command_kind") in {"RetainedPublication", "RetainedQos0", "ReplaySubscriptions"}
+        publish_properties |= payload.get("command_kind") == "AnnotatedPublication"
         message_expiry |= payload.get("command_kind") in {
             "ExpiringPublication", "TimedReplaySubscriptions", "MarkDeliveryStarted", "ExpireDelivery",
             "DeliveryStarted", "MessageExpire", "MessageExpiry"}
         message_expiry |= payload.get("expiry") is not None or payload.get("message_expiry_interval") is not None
         if record.kind in {"PeerPacketSent", "ClientBytesReceived"}:
             message_expiry |= _wire_message_expiry(payload.get("bytes_hex", ""))
+            publish_properties |= _wire_publish_properties(payload.get("bytes_hex", ""))
         retained |= record.kind == "ClientBytesReceived" and payload.get("retain", False)
         non_qos2 |= (record.kind == "ClientBytesReceived"
                      and payload.get("packet_kind") == "PUBLISH"
@@ -331,23 +349,21 @@ def _scope_unmet(contracts, scenario_path, trace_path):
         [FIXTURE_MESSAGE_EXPIRY_SCOPE] if message_expiry else []
     ) + (
         [FIXTURE_WILL_SCOPE] if will else []
+    ) + (
+        [FIXTURE_PROPERTIES_SCOPE] if publish_properties else []
     )
 
 
-def _wire_message_expiry(raw_hex):
-    """Scope guard only: detect property0x02 in a bounded MQTT5 PUBLISH.
-
-    This does not judge temporal semantics. Reading wire evidence closes the
-    scope gap when a timed message expires before leaving any durable row.
-    """
+def _wire_publish_property_ids(raw_hex):
+    """Extract property IDs carried by a bounded MQTT 5 PUBLISH packet."""
     if not isinstance(raw_hex, str) or len(raw_hex) > 2 * 65536:
-        return False
+        return ()
     try:
         data = bytes.fromhex(raw_hex)
     except (ValueError, TypeError):
-        return False
+        return ()
     if not data or data[0] >> 4 != 3 or len(data) > 65536:
-        return False
+        return ()
     def variable(at):
         value = 0
         for shift in (0, 7, 14, 21):
@@ -362,19 +378,21 @@ def _wire_message_expiry(raw_hex):
     try:
         length, at = variable(1)
         if at + length != len(data) or at + 2 > len(data):
-            return False
+            return ()
         topic_length = int.from_bytes(data[at:at+2], "big")
         at += 2 + topic_length + (2 if (data[0] >> 1) & 3 else 0)
         length, at = variable(at)
         end = at + length
         if end > len(data):
-            return False
+            return ()
+        found = []
         while at < end:
             prop, at = variable(at)
-            if prop == 2:
-                return True
+            found.append(prop)
             if prop == 1:
                 at += 1
+            elif prop == 2:
+                at += 4
             elif prop == 0x23:
                 at += 2
             elif prop == 0x0b:
@@ -382,14 +400,24 @@ def _wire_message_expiry(raw_hex):
             elif prop in (3, 8, 9, 0x26):
                 for _ in range(2 if prop == 0x26 else 1):
                     if at + 2 > end:
-                        return False
+                        return tuple(found)
                     count = int.from_bytes(data[at:at+2], "big")
                     at += 2 + count
             else:
-                return False
-        return False
+                return tuple(found)
+        return tuple(found)
     except ValueError:
-        return False
+        return ()
+
+
+def _wire_message_expiry(raw_hex):
+    """Scope guard only: detect property 0x02 in a bounded MQTT5 PUBLISH."""
+    return 2 in _wire_publish_property_ids(raw_hex)
+
+
+def _wire_publish_properties(raw_hex):
+    """Scope guard only: detect application properties (0x01, 0x03, 0x08, 0x09, 0x26)."""
+    return any(prop in (1, 3, 8, 9, 0x26) for prop in _wire_publish_property_ids(raw_hex))
 
 
 def _broker_unmet(contracts, manifest, trace_path):

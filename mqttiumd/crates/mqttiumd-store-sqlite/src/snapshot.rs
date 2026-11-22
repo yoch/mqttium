@@ -6,7 +6,9 @@
 //! `WriterLease`, atomically renames over the target path, and syncs the
 //! parent directory.
 
-use std::fs::{File, remove_file};
+use std::fs::{File, OpenOptions, Permissions, remove_file};
+#[cfg(unix)]
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -44,10 +46,48 @@ fn remove_if_exists(path: &Path) -> Result<(), OpenError> {
     }
 }
 
+fn create_temp_with_permissions(
+    tmp: &Path,
+    existing: Option<&Permissions>,
+    secured: bool,
+) -> Result<(), OpenError> {
+    let mut opts = OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        let mode = existing
+            .map(Permissions::mode)
+            .unwrap_or(if secured { 0o600 } else { 0o666 });
+        opts.mode(mode);
+    }
+    let file = opts.open(tmp).map_err(OpenError::WriterLock)?;
+    if let Some(perms) = existing {
+        file.set_permissions(perms.clone())
+            .map_err(OpenError::WriterLock)?;
+    } else if secured {
+        #[cfg(unix)]
+        file.set_permissions(Permissions::from_mode(0o600))
+            .map_err(OpenError::WriterLock)?;
+    }
+    Ok(())
+}
+
+fn sync_parent_dir(path: &Path) -> Result<(), OpenError> {
+    let dir = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    File::open(dir)
+        .and_then(|handle| handle.sync_all())
+        .map_err(OpenError::WriterLock)
+}
+
 /// Atomically writes `state` as a complete Schema-14 (or Schema-15 when
 /// `policy` is `Some`) SQLite database at `path`.
 ///
 /// The caller must hold the exclusive `WriterLease` for `path`.
+/// Preserves existing file permissions on `path` and verifies `fsync` of both
+/// the snapshot image and its parent directory.
 pub fn save_state_atomic(
     path: &Path,
     state: &DurableState,
@@ -61,7 +101,18 @@ pub fn save_state_atomic(
     if let Some(policy) = policy {
         policy.validate()?;
     }
+    let existing_perms = match std::fs::symlink_metadata(path) {
+        Ok(meta) => {
+            if meta.file_type().is_symlink() || !meta.file_type().is_file() {
+                return Err(OpenError::Corrupt);
+            }
+            Some(meta.permissions())
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(OpenError::WriterLock(error)),
+    };
     let tmp = sibling_temp_path(path);
+    create_temp_with_permissions(&tmp, existing_perms.as_ref(), policy.is_some())?;
     let write_result = write_snapshot_file(&tmp, state, policy, expected);
     if let Err(error) = write_result {
         let _ = remove_file(&tmp);
@@ -73,22 +124,17 @@ pub fn save_state_atomic(
     }
     // Clean any stale WAL/SHM sidecars before replacing the main image so no
     // reader or next opener sees a mismatched WAL header.
-    let _ = remove_if_exists(&sidecar_path(path, "-wal"));
-    let _ = remove_if_exists(&sidecar_path(path, "-shm"));
+    if let Err(error) = remove_if_exists(&sidecar_path(path, "-wal"))
+        .and_then(|()| remove_if_exists(&sidecar_path(path, "-shm")))
+    {
+        let _ = remove_file(&tmp);
+        return Err(error);
+    }
     if let Err(error) = std::fs::rename(&tmp, path) {
         let _ = remove_file(&tmp);
         return Err(OpenError::WriterLock(error));
     }
-    if let Some(parent) = path.parent() {
-        let dir = if parent.as_os_str().is_empty() {
-            Path::new(".")
-        } else {
-            parent
-        };
-        if let Ok(handle) = File::open(dir) {
-            let _ = handle.sync_all();
-        }
-    }
+    sync_parent_dir(path)?;
     Ok(())
 }
 
@@ -372,5 +418,101 @@ fn fault_to_open(fault: Fault) -> OpenError {
         Fault::Sql(error) => OpenError::Sql(error),
         Fault::Corrupt => OpenError::Corrupt,
         Fault::Read(error) => OpenError::Read(error),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{SqliteStore, acquire_writer_lock};
+    use mqttiumd_contract::capacity::{ExchangeSlots, PayloadBytes, ReceiptSlots, References};
+    use mqttiumd_contract::ids::StoreIncarnation;
+    use mqttiumd_store_api::Limits;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static TEST_SEQ: AtomicU64 = AtomicU64::new(0);
+
+    fn test_limits() -> Limits {
+        Limits {
+            payload_bytes: PayloadBytes::new(1024 * 1024),
+            references: References::new(256),
+            exchange_slots: ExchangeSlots::new(64),
+            receipt_slots: ReceiptSlots::new(256),
+            max_targets_per_admission: 16,
+            max_topic_bytes: 128,
+            max_payload_bytes: 32_768,
+            max_sessions: 32,
+            max_route_targets: 16,
+        }
+    }
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "mqttiumd-snap-unit-{name}-{}-{}",
+            std::process::id(),
+            TEST_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_state_atomic_preserves_existing_permissions_and_rejects_symlinks() {
+        let dir = temp_dir("perms");
+        let db = dir.join("state.sqlite");
+        let store = SqliteStore::create(&db, StoreIncarnation::new(1), test_limits()).unwrap();
+        let (state, _settings, lease) = store.into_state_and_lease().unwrap();
+
+        for mode in [0o600u32, 0o640u32] {
+            std::fs::set_permissions(&db, Permissions::from_mode(mode)).unwrap();
+            save_state_atomic(&db, &state, None, &lease).unwrap();
+            let got = std::fs::metadata(&db).unwrap().permissions().mode() & 0o777;
+            assert_eq!(got, mode, "mode {mode:o} must be preserved across snapshot");
+        }
+
+        // Symlink target must be refused without modifying its target.
+        let link = dir.join("link.sqlite");
+        std::os::unix::fs::symlink(&db, &link).unwrap();
+        let link_lease = acquire_writer_lock(&link).unwrap();
+        assert!(matches!(
+            save_state_atomic(&link, &state, None, &link_lease),
+            Err(OpenError::Corrupt)
+        ));
+        drop(link_lease);
+        drop(lease);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_state_atomic_fails_cleanly_on_unwritable_dir_and_verifies_parent_fsync() {
+        let dir = temp_dir("fsync");
+        let db = dir.join("state.sqlite");
+        let store = SqliteStore::create(&db, StoreIncarnation::new(2), test_limits()).unwrap();
+        let (state, _settings, lease) = store.into_state_and_lease().unwrap();
+        save_state_atomic(&db, &state, None, &lease).unwrap();
+        let before = std::fs::read(&db).unwrap();
+
+        // Non-existent parent dir fails parent fsync verification explicitly.
+        assert!(sync_parent_dir(&dir.join("missing/file.sqlite")).is_err());
+
+        // Read-only parent directory refuses temp snapshot creation while preserving prior DB.
+        // Skip only if the effective user ignores 0o555 directory permissions (e.g. root).
+        std::fs::set_permissions(&dir, Permissions::from_mode(0o555)).unwrap();
+        let probe = dir.join("perm-probe");
+        let dir_is_enforced = File::create(&probe).is_err();
+        let _ = remove_file(&probe);
+        if dir_is_enforced {
+            let err = save_state_atomic(&db, &state, None, &lease);
+            std::fs::set_permissions(&dir, Permissions::from_mode(0o755)).unwrap();
+            assert!(err.is_err(), "read-only parent dir must fail snapshot");
+            assert_eq!(std::fs::read(&db).unwrap(), before);
+        } else {
+            std::fs::set_permissions(&dir, Permissions::from_mode(0o755)).unwrap();
+        }
+
+        drop(lease);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

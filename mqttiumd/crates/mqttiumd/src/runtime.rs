@@ -2650,7 +2650,10 @@ impl Runtime<'_> {
                     StoreReply::Outcome(StoreOutcome::Committed(
                         CommitFacts::DeliveryClaimed { target, .. }
                         | CommitFacts::DeliveryFinished { target, .. }
-                        | CommitFacts::DeliveryConsumed { target, .. },
+                        | CommitFacts::DeliveryConsumed { target, .. }
+                        | CommitFacts::DeliveryPubrelReady { target, .. }
+                        | CommitFacts::DeliveryStarted { target, .. }
+                        | CommitFacts::DeliveryExpired { target, .. },
                     )),
                 ..
             } => Some((*target, false)),
@@ -5524,7 +5527,50 @@ fn nz(v: u32) -> NonZeroU32 {
     NonZeroU32::new(v).expect("fixed nonzero budget")
 }
 
+fn normalize_path_for_collision(path: &std::path::Path) -> PathBuf {
+    if let (Some(parent), Some(name)) = (path.parent(), path.file_name()) {
+        let dir = if parent.as_os_str().is_empty() {
+            std::path::Path::new(".")
+        } else {
+            parent
+        };
+        if let Ok(canon) = std::fs::canonicalize(dir) {
+            return canon.join(name);
+        }
+    }
+    path.to_path_buf()
+}
+
+fn path_with_suffix(path: &std::path::Path, suffix: &str) -> PathBuf {
+    let mut os = path.as_os_str().to_os_string();
+    os.push(suffix);
+    PathBuf::from(os)
+}
+
+fn paths_collide_with_db(events: &std::path::Path, db: &std::path::Path) -> bool {
+    let ev = normalize_path_for_collision(events);
+    let ev_prev = path_with_suffix(&ev, ".previous");
+    let db_norm = normalize_path_for_collision(db);
+    let db_paths = [
+        db_norm.clone(),
+        path_with_suffix(&db_norm, "-wal"),
+        path_with_suffix(&db_norm, "-shm"),
+        path_with_suffix(&db_norm, ".writer-lock"),
+    ];
+    db_paths.iter().any(|p| *p == ev || *p == ev_prev)
+}
+
 pub fn run(config: Config) -> Result<(), Failure> {
+    let disk_db_active = matches!(
+        config.storage_mode,
+        crate::writer::StorageMode::Durable
+            | crate::writer::StorageMode::Volatile {
+                snapshot_interval: Some(_),
+            }
+    ) || config.require_existing_db;
+    if disk_db_active && paths_collide_with_db(&config.events, &config.db) {
+        return Err(Failure::plain("events_db_path_collision"));
+    }
     let events = Events::open_at(&config.events, config.event_level).map_err(event_failure)?;
     let security = match &config.tls {
         Some(files) => Security::load(files).map(Some).map_err(Failure::plain),
@@ -5585,9 +5631,13 @@ pub fn run(config: Config) -> Result<(), Failure> {
         );
         return Err(Failure::plain("writer_shutdown_deadline"));
     }
-    writer.join_finished()?;
-    events.emit("stopped",json!({"details":{"writer_released":true,"accepted_commands_certainly_rejected":false}})).map_err(event_failure)?;
-    result
+    let writer_result = writer.join_finished();
+    if let Err(failure) = &writer_result {
+        let _ = events.emit("startup_or_runtime_refused", failure.fields());
+    } else {
+        events.emit("stopped",json!({"details":{"writer_released":true,"accepted_commands_certainly_rejected":false}})).map_err(event_failure)?;
+    }
+    result.and(writer_result)
 }
 /// Accepts on its own thread so that the reactor never polls the listener.
 /// The lane is bounded: a reactor that does not take connections leaves

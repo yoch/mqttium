@@ -447,7 +447,7 @@ for version in (4, 5):
     }
 del version, refused, name
 LIMIT = "errors/packet-at-announced-maximum-v5#limit"
-ANNOUNCING = wire.connack(level=5, props={"maximum_packet_size": 32_776})
+ANNOUNCING = wire.connack(level=5, props={"maximum_packet_size": 1_048_584})
 CASES[LIMIT] = {
     PASS: [[record("connack", ANNOUNCING), record("exact", wire.puback(1, level=5)),
             closed_with("over", disconnect(0x95))],

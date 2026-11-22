@@ -2,9 +2,9 @@
   {
     "id": "connect/connack-capabilities-v5",
     "class": "profile-refused",
-    "difference": "Mosquitto announces Receive Maximum 20 and Topic Alias Maximum 10 and leaves every other capability at its default; mqttiumd announces Receive Maximum 8, Maximum Packet Size 32 776, Topic Alias Maximum 0, and shared subscriptions and Subscription Identifiers not available.",
-    "lot": "The capabilities of the v0.1 profile: Topic Alias from client to server (Topic Alias Maximum above 0); Shared subscriptions (CMP-002); Subscription Identifiers; Receive Maximum and Maximum Packet Size of the bounded preview",
-    "fingerprint": "3f658f2a95b3d637"
+    "difference": "Mosquitto announces Receive Maximum 20 and Topic Alias Maximum 10 and leaves every other capability at its default; mqttiumd announces Receive Maximum 8, Maximum Packet Size 1 048 584, Topic Alias Maximum 0, and shared subscriptions and Subscription Identifiers not available.",
+    "lot": "The capabilities of the v0.1 profile: Topic Alias from client to server (Topic Alias Maximum above 0); Shared subscriptions (CMP-002); Subscription Identifiers; Receive Maximum and Maximum Packet Size of the runtime profile",
+    "fingerprint": "b52c6f8738fb9477"
   },
   {
     "id": "connect/empty-clientid-v4",
@@ -52,51 +52,13 @@
     "fingerprint": "e65f6932e92f4b99"
   },
   {
-    "id": "errors/oversized-packet-v4",
-    "class": "profile-refused",
-    "difference": "Mosquitto, whose default limit is the protocol maximum, acknowledges a 70 000-byte PUBLISH; mqttiumd accepts packets up to 65 536 bytes and closes the connection.",
-    "lot": "Runtime limits of the bounded preview (ADR 0044), to be raised to Mosquitto's defaults or made configurable: 65 536-byte packets",
-    "fingerprint": "1ccaa34a000e94b5"
-  },
-  {
-    "id": "errors/oversized-packet-v5",
-    "class": "profile-refused",
-    "difference": "Mosquitto, whose default limit is the protocol maximum, acknowledges a 70 000-byte PUBLISH; mqttiumd announced Maximum Packet Size 32 776, reads frames up to 65 536 bytes, and answers DISCONNECT 0x95 (Packet too large) before closing.",
-    "lot": "Runtime limits of the bounded preview (ADR 0044), to be raised to Mosquitto's defaults or made configurable: 65 536-byte packets",
-    "fingerprint": "a6c0e8adc59c1e58"
-  },
-  {
     "id": "errors/packet-at-announced-maximum-v5",
     "class": "reference-nonconformant",
-    "difference": "Both acknowledge a PUBLISH of exactly the announced 32 776 bytes with Reason Code 0x10 (No matching subscribers). Mosquitto also acknowledges the next one, of 32 777 bytes, and keeps the connection; mqttiumd answers DISCONNECT 0x95 (Packet too large) and closes.",
+    "difference": "Both acknowledge a PUBLISH of exactly the announced 1 048 584 bytes with Reason Code 0x10 (No matching subscribers). Mosquitto also acknowledges the next one, of 1 048 585 bytes, and keeps the connection; mqttiumd answers DISCONNECT 0x95 (Packet too large) and closes.",
     "statement": "MQTT-4.13.1-1, with section 3.2.2.3.6: the size is the whole packet, and a larger one is a Protocol Error with 0x95",
-    "mqttiumd": "Measures the whole packet, fixed header included: acknowledges 32 776 bytes, answers 32 777 with DISCONNECT 0x95 (Packet too large) and closes the network connection.",
+    "mqttiumd": "Measures the whole packet, fixed header included: acknowledges 1 048 584 bytes, answers 1 048 585 with DISCONNECT 0x95 (Packet too large) and closes the network connection.",
     "decision": "0049",
-    "fingerprint": "aa2826f0d5268e60"
-  },
-  {
-    "id": "properties/content-type-v5",
-    "class": "profile-refused",
-    "difference": "Mosquitto acknowledges the PUBLISH and forwards the Content Type to the subscriber; mqttiumd answers the PUBLISH with DISCONNECT 0x83 (Implementation specific error), closes the publisher's connection and delivers nothing.",
-    "statement": "MQTT-3.3.2-20: what the feature requires once it is supported",
-    "lot": "MQTT 5 PUBLISH properties forwarded to subscribers: User Property, Payload Format Indicator, Content Type, Response Topic, Correlation Data",
-    "fingerprint": "bcd9fc49f9c8fa13"
-  },
-  {
-    "id": "properties/payload-format-indicator-v5",
-    "class": "profile-refused",
-    "difference": "Mosquitto acknowledges the PUBLISH and forwards the Payload Format Indicator to the subscriber; mqttiumd answers the PUBLISH with DISCONNECT 0x83 (Implementation specific error), closes the publisher's connection and delivers nothing.",
-    "statement": "MQTT-3.3.2-4: what the feature requires once it is supported",
-    "lot": "MQTT 5 PUBLISH properties forwarded to subscribers: User Property, Payload Format Indicator, Content Type, Response Topic, Correlation Data",
-    "fingerprint": "d16a2db7a532c723"
-  },
-  {
-    "id": "properties/response-topic-v5",
-    "class": "profile-refused",
-    "difference": "Mosquitto acknowledges the PUBLISH and forwards Response Topic and Correlation Data to the subscriber; mqttiumd answers the PUBLISH with DISCONNECT 0x83 (Implementation specific error), closes the publisher's connection and delivers nothing.",
-    "statement": "MQTT-3.3.2-15 and MQTT-3.3.2-16: what the feature requires once it is supported",
-    "lot": "MQTT 5 PUBLISH properties forwarded to subscribers: User Property, Payload Format Indicator, Content Type, Response Topic, Correlation Data",
-    "fingerprint": "6e91a9935adc7dff"
+    "fingerprint": "b11195bc5d8f4afa"
   },
   {
     "id": "properties/topic-alias-v5",
@@ -105,28 +67,6 @@
     "statement": "MQTT-3.2.2-18: with Topic Alias Maximum 0 the client is the one at fault",
     "lot": "Topic Alias from client to server (Topic Alias Maximum above 0)",
     "fingerprint": "36e59be75d5309a5"
-  },
-  {
-    "id": "properties/user-properties-v5",
-    "class": "profile-refused",
-    "difference": "Mosquitto acknowledges the PUBLISH and forwards the User Properties to the subscriber in their order; mqttiumd answers the PUBLISH with DISCONNECT 0x83 (Implementation specific error), closes the publisher's connection and delivers nothing.",
-    "statement": "MQTT-3.3.2-17 and MQTT-3.3.2-18: what the feature requires once it is supported",
-    "lot": "MQTT 5 PUBLISH properties forwarded to subscribers: User Property, Payload Format Indicator, Content Type, Response Topic, Correlation Data",
-    "fingerprint": "187c373bc988f6ef"
-  },
-  {
-    "id": "publish/burst-qos0-v4",
-    "class": "profile-refused",
-    "difference": "Mosquitto delivers all one hundred QoS 0 messages written at once to an online subscriber; mqttiumd delivers fewer (between 4 and 52 in the runs read), in the order sent, and drops the others silently.",
-    "lot": "Runtime limits of the bounded preview (ADR 0044), to be raised to Mosquitto's defaults or made configurable: the bounded volatile path of QoS 0 messages (8 outgoing messages per connection, 32 writer slots)",
-    "fingerprint": "737eee3aa9a2785b"
-  },
-  {
-    "id": "publish/payload-40000-bytes-v5",
-    "class": "profile-refused",
-    "difference": "Mosquitto acknowledges and delivers a 40 000-byte message; mqttiumd announced Maximum Packet Size 32 776, which follows its payload limit of 32 768 bytes, and answers DISCONNECT 0x95 (Packet too large).",
-    "lot": "Runtime limits of the bounded preview (ADR 0044), to be raised to Mosquitto's defaults or made configurable: 32 768-byte payloads",
-    "fingerprint": "4def2420df805cd8"
   },
   {
     "id": "publish/pubrel-retransmit-v5",
@@ -154,20 +94,6 @@
     "fingerprint": "3d5fe5d94ba4a6cf"
   },
   {
-    "id": "retained/forty-topics-qos1-v4",
-    "class": "profile-refused",
-    "difference": "Mosquitto keeps forty retained messages and sends them all to a new subscription at QoS 1; mqttiumd keeps thirty-two, closes the publisher's connection on the thirty-third and sends those thirty-two, each once.",
-    "lot": "Runtime limits of the bounded preview (ADR 0044), to be raised to Mosquitto's defaults or made configurable: 32 retained topics",
-    "fingerprint": "737963249fbca0ae"
-  },
-  {
-    "id": "retained/forty-topics-v4",
-    "class": "profile-refused",
-    "difference": "Mosquitto acknowledges forty retained publications; mqttiumd acknowledges thirty-two and closes the publisher's connection on the thirty-third. The messages that reach the subscription at QoS 0 compare equal (each one of the forty, none twice); how many reach it is measured and not compared: forty from Mosquitto, between 13 and 32 from mqttiumd in the runs read.",
-    "lot": "Runtime limits of the bounded preview (ADR 0044), to be raised to Mosquitto's defaults or made configurable: 32 retained topics; the QoS 0 deliveries mqttiumd sheds go through the bounded volatile path (4 output slots per connection)",
-    "fingerprint": "5b8352a9198b0cf8"
-  },
-  {
     "id": "subscribe/invalid-empty-filter-v5",
     "class": "unspecified",
     "difference": "Both close the connection on the invalid Topic Filter; Mosquitto with DISCONNECT 0x81 (Malformed Packet), mqttiumd with DISCONNECT 0x82 (Protocol Error).",
@@ -182,13 +108,6 @@
     "statement": "MQTT-4.13.1-1: both close; the Reason Code is not prescribed",
     "decision": "0049",
     "fingerprint": "6a79447df4524ecc"
-  },
-  {
-    "id": "subscribe/many-subscriptions-v4",
-    "class": "profile-refused",
-    "difference": "Mosquitto grants all 150 subscriptions; mqttiumd grants 128 and answers the other 22 with SUBACK return code 0x80 (Failure).",
-    "lot": "Runtime limits of the bounded preview (ADR 0044), to be raised to Mosquitto's defaults or made configurable: 128 subscriptions",
-    "fingerprint": "1f74c37fb99b45b3"
   },
   {
     "id": "subscribe/overlapping-subscriptions-v5",

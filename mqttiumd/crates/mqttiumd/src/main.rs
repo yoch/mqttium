@@ -260,8 +260,20 @@ fn parse_arguments(args_iter: impl Iterator<Item = String>) -> Result<Config, St
     {
         return Err("test control must be an existing directory".to_owned());
     }
+    let needs_db = matches!(
+        storage_mode,
+        StorageMode::Durable
+            | StorageMode::Volatile {
+                snapshot_interval: Some(_),
+            }
+    ) || require_existing_db;
+    let db = if needs_db {
+        db.ok_or_else(|| "--db or --existing-db is required".to_owned())?
+    } else {
+        db.unwrap_or_default()
+    };
     Ok(Config {
-        db: db.ok_or_else(|| "--db or --existing-db is required".to_owned())?,
+        db,
         require_existing_db,
         storage_mode,
         listen,

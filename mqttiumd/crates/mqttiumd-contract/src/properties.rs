@@ -78,7 +78,8 @@ pub fn valid_response_topic(bytes: &[u8]) -> bool {
 
 /// Immutable MQTT 5 PUBLISH application properties forwarded end-to-end.
 ///
-/// Order of `user_properties` is preserved verbatim (MQTT-3.3.2-17).
+/// All User Properties are forwarded unaltered (MQTT-3.3.2-17) and their order
+/// is preserved verbatim (MQTT-3.3.2-18).
 #[derive(Clone, PartialEq, Eq, Debug, Default)]
 pub struct PublishProperties {
     pub payload_format_indicator: Option<u8>,
@@ -177,7 +178,7 @@ impl PublishProperties {
     }
 
     /// Validates payload consistency with Payload Format Indicator (`0x01 == 1`
-    /// requires RFC 3629 UTF-8 payload per MQTT-3.3.2-5).
+    /// requires RFC 3629 UTF-8 payload per MQTT 5.0 section 3.3.2.3.2).
     pub fn check_payload(&self, payload: &[u8]) -> Result<(), RecipeError> {
         if self.payload_format_indicator == Some(1) && core::str::from_utf8(payload).is_err() {
             return Err(RecipeError::InvalidField("payload_format_invalid"));

@@ -1279,12 +1279,13 @@ pub fn serve(arguments: &Arguments) -> Result<(), String> {
         crate::files::contract_directories(Path::new(&arguments.contracts))?.1
     )))?;
     let kinds = KindTable::from_schema(&schema)?;
-    let settings = settings_of(
+    let mut settings = settings_of(
         &fixture,
         &arguments.run_id,
         arguments.seed,
         scenario.faults.len(),
     )?;
+    settings.retained_enabled = scenario.uses_retained();
     let population = Population {
         clients: arguments
             .sessions

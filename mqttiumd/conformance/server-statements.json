@@ -1604,10 +1604,14 @@
         "evidence": [
           {
             "file": "mqttiumd/crates/mqttiumd/tests/publish_properties.rs",
+            "test": "invalid_response_topic_and_content_type_are_rejected_over_tcp"
+          },
+          {
+            "file": "mqttiumd/crates/mqttiumd/tests/publish_properties.rs",
             "test": "publish_properties_traverse_qos0_qos1_qos2_and_strip_for_v311"
           }
         ],
-        "note": "Response Topic (0x08) is validated as a non-empty MQTT UTF-8 topic name without wildcards and forwarded unaltered to MQTT 5 subscribers (ADR 0053)."
+        "note": "Response Topic (0x08) must be a valid MQTT UTF-8 Encoded String; malformed UTF-8 is rejected with DISCONNECT 0x81 and valid values are forwarded unaltered (ADR 0053)."
       },
       {
         "id": "MQTT-3.3.2-14",
@@ -1621,10 +1625,10 @@
           },
           {
             "file": "mqttiumd/crates/mqttiumd/tests/publish_properties.rs",
-            "test": "publish_properties_traverse_qos0_qos1_qos2_and_strip_for_v311"
+            "test": "invalid_response_topic_and_content_type_are_rejected_over_tcp"
           }
         ],
-        "note": "Response Topic containing '+' or '#' is rejected as a protocol error and never forwarded (ADR 0053)."
+        "note": "Response Topic containing '+' or '#' is rejected as a Protocol Error (0x82) and never forwarded (ADR 0053)."
       },
       {
         "id": "MQTT-3.3.2-15",
@@ -1663,11 +1667,11 @@
             "test": "publish_properties_traverse_qos0_qos1_qos2_and_strip_for_v311"
           },
           {
-            "file": "mqttiumd/crates/mqttiumd-contract/src/properties.rs",
-            "test": "canonical_round_trip_preserves_every_property_and_order"
+            "file": "mqttiumd/crates/mqttiumd/tests/publish_properties.rs",
+            "test": "retained_publish_properties_survive_volatile_snapshot_and_durable_restart"
           }
         ],
-        "note": "User Properties (0x26) preserve exact insertion order, including duplicate keys, across QoS 0/1/2 and retained restarts (ADR 0053)."
+        "note": "All User Properties (0x26) are forwarded unaltered to MQTT 5 subscribers across QoS 0/1/2 and retained restarts, and stripped for MQTT 3.1.1 (ADR 0053)."
       },
       {
         "id": "MQTT-3.3.2-18",
@@ -1678,9 +1682,13 @@
           {
             "file": "mqttiumd/crates/mqttiumd/tests/publish_properties.rs",
             "test": "publish_properties_traverse_qos0_qos1_qos2_and_strip_for_v311"
+          },
+          {
+            "file": "mqttiumd/crates/mqttiumd-contract/src/properties.rs",
+            "test": "canonical_round_trip_preserves_every_property_and_order"
           }
         ],
-        "note": "User Properties (0x26) are forwarded verbatim to MQTT 5 subscribers and stripped for MQTT 3.1.1 (ADR 0053)."
+        "note": "User Properties (0x26) preserve exact insertion order, including duplicate keys, across QoS 0/1/2 and retained restarts (ADR 0053)."
       },
       {
         "id": "MQTT-3.3.2-19",
@@ -1690,10 +1698,14 @@
         "evidence": [
           {
             "file": "mqttiumd/crates/mqttiumd/tests/publish_properties.rs",
+            "test": "invalid_response_topic_and_content_type_are_rejected_over_tcp"
+          },
+          {
+            "file": "mqttiumd/crates/mqttiumd/tests/publish_properties.rs",
             "test": "publish_properties_traverse_qos0_qos1_qos2_and_strip_for_v311"
           }
         ],
-        "note": "Content Type (0x03) is validated as MQTT UTF-8 and forwarded unaltered to MQTT 5 subscribers (ADR 0053)."
+        "note": "Content Type (0x03) must be a valid MQTT UTF-8 Encoded String; malformed UTF-8 is rejected with DISCONNECT 0x81 and valid values are forwarded unaltered (ADR 0053)."
       },
       {
         "id": "MQTT-3.3.2-20",

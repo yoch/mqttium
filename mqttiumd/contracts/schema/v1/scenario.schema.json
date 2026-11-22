@@ -366,6 +366,42 @@
               "payload_hex": {
                 "$ref": "primitives.schema.json#/$defs/hex_bytes"
               },
+              "properties": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "payload_format_indicator": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 1
+                  },
+                  "content_type": {
+                    "type": "string",
+                    "maxLength": 65535
+                  },
+                  "response_topic": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 65535
+                  },
+                  "correlation_data_hex": {
+                    "$ref": "primitives.schema.json#/$defs/hex_bytes"
+                  },
+                  "user_properties": {
+                    "type": "array",
+                    "maxItems": 64,
+                    "items": {
+                      "type": "array",
+                      "items": {
+                        "type": "string",
+                        "maxLength": 65535
+                      },
+                      "minItems": 2,
+                      "maxItems": 2
+                    }
+                  }
+                }
+              },
               "bind_exchange_as": {
                 "$ref": "primitives.schema.json#/$defs/binding"
               }

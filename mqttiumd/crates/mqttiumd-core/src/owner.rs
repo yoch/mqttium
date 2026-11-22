@@ -975,6 +975,13 @@ impl Owner {
         })
     }
 
+    /// Enables retained publication and session-lifecycle admission paths on an
+    /// owner whose sessions were pre-installed from a fixture rather than opened
+    /// via `Input::OpenSession`.
+    pub fn enable_session_lifecycle(&mut self) {
+        self.lifecycle_enabled = true;
+    }
+
     /// The box of the owner. It is always present: a renewal replaces it
     /// in place, and a refused renewal keeps it (review R2). The `Option`
     /// is kept so that the callers written against the earlier form go on

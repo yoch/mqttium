@@ -1,0 +1,155 @@
+{
+  "format": "mqttiumd.fixture",
+  "schema_version": 1,
+  "id": "wide-persistent-sessions",
+  "profile": "p1-durable-mqtt5-without-expiry",
+  "store": {
+    "incarnation": "1"
+  },
+  "sessions": [
+    {
+      "client": "producer",
+      "client_id": "p1-producer",
+      "persistent": true,
+      "connected": false
+    },
+    {
+      "client": "t01",
+      "client_id": "p1-t01",
+      "persistent": true,
+      "connected": false
+    },
+    {
+      "client": "t02",
+      "client_id": "p1-t02",
+      "persistent": true,
+      "connected": false
+    },
+    {
+      "client": "t03",
+      "client_id": "p1-t03",
+      "persistent": true,
+      "connected": false
+    },
+    {
+      "client": "t04",
+      "client_id": "p1-t04",
+      "persistent": true,
+      "connected": false
+    },
+    {
+      "client": "t05",
+      "client_id": "p1-t05",
+      "persistent": true,
+      "connected": false
+    },
+    {
+      "client": "t06",
+      "client_id": "p1-t06",
+      "persistent": true,
+      "connected": false
+    },
+    {
+      "client": "t07",
+      "client_id": "p1-t07",
+      "persistent": true,
+      "connected": false
+    },
+    {
+      "client": "t08",
+      "client_id": "p1-t08",
+      "persistent": true,
+      "connected": false
+    },
+    {
+      "client": "t09",
+      "client_id": "p1-t09",
+      "persistent": true,
+      "connected": false
+    },
+    {
+      "client": "t10",
+      "client_id": "p1-t10",
+      "persistent": true,
+      "connected": false
+    },
+    {
+      "client": "t11",
+      "client_id": "p1-t11",
+      "persistent": true,
+      "connected": false
+    },
+    {
+      "client": "t12",
+      "client_id": "p1-t12",
+      "persistent": true,
+      "connected": false
+    },
+    {
+      "client": "t13",
+      "client_id": "p1-t13",
+      "persistent": true,
+      "connected": false
+    },
+    {
+      "client": "t14",
+      "client_id": "p1-t14",
+      "persistent": true,
+      "connected": false
+    },
+    {
+      "client": "t15",
+      "client_id": "p1-t15",
+      "persistent": true,
+      "connected": false
+    },
+    {
+      "client": "t16",
+      "client_id": "p1-t16",
+      "persistent": true,
+      "connected": false
+    },
+    {
+      "client": "t17",
+      "client_id": "p1-t17",
+      "persistent": true,
+      "connected": false
+    }
+  ],
+  "routes": [
+    {
+      "topic": "p1/wide",
+      "targets": [
+        { "client": "t01", "qos": 1 },
+        { "client": "t02", "qos": 1 },
+        { "client": "t03", "qos": 1 },
+        { "client": "t04", "qos": 1 },
+        { "client": "t05", "qos": 1 },
+        { "client": "t06", "qos": 1 },
+        { "client": "t07", "qos": 1 },
+        { "client": "t08", "qos": 1 },
+        { "client": "t09", "qos": 1 },
+        { "client": "t10", "qos": 1 },
+        { "client": "t11", "qos": 1 },
+        { "client": "t12", "qos": 1 },
+        { "client": "t13", "qos": 1 },
+        { "client": "t14", "qos": 1 },
+        { "client": "t15", "qos": 1 },
+        { "client": "t16", "qos": 1 },
+        { "client": "t17", "qos": 1 }
+      ]
+    }
+  ],
+  "capacities": {
+    "effect_slots": "8",
+    "result_slots": "8",
+    "store_operations_in_flight": "2",
+    "payload_bytes": "16384",
+    "references": "64",
+    "exchange_slots": "32",
+    "receipt_slots": "32",
+    "max_targets_per_admission": "20",
+    "max_topic_bytes": "256",
+    "max_payload_bytes": "1024"
+  }
+}

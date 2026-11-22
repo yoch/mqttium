@@ -31,19 +31,31 @@ security-weakening directives.
    - Durability (`CFG-006`, `DUR-001`, `DUR-002`): `persistence true` translates
      explicitly to `StorageMode::Durable` (highlighting per-commit WAL
      durability/cost differences vs Mosquitto periodic snapshots);
-     `persistence false` translates explicitly to `StorageMode::Volatile`;
+     `persistence false` translates explicitly to pure in-memory
+     `StorageMode::Volatile { snapshot_interval: None }` (never reading or
+     overwriting existing DB files, leaving `autosave_interval` inactive, and
+     refusing contradictions with `mqttiumd_storage_mode durable`, non-zero
+     `mqttiumd_snapshot_interval`, or `mqttiumd_existing_db true`);
      `persistence_location`, `persistence_file`, and `autosave_interval`
-     (mapped to periodic atomic SQLite snapshot interval in Volatile mode,
-     explicitly flagged as not a proven loss bound in Durable mode).
+     (mapped to periodic atomic SQLite snapshot interval only when
+     `mqttiumd_storage_mode volatile` is explicitly chosen without
+     `persistence false`, explicitly flagged as not a proven loss bound in
+     Durable mode).
    - Security (`SEC-005`): TLS listeners require `certfile`, `keyfile`, `cafile`,
      `require_certificate true`, and `mqttiumd_identities` (with optional
      `tls_version tlsv1.3` and `use_identity_as_username true`). Plain
-     `allow_anonymous true` is permitted only on loopback addresses without TLS.
+     `allow_anonymous true` is permitted only on loopback addresses without TLS;
+     an explicit `listener` (or legacy `port`/`bind_address`) omitting
+     `allow_anonymous` defaults to `allow_anonymous false` (Mosquitto 2.x) and
+     is therefore refused unless TLS 1.3 mTLS is configured.
      `password_file`, `acl_file`, `psk_*`, `plugin`, `require_certificate false`,
      non-TLS `1.3` versions, websockets, bridging directives, multi-listener
      configs, and all unknown directives are explicitly `Blocking`.
    - Observability: `log_dest file PATH` and `log_type` map to JSONL events
-     path and `Level::Ops`/`Level::Audit`.
+     path and `Level::Ops`/`Level::Audit`. Consecutive startups on the same
+     event journal acquire an exclusive non-blocking lock on the prior segment
+     and rotate it atomically to `.previous`, refusing concurrent overlap with
+     another live broker or with active database paths.
    - Native extensions (`Equivalent`): `mqttiumd_db`, `mqttiumd_existing_db`,
      `mqttiumd_storage_mode`, `mqttiumd_snapshot_interval`, `mqttiumd_events`,
      `mqttiumd_event_level`, `mqttiumd_identities`, `mqttiumd_io_threads`.

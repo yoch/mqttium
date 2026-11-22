@@ -21,10 +21,15 @@ Correlation Data, Payload Format Indicator, and ordered User Properties.
      logical bytes; validated before any application-owned copy in `codec.rs`
      and inside the pure core (`no_std + alloc`, `#![forbid(unsafe_code)]`).
    - When `payload_format_indicator == Some(1)`, RFC 3629 UTF-8 validity of the
-     payload is enforced (`0x99 PayloadFormatInvalid`, MQTT-3.3.2-5).
-   - `response_topic` must be a valid non-empty MQTT topic name with no
-     wildcard characters (`+`, `#`; MQTT-3.3.2-14).
-   - User Property ordering is preserved end-to-end (MQTT-3.3.2-17).
+     payload is enforced (`0x99 PayloadFormatInvalid`, MQTT 5.0 section 3.3.2.3.2;
+     forwarded unaltered per MQTT-3.3.2-4).
+   - `response_topic` must be a valid non-empty MQTT UTF-8 topic name
+     (MQTT-3.3.2-13) with no wildcard characters (`+`, `#`; MQTT-3.3.2-14),
+     forwarded unaltered (MQTT-3.3.2-15).
+   - `content_type` must be a valid MQTT UTF-8 string (MQTT-3.3.2-19),
+     forwarded unaltered (MQTT-3.3.2-20).
+   - All User Properties are forwarded unaltered (MQTT-3.3.2-17) while
+     preserving their exact order (MQTT-3.3.2-18).
    - Publications without application properties carry `None`, incurring zero
      additional allocation on the hot path.
 2. **Canonical recipe wrapper (kind 23, `Recipe::AnnotatedPublication`)**:

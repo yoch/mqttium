@@ -342,6 +342,7 @@ pub fn settings_of(
             max_topic: limits.max_topic_bytes,
             max_payload: limits.max_payload_bytes,
         },
+        retained_enabled: false,
     };
     Ok(settings)
 }
@@ -621,7 +622,11 @@ fn execute_with<B: Backend>(request: &Request, mut backend: B) -> Result<Report,
         &run_id,
         request.seed,
         scenario.faults.len(),
-    );
+    )
+    .map(|mut s| {
+        s.settings.retained_enabled = scenario.uses_retained();
+        s
+    });
     let backend_settings = backend.describe();
     let in_child = request.process == "child";
     let outcome: Outcome = match setup {

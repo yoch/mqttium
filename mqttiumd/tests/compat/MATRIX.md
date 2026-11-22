@@ -3,7 +3,7 @@
 Written by `tests/compat/run.py`: regenerate it with the command in
 `tests/compat/README.md` and copy `matrix.md` here; do not edit it by hand.
 
-- broker: `mqttiumd` built from commit `921df9d3cc39d42fc14ec5a422cd107243672228`
+- broker: `mqttiumd` built from commit `09632cd040f6fb8288673acef9630f4341aedb0d with uncommitted changes`
 - reference: Mosquitto 2.0.21, the version `preview/build-mosquitto-reference.sh` builds
 - scenarios played: 126
 
@@ -19,19 +19,19 @@ the oracle, the MQTT specification is. Each difference is classified in
 
 ## Summary
 
-126 scenarios: 92 `same`, 26 `profile-refused`, 2 `reference-nonconformant`, 6 `unspecified`.
+126 scenarios: 103 `same`, 15 `profile-refused`, 2 `reference-nonconformant`, 6 `unspecified`.
 
 | Area | same | profile-refused | reference-nonconformant | defect | unspecified | total |
 | - | -: | -: | -: | -: | -: | -: |
 | connect | 20 | 6 | 0 | 0 | 0 | 26 |
 | session | 9 | 0 | 0 | 0 | 0 | 9 |
-| subscribe | 18 | 5 | 0 | 0 | 3 | 26 |
-| publish | 19 | 2 | 1 | 0 | 2 | 24 |
-| retained | 12 | 2 | 0 | 0 | 0 | 14 |
-| properties | 4 | 5 | 0 | 0 | 0 | 9 |
+| subscribe | 19 | 4 | 0 | 0 | 3 | 26 |
+| publish | 21 | 0 | 1 | 0 | 2 | 24 |
+| retained | 14 | 0 | 0 | 0 | 0 | 14 |
+| properties | 8 | 1 | 0 | 0 | 0 | 9 |
 | will | 8 | 4 | 0 | 0 | 0 | 12 |
-| errors | 2 | 2 | 1 | 0 | 1 | 6 |
-| **all** | 92 | 26 | 2 | 0 | 6 | 126 |
+| errors | 4 | 0 | 1 | 0 | 1 | 6 |
+| **all** | 103 | 15 | 2 | 0 | 6 | 126 |
 
 ## Expectations on mqttiumd's transcript
 
@@ -39,16 +39,16 @@ What a normative statement requires of the broker in a scenario, whatever Mosqui
 does there. A `fail` is listed in `expectations-open.json` or fails the run; the
 column of the reference is information.
 
-21 expectations: 20 `pass`, 1 `fail` (1 listed as open), 0 `not-applicable`.
+21 expectations: 21 `pass`, 0 `fail` (0 listed as open), 0 `not-applicable`.
 
 | Expectation | MQTT | Statement | Requires | mqttiumd | Observed on mqttiumd | Mosquitto |
 | - | - | - | - | - | - | - |
-| `errors/packet-at-announced-maximum-v5#limit` | 5.0 | MQTT-4.13.1-1, with section 3.2.2.3.6: a packet larger than the announced Maximum Packet Size is a Protocol Error with the Reason Code 0x95 | Where CONNACK announces Maximum Packet Size 32776: a PUBLISH of exactly that size is acknowledged, and one a byte larger is answered DISCONNECT 0x95 and the connection is closed | pass | connack: recv [CONNACK reason=0x00 maximum_packet_size=32776] ok; exact: recv [PUBACK packet_id=1 reason=0x10] ok; over: until_close [DISCONNECT reason=0x95] eof | fail |
+| `errors/packet-at-announced-maximum-v5#limit` | 5.0 | MQTT-4.13.1-1, with section 3.2.2.3.6: a packet larger than the announced Maximum Packet Size is a Protocol Error with the Reason Code 0x95 | Where CONNACK announces Maximum Packet Size 1048584: a PUBLISH of exactly that size is acknowledged, and one a byte larger is answered DISCONNECT 0x95 and the connection is closed | pass | connack: recv [CONNACK reason=0x00 maximum_packet_size=1048584] ok; exact: recv [PUBACK packet_id=1 reason=0x10] ok; over: until_close [DISCONNECT reason=0x95] eof | fail |
 | `publish/over-maximum-packet-size-qos1-v5#discarded` | 5.0 | MQTT-3.1.2-25, with MQTT-3.1.2-24 for the size of what is sent | Nothing is sent for the message that would take 114 bytes and the connection stays open; the next message is delivered in a packet of at most 64 bytes, and nothing follows it | pass | large: quiet [] quiet; small: recv [PUBLISH packet_id=1 dup=false payload="small" topic="limit/t" wire_bytes=19] ok; after-small: quiet [] quiet | pass |
 | `publish/over-maximum-packet-size-qos1-v5#not-redelivered` | 5.0 | MQTT-3.1.2-25, with MQTT-3.2.2-3 for Session Present | The resumed session (Session Present 1), which now accepts 1024 bytes, is sent nothing for the discarded message: the first PUBLISH it reads is a new message, with DUP 0 | pass | resumed: recv [CONNACK reason=0x00 session_present=true] ok; no-redelivery: quiet [] quiet; next: recv [PUBLISH packet_id=1 dup=false payload="next" topic="limit/t"] ok | pass |
 | `publish/over-maximum-packet-size-qos2-v5#discarded` | 5.0 | MQTT-3.1.2-25, with MQTT-3.1.2-24 for the size of what is sent | Nothing is sent for the message that would take 114 bytes and the connection stays open; the next message is delivered in a packet of at most 64 bytes, and nothing follows it | pass | large: quiet [] quiet; small: recv [PUBLISH packet_id=1 dup=false payload="small" topic="limit/t" wire_bytes=19] ok; after-small: quiet [] quiet | pass |
 | `publish/over-maximum-packet-size-qos2-v5#not-redelivered` | 5.0 | MQTT-3.1.2-25, with MQTT-3.2.2-3 for Session Present | The resumed session (Session Present 1), which now accepts 1024 bytes, is sent nothing for the discarded message: the first PUBLISH it reads is a new message, with DUP 0 | pass | resumed: recv [CONNACK reason=0x00 session_present=true] ok; no-redelivery: quiet [] quiet; next: recv [PUBLISH packet_id=1 dup=false payload="next" topic="limit/t"] ok | pass |
-| `retained/forty-topics-qos1-v4#store` | 3.1.1 | MQTT-3.3.1-6, with MQTT-3.3.1-5 for the store and MQTT-3.3.1-8 for the RETAIN flag | The SUBACK and the 40 retained messages, one for each topic, with its payload and RETAIN 1, each once and in any order; then nothing | fail (open) | retained: drain [33 packets: 1 SUBACK, 32 PUBLISH] idle; after: quiet [] quiet | pass |
+| `retained/forty-topics-qos1-v4#store` | 3.1.1 | MQTT-3.3.1-6, with MQTT-3.3.1-5 for the store and MQTT-3.3.1-8 for the RETAIN flag | The SUBACK and the 40 retained messages, one for each topic, with its payload and RETAIN 1, each once and in any order; then nothing | pass | retained: drain [41 packets: 1 SUBACK, 40 PUBLISH] ok; after: quiet [] quiet | pass |
 | `retained/thirty-two-topics-qos1-v4#store` | 3.1.1 | MQTT-3.3.1-6, with MQTT-3.3.1-5 for the store and MQTT-3.3.1-8 for the RETAIN flag | The SUBACK and the 32 retained messages, one for each topic, with its payload and RETAIN 1, each once and in any order; then nothing | pass | retained: drain [33 packets: 1 SUBACK, 32 PUBLISH] ok; after: quiet [] quiet | pass |
 | `subscribe/many-filters-effective-v4#granted` | 3.1.1 | MQTT-3.8.4-4: the responses of the sequence are combined into a single SUBACK | One SUBACK with twelve codes, each the grant of QoS 0 that a SUBSCRIBE of that filter alone receives | pass | answer: recv [SUBACK packet_id=1 codes=0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00] ok | pass |
 | `subscribe/many-filters-effective-v4#effective` | 3.1.1 | MQTT-3.8.4-4: every filter is handled as a SUBSCRIBE of its own | The twelfth filter is a subscription: the message published on it is delivered | pass | delivered: recv [PUBLISH payload="twelfth" topic="eff/11"] ok | pass |
@@ -74,9 +74,9 @@ this run and may differ in the next: where a broker may lawfully shed messages
 
 | Scenario | Connection | Counted | Named | Mosquitto | mqttiumd |
 | - | - | - | -: | -: | -: |
-| `publish/burst-qos0-v4` | sub | PUBLISH | 100 | 100 | 14 |
+| `publish/burst-qos0-v4` | sub | PUBLISH | 100 | 100 | 100 |
 | `publish/pipelined-qos1-v4` | pub | PUBACK | 20 | 20 | 20 |
-| `retained/forty-topics-v4` | sub | PUBLISH | 40 | 40 | 32 |
+| `retained/forty-topics-v4` | sub | PUBLISH | 40 | 40 | 40 |
 
 ## Scenarios
 
@@ -88,7 +88,7 @@ this run and may differ in the next: where a broker may lawfully shed messages
 | `connect/clean-start-discards-session-v4` | 3.1.1 | same | Clean Session 1 discards a kept session: Session Present 0, the old subscription no longer routes, and nothing is left for a later resume. |
 | `connect/clean-start-v4` | 3.1.1 | same | A first CONNECT with Clean Session/Clean Start 1 is accepted with Session Present 0. |
 | `connect/clean-start-v5` | 5.0 | same | A first CONNECT with Clean Session/Clean Start 1 is accepted with Session Present 0. |
-| `connect/connack-capabilities-v5` | 5.0 | profile-refused | Mosquitto announces Receive Maximum 20 and Topic Alias Maximum 10 and leaves every other capability at its default; mqttiumd announces Receive Maximum 8, Maximum Packet Size 32 776, Topic Alias Maximum 0, and shared subscriptions and Subscription Identifiers not available. |
+| `connect/connack-capabilities-v5` | 5.0 | profile-refused | Mosquitto announces Receive Maximum 20 and Topic Alias Maximum 10 and leaves every other capability at its default; mqttiumd announces Receive Maximum 8, Maximum Packet Size 1 048 584, Topic Alias Maximum 0, and shared subscriptions and Subscription Identifiers not available. |
 | `connect/disconnect-v4` | 3.1.1 | same | After DISCONNECT the broker closes the network connection without sending anything. |
 | `connect/disconnect-v5` | 5.0 | same | After DISCONNECT the broker closes the network connection without sending anything. |
 | `connect/duplicate-connect-v4` | 3.1.1 | same | A second CONNECT on an established connection is a protocol violation: the connection is closed. |
@@ -110,20 +110,20 @@ this run and may differ in the next: where a broker may lawfully shed messages
 | `connect/username-password-v5` | 5.0 | profile-refused | Mosquitto, which accepts anonymous clients here, accepts a CONNECT with User Name and Password; mqttiumd refuses any credentials with CONNACK 0x83 (Implementation specific error) and closes. |
 | `errors/malformed-remaining-length-v4` | 3.1.1 | same | A fixed header whose Remaining Length runs over a fifth byte: the connection is closed. |
 | `errors/malformed-remaining-length-v5` | 5.0 | unspecified | Both close the connection on a Remaining Length of five bytes; Mosquitto without a packet, mqttiumd after DISCONNECT 0x81 (Malformed Packet). |
-| `errors/oversized-packet-v4` | 3.1.1 | profile-refused | Mosquitto, whose default limit is the protocol maximum, acknowledges a 70 000-byte PUBLISH; mqttiumd accepts packets up to 65 536 bytes and closes the connection. |
-| `errors/oversized-packet-v5` | 5.0 | profile-refused | Mosquitto, whose default limit is the protocol maximum, acknowledges a 70 000-byte PUBLISH; mqttiumd announced Maximum Packet Size 32 776, reads frames up to 65 536 bytes, and answers DISCONNECT 0x95 (Packet too large) before closing. |
-| `errors/packet-at-announced-maximum-v5` | 5.0 | reference-nonconformant | Both acknowledge a PUBLISH of exactly the announced 32 776 bytes with Reason Code 0x10 (No matching subscribers). Mosquitto also acknowledges the next one, of 32 777 bytes, and keeps the connection; mqttiumd answers DISCONNECT 0x95 (Packet too large) and closes. |
-| `errors/packet-over-announced-maximum-v5` | 5.0 | same | Both brokers announce Maximum Packet Size 32 776 (the reference by `max_packet_size 32776`) and the client sends a PUBLISH of 70 000 bytes. Both answer DISCONNECT 0x95. The reference then closes with the rest of the packet unread, which resets the connection; mqttiumd reads and drops it and ends the stream. How the connection ends after the DISCONNECT is outside the protocol and depends on what was still in flight: the closure is compared as `any`. |
+| `errors/oversized-packet-v4` | 3.1.1 | same | A QoS 1 PUBLISH of 70 000 bytes with each broker's default limits: both brokers accept it within their advertised packet limits. |
+| `errors/oversized-packet-v5` | 5.0 | same | A QoS 1 PUBLISH of 70 000 bytes with each broker's default limits: both brokers accept it within their advertised packet limits. |
+| `errors/packet-at-announced-maximum-v5` | 5.0 | reference-nonconformant | Both acknowledge a PUBLISH of exactly the announced 1 048 584 bytes with Reason Code 0x10 (No matching subscribers). Mosquitto also acknowledges the next one, of 1 048 585 bytes, and keeps the connection; mqttiumd answers DISCONNECT 0x95 (Packet too large) and closes. |
+| `errors/packet-over-announced-maximum-v5` | 5.0 | same | Both brokers announce Maximum Packet Size 1048584 (the reference by `max_packet_size 1048584`) and the client sends a PUBLISH of 1 150 000 bytes. Both answer DISCONNECT 0x95. The reference then closes with the rest of the packet unread, which resets the connection; mqttiumd reads and drops it and ends the stream. How the connection ends after the DISCONNECT is outside the protocol and depends on what was still in flight: the closure is compared as `any`. |
 | `properties/client-maximum-packet-size-v5` | 5.0 | same | The subscriber announces Maximum Packet Size 40: a PUBLISH that would exceed it is not sent to it, and a smaller one is. |
-| `properties/content-type-v5` | 5.0 | profile-refused | Mosquitto acknowledges the PUBLISH and forwards the Content Type to the subscriber; mqttiumd answers the PUBLISH with DISCONNECT 0x83 (Implementation specific error), closes the publisher's connection and delivers nothing. |
+| `properties/content-type-v5` | 5.0 | same | The Content Type of a PUBLISH is forwarded unaltered to the subscriber. |
 | `properties/message-expiry-elapsed-queued-v5` | 5.0 | same | A QoS 1 message with Message Expiry Interval 1 queued for an offline session is not delivered when the session reconnects 2.5 s later; one without expiry is. |
 | `properties/message-expiry-elapsed-retained-v5` | 5.0 | same | A retained message with Message Expiry Interval 1 is not sent to a subscription made 2.5 s later. |
 | `properties/message-expiry-forwarded-v5` | 5.0 | same | A PUBLISH with Message Expiry Interval 600 is forwarded at once with the property set to the remaining lifetime (compared as the interval 591..600). |
-| `properties/payload-format-indicator-v5` | 5.0 | profile-refused | Mosquitto acknowledges the PUBLISH and forwards the Payload Format Indicator to the subscriber; mqttiumd answers the PUBLISH with DISCONNECT 0x83 (Implementation specific error), closes the publisher's connection and delivers nothing. |
-| `properties/response-topic-v5` | 5.0 | profile-refused | Mosquitto acknowledges the PUBLISH and forwards Response Topic and Correlation Data to the subscriber; mqttiumd answers the PUBLISH with DISCONNECT 0x83 (Implementation specific error), closes the publisher's connection and delivers nothing. |
+| `properties/payload-format-indicator-v5` | 5.0 | same | Payload Format Indicator 1 on a UTF-8 payload is forwarded unaltered to the subscriber. |
+| `properties/response-topic-v5` | 5.0 | same | Response Topic and Correlation Data of a PUBLISH are forwarded unaltered to the subscriber. |
 | `properties/topic-alias-v5` | 5.0 | profile-refused | Mosquitto (Topic Alias Maximum 10) resolves the alias and delivers both messages; mqttiumd (Topic Alias Maximum 0) answers the first PUBLISH with DISCONNECT 0x94 (Topic Alias invalid) and closes. |
-| `properties/user-properties-v5` | 5.0 | profile-refused | Mosquitto acknowledges the PUBLISH and forwards the User Properties to the subscriber in their order; mqttiumd answers the PUBLISH with DISCONNECT 0x83 (Implementation specific error), closes the publisher's connection and delivers nothing. |
-| `publish/burst-qos0-v4` | 3.1.1 | profile-refused | Mosquitto delivers all one hundred QoS 0 messages written at once to an online subscriber; mqttiumd delivers fewer (between 4 and 52 in the runs read), in the order sent, and drops the others silently. |
+| `properties/user-properties-v5` | 5.0 | same | User Properties of a PUBLISH are forwarded to the subscriber, repeated names included, in order. |
+| `publish/burst-qos0-v4` | 3.1.1 | same | One hundred QoS 0 messages written at once reach an online QoS 0 subscriber; the transcript keeps whether all came and whether those that came are in the order sent, not how many. |
 | `publish/cross-version-v5-to-v4` | 3.1.1 + 5.0 | same | A MQTT 5 publisher sets Message Expiry Interval and a MQTT 3.1.1 subscriber receives the message, without any property. |
 | `publish/duplicate-qos1-publish-v4` | 3.1.1 | same | A QoS 1 PUBLISH is sent again with DUP 1 and the same Packet Identifier after its PUBACK: it is a new publication, acknowledged and delivered again, and DUP is not propagated to the subscriber. |
 | `publish/duplicate-qos2-publish-v4` | 3.1.1 | same | A QoS 2 PUBLISH is sent again with DUP 1 before PUBREL: it is acknowledged again and the subscriber still receives one message. |
@@ -131,7 +131,7 @@ this run and may differ in the next: where a broker may lawfully shed messages
 | `publish/no-matching-subscribers-v5` | 5.0 | same | A QoS 1 and a QoS 2 PUBLISH that match no subscription: the Reason Codes of PUBACK and PUBREC. |
 | `publish/over-maximum-packet-size-qos1-v5` | 5.0 | same | A subscriber with a kept session announces Maximum Packet Size 64 and subscribes at QoS 1. A message of 100 bytes published at QoS 1, which would take 114 bytes on the wire, is accepted from its publisher and not sent to the subscriber, whose connection stays open; the next message, which fits, is delivered and acknowledged. The session then resumes with Maximum Packet Size 1024: nothing is redelivered, and the first PUBLISH it reads is a new message. |
 | `publish/over-maximum-packet-size-qos2-v5` | 5.0 | same | A subscriber with a kept session announces Maximum Packet Size 64 and subscribes at QoS 2. A message of 100 bytes published at QoS 2, which would take 114 bytes on the wire, is accepted from its publisher and not sent to the subscriber, whose connection stays open; the next message, which fits, is delivered and acknowledged. The session then resumes with Maximum Packet Size 1024: nothing is redelivered, and the first PUBLISH it reads is a new message. |
-| `publish/payload-40000-bytes-v5` | 5.0 | profile-refused | Mosquitto acknowledges and delivers a 40 000-byte message; mqttiumd announced Maximum Packet Size 32 776, which follows its payload limit of 32 768 bytes, and answers DISCONNECT 0x95 (Packet too large). |
+| `publish/payload-40000-bytes-v5` | 5.0 | same | A QoS 1 PUBLISH with a 40 000-byte payload, below the Maximum Packet Size either broker announces, is acknowledged and delivered. |
 | `publish/pipelined-qos1-v4` | 3.1.1 | same | A MQTT 3.1.1 client writes twenty QoS 1 PUBLISH packets at once, before reading any PUBACK: MQTT 3.1.1 has no Receive Maximum, and all twenty are acknowledged, in the order of the PUBLISH packets (the transcript keeps whether all PUBACK came and whether their Packet Identifiers came as sent, not how many). |
 | `publish/pubrel-retransmit-v4` | 3.1.1 | same | PUBREL is sent again after the QoS 2 exchange completed: it is answered by PUBCOMP again and the message is not delivered a second time. |
 | `publish/pubrel-retransmit-v5` | 5.0 | unspecified | For a PUBREL whose Packet Identifier is no longer known, Mosquitto answers PUBCOMP 0x00 (Success) and mqttiumd PUBCOMP 0x92 (Packet Identifier not found). |
@@ -148,8 +148,8 @@ this run and may differ in the next: where a broker may lawfully shed messages
 | `publish/topic-with-wildcard-v4` | 3.1.1 | same | A PUBLISH whose Topic Name contains the wildcard `#`: the connection is closed. |
 | `publish/topic-with-wildcard-v5` | 5.0 | unspecified | Both close the connection on a Topic Name with a wildcard; Mosquitto with DISCONNECT 0x81 (Malformed Packet), mqttiumd with DISCONNECT 0x90 (Topic Name invalid). |
 | `retained/clear-v4` | 3.1.1 | same | A retained message with a zero-length payload removes the retained message of its topic: a new subscriber receives nothing. |
-| `retained/forty-topics-qos1-v4` | 3.1.1 | profile-refused | Mosquitto keeps forty retained messages and sends them all to a new subscription at QoS 1; mqttiumd keeps thirty-two, closes the publisher's connection on the thirty-third and sends those thirty-two, each once. |
-| `retained/forty-topics-v4` | 3.1.1 | profile-refused | Mosquitto acknowledges forty retained publications; mqttiumd acknowledges thirty-two and closes the publisher's connection on the thirty-third. The messages that reach the subscription at QoS 0 compare equal (each one of the forty, none twice); how many reach it is measured and not compared: forty from Mosquitto, between 13 and 32 from mqttiumd in the runs read. |
+| `retained/forty-topics-qos1-v4` | 3.1.1 | same | The content of the retained store: forty topics each keep a retained message (forty is more than the bounded profile of mqttiumd keeps), and a `forty/#` subscription made afterwards at QoS 1 acknowledges every delivery. Each message is owed once, with RETAIN 1, in any order, and nothing after. |
+| `retained/forty-topics-v4` | 3.1.1 | same | QoS 0 deliveries of retained messages: forty topics each keep a retained message and a `forty/#` subscription is made afterwards at QoS 0. A broker may shed QoS 0 deliveries for a subscriber it cannot write to fast enough: each message that comes is one of the forty and comes once; how many come is measured, not compared. |
 | `retained/live-delivery-clears-retain-flag-v4` | 3.1.1 | same | A message published with RETAIN 1 reaches an already established subscription with RETAIN 0. |
 | `retained/qos-downgrade-v4` | 3.1.1 | same | A message retained at QoS 2 is sent to a subscription granted QoS 1 at QoS 1, with RETAIN 1. |
 | `retained/replace-v4` | 3.1.1 | same | A second retained message on a topic replaces the first: a new subscriber receives only the second. |
@@ -177,7 +177,7 @@ this run and may differ in the next: where a broker may lawfully shed messages
 | `subscribe/invalid-hash-not-last-v5` | 5.0 | unspecified | Both close the connection on the invalid Topic Filter; Mosquitto with DISCONNECT 0x81 (Malformed Packet), mqttiumd with DISCONNECT 0x82 (Protocol Error). |
 | `subscribe/many-filters-effective-v4` | 3.1.1 | same | A SUBSCRIBE with twelve Topic Filters is handled as twelve SUBSCRIBE packets would be, with one SUBACK: every filter is granted, and a message published on the twelfth is delivered. |
 | `subscribe/many-filters-effective-v5` | 5.0 | same | A SUBSCRIBE with twelve Topic Filters is handled as twelve SUBSCRIBE packets would be, with one SUBACK: every filter is granted, and a message published on the twelfth is delivered. |
-| `subscribe/many-subscriptions-v4` | 3.1.1 | profile-refused | Mosquitto grants all 150 subscriptions; mqttiumd grants 128 and answers the other 22 with SUBACK return code 0x80 (Failure). |
+| `subscribe/many-subscriptions-v4` | 3.1.1 | same | One client makes 150 subscriptions, five Topic Filters per SUBSCRIBE packet: all are granted. |
 | `subscribe/no-local-v5` | 5.0 | same | No Local: a client does not receive its own publication and receives another client's. |
 | `subscribe/overlapping-subscriptions-v4` | 3.1.1 | same | Two subscriptions of one client, granted QoS 0 and QoS 1, match one QoS 2 message: how many copies are sent, and at which QoS. |
 | `subscribe/overlapping-subscriptions-v5` | 5.0 | unspecified | For one message matching two subscriptions of a MQTT 5 client, Mosquitto sends one copy per subscription (QoS 0 and QoS 1); mqttiumd sends one copy at the highest granted QoS. |
@@ -209,10 +209,10 @@ this run and may differ in the next: where a broker may lawfully shed messages
 | `will/retain-v5` | 5.0 | same | A QoS 1 Will with Will Retain 1 is published on abrupt close and kept as the retained message of its topic: a later subscriber receives it with RETAIN 1. |
 | `will/takeover-v5` | 5.0 | same | A client with a Will is taken over by a new connection with the same ClientID and Clean Start 1: the Will of the first connection is published. |
 
-## profile-refused (26)
+## profile-refused (15)
 
-- `connect/connack-capabilities-v5` (MQTT 5.0): Mosquitto announces Receive Maximum 20 and Topic Alias Maximum 10 and leaves every other capability at its default; mqttiumd announces Receive Maximum 8, Maximum Packet Size 32 776, Topic Alias Maximum 0, and shared subscriptions and Subscription Identifiers not available.
-  - Lot: The capabilities of the v0.1 profile: Topic Alias from client to server (Topic Alias Maximum above 0); Shared subscriptions (CMP-002); Subscription Identifiers; Receive Maximum and Maximum Packet Size of the bounded preview
+- `connect/connack-capabilities-v5` (MQTT 5.0): Mosquitto announces Receive Maximum 20 and Topic Alias Maximum 10 and leaves every other capability at its default; mqttiumd announces Receive Maximum 8, Maximum Packet Size 1 048 584, Topic Alias Maximum 0, and shared subscriptions and Subscription Identifiers not available.
+  - Lot: The capabilities of the v0.1 profile: Topic Alias from client to server (Topic Alias Maximum above 0); Shared subscriptions (CMP-002); Subscription Identifiers; Receive Maximum and Maximum Packet Size of the runtime profile
 - `connect/empty-clientid-v4` (MQTT 3.1.1): Mosquitto accepts a zero-length ClientID with Clean Session 1 (CONNACK 0); mqttiumd refuses it with return code 2 (Identifier rejected) and closes.
   - Statement: MQTT-3.1.3-6 makes accepting it optional; MQTT-3.1.3-9 is how mqttiumd refuses
   - Lot: Server-assigned Client Identifier for a zero-length ClientID
@@ -225,35 +225,9 @@ this run and may differ in the next: where a broker may lawfully shed messages
   - Lot: Authentication: user name and password checked against a password file (chapter 1, section 3, row Authentification; CFG-004, CFG-005)
 - `connect/username-password-v5` (MQTT 5.0): Mosquitto, which accepts anonymous clients here, accepts a CONNECT with User Name and Password; mqttiumd refuses any credentials with CONNACK 0x83 (Implementation specific error) and closes.
   - Lot: Authentication: user name and password checked against a password file (chapter 1, section 3, row Authentification; CFG-004, CFG-005)
-- `errors/oversized-packet-v4` (MQTT 3.1.1): Mosquitto, whose default limit is the protocol maximum, acknowledges a 70 000-byte PUBLISH; mqttiumd accepts packets up to 65 536 bytes and closes the connection.
-  - Lot: Runtime limits of the bounded preview (ADR 0044), to be raised to Mosquitto's defaults or made configurable: 65 536-byte packets
-- `errors/oversized-packet-v5` (MQTT 5.0): Mosquitto, whose default limit is the protocol maximum, acknowledges a 70 000-byte PUBLISH; mqttiumd announced Maximum Packet Size 32 776, reads frames up to 65 536 bytes, and answers DISCONNECT 0x95 (Packet too large) before closing.
-  - Lot: Runtime limits of the bounded preview (ADR 0044), to be raised to Mosquitto's defaults or made configurable: 65 536-byte packets
-- `properties/content-type-v5` (MQTT 5.0): Mosquitto acknowledges the PUBLISH and forwards the Content Type to the subscriber; mqttiumd answers the PUBLISH with DISCONNECT 0x83 (Implementation specific error), closes the publisher's connection and delivers nothing.
-  - Statement: MQTT-3.3.2-20: what the feature requires once it is supported
-  - Lot: MQTT 5 PUBLISH properties forwarded to subscribers: User Property, Payload Format Indicator, Content Type, Response Topic, Correlation Data
-- `properties/payload-format-indicator-v5` (MQTT 5.0): Mosquitto acknowledges the PUBLISH and forwards the Payload Format Indicator to the subscriber; mqttiumd answers the PUBLISH with DISCONNECT 0x83 (Implementation specific error), closes the publisher's connection and delivers nothing.
-  - Statement: MQTT-3.3.2-4: what the feature requires once it is supported
-  - Lot: MQTT 5 PUBLISH properties forwarded to subscribers: User Property, Payload Format Indicator, Content Type, Response Topic, Correlation Data
-- `properties/response-topic-v5` (MQTT 5.0): Mosquitto acknowledges the PUBLISH and forwards Response Topic and Correlation Data to the subscriber; mqttiumd answers the PUBLISH with DISCONNECT 0x83 (Implementation specific error), closes the publisher's connection and delivers nothing.
-  - Statement: MQTT-3.3.2-15 and MQTT-3.3.2-16: what the feature requires once it is supported
-  - Lot: MQTT 5 PUBLISH properties forwarded to subscribers: User Property, Payload Format Indicator, Content Type, Response Topic, Correlation Data
 - `properties/topic-alias-v5` (MQTT 5.0): Mosquitto (Topic Alias Maximum 10) resolves the alias and delivers both messages; mqttiumd (Topic Alias Maximum 0) answers the first PUBLISH with DISCONNECT 0x94 (Topic Alias invalid) and closes.
   - Statement: MQTT-3.2.2-18: with Topic Alias Maximum 0 the client is the one at fault
   - Lot: Topic Alias from client to server (Topic Alias Maximum above 0)
-- `properties/user-properties-v5` (MQTT 5.0): Mosquitto acknowledges the PUBLISH and forwards the User Properties to the subscriber in their order; mqttiumd answers the PUBLISH with DISCONNECT 0x83 (Implementation specific error), closes the publisher's connection and delivers nothing.
-  - Statement: MQTT-3.3.2-17 and MQTT-3.3.2-18: what the feature requires once it is supported
-  - Lot: MQTT 5 PUBLISH properties forwarded to subscribers: User Property, Payload Format Indicator, Content Type, Response Topic, Correlation Data
-- `publish/burst-qos0-v4` (MQTT 3.1.1): Mosquitto delivers all one hundred QoS 0 messages written at once to an online subscriber; mqttiumd delivers fewer (between 4 and 52 in the runs read), in the order sent, and drops the others silently.
-  - Lot: Runtime limits of the bounded preview (ADR 0044), to be raised to Mosquitto's defaults or made configurable: the bounded volatile path of QoS 0 messages (8 outgoing messages per connection, 32 writer slots)
-- `publish/payload-40000-bytes-v5` (MQTT 5.0): Mosquitto acknowledges and delivers a 40 000-byte message; mqttiumd announced Maximum Packet Size 32 776, which follows its payload limit of 32 768 bytes, and answers DISCONNECT 0x95 (Packet too large).
-  - Lot: Runtime limits of the bounded preview (ADR 0044), to be raised to Mosquitto's defaults or made configurable: 32 768-byte payloads
-- `retained/forty-topics-qos1-v4` (MQTT 3.1.1): Mosquitto keeps forty retained messages and sends them all to a new subscription at QoS 1; mqttiumd keeps thirty-two, closes the publisher's connection on the thirty-third and sends those thirty-two, each once.
-  - Lot: Runtime limits of the bounded preview (ADR 0044), to be raised to Mosquitto's defaults or made configurable: 32 retained topics
-- `retained/forty-topics-v4` (MQTT 3.1.1): Mosquitto acknowledges forty retained publications; mqttiumd acknowledges thirty-two and closes the publisher's connection on the thirty-third. The messages that reach the subscription at QoS 0 compare equal (each one of the forty, none twice); how many reach it is measured and not compared: forty from Mosquitto, between 13 and 32 from mqttiumd in the runs read.
-  - Lot: Runtime limits of the bounded preview (ADR 0044), to be raised to Mosquitto's defaults or made configurable: 32 retained topics; the QoS 0 deliveries mqttiumd sheds go through the bounded volatile path (4 output slots per connection)
-- `subscribe/many-subscriptions-v4` (MQTT 3.1.1): Mosquitto grants all 150 subscriptions; mqttiumd grants 128 and answers the other 22 with SUBACK return code 0x80 (Failure).
-  - Lot: Runtime limits of the bounded preview (ADR 0044), to be raised to Mosquitto's defaults or made configurable: 128 subscriptions
 - `subscribe/share-literal-filter-v4` (MQTT 3.1.1): Mosquitto, which offers shared subscriptions to MQTT 3.1.1 clients too, grants `$share/group/lit/t` at QoS 0; mqttiumd reads it as an ordinary Topic Filter of MQTT 3.1.1 and refuses to hold it: SUBACK with return code 0x80 (Failure), connection kept.
   - Statement: MQTT-3.8.4-5 allows a return code that says the subscription failed
   - Lot: Shared subscriptions (CMP-002)
@@ -277,9 +251,9 @@ this run and may differ in the next: where a broker may lawfully shed messages
 
 ## reference-nonconformant (2)
 
-- `errors/packet-at-announced-maximum-v5` (MQTT 5.0): Both acknowledge a PUBLISH of exactly the announced 32 776 bytes with Reason Code 0x10 (No matching subscribers). Mosquitto also acknowledges the next one, of 32 777 bytes, and keeps the connection; mqttiumd answers DISCONNECT 0x95 (Packet too large) and closes.
+- `errors/packet-at-announced-maximum-v5` (MQTT 5.0): Both acknowledge a PUBLISH of exactly the announced 1 048 584 bytes with Reason Code 0x10 (No matching subscribers). Mosquitto also acknowledges the next one, of 1 048 585 bytes, and keeps the connection; mqttiumd answers DISCONNECT 0x95 (Packet too large) and closes.
   - Statement: MQTT-4.13.1-1, with section 3.2.2.3.6: the size is the whole packet, and a larger one is a Protocol Error with 0x95
-  - mqttiumd: Measures the whole packet, fixed header included: acknowledges 32 776 bytes, answers 32 777 with DISCONNECT 0x95 (Packet too large) and closes the network connection.
+  - mqttiumd: Measures the whole packet, fixed header included: acknowledges 1 048 584 bytes, answers 1 048 585 with DISCONNECT 0x95 (Packet too large) and closes the network connection.
   - Decision record: 0049
 - `publish/receive-maximum-inbound-v5` (MQTT 5.0): On a ninth QoS 2 PUBLISH while eight exchanges are open, Mosquitto answers PUBREC 0x97 (Quota exceeded) and keeps the connection open; mqttiumd sends DISCONNECT 0x93 (Receive Maximum exceeded) and closes.
   - Statement: MQTT-4.13.1-1, with section 3.3.4: a client that exceeds Receive Maximum (MQTT-3.3.4-7) makes a Protocol Error for which the Reason Code 0x93 is given, so the server must close the connection

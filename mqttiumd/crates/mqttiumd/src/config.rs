@@ -112,13 +112,26 @@ pub struct ParsedConfig {
 }
 
 impl ParsedConfig {
-    /// Finalizes into a runnable [`Config`], requiring explicit `--db` and
-    /// `--events` either from the configuration file or CLI overrides.
+    /// Finalizes into a runnable [`Config`], requiring `--db` when disk
+    /// storage or snapshotting is active and `--events` either from the
+    /// configuration file or CLI overrides.
     pub fn into_runtime_config(self, hooks: Hooks) -> Result<Config, String> {
-        Ok(Config {
-            db: self.db.ok_or_else(|| {
+        let needs_db = matches!(
+            self.storage_mode,
+            StorageMode::Durable
+                | StorageMode::Volatile {
+                    snapshot_interval: Some(_),
+                }
+        ) || self.require_existing_db;
+        let db = if needs_db {
+            self.db.ok_or_else(|| {
                 "database path missing (set persistence_location/mqttiumd_db or --db)".to_owned()
-            })?,
+            })?
+        } else {
+            self.db.unwrap_or_default()
+        };
+        Ok(Config {
+            db,
             require_existing_db: self.require_existing_db,
             storage_mode: self.storage_mode,
             listen: self.listen,
@@ -428,9 +441,13 @@ fn parse_file(acc: &mut Accumulator, path: &Path, depth: usize) -> Result<(), St
                     );
                     continue;
                 };
-                let ip = if let Some(addr_str) = tokens.get(1) {
+                let (ip, status, reason) = if let Some(addr_str) = tokens.get(1) {
                     match addr_str.parse::<IpAddr>() {
-                        Ok(ip) => ip,
+                        Ok(ip) => (
+                            ip,
+                            DirectiveStatus::Equivalent,
+                            format!("single TCP listener on {ip}:{port}"),
+                        ),
                         Err(_) => {
                             acc.record(
                                 path,
@@ -443,17 +460,17 @@ fn parse_file(acc: &mut Accumulator, path: &Path, depth: usize) -> Result<(), St
                         }
                     }
                 } else {
-                    IpAddr::V4(Ipv4Addr::LOCALHOST)
+                    (
+                        IpAddr::V4(Ipv4Addr::LOCALHOST),
+                        DirectiveStatus::Translated,
+                        format!(
+                            "single TCP listener on 127.0.0.1:{port} (omitted bind IP narrowed to loopback; specify explicit bind IP for non-loopback TLS)"
+                        ),
+                    )
                 };
                 acc.listener_set = true;
                 acc.listen = Some(SocketAddr::new(ip, port));
-                acc.record(
-                    path,
-                    line_no,
-                    directive,
-                    DirectiveStatus::Equivalent,
-                    format!("single TCP listener on {ip}:{port}"),
-                );
+                acc.record(path, line_no, directive, status, reason);
             }
             "port" => {
                 if acc.listener_set {
@@ -670,7 +687,7 @@ fn parse_file(acc: &mut Accumulator, path: &Path, depth: usize) -> Result<(), St
                         line_no,
                         directive,
                         DirectiveStatus::Translated,
-                        "DUR-001: mapped to Volatile in-memory mode with no disk durability",
+                        "DUR-001: mapped to pure in-memory Volatile mode (no disk reads, no snapshots; ignores `autosave_interval` and existing DB files)",
                     );
                 }
                 None => acc.record(
@@ -723,7 +740,7 @@ fn parse_file(acc: &mut Accumulator, path: &Path, depth: usize) -> Result<(), St
                         line_no,
                         directive,
                         DirectiveStatus::Translated,
-                        "CFG-006: not a proven loss bound; ignored in Durable mode (which commits per transaction) and mapped to periodic atomic SQLite snapshot interval in Volatile mode",
+                        "CFG-006: not a proven loss bound; inactive when `persistence false`, ignored in Durable mode (which commits per transaction), and mapped to periodic atomic SQLite snapshot interval when `mqttiumd_storage_mode volatile` is enabled without `persistence false`",
                     );
                 }
                 _ => acc.record(
@@ -1118,6 +1135,9 @@ pub fn check_file(path: &Path) -> Result<(ConfigReport, Option<ParsedConfig>), S
         || acc.identities.is_some()
         || acc.require_certificate.is_some();
 
+    let explicit_listener =
+        acc.listener_set || acc.legacy_port.is_some() || acc.legacy_bind.is_some();
+
     let tls = if any_tls {
         if acc.allow_anonymous == Some(true) {
             acc.errors.push(
@@ -1155,6 +1175,11 @@ pub fn check_file(path: &Path) -> Result<(ConfigReport, Option<ParsedConfig>), S
                 "CFG-002: `allow_anonymous false` requires TLS 1.3 mTLS (`certfile`, `keyfile`, `cafile`, `require_certificate true`, `mqttiumd_identities`)"
                     .to_owned(),
             );
+        } else if explicit_listener && acc.allow_anonymous.is_none() {
+            acc.errors.push(
+                "SEC-005/CFG-002: explicit listener defaults to `allow_anonymous false`; set explicit `allow_anonymous true` on loopback or configure TLS 1.3 mTLS (`certfile`, `keyfile`, `cafile`, `require_certificate true`, `mqttiumd_identities`)"
+                    .to_owned(),
+            );
         }
         if !listen.ip().is_loopback() {
             acc.errors.push(format!(
@@ -1166,8 +1191,15 @@ pub fn check_file(path: &Path) -> Result<(ConfigReport, Option<ParsedConfig>), S
     };
 
     // Resolve storage mode (CFG-006, DUR-001, DUR-002).
-    let storage_mode = match acc.explicit_storage_mode.as_deref() {
-        Some("durable") => {
+    let storage_mode = match (acc.explicit_storage_mode.as_deref(), acc.persistence) {
+        (Some("durable"), Some(false)) => {
+            acc.errors.push(
+                "CFG-006: `persistence false` conflicts with `mqttiumd_storage_mode durable`"
+                    .to_owned(),
+            );
+            StorageMode::Durable
+        }
+        (Some("durable"), _) | (None, None | Some(true)) => {
             if acc.explicit_snapshot_interval.is_some() {
                 acc.errors.push(
                     "mqttiumd_snapshot_interval requires `mqttiumd_storage_mode volatile`"
@@ -1176,7 +1208,24 @@ pub fn check_file(path: &Path) -> Result<(ConfigReport, Option<ParsedConfig>), S
             }
             StorageMode::Durable
         }
-        Some("volatile") => {
+        (_, Some(false)) => {
+            if acc.explicit_snapshot_interval.is_some_and(|secs| secs > 0) {
+                acc.errors.push(
+                    "CFG-006: `persistence false` disables disk persistence and conflicts with non-zero `mqttiumd_snapshot_interval`"
+                        .to_owned(),
+                );
+            }
+            if acc.require_existing_db {
+                acc.errors.push(
+                    "CFG-006: `persistence false` disables disk persistence and conflicts with `mqttiumd_existing_db true`"
+                        .to_owned(),
+                );
+            }
+            StorageMode::Volatile {
+                snapshot_interval: None,
+            }
+        }
+        (Some("volatile"), _) => {
             let secs = acc.explicit_snapshot_interval.or(acc.autosave_interval);
             let snapshot_interval = match secs {
                 None | Some(0) => None,
@@ -1184,26 +1233,7 @@ pub fn check_file(path: &Path) -> Result<(ConfigReport, Option<ParsedConfig>), S
             };
             StorageMode::Volatile { snapshot_interval }
         }
-        None => match acc.persistence {
-            None | Some(true) => {
-                if acc.explicit_snapshot_interval.is_some() {
-                    acc.errors.push(
-                        "mqttiumd_snapshot_interval requires volatile mode (`persistence false` or `mqttiumd_storage_mode volatile`)"
-                            .to_owned(),
-                    );
-                }
-                StorageMode::Durable
-            }
-            Some(false) => {
-                let secs = acc.explicit_snapshot_interval.or(acc.autosave_interval);
-                let snapshot_interval = match secs {
-                    None | Some(0) => None,
-                    Some(n) => Some(Duration::from_secs(n)),
-                };
-                StorageMode::Volatile { snapshot_interval }
-            }
-        },
-        Some(_) => StorageMode::Durable,
+        (Some(_), _) => StorageMode::Durable,
     };
 
     // Resolve database path.
@@ -1369,6 +1399,79 @@ mqttiumd_io_threads 4
                 >= 2
         );
 
+        // 5. Explicit listener without allow_anonymous defaults to anonymous disabled (Mosquitto 2.x / SEC-005).
+        let implicit_anon = dir.join("implicit_anon.conf");
+        fs::write(&implicit_anon, "listener 1883 127.0.0.1\n").unwrap();
+        let (rep, parsed) = check_file(&implicit_anon).unwrap();
+        assert!(
+            !rep.ok,
+            "explicit listener without allow_anonymous must be refused"
+        );
+        assert!(parsed.is_none());
+
+        // 6. Legacy port without allow_anonymous is likewise refused.
+        let legacy_implicit = dir.join("legacy_implicit.conf");
+        fs::write(&legacy_implicit, "port 1883\n").unwrap();
+        let (rep, parsed) = check_file(&legacy_implicit).unwrap();
+        assert!(!rep.ok);
+        assert!(parsed.is_none());
+
+        // 7. Contradictions with `persistence false` are refused.
+        for (name, body) in [
+            (
+                "pf_durable.conf",
+                "listener 1883 127.0.0.1\nallow_anonymous true\npersistence false\nmqttiumd_storage_mode durable\n",
+            ),
+            (
+                "pf_snap.conf",
+                "listener 1883 127.0.0.1\nallow_anonymous true\npersistence false\nmqttiumd_snapshot_interval 15\n",
+            ),
+            (
+                "pf_existing.conf",
+                "listener 1883 127.0.0.1\nallow_anonymous true\npersistence false\nmqttiumd_existing_db true\n",
+            ),
+        ] {
+            let p = dir.join(name);
+            fs::write(&p, body).unwrap();
+            let (rep, parsed) = check_file(&p).unwrap();
+            assert!(!rep.ok, "{name} must be refused");
+            assert!(parsed.is_none());
+        }
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn persistence_false_ignores_autosave_interval_and_requires_no_db_path() {
+        let dir = temp_dir("pf-autosave");
+        let conf = dir.join("mosquitto.conf");
+        fs::write(
+            &conf,
+            "\
+listener 1886 127.0.0.1
+allow_anonymous true
+persistence false
+autosave_interval 30
+log_dest file ./events.jsonl
+",
+        )
+        .unwrap();
+        let (rep, parsed) = check_file(&conf).unwrap();
+        assert!(rep.ok, "errors: {:?}", rep.errors);
+        let parsed = parsed.unwrap();
+        assert_eq!(
+            parsed.storage_mode,
+            StorageMode::Volatile {
+                snapshot_interval: None
+            }
+        );
+        let runtime_cfg = parsed.into_runtime_config(Hooks::default()).unwrap();
+        assert_eq!(
+            runtime_cfg.storage_mode,
+            StorageMode::Volatile {
+                snapshot_interval: None
+            }
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -1379,7 +1482,7 @@ mqttiumd_io_threads 4
         fs::create_dir_all(&inc).unwrap();
         fs::write(
             inc.join("01-base.conf"),
-            "persistence false\nautosave_interval 15\n",
+            "mqttiumd_storage_mode volatile\nautosave_interval 15\n",
         )
         .unwrap();
         fs::write(

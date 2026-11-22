@@ -1,10 +1,9 @@
 diff --git a/mqttiumd/crates/mqttiumd-core/src/owner.rs b/mqttiumd/crates/mqttiumd-core/src/owner.rs
-index 2f882bc..26566d1 100644
 --- a/mqttiumd/crates/mqttiumd-core/src/owner.rs
 +++ b/mqttiumd/crates/mqttiumd-core/src/owner.rs
-@@ -1394,6 +1394,19 @@ impl Owner {
-                 .is_some_and(|held| held.operation == operation)
-         });
+@@ -2653,6 +2653,19 @@ impl Owner {
+         let slots = self.slots.as_slice();
+         let waiting = self.slot_by_op.get(&operation).copied();
          let Some(index) = waiting else {
 +            // MUTANT M5: a late unknown answer acknowledges the exchange again.
 +            if let StoreReply::Outcome(StoreOutcome::PendingOrUnknown) = reply

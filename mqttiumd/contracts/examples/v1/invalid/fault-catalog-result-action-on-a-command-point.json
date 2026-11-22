@@ -3,6 +3,8 @@
   "schema_version": 1,
   "command_kinds": [
     "AdmitPublication",
+    "RetainedPublication",
+    "AnnotatedPublication",
     "ReleaseInbound"
   ],
   "points": [

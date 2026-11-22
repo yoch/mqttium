@@ -168,6 +168,10 @@ impl RouteIndex {
         self.wildcard_count > 0
     }
 
+    pub(super) fn wildcard_count(&self) -> usize {
+        self.wildcard_count
+    }
+
     pub(super) fn insert(&mut self, index: usize, route: &Route) {
         let bytes = route.topic.as_slice();
         if bytes.contains(&b'+') || bytes.contains(&b'#') {
@@ -460,15 +464,17 @@ impl Owner {
         {
             return 0;
         }
-        // Indexed exact lookup plus optional bounded wildcard trie walk,
-        // per-target O(log S) session verification and O(T log T) canonical
-        // sort (ADR 0051).
+        // Indexed exact lookup plus bounded wildcard trie walk (which may visit
+        // up to `wildcard_count` overlapping filters that deduplicate onto a
+        // single subscriber), per-target O(log S) session verification, and
+        // O(T log T) canonical sort (ADR 0051).
         let targets = self
             .limits
             .map_or(0, |limits| {
                 u64::from(limits.max_targets).min(MAX_TARGETS as u64)
             })
             .min(capacity_of(self.routes.capacity()));
+        let wildcard_work = capacity_of(self.route_index.wildcard_count()).saturating_mul(2);
         let per_target = if self.route_index.has_wildcards() {
             16
         } else {
@@ -476,6 +482,7 @@ impl Owner {
         };
         targets
             .saturating_mul(per_target)
+            .saturating_add(wildcard_work)
             .saturating_add(capacity_of(self.routes.capacity()).min(16))
     }
 }
@@ -1408,5 +1415,122 @@ mod tests {
                 .err(),
             Some(Refusal::Capacity)
         );
+    }
+
+    #[test]
+    fn routing_work_bound_accounts_for_many_wildcard_filters_matching_one_subscriber() {
+        // Generate 64 distinct 6-level wildcard filters matching `a/b/c/d/e/f`
+        // (every non-exact combination of exact level vs `+` plus `#` prefixes),
+        // all belonging to a SINGLE subscriber (session 2) while `max_targets = 1`.
+        let levels = ["a", "b", "c", "d", "e", "f"];
+        let mut wildcard_routes = Vec::new();
+        for mask in 1u32..64 {
+            let filter: alloc::string::String = levels
+                .iter()
+                .enumerate()
+                .map(|(i, lvl)| if (mask & (1 << i)) != 0 { "+" } else { *lvl })
+                .collect::<Vec<_>>()
+                .join("/");
+            wildcard_routes.push(route(
+                filter.as_bytes(),
+                2,
+                if mask == 63 {
+                    Qos::AtLeastOnce
+                } else {
+                    Qos::AtMostOnce
+                },
+                false,
+            ));
+        }
+        wildcard_routes.push(route(b"#", 2, Qos::AtMostOnce, false));
+        assert_eq!(wildcard_routes.len(), 64);
+
+        let exact_only = [route(b"a/b/c/d/e/f", 2, Qos::AtLeastOnce, false)];
+
+        let mut owner_exact = bounded_owner(&exact_only, 2);
+        let mut owner_wild = bounded_owner(&wildcard_routes, 2);
+        // Set max_targets = 1 on both owners so destination count alone is 1.
+        owner_exact.limits.as_mut().unwrap().max_targets = 1;
+        owner_wild.limits.as_mut().unwrap().max_targets = 1;
+
+        let make_publish = |ingress_order: u64| Input::Packet {
+            connection: ConnectionGeneration::new(1),
+            ingress_order,
+            packet: InboundPacket::Publish {
+                topic: bytes(b"a/b/c/d/e/f"),
+                qos: Qos::AtLeastOnce,
+                retain: false,
+                dup: false,
+                packet_id: Some(InboundPacketId::new(1).unwrap()),
+                expiry: None,
+                properties: None,
+                payload: bytes(b"ok"),
+            },
+        };
+
+        // Connect session 1 (publisher) on both owners.
+        for owner in [&mut owner_exact, &mut owner_wild] {
+            let _ = apply(
+                owner,
+                Input::Packet {
+                    connection: ConnectionGeneration::new(1),
+                    ingress_order: 1,
+                    packet: InboundPacket::ConnectResume {
+                        client_id: bytes(b"1"),
+                    },
+                },
+            );
+        }
+
+        let publish_probe = make_publish(2);
+        let exact_bound = owner_exact.routing_work_bound(&publish_probe);
+        let wild_bound = owner_wild.routing_work_bound(&publish_probe);
+        assert!(
+            wild_bound >= exact_bound + 64 * 2,
+            "routing_work_bound must charge for all 64 matching wildcard filters on 1 subscriber (exact={exact_bound}, wild={wild_bound})"
+        );
+
+        // Verify select deduplicates all 64 matching filters onto 1 target.
+        let selected = owner_wild
+            .route_index
+            .select(
+                owner_wild.routes.as_slice(),
+                owner_wild.sessions.as_slice(),
+                &owner_wild.session_by_id,
+                SessionId::new(1),
+                b"a/b/c/d/e/f",
+                Qos::AtLeastOnce,
+                1,
+            )
+            .unwrap();
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected.iter().next().unwrap().session, SessionId::new(2));
+        assert_eq!(selected.iter().next().unwrap().qos, Qos::AtLeastOnce);
+
+        // Step with work_limit strictly below the wildcard bound MUST return
+        // NeedCapacity(Work) without mutating state; stepping with sufficient grant succeeds.
+        let too_small = TurnGrant {
+            work_limit: WorkUnits::new(wild_bound),
+        };
+        assert!(
+            matches!(
+                owner_wild.step(publish_probe, too_small),
+                StepOutcome::NeedCapacity {
+                    need: crate::contract::capacity::CapacityNeed {
+                        resource: crate::contract::capacity::Resource::Work,
+                        ..
+                    },
+                    ..
+                }
+            ),
+            "insufficient work budget must block before scanning 64 overlapping wildcard filters"
+        );
+        let sufficient = TurnGrant {
+            work_limit: WorkUnits::new(wild_bound + 1_000),
+        };
+        assert!(matches!(
+            owner_wild.step(make_publish(2), sufficient),
+            StepOutcome::Applied { .. }
+        ));
     }
 }

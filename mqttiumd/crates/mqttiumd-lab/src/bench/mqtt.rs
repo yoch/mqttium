@@ -131,6 +131,24 @@ fn take_string(body: &[u8], at: usize) -> Result<(&[u8], usize), &'static str> {
     Ok((bytes, at + 2 + length))
 }
 
+fn take_varint(body: &[u8], mut at: usize) -> Result<(usize, usize), &'static str> {
+    let mut value = 0usize;
+    let mut multiplier = 1usize;
+    for used in 0..4 {
+        let byte = *body.get(at).ok_or("truncated variable byte integer")?;
+        at += 1;
+        value += usize::from(byte & 0x7f) * multiplier;
+        if byte & 0x80 == 0 {
+            return Ok((value, at));
+        }
+        if used == 3 {
+            return Err("variable byte integer longer than four bytes");
+        }
+        multiplier *= 128;
+    }
+    Err("variable byte integer longer than four bytes")
+}
+
 /// A property length that is zero; the subset carries no property.
 fn no_properties(body: &[u8], at: usize) -> Result<usize, &'static str> {
     match body.get(at) {
@@ -142,7 +160,9 @@ fn no_properties(body: &[u8], at: usize) -> Result<usize, &'static str> {
 
 /// The simulated clients' side.
 pub mod peer {
-    use super::{Kind, no_properties, packet, split, string, take_u16};
+    use mqttiumd_contract::properties::PublishProperties;
+
+    use super::{Kind, no_properties, packet, remaining_length, split, string, take_u16};
 
     /// CONNECT of MQTT 5 that resumes a persistent session: Clean Start
     /// is 0, keep alive 10 seconds, no property, no Will, no credential.
@@ -166,6 +186,19 @@ pub mod peer {
         packet_id: Option<u16>,
         payload: &[u8],
     ) -> Result<Vec<u8>, &'static str> {
+        publish_with_properties(topic, qos, retain, dup, packet_id, None, payload)
+    }
+
+    /// PUBLISH carrying optional MQTT 5 application properties.
+    pub fn publish_with_properties(
+        topic: &[u8],
+        qos: u8,
+        retain: bool,
+        dup: bool,
+        packet_id: Option<u16>,
+        properties: Option<&PublishProperties>,
+        payload: &[u8],
+    ) -> Result<Vec<u8>, &'static str> {
         if qos > 2 || (qos == 0) != packet_id.is_none() {
             return Err("a Packet Identifier exactly when QoS is above 0");
         }
@@ -175,7 +208,34 @@ pub mod peer {
         if let Some(packet_id) = packet_id {
             body.extend_from_slice(&packet_id.to_be_bytes());
         }
-        body.push(0);
+        if let Some(props) = properties.filter(|p| !p.is_empty()) {
+            let mut prop_bytes = Vec::with_capacity(props.wire_len());
+            if let Some(pfi) = props.payload_format_indicator {
+                prop_bytes.push(0x01);
+                prop_bytes.push(pfi);
+            }
+            if let Some(ct) = &props.content_type {
+                prop_bytes.push(0x03);
+                string(&mut prop_bytes, ct.as_slice())?;
+            }
+            if let Some(rt) = &props.response_topic {
+                prop_bytes.push(0x08);
+                string(&mut prop_bytes, rt.as_slice())?;
+            }
+            if let Some(cd) = &props.correlation_data {
+                prop_bytes.push(0x09);
+                string(&mut prop_bytes, cd.as_slice())?;
+            }
+            for (k, v) in props.user_properties.iter() {
+                prop_bytes.push(0x26);
+                string(&mut prop_bytes, k.as_slice())?;
+                string(&mut prop_bytes, v.as_slice())?;
+            }
+            remaining_length(&mut body, prop_bytes.len())?;
+            body.extend_from_slice(&prop_bytes);
+        } else {
+            body.push(0);
+        }
         body.extend_from_slice(payload);
         packet(first, &body)
     }
@@ -249,10 +309,15 @@ pub mod peer {
 
 /// The broker's side: the connection adapter of the bench.
 pub mod transport {
+    use std::sync::Arc;
+
     use mqttiumd_contract::ids::InboundPacketId;
     use mqttiumd_contract::packet::{AckReason, InboundPacket, OutboundFrame, Qos, SharedBytes};
+    use mqttiumd_contract::properties::{
+        MAX_PROPERTY_BYTES, MAX_USER_PROPERTIES, PublishProperties,
+    };
 
-    use super::{Kind, no_properties, packet, split, take_string, take_u16};
+    use super::{Kind, no_properties, packet, split, take_string, take_u16, take_varint};
 
     /// The bounds a decoded packet is copied within.
     #[derive(Clone, Copy, Debug)]
@@ -307,8 +372,115 @@ pub mod transport {
                     at += 2;
                     Some(InboundPacketId::new(raw).ok_or("Packet Identifier 0")?)
                 };
-                let at = no_properties(body, at)?;
-                let payload = body.get(at..).ok_or("truncated PUBLISH")?;
+                let (prop_len, mut at) = take_varint(body, at)?;
+                let prop_end = at.checked_add(prop_len).ok_or("property length overflow")?;
+                if prop_end > body.len() {
+                    return Err("truncated PUBLISH properties");
+                }
+                let properties = if prop_len == 0 {
+                    None
+                } else {
+                    let mut pfi = None;
+                    let mut content_type = None;
+                    let mut response_topic = None;
+                    let mut correlation_data = None;
+                    let mut user_properties = Vec::new();
+                    while at < prop_end {
+                        let (prop_id, next) = take_varint(body, at)?;
+                        at = next;
+                        match prop_id {
+                            0x01 => {
+                                if pfi.is_some() {
+                                    return Err("duplicate Payload Format Indicator");
+                                }
+                                let v = *body
+                                    .get(at)
+                                    .filter(|_| at < prop_end)
+                                    .ok_or("truncated Payload Format Indicator")?;
+                                at += 1;
+                                pfi = Some(v);
+                            }
+                            0x03 => {
+                                if content_type.is_some() {
+                                    return Err("duplicate Content Type");
+                                }
+                                let (slice, next) = take_string(body, at)?;
+                                if next > prop_end {
+                                    return Err("truncated Content Type");
+                                }
+                                at = next;
+                                content_type = Some(
+                                    SharedBytes::copy_from(slice, MAX_PROPERTY_BYTES)
+                                        .map_err(|_| "Content Type beyond bound")?,
+                                );
+                            }
+                            0x08 => {
+                                if response_topic.is_some() {
+                                    return Err("duplicate Response Topic");
+                                }
+                                let (slice, next) = take_string(body, at)?;
+                                if next > prop_end {
+                                    return Err("truncated Response Topic");
+                                }
+                                at = next;
+                                response_topic = Some(
+                                    SharedBytes::copy_from(slice, MAX_PROPERTY_BYTES)
+                                        .map_err(|_| "Response Topic beyond bound")?,
+                                );
+                            }
+                            0x09 => {
+                                if correlation_data.is_some() {
+                                    return Err("duplicate Correlation Data");
+                                }
+                                let (slice, next) = take_string(body, at)?;
+                                if next > prop_end {
+                                    return Err("truncated Correlation Data");
+                                }
+                                at = next;
+                                correlation_data = Some(
+                                    SharedBytes::copy_from(slice, MAX_PROPERTY_BYTES)
+                                        .map_err(|_| "Correlation Data beyond bound")?,
+                                );
+                            }
+                            0x26 => {
+                                if user_properties.len() >= MAX_USER_PROPERTIES {
+                                    return Err("too many User Properties");
+                                }
+                                let (k, next_k) = take_string(body, at)?;
+                                let (v, next_v) = take_string(body, next_k)?;
+                                if next_v > prop_end {
+                                    return Err("truncated User Property");
+                                }
+                                at = next_v;
+                                let k = SharedBytes::copy_from(k, MAX_PROPERTY_BYTES)
+                                    .map_err(|_| "User Property key beyond bound")?;
+                                let v = SharedBytes::copy_from(v, MAX_PROPERTY_BYTES)
+                                    .map_err(|_| "User Property value beyond bound")?;
+                                user_properties.push((k, v));
+                            }
+                            _ => return Err("properties are outside the subset"),
+                        }
+                    }
+                    let props = PublishProperties {
+                        payload_format_indicator: pfi,
+                        content_type,
+                        response_topic,
+                        correlation_data,
+                        user_properties: Arc::from(user_properties),
+                    };
+                    props.check().map_err(|_| "invalid PUBLISH properties")?;
+                    if props.is_empty() {
+                        None
+                    } else {
+                        Some(Arc::new(props))
+                    }
+                };
+                let payload = body.get(prop_end..).ok_or("truncated PUBLISH")?;
+                if let Some(props) = &properties {
+                    props
+                        .check_payload(payload)
+                        .map_err(|_| "payload violates Payload Format Indicator")?;
+                }
                 let topic = SharedBytes::copy_from(topic, bounds.max_topic)
                     .map_err(|_| "topic beyond its bound")?;
                 let payload = SharedBytes::copy_from(payload, bounds.max_payload)
@@ -317,7 +489,7 @@ pub mod transport {
                 Ok((
                     InboundPacket::Publish {
                         expiry: None,
-                        properties: None,
+                        properties,
                         topic,
                         qos,
                         retain,
@@ -472,5 +644,49 @@ mod tests {
         assert!(transport::decode(&bytes, BOUNDS).is_err());
         assert!(transport::decode(&bytes[..3], BOUNDS).is_err());
         assert!(peer::observe(&[0x50, 0x02, 0x00]).is_err());
+    }
+
+    #[test]
+    fn annotated_publish_properties_round_trip_in_order() {
+        use std::sync::Arc;
+
+        use mqttiumd_contract::packet::SharedBytes;
+        use mqttiumd_contract::properties::{MAX_PROPERTY_BYTES, PublishProperties};
+
+        let sb = |s: &[u8]| SharedBytes::copy_from(s, MAX_PROPERTY_BYTES).unwrap();
+        let props = PublishProperties {
+            payload_format_indicator: Some(1),
+            content_type: Some(sb(b"text/plain")),
+            response_topic: Some(sb(b"replies/p1")),
+            correlation_data: Some(sb(&[0x00, 0xfe, 0x01, 0xff])),
+            user_properties: Arc::from([
+                (sb(b"trace"), sb(b"first")),
+                (sb(b"trace"), sb(b"second")),
+                (sb(b"env"), sb(b"arm64")),
+            ]),
+        };
+        let bytes = peer::publish_with_properties(
+            b"p1/example",
+            2,
+            false,
+            false,
+            Some(7),
+            Some(&props),
+            b"payload",
+        )
+        .unwrap();
+        let (packet, kind, id) = transport::decode(&bytes, BOUNDS).unwrap();
+        assert_eq!((kind, id), (Kind::Publish, Some(7)));
+        match packet {
+            InboundPacket::Publish {
+                properties: Some(decoded),
+                payload,
+                ..
+            } => {
+                assert_eq!(*decoded, props);
+                assert_eq!(payload.as_slice(), b"payload");
+            }
+            other => panic!("expected annotated PUBLISH, got {other:?}"),
+        }
     }
 }

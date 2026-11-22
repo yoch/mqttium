@@ -83,6 +83,7 @@ struct Exchange {
     retain: bool,
     packet_id: Option<u16>,
     payload: Vec<u8>,
+    properties: Option<mqttiumd_contract::properties::PublishProperties>,
 }
 
 /// What a run leaves for the campaign.
@@ -626,10 +627,19 @@ impl<B: Backend> Runner<'_, B> {
                 retain,
                 packet_id,
                 payload,
+                properties,
                 bind_exchange_as,
             } => {
-                let bytes = peer::publish(topic, *qos, *retain, false, *packet_id, payload)
-                    .map_err(Stop::new)?;
+                let bytes = peer::publish_with_properties(
+                    topic,
+                    *qos,
+                    *retain,
+                    false,
+                    *packet_id,
+                    properties.as_ref(),
+                    payload,
+                )
+                .map_err(Stop::new)?;
                 if let Some(binding) = bind_exchange_as {
                     self.exchanges.insert(
                         binding.clone(),
@@ -640,6 +650,7 @@ impl<B: Backend> Runner<'_, B> {
                             retain: *retain,
                             packet_id: *packet_id,
                             payload: payload.clone(),
+                            properties: properties.clone(),
                         },
                     );
                 }
@@ -656,12 +667,13 @@ impl<B: Backend> Runner<'_, B> {
                         "{exchange} is not an exchange of {client}"
                     )));
                 }
-                let bytes = peer::publish(
+                let bytes = peer::publish_with_properties(
                     &sent.topic,
                     sent.qos,
                     sent.retain,
                     true,
                     sent.packet_id,
+                    sent.properties.as_ref(),
                     &sent.payload,
                 )
                 .map_err(Stop::new)?;

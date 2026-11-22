@@ -99,11 +99,12 @@ pub(super) struct Delivery {
     certain_never_started: bool,
     early_puback: bool,
     early_pubrec: Option<u8>,
-    /// The preparation of this delivery's PUBREL, submitted when its PUBREC
-    /// was received: operations are numbered as they are submitted, so it
-    /// orders the PUBRECs of a subscriber. `None` for a PUBREL recovered
-    /// from an earlier run, which precedes those of this one.
-    pubrec: Option<OperationId>,
+    /// Monotone rank assigned on the first positive PUBREC observed for this
+    /// delivery, even while `StartPending` / `StartRetry` is still running
+    /// (MQTT-4.6.0-4 / MQTT-4.6.0-6). Never overwritten by later retries or
+    /// duplicate PUBRECs; `None` for a PUBREL recovered from an earlier run,
+    /// which precedes those of this run.
+    pubrec_rank: Option<u64>,
     retired: bool,
 }
 
@@ -215,7 +216,7 @@ impl Delivery {
             certain_never_started: claim.is_none(),
             early_puback: false,
             early_pubrec: None,
-            pubrec: None,
+            pubrec_rank: None,
             retired: false,
         }
     }
@@ -366,6 +367,13 @@ pub(super) struct State {
     pub(super) volatile: VolatileQueue,
     pub(super) continuation: Option<ContinuationId>,
     pub(super) continuations_started: bool,
+    next_pubrec_rank: u64,
+}
+
+#[derive(Debug)]
+pub(super) enum StartFollowUp {
+    Finish(InFlight),
+    PreparePubrel { in_flight: InFlight, rank: u64 },
 }
 
 #[derive(Debug)]
@@ -450,6 +458,7 @@ pub(super) enum Change {
     PreparePubrel {
         slot: usize,
         in_flight: InFlight,
+        rank: u64,
     },
     PubrelReady {
         slot: usize,
@@ -479,6 +488,7 @@ pub(super) enum Change {
     PubrecObserved {
         slot: usize,
         reason: u8,
+        rank: Option<u64>,
     },
     Start {
         slot: usize,
@@ -487,7 +497,7 @@ pub(super) enum Change {
     Started {
         slot: usize,
         finished: Finished,
-        finish: Option<InFlight>,
+        follow_up: Option<StartFollowUp>,
     },
     Expire {
         slot: usize,
@@ -814,6 +824,7 @@ impl State {
             volatile: VolatileQueue::new(config.max_exchanges)?,
             continuation: None,
             continuations_started: false,
+            next_pubrec_rank: 1,
         })
     }
     fn connection(&self, generation: ConnectionGeneration) -> Option<usize> {
@@ -837,18 +848,27 @@ impl State {
         let slice = self.deliveries.as_slice();
         let mut publish: Option<(usize, &Delivery)> = None;
         let mut pubrel: Option<(usize, &Delivery)> = None;
-        // PUBREL leaves in the order of the PUBRECs (MQTT-4.6.0-4). The
-        // earliest PUBREC of this session whose PUBREL is still being
-        // prepared holds the PUBRELs of the later ones, whenever their own
-        // preparations became known.
+        // PUBREL leaves in the order of the first positive PUBREC
+        // (MQTT-4.6.0-4 / MQTT-4.6.0-6). Any delivery of this session that
+        // already received a positive PUBREC — whether waiting for
+        // MarkDeliveryStarted before PreparePubrel or waiting for
+        // PreparePubrel to commit — holds later PUBRELs behind its rank.
         let preparing = indices
             .iter()
-            .filter_map(|&idx| match slice[idx].phase {
-                Phase::PubrelPending(in_flight) => Some(in_flight.operation.sequence()),
-                _ => None,
+            .filter_map(|&idx| {
+                let d = &slice[idx];
+                if !d.retired
+                    && !d.awaits_pubcomp()
+                    && (matches!(d.phase, Phase::PubrelPending(_))
+                        || d.early_pubrec.is_some_and(|reason| reason < 0x80))
+                {
+                    d.pubrec_rank
+                } else {
+                    None
+                }
             })
             .min();
-        let received = |delivery: &Delivery| delivery.pubrec.map(OperationId::sequence);
+        let received = |delivery: &Delivery| delivery.pubrec_rank;
         for &index in indices {
             let delivery = &slice[index];
             if !delivery.waiting_to_send(generation, now) {
@@ -1850,14 +1870,19 @@ impl Owner {
         let delivery = &self.pubsub.deliveries.as_slice()[slot];
         if kind == Qos2Ack::Pubrec {
             if delivery.claim.is_some_and(|c| c.await_pubcomp) {
-                if reason < 0x80 {
+                if reason < 0x80 && delivery.frame.is_some_and(|(_, sent)| sent == connection) {
                     draft.frame(connection, OutboundFrame::Pubrel { packet_id })?;
                 }
                 return Ok(super::Change::Nothing);
             }
             if matches!(delivery.phase, Phase::StartPending(_) | Phase::StartRetry) {
                 return if delivery.early_pubrec.is_none() {
-                    Ok(changed(Change::PubrecObserved { slot, reason }))
+                    let rank = if reason < 0x80 {
+                        Some(delivery.pubrec_rank.unwrap_or(self.pubsub.next_pubrec_rank))
+                    } else {
+                        None
+                    };
+                    Ok(changed(Change::PubrecObserved { slot, reason, rank }))
                 } else {
                     Ok(super::Change::Nothing)
                 };
@@ -1885,9 +1910,14 @@ impl Owner {
                 self.plan_submission(operation, Recipe::FinishDelivery(guarded), None, draft)?;
             return Ok(Change::Finish { slot, in_flight });
         }
+        let rank = delivery.pubrec_rank.unwrap_or(self.pubsub.next_pubrec_rank);
         let in_flight =
             self.plan_submission(operation, Recipe::PreparePubrel(guarded), None, draft)?;
-        Ok(Change::PreparePubrel { slot, in_flight })
+        Ok(Change::PreparePubrel {
+            slot,
+            in_flight,
+            rank,
+        })
     }
 
     pub(super) fn plan_observed_puback(
@@ -2812,21 +2842,45 @@ impl Owner {
                             finished: done,
                         })));
                     }
-                    let finish = if d.early_puback && self.receipts.control_available() {
+                    let follow_up = if d.early_puback && self.receipts.control_available() {
                         let operation = self.operation(draft)?;
-                        Some(self.plan_submission(
+                        Some(StartFollowUp::Finish(self.plan_submission(
                             operation,
                             Recipe::FinishDelivery(self.finish_recipe(d, operation)?),
                             None,
                             draft,
-                        )?)
+                        )?))
+                    } else if let Some(reason) = d.early_pubrec
+                        && self.receipts.control_available()
+                    {
+                        let operation = self.operation(draft)?;
+                        let guarded = self.finish_recipe(d, operation)?;
+                        if reason >= 0x80 {
+                            Some(StartFollowUp::Finish(self.plan_submission(
+                                operation,
+                                Recipe::FinishDelivery(guarded),
+                                None,
+                                draft,
+                            )?))
+                        } else {
+                            let rank = d.pubrec_rank.unwrap_or(self.pubsub.next_pubrec_rank);
+                            Some(StartFollowUp::PreparePubrel {
+                                in_flight: self.plan_submission(
+                                    operation,
+                                    Recipe::PreparePubrel(guarded),
+                                    None,
+                                    draft,
+                                )?,
+                                rank,
+                            })
+                        }
                     } else {
                         None
                     };
                     return Ok(Some(changed(Change::Started {
                         slot,
                         finished: done,
-                        finish,
+                        follow_up,
                     })));
                 }
                 if d.retired {
@@ -3629,14 +3683,22 @@ impl Owner {
                     Phase::DiscardPending(in_flight);
                 self.pubsub.index_delivery(slot);
             }
-            Change::PreparePubrel { slot, in_flight } => {
+            Change::PreparePubrel {
+                slot,
+                in_flight,
+                rank,
+            } => {
                 if slot >= self.pubsub.deliveries.len() {
                     return Err(stale);
                 }
                 self.pubsub.unindex_delivery(slot);
                 let d = &mut self.pubsub.deliveries.as_mut_slice()[slot];
                 d.early_pubrec = None;
-                d.pubrec = Some(in_flight.operation);
+                if d.pubrec_rank.is_none() {
+                    d.pubrec_rank = Some(rank);
+                    self.pubsub.next_pubrec_rank =
+                        self.pubsub.next_pubrec_rank.max(rank.saturating_add(1));
+                }
                 d.phase = Phase::PubrelPending(in_flight);
                 self.pubsub.index_delivery(slot);
             }
@@ -3753,12 +3815,20 @@ impl Owner {
                 self.pubsub.deliveries.as_mut_slice()[slot].early_puback = true;
                 self.pubsub.index_delivery(slot);
             }
-            Change::PubrecObserved { slot, reason } => {
+            Change::PubrecObserved { slot, reason, rank } => {
                 if slot >= self.pubsub.deliveries.len() {
                     return Err(stale);
                 }
                 self.pubsub.unindex_delivery(slot);
-                self.pubsub.deliveries.as_mut_slice()[slot].early_pubrec = Some(reason);
+                let d = &mut self.pubsub.deliveries.as_mut_slice()[slot];
+                d.early_pubrec = Some(reason);
+                if let Some(rank) = rank
+                    && d.pubrec_rank.is_none()
+                {
+                    d.pubrec_rank = Some(rank);
+                    self.pubsub.next_pubrec_rank =
+                        self.pubsub.next_pubrec_rank.max(rank.saturating_add(1));
+                }
                 self.pubsub.index_delivery(slot);
             }
             Change::Start { slot, in_flight } => {
@@ -3774,7 +3844,7 @@ impl Owner {
             Change::Started {
                 slot,
                 finished,
-                finish,
+                follow_up,
             } => {
                 if slot >= self.pubsub.deliveries.len()
                     || self.pubsub.deliveries.as_slice()[slot].claim.is_none()
@@ -3784,7 +3854,22 @@ impl Owner {
                 self.pubsub.unindex_delivery(slot);
                 let d = &mut self.pubsub.deliveries.as_mut_slice()[slot];
                 d.claim.as_mut().ok_or(stale)?.started = true;
-                d.phase = finish.map_or(Phase::AwaitPuback, Phase::FinishPending);
+                match follow_up {
+                    None => d.phase = Phase::AwaitPuback,
+                    Some(StartFollowUp::Finish(in_flight)) => {
+                        d.early_pubrec = None;
+                        d.phase = Phase::FinishPending(in_flight);
+                    }
+                    Some(StartFollowUp::PreparePubrel { in_flight, rank }) => {
+                        d.early_pubrec = None;
+                        if d.pubrec_rank.is_none() {
+                            d.pubrec_rank = Some(rank);
+                            self.pubsub.next_pubrec_rank =
+                                self.pubsub.next_pubrec_rank.max(rank.saturating_add(1));
+                        }
+                        d.phase = Phase::PubrelPending(in_flight);
+                    }
+                }
                 self.pubsub.index_delivery(slot);
                 self.remember_finished(finished)?;
             }
@@ -7826,5 +7911,195 @@ mod tests {
             )));
         }
         assert_eq!(seen, [pids[0].get(), pids[1].get()]);
+    }
+
+    /// Regression witness for MQTT-4.6.0-4 / MQTT-4.6.0-6:
+    /// Delivery 0 carries a Message Expiry Interval (so `FrameProgress::Started`
+    /// places it in `Phase::StartPending` while persisting `MarkDeliveryStarted`).
+    /// Delivery 1 has no expiry. When `PUBREC(0)` arrives while delivery 0 is
+    /// still `StartPending` and `PUBREC(1)` arrives right after (committing its
+    /// `PreparePubrel` before delivery 0's `MarkDeliveryStarted` even commits),
+    /// delivery 0 MUST keep its earlier rank from the very first PUBREC, holding
+    /// `PUBREL(1)` until `PUBREL(0)` leaves first.
+    #[test]
+    fn early_pubrec_during_start_pending_preserves_pubrel_order_against_later_pubrec() {
+        let mut owner = world();
+        let now = MessageTime {
+            domain: [1u8; 32],
+            tick: 1_000_000_000,
+        };
+        let _ = apply(&mut owner, Input::MessageClock { now });
+        let key = ConnectionKey {
+            session: TARGET,
+            generation: CONNECTION,
+        };
+
+        // Delivery 0: QoS 2 WITH Message Expiry Interval.
+        queued(&mut owner, 0);
+        {
+            let d0 = &mut owner.pubsub.deliveries.as_mut_slice()[0];
+            d0.qos = Qos::ExactlyOnce;
+            d0.expiry = Some(MessageExpiry {
+                observed: now,
+                interval: 60,
+            });
+        }
+        let claim0 = apply(&mut owner, Input::WorkAvailable { session: TARGET });
+        let (id0, Effect::Persist { command: cmd0 }) = &claim0[0] else {
+            panic!("claim0")
+        };
+        let pub0 = known(&mut owner, *id0, cmd0);
+        let (
+            frame0,
+            Effect::EmitPublish {
+                packet_id: pid0, ..
+            },
+        ) = pub0[0]
+        else {
+            panic!("publish0")
+        };
+
+        // Delivery 1: QoS 2 WITHOUT Message Expiry Interval.
+        queued(&mut owner, 1);
+        owner.pubsub.deliveries.as_mut_slice()[1].qos = Qos::ExactlyOnce;
+        let claim1 = apply(&mut owner, Input::WorkAvailable { session: TARGET });
+        let (id1, Effect::Persist { command: cmd1 }) = &claim1[0] else {
+            panic!("claim1")
+        };
+        let pub1 = known(&mut owner, *id1, cmd1);
+        let Effect::EmitPublish {
+            packet_id: pid1, ..
+        } = pub1[0].1
+        else {
+            panic!("publish1")
+        };
+
+        // Frame 0 begins writing -> triggers MarkDeliveryStarted (Phase::StartPending).
+        let start_effects = apply(
+            &mut owner,
+            Input::FrameResult {
+                effect: frame0,
+                connection: key,
+                progress: FrameProgress::Started,
+            },
+        );
+        let (start_id, Effect::Persist { command: start_cmd }) = &start_effects[0] else {
+            panic!("MarkDeliveryStarted expected")
+        };
+        assert!(matches!(
+            start_cmd.recipe.get(),
+            Recipe::MarkDeliveryStarted(_)
+        ));
+
+        // 1) PUBREC(pid0) arrives FIRST while delivery 0 is still StartPending.
+        let target0 = owner.qos2_ack_target(key, pid0, Qos2Ack::Pubrec);
+        assert!(target0.is_some());
+        let ack0 = apply(
+            &mut owner,
+            Input::ObservedQos2Ack {
+                connection: key,
+                kind: Qos2Ack::Pubrec,
+                packet_id: pid0,
+                reason: 0,
+                target: target0,
+            },
+        );
+        assert!(
+            ack0.is_empty(),
+            "early PUBREC waits for MarkDeliveryStarted"
+        );
+
+        // 2) PUBREC(pid1) arrives SECOND and immediately submits PreparePubrel(1).
+        let target1 = owner.qos2_ack_target(key, pid1, Qos2Ack::Pubrec);
+        assert!(target1.is_some());
+        let prep1_effects = apply(
+            &mut owner,
+            Input::ObservedQos2Ack {
+                connection: key,
+                kind: Qos2Ack::Pubrec,
+                packet_id: pid1,
+                reason: 0,
+                target: target1,
+            },
+        );
+        let (prep1_id, Effect::Persist { command: prep1_cmd }) = &prep1_effects[0] else {
+            panic!("PreparePubrel(1) expected")
+        };
+        assert!(matches!(prep1_cmd.recipe.get(), Recipe::PreparePubrel(_)));
+
+        let pubrels = |effects: &[(EffectId, Effect)]| -> Vec<u16> {
+            effects
+                .iter()
+                .filter_map(|(_, effect)| match effect {
+                    Effect::EmitFrame {
+                        frame: OutboundFrame::Pubrel { packet_id },
+                        ..
+                    } => Some(packet_id.get()),
+                    _ => None,
+                })
+                .collect()
+        };
+
+        // 3) PreparePubrel(1) commits BEFORE MarkDeliveryStarted(0)!
+        //    PUBREL(1) MUST stay held behind delivery 0's earlier PUBREC rank.
+        let mut seen = pubrels(&known(&mut owner, *prep1_id, prep1_cmd));
+        seen.extend(pubrels(&apply(
+            &mut owner,
+            Input::WorkAvailable { session: TARGET },
+        )));
+        assert_eq!(
+            seen,
+            Vec::<u16>::new(),
+            "PUBREL(1) must not overtake delivery 0 whose PUBREC arrived earlier during StartPending"
+        );
+
+        // 4) MarkDeliveryStarted(0) commits -> immediately submits PreparePubrel(0)
+        //    preserving delivery 0's rank (1 < 2).
+        let started_effects = known(&mut owner, *start_id, start_cmd);
+        let (prep0_id, Effect::Persist { command: prep0_cmd }) = &started_effects[0] else {
+            panic!("PreparePubrel(0) expected immediately after DeliveryStarted")
+        };
+        assert!(matches!(prep0_cmd.recipe.get(), Recipe::PreparePubrel(_)));
+        // Still waiting for PreparePubrel(0) to commit -> PUBREL(1) must STILL be held.
+        seen.extend(pubrels(&apply(
+            &mut owner,
+            Input::WorkAvailable { session: TARGET },
+        )));
+        assert_eq!(
+            seen,
+            Vec::<u16>::new(),
+            "PUBREL(1) must remain held while PreparePubrel(0) is in flight"
+        );
+
+        // 5) PreparePubrel(0) commits -> PUBREL(0) leaves strictly before PUBREL(1).
+        seen.extend(pubrels(&known(&mut owner, *prep0_id, prep0_cmd)));
+        for _ in 0..3 {
+            seen.extend(pubrels(&apply(
+                &mut owner,
+                Input::WorkAvailable { session: TARGET },
+            )));
+        }
+        assert_eq!(seen, [pid0.get(), pid1.get()]);
+
+        // 6) Both PUBCOMPs resolve both deliveries cleanly.
+        for pid in [pid0, pid1] {
+            let target = owner.qos2_ack_target(key, pid, Qos2Ack::Pubcomp);
+            assert!(target.is_some());
+            let fin = apply(
+                &mut owner,
+                Input::ObservedQos2Ack {
+                    connection: key,
+                    kind: Qos2Ack::Pubcomp,
+                    packet_id: pid,
+                    reason: 0,
+                    target,
+                },
+            );
+            let (fin_id, Effect::Persist { command: fin_cmd }) = &fin[0] else {
+                panic!("FinishDelivery expected")
+            };
+            let _ = known(&mut owner, *fin_id, fin_cmd);
+        }
+        assert!(owner.pubsub.deliveries.is_empty());
     }
 }

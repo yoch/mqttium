@@ -24,15 +24,17 @@ use mqttiumd_store_sqlite::{
 
 use crate::VolatileStore;
 
-/// Owns a `VolatileStore` alongside the exclusive `<path>.writer-lock` lease
-/// so that no second broker can concurrently write to `path` and periodic or
-/// shutdown snapshots can be written atomically in Schema 14 / Schema 15.
+/// Owns a `VolatileStore` alongside an optional exclusive `<path>.writer-lock`
+/// lease for periodic or shutdown atomic Schema-14 / Schema-15 snapshots.
+///
+/// Pure in-memory handles created via [`VolatileHandle::in_memory`] never
+/// open, load, lock, or modify any database file on disk.
 pub struct VolatileHandle {
     store: VolatileStore,
-    path: PathBuf,
+    path: Option<PathBuf>,
     policy: Option<StoragePolicy>,
     sqlite_settings: Option<Settings>,
-    lease: WriterLease,
+    lease: Option<WriterLease>,
 }
 
 impl std::fmt::Debug for VolatileHandle {
@@ -45,6 +47,28 @@ impl std::fmt::Debug for VolatileHandle {
 }
 
 impl VolatileHandle {
+    /// Creates a strictly ephemeral in-memory `VolatileStore` with no database
+    /// file, no writer lock, and no disk reads or writes.
+    pub fn in_memory(
+        incarnation: StoreIncarnation,
+        limits: Limits,
+        policy: Option<StoragePolicy>,
+    ) -> Result<Self, OpenError> {
+        if let Some(p) = policy.as_ref()
+            && (p.owners.is_empty() || p.owners.len() > 4_096)
+        {
+            return Err(OpenError::SecurityPolicyMismatch);
+        }
+        let store = VolatileStore::create(incarnation, limits);
+        Ok(Self {
+            store,
+            path: None,
+            policy,
+            sqlite_settings: None,
+            lease: None,
+        })
+    }
+
     /// Opens an existing SQLite database into RAM (transferring the writer
     /// lease with no lock gap), or creates an empty `VolatileStore` under the
     /// exclusive writer lease if `path` does not yet exist.
@@ -65,10 +89,10 @@ impl VolatileHandle {
             let store = VolatileStore::reopen(state);
             Ok(Self {
                 store,
-                path: path.to_path_buf(),
+                path: Some(path.to_path_buf()),
                 policy,
                 sqlite_settings: Some(settings),
-                lease,
+                lease: Some(lease),
             })
         } else if require_existing {
             Err(OpenError::Read(ReadError::Unavailable))
@@ -82,10 +106,10 @@ impl VolatileHandle {
             let store = VolatileStore::create(incarnation, limits);
             Ok(Self {
                 store,
-                path: path.to_path_buf(),
+                path: Some(path.to_path_buf()),
                 policy,
                 sqlite_settings: None,
-                lease,
+                lease: Some(lease),
             })
         }
     }
@@ -93,14 +117,17 @@ impl VolatileHandle {
     /// Atomically snapshots the current in-memory state to `self.path` as a
     /// valid Schema-14 (or Schema-15 when secured) SQLite database.
     pub fn save_snapshot(&self) -> Result<(), OpenError> {
+        let (Some(path), Some(lease)) = (&self.path, &self.lease) else {
+            return Err(OpenError::Read(ReadError::Unavailable));
+        };
         let state = self.store.snapshot().map_err(OpenError::Read)?;
-        save_state_atomic(&self.path, &state, self.policy.as_ref(), &self.lease)
+        save_state_atomic(path, &state, self.policy.as_ref(), lease)
     }
 
-    /// Snapshot target path.
+    /// Snapshot target path, when backed by a disk snapshot target.
     #[must_use]
-    pub fn path(&self) -> &Path {
-        &self.path
+    pub fn path(&self) -> Option<&Path> {
+        self.path.as_deref()
     }
 
     /// SQLite settings from initial load, if loaded from an existing file.

@@ -80,6 +80,8 @@ pub struct Settings {
     pub adapter: AdapterLimits,
     pub owner: OwnerConfig,
     pub bounds: transport::Bounds,
+    /// Whether retained publication admission is enabled on the owner.
+    pub retained_enabled: bool,
 }
 
 /// The owner of S0: one logical owner, owner 0.
@@ -810,8 +812,11 @@ impl<S: DurableStore> Process<S> {
         let outbox = authority
             .create_outbox(OWNER, settings.effect_slots, settings.reservations)
             .map_err(|refused| Stop::new(format!("no effect box: {refused:?}")))?;
-        let owner = Owner::new(settings.owner, outbox)
+        let mut owner = Owner::new(settings.owner, outbox)
             .map_err(|refused| Stop::new(format!("no owner: {:?}", refused.reason)))?;
+        if settings.retained_enabled {
+            owner.enable_session_lifecycle();
+        }
 
         // The faults of the scenario act on the broker's work; they are
         // armed once the epoch is open.

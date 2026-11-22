@@ -117,7 +117,7 @@ impl StoreBackend {
         }
     }
 
-    fn maybe_snapshot(&mut self, events: &Events, force: bool) {
+    fn maybe_snapshot(&mut self, events: &Events, force: bool) -> Result<(), Failure> {
         let Self::Volatile {
             handle,
             snapshot_interval: Some(interval),
@@ -125,10 +125,10 @@ impl StoreBackend {
             dirty,
         } = self
         else {
-            return;
+            return Ok(());
         };
         if !*dirty || (!force && last_snapshot.elapsed() < *interval) {
-            return;
+            return Ok(());
         }
         match handle.save_snapshot() {
             Ok(()) => {
@@ -138,13 +138,16 @@ impl StoreBackend {
                     "volatile_snapshot_saved",
                     json!({"details":{"forced":force}}),
                 );
+                Ok(())
             }
             Err(error) => {
                 *last_snapshot = Instant::now();
+                let read_err = error.read_error();
                 let _ = events.emit(
                     "volatile_snapshot_failed",
-                    json!({"details":{"cause":error.read_error().code(),"forced":force}}),
+                    json!({"details":{"cause":read_err.code(),"forced":force}}),
                 );
+                Err(Failure::read(read_err, ReadPhase::Snapshot))
             }
         }
     }
@@ -648,7 +651,7 @@ pub struct Writer {
     pub boot: Receiver<Result<Boot, Failure>>,
     /// Signalled after each reply the worker publishes.
     pub wake: crate::wake::Wake,
-    handle: Option<JoinHandle<()>>,
+    handle: Option<JoinHandle<Result<(), Failure>>>,
 }
 impl Writer {
     pub fn spawn(
@@ -737,7 +740,7 @@ impl Writer {
                 StorageMode::Durable => "sqlite-writer".into(),
                 StorageMode::Volatile { .. } => "volatile-writer".into(),
             })
-            .spawn(move || {
+            .spawn(move || -> Result<(), Failure> {
                 let (mut store, boot) = match bootstrap_bound(
                     &path,
                     clock,
@@ -748,11 +751,11 @@ impl Writer {
                     Ok(value) => value,
                     Err(error) => {
                         let _ = btx.send(Err(error));
-                        return;
+                        return Ok(());
                     }
                 };
                 if btx.send(Ok(boot)).is_err() {
-                    return;
+                    return Ok(());
                 }
                 let mut pending: VecDeque<Response> = VecDeque::new();
                 let mut pending_control = None;
@@ -760,6 +763,7 @@ impl Writer {
                 // command at a time: no group is formed while they exist.
                 let group = if hooks.directory.is_some() { 1 } else { GROUP };
                 let mut stopping = false;
+                let mut stop_result: Result<(), Failure> = Ok(());
                 let mut state = BusinessState::default();
                 #[cfg(feature="test-hooks")]
                 let mut duplicate_control: Option<ControlResponse> = None;
@@ -776,7 +780,13 @@ impl Writer {
                                 stalled = true;
                                 pending_control = Some(reply);
                             }
-                            Err(TrySendError::Disconnected(_)) => return,
+                            Err(TrySendError::Disconnected(_)) => {
+                                return if stopping {
+                                    stop_result
+                                } else {
+                                    store.maybe_snapshot(&events, true)
+                                };
+                            }
                         }
                     }
                     // Replies leave in the order of their requests.
@@ -789,14 +799,20 @@ impl Writer {
                                 pending.push_front(reply);
                                 break;
                             }
-                            Err(TrySendError::Disconnected(_)) => return,
+                            Err(TrySendError::Disconnected(_)) => {
+                                return if stopping {
+                                    stop_result
+                                } else {
+                                    store.maybe_snapshot(&events, true)
+                                };
+                            }
                         }
                     }
                     if sent_reply {
                         worker_wake.wake();
                     }
                     if stopping && pending.is_empty() {
-                        return;
+                        return stop_result;
                     }
                     // Even a completely unread ordinary result lane cannot prevent
                     // a reserved receipt closure from committing and replying.
@@ -821,7 +837,13 @@ impl Writer {
                                 pending_control = Some(reply);
                             }
                             Err(TryRecvError::Empty) => {}
-                            Err(TryRecvError::Disconnected) => return,
+                            Err(TryRecvError::Disconnected) => {
+                                return if stopping {
+                                    stop_result
+                                } else {
+                                    store.maybe_snapshot(&events, true)
+                                };
+                            }
                         }
                     }
                     if pending.is_empty() && !stopping {
@@ -870,7 +892,7 @@ impl Writer {
                         }
                         match other {
                             Some(Err(Request::Stop)) => {
-                                store.maybe_snapshot(&events, true);
+                                stop_result = store.maybe_snapshot(&events, true);
                                 pending.push_back(Response::Stopped);
                                 stopping = true;
                             }
@@ -883,11 +905,10 @@ impl Writer {
                             None => {}
                         }
                         if !stopping {
-                            store.maybe_snapshot(&events, false);
+                            let _ = store.maybe_snapshot(&events, false);
                         }
                         if closed && pending.is_empty() {
-                            store.maybe_snapshot(&events, true);
-                            return;
+                            return store.maybe_snapshot(&events, true);
                         }
                         // Both request lanes signal `requests`. A reply
                         // produced in this turn is published before waiting.
@@ -917,7 +938,7 @@ impl Writer {
     pub fn join_finished(&mut self) -> Result<(), Failure> {
         if self.is_finished() {
             if let Some(h) = self.handle.take() {
-                h.join().map_err(|_| Failure::plain("writer_panicked"))?;
+                h.join().map_err(|_| Failure::plain("writer_panicked"))??;
             }
             Ok(())
         } else {
@@ -1918,15 +1939,15 @@ fn bootstrap_bound(
     require_existing: bool,
     storage_mode: StorageMode,
 ) -> Result<(StoreBackend, Boot), Failure> {
-    // Existing files, including empty/truncated files, are never silently initialised.
-    let exists = path
-        .try_exists()
-        .map_err(|e| Failure::read(io_cause(e.kind()), ReadPhase::Open))?;
-    if !exists && require_existing {
-        return Err(Failure::plain("existing_database_missing"));
-    }
     let mut store = match storage_mode {
         StorageMode::Durable => {
+            // Existing files, including empty/truncated files, are never silently initialised.
+            let exists = path
+                .try_exists()
+                .map_err(|e| Failure::read(io_cause(e.kind()), ReadPhase::Open))?;
+            if !exists && require_existing {
+                return Err(Failure::plain("existing_database_missing"));
+            }
             let sqlite = if exists {
                 match policy.as_ref() {
                     Some(policy) => SqliteStore::open_secured(path, policy),
@@ -1938,7 +1959,32 @@ fn bootstrap_bound(
             };
             StoreBackend::Durable(sqlite)
         }
+        StorageMode::Volatile {
+            snapshot_interval: None,
+        } if !require_existing => {
+            // Pure in-memory volatile mode (`persistence false` or `--storage-mode volatile`
+            // without snapshots or `--existing-db`) never reads, locks, or overwrites any
+            // database file on disk.
+            let mut random = [0u8; 8];
+            getrandom::fill(&mut random).map_err(|_| Failure::plain("random_unavailable"))?;
+            let incarnation = StoreIncarnation::new(u64::from_be_bytes(random).max(1));
+            let handle =
+                mqttiumd_store_volatile::VolatileHandle::in_memory(incarnation, limits(), policy)
+                    .map_err(database_open_error)?;
+            StoreBackend::Volatile {
+                handle,
+                snapshot_interval: None,
+                last_snapshot: Instant::now(),
+                dirty: false,
+            }
+        }
         StorageMode::Volatile { snapshot_interval } => {
+            let exists = path
+                .try_exists()
+                .map_err(|e| Failure::read(io_cause(e.kind()), ReadPhase::Open))?;
+            if !exists && require_existing {
+                return Err(Failure::plain("existing_database_missing"));
+            }
             let mut random = [0u8; 8];
             getrandom::fill(&mut random).map_err(|_| Failure::plain("random_unavailable"))?;
             let incarnation = StoreIncarnation::new(u64::from_be_bytes(random).max(1));
@@ -2513,7 +2559,10 @@ mod tests {
             });
         assert_eq!(
             recipe_identity_highwater(&recipe).unwrap(),
-            (1255, 0),
+            (
+                1000 + mqttiumd_contract::retained::MAX_REPLAYS as u64 - 1,
+                0
+            ),
             "retired_probe_reused_reserved_replay_identity"
         );
     }

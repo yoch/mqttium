@@ -3,13 +3,17 @@ import mqttwire as wire
 from dsl import connect, mark, publish, quiet, recv, scenario, send, until_close
 from expectations import CLOSED, at, expectation
 
+# The Maximum Packet Size mqttiumd announces: the size at which no PUBLISH
+# exceeds its payload limit (1 048 576 bytes and eight bytes around them).
+ANNOUNCED = 1_048_584
+
 for level in (4, 5):
     v = f"v{level}"
 
     scenario(
         f"errors/oversized-packet-{v}",
-        doc="""A QoS 1 PUBLISH of 70 000 bytes with each broker's default limits: mqttiumd
-        accepts packets up to 65 536 bytes, the reference up to the protocol maximum.""",
+        doc="""A QoS 1 PUBLISH of 70 000 bytes with each broker's default limits: both
+        brokers accept it within their advertised packet limits.""",
         steps=[connect("a", "e-big", level=level),
                publish("a", "big/t", b"x" * 70_000, qos=1, packet_id=1, level=level), recv("a"), quiet("a")],
     )
@@ -24,22 +28,18 @@ for level in (4, 5):
 
 scenario(
     "errors/packet-over-announced-maximum-v5",
-    doc="""Both brokers announce Maximum Packet Size 32 776 (the reference by
-    `max_packet_size 32776`) and the client sends a PUBLISH of 70 000 bytes.
+    doc=f"""Both brokers announce Maximum Packet Size {ANNOUNCED} (the reference by
+    `max_packet_size {ANNOUNCED}`) and the client sends a PUBLISH of 1 150 000 bytes.
     Both answer DISCONNECT 0x95. The reference then closes with the rest of
     the packet unread, which resets the connection; mqttiumd reads and drops
     it and ends the stream. How the connection ends after the DISCONNECT is
     outside the protocol and depends on what was still in flight: the
     closure is compared as `any`.""",
-    reference_config=["max_packet_size 32776"],
+    reference_config=[f"max_packet_size {ANNOUNCED}"],
     steps=[connect("a", "e-toobig", level=5),
-           publish("a", "big/t", b"x" * 70_000, qos=1, packet_id=1, level=5), until_close("a")],
+           publish("a", "big/t", b"x" * 1_150_000, qos=1, packet_id=1, level=5), until_close("a")],
     closure="any",
 )
-
-# The Maximum Packet Size mqttiumd announces: the size at which no PUBLISH
-# exceeds its payload limit (32 768 bytes and eight bytes around them).
-ANNOUNCED = 32_776
 
 
 def sized_publish(total, packet_id):

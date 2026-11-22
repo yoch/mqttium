@@ -31,12 +31,31 @@ EXPIRE_DELIVERY = 16
 WILL_PUBLICATION = 17
 RETAINED_WILL_PUBLICATION = 18
 PREPARE_PUBREL = 19
-MAX_RETAINED_REPLAYS = 256
-MAX_RETAINED_TARGETS = 16
+WIDE_RETAINED_PUBLICATION = 20
+WIDE_RETAINED_QOS0 = 21
+WIDE_RETAINED_WILL_PUBLICATION = 22
+ANNOTATED_PUBLICATION = 23
+LEGACY_MAX_TARGETS = 16
+MAX_RETAINED_REPLAYS = 32_768
+MAX_RETAINED_TARGETS = 1_024
 MAX_SESSION_CLIENT_BYTES = 1024
 MAX_WILL_TOPIC_BYTES = 1024
 MAX_WILL_PAYLOAD_BYTES = 32768
-MAX_WILL_TARGETS = 16
+MAX_WILL_TARGETS = 1_024
+MAX_USER_PROPERTIES = 64
+MAX_PROPERTY_BYTES = 16_384
+_FLAG_PAYLOAD_FORMAT = 0x01
+_FLAG_CONTENT_TYPE = 0x02
+_FLAG_RESPONSE_TOPIC = 0x04
+_FLAG_CORRELATION_DATA = 0x08
+_FLAG_USER_PROPERTIES = 0x10
+_ALL_PROP_FLAGS = (
+    _FLAG_PAYLOAD_FORMAT
+    | _FLAG_CONTENT_TYPE
+    | _FLAG_RESPONSE_TOPIC
+    | _FLAG_CORRELATION_DATA
+    | _FLAG_USER_PROPERTIES
+)
 
 
 class RecipeError(ValueError):
@@ -270,6 +289,27 @@ class ExpireDelivery:
 
 
 @dataclass(frozen=True)
+class PublishProperties:
+    payload_format_indicator: int | None = None
+    content_type: bytes | None = None
+    response_topic: bytes | None = None
+    correlation_data: bytes | None = None
+    user_properties: tuple[tuple[bytes, bytes], ...] = ()
+
+
+@dataclass(frozen=True)
+class AnnotatedPublication:
+    inner: Admit | RetainedPublication | RetainedQos0 | ExpiringPublication
+    properties: PublishProperties
+
+    kind = "AnnotatedPublication"
+
+    @property
+    def operation(self) -> tuple:
+        return self.inner.operation
+
+
+@dataclass(frozen=True)
 class SessionOpen:
     operation: tuple
     clean_start: bool
@@ -455,19 +495,123 @@ def _valid_topic(topic: bytes) -> bool:
     return True
 
 
+def _valid_mqtt_utf8(raw: bytes) -> bool:
+    if len(raw) > 65535:
+        return False
+    try:
+        text = raw.decode("utf-8", errors="strict")
+    except UnicodeDecodeError:
+        return False
+    for ch in text:
+        code = ord(ch)
+        if (
+            code <= 0x1F
+            or 0x7F <= code <= 0x9F
+            or 0xFDD0 <= code <= 0xFDEF
+            or (code & 0xFFFE) == 0xFFFE
+        ):
+            return False
+    return True
+
+
+def _valid_response_topic(raw: bytes) -> bool:
+    return bool(raw) and _valid_mqtt_utf8(raw) and not any(b in (35, 43) for b in raw)
+
+
+def _decode_publish_properties(raw: bytes) -> PublishProperties:
+    reader = _Reader(raw)
+    flags = reader.number(1)
+    if flags == 0 or (flags & ~_ALL_PROP_FLAGS):
+        raise RecipeError("invalid publish properties flags")
+    pfi = None
+    if flags & _FLAG_PAYLOAD_FORMAT:
+        pfi = reader.number(1)
+        if pfi > 1:
+            raise RecipeError("invalid payload format indicator")
+    content_type = None
+    if flags & _FLAG_CONTENT_TYPE:
+        length = reader.number(2)
+        if length > MAX_PROPERTY_BYTES:
+            raise RecipeError("publish properties too large")
+        content_type = reader.take(length)
+        if not _valid_mqtt_utf8(content_type):
+            raise RecipeError("invalid content type")
+    response_topic = None
+    if flags & _FLAG_RESPONSE_TOPIC:
+        length = reader.number(2)
+        if length > MAX_PROPERTY_BYTES:
+            raise RecipeError("publish properties too large")
+        response_topic = reader.take(length)
+        if not _valid_response_topic(response_topic):
+            raise RecipeError("invalid response topic")
+    correlation_data = None
+    if flags & _FLAG_CORRELATION_DATA:
+        length = reader.number(2)
+        if length > MAX_PROPERTY_BYTES:
+            raise RecipeError("publish properties too large")
+        correlation_data = reader.take(length)
+    user_properties = []
+    if flags & _FLAG_USER_PROPERTIES:
+        count = reader.number(2)
+        if not 1 <= count <= MAX_USER_PROPERTIES:
+            raise RecipeError("invalid user properties count")
+        for _ in range(count):
+            klen = reader.number(2)
+            if klen > MAX_PROPERTY_BYTES:
+                raise RecipeError("publish properties too large")
+            key = reader.take(klen)
+            vlen = reader.number(2)
+            if vlen > MAX_PROPERTY_BYTES:
+                raise RecipeError("publish properties too large")
+            val = reader.take(vlen)
+            if not _valid_mqtt_utf8(key) or not _valid_mqtt_utf8(val):
+                raise RecipeError("invalid user property")
+            user_properties.append((key, val))
+    if reader.at != len(reader.data):
+        raise RecipeError("trailing bytes in publish properties")
+    logical_bytes = (
+        (1 if pfi is not None else 0)
+        + (len(content_type) if content_type is not None else 0)
+        + (len(response_topic) if response_topic is not None else 0)
+        + (len(correlation_data) if correlation_data is not None else 0)
+        + sum(len(k) + len(v) for k, v in user_properties)
+    )
+    if logical_bytes > MAX_PROPERTY_BYTES:
+        raise RecipeError("publish properties too large")
+    return PublishProperties(
+        payload_format_indicator=pfi,
+        content_type=content_type,
+        response_topic=response_topic,
+        correlation_data=correlation_data,
+        user_properties=tuple(user_properties),
+    )
+
+
 def _retained_mask(mask: int, count: int) -> None:
-    if count > MAX_RETAINED_TARGETS or mask >> count:
+    if count > LEGACY_MAX_TARGETS or mask >> count:
         raise RecipeError("invalid retain targets")
 
 
-def _nested(reader: _Reader, allowed: tuple[int, ...]):
-    # Inspect every child tag before calling decode. A temporal envelope may
-    # contain one legacy envelope, whose own child is strictly a base recipe;
-    # no attacker-controlled temporal recursion can consume Python stack space.
+def _decode_wide_mask(reader: _Reader, count: int) -> int:
+    expected = (count + 7) // 8
+    byte_len = reader.number(2)
+    if byte_len != expected:
+        raise RecipeError("invalid wide retain mask length")
+    raw = reader.take(byte_len)
+    rem = count % 8
+    if rem != 0 and raw and (raw[-1] >> rem) != 0:
+        raise RecipeError("invalid wide retain mask trailing bits")
+    return int.from_bytes(raw, "little")
+
+
+def _nested(reader: _Reader, allowed: tuple[int, ...], *, target_limit: int = MAX_RETAINED_TARGETS):
+    # Inspect every child tag before calling decode. An annotated or temporal
+    # envelope may contain strictly permitted inner kinds; no attacker-controlled
+    # recursion can consume Python stack space.
     nested = reader.take(reader.number(4))
     if len(nested) < 7 or nested[6] not in allowed:
         raise RecipeError("invalid retained nested kind")
-    return decode(nested, _target_limit=MAX_RETAINED_TARGETS)
+    return decode(nested, _target_limit=target_limit)
 
 
 def decode(data: bytes, *, _target_limit: int | None = None):
@@ -478,7 +622,24 @@ def decode(data: bytes, *, _target_limit: int | None = None):
     if reader.number(2) != FORMAT:
         raise RecipeError("unknown format")
     kind = reader.number(1)
-    if kind in (WILL_PUBLICATION, RETAINED_WILL_PUBLICATION):
+    if kind == ANNOTATED_PUBLICATION:
+        props_len = reader.number(4)
+        props = _decode_publish_properties(reader.take(props_len))
+        inner = _nested(
+            reader,
+            (
+                ADMIT_PUBLICATION,
+                RETAINED_PUBLICATION,
+                RETAINED_QOS0,
+                EXPIRING_PUBLICATION,
+                WIDE_RETAINED_PUBLICATION,
+                WIDE_RETAINED_QOS0,
+            ),
+            target_limit=MAX_RETAINED_TARGETS,
+        )
+        recipe = AnnotatedPublication(inner, props)
+    elif kind in (WILL_PUBLICATION, RETAINED_WILL_PUBLICATION, WIDE_RETAINED_WILL_PUBLICATION):
+        wide = kind == WIDE_RETAINED_WILL_PUBLICATION
         operation, will, publication = reader.scoped(), reader.scoped(), reader.scoped()
         route_revision = reader.number(8)
         topic_length = reader.number(2)
@@ -487,8 +648,11 @@ def decode(data: bytes, *, _target_limit: int | None = None):
         topic = reader.take(topic_length)
         payload, length = reader.scoped(), reader.number(8)
         costs = tuple(reader.number(8) for _ in range(4))
-        count = reader.number(1)
-        if count > MAX_WILL_TARGETS:
+        count = reader.number(2) if wide else reader.number(1)
+        if wide:
+            if not (LEGACY_MAX_TARGETS < count <= MAX_WILL_TARGETS):
+                raise RecipeError("invalid wide Will target count")
+        elif count > LEGACY_MAX_TARGETS:
             raise RecipeError("invalid Will target count")
         targets = tuple(Target(reader.number(8), reader.number(8), reader.number(4),
                                reader.number(1), reader.number(1)) for _ in range(count))
@@ -497,13 +661,28 @@ def decode(data: bytes, *, _target_limit: int | None = None):
                        or target.cause != 1 for index, target in enumerate(targets))
                 or any(left.session >= right.session for left, right in zip(targets, targets[1:]))):
             raise RecipeError("invalid Will publication field")
-        live_retain = reader.number(2) if kind == RETAINED_WILL_PUBLICATION else None
-        if live_retain is not None and live_retain >> count:
-            raise RecipeError("invalid Will live RETAIN mask")
+        if wide:
+            live_retain = _decode_wide_mask(reader, count) if reader.boolean() else None
+        elif kind == RETAINED_WILL_PUBLICATION:
+            live_retain = reader.number(2)
+            if live_retain >> count:
+                raise RecipeError("invalid Will live RETAIN mask")
+        else:
+            live_retain = None
         recipe = WillPublication(operation, will, publication, route_revision, topic,
                                  payload, length, costs, targets, live_retain)
     elif kind == EXPIRING_PUBLICATION:
-        admission = _nested(reader, (ADMIT_PUBLICATION, RETAINED_PUBLICATION, RETAINED_QOS0))
+        admission = _nested(
+            reader,
+            (
+                ADMIT_PUBLICATION,
+                RETAINED_PUBLICATION,
+                RETAINED_QOS0,
+                WIDE_RETAINED_PUBLICATION,
+                WIDE_RETAINED_QOS0,
+            ),
+            target_limit=MAX_RETAINED_TARGETS,
+        )
         if isinstance(admission, Admit):
             if admission.retain or admission.qos not in (1, 2):
                 raise RecipeError("noncanonical expiring admission")
@@ -512,28 +691,45 @@ def decode(data: bytes, *, _target_limit: int | None = None):
         recipe = ExpiringPublication(admission, reader.message_expiry())
     elif kind == TIMED_REPLAY_SUBSCRIPTIONS:
         recipe = TimedReplaySubscriptions(_nested(reader, (REPLAY_SUBSCRIPTIONS,)), reader.message_time())
-    elif kind == RETAINED_PUBLICATION:
-        admission = _nested(reader, (ADMIT_PUBLICATION,))
-        mask = reader.number(2)
+    elif kind in (RETAINED_PUBLICATION, WIDE_RETAINED_PUBLICATION):
+        wide = kind == WIDE_RETAINED_PUBLICATION
+        admission = _nested(
+            reader,
+            (ADMIT_PUBLICATION,),
+            target_limit=MAX_RETAINED_TARGETS if wide else LEGACY_MAX_TARGETS,
+        )
+        if wide and len(admission.targets) <= LEGACY_MAX_TARGETS:
+            raise RecipeError("noncanonical wide targets")
         if admission.qos not in (1, 2) or not admission.retain:
             raise RecipeError("invalid retained admission")
-        _retained_mask(mask, len(admission.targets))
+        if wide:
+            mask = _decode_wide_mask(reader, len(admission.targets))
+        else:
+            mask = reader.number(2)
+            _retained_mask(mask, len(admission.targets))
         if any(target.effective_qos > 2 or target.cause != 1 for target in admission.targets):
             raise RecipeError("invalid retained target")
         recipe = RetainedPublication(admission, mask)
-    elif kind == RETAINED_QOS0:
+    elif kind in (RETAINED_QOS0, WIDE_RETAINED_QOS0):
+        wide = kind == WIDE_RETAINED_QOS0
         operation, request, publication = reader.scoped(), reader.scoped(), reader.scoped()
         session, revision, connection, order, route_revision = (reader.number(8) for _ in range(5))
         topic = reader.take(reader.number(2))
         payload, length = reader.scoped(), reader.number(8)
         costs = tuple(reader.number(8) for _ in range(4))
-        count = reader.number(1)
-        if count > MAX_RETAINED_TARGETS:
+        count = reader.number(2) if wide else reader.number(1)
+        if wide:
+            if not (LEGACY_MAX_TARGETS < count <= MAX_RETAINED_TARGETS):
+                raise RecipeError("invalid wide retained target count")
+        elif count > LEGACY_MAX_TARGETS:
             raise RecipeError("invalid retained target count")
         targets = tuple(Target(reader.number(8), reader.number(8), reader.number(4),
                                reader.number(1), reader.number(1)) for _ in range(count))
-        mask = reader.number(2)
-        _retained_mask(mask, count)
+        if wide:
+            mask = _decode_wide_mask(reader, count)
+        else:
+            mask = reader.number(2)
+            _retained_mask(mask, count)
         if (not _valid_topic(topic)
                 or order == 0 or any(target.effective_qos > 2 or target.cause != 1 for target in targets)):
             raise RecipeError("invalid retained QoS0 field")

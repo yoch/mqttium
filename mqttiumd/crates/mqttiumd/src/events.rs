@@ -211,13 +211,51 @@ impl Events {
         let mut name = path.as_os_str().to_owned();
         name.push(".previous");
         let previous = PathBuf::from(name);
-        if previous.try_exists()? {
-            return Err(io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                "previous event file exists",
-            ));
+        match std::fs::symlink_metadata(&previous) {
+            Ok(meta) => {
+                if meta.file_type().is_symlink() || !meta.file_type().is_file() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "previous event path is not a regular file",
+                    ));
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
         }
+        // If a prior run left an event journal at `path`, acquire an exclusive
+        // non-blocking lock on it first (so a live broker's journal is never
+        // displaced), then rotate it atomically to `.previous` before opening
+        // a fresh segment with sequence 1.
+        let held_prior = match std::fs::symlink_metadata(path) {
+            Ok(meta) => {
+                if meta.file_type().is_symlink() || !meta.file_type().is_file() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "event path is not a regular file",
+                    ));
+                }
+                let existing = OpenOptions::new().write(true).open(path)?;
+                existing.try_lock().map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::WouldBlock,
+                        "event file is locked by another process",
+                    )
+                })?;
+                std::fs::rename(path, &previous)?;
+                Some(existing)
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error),
+        };
         let file = OpenOptions::new().write(true).create_new(true).open(path)?;
+        file.try_lock().map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "event file is locked by another process",
+            )
+        })?;
+        drop(held_prior);
         Ok(Self {
             log: Arc::new(Mutex::new(Log {
                 file,
@@ -278,6 +316,12 @@ impl Events {
                 .write(true)
                 .create_new(true)
                 .open(&log.path)?;
+            file.try_lock().map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "event file is locked by another process",
+                )
+            })?;
             log.file = file;
             log.file.write_all(&marker)?;
             log.file.sync_data()?;
@@ -475,5 +519,53 @@ mod tests {
         assert_eq!("audit".parse(), Ok(Level::Audit));
         assert_eq!("ops".parse(), Ok(Level::Ops));
         assert!("AUDIT".parse::<Level>().is_err());
+    }
+
+    #[test]
+    fn consecutive_startups_rotate_prior_journal_while_concurrent_open_is_refused() {
+        let directory = Directory::new();
+        let path = directory.0.join("events.jsonl");
+        let previous = directory.0.join("events.jsonl.previous");
+
+        // First run opens fresh journal and holds an exclusive lock.
+        let first = Events::open(&path).unwrap();
+        first
+            .emit("starting", json!({"details":{"run":1}}))
+            .unwrap();
+
+        // A live concurrent broker must not displace the locked journal.
+        let concurrent = Events::open(&path);
+        assert!(
+            concurrent
+                .as_ref()
+                .is_err_and(|err| err.kind() == io::ErrorKind::WouldBlock),
+            "concurrent open on active journal must fail with WouldBlock"
+        );
+        drop(first);
+
+        // Second consecutive startup on the same journal rotates run 1 to `.previous`.
+        let second = Events::open(&path).unwrap();
+        second
+            .emit("starting", json!({"details":{"run":2}}))
+            .unwrap();
+        assert!(previous.is_file());
+        let prev_rows = read(&previous);
+        assert_eq!(prev_rows.len(), 1);
+        assert_eq!(prev_rows[0]["details"]["run"], 1);
+        let cur_rows = read(&path);
+        assert_eq!(cur_rows.len(), 1);
+        assert_eq!(cur_rows[0]["details"]["run"], 2);
+        assert_eq!(sequence(&cur_rows[0]), 1);
+        drop(second);
+
+        // Third consecutive startup replaces `.previous` with run 2 cleanly.
+        let third = Events::open(&path).unwrap();
+        third
+            .emit("starting", json!({"details":{"run":3}}))
+            .unwrap();
+        let prev_rows = read(&previous);
+        assert_eq!(prev_rows[0]["details"]["run"], 2);
+        let cur_rows = read(&path);
+        assert_eq!(cur_rows[0]["details"]["run"], 3);
     }
 }

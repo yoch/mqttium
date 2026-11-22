@@ -514,3 +514,60 @@ fn subscriber_maximum_packet_size_accounts_for_publish_properties() {
     stop_broker(child);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn invalid_response_topic_and_content_type_are_rejected_over_tcp() {
+    let dir = temp_dir("invalid-props");
+    let db = dir.join("broker.sqlite");
+    let events = dir.join("events.jsonl");
+    let (child, addr) = spawn_broker(&db, &events, &[]);
+
+    // 1. MQTT-3.3.2-13: Response Topic (0x08) MUST be valid UTF-8.
+    {
+        let mut client = connect_v5(addr, "bad-rt-utf8", None);
+        let mut props = Vec::new();
+        props.push(0x08);
+        mqtt_str(&[0xff, 0xfe], &mut props);
+        publish_v5(&mut client, "req/1", 1, false, Some(1), &props, b"hello");
+        let (f, b) = read_frame(&mut client);
+        assert_eq!(
+            f, 0xe0,
+            "expected DISCONNECT on invalid UTF-8 response topic"
+        );
+        assert_eq!(b[0], 0x81, "expected Malformed Packet (0x81)");
+    }
+
+    // 2. MQTT-3.3.2-14: Response Topic (0x08) MUST NOT contain '+' or '#'.
+    for (idx, bad_rt) in [b"replies/+".as_slice(), b"replies/#".as_slice()]
+        .into_iter()
+        .enumerate()
+    {
+        let mut client = connect_v5(addr, &format!("bad-rt-wild-{idx}"), None);
+        let mut props = Vec::new();
+        props.push(0x08);
+        mqtt_str(bad_rt, &mut props);
+        publish_v5(&mut client, "req/2", 1, false, Some(1), &props, b"hello");
+        let (f, b) = read_frame(&mut client);
+        assert_eq!(f, 0xe0, "expected DISCONNECT on wildcard response topic");
+        assert!(
+            matches!(b[0], 0x82 | 0x90),
+            "expected Protocol Error / Topic Name invalid, got 0x{:02x}",
+            b[0]
+        );
+    }
+
+    // 3. MQTT-3.3.2-19: Content Type (0x03) MUST be valid UTF-8.
+    {
+        let mut client = connect_v5(addr, "bad-ct-utf8", None);
+        let mut props = Vec::new();
+        props.push(0x03);
+        mqtt_str(b"text/\xff", &mut props);
+        publish_v5(&mut client, "req/3", 1, false, Some(1), &props, b"hello");
+        let (f, b) = read_frame(&mut client);
+        assert_eq!(f, 0xe0, "expected DISCONNECT on invalid UTF-8 content type");
+        assert_eq!(b[0], 0x81, "expected Malformed Packet (0x81)");
+    }
+
+    stop_broker(child);
+    let _ = std::fs::remove_dir_all(&dir);
+}

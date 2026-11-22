@@ -261,13 +261,18 @@ class Run:
                 except recipes.RecipeError:
                     slots.add(None)
                     continue
-                if not isinstance(recipe, (recipes.Admit, recipes.Release)):
+                inner = recipe
+                if isinstance(inner, recipes.AnnotatedPublication):
+                    inner = inner.inner
+                if isinstance(inner, recipes.RetainedPublication):
+                    inner = inner.admission
+                if not isinstance(inner, (recipes.Admit, recipes.Release)):
                     # New product recipes are readable descriptive evidence;
                     # the fixture assertions still describe incoming exchanges.
                     # results.unmet excludes their semantics from qualification.
                     slots.add(None)
                     continue
-                slots.add((recipe.kind, recipe.session, recipe.packet_id))
+                slots.add((inner.kind, inner.session, inner.packet_id))
             if len(slots) == 1 and None not in slots:
                 found[operation] = next(iter(slots))
         return found
@@ -491,10 +496,11 @@ def one_admission_per_observed_inbound_exchange(run):
             statuses.append(FAIL)
             reasons.append(f"the admission {operation} belongs to no exchange {slot} had open")
 
+    ADMISSION_KINDS = ("AdmitPublication", "RetainedPublication", "AnnotatedPublication")
     stable = [
         commit
         for commit in run.trace.of_kind("StoreCommitStable")
-        if commit.payload["command_kind"] == "AdmitPublication"
+        if commit.payload["command_kind"] in ADMISSION_KINDS
     ]
     for commit in stable:
         attribute(_key(commit.payload["operation_id"]), commit)
@@ -578,7 +584,7 @@ def one_admission_per_observed_inbound_exchange(run):
                 submitted = [
                     command for command in run.trace.of_kind("CommandSubmitted")
                     if _key(command.payload["operation_id"]) == operation
-                    and command.payload["command_kind"] == "AdmitPublication"
+                    and command.payload["command_kind"] in ADMISSION_KINDS
                     and any(
                         order is True and run.trace.before(command, kill) is True
                         for kill, order in zip(kills, follows)
