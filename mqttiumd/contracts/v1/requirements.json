@@ -263,6 +263,11 @@
       "decision": "0048",
       "path": "docs/decisions/0048-runtime-limits.md",
       "sha256": "8d11753aea3d61ecd0ecd75cba2e3500398675a02896cfc2ff08db0edb73501b"
+    },
+    {
+      "decision": "0049",
+      "path": "docs/decisions/0049-functional-compatibility.md",
+      "sha256": "efcc254df16de89f7ecd8f9820212833087758df632b81a2319a2fd63c46b24c"
     }
   ],
   "entries": [

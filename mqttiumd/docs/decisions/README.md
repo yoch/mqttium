@@ -63,6 +63,7 @@ its source; a test fails when the register and the records drift apart.
 | [0046](0046-input-backpressure.md) | Accepted with amendments | Input pressure slows a peer instead of disconnecting it: a packet the core cannot take waits in order, a full input lane holds its packet without a deadline, the last places of the lane are kept for packets that release capacity; receipts keep their deadline | Runtime tier |
 | [0047](0047-precedence-between-records.md) | Accepted | Precedence between decision records: the later record prevails on the point it states and the earlier one carries an "Amended by" line | All records |
 | [0048](0048-runtime-limits.md) | Accepted | Capacities of the runtime and their derivation: the sixteen-connection numbers of eight records describe the bounded profile | Runtime |
+| [0049](0049-functional-compatibility.md) | Accepted | Compatibility with the reference broker is functional: the specification prevails over Mosquitto, and the choices where it allows both (0x10 for a publication without subscriber, one copy for overlapping subscriptions, precise refusal codes) | Contract, core, runtime, compatibility bench |
 
 What each record leaves open is tracked in
 [`../reception/open-conditions.md`](../reception/open-conditions.md).
