@@ -76,6 +76,11 @@ def _key(identity: dict) -> tuple:
     return tuple(int(identity[name]) for name in _COMPONENTS if name in identity)
 
 
+# The reasons of a frame that accepts what it answers. "No matching
+# subscribers" is a success of a PUBREC (record 0049): the rules of a
+# positive acknowledgement hold for it and those of a refusal do not.
+POSITIVE_REASONS = frozenset({"Success", "NoMatchingSubscribers"})
+
 _PACKET_KINDS = {1: "CONNECT", 3: "PUBLISH", 6: "PUBREL"}
 _OBSERVED_KINDS = {2: "CONNACK", 5: "PUBREC", 7: "PUBCOMP"}
 
@@ -958,7 +963,7 @@ def no_positive_ack_before_confirmed_commit(run):
                     learned["PUBREC"].update(pending)
                     pending = {}
             elif record.kind == "FrameEligible" and payload["packet_kind"] in learned:
-                if payload["reason"] != "Success":
+                if payload["reason"] not in POSITIVE_REASONS:
                     continue
                 kind = payload["packet_kind"]
                 slot = (int(payload["connection"]["session"]), payload["packet_id"])
@@ -1347,7 +1352,7 @@ def refusal_carries_the_reason_of_its_rejection(run):
     statuses, reasons = [], []
     for frame in run.trace.of_kind("FrameEligible"):
         payload = frame.payload
-        if payload["packet_kind"] != "PUBREC" or payload["reason"] == "Success":
+        if payload["packet_kind"] != "PUBREC" or payload["reason"] in POSITIVE_REASONS:
             continue
         causes = [
             by_key[key]

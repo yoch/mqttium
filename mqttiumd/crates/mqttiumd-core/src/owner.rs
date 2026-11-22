@@ -393,6 +393,11 @@ struct Slot {
     /// The latest PUBLISH of this active occurrence. Recovery supplies no
     /// invented network ingress order.
     publish_origin: Option<(ConnectionGeneration, u64)>,
+    /// The admission of this exchange named no target: its positive
+    /// acknowledgement says that no subscription matched (record 0049).
+    /// `false` for an exchange read from durable data, whose targets this
+    /// owner never selected.
+    unmatched: bool,
     /// The lease of the exchange in the account of the owner, held until
     /// the exchange ends.
     lease: LeaseKey,
@@ -409,6 +414,24 @@ struct Slot {
 }
 
 impl Slot {
+    /// The reason of the PUBREC that accepts this exchange.
+    const fn pubrec_reason(&self) -> AckReason {
+        if self.unmatched {
+            AckReason::NoMatchingSubscribers
+        } else {
+            AckReason::Success
+        }
+    }
+
+    /// The reason of the PUBACK that accepts this exchange.
+    const fn puback_reason(&self) -> PubackReason {
+        if self.unmatched {
+            PubackReason::NoMatchingSubscribers
+        } else {
+            PubackReason::Success
+        }
+    }
+
     fn in_flight(&self) -> Option<InFlight> {
         match self.state {
             SlotState::AdmissionPending(in_flight) | SlotState::ReleasePending(in_flight) => {
@@ -486,6 +509,7 @@ enum Change {
         publication: PublicationId,
         qos: Qos,
         publish_origin: (ConnectionGeneration, u64),
+        unmatched: bool,
         cost: Credits,
         in_flight: InFlight,
     },
@@ -1686,7 +1710,7 @@ impl Owner {
                     SlotState::AwaitPubrel => {
                         let frame = OutboundFrame::Pubrec {
                             packet_id,
-                            reason: AckReason::Success,
+                            reason: held.pubrec_reason(),
                         };
                         draft.publish_frame(key, frame, Some(ingress_order))?;
                         Ok(Change::Replay {
@@ -1968,6 +1992,7 @@ impl Owner {
             publication,
             qos,
             publish_origin,
+            unmatched: targets == 0,
             cost,
             in_flight,
         })
@@ -2204,9 +2229,10 @@ impl Owner {
                 }
                 if admission {
                     if slot.qos == Qos::AtLeastOnce {
-                        return self.plan_puback(index, finished, PubackReason::Success, draft);
+                        return self.plan_puback(index, finished, slot.puback_reason(), draft);
                     }
                     // PUBREC becomes eligible here and nowhere earlier.
+                    let reason = slot.pubrec_reason();
                     self.plan_answer(slot, OutboundFrame::Pubrec { packet_id, reason }, draft)?;
                     Ok(Change::Committed {
                         slot: index,
@@ -2708,6 +2734,7 @@ impl Owner {
                 publication,
                 qos,
                 publish_origin,
+                unmatched,
                 cost,
                 in_flight,
             } => {
@@ -2720,6 +2747,7 @@ impl Owner {
                     publication,
                     qos,
                     publish_origin: Some(publish_origin),
+                    unmatched,
                     lease,
                     admission: None,
                     release_preparations: 0,
@@ -2940,6 +2968,7 @@ impl Owner {
                     publication: *publication,
                     qos: Qos::ExactlyOnce,
                     publish_origin: None,
+                    unmatched: false,
                     lease,
                     admission: None,
                     release_preparations: 0,

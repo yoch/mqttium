@@ -1220,6 +1220,23 @@ pub fn encode_for(version: Version, frame: OutboundFrame) -> Result<Vec<u8>, Err
         }
         | OutboundFrame::Pubrel { .. }
         | OutboundFrame::Pingresp => encode(frame),
+        // MQTT 3.1.1 has no reason code: a publication accepted without a
+        // matching subscription is acknowledged like any other (record
+        // 0049).
+        OutboundFrame::Puback {
+            packet_id,
+            reason: PubackReason::NoMatchingSubscribers,
+        } => encode(OutboundFrame::Puback {
+            packet_id,
+            reason: PubackReason::Success,
+        }),
+        OutboundFrame::Pubrec {
+            packet_id,
+            reason: AckReason::NoMatchingSubscribers,
+        } => encode(OutboundFrame::Pubrec {
+            packet_id,
+            reason: AckReason::Success,
+        }),
         OutboundFrame::Pubcomp {
             packet_id,
             reason: AckReason::PacketIdentifierNotFound,
@@ -2475,6 +2492,10 @@ mod tests {
         let packet_id = InboundPacketId::new(7).unwrap();
         for (reason, expected) in [
             (PubackReason::Success, vec![0x40, 2, 0, 7]),
+            (
+                PubackReason::NoMatchingSubscribers,
+                vec![0x40, 3, 0, 7, 0x10],
+            ),
             (PubackReason::QuotaExceeded, vec![0x40, 3, 0, 7, 0x97]),
             (
                 PubackReason::ImplementationSpecificError,

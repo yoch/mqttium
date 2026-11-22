@@ -61,6 +61,7 @@
     "contracts/examples/v1/valid/trace-record-input-refused.json",
     "contracts/examples/v1/valid/trace-record-held-item-released.json",
     "contracts/examples/v1/valid/trace-record-frame-eligible.json",
+    "contracts/examples/v1/valid/trace-record-frame-eligible-no-matching-subscribers.json",
     "contracts/examples/v1/valid/trace-record-frame-eligible-refusal-without-quota.json",
     "contracts/examples/v1/valid/trace-record-frame-eligible-connack.json",
     "contracts/examples/v1/valid/trace-record-store-fence-refused.json",

@@ -1701,6 +1701,10 @@ ELIGIBLE = record(
 )
 ok("trace-record-frame-eligible.json", ELIGIBLE)
 ok(
+    "trace-record-frame-eligible-no-matching-subscribers.json",
+    {**ELIGIBLE, "payload": {**ELIGIBLE["payload"], "reason": "NoMatchingSubscribers"}},
+)
+ok(
     "trace-record-frame-eligible-refusal-without-quota.json",
     {**ELIGIBLE, "payload": {**ELIGIBLE["payload"], "reason": "ImplementationSpecificError"}},
 )

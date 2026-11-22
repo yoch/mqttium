@@ -4713,9 +4713,9 @@ impl EffectSink for Sink<'_> {
                 let terminal = match frame {
                     OutboundFrame::Puback { .. } => Some(Terminal::Puback),
                     OutboundFrame::Pubcomp { .. } => Some(Terminal::Pubcomp),
-                    OutboundFrame::Pubrec { reason, .. }
-                        if reason != mqttiumd_contract::packet::AckReason::Success =>
-                    {
+                    // A PUBREC that accepts, with or without a matching
+                    // subscription, leaves the exchange open to its PUBREL.
+                    OutboundFrame::Pubrec { reason, .. } if !reason.is_success() => {
                         Some(Terminal::RejectedPubrec)
                     }
                     _ => None,

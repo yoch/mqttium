@@ -2097,6 +2097,13 @@ fn a_real_puback_write_receipt_returns_its_receive_credit() {
     });
 }
 
+/// The body of the PUBACK or PUBREC that accepts a publication of an
+/// MQTT 5 client on a topic nobody subscribed to: "No matching
+/// subscribers" (record 0049).
+fn unmatched(id: u16) -> Vec<u8> {
+    [&id.to_be_bytes()[..], &[0x10]].concat()
+}
+
 fn seven_qos2(runtime: &mut Runtime<'_>, generation: ConnectionGeneration, client: &mut TcpStream) {
     let session = runtime.sessions[b"flow-new-id".as_slice()].id;
     for id in 1..=7 {
@@ -2106,7 +2113,7 @@ fn seven_qos2(runtime: &mut Runtime<'_>, generation: ConnectionGeneration, clien
                 .exchange(session, InboundPacketId::new(id).unwrap())
                 .is_some_and(|(_, phase)| phase == ExchangePhase::AwaitPubrel)
         });
-        assert_eq!(read_frame(client), (0x50, id.to_be_bytes().to_vec()));
+        assert_eq!(read_frame(client), (0x50, unmatched(id)));
     }
 }
 
@@ -2122,7 +2129,7 @@ fn a_new_identifier_after_received_puback_does_not_exceed_receive_maximum() {
         seven_qos2(runtime, generation, &mut client);
         runtime.packet(generation, 0x32, publish_body(8)).unwrap();
         until(runtime, |r| r.frames.values().any(|p| p.kind == "PUBACK"));
-        assert_eq!(read_frame(&mut client), (0x40, vec![0, 8]));
+        assert_eq!(read_frame(&mut client), (0x40, unmatched(8)));
         assert!(
             runtime.frames.values().any(|p| p.kind == "PUBACK"),
             "the core's write receipt is still unprocessed"
@@ -2156,7 +2163,7 @@ fn a_new_identifier_after_received_puback_does_not_exceed_receive_maximum() {
                 .values()
                 .any(|p| p.kind == "PUBACK" && p.packet_id == Some(9))
         });
-        assert_eq!(read_frame(&mut client), (0x40, vec![0, 9]));
+        assert_eq!(read_frame(&mut client), (0x40, unmatched(9)));
     });
 }
 
@@ -2176,7 +2183,7 @@ fn a_received_puback_can_precede_publication_of_its_network_progress() {
         runtime.peers[&generation].io.pause_wire_progress(true);
         runtime.packet(generation, 0x32, publish_body(8)).unwrap();
         until(runtime, |r| r.frames.values().any(|p| p.kind == "PUBACK"));
-        assert_eq!(read_frame(&mut client), (0x40, vec![0, 8]));
+        assert_eq!(read_frame(&mut client), (0x40, unmatched(8)));
         let deadline = Instant::now() + Duration::from_secs(1);
         while !runtime.peers[&generation].io.wire_progress_is_waiting() && Instant::now() < deadline
         {
@@ -2215,7 +2222,7 @@ fn a_received_puback_can_precede_publication_of_its_network_progress() {
                 .values()
                 .any(|p| p.kind == "PUBACK" && p.packet_id == Some(9))
         });
-        assert_eq!(read_frame(&mut client), (0x40, vec![0, 9]));
+        assert_eq!(read_frame(&mut client), (0x40, unmatched(9)));
         assert!(runtime.peers[&generation].deferred_publish.is_none());
     });
 }
@@ -2237,7 +2244,7 @@ fn eight_live_qos2_exchanges_still_refuse_a_genuine_ninth_identifier() {
                 .exchange(session, InboundPacketId::new(8).unwrap())
                 .is_some_and(|(_, phase)| phase == ExchangePhase::AwaitPubrel)
         });
-        assert_eq!(read_frame(&mut client), (0x50, vec![0, 8]));
+        assert_eq!(read_frame(&mut client), (0x50, unmatched(8)));
         runtime.packet(generation, 0x32, publish_body(9)).unwrap();
         assert_eq!(
             runtime.peers[&generation].closing.map(|v| v.0),
@@ -2263,7 +2270,7 @@ fn a_new_identifier_progresses_while_the_old_core_ack_receipt_is_held() {
         seven_qos2(runtime, generation, &mut client);
         runtime.packet(generation, 0x32, publish_body(8)).unwrap();
         until(runtime, |r| r.deferred_ack.is_some());
-        assert_eq!(read_frame(&mut client), (0x40, vec![0, 8]));
+        assert_eq!(read_frame(&mut client), (0x40, unmatched(8)));
         let mut bytes = vec![0x32, 7];
         bytes.extend_from_slice(&publish_body(9));
         client.write_all(&bytes).unwrap();
@@ -2288,7 +2295,7 @@ fn a_new_identifier_progresses_while_the_old_core_ack_receipt_is_held() {
                 .is_some_and(|p| p.closing.is_none()),
             "Receive Maximum must use actual wire progress independently of the held core receipt"
         );
-        assert_eq!(read_frame(&mut client), (0x40, vec![0, 9]));
+        assert_eq!(read_frame(&mut client), (0x40, unmatched(9)));
         assert!(
             runtime.deferred_ack.is_some(),
             "the old core receipt was not released to make this pass"
@@ -2311,7 +2318,7 @@ fn a_peer_reuses_qos1_identifier_before_the_old_internal_written_receipt() {
         until(runtime, |r| r.frames.values().any(|p| p.kind == "PUBACK"));
         // This read proves the client can legally reuse PI 1. Deliberately do
         // not poll the socket's internal Written channel before the new input.
-        assert_eq!(read_frame(&mut client), (0x40, vec![0, 1]));
+        assert_eq!(read_frame(&mut client), (0x40, unmatched(1)));
         let old = *runtime
             .frames
             .iter()
@@ -2348,7 +2355,7 @@ fn a_peer_reuses_qos1_identifier_before_the_old_internal_written_receipt() {
             ExchangePhase::AdmissionPending
         );
         until(runtime, |r| r.frames.values().any(|p| p.kind == "PUBACK"));
-        assert_eq!(read_frame(&mut client), (0x40, vec![0, 1]));
+        assert_eq!(read_frame(&mut client), (0x40, unmatched(1)));
     });
 }
 
