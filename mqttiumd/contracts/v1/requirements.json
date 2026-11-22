@@ -252,7 +252,7 @@
     {
       "decision": "0046",
       "path": "docs/decisions/0046-input-backpressure.md",
-      "sha256": "419df1f7d3940f806e4b5f986445a21b304453b76f64df40c2b2bafc83c96fa0"
+      "sha256": "d2a77b383674b952d14c0079e19a72227df986efe39b89dae442def2a23a8c3f"
     },
     {
       "decision": "0047",
@@ -268,6 +268,11 @@
       "decision": "0049",
       "path": "docs/decisions/0049-functional-compatibility.md",
       "sha256": "efcc254df16de89f7ecd8f9820212833087758df632b81a2319a2fd63c46b24c"
+    },
+    {
+      "decision": "0050",
+      "path": "docs/decisions/0050-acknowledgements-in-order-of-reception.md",
+      "sha256": "62b21ad68a2f35c8bd615cab0494a6b0d133e2aa0508831bf5f83e9ef122ec1e"
     }
   ],
   "entries": [

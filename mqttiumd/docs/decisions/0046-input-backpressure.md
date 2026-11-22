@@ -27,6 +27,11 @@ cost grew with their number and brought the broker to a standstill. The
 five-second bound of a wait for a credit ran from the start of the wait;
 it runs from the last credit the broker returned.
 
+Amended by 0050 (record 0047): the broker's own PUBACK and PUBREC no
+longer follow the results of the store. The paragraph of "Left open" that
+records the later acknowledgement leaving first describes the product
+before that record.
+
 ## Context
 
 Two bounded waits of the first product adapter ended a connection under
