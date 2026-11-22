@@ -384,6 +384,44 @@ enum SlotState {
         effect: EffectId,
         connection: ConnectionKey,
     },
+    /// The result of the admission is known and consumed, and `frame`
+    /// answers it, but an earlier publication of the same connection has
+    /// no answer yet: the frame waits its turn (record 0050). `resent`
+    /// says the frame repeats a PUBREC, for a PUBLISH received again while
+    /// the exchange awaited its PUBREL: the client may then send PUBREL.
+    AnswerHeld {
+        frame: OutboundFrame,
+        resent: bool,
+    },
+}
+
+/// A held answer the plan of a transition releases beside its change.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct Released {
+    slot: usize,
+    next: Next,
+}
+
+/// What an exchange becomes when its held answer leaves.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Next {
+    /// A PUBACK waits for its write receipt.
+    Ack {
+        effect: EffectId,
+        connection: ConnectionKey,
+    },
+    /// A PUBREC that accepts: the exchange awaits its PUBREL.
+    AwaitPubrel,
+    /// A PUBREC that refuses: the exchange is over.
+    End,
+}
+
+/// One slot seen as the transition being planned leaves it: unanswered at
+/// `order` in the order of its connection, or answered (`None`).
+#[derive(Clone, Copy)]
+struct Seen {
+    slot: usize,
+    order: Option<u64>,
 }
 
 /// One bounded inbound occurrence, using the shared admission path.
@@ -441,9 +479,10 @@ impl Slot {
             SlotState::AdmissionPending(in_flight) | SlotState::ReleasePending(in_flight) => {
                 Some(in_flight)
             }
-            SlotState::AwaitPubrel | SlotState::ReleaseRetry(_) | SlotState::AckPending { .. } => {
-                None
-            }
+            SlotState::AwaitPubrel
+            | SlotState::ReleaseRetry(_)
+            | SlotState::AckPending { .. }
+            | SlotState::AnswerHeld { .. } => None,
         }
     }
 }
@@ -534,6 +573,18 @@ enum Change {
         effect: EffectId,
         connection: ConnectionKey,
     },
+    /// The answer of the exchange is known and waits for the answers of
+    /// earlier publications of its connection (record 0050). `admission`
+    /// is the operation the result ended, absent when the frame repeats a
+    /// PUBREC; `publish_origin` is the new occurrence of a PUBLISH
+    /// received again.
+    Hold {
+        slot: usize,
+        admission: Option<Finished>,
+        frame: OutboundFrame,
+        resent: bool,
+        publish_origin: Option<(ConnectionGeneration, u64)>,
+    },
     /// The exchange ends with the operation it waited for, and gives its
     /// lease back.
     End {
@@ -593,6 +644,8 @@ struct Plan {
     closed: Option<ConnectionGeneration>,
     receipt_issued: Option<receipts::Entry>,
     receipt_consumed: Option<OperationId>,
+    /// The held answer the transition releases beside its change.
+    released: Option<Released>,
 }
 
 /// What a plan draws and publishes while it is computed.
@@ -605,6 +658,7 @@ struct Draft {
     closed: Option<ConnectionGeneration>,
     receipt_issued: Option<receipts::Entry>,
     receipt_consumed: Option<OperationId>,
+    released: Option<Released>,
 }
 
 impl Draft {
@@ -1049,6 +1103,7 @@ impl Owner {
             SlotState::ReleasePending(_) | SlotState::ReleaseRetry(_) => {
                 ExchangePhase::ReleasePending
             }
+            SlotState::AnswerHeld { .. } => ExchangePhase::AnswerHeld,
             SlotState::AckPending { .. } => return None,
         };
         Some((slot.exchange, phase))
@@ -1204,6 +1259,7 @@ impl Owner {
             closed: None,
             receipt_issued: None,
             receipt_consumed: None,
+            released: None,
         };
         let planned = self
             .revision
@@ -1252,6 +1308,7 @@ impl Owner {
                     closed: draft.closed,
                     receipt_issued: draft.receipt_issued,
                     receipt_consumed: draft.receipt_consumed,
+                    released: draft.released,
                 })
             }
             Err(stop) => Err(Refusal {
@@ -1706,16 +1763,36 @@ impl Owner {
                 let publish_origin = (connection, ingress_order);
                 match held.state {
                     // The exchange owns its admission: the replay creates
-                    // no command and no acknowledgement (ADR 0001).
-                    SlotState::AdmissionPending(_) => Ok(Change::Replay {
-                        slot,
-                        publish_origin,
-                    }),
+                    // no command and no acknowledgement (ADR 0001). It
+                    // takes a new place in the order of its connection:
+                    // an answer it preceded may leave (record 0050).
+                    SlotState::AdmissionPending(_) | SlotState::AnswerHeld { .. } => {
+                        let seen = Seen {
+                            slot,
+                            order: Some(ingress_order),
+                        };
+                        self.plan_held_release(session.id, Some(seen), draft)?;
+                        Ok(Change::Replay {
+                            slot,
+                            publish_origin,
+                        })
+                    }
                     SlotState::AwaitPubrel => {
                         let frame = OutboundFrame::Pubrec {
                             packet_id,
                             reason: held.pubrec_reason(),
                         };
+                        // The PUBREC sent again waits for the answers of
+                        // the publications received before this copy.
+                        if self.preceded(session.id, ingress_order, None) {
+                            return Ok(Change::Hold {
+                                slot,
+                                admission: None,
+                                frame,
+                                resent: true,
+                                publish_origin: Some(publish_origin),
+                            });
+                        }
                         draft.publish_frame(key, frame, Some(ingress_order))?;
                         Ok(Change::Replay {
                             slot,
@@ -1744,7 +1821,17 @@ impl Owner {
                 }
                 match held.state {
                     // No PUBREC of this exchange was ever made eligible.
-                    SlotState::AdmissionPending(_) => protocol_error(draft),
+                    SlotState::AdmissionPending(_)
+                    | SlotState::AnswerHeld { resent: false, .. } => protocol_error(draft),
+                    // The held frame repeats a PUBREC the client may hold:
+                    // its PUBREL is served and the repetition never leaves.
+                    // An answer this exchange preceded may leave.
+                    SlotState::AnswerHeld { resent: true, .. } => {
+                        let change = self.plan_release(slot, None, draft)?;
+                        let seen = Seen { slot, order: None };
+                        self.plan_held_release(session.id, Some(seen), draft)?;
+                        Ok(change)
+                    }
                     SlotState::AwaitPubrel => self.plan_release(slot, None, draft),
                     // No second release, and no PUBCOMP before the commit.
                     SlotState::ReleasePending(_) | SlotState::ReleaseRetry(_) => {
@@ -2087,6 +2174,106 @@ impl Owner {
         })
     }
 
+    /// The place of an exchange in the order of the connection that is
+    /// current for its session: the ingress order of its PUBLISH, when
+    /// that PUBLISH came on this connection. An exchange read from durable
+    /// data, or whose PUBLISH came on a connection since replaced, has no
+    /// place: it neither waits nor makes another wait (record 0050).
+    fn place(&self, slot: &Slot) -> Option<u64> {
+        let generation = self.connection_of(slot.session)?;
+        slot.publish_origin
+            .filter(|(origin, _)| *origin == generation)
+            .map(|(_, order)| order)
+    }
+
+    /// Whether an answer at `order` on the connection of `session` would
+    /// overtake: another exchange of the session whose PUBLISH came
+    /// earlier on that connection has no answer yet, its admission pending
+    /// or its own answer held. `seen` replaces what the state says of the
+    /// one slot the transition being planned changes.
+    fn preceded(&self, session: SessionId, order: u64, seen: Option<Seen>) -> bool {
+        self.slots
+            .as_slice()
+            .iter()
+            .enumerate()
+            .filter(|(_, slot)| slot.session == session)
+            .any(|(index, slot)| {
+                let unanswered = match seen {
+                    Some(seen) if seen.slot == index => seen.order,
+                    _ if matches!(
+                        slot.state,
+                        SlotState::AdmissionPending(_) | SlotState::AnswerHeld { .. }
+                    ) =>
+                    {
+                        self.place(slot)
+                    }
+                    _ => None,
+                };
+                unanswered.is_some_and(|earlier| earlier < order)
+            })
+    }
+
+    /// Whether the answer of `slot` must wait its turn.
+    fn must_wait(&self, slot: &Slot) -> bool {
+        self.place(slot)
+            .is_some_and(|order| self.preceded(slot.session, order, None))
+    }
+
+    /// Makes the oldest held answer of `session` eligible when nothing
+    /// precedes it any more: one for each transition, beside its change,
+    /// and only while the plan has room for its frame. The receipt of the
+    /// frame is an input of its own, which releases the next (record 0050).
+    fn plan_held_release(
+        &self,
+        session: SessionId,
+        seen: Option<Seen>,
+        draft: &mut Draft,
+    ) -> Result<(), Stop> {
+        if draft.released.is_some() || draft.effects.count >= MAX_TRANSITION_EFFECTS {
+            return Ok(());
+        }
+        let Some(generation) = self.connection_of(session) else {
+            return Ok(());
+        };
+        let place = |index: usize, slot: &Slot| match seen {
+            Some(seen) if seen.slot == index => seen.order,
+            _ => self.place(slot),
+        };
+        let oldest = self
+            .slots
+            .as_slice()
+            .iter()
+            .enumerate()
+            .filter(|(_, slot)| slot.session == session)
+            // A slot the transition answers itself holds nothing to release.
+            .filter(|(index, _)| {
+                !seen.is_some_and(|seen| seen.slot == *index && seen.order.is_none())
+            })
+            .filter_map(|(index, slot)| match slot.state {
+                SlotState::AnswerHeld { frame, .. } => Some((place(index, slot), index, frame)),
+                _ => None,
+            })
+            .min_by_key(|(order, index, _)| (*order, *index));
+        let Some((order, index, frame)) = oldest else {
+            return Ok(());
+        };
+        if order.is_some_and(|order| self.preceded(session, order, seen)) {
+            return Ok(());
+        }
+        let connection = ConnectionKey {
+            session,
+            generation,
+        };
+        let effect = draft.publish_frame(connection, frame, order)?;
+        let next = match frame {
+            OutboundFrame::Puback { .. } => Next::Ack { effect, connection },
+            OutboundFrame::Pubrec { reason, .. } if reason.is_success() => Next::AwaitPubrel,
+            _ => Next::End,
+        };
+        draft.released = Some(Released { slot: index, next });
+        Ok(())
+    }
+
     /// The frame that answers an exchange goes to the connection that is
     /// current when its operation completes; without one nothing is
     /// emitted, and the commit is reconciled all the same (ADR 0001).
@@ -2132,6 +2319,15 @@ impl Owner {
             packet_id: slot.packet_id,
             reason,
         };
+        if self.must_wait(slot) {
+            return Ok(Change::Hold {
+                slot: index,
+                admission: Some(finished),
+                frame,
+                resent: false,
+                publish_origin: None,
+            });
+        }
         match self.plan_answer_frame(slot, frame, draft)? {
             Some((effect, connection)) => Ok(Change::AckReady {
                 slot: index,
@@ -2146,7 +2342,31 @@ impl Owner {
         }
     }
 
+    /// Applies the result of a command, then lets the oldest held answer
+    /// of the same session leave if the result answered or ended what
+    /// preceded it (record 0050).
     fn plan_result(
+        &self,
+        effect: EffectId,
+        operation: OperationId,
+        reply: &StoreReply,
+        draft: &mut Draft,
+    ) -> Result<Change, Stop> {
+        let change = self.plan_result_change(effect, operation, reply, draft)?;
+        let (index, seen) = match change {
+            Change::Committed { slot, .. }
+            | Change::AckReady { slot, .. }
+            | Change::End { slot, .. } => (slot, Some(Seen { slot, order: None })),
+            // The exchange stays without an answer, at its place.
+            Change::Hold { slot, .. } => (slot, None),
+            _ => return Ok(change),
+        };
+        let session = self.slots.as_slice()[index].session;
+        self.plan_held_release(session, seen, draft)?;
+        Ok(change)
+    }
+
+    fn plan_result_change(
         &self,
         effect: EffectId,
         operation: OperationId,
@@ -2237,7 +2457,17 @@ impl Owner {
                     }
                     // PUBREC becomes eligible here and nowhere earlier.
                     let reason = slot.pubrec_reason();
-                    self.plan_answer(slot, OutboundFrame::Pubrec { packet_id, reason }, draft)?;
+                    let frame = OutboundFrame::Pubrec { packet_id, reason };
+                    if self.must_wait(slot) {
+                        return Ok(Change::Hold {
+                            slot: index,
+                            admission: Some(finished),
+                            frame,
+                            resent: false,
+                            publish_origin: None,
+                        });
+                    }
+                    self.plan_answer(slot, frame, draft)?;
                     Ok(Change::Committed {
                         slot: index,
                         admission: finished,
@@ -2277,6 +2507,15 @@ impl Owner {
                         packet_id: slot.packet_id,
                         reason: AckReason::refusing(rejection),
                     };
+                    if self.must_wait(slot) {
+                        return Ok(Change::Hold {
+                            slot: index,
+                            admission: Some(finished),
+                            frame,
+                            resent: false,
+                            publish_origin: None,
+                        });
+                    }
                     self.plan_answer(slot, frame, draft)?;
                     return Ok(Change::End {
                         slot: index,
@@ -2455,11 +2694,17 @@ impl Owner {
                 };
                 (held == effect && destination == connection).then_some((index, slot.admission))
             });
+        // The receipt of a frame of the current connection is where the
+        // next held answer of its session leaves (record 0050): each
+        // acknowledgement released brings such a receipt.
+        let current = self.connection_of(connection.session) == Some(connection.generation);
         if (failed || completed)
             && let Some((slot, Some(finished))) = ended
         {
-            if failed && self.connection_of(connection.session) == Some(connection.generation) {
+            if failed && current {
                 draft.end(connection.generation)?;
+            } else if current {
+                self.plan_held_release(connection.session, None, draft)?;
             }
             return Ok(Change::End { slot, finished });
         }
@@ -2470,7 +2715,12 @@ impl Owner {
                 draft.end(connection.generation)?;
                 Ok(Change::Unbind { session })
             }
-            _ => Ok(Change::Nothing),
+            _ => {
+                if current && !failed {
+                    self.plan_held_release(connection.session, None, draft)?;
+                }
+                Ok(Change::Nothing)
+            }
         }
     }
 
@@ -2645,6 +2895,7 @@ impl Owner {
             closed,
             receipt_issued,
             receipt_consumed,
+            released,
             ..
         } = plan;
         let reserved = match reservation {
@@ -2662,7 +2913,34 @@ impl Owner {
             .checked_next()
             .map_err(|_| CoreFault::StalePlan)?;
 
+        // A release that leaves its slot in place is applied first: the
+        // change may remove a slot and move the last one. One that removes
+        // its slot is applied after the change, unless the change removes
+        // a slot of a smaller index: the larger index is removed first, so
+        // that neither removal moves the slot of the other.
+        let after = match (released, &change) {
+            (
+                Some(Released {
+                    slot,
+                    next: Next::End,
+                }),
+                Change::End { slot: ended, .. },
+            ) => slot < *ended,
+            (
+                Some(Released {
+                    next: Next::End, ..
+                }),
+                _,
+            ) => true,
+            _ => false,
+        };
+        if !after && let Some(released) = released {
+            self.apply_release(released)?;
+        }
         self.apply_change(change, input)?;
+        if after && let Some(released) = released {
+            self.apply_release(released)?;
+        }
         self.receipts.apply_issued(receipt_issued)?;
         self.receipts.consume(receipt_consumed)?;
         if let Some(connection) = closed {
@@ -2790,6 +3068,32 @@ impl Owner {
                 held.admission = Some(admission);
                 held.state = SlotState::AckPending { effect, connection };
             }
+            Change::Hold {
+                slot,
+                admission,
+                frame,
+                resent,
+                publish_origin,
+            } => {
+                let held = self.slots.as_mut_slice().get_mut(slot).ok_or(STALE)?;
+                // A first answer is held with the result that produced it;
+                // a PUBREC sent again, for an exchange that awaits PUBREL.
+                let expected = match (resent, held.state) {
+                    (false, SlotState::AdmissionPending(_)) => admission.is_some(),
+                    (true, SlotState::AwaitPubrel) => admission.is_none(),
+                    _ => false,
+                };
+                if !expected {
+                    return Err(STALE);
+                }
+                if admission.is_some() {
+                    held.admission = admission;
+                }
+                if publish_origin.is_some() {
+                    held.publish_origin = publish_origin;
+                }
+                held.state = SlotState::AnswerHeld { frame, resent };
+            }
             Change::End { slot, finished } => {
                 let slots = self.slots.as_mut_slice();
                 let last = slots.len().checked_sub(1).ok_or(STALE)?;
@@ -2854,7 +3158,70 @@ impl Owner {
         Ok(())
     }
 
+    /// A held answer left: its exchange goes where the answer takes it.
+    fn apply_release(&mut self, released: Released) -> Result<(), CoreFault> {
+        const STALE: CoreFault = CoreFault::StalePlan;
+        let held = self
+            .slots
+            .as_mut_slice()
+            .get_mut(released.slot)
+            .ok_or(STALE)?;
+        if !matches!(held.state, SlotState::AnswerHeld { .. }) {
+            return Err(STALE);
+        }
+        match released.next {
+            Next::Ack { effect, connection } => {
+                held.state = SlotState::AckPending { effect, connection };
+            }
+            Next::AwaitPubrel => held.state = SlotState::AwaitPubrel,
+            Next::End => self.end_held(released.slot)?,
+        }
+        Ok(())
+    }
+
+    /// Ends an exchange whose answer was held: its lease returns and the
+    /// operation its result ended stays visible to a late result.
+    fn end_held(&mut self, index: usize) -> Result<(), CoreFault> {
+        const STALE: CoreFault = CoreFault::StalePlan;
+        let held = *self.slots.as_slice().get(index).ok_or(STALE)?;
+        let finished = held.admission.ok_or(STALE)?;
+        if self.leases.release(held.lease) != Ok(ReleaseOutcome::Released) {
+            return Err(STALE);
+        }
+        let last = self.slots.len().checked_sub(1).ok_or(STALE)?;
+        self.slots.as_mut_slice().swap(index, last);
+        let _ = self.slots.pop();
+        remember(&mut self.finished, finished)
+    }
+
     fn finish_closed_acks(&mut self, connection: ConnectionGeneration) -> Result<(), CoreFault> {
+        // A held answer does not outlive the connection it waited on. A
+        // PUBREC that accepts leaves its exchange awaiting PUBREL, to be
+        // answered when the client sends the PUBLISH again; a PUBACK, or a
+        // PUBREC that refuses, ends its exchange as it would have with no
+        // connection to answer on (record 0050).
+        let mut index = 0;
+        while index < self.slots.len() {
+            let held = self.slots.as_slice()[index];
+            let SlotState::AnswerHeld { frame, .. } = held.state else {
+                index += 1;
+                continue;
+            };
+            if !held
+                .publish_origin
+                .is_some_and(|(origin, _)| origin == connection)
+            {
+                index += 1;
+                continue;
+            }
+            if matches!(frame, OutboundFrame::Pubrec { reason, .. } if reason.is_success()) {
+                self.slots.as_mut_slice()[index].state = SlotState::AwaitPubrel;
+                index += 1;
+            } else {
+                // The last slot takes this place and is looked at next.
+                self.end_held(index)?;
+            }
+        }
         let mut index = 0;
         while index < self.slots.len() {
             let held = self.slots.as_slice()[index];
@@ -6092,29 +6459,57 @@ mod tests {
             (ExactlyOnce, AtLeastOnce),
             (AtLeastOnce, ExactlyOnce),
         ] {
-            let case = format!("{first:?} then {second:?}");
             let mut world = World::connected();
             let earlier = world.submit(ordered(CONN, 7, first, 1));
             let later = world.submit(ordered(CONN, 8, second, 2));
             assert!(
                 world.sent(committed(&later)).is_empty(),
-                "{case}: an acknowledgement overtook an earlier publication"
+                "{first:?} then {second:?}: an acknowledgement overtook an earlier publication"
             );
             if second == ExactlyOnce {
-                assert_eq!(world.phase(8), Some(ExchangePhase::AnswerHeld), "{case}");
+                assert_eq!(
+                    world.phase(8),
+                    Some(ExchangePhase::AnswerHeld),
+                    "{first:?} then {second:?}"
+                );
             }
             world.applied(committed(&earlier));
             assert_eq!(
                 answered(&world.drain()),
                 [(answer_of(first), 7, CONN), (answer_of(second), 8, CONN)],
-                "{case}"
+                "{first:?} then {second:?}"
             );
             if second == ExactlyOnce {
-                assert_eq!(world.phase(8), AWAIT, "{case}");
+                assert_eq!(world.phase(8), AWAIT, "{first:?} then {second:?}");
                 let release = world.submit(pubrel(8));
-                assert_eq!(world.sent(committed(&release)), ["EmitPubcomp"], "{case}");
+                assert_eq!(
+                    world.sent(committed(&release)),
+                    ["EmitPubcomp"],
+                    "{first:?} then {second:?}"
+                );
             }
         }
+    }
+
+    /// The transitions of a held answer are applied entirely or handed
+    /// back intact, like every other: the one that holds publishes
+    /// nothing, the one that releases publishes two frames.
+    #[test]
+    fn holding_and_releasing_an_answer_reserve_before_mutating() {
+        fn two_pending() -> World {
+            let mut world = World::connected();
+            let _ = world.submit(ordered(CONN, 7, Qos::ExactlyOnce, 1));
+            let _ = world.submit(ordered(CONN, 8, Qos::ExactlyOnce, 2));
+            world
+        }
+        fn later_held() -> World {
+            let mut world = two_pending();
+            let later = world.flights[1];
+            assert!(world.sent(committed(&later)).is_empty());
+            world
+        }
+        handed_back(two_pending, &|world| committed(&world.flights[1]), 0);
+        handed_back(later_held, &|world| committed(&world.flights[0]), 2);
     }
 
     /// One held answer leaves with each transition: the result of the
@@ -6123,7 +6518,15 @@ mod tests {
     #[test]
     fn held_acknowledgements_leave_one_after_the_other_with_the_receipts() {
         for qos in [Qos::ExactlyOnce, Qos::AtLeastOnce] {
-            let mut world = World::connected();
+            // Three exchanges at once: one more than the fixture allows.
+            let roomy = OwnerConfig {
+                max_exchanges: bound(3),
+                payload_bytes: PayloadBytes::new(32),
+                ..config()
+            };
+            let mut world = World::with(roomy, EPOCH, CAPACITY);
+            world.applied(page(&fixture(EPOCH), true));
+            assert_eq!(world.sent(connect(CONN, b"p1-producer")), ["EmitConnack"]);
             let first = world.submit(ordered(CONN, 7, qos, 1));
             let second = world.submit(ordered(CONN, 8, qos, 2));
             let third = world.submit(ordered(CONN, 9, qos, 3));
