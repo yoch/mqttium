@@ -187,6 +187,45 @@ class Rules(unittest.TestCase):
 
         self.assertEqual(self.statuses(edit)[ACK], "PASS")
 
+    def test_a_pubrec_without_a_matching_subscription_is_a_positive_acknowledgement(self):
+        # Record 0049: "No matching subscribers" (0x10) is a success. After
+        # the commit it passes every assertion; it is not a refusal, so it
+        # answers no rejection.
+        def unmatched(events):
+            eligible = events[corpus.at(events, "pubrec")]
+            eligible["payload"] = dict(eligible["payload"], reason="NoMatchingSubscribers")
+            written = events[corpus.at(events, "pubrec.written")]
+            written["payload"] = dict(written["payload"], bytes_confirmed="5", bytes_total="5")
+            seen = events[corpus.at(events, "pubrec.seen")]
+            seen["payload"] = dict(seen["payload"], reason_code=0x10, bytes_hex="5003000710")
+
+        self.assertEqual(set(self.statuses(unmatched).values()), {"PASS"})
+
+        # Before the core knew of a commit it is premature, as a plain
+        # PUBREC is: the reason does not take it out of the assertion.
+        def early(events):
+            corpus.insert_after(
+                events,
+                "publish.in",
+                [
+                    corpus.ev(
+                        "early",
+                        "broker-core",
+                        "FrameEligible",
+                        {
+                            "effect_id": corpus.effect(1, 9),
+                            "connection": {"session": "1", "generation": "1"},
+                            "packet_kind": "PUBREC",
+                            "packet_id": 7,
+                            "reason": "NoMatchingSubscribers",
+                        },
+                        ["publish.in"],
+                    )
+                ],
+            )
+
+        self.assertEqual(self.statuses(early)[ACK], "FAIL")
+
     def test_knowledge_of_one_exchange_does_not_acknowledge_the_next(self):
         # After PUBCOMP the slot is free: a second PUBREC needs a commit of
         # its own.

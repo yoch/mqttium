@@ -195,6 +195,9 @@ fn ack_reason(frame: OutboundFrame) -> Option<&'static str> {
         OutboundFrame::Puback { reason, .. } => {
             return Some(match reason {
                 mqttiumd_contract::packet::PubackReason::Success => "Success",
+                mqttiumd_contract::packet::PubackReason::NoMatchingSubscribers => {
+                    "NoMatchingSubscribers"
+                }
                 mqttiumd_contract::packet::PubackReason::QuotaExceeded => "QuotaExceeded",
                 mqttiumd_contract::packet::PubackReason::ImplementationSpecificError => {
                     "ImplementationSpecificError"
@@ -205,6 +208,7 @@ fn ack_reason(frame: OutboundFrame) -> Option<&'static str> {
     };
     Some(match reason {
         AckReason::Success => "Success",
+        AckReason::NoMatchingSubscribers => "NoMatchingSubscribers",
         AckReason::PacketIdentifierNotFound => "PacketIdentifierNotFound",
         AckReason::QuotaExceeded => "QuotaExceeded",
         AckReason::ImplementationSpecificError => "ImplementationSpecificError",

@@ -345,6 +345,7 @@ pub mod transport {
     pub const fn reason_code(reason: AckReason) -> u8 {
         match reason {
             AckReason::Success => 0x00,
+            AckReason::NoMatchingSubscribers => 0x10,
             AckReason::PacketIdentifierNotFound => 0x92,
             AckReason::QuotaExceeded => 0x97,
             AckReason::ImplementationSpecificError => 0x83,

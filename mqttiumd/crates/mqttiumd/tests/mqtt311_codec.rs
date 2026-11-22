@@ -314,3 +314,43 @@ fn a_subscribe_with_a_filter_longer_than_the_profile_is_answered_in_3_1_1() {
         "a filter the profile cannot store reached the core"
     );
 }
+
+/// Record 0049: a publication accepted without a matching subscription is
+/// acknowledged 0x10 in MQTT 5. MQTT 3.1.1 has no reason code: the
+/// acknowledgement is the plain one, and the connection is kept. A PUBCOMP
+/// never carries that reason.
+#[test]
+fn an_acknowledgement_without_a_matching_subscription_is_plain_in_3_1_1() {
+    use mqttiumd::codec::Version::V5;
+    let mid = InboundPacketId::new(7).unwrap();
+    let puback = OutboundFrame::Puback {
+        packet_id: mid,
+        reason: PubackReason::NoMatchingSubscribers,
+    };
+    let pubrec = OutboundFrame::Pubrec {
+        packet_id: mid,
+        reason: AckReason::NoMatchingSubscribers,
+    };
+    assert_eq!(
+        codec::encode_for(V5, puback).unwrap(),
+        [0x40, 3, 0, 7, 0x10]
+    );
+    assert_eq!(
+        codec::encode_for(V5, pubrec).unwrap(),
+        [0x50, 3, 0, 7, 0x10]
+    );
+    assert_eq!(codec::encode_for(V311, puback).unwrap(), [0x40, 2, 0, 7]);
+    assert_eq!(codec::encode_for(V311, pubrec).unwrap(), [0x50, 2, 0, 7]);
+    for version in [V5, V311] {
+        assert!(
+            codec::encode_for(
+                version,
+                OutboundFrame::Pubcomp {
+                    packet_id: mid,
+                    reason: AckReason::NoMatchingSubscribers
+                }
+            )
+            .is_err()
+        );
+    }
+}

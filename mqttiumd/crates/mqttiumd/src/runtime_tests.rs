@@ -1455,6 +1455,75 @@ fn pubrels_keep_the_order_of_the_pubrecs_when_an_earlier_store_result_is_late() 
     }
 }
 
+/// Record 0049: a publication the broker accepts and gives to no subscriber
+/// is acknowledged "No matching subscribers" (0x10) in MQTT 5, retained or
+/// not, and with the plain acknowledgement in MQTT 3.1.1, which has no
+/// reason code. Once a subscription matches, the acknowledgement is the
+/// plain success. The QoS 2 exchange goes on to its PUBCOMP either way.
+#[test]
+fn a_publication_without_a_subscriber_is_acknowledged_as_matching_no_subscription() {
+    use codec::Version::{V5, V311};
+    for (version, qos) in [(V5, 1u8), (V5, 2), (V311, 1), (V311, 2)] {
+        with_runtime(128, |runtime, _| {
+            let case = format!("{version:?} QoS {qos}");
+            let properties: &[u8] = if version == V5 { &[0] } else { &[] };
+            let open = |runtime: &mut Runtime<'_>, client_id: &[u8]| {
+                let (generation, mut client) = peer(runtime);
+                let connect = codec::Connect {
+                    version,
+                    ..connect_packet(client_id)
+                };
+                runtime.connect(generation, connect).unwrap();
+                until(runtime, |r| r.session_requests.is_empty());
+                assert_eq!(read_frame(&mut client).0, 0x20, "{case}");
+                (generation, client)
+            };
+            let (publisher, mut publishing) = open(runtime, b"unmatched-publisher");
+            let acknowledgement = if qos == 1 { 0x40 } else { 0x50 };
+            let mut publish = |runtime: &mut Runtime<'_>, id: u8, retain: u8, expected: &[u8]| {
+                let body = [&[0, 1, b'n', 0, id][..], properties, b"v"].concat();
+                runtime
+                    .packet(publisher, 0x30 | (qos << 1) | retain, body)
+                    .unwrap();
+                assert_eq!(
+                    served_frame(runtime, &mut publishing),
+                    (acknowledgement, expected.to_vec()),
+                    "{case}: publication {id}"
+                );
+                if qos == 2 {
+                    runtime.packet(publisher, 0x62, vec![0, id]).unwrap();
+                    assert_eq!(
+                        served_frame(runtime, &mut publishing),
+                        (0x70, vec![0, id]),
+                        "{case}: the exchange of publication {id} completes"
+                    );
+                }
+            };
+            if version == V5 {
+                publish(runtime, 1, 0, &[0, 1, 0x10]);
+                publish(runtime, 2, 1, &[0, 2, 0x10]);
+            } else {
+                publish(runtime, 1, 0, &[0, 1]);
+                publish(runtime, 2, 1, &[0, 2]);
+            }
+
+            let (subscriber, mut subscribed) = open(runtime, b"unmatched-subscriber");
+            let subscribe = [&[0, 1][..], properties, &[0, 1, b'n', qos]].concat();
+            runtime.packet(subscriber, 0x82, subscribe).unwrap();
+            assert_eq!(served_frame(runtime, &mut subscribed).0, 0x90, "{case}");
+            // The retained message of publication 2 reaches the new
+            // subscription: it was stored although nobody matched.
+            assert_eq!(
+                served_frame(runtime, &mut subscribed).0 & 0xf0,
+                0x30,
+                "{case}"
+            );
+            publish(runtime, 3, 0, &[0, 3]);
+            assert!(runtime.peers[&publisher].closing.is_none(), "{case}");
+        });
+    }
+}
+
 /// A publication that finds every exchange credit lent to admissions in
 /// flight waits for one of them: the results of the store return the
 /// credits. It is pressure, not a fault of the client, and its connection

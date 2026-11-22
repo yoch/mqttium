@@ -3278,10 +3278,7 @@ mod tests {
                 OutboundFrame::Puback { .. } => "EmitPuback",
                 OutboundFrame::Pingresp => "EmitPingresp",
                 OutboundFrame::Connack { .. } => "EmitConnack",
-                OutboundFrame::Pubrec {
-                    reason: AckReason::Success,
-                    ..
-                } => "EmitPubrec",
+                OutboundFrame::Pubrec { reason, .. } if reason.is_success() => "EmitPubrec",
                 OutboundFrame::Pubrec { .. } => "EmitPubrecRefusal",
                 OutboundFrame::Pubcomp {
                     reason: AckReason::Success,
@@ -5998,6 +5995,71 @@ mod tests {
         });
         assert_eq!(command.recipe.get(), &expected);
         assert_eq!(command.payload, Some(bytes(b"payload")));
+    }
+
+    /// A PUBLISH of the producer on a topic no subscription matches.
+    fn unmatched(raw: u16, qos: Qos, retain: bool) -> Input {
+        Input::Packet {
+            connection: ConnectionGeneration::new(CONN),
+            ingress_order: 0,
+            packet: InboundPacket::Publish {
+                expiry: None,
+                topic: bytes(b"p1/exampl"),
+                qos,
+                retain,
+                dup: false,
+                packet_id: Some(packet_id(raw)),
+                payload: bytes(b"payload"),
+            },
+        }
+    }
+
+    /// Record 0049: a publication the broker accepted and gave to no
+    /// subscriber is acknowledged with "No matching subscribers", at the
+    /// commit and when its PUBREC is sent again. One with a target keeps
+    /// the plain success (every other test of this module).
+    #[test]
+    fn an_admitted_publication_without_a_target_is_acknowledged_as_matching_no_subscription() {
+        let mut world = World::connected();
+        let admission = world.submit(unmatched(7, Qos::ExactlyOnce, false));
+        world.applied(committed(&admission));
+        let unmatched_pubrec = frame_to(CONN, pubrec(AckReason::NoMatchingSubscribers));
+        assert_eq!(world.drain()[0].1, unmatched_pubrec);
+        assert_eq!(world.phase(7), AWAIT, "the exchange goes on to its PUBREL");
+        // The PUBREC sent again says the same.
+        world.applied(unmatched(7, Qos::ExactlyOnce, false));
+        assert_eq!(world.drain()[0].1, unmatched_pubrec);
+        // The release is the ordinary one.
+        let release = world.submit(pubrel(7));
+        assert_eq!(world.sent(committed(&release)), ["EmitPubcomp"]);
+
+        let mut world = World::connected();
+        let admission = world.submit(unmatched(8, Qos::AtLeastOnce, false));
+        world.applied(committed(&admission));
+        let effects = world.drain();
+        let Effect::EmitFrame { frame, .. } = effects[0].1 else {
+            panic!("a frame")
+        };
+        assert_eq!(
+            frame,
+            OutboundFrame::Puback {
+                packet_id: packet_id(8),
+                reason: PubackReason::NoMatchingSubscribers
+            }
+        );
+    }
+
+    /// A refusal stays a refusal whatever the targets: the reason of a
+    /// rejected admission without a target is that of its rejection.
+    #[test]
+    fn a_refused_publication_without_a_target_keeps_the_reason_of_its_rejection() {
+        let mut world = World::connected();
+        let admission = world.submit(unmatched(7, Qos::ExactlyOnce, false));
+        world.applied(rejected(&admission));
+        assert_eq!(
+            world.drain()[0].1,
+            frame_to(CONN, pubrec(AckReason::QuotaExceeded))
+        );
     }
 
     #[test]
