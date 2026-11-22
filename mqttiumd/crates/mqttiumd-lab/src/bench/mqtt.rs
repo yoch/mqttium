@@ -317,6 +317,7 @@ pub mod transport {
                 Ok((
                     InboundPacket::Publish {
                         expiry: None,
+                        properties: None,
                         topic,
                         qos,
                         retain,

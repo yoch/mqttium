@@ -51,11 +51,10 @@ use std::time::{Duration, Instant};
 const CONNECTIONS: usize = Limits::BOUNDED.connections;
 const IN_FLIGHT: usize = 16;
 const TIMERS: usize = 512;
-const INPUTS: usize = 128;
 // One FIFO with reserved capacity for accepted writer requests and due deadlines.
 const WRITER_INPUTS: usize = crate::writer::QUEUE;
 const DEADLINE_INPUTS: usize = 4;
-const ORDINARY_INPUTS: usize = INPUTS - WRITER_INPUTS - DEADLINE_INPUTS;
+const ORDINARY_INPUTS: usize = 92;
 const OUTGOING_BINDINGS: usize = 128;
 const LIFECYCLE_IN_FLIGHT: usize = 1;
 /// Closing and terminal facts applied by one pass over the inputs. With
@@ -98,6 +97,12 @@ pub struct Limits {
     /// Outgoing packet identifiers in flight: eight per connection.
     outgoing_bindings: usize,
     timers: usize,
+    /// Concurrent business commands/work reads allowed in flight to the writer.
+    in_flight: usize,
+    /// Closing and terminal facts applied by one pass over the inputs.
+    pass_facts: usize,
+    /// Maximum step transitions applied by one pass over the inputs.
+    drain_steps: usize,
 }
 
 impl Limits {
@@ -133,27 +138,50 @@ impl Limits {
         // The first profile sized these for sixteen connections; they grow
         // with every further sixteen.
         let scale = connections.div_ceil(Self::BOUNDED_CONNECTIONS);
+        let effect_box = if 128 * scale > 4_096 {
+            4_096
+        } else {
+            128 * scale
+        };
+        let in_flight = if IN_FLIGHT * scale > 512 {
+            512
+        } else {
+            IN_FLIGHT * scale
+        };
+        let pass_facts = if PASS_FACTS * scale > 4_096 {
+            4_096
+        } else {
+            PASS_FACTS * scale
+        };
+        let drain_steps = if 512 * scale > 32_768 {
+            32_768
+        } else {
+            512 * scale
+        };
         Self {
             connections,
             closing_inputs: 2 * connections,
             frames,
-            terminal_inputs: 2 * frames + 128 * scale,
+            terminal_inputs: 2 * frames + effect_box,
             // Every connection may have its announced window of
             // publications waiting for a credit at once; the lane holds
             // them all beside its ordinary share, so its control reserve
             // is never what keeps a window-respecting client waiting.
             ordinary_inputs: ORDINARY_INPUTS * scale + connections * crate::receiving::MAXIMUM,
-            effect_box: 128 * scale,
+            effect_box,
             outgoing_bindings: OUTGOING_BINDINGS * scale,
             timers: TIMERS * scale,
+            in_flight,
+            pass_facts,
+            drain_steps,
         }
     }
 }
 const BOUNDS: Bounds = Bounds {
-    max_packet: 65536,
-    max_client_id: 1024,
-    max_topic: 1024,
-    max_payload: 32768,
+    max_packet: net::MAX_PACKET_BYTES,
+    max_client_id: crate::writer::MAX_CLIENT,
+    max_topic: crate::writer::MAX_TOPIC,
+    max_payload: crate::writer::MAX_PAYLOAD,
 };
 // The announced Maximum Packet Size follows the payload limit.
 const _: () = assert!(codec::ANNOUNCED_PACKET_BYTES as usize == BOUNDS.max_payload + 8);
@@ -183,6 +211,7 @@ const MUTANT_REBIND_OBSERVED_PUBACK: bool = false;
 pub struct Config {
     pub db: PathBuf,
     pub require_existing_db: bool,
+    pub storage_mode: crate::writer::StorageMode,
     pub listen: SocketAddr,
     pub events: PathBuf,
     pub event_level: crate::events::Level,
@@ -367,6 +396,11 @@ struct Runtime<'a> {
     session_cardinality_dirty: bool,
     last_session_cardinality: Option<[usize; 13]>,
     work_reads: BTreeMap<EffectId, SessionId>,
+    pending_work: VecDeque<SessionId>,
+    pending_work_set: BTreeSet<SessionId>,
+    cached_bindings: BTreeMap<SessionId, ConnectionGeneration>,
+    bindings_dirty: bool,
+    stale_frames_dirty: bool,
     last_work_scan: Instant,
     last_will_scan: Instant,
     maintenance_needed: bool,
@@ -655,12 +689,14 @@ impl Runtime<'_> {
         self.writer_results()?;
         self.connections()?;
         self.discover_work();
+        self.drain_pending_work();
         self.expire_messages()?;
         self.expire_sessions()?;
         self.due_deadlines()?;
         #[cfg(feature = "test-hooks")]
         self.controls()?;
         self.drain_inputs()?;
+        self.drain_pending_work();
         self.dispatch()
     }
 
@@ -1039,6 +1075,8 @@ impl Runtime<'_> {
         code: &'static str,
     ) -> Result<(), Failure> {
         if let Some(peer) = self.peers.remove(&generation) {
+            self.bindings_dirty = true;
+            self.stale_frames_dirty = true;
             let observed_monotonic_ns = peer
                 .io
                 .terminal_observed_ns()
@@ -1254,6 +1292,7 @@ impl Runtime<'_> {
                 retired,
                 ..
             } => {
+                self.bindings_dirty = true;
                 if let Some(old) = retired {
                     self.retire_session(old)?;
                 }
@@ -1489,11 +1528,15 @@ impl Runtime<'_> {
     }
 
     fn retire_session(&mut self, retired: SessionId) -> Result<(), Failure> {
+        self.bindings_dirty = true;
         self.expiry_timers.remove(&retired);
         self.expiry_inputs
             .retain(|i| !matches!(i, Input::ExpireSession {guard,..} if guard.session == retired));
         self.session_cardinality_dirty = true;
         self.sessions.retain(|_, cached| cached.id != retired);
+        if self.pending_work_set.remove(&retired) {
+            self.pending_work.retain(|s| *s != retired);
+        }
         self.outgoing_bindings
             .retain(|(connection, _), _| connection.session != retired);
         self.inputs.retain(
@@ -1534,19 +1577,21 @@ impl Runtime<'_> {
         }
         let mut control_budget = crate::writer::CONTROL_QUEUE;
         // Work per pass, not a capacity: each of these inputs can leave an
-        // effect in the core's box, which the dispatch after the pass empties.
-        let mut closing_budget = self.closing_inputs.len().min(PASS_FACTS);
-        let mut terminal_budget = self.terminal_inputs.len().min(PASS_FACTS);
+        // effect in the core's box, which the dispatch after the step empties.
+        let mut closing_budget = self.closing_inputs.len().min(self.limits.pass_facts);
+        let mut terminal_budget = self.terminal_inputs.len().min(self.limits.pass_facts);
         let mut expiry_budget = self.expiry_inputs.len().min(4);
-        for _ in 0..(self.inputs.len()
+        let mut step_budget = (self.inputs.len()
             + self.control_inputs.len()
             + closing_budget
             + terminal_budget
             + expiry_budget
             + usize::from(self.message_expiry_input.is_some())
             + self.deferred_retries)
-            .min(64)
-        {
+            .min(self.limits.drain_steps);
+        let mut steps_taken = 0usize;
+        while steps_taken < step_budget {
+            steps_taken += 1;
             // A wake serves the oldest packet that waits, ahead of
             // everything else and without moving the others.
             let retried = if self.deferred_retries > 0 {
@@ -1832,12 +1877,71 @@ impl Runtime<'_> {
             let returns_credit = closes
                 || matches!(&input, Input::FrameResult { progress, .. }
                     if !matches!(progress, FrameProgress::Started));
-            match self.owner.step(
-                input,
-                TurnGrant {
-                    work_limit: WorkUnits::new(65536),
-                },
-            ) {
+            let is_recovery = matches!(&input, Input::Recovery { .. });
+            let may_change_bindings = is_recovery
+                || closes
+                || matches!(
+                    &input,
+                    Input::SessionEstablished { .. }
+                        | Input::OpenSession { .. }
+                        | Input::OpenSessionAt { .. }
+                        | Input::OpenSessionWillAt { .. }
+                        | Input::ExpireSession { .. }
+                        | Input::Packet {
+                            packet: InboundPacket::ConnectResume { .. },
+                            ..
+                        }
+                        | Input::StoreResult {
+                            reply: StoreReply::Outcome(StoreOutcome::Committed(
+                                CommitFacts::SessionLifecycle(_)
+                            )),
+                            ..
+                        }
+                );
+            let may_change_outgoing_bindings = !self.outgoing_bindings.is_empty()
+                && !matches!(
+                    &input,
+                    Input::Packet {
+                        packet: InboundPacket::Publish { .. }
+                            | InboundPacket::Subscribe { .. }
+                            | InboundPacket::Unsubscribe { .. }
+                            | InboundPacket::Pingreq,
+                        ..
+                    } | Input::Continue { .. }
+                        | Input::WorkAvailable { .. }
+                        | Input::WorkPage { .. }
+                        | Input::MessageClock { .. }
+                        | Input::MaintainReceipts
+                        | Input::ReceiptsCollected { .. }
+                        | Input::DiscoverWills
+                        | Input::WillPage { .. }
+                        | Input::Qos0EmitRefused { .. }
+                );
+            let may_change_timers = !self.timers.is_empty()
+                && !matches!(
+                    &input,
+                    Input::Packet {
+                        packet: InboundPacket::Publish { .. }
+                            | InboundPacket::Subscribe { .. }
+                            | InboundPacket::Unsubscribe { .. }
+                            | InboundPacket::Pingreq
+                            | InboundPacket::Puback { .. }
+                            | InboundPacket::Qos2Ack { .. },
+                        ..
+                    } | Input::ObservedPuback { .. }
+                        | Input::ObservedQos2Ack { .. }
+                        | Input::Continue { .. }
+                        | Input::WorkAvailable { .. }
+                        | Input::WorkPage { .. }
+                        | Input::MessageClock { .. }
+                        | Input::Qos0EmitRefused { .. }
+                );
+            let work_limit = if is_recovery {
+                WorkUnits::new(u64::MAX)
+            } else {
+                WorkUnits::new(65536)
+            };
+            match self.owner.step(input, TurnGrant { work_limit }) {
                 StepOutcome::Applied { .. } => {
                     applied = true;
                     self.progress = self.progress.wrapping_add(1);
@@ -1871,7 +1975,7 @@ impl Runtime<'_> {
                             .map_err(event_failure)?;
                     }
                     if let Some((id, delivery)) = finish {
-                        self.events.emit("core_finish_observed",json!({"operation":operation(id),"details":{"delivery":delivery_text(delivery)}})).map_err(event_failure)?;
+                        self.events.emit_with("core_finish_observed",||json!({"operation":operation(id),"details":{"delivery":delivery_text(delivery)}})).map_err(event_failure)?;
                     }
                     if wakes_business || returns_credit {
                         self.credit_progress = Instant::now();
@@ -1972,13 +2076,21 @@ impl Runtime<'_> {
             }
             if applied {
                 self.session_cardinality_dirty = true;
-                self.prune_outgoing_bindings();
+                if may_change_bindings {
+                    self.bindings_dirty = true;
+                }
+                if may_change_outgoing_bindings {
+                    self.prune_outgoing_bindings();
+                }
                 // A terminal result is consumed only after the exact input was
                 // applied. The pure owner, rather than elapsed wall time or a
                 // received reply, decides which deadlines remain meaningful.
-                self.timers
-                    .retain(|token, _| self.owner.deadline_is_live(*token));
+                if may_change_timers {
+                    self.timers
+                        .retain(|token, _| self.owner.deadline_is_live(*token));
+                }
             }
+            let inputs_before_dispatch = self.inputs.len();
             self.dispatch()?;
             if applied
                 && let Some(operation) = lifecycle_result
@@ -2005,6 +2117,11 @@ impl Runtime<'_> {
             }
             if applied && let Some((session, initial)) = ready_work {
                 self.rearm_ready_work(session, initial);
+            }
+            if applied && self.inputs.len() > inputs_before_dispatch {
+                step_budget = step_budget
+                    .saturating_add(self.inputs.len() - inputs_before_dispatch)
+                    .min(self.limits.drain_steps);
             }
         }
         self.schedule_maintenance();
@@ -2089,8 +2206,14 @@ impl Runtime<'_> {
     }
 
     fn dispatch(&mut self) -> Result<(), Failure> {
-        let bindings = self.bindings();
-        let queued_writer_replies = self.writer_input_count();
+        #[cfg(not(feature = "test-hooks"))]
+        if self.owner.outbox().is_some_and(|box_| box_.is_empty()) {
+            return Ok(());
+        }
+        if self.bindings_dirty {
+            self.cached_bindings = self.bindings();
+            self.bindings_dirty = false;
+        }
         let mut sink = Sink {
             writer: self.writer,
             limits: self.limits,
@@ -2102,7 +2225,7 @@ impl Runtime<'_> {
             will_operation: self.owner.will_dispatch().map(|(op, _)| op),
             will_reads: &mut self.will_reads,
             work_reads: &mut self.work_reads,
-            bindings: &bindings,
+            bindings: &self.cached_bindings,
             #[cfg(feature = "test-hooks")]
             work_cache: &self.work_cache,
             #[cfg(feature = "test-hooks")]
@@ -2115,7 +2238,7 @@ impl Runtime<'_> {
             inputs: &mut self.inputs,
             terminal_inputs: &mut self.terminal_inputs,
             ordinary_reserved: self.deferred_inputs.len() + self.will_connects.len(),
-            queued_writer_replies,
+            queued_writer_replies: None,
             frames: &mut self.frames,
             outgoing_bindings: &mut self.outgoing_bindings,
             close: Vec::new(),
@@ -2140,6 +2263,7 @@ impl Runtime<'_> {
         if let Some(error) = error {
             return Err(error);
         }
+        let had_close_or_change = changed.is_some() || !close.is_empty();
         for (generation, code) in close {
             // A terminated TLS sender can reject a queued PINGRESP before
             // the reactor reaches the normal DISCONNECT already in its reader
@@ -2158,8 +2282,10 @@ impl Runtime<'_> {
         if let Some(changed) = changed {
             self.session_changed(changed)?;
         }
-        self.timers
-            .retain(|token, _| self.owner.deadline_is_live(*token));
+        if had_close_or_change && !self.timers.is_empty() {
+            self.timers
+                .retain(|token, _| self.owner.deadline_is_live(*token));
+        }
         self.session_cardinality_dirty = true;
         self.emit_session_cardinality()?;
         Ok(())
@@ -2553,10 +2679,9 @@ impl Runtime<'_> {
                 packet: InboundPacket::Puback { .. },
                 ..
             } => self
-                .sessions
-                .values()
-                .find(|s| self.owner.connection_of(s.id) == Some(*connection))
-                .map(|s| (s.id, false)),
+                .owner
+                .session_for_connection(*connection)
+                .map(|id| (id, false)),
             _ => None,
         }
     }
@@ -2567,19 +2692,52 @@ impl Runtime<'_> {
                 .is_some_and(|p| p.connected && !p.pending && p.closing.is_none())
         });
         if usable && (initial || self.owner.has_ready_work(session)) {
-            // queue_work is FIFO, bounded by the existing input budget, and
-            // deduplicated by destination. Each turn retains its 64-input cap.
-            self.queue_work(session);
+            self.queue_work_front(session);
+        }
+    }
+    fn queue_work_front(&mut self, session: SessionId) {
+        if self.ordinary_room() != 0 {
+            if !self
+                .inputs
+                .iter()
+                .any(|i| matches!(i, Input::WorkAvailable { session: s } if *s == session))
+            {
+                self.inputs.push_front(Input::WorkAvailable { session });
+            }
+        } else if self.pending_work.len() < crate::writer::SESSIONS
+            && self.pending_work_set.insert(session)
+        {
+            self.pending_work.push_back(session);
         }
     }
     fn queue_work(&mut self, session: SessionId) {
-        if self.ordinary_room() != 0
-            && !self
+        if self.ordinary_room() != 0 {
+            if !self
                 .inputs
                 .iter()
                 .any(|i| matches!(i,Input::WorkAvailable{session:s} if *s==session))
+            {
+                self.inputs.push_back(Input::WorkAvailable { session });
+            }
+        } else if self.pending_work.len() < crate::writer::SESSIONS
+            && self.pending_work_set.insert(session)
         {
-            self.inputs.push_back(Input::WorkAvailable { session });
+            self.pending_work.push_back(session);
+        }
+    }
+    fn drain_pending_work(&mut self) {
+        while self.ordinary_room() != 0 {
+            let Some(session) = self.pending_work.pop_front() else {
+                break;
+            };
+            self.pending_work_set.remove(&session);
+            if !self
+                .inputs
+                .iter()
+                .any(|i| matches!(i, Input::WorkAvailable { session: s } if *s == session))
+            {
+                self.inputs.push_back(Input::WorkAvailable { session });
+            }
         }
     }
     fn discover_work(&mut self) {
@@ -3173,7 +3331,10 @@ impl Runtime<'_> {
                     ..
                 } = &packet
                 {
-                    self.events.emit("publish_validated", json!({"connection":generation.get().to_string(),"details":{"packet_id":id.get(),"qos":qos.to_wire(),"dup":dup,"publish_order":ingress_order.to_string()}})).map_err(event_failure)?;
+                    let pid = id.get();
+                    let wire_qos = qos.to_wire();
+                    let dup = *dup;
+                    self.events.emit_with("publish_validated", || json!({"connection":generation.get().to_string(),"details":{"packet_id":pid,"qos":wire_qos,"dup":dup,"publish_order":ingress_order.to_string()}})).map_err(event_failure)?;
                 }
                 if let InboundPacket::Publish {
                     packet_id: Some(id),
@@ -3260,18 +3421,18 @@ impl Runtime<'_> {
                         .puback_observation
                         .checked_add(1)
                         .ok_or_else(|| Failure::plain("puback_observation_exhausted"))?;
+                    let observation = self.puback_observation;
                     self.events
-                        .emit(
-                            "puback_observed",
+                        .emit_with("puback_observed", || {
                             puback_fields(
                                 connection,
                                 packet_id,
                                 reason,
                                 target,
-                                Some(self.puback_observation),
+                                Some(observation),
                                 "observed",
-                            ),
-                        )
+                            )
+                        })
                         .map_err(event_failure)?;
                     #[cfg(feature = "test-hooks")]
                     if self.hooks.directory.as_ref().is_some_and(|dir| {
@@ -3413,7 +3574,7 @@ impl Runtime<'_> {
                 self.retry_deferred_publish(generation)?;
             }
             self.serve_requests(generation)?;
-            for _ in 0..4 {
+            for _ in 0..32 {
                 // A CONNECT can use one slot now and reserve one for Open.
                 // Leave the bytes with their socket reader until both fit.
                 if backpressured || self.ordinary_room() < 2 {
@@ -3585,19 +3746,22 @@ impl Runtime<'_> {
             }
         }
         // Accepted frames whose socket closed still receive terminal failure; commits are separate.
-        let stale: Vec<_> = self
-            .frames
-            .iter()
-            .filter(|(_, v)| !self.peers.contains_key(&v.connection.generation))
-            .map(|(id, v)| (*id, v.connection))
-            .collect();
-        for (effect, connection) in stale {
-            self.frames.remove(&effect);
-            self.queue(Input::FrameResult {
-                effect,
-                connection,
-                progress: FrameProgress::Failed,
-            })?;
+        if self.stale_frames_dirty {
+            self.stale_frames_dirty = false;
+            let stale: Vec<_> = self
+                .frames
+                .iter()
+                .filter(|(_, v)| !self.peers.contains_key(&v.connection.generation))
+                .map(|(id, v)| (*id, v.connection))
+                .collect();
+            for (effect, connection) in stale {
+                self.frames.remove(&effect);
+                self.queue(Input::FrameResult {
+                    effect,
+                    connection,
+                    progress: FrameProgress::Failed,
+                })?;
+            }
         }
         for n in (0..self.retiring.len()).rev() {
             if self.retiring[n].is_finished() {
@@ -3788,7 +3952,9 @@ impl Runtime<'_> {
                     .receiving
                     .complete_frame(id, frame.receive_serial, terminal);
                 frame.wire_released |= released;
-                self.events.emit("wire_receive_credit",json!({"connection":generation.get().to_string(),"details":{"effect":effect_text(progress.effect),"packet_kind":frame.kind,"packet_id":id,"publish_order":frame.receive_serial.map(|v|v.to_string()).unwrap_or_default(),"released":released}})).map_err(event_failure)?;
+                let frame_kind = frame.kind;
+                let frame_serial = frame.receive_serial;
+                self.events.emit_with("wire_receive_credit",||json!({"connection":generation.get().to_string(),"details":{"effect":effect_text(progress.effect),"packet_kind":frame_kind,"packet_id":id,"publish_order":frame_serial.map(|v|v.to_string()).unwrap_or_default(),"released":released}})).map_err(event_failure)?;
             }
         }
         Ok(())
@@ -3852,9 +4018,10 @@ impl Runtime<'_> {
         let generation = connection.generation;
         let (kind, id) = (pending.kind, pending.packet_id);
         if kind == "PUBLISH0" {
-            self.events.emit("frame_written",json!({"connection":generation.get().to_string(),"details":{"packet_kind":"PUBLISH","qos":0,"effect":effect_text(effect),"bytes":bytes}})).map_err(event_failure)?;
+            self.events.emit_with("frame_written",||json!({"connection":generation.get().to_string(),"details":{"packet_kind":"PUBLISH","qos":0,"effect":effect_text(effect),"bytes":bytes}})).map_err(event_failure)?;
         } else if kind != "PINGRESP" || pending.was_retained {
-            self.events.emit("frame_written",json!({"connection":generation.get().to_string(),"details":{"packet_kind":kind,"effect":effect_text(effect),"packet_id":id.unwrap_or(0),"publish_order":pending.receive_serial.map(|v|v.to_string()).unwrap_or_default(),"bytes":bytes}})).map_err(event_failure)?;
+            let serial = pending.receive_serial;
+            self.events.emit_with("frame_written",||json!({"connection":generation.get().to_string(),"details":{"packet_kind":kind,"effect":effect_text(effect),"packet_id":id.unwrap_or(0),"publish_order":serial.map(|v|v.to_string()).unwrap_or_default(),"bytes":bytes}})).map_err(event_failure)?;
         }
         if let Some(terminal) = pending.terminal
             && let Some(p) = self.peers.get_mut(&generation)
@@ -3873,7 +4040,8 @@ impl Runtime<'_> {
             } else {
                 released
             };
-            self.events.emit("receive_credit", json!({"connection":generation.get().to_string(),"details":{"packet_kind":kind,"effect":effect_text(effect),"packet_id":id,"publish_order":pending.receive_serial.map(|v|v.to_string()).unwrap_or_default(),"released":released}})).map_err(event_failure)?;
+            let serial = pending.receive_serial;
+            self.events.emit_with("receive_credit", || json!({"connection":generation.get().to_string(),"details":{"packet_kind":kind,"effect":effect_text(effect),"packet_id":id,"publish_order":serial.map(|v|v.to_string()).unwrap_or_default(),"released":released}})).map_err(event_failure)?;
         }
         #[cfg(feature = "test-hooks")]
         if kind == "PUBLISH"
@@ -4180,7 +4348,7 @@ struct Sink<'a> {
     inputs: &'a mut VecDeque<Input>,
     terminal_inputs: &'a mut VecDeque<Input>,
     ordinary_reserved: usize,
-    queued_writer_replies: usize,
+    queued_writer_replies: Option<usize>,
     frames: &'a mut BTreeMap<EffectId, PendingFrame>,
     outgoing_bindings: &'a mut BTreeMap<(ConnectionKey, OutboundPacketId), PubackTarget>,
     limits: Limits,
@@ -4189,8 +4357,14 @@ struct Sink<'a> {
     error: Option<Failure>,
 }
 impl Sink<'_> {
-    fn writer_reply_room(&self) -> bool {
-        self.queued_writer_replies
+    fn writer_reply_room(&mut self) -> bool {
+        let queued = *self.queued_writer_replies.get_or_insert_with(|| {
+            self.inputs
+                .iter()
+                .filter(|input| Runtime::writer_input(input))
+                .count()
+        });
+        queued
             + self.inflight.len()
             + self.work_reads.len()
             + usize::from(self.will_reads.is_some())
@@ -4355,7 +4529,8 @@ impl EffectSink for Sink<'_> {
                 target,
                 reason,
             } => {
-                if self.events.emit("qos0_dropped",json!({"details":{"origin":qos0_origin(*origin),"target":target.map(|t|t.get().to_string()).unwrap_or_default(),"reason":reason.code()}})).is_err(){self.error=Some(Failure::plain("events_unavailable"));}
+                let (origin, target, reason) = (*origin, *target, *reason);
+                if self.events.emit_with("qos0_dropped",||json!({"details":{"origin":qos0_origin(origin),"target":target.map(|t|t.get().to_string()).unwrap_or_default(),"reason":reason.code()}})).is_err(){self.error=Some(Failure::plain("events_unavailable"));}
                 let _ = effect.into_parts();
                 SubmitResult::Accepted
             }
@@ -4365,16 +4540,22 @@ impl EffectSink for Sink<'_> {
                 operation: finished,
                 reason,
             } => {
-                let record = json!({
-                    "operation": operation(*finished),
-                    "command_kind": "Finish",
-                    "details": {
-                        "delivery": delivery_text(*delivery),
-                        "target": target.get().to_string(),
-                        "reason": reason.code(),
-                    },
-                });
-                if self.events.emit("delivery_discarded", record).is_err() {
+                let (delivery, target, finished, reason) = (*delivery, *target, *finished, *reason);
+                if self
+                    .events
+                    .emit_with("delivery_discarded", || {
+                        json!({
+                            "operation": operation(finished),
+                            "command_kind": "Finish",
+                            "details": {
+                                "delivery": delivery_text(delivery),
+                                "target": target.get().to_string(),
+                                "reason": reason.code(),
+                            },
+                        })
+                    })
+                    .is_err()
+                {
                     self.error = Some(Failure::plain("events_unavailable"));
                 }
                 let _ = effect.into_parts();
@@ -4382,6 +4563,7 @@ impl EffectSink for Sink<'_> {
             }
             Effect::EmitQos0 {
                 expiry,
+                properties,
                 connection,
                 origin,
                 cause,
@@ -4424,13 +4606,14 @@ impl EffectSink for Sink<'_> {
                         && self.bindings.get(&connection.session) == Some(&generation)
                 }) {
                     let version = peer.version.unwrap_or_default();
-                    match codec::encode_qos0_for(
+                    match codec::encode_qos0_with_properties(
                         version,
                         topic,
                         payload,
                         *retain
                             && (version == Version::V5 || *cause == DeliveryCause::RetainedReplay),
                         expiry.map(|value| value.interval),
+                        properties.as_deref(),
                     ) {
                         Ok(encoded) if encoded.bytes.len() <= peer.max_packet => {
                             let write_expiry = expiry.map(|expiry| net::WriteExpiry {
@@ -4489,7 +4672,7 @@ impl EffectSink for Sink<'_> {
                                 was_retained: false,
                             },
                         );
-                        if self.events.emit("frame_queued",json!({"connection":generation.get().to_string(),"details":{"packet_kind":"PUBLISH","qos":0,"origin":qos0_origin(origin),"effect":effect_text(id)}})).is_err(){self.error=Some(Failure::plain("events_unavailable"));}
+                        if self.events.emit_with("frame_queued",||json!({"connection":generation.get().to_string(),"details":{"packet_kind":"PUBLISH","qos":0,"origin":qos0_origin(origin),"effect":effect_text(id)}})).is_err(){self.error=Some(Failure::plain("events_unavailable"));}
                     }
                     Err(reason) => self.terminal_inputs.push_back(Input::Qos0EmitRefused {
                         effect: id,
@@ -4529,12 +4712,15 @@ impl EffectSink for Sink<'_> {
                 self.submit_lifecycle(effect)
             }
             Effect::Persist { command } => {
-                if self.inflight.len() >= IN_FLIGHT || !self.writer_reply_room() {
+                if self.inflight.len() >= self.limits.in_flight || !self.writer_reply_room() {
                     return refused(effect, SubmitBlock::InFlightLimit);
                 }
                 let operation_id = command.recipe.operation();
                 let command_kind = crate::writer::recipe_kind(command.recipe.get());
-                let details = recipe_details(command.recipe.get());
+                let details = self
+                    .events
+                    .records("command_submitted")
+                    .then(|| recipe_details(command.recipe.get()));
                 #[cfg(feature = "test-hooks")]
                 if MUTANT_EARLY_QOS0
                     && let Recipe::ConsumeDelivery(c) = command.recipe.get()
@@ -4631,14 +4817,15 @@ impl EffectSink for Sink<'_> {
                         #[cfg(feature = "test-hooks")]
                         if let Some(input) = early_finish {
                             self.inputs.push_back(input);
-                            self.queued_writer_replies += 1;
+                            if let Some(count) = self.queued_writer_replies.as_mut() {
+                                *count += 1;
+                            }
                         }
                         if self
                             .events
-                            .emit(
-                                "command_submitted",
-                                json!({"operation":operation(operation_id),"command_kind":command_kind,"details":details}),
-                            )
+                            .emit_with("command_submitted", || {
+                                json!({"operation":operation(operation_id),"command_kind":command_kind,"details":details.unwrap_or_else(|| json!({}))})
+                            })
                             .is_err()
                         {
                             self.error = Some(Failure::plain("events_unavailable"));
@@ -4662,7 +4849,7 @@ impl EffectSink for Sink<'_> {
                 self.submit_lifecycle(effect)
             }
             Effect::ResolveAndFence { operation } => {
-                if self.inflight.len() >= IN_FLIGHT || !self.writer_reply_room() {
+                if self.inflight.len() >= self.limits.in_flight || !self.writer_reply_room() {
                     return refused(effect, SubmitBlock::InFlightLimit);
                 }
                 let op = *operation;
@@ -4840,12 +5027,12 @@ impl EffectSink for Sink<'_> {
                             },
                         );
                         let _ = effect.into_parts();
-                        if kind!="PINGRESP"&&self.events.emit("frame_queued",json!({"connection":generation.get().to_string(),"details":{"packet_kind":kind,"effect":effect_text(id),"packet_id":packet_id.unwrap_or(0)}})).is_err(){self.error=Some(Failure::plain("events_unavailable"));}
+                        if kind!="PINGRESP"&&self.events.emit_with("frame_queued",||json!({"connection":generation.get().to_string(),"details":{"packet_kind":kind,"effect":effect_text(id),"packet_id":packet_id.unwrap_or(0)}})).is_err(){self.error=Some(Failure::plain("events_unavailable"));}
                         SubmitResult::Accepted
                     }
                     Err(TrySendError::Full(_)) => {
                         if peer.blocked_output.replace(id) != Some(id)
-                            && self.events.emit("effect_retained",json!({"connection":generation.get().to_string(),"details":{"code":"output_queue_full","effect":effect_text(id),"packet_kind":kind}})).is_err(){self.error=Some(Failure::plain("events_unavailable"));}
+                            && self.events.emit_with("effect_retained",||json!({"connection":generation.get().to_string(),"details":{"code":"output_queue_full","effect":effect_text(id),"packet_kind":kind}})).is_err(){self.error=Some(Failure::plain("events_unavailable"));}
                         refused(effect, SubmitBlock::TransportBackpressure)
                     }
                     Err(TrySendError::Disconnected(_)) => {
@@ -4945,7 +5132,7 @@ impl EffectSink for Sink<'_> {
                 {
                     return refused(effect, SubmitBlock::QueueFull);
                 }
-                self.inputs.push_back(Input::Continue {
+                self.inputs.push_front(Input::Continue {
                     continuation: *continuation,
                     budget: WorkUnits::new(65536),
                 });
@@ -4971,7 +5158,7 @@ impl EffectSink for Sink<'_> {
                 }
             }
             Effect::LoadWork { session, .. } => {
-                if self.work_reads.len() >= IN_FLIGHT || !self.writer_reply_room() {
+                if self.work_reads.len() >= self.limits.in_flight || !self.writer_reply_room() {
                     return refused(effect, SubmitBlock::InFlightLimit);
                 }
                 let session = *session;
@@ -4992,6 +5179,7 @@ impl EffectSink for Sink<'_> {
             }
             Effect::EmitPublish {
                 expiry,
+                properties,
                 started,
                 connection,
                 delivery,
@@ -5067,7 +5255,7 @@ impl EffectSink for Sink<'_> {
                 let version = peer.version.unwrap_or_default();
                 let retain =
                     retain && (version == Version::V5 || *cause == DeliveryCause::RetainedReplay);
-                let encoded = match codec::encode_delivery_for(
+                let encoded = match codec::encode_delivery_with_properties(
                     version,
                     (packet_id, *qos),
                     topic,
@@ -5075,6 +5263,7 @@ impl EffectSink for Sink<'_> {
                     dup,
                     retain,
                     expiry.map(|value| value.interval),
+                    properties.as_deref(),
                 ) {
                     Ok(encoded) if encoded.bytes.len() <= peer.max_packet => encoded,
                     _ => {
@@ -5123,13 +5312,13 @@ impl EffectSink for Sink<'_> {
                             },
                         );
                         let _ = effect.into_parts();
-                        if self.events.emit("frame_queued",json!({"connection":generation.get().to_string(),"details":{"packet_kind":"PUBLISH","effect":effect_text(id),"delivery":delivery_text(delivery),"target":connection.session.get().to_string(),"packet_id":packet_id.get(),"claim":operation_text(claim),"dup":dup,"retain":retain}})).is_err(){self.error=Some(Failure::plain("events_unavailable"));}
+                        if self.events.emit_with("frame_queued",||json!({"connection":generation.get().to_string(),"details":{"packet_kind":"PUBLISH","effect":effect_text(id),"delivery":delivery_text(delivery),"target":connection.session.get().to_string(),"packet_id":packet_id.get(),"claim":operation_text(claim),"dup":dup,"retain":retain}})).is_err(){self.error=Some(Failure::plain("events_unavailable"));}
                         SubmitResult::Accepted
                     }
                     Err(TrySendError::Full(_)) => {
                         self.outgoing_bindings.remove(&binding_key);
                         if peer.blocked_output.replace(id) != Some(id)
-                            && self.events.emit("effect_retained",json!({"connection":generation.get().to_string(),"details":{"code":"output_queue_full","effect":effect_text(id),"packet_kind":"PUBLISH"}})).is_err(){self.error=Some(Failure::plain("events_unavailable"));}
+                            && self.events.emit_with("effect_retained",||json!({"connection":generation.get().to_string(),"details":{"code":"output_queue_full","effect":effect_text(id),"packet_kind":"PUBLISH"}})).is_err(){self.error=Some(Failure::plain("events_unavailable"));}
                         refused(effect, SubmitBlock::TransportBackpressure)
                     }
                     Err(TrySendError::Disconnected(_)) => {
@@ -5217,6 +5406,7 @@ fn expiry_json(expiry: SessionExpiry) -> serde_json::Value {
     }
 }
 fn recipe_details(recipe: &Recipe) -> serde_json::Value {
+    let recipe = recipe.inner_publication();
     if let Recipe::ExpiringPublication(value) = recipe {
         let (publication, topic) = match &value.admission {
             mqttiumd_contract::message_expiry::ExpiringAdmission::Qos12(v) => {
@@ -5362,6 +5552,7 @@ pub fn run(config: Config) -> Result<(), Failure> {
             .as_ref()
             .map(|security| security.policy.storage().clone()),
         config.require_existing_db,
+        config.storage_mode,
     )?;
     let result = run_inner(
         &config.listen,
@@ -5519,6 +5710,7 @@ fn run_inner(
     let incarnation = boot.grant.incarnation();
     let collect_closed = boot.collect_closed;
     let sqlite = boot.sqlite.clone();
+    let storage_mode = boot.storage_mode;
     let mut authority = OwnerAuthority::from_grant(boot.grant, NonZeroU32::MIN)
         .map_err(|_| Failure::plain("authority_allocation"))?;
     let outbox = authority
@@ -5528,13 +5720,14 @@ fn run_inner(
             nz(65536),
         )
         .map_err(|_| Failure::plain("outbox_creation"))?;
+    let max_exchanges = (limits.connections * crate::receiving::MAXIMUM).max(128);
     let owner = Owner::new(
         OwnerConfig {
-            max_sessions: nz(128),
-            max_routes: nz(128),
-            max_exchanges: nz(128),
+            max_sessions: nz(crate::writer::SESSIONS as u32),
+            max_routes: nz(mqttiumd_contract::pubsub::MAX_SUBSCRIPTIONS as u32),
+            max_exchanges: nz(max_exchanges as u32),
             account: AccountId::new(1),
-            payload_bytes: PayloadBytes::new(4 * 1024 * 1024),
+            payload_bytes: PayloadBytes::new(64 * 1024 * 1024),
             resolution_delay: LogicalDuration::new(10000),
             retained_operations: nz(128),
             remembered_connections: nz(8),
@@ -5612,6 +5805,11 @@ fn run_inner(
         session_cardinality_dirty: false,
         last_session_cardinality: None,
         work_reads: BTreeMap::new(),
+        pending_work: VecDeque::new(),
+        pending_work_set: BTreeSet::new(),
+        cached_bindings: BTreeMap::new(),
+        bindings_dirty: true,
+        stale_frames_dirty: false,
         last_work_scan: Instant::now(),
         last_will_scan: Instant::now(),
         maintenance_needed: false,
@@ -5793,8 +5991,20 @@ fn run_inner(
             "started_proof":"positive-socket-write-then-durable-marker","terminal_input_slots":limits.terminal_inputs,
             "socket_write_receipt_slots":net::WRITTEN_SLOTS
         }})).map_err(event_failure)?;
-        events.emit("receipt_policy",json!({"details":{"receipt_window":1024,"receipt_data_window":mqttiumd_contract::receipts::RECEIPT_DATA_WINDOW,"receipt_control_reserve":512,"receipt_collection_rows":128,"receipt_collection_bytes":mqttiumd_store_api::ReadBudget::COLLECTION.max_bytes,"receipt_collection_trigger":64,"max_receipt_origins":64,"startup_origins_trigger":32,"startup_receipts_trigger":4096,"startup_closed_collection":collect_closed,"control_request_slots":crate::writer::CONTROL_QUEUE,"control_reply_slots":crate::writer::CONTROL_QUEUE,"control_input_slots":crate::writer::CONTROL_QUEUE}})).map_err(event_failure)?;
-        events.emit("sqlite_configuration",json!({"details":{"journal_mode":sqlite.journal_mode,"synchronous":sqlite.synchronous,"wal_autocheckpoint":sqlite.wal_autocheckpoint,"checkpoint_policy":sqlite.checkpoint_policy,"sqlite_version":sqlite.sqlite_version,"user_version":sqlite.user_version,"page_size":sqlite.page_size,"kill_points":sqlite.kill_points,"hooks_active":false,"install_order":"sqlite-autocheckpoint-before-optional-business-hook"}})).map_err(event_failure)?;
+        events.emit("receipt_policy",json!({"details":{"receipt_window":mqttiumd_contract::receipts::RECEIPT_WINDOW,"receipt_data_window":mqttiumd_contract::receipts::RECEIPT_DATA_WINDOW,"receipt_control_reserve":mqttiumd_contract::receipts::RECEIPT_CONTROL_RESERVE,"receipt_collection_rows":mqttiumd_contract::receipts::MAX_COLLECTION_ROWS,"receipt_collection_bytes":mqttiumd_store_api::ReadBudget::COLLECTION.max_bytes,"receipt_collection_trigger":mqttiumd_contract::receipts::RECEIPT_COLLECTION_TRIGGER,"max_receipt_origins":mqttiumd_contract::receipts::MAX_RECEIPT_ORIGINS,"startup_origins_trigger":32,"startup_receipts_trigger":4096,"startup_closed_collection":collect_closed,"control_request_slots":crate::writer::CONTROL_QUEUE,"control_reply_slots":crate::writer::CONTROL_QUEUE,"control_input_slots":crate::writer::CONTROL_QUEUE}})).map_err(event_failure)?;
+        if let Some(sqlite) = &sqlite {
+            events.emit("sqlite_configuration",json!({"details":{"journal_mode":sqlite.journal_mode,"synchronous":sqlite.synchronous,"wal_autocheckpoint":sqlite.wal_autocheckpoint,"checkpoint_policy":sqlite.checkpoint_policy,"sqlite_version":sqlite.sqlite_version,"user_version":sqlite.user_version,"page_size":sqlite.page_size,"kill_points":sqlite.kill_points,"hooks_active":false,"install_order":"sqlite-autocheckpoint-before-optional-business-hook"}})).map_err(event_failure)?;
+        }
+        let sqlite_schema = sqlite.as_ref().map_or_else(
+            || {
+                if runtime.security.is_some() {
+                    mqttiumd_store_sqlite::SECURE_SCHEMA_VERSION
+                } else {
+                    mqttiumd_store_sqlite::SCHEMA_VERSION
+                }
+            },
+            |s| s.user_version,
+        );
         check_startup_cancel(&cancel)?;
         let listener =
             TcpListener::bind(listen).map_err(|_| Failure::plain("listen_unavailable"))?;
@@ -5807,7 +6017,18 @@ fn run_inner(
         } else {
             "tcp-will-pubsub-v1"
         };
-        let readiness = json!({"details":{"address":address.to_string(),"epoch":epoch.get().to_string(),"incarnation":incarnation.get().to_string(),"max_connections":limits.connections,"max_sessions":128,"max_packet_bytes":65536,"max_client_id_bytes":1024,"max_topic_bytes":1024,"max_payload_bytes":32768,"receive_maximum":8,"max_exchange_slots":128,"input_slots":4,"output_slots":4,"writer_slots":32,"commands_in_flight":16,"max_timers":limits.timers,"receipt_slots":8192,"partial_packet_ms":5000,"connect_ms":3000,"write_ms":250,"remembered_connections":8,"max_subscriptions":128,"max_targets":16,"outgoing_per_connection":8,"outgoing_metadata":limits.outgoing_bindings,"outgoing_packet_identifier_max":65535,"outgoing_packet_identifier_probe_limit":129,"outgoing_payload_bytes":4194304,"work_page_items":8,"work_scan_ms":100,"wildcard_subscriptions":true,"no_local":true,"shared_subscriptions":false,"subscription_identifiers":false,"sqlite_schema":sqlite.user_version,"retained_available":true,"retained_topics":32,"retained_bytes":1048576,"max_replay_candidates":256,"profile":profile}});
+        let mut readiness = json!({"details":{"address":address.to_string(),"epoch":epoch.get().to_string(),"incarnation":incarnation.get().to_string(),"max_connections":limits.connections,"max_sessions":crate::writer::SESSIONS,"max_packet_bytes":net::MAX_PACKET_BYTES,"max_client_id_bytes":crate::writer::MAX_CLIENT,"max_topic_bytes":crate::writer::MAX_TOPIC,"max_payload_bytes":crate::writer::MAX_PAYLOAD,"receive_maximum":crate::receiving::MAXIMUM,"max_exchange_slots":max_exchanges,"input_slots":net::INPUT_SLOTS,"output_slots":net::OUTPUT_SLOTS,"writer_slots":crate::writer::QUEUE,"commands_in_flight":limits.in_flight,"max_timers":limits.timers,"receipt_slots":crate::writer::limits().receipt_slots.get(),"partial_packet_ms":5000,"connect_ms":3000,"write_ms":250,"remembered_connections":8,"max_subscriptions":mqttiumd_contract::pubsub::MAX_SUBSCRIPTIONS,"max_targets":mqttiumd_contract::retained::MAX_RETAIN_MASK_TARGETS,"outgoing_per_connection":8,"outgoing_metadata":limits.outgoing_bindings,"outgoing_packet_identifier_max":65535,"outgoing_packet_identifier_probe_limit":129,"outgoing_payload_bytes":64*1024*1024,"work_page_items":8,"work_scan_ms":100,"wildcard_subscriptions":true,"no_local":true,"shared_subscriptions":false,"subscription_identifiers":false,"sqlite_schema":sqlite_schema,"retained_available":true,"retained_topics":mqttiumd_contract::retained::MAX_RETAINED_TOPICS,"retained_bytes":mqttiumd_contract::retained::MAX_RETAINED_BYTES,"max_replay_candidates":mqttiumd_contract::retained::MAX_REPLAYS,"profile":profile}});
+        if let Some(details) = readiness["details"].as_object_mut() {
+            details.insert("storage_mode".into(), json!(storage_mode.mode_name()));
+            details.insert(
+                "durability_guarantee".into(),
+                json!(storage_mode.durability_guarantee()),
+            );
+            details.insert(
+                "snapshot_interval_secs".into(),
+                json!(storage_mode.snapshot_interval_secs()),
+            );
+        }
         if let Some(security) = &runtime.security {
             events.emit("tls_profile", json!({"details":{"version":"TLS1.3","client_certificate":"required",
                 "policy_fingerprint":hex_domain(security.policy.storage().fingerprint),"max_handshakes":security::MAX_UNAUTHENTICATED,
@@ -5815,15 +6036,25 @@ fn run_inner(
                 "certificate_bytes":security::CERT_BYTES,"chain_bytes":security::CHAIN_BYTES,"chain_certificates":security::CHAIN_CERTS,
                 "tls_buffer_bytes":security::TLS_BUFFER_BYTES,"resumption":false,"early_data":false}})).map_err(event_failure)?;
         }
-        events.emit("will_capabilities",json!({"details":{"will":true,"will_qos":1,"will_retain":true,"will_delay_interval":0,"will_message_expiry":false,"max_will_intents":256,"max_will_bytes":8388608,"max_will_receipt_bytes":8388608}})).map_err(event_failure)?;
+        events.emit("will_capabilities",json!({"details":{"will":true,"will_qos":1,"will_retain":true,"will_delay_interval":0,"will_message_expiry":false,"max_will_intents":mqttiumd_contract::will::MAX_WILL_INTENTS,"max_will_bytes":mqttiumd_contract::will::MAX_WILL_BYTES,"max_will_receipt_bytes":8388608}})).map_err(event_failure)?;
         events.emit("ready", readiness).map_err(event_failure)?;
-        println!("mqttiumd ready {address} ({profile})");
+        match storage_mode {
+            crate::writer::StorageMode::Durable => {
+                println!("mqttiumd ready {address} ({profile})");
+            }
+            crate::writer::StorageMode::Volatile { .. } => {
+                println!(
+                    "mqttiumd ready {address} ({profile}, storage=volatile, durability={})",
+                    storage_mode.durability_guarantee()
+                );
+            }
+        }
         let acceptor = Acceptor::spawn(listener, cancel.clone(), runtime.wake.clone())?;
         let served = (|| {
             let mut counters_due = Instant::now() + COUNTERS_INTERVAL;
             while !cancel.load(Ordering::Relaxed) {
                 let before = runtime.progress;
-                for _ in 0..4 {
+                for _ in 0..32 {
                     if !runtime.admits_handshake() {
                         break;
                     }

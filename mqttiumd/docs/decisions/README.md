@@ -65,6 +65,10 @@ its source; a test fails when the register and the records drift apart.
 | [0048](0048-runtime-limits.md) | Accepted | Capacities of the runtime and their derivation: the sixteen-connection numbers of eight records describe the bounded profile | Runtime |
 | [0049](0049-functional-compatibility.md) | Accepted | Compatibility with the reference broker is functional: the specification prevails over Mosquitto, and the choices where it allows both (PUBACK 0x10 for a publication without subscriber, one copy for overlapping subscriptions, precise refusal codes) | Contract, core, runtime, compatibility bench |
 | [0050](0050-acknowledgements-in-order-of-reception.md) | Accepted | The PUBACK and PUBREC of a connection leave in the order of reception of its PUBLISH packets: an answer that would overtake is held in the core and released by the next transition | Core, runtime |
+| [0051](0051-core-scaling-indexed-routing-and-credits.md) | Proposed | Core scaling (4,096 sessions, 16,384 subscriptions, 1,024 fanout, 1 MiB payloads), indexed trie routing, aligned exchange credits, SQLite schema 14/15 + `data_version`-guarded caches, and transport coalescing | Contract, core, SQLite store, runtime |
+| [0052](0052-volatile-store-and-periodic-snapshot.md) | Proposed | Indexed zero-clone `VolatileStore` (`mqttiumd-store-volatile`) with optional periodic atomic Schema-14/15 SQLite snapshots and explicit `DUR-001`/`DUR-002` readiness reporting | `mqttiumd-store-volatile`, `mqttiumd-store-sqlite`, `mqttiumd` |
+| [0053](0053-publish-properties.md) | Proposed | End-to-end MQTT 5 PUBLISH application properties (`0x01`, `0x03`, `0x08`, `0x09`, ordered `0x26`), canonical recipe kind 23, SQLite/Volatile persistence, and MQTT 3.1.1 stripping | Contract, core, stores, runtime |
+| [0054](0054-mosquitto-config-subset.md) | Proposed | Native `mosquitto.conf` subset reader (`-c`/`--config`) and static checker (`check-config`) with per-directive CFG-001/002/006/SEC-005 classification | `mqttiumd` |
 
 What each record leaves open is tracked in
 [`../reception/open-conditions.md`](../reception/open-conditions.md).

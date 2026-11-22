@@ -31,22 +31,355 @@ use std::sync::{
     mpsc::{self, Receiver, TryRecvError, TrySendError},
 };
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
-#[cfg(feature = "test-hooks")]
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
-pub const QUEUE: usize = 32;
+/// Storage durability profile chosen explicitly by the operator (ADR 0052,
+/// ARC-020, DUR-001, DUR-002). Defaults to `Durable`; never degrades silently.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum StorageMode {
+    /// SQLite WAL + `synchronous=FULL` (every commit fsynced before reply).
+    #[default]
+    Durable,
+    /// Indexed in-memory `VolatileStore` with optional periodic atomic SQLite
+    /// snapshots. Never implicitly substitutes for `Durable`.
+    Volatile {
+        /// Periodic atomic snapshot interval; `None` disables snapshots (pure RAM).
+        snapshot_interval: Option<Duration>,
+    },
+}
+
+impl StorageMode {
+    #[must_use]
+    pub const fn mode_name(self) -> &'static str {
+        match self {
+            Self::Durable => "durable",
+            Self::Volatile { .. } => "volatile",
+        }
+    }
+
+    #[must_use]
+    pub const fn durability_guarantee(self) -> &'static str {
+        match self {
+            Self::Durable => "per_commit_fsync_wal_full",
+            Self::Volatile {
+                snapshot_interval: Some(_),
+            } => "periodic_atomic_snapshot",
+            Self::Volatile {
+                snapshot_interval: None,
+            } => "none_in_memory_only",
+        }
+    }
+
+    #[must_use]
+    pub const fn snapshot_interval_secs(self) -> u64 {
+        match self {
+            Self::Durable => 0,
+            Self::Volatile { snapshot_interval } => match snapshot_interval {
+                Some(duration) => duration.as_secs(),
+                None => 0,
+            },
+        }
+    }
+}
+
+#[allow(clippy::large_enum_variant)]
+enum StoreBackend {
+    Durable(SqliteStore),
+    Volatile {
+        handle: mqttiumd_store_volatile::VolatileHandle,
+        snapshot_interval: Option<Duration>,
+        last_snapshot: Instant,
+        dirty: bool,
+    },
+}
+
+impl StoreBackend {
+    fn has_will_for_client(&self, client: &[u8]) -> Result<bool, ReadError> {
+        match self {
+            Self::Durable(s) => s.has_will_for_client(client),
+            Self::Volatile { handle, .. } => handle.has_will_for_client(client),
+        }
+    }
+
+    fn apply_group(
+        &mut self,
+        commands: &[&mqttiumd_contract::command::Command],
+    ) -> Result<Vec<mqttiumd_store_api::Applied>, mqttiumd_store_sqlite::GroupRefused> {
+        match self {
+            Self::Durable(s) => s.apply_group(commands),
+            Self::Volatile { handle, dirty, .. } => {
+                let res = handle.apply_group(commands)?;
+                if res.iter().any(|r| r.wrote) {
+                    *dirty = true;
+                }
+                Ok(res)
+            }
+        }
+    }
+
+    fn maybe_snapshot(&mut self, events: &Events, force: bool) {
+        let Self::Volatile {
+            handle,
+            snapshot_interval: Some(interval),
+            last_snapshot,
+            dirty,
+        } = self
+        else {
+            return;
+        };
+        if !*dirty || (!force && last_snapshot.elapsed() < *interval) {
+            return;
+        }
+        match handle.save_snapshot() {
+            Ok(()) => {
+                *last_snapshot = Instant::now();
+                *dirty = false;
+                let _ = events.emit(
+                    "volatile_snapshot_saved",
+                    json!({"details":{"forced":force}}),
+                );
+            }
+            Err(error) => {
+                *last_snapshot = Instant::now();
+                let _ = events.emit(
+                    "volatile_snapshot_failed",
+                    json!({"details":{"cause":error.read_error().code(),"forced":force}}),
+                );
+            }
+        }
+    }
+
+    #[cfg(feature = "test-hooks")]
+    fn set_kill_hook(
+        &mut self,
+        hook: Option<mqttiumd_store_sqlite::kill_points::Hook>,
+    ) -> Result<(), mqttiumd_store_sqlite::OpenError> {
+        match self {
+            Self::Durable(s) => s.set_kill_hook(hook),
+            Self::Volatile { .. } => Ok(()),
+        }
+    }
+
+    #[cfg(feature = "test-hooks")]
+    fn set_receipt_hook(&mut self, hook: Option<mqttiumd_store_sqlite::receipt_points::Hook>) {
+        if let Self::Durable(s) = self {
+            s.set_receipt_hook(hook);
+        }
+    }
+}
+
+impl DurableStore for StoreBackend {
+    fn read_wills(
+        &self,
+        after: Option<OperationId>,
+        limit: usize,
+        budget: ReadBudget,
+    ) -> Result<WillPage, ReadError> {
+        match self {
+            Self::Durable(s) => s.read_wills(after, limit, budget),
+            Self::Volatile { handle, .. } => handle.read_wills(after, limit, budget),
+        }
+    }
+
+    fn expire_messages(
+        &mut self,
+        now: MessageTime,
+        after: Option<mqttiumd_contract::ids::PublicationId>,
+        limit: u32,
+    ) -> Result<mqttiumd_store_api::MessageExpirySweep, ReadError> {
+        match self {
+            Self::Durable(s) => s.expire_messages(now, after, limit),
+            Self::Volatile { handle, dirty, .. } => {
+                let res = handle.expire_messages(now, after, limit)?;
+                if !res.removed.is_empty() || res.retained_removed > 0 {
+                    *dirty = true;
+                }
+                Ok(res)
+            }
+        }
+    }
+
+    fn checkpoint_session_clock(
+        &mut self,
+        expected: Option<SessionClockAnchor>,
+        reading: SessionClockReading,
+    ) -> Result<SessionClockAnchor, ReadError> {
+        match self {
+            Self::Durable(s) => s.checkpoint_session_clock(expected, reading),
+            Self::Volatile { handle, dirty, .. } => {
+                let anchor = handle.checkpoint_session_clock(expected, reading)?;
+                *dirty = true;
+                Ok(anchor)
+            }
+        }
+    }
+
+    fn collect_receipts(
+        &mut self,
+        collection: ReceiptCollection,
+    ) -> Result<ReceiptCollectionReply, ReadError> {
+        match self {
+            Self::Durable(s) => s.collect_receipts(collection),
+            Self::Volatile { handle, dirty, .. } => {
+                let reply = handle.collect_receipts(collection)?;
+                if matches!(reply, ReceiptCollectionReply::Applied { .. }) {
+                    *dirty = true;
+                }
+                Ok(reply)
+            }
+        }
+    }
+
+    fn receipt_frontier(
+        &self,
+        origin: mqttiumd_contract::receipts::ReceiptOrigin,
+    ) -> Result<Option<mqttiumd_contract::receipts::ReceiptClosure>, ReadError> {
+        match self {
+            Self::Durable(s) => s.receipt_frontier(origin),
+            Self::Volatile { handle, .. } => handle.receipt_frontier(origin),
+        }
+    }
+
+    fn collect_closed_receipts(
+        &mut self,
+        collection: ClosedReceiptCollection,
+    ) -> Result<ClosedReceiptReply, ReadError> {
+        match self {
+            Self::Durable(s) => s.collect_closed_receipts(collection),
+            Self::Volatile { handle, dirty, .. } => {
+                let reply = handle.collect_closed_receipts(collection)?;
+                if matches!(reply, ClosedReceiptReply::Applied { .. }) {
+                    *dirty = true;
+                }
+                Ok(reply)
+            }
+        }
+    }
+
+    fn ledger(&self) -> Result<mqttiumd_contract::command::EpochLedger, ReadError> {
+        match self {
+            Self::Durable(s) => s.ledger(),
+            Self::Volatile { handle, .. } => handle.ledger(),
+        }
+    }
+
+    fn open_epoch(
+        &mut self,
+        command: &mqttiumd_contract::command::OpenEpoch,
+    ) -> Result<mqttiumd_contract::outcome::OpeningOutcome, ReadError> {
+        match self {
+            Self::Durable(s) => s.open_epoch(command),
+            Self::Volatile { handle, dirty, .. } => {
+                let res = handle.open_epoch(command)?;
+                *dirty = true;
+                Ok(res)
+            }
+        }
+    }
+
+    fn apply(
+        &mut self,
+        command: &mqttiumd_contract::command::Command,
+    ) -> mqttiumd_store_api::Applied {
+        match self {
+            Self::Durable(s) => s.apply(command),
+            Self::Volatile { handle, dirty, .. } => {
+                let res = handle.apply(command);
+                if res.wrote {
+                    *dirty = true;
+                }
+                res
+            }
+        }
+    }
+
+    fn established(
+        &self,
+        operation: OperationId,
+    ) -> Result<Option<mqttiumd_contract::outcome::StoreOutcome>, ReadError> {
+        match self {
+            Self::Durable(s) => s.established(operation),
+            Self::Volatile { handle, .. } => handle.established(operation),
+        }
+    }
+
+    fn resolve_and_fence(&mut self, operation: OperationId) -> mqttiumd_store_api::Resolved {
+        match self {
+            Self::Durable(s) => s.resolve_and_fence(operation),
+            Self::Volatile { handle, dirty, .. } => {
+                let res = handle.resolve_and_fence(operation);
+                if res.fenced_now {
+                    *dirty = true;
+                }
+                res
+            }
+        }
+    }
+
+    fn admin(
+        &mut self,
+        command: AdminCommand,
+    ) -> Result<AdminDone, mqttiumd_store_api::AdminRefused> {
+        match self {
+            Self::Durable(s) => s.admin(command),
+            Self::Volatile { handle, dirty, .. } => {
+                let res = handle.admin(command)?;
+                *dirty = true;
+                Ok(res)
+            }
+        }
+    }
+
+    fn recover_with_budget(
+        &self,
+        cursor: Option<RecoveryCursor>,
+        limit: usize,
+        budget: ReadBudget,
+    ) -> Result<RecoveryPage, RecoveryRefused> {
+        match self {
+            Self::Durable(s) => s.recover_with_budget(cursor, limit, budget),
+            Self::Volatile { handle, .. } => handle.recover_with_budget(cursor, limit, budget),
+        }
+    }
+
+    fn read_work_with_budget(
+        &self,
+        session: SessionId,
+        after: Option<mqttiumd_contract::ids::DeliveryId>,
+        limit: usize,
+        budget: ReadBudget,
+    ) -> Result<WorkPage, ReadError> {
+        match self {
+            Self::Durable(s) => s.read_work_with_budget(session, after, limit, budget),
+            Self::Volatile { handle, .. } => {
+                handle.read_work_with_budget(session, after, limit, budget)
+            }
+        }
+    }
+
+    fn snapshot_with_budget(
+        &self,
+        budget: ReadBudget,
+    ) -> Result<mqttiumd_store_api::DurableState, ReadError> {
+        match self {
+            Self::Durable(s) => s.snapshot_with_budget(budget),
+            Self::Volatile { handle, .. } => handle.snapshot_with_budget(budget),
+        }
+    }
+}
+
+pub const QUEUE: usize = 1024;
 pub const CONTROL_QUEUE: usize = 4;
-/// Commands one transaction may carry: what the request lane can hold.
+/// Commands one transaction may carry: bounded by both request lane and SQLite group cap.
 const GROUP: usize = if QUEUE < mqttiumd_store_sqlite::MAX_GROUP {
     QUEUE
 } else {
     mqttiumd_store_sqlite::MAX_GROUP
 };
-pub const SESSIONS: usize = 128;
+pub const SESSIONS: usize = 4_096;
 pub const MAX_CLIENT: usize = 1024;
 pub const MAX_TOPIC: usize = 1024;
-pub const MAX_PAYLOAD: usize = 32768;
+pub const MAX_PAYLOAD: usize = 1_048_576;
 fn hex_domain(domain: [u8; 32]) -> String {
     domain.iter().map(|byte| format!("{byte:02x}")).collect()
 }
@@ -62,19 +395,20 @@ pub fn message_expiry_details(
 }
 pub fn limits() -> Limits {
     Limits {
-        payload_bytes: PayloadBytes::new(4 * 1024 * 1024),
-        references: References::new(128),
-        exchange_slots: ExchangeSlots::new(128),
-        receipt_slots: ReceiptSlots::new(8192),
-        max_targets_per_admission: 16,
+        payload_bytes: PayloadBytes::new(256 * 1024 * 1024),
+        references: References::new(65_536),
+        exchange_slots: ExchangeSlots::new(32_768),
+        receipt_slots: ReceiptSlots::new(65_536),
+        max_targets_per_admission: 1_024,
         max_topic_bytes: MAX_TOPIC,
         max_payload_bytes: MAX_PAYLOAD,
         max_sessions: SESSIONS,
-        max_route_targets: 16,
+        max_route_targets: 1_024,
     }
 }
 pub fn recipe_kind(recipe: &Recipe) -> &'static str {
     match recipe {
+        Recipe::AnnotatedPublication(value) => recipe_kind(value.inner.as_ref()),
         Recipe::WillPublication(_) => "WillAdmission",
         Recipe::SessionLifecycle(change) => match change.action {
             SessionAction::Open { .. }
@@ -142,7 +476,8 @@ pub struct Boot {
     pub grant: EpochGrant,
     pub sessions: BTreeMap<Vec<u8>, Session>,
     pub collect_closed: bool,
-    pub sqlite: mqttiumd_store_sqlite::Settings,
+    pub sqlite: Option<mqttiumd_store_sqlite::Settings>,
+    pub storage_mode: StorageMode,
     pub clock: Arc<dyn SessionClock>,
     pub clock_anchor: SessionClockAnchor,
 }
@@ -333,7 +668,16 @@ impl Writer {
         cancel: Arc<AtomicBool>,
         clock: Arc<dyn SessionClock>,
     ) -> Result<Self, Failure> {
-        Self::spawn_bound(path, events, hooks, cancel, clock, None, false)
+        Self::spawn_bound(
+            path,
+            events,
+            hooks,
+            cancel,
+            clock,
+            None,
+            false,
+            StorageMode::Durable,
+        )
     }
 
     pub(crate) fn spawn_configured(
@@ -343,11 +687,22 @@ impl Writer {
         cancel: Arc<AtomicBool>,
         policy: Option<mqttiumd_store_sqlite::StoragePolicy>,
         require_existing: bool,
+        storage_mode: StorageMode,
     ) -> Result<Self, Failure> {
         let clock = Arc::new(SystemClock::new().map_err(|error| Failure::plain(error.code()))?);
-        Self::spawn_bound(path, events, hooks, cancel, clock, policy, require_existing)
+        Self::spawn_bound(
+            path,
+            events,
+            hooks,
+            cancel,
+            clock,
+            policy,
+            require_existing,
+            storage_mode,
+        )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn spawn_bound(
         path: PathBuf,
         events: Events,
@@ -356,12 +711,16 @@ impl Writer {
         clock: Arc<dyn SessionClock>,
         policy: Option<mqttiumd_store_sqlite::StoragePolicy>,
         require_existing: bool,
+        storage_mode: StorageMode,
     ) -> Result<Self, Failure> {
         let _ = &hooks;
+        if hooks.directory.is_some() && storage_mode != StorageMode::Durable {
+            return Err(Failure::plain("volatile_test_hooks_unsupported"));
+        }
         // The worker waits on `requests` when both request lanes are empty.
         let requests = crate::wake::Wake::new();
         let (tx, rx) = crate::wake::signalled(QUEUE, &requests);
-        let (rtx, rrx) = mpsc::sync_channel(64);
+        let (rtx, rrx) = mpsc::sync_channel(QUEUE * 2);
         let (btx, brx) = mpsc::sync_channel(1);
         let (ctx, crx) = crate::wake::signalled(CONTROL_QUEUE, &requests);
         // File-polled test controls have no producer to signal the worker.
@@ -374,9 +733,18 @@ impl Writer {
         let wake = crate::wake::Wake::new();
         let worker_wake = wake.clone();
         let handle = thread::Builder::new()
-            .name("sqlite-writer".into())
+            .name(match storage_mode {
+                StorageMode::Durable => "sqlite-writer".into(),
+                StorageMode::Volatile { .. } => "volatile-writer".into(),
+            })
             .spawn(move || {
-                let (mut store, boot) = match bootstrap_bound(&path, clock, policy.as_ref(), require_existing) {
+                let (mut store, boot) = match bootstrap_bound(
+                    &path,
+                    clock,
+                    policy,
+                    require_existing,
+                    storage_mode,
+                ) {
                     Ok(value) => value,
                     Err(error) => {
                         let _ = btx.send(Err(error));
@@ -412,9 +780,10 @@ impl Writer {
                         }
                     }
                     // Replies leave in the order of their requests.
+                    let mut sent_reply = false;
                     while let Some(reply) = pending.pop_front() {
                         match rtx.try_send(reply) {
-                            Ok(()) => worker_wake.wake(),
+                            Ok(()) => sent_reply = true,
                             Err(TrySendError::Full(reply)) => {
                                 stalled = true;
                                 pending.push_front(reply);
@@ -422,6 +791,9 @@ impl Writer {
                             }
                             Err(TrySendError::Disconnected(_)) => return,
                         }
+                    }
+                    if sent_reply {
+                        worker_wake.wake();
                     }
                     if stopping && pending.is_empty() {
                         return;
@@ -454,16 +826,21 @@ impl Writer {
                     }
                     if pending.is_empty() && !stopping {
                         // Consecutive commands waiting in the lane commit as
-                        // one group; any other request ends the group and is
-                        // served after it, in order.
+                        // one group. Interleaved read-only LoadWork requests do
+                        // not shatter the write group: they run immediately
+                        // after the group commit so they see the committed rows.
                         let mut members: Vec<Member> = Vec::new();
+                        let mut deferred_reads: Vec<(EffectId, Effect)> = Vec::new();
                         let mut other = None;
                         let mut closed = false;
-                        while members.len() < group {
+                        while members.len() < group && deferred_reads.len() < group {
                             match rx.try_recv() {
                                 Ok(Request::Effect(effect)) => match effect.into_parts() {
                                     (effect, Effect::Persist { command }) if group > 1 => {
                                         members.push(Member { effect, command });
+                                    }
+                                    (effect, work @ Effect::LoadWork { .. }) if group > 1 => {
+                                        deferred_reads.push((effect, work));
                                     }
                                     (effect, work) => {
                                         other = Some(Ok((effect, work)));
@@ -481,12 +858,19 @@ impl Writer {
                                 }
                             }
                         }
-                        let idle_turn = members.is_empty() && other.is_none();
+                        let idle_turn =
+                            members.is_empty() && deferred_reads.is_empty() && other.is_none();
                         if !members.is_empty() {
                             pending.extend(group_responses(&mut store, members, &events, &cancel));
                         }
+                        for (effect, work) in deferred_reads {
+                            pending.push_back(effect_response(
+                                &mut store, effect, work, &events, &hooks, &cancel, &mut state,
+                            ));
+                        }
                         match other {
                             Some(Err(Request::Stop)) => {
+                                store.maybe_snapshot(&events, true);
                                 pending.push_back(Response::Stopped);
                                 stopping = true;
                             }
@@ -498,7 +882,11 @@ impl Writer {
                             )),
                             None => {}
                         }
+                        if !stopping {
+                            store.maybe_snapshot(&events, false);
+                        }
                         if closed && pending.is_empty() {
+                            store.maybe_snapshot(&events, true);
                             return;
                         }
                         // Both request lanes signal `requests`. A reply
@@ -563,7 +951,7 @@ struct BusinessState {
     captured: Option<mqttiumd_contract::command::Command>,
 }
 fn business_response(
-    store: &mut SqliteStore,
+    store: &mut StoreBackend,
     request: Request,
     events: &Events,
     hooks: &Hooks,
@@ -677,7 +1065,7 @@ fn record_result(
             cancel.store(true, Ordering::Relaxed);
         }
     }
-    if events.emit("store_result",json!({"operation":operation(id),"command_kind":kind,"details":{"committed_now":applied.committed_now,"wrote":applied.wrote,"outcome":outcome_name(applied.reply)}})).is_err(){cancel.store(true,Ordering::Relaxed);}
+    if events.emit_with("store_result",||json!({"operation":operation(id),"command_kind":kind,"details":{"committed_now":applied.committed_now,"wrote":applied.wrote,"outcome":outcome_name(applied.reply)}})).is_err(){cancel.store(true,Ordering::Relaxed);}
 }
 
 /// One command of a group and the effect that carries it.
@@ -689,17 +1077,15 @@ struct Member {
 /// Applies the commands in one transaction (record 0045) and answers each
 /// in order. No answer exists before the commit of the group returned.
 fn group_responses(
-    store: &mut SqliteStore,
+    store: &mut StoreBackend,
     members: Vec<Member>,
     events: &Events,
     cancel: &AtomicBool,
 ) -> Vec<Response> {
     let commands: Vec<_> = members.iter().map(|member| &member.command).collect();
+    let count = commands.len();
     if events
-        .emit(
-            "store_group",
-            json!({"details":{"commands":commands.len()}}),
-        )
+        .emit_with("store_group", || json!({"details":{"commands":count}}))
         .is_err()
     {
         cancel.store(true, Ordering::Relaxed);
@@ -729,7 +1115,7 @@ fn group_responses(
 }
 
 fn effect_response(
-    store: &mut SqliteStore,
+    store: &mut StoreBackend,
     effect: EffectId,
     work: Effect,
     events: &Events,
@@ -1050,7 +1436,7 @@ fn identity_text(incarnation: u64, epoch: u64, owner: u64, sequence: u64) -> Str
 
 #[cfg(feature = "test-hooks")]
 fn replay_controls(
-    store: &mut SqliteStore,
+    store: &mut StoreBackend,
     state: &BusinessState,
     hooks: &Hooks,
     events: &Events,
@@ -1080,8 +1466,9 @@ fn replay_controls(
             .get()
             .encode_canonical(&mut bytes)
             .map_err(|_| Failure::plain("receipt_replay_recipe"))?;
-        let mut recipe = Recipe::decode_canonical(&bytes, 16, MAX_TOPIC)
-            .map_err(|_| Failure::plain("receipt_replay_recipe"))?;
+        let mut recipe =
+            Recipe::decode_canonical(&bytes, limits().max_targets_per_admission, MAX_TOPIC)
+                .map_err(|_| Failure::plain("receipt_replay_recipe"))?;
         let admission = match &mut recipe {
             Recipe::AdmitPublication(a) => a,
             Recipe::RetainedPublication(a) => &mut a.admission,
@@ -1124,8 +1511,12 @@ fn replay_controls(
             // Refresh the unrelated identity above both the compact guard and
             // every retained recipe, even when its business object was freed.
             for record in before.operations.values() {
-                let known = Recipe::decode_canonical(&record.recipe, 16, MAX_TOPIC)
-                    .map_err(|_| Failure::plain("receipt_replay_recipe"))?;
+                let known = Recipe::decode_canonical(
+                    &record.recipe,
+                    limits().max_targets_per_admission,
+                    MAX_TOPIC,
+                )
+                .map_err(|_| Failure::plain("receipt_replay_recipe"))?;
                 if mqttiumd_contract::receipts::ReceiptOrigin::of(known.operation()) != origin {
                     continue;
                 }
@@ -1213,7 +1604,7 @@ fn replay_controls(
 }
 
 fn control_response(
-    store: &mut SqliteStore,
+    store: &mut StoreBackend,
     request: ControlRequest,
     events: &Events,
     hooks: &Hooks,
@@ -1468,7 +1859,7 @@ fn recipe_identity_highwater(recipe: &Recipe) -> Result<(u64, u64), Failure> {
 }
 
 #[cfg(test)]
-fn bootstrap(path: &Path) -> Result<(SqliteStore, Boot), Failure> {
+fn bootstrap(path: &Path) -> Result<(StoreBackend, Boot), Failure> {
     let clock = Arc::new(SystemClock::new().map_err(|error| Failure::plain(error.code()))?);
     bootstrap_with_clock(path, clock)
 }
@@ -1477,8 +1868,8 @@ fn bootstrap(path: &Path) -> Result<(SqliteStore, Boot), Failure> {
 fn bootstrap_with_clock(
     path: &Path,
     clock: Arc<dyn SessionClock>,
-) -> Result<(SqliteStore, Boot), Failure> {
-    bootstrap_bound(path, clock, None, false)
+) -> Result<(StoreBackend, Boot), Failure> {
+    bootstrap_bound(path, clock, None, false, StorageMode::Durable)
 }
 
 fn create_store(
@@ -1523,23 +1914,49 @@ pub fn initialize_secured(
 fn bootstrap_bound(
     path: &Path,
     clock: Arc<dyn SessionClock>,
-    policy: Option<&mqttiumd_store_sqlite::StoragePolicy>,
+    policy: Option<mqttiumd_store_sqlite::StoragePolicy>,
     require_existing: bool,
-) -> Result<(SqliteStore, Boot), Failure> {
+    storage_mode: StorageMode,
+) -> Result<(StoreBackend, Boot), Failure> {
     // Existing files, including empty/truncated files, are never silently initialised.
-    let mut store = if path
+    let exists = path
         .try_exists()
-        .map_err(|e| Failure::read(io_cause(e.kind()), ReadPhase::Open))?
-    {
-        match policy {
-            Some(policy) => SqliteStore::open_secured(path, policy),
-            None => SqliteStore::open(path),
-        }
-        .map_err(database_open_error)?
-    } else if require_existing {
+        .map_err(|e| Failure::read(io_cause(e.kind()), ReadPhase::Open))?;
+    if !exists && require_existing {
         return Err(Failure::plain("existing_database_missing"));
-    } else {
-        create_store(path, policy)?
+    }
+    let mut store = match storage_mode {
+        StorageMode::Durable => {
+            let sqlite = if exists {
+                match policy.as_ref() {
+                    Some(policy) => SqliteStore::open_secured(path, policy),
+                    None => SqliteStore::open(path),
+                }
+                .map_err(database_open_error)?
+            } else {
+                create_store(path, policy.as_ref())?
+            };
+            StoreBackend::Durable(sqlite)
+        }
+        StorageMode::Volatile { snapshot_interval } => {
+            let mut random = [0u8; 8];
+            getrandom::fill(&mut random).map_err(|_| Failure::plain("random_unavailable"))?;
+            let incarnation = StoreIncarnation::new(u64::from_be_bytes(random).max(1));
+            let handle = mqttiumd_store_volatile::VolatileHandle::open_or_create(
+                path,
+                incarnation,
+                limits(),
+                policy,
+                require_existing,
+            )
+            .map_err(database_open_error)?;
+            StoreBackend::Volatile {
+                handle,
+                snapshot_interval,
+                last_snapshot: Instant::now(),
+                dirty: !exists,
+            }
+        }
     };
     let state = store
         .snapshot()
@@ -1552,7 +1969,7 @@ fn bootstrap_bound(
         .values()
         .try_fold(0usize, |n, targets| n.checked_add(targets.len()))
         .ok_or_else(|| Failure::read(ReadError::LimitExceeded, ReadPhase::Snapshot))?;
-    if route_count > 128 {
+    if route_count > mqttiumd_contract::pubsub::MAX_SUBSCRIPTIONS {
         return Err(Failure::read(ReadError::LimitExceeded, ReadPhase::Snapshot));
     }
     // Establish the logical domain before new-epoch cleanup derives any
@@ -1617,7 +2034,10 @@ fn bootstrap_bound(
     }
     let collect_closed =
         state.receipt_frontiers.len() >= 32 || state.accounts.receipt_slots.get() >= 4096;
-    let sqlite = store.effective_settings().clone();
+    let sqlite = match &store {
+        StoreBackend::Durable(s) => Some(s.effective_settings().clone()),
+        StoreBackend::Volatile { handle, .. } => handle.sqlite_settings().cloned(),
+    };
     Ok((
         store,
         Boot {
@@ -1625,12 +2045,13 @@ fn bootstrap_bound(
             sessions,
             collect_closed,
             sqlite,
+            storage_mode,
             clock,
             clock_anchor,
         },
     ))
 }
-fn session(store: &mut SqliteStore, client: SharedBytes) -> Result<Session, Failure> {
+fn session(store: &mut StoreBackend, client: SharedBytes) -> Result<Session, Failure> {
     let state = store
         .snapshot()
         .map_err(|e| Failure::read(e, ReadPhase::Lookup))?;
@@ -2131,7 +2552,7 @@ mod tests {
                 OperationSeq::new(sequence),
             )
         };
-        let apply = |store: &mut SqliteStore, sequence, action| {
+        let apply = |store: &mut StoreBackend, sequence, action| {
             store
                 .apply(&Command {
                     recipe: FrozenRecipe::freeze(Recipe::SessionLifecycle(SessionLifecycle {

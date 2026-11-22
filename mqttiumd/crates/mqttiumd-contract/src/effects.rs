@@ -425,6 +425,7 @@ pub enum Effect {
         cause: crate::command::DeliveryCause,
         retain: bool,
         expiry: Option<MessageExpiry>,
+        properties: Option<alloc::sync::Arc<crate::properties::PublishProperties>>,
         topic: SharedBytes,
         payload: SharedBytes,
     },
@@ -467,6 +468,7 @@ pub enum Effect {
         dup: bool,
         retain: bool,
         expiry: Option<MessageExpiry>,
+        properties: Option<alloc::sync::Arc<crate::properties::PublishProperties>>,
         started: bool,
     },
     /// Emit one precise frame on one connection generation.

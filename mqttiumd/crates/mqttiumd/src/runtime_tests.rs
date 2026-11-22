@@ -142,6 +142,11 @@ fn with_runtime_clock_hooks(
         session_cardinality_dirty: false,
         last_session_cardinality: None,
         work_reads: BTreeMap::new(),
+        pending_work: VecDeque::new(),
+        pending_work_set: BTreeSet::new(),
+        cached_bindings: BTreeMap::new(),
+        bindings_dirty: true,
+        stale_frames_dirty: false,
         last_work_scan: Instant::now(),
         last_will_scan: Instant::now(),
         maintenance_needed: false,
@@ -6198,14 +6203,16 @@ fn tls_terminal_writer_cannot_discard_an_already_decoded_normal_disconnect() {
             r.session_requests.is_empty() && r.frames.is_empty()
         });
         assert_eq!(read_frame(&mut client).0, 0x20);
-        client.write_all(&[0xc0, 0].repeat(5)).unwrap();
+        let pings = net::INPUT_SLOTS + 1;
+        let total = pings + 1;
+        client.write_all(&[0xc0, 0].repeat(pings)).unwrap();
         client.write_all(&[0xe0, 0]).unwrap();
         client.flush().unwrap();
-        // Retain the exact six facts decoded by the real TLS task. No fact or
+        // Retain the exact facts decoded by the real TLS task. No fact or
         // writer result is manufactured. Requeue through a bounded lane so the
-        // reactor's four-input turn leaves the normal DISCONNECT for next turn.
-        let mut facts = Vec::new();
-        for _ in 0..6 {
+        // reactor's bounded input turn leaves the normal DISCONNECT for next turn.
+        let mut facts = Vec::with_capacity(total);
+        for _ in 0..total {
             facts.push(
                 runtime.peers[&generation]
                     .io

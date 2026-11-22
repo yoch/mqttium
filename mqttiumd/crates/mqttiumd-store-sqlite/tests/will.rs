@@ -134,7 +134,7 @@ fn will_publication(
     }
     Command {
         recipe: FrozenRecipe::freeze(Recipe::WillPublication(WillPublication {
-            live_retain,
+            live_retain: live_retain.map(mqttiumd_contract::retained::RetainMask::from_u16),
             operation: op,
             will,
             publication: p,

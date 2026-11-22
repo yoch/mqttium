@@ -4,8 +4,8 @@
 use super::{Connection, OpenError, SCHEMA_VERSION, params, reader};
 use std::collections::BTreeMap;
 
-pub const SECURE_SCHEMA_VERSION: i64 = 13;
-const MAX_OWNERS: usize = 128;
+pub const SECURE_SCHEMA_VERSION: i64 = 15;
+const MAX_OWNERS: usize = 4_096;
 const MAX_CLIENT_BYTES: usize = 1024;
 const MAX_PRINCIPAL_BYTES: usize = 64;
 
@@ -16,7 +16,7 @@ pub struct StoragePolicy {
     pub owners: BTreeMap<Vec<u8>, String>,
 }
 
-pub(super) fn version(policy: Option<&StoragePolicy>) -> i64 {
+pub(crate) fn version(policy: Option<&StoragePolicy>) -> i64 {
     if policy.is_some() {
         SECURE_SCHEMA_VERSION
     } else {
@@ -53,7 +53,7 @@ END;
 ";
 
 impl StoragePolicy {
-    pub(super) fn validate(&self) -> Result<(), OpenError> {
+    pub(crate) fn validate(&self) -> Result<(), OpenError> {
         if self.owners.is_empty()
             || self.owners.len() > MAX_OWNERS
             || self.owners.iter().any(|(id, principal)| {
@@ -68,7 +68,7 @@ impl StoragePolicy {
         Ok(())
     }
 
-    pub(super) fn install(&self, conn: &Connection) -> Result<(), OpenError> {
+    pub(crate) fn install(&self, conn: &Connection) -> Result<(), OpenError> {
         conn.execute_batch(CREATE)?;
         conn.execute(
             "INSERT INTO security_policy VALUES (1, ?1)",
@@ -136,7 +136,7 @@ impl StoragePolicy {
         }
         {
             let mut statement = conn.prepare(
-                "SELECT client_id, principal FROM security_client_owners ORDER BY client_id LIMIT 129",
+                "SELECT client_id, principal FROM security_client_owners ORDER BY client_id LIMIT 4097",
             )?;
             let mut rows = statement.query([])?;
             for (badged_id, badged_owner) in &self.owners {
@@ -163,7 +163,7 @@ impl StoragePolicy {
         // one durable owner and termination reclaims that row atomically.
         for table in ["sessions", "security_session_owners"] {
             let count: i64 = conn.query_row(
-                &format!("SELECT count(*) FROM (SELECT 1 FROM {table} LIMIT 129)"),
+                &format!("SELECT count(*) FROM (SELECT 1 FROM {table} LIMIT 4097)"),
                 [],
                 |row| row.get(0),
             )?;

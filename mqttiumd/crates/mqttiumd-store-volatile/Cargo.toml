@@ -1,0 +1,19 @@
+[package]
+name = "mqttiumd-store-volatile"
+description = "High-throughput in-memory VolatileStore with optional periodic atomic SQLite snapshots (ADR 0052)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+mqttiumd-contract.workspace = true
+mqttiumd-store-api = { path = "../mqttiumd-store-api" }
+mqttiumd-store-sqlite = { path = "../mqttiumd-store-sqlite" }
+
+[dev-dependencies]
+mqttiumd-lab = { path = "../mqttiumd-lab" }
+
+[lints]
+workspace = true

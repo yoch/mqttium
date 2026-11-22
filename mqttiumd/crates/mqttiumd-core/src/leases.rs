@@ -16,6 +16,7 @@
 //! as well, so no record is rebuilt from its parts and no account is
 //! charged by hand.
 
+use alloc::collections::BTreeSet;
 use core::num::NonZeroU32;
 
 use crate::contract::capacity::{AllocationFailed, BoundedVec, Resource};
@@ -75,6 +76,9 @@ struct LeaseSlot {
 pub struct LeaseTable {
     account: Account,
     slots: BoundedVec<LeaseSlot>,
+    free_slots: BTreeSet<usize>,
+    held_count: usize,
+    exhausted_count: usize,
 }
 
 impl LeaseTable {
@@ -87,16 +91,21 @@ impl LeaseTable {
     ) -> Result<Self, AllocationFailed> {
         let count = usize::try_from(max_leases.get()).map_err(|_| AllocationFailed)?;
         let mut slots = BoundedVec::with_capacity(count)?;
-        for _ in 0..count {
+        let mut free_slots = BTreeSet::new();
+        for index in 0..count {
             let free = LeaseSlot {
                 next_generation: Some(LeaseGeneration::new(0)),
                 record: None,
             };
             slots.try_push(free).map_err(|_| AllocationFailed)?;
+            free_slots.insert(index);
         }
         Ok(Self {
             account: Account::new(account, limit),
             slots,
+            free_slots,
+            held_count: 0,
+            exhausted_count: 0,
         })
     }
 
@@ -110,19 +119,12 @@ impl LeaseTable {
 
     /// The slot the next lease takes, or why there is none.
     fn free_slot(&self) -> Result<usize, LeaseRefused> {
-        let slots = self.slots.as_slice();
-        let free = slots
-            .iter()
-            .position(|slot| slot.record.is_none() && slot.next_generation.is_some());
-        if let Some(index) = free {
+        if let Some(&index) = self.free_slots.first() {
             return Ok(index);
         }
         // A held slot is freed by a release unless its lease took the
         // last generation: that slot is spent already.
-        if slots
-            .iter()
-            .any(|slot| slot.record.is_some() && slot.next_generation.is_some())
-        {
+        if self.exhausted_count < self.slots.len() {
             Err(LeaseRefused::TableFull)
         } else {
             Err(LeaseRefused::TableExhausted)
@@ -166,11 +168,7 @@ impl LeaseTable {
     /// Number of leases held.
     #[must_use]
     pub fn held(&self) -> usize {
-        self.slots
-            .as_slice()
-            .iter()
-            .filter(|slot| slot.record.is_some())
-            .count()
+        self.held_count
     }
 
     /// Whether `key` names a lease this table holds now.
@@ -225,6 +223,11 @@ impl LeaseTable {
         entry.record = Some(record);
         // The generation is used whatever follows; the last leaves `None`.
         entry.next_generation = generation.checked_next().ok();
+        self.free_slots.remove(&index);
+        self.held_count += 1;
+        if entry.next_generation.is_none() {
+            self.exhausted_count += 1;
+        }
         Ok(key)
     }
 
@@ -246,6 +249,10 @@ impl LeaseTable {
         if outcome == ReleaseOutcome::Released {
             // The one record of the lease leaves the table with it.
             entry.record = None;
+            self.held_count -= 1;
+            if entry.next_generation.is_some() {
+                self.free_slots.insert(index);
+            }
         }
         Ok(outcome)
     }
@@ -282,6 +289,11 @@ impl LeaseTable {
         let entry = &mut self.slots.as_mut_slice()[index];
         entry.record = Some(record);
         entry.next_generation = key.generation.checked_next().ok();
+        self.free_slots.remove(&index);
+        self.held_count += 1;
+        if entry.next_generation.is_none() {
+            self.exhausted_count += 1;
+        }
         Ok(())
     }
 }

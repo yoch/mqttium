@@ -12,6 +12,147 @@ pub(super) struct IdentityBounds {
     pub payload: Option<PayloadId>,
 }
 
+/// Disjoint, non-adjacent closed intervals `[start, end]`, keyed by `start`.
+/// Monotonic sequences collapse into a single `(1, N)` interval in O(1) space.
+#[derive(Default, Debug)]
+struct IntervalSet {
+    ranges: BTreeMap<u64, u64>,
+}
+
+impl IntervalSet {
+    fn insert(&mut self, mut start: u64, mut end: u64) {
+        if start > end {
+            return;
+        }
+        if let Some((&prev_start, &prev_end)) = self.ranges.range(..=start).next_back()
+            && prev_end.saturating_add(1) >= start
+        {
+            if prev_end >= end {
+                return;
+            }
+            start = prev_start;
+            let upper = end.saturating_add(1);
+            if self
+                .ranges
+                .range(start.saturating_add(1)..=upper)
+                .next()
+                .is_none()
+            {
+                if let Some(slot) = self.ranges.get_mut(&prev_start) {
+                    *slot = end;
+                }
+                return;
+            }
+        }
+        let upper = end.saturating_add(1);
+        let mut to_remove = Vec::new();
+        for (&s, &e) in self.ranges.range(start..=upper) {
+            if e > end {
+                end = e;
+            }
+            to_remove.push(s);
+        }
+        for s in to_remove {
+            self.ranges.remove(&s);
+        }
+        self.ranges.insert(start, end);
+    }
+
+    fn overlaps(&self, start: u64, end: u64) -> bool {
+        if start > end {
+            return false;
+        }
+        self.ranges
+            .range(..=end)
+            .next_back()
+            .is_some_and(|(_, &r_end)| r_end >= start)
+    }
+}
+
+/// Verified per-origin receipt witness intervals at the current `PRAGMA data_version`.
+#[derive(Default, Debug)]
+pub(super) struct OriginWitness {
+    publications: IntervalSet,
+    payloads: IntervalSet,
+}
+
+impl OriginWitness {
+    pub(super) fn record(&mut self, bounds: IdentityBounds) {
+        self.publications
+            .insert(bounds.first.sequence().get(), bounds.last.sequence().get());
+        if let Some(payload) = bounds.payload {
+            let seq = payload.sequence().get();
+            self.payloads.insert(seq, seq);
+        }
+    }
+
+    fn matches(
+        &self,
+        origin: ReceiptOrigin,
+        first: PublicationId,
+        last: PublicationId,
+        payload: Option<PayloadId>,
+    ) -> bool {
+        let same_pub = (first.incarnation(), first.epoch(), first.owner())
+            == (origin.incarnation, origin.epoch, origin.owner)
+            && (last.incarnation(), last.epoch(), last.owner())
+                == (origin.incarnation, origin.epoch, origin.owner);
+        if same_pub
+            && self
+                .publications
+                .overlaps(first.sequence().get(), last.sequence().get())
+        {
+            return true;
+        }
+        if let Some(p) = payload
+            && (p.incarnation(), p.epoch(), p.owner())
+                == (origin.incarnation, origin.epoch, origin.owner)
+        {
+            let seq = p.sequence().get();
+            if self.payloads.overlaps(seq, seq) {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn load(conn: &Connection, meta: &Meta, origin: ReceiptOrigin) -> Result<Self, Fault> {
+        let op = |seq| {
+            OperationId::new(
+                origin.incarnation,
+                origin.epoch,
+                origin.owner,
+                OperationSeq::new(seq),
+            )
+            .to_be_bytes()
+        };
+        let mut statement = conn.prepare_cached(
+            "SELECT id,recipe,decision,publication,exchange,reason,resource,facts FROM operations WHERE id>=?1 AND id<=?2 ORDER BY id",
+        )?;
+        let mut rows = statement.query(params![op(0).as_slice(), op(u64::MAX).as_slice()])?;
+        let mut meter = reader::Meter::new(ReadBudget::SNAPSHOT);
+        let mut witness = Self::default();
+        while let Some(row) = rows.next()? {
+            let bytes = reader::borrow_blob(row, 1, ReadBudget::SNAPSHOT.max_field_bytes)?;
+            meter.charge(
+                256usize
+                    .checked_add(bytes.len())
+                    .ok_or(ReadError::LimitExceeded)?,
+            )?;
+            let id = OperationId::from_be_slice(reader::borrow_blob(row, 0, 32)?)
+                .map_err(|_| Fault::Corrupt)?;
+            let record = OperationRecord {
+                recipe: reader::copy_blob(row, 1, ReadBudget::SNAPSHOT.max_field_bytes)?,
+                decision: decision_of(row, 2)?.decode()?,
+            };
+            if let Some(stored) = receipt_bounds(meta, id, &record)? {
+                witness.record(stored);
+            }
+        }
+        Ok(witness)
+    }
+}
+
 pub(super) fn bounds(recipe: &Recipe) -> Result<Option<IdentityBounds>, Fault> {
     let one = |p, payload| {
         Some(IdentityBounds {
@@ -129,15 +270,19 @@ pub(super) fn receipt_bounds(
     Ok(Some(bounds))
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn identity_was_used(
     conn: &Connection,
     meta: &Meta,
+    caches: &mut StoreCaches,
+    delta: &TxDelta,
     operation: OperationId,
     first: PublicationId,
     last: PublicationId,
     payload: Option<PayloadId>,
 ) -> Result<bool, Fault> {
-    if let Some(closure) = receipts::frontier(conn, meta, ReceiptOrigin::of(operation))?
+    let origin = ReceiptOrigin::of(operation);
+    if let Some(closure) = receipts::frontier(conn, meta, origin)?
         && ((!receipts::MUTANT_ALLOW_OLD_PUBLICATION
             && first.sequence() <= closure.publication_through)
             || (!receipts::MUTANT_ALLOW_OLD_PAYLOAD
@@ -145,14 +290,17 @@ pub(super) fn identity_was_used(
     {
         return Ok(true);
     }
-    let live: bool = conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM publications WHERE id>=?1 AND id<=?2 LIMIT 1)",
-        params![
-            first.to_be_bytes().as_slice(),
-            last.to_be_bytes().as_slice()
-        ],
-        |r| r.get(0),
-    )?;
+    let live: bool = conn
+        .prepare_cached(
+            "SELECT EXISTS(SELECT 1 FROM publications WHERE id>=?1 AND id<=?2 LIMIT 1)",
+        )?
+        .query_row(
+            params![
+                first.to_be_bytes().as_slice(),
+                last.to_be_bytes().as_slice()
+            ],
+            |r| r.get(0),
+        )?;
     if live {
         return Ok(true);
     }
@@ -169,32 +317,17 @@ pub(super) fn identity_was_used(
     {
         return Ok(true);
     }
-    let op = |seq| {
-        OperationId::new(
-            operation.incarnation(),
-            operation.epoch(),
-            operation.owner(),
-            OperationSeq::new(seq),
-        )
-        .to_be_bytes()
+    let witness = match caches.witnesses.entry(origin) {
+        std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
+        std::collections::btree_map::Entry::Vacant(entry) => {
+            entry.insert(OriginWitness::load(conn, meta, origin)?)
+        }
     };
-    let mut statement=conn.prepare_cached("SELECT id,recipe,decision,publication,exchange,reason,resource,facts FROM operations WHERE id>=?1 AND id<=?2 ORDER BY id")?;
-    let mut rows = statement.query(params![op(0).as_slice(), op(u64::MAX).as_slice()])?;
-    let mut meter = reader::Meter::new(ReadBudget::SNAPSHOT);
-    while let Some(row) = rows.next()? {
-        let bytes = reader::borrow_blob(row, 1, ReadBudget::SNAPSHOT.max_field_bytes)?;
-        meter.charge(
-            256usize
-                .checked_add(bytes.len())
-                .ok_or(ReadError::LimitExceeded)?,
-        )?;
-        let id = OperationId::from_be_slice(reader::borrow_blob(row, 0, 32)?)
-            .map_err(|_| Fault::Corrupt)?;
-        let record = OperationRecord {
-            recipe: reader::copy_blob(row, 1, ReadBudget::SNAPSHOT.max_field_bytes)?,
-            decision: decision_of(row, 2)?.decode()?,
-        };
-        if let Some(stored) = receipt_bounds(meta, id, &record)?
+    if witness.matches(origin, first, last, payload) {
+        return Ok(true);
+    }
+    for &(staged_origin, stored) in &delta.witnesses {
+        if staged_origin == origin
             && (first <= stored.last && stored.first <= last
                 || payload.is_some() && payload == stored.payload)
         {
@@ -211,10 +344,25 @@ pub(super) fn snapshot(
     meta: &Meta,
     budget: ReadBudget,
 ) -> Result<BTreeMap<Vec<u8>, RetainedRecord>, Fault> {
+    snapshot_with_lengths(conn, meta, budget).map(|(map, _, _)| map)
+}
+
+type RetainedLengths = (
+    BTreeMap<Vec<u8>, RetainedRecord>,
+    u64,
+    BTreeMap<Vec<u8>, u64>,
+);
+
+fn snapshot_with_lengths(
+    conn: &Connection,
+    meta: &Meta,
+    budget: ReadBudget,
+) -> Result<RetainedLengths, Fault> {
     let mut out = BTreeMap::new();
+    let mut lengths = BTreeMap::new();
     let mut meter = reader::Meter::new(budget);
     let mut total = 0u64;
-    let mut stmt=conn.prepare("SELECT r.topic,r.publication,r.producer_client_id,p.topic,p.qos,p.retain,p.retained_version,y.length,y.refs,length(y.bytes),p.expiry_domain,p.expiry_tick,p.expiry_interval FROM retained r LEFT JOIN publications p ON p.id=r.publication LEFT JOIN payloads y ON y.id=p.payload ORDER BY r.topic LIMIT ?1")?;
+    let mut stmt=conn.prepare_cached("SELECT r.topic,r.publication,r.producer_client_id,p.topic,p.qos,p.retain,p.retained_version,y.length,y.refs,length(y.bytes),p.expiry_domain,p.expiry_tick,p.expiry_interval FROM retained r LEFT JOIN publications p ON p.id=r.publication LEFT JOIN payloads y ON y.id=p.payload ORDER BY r.topic LIMIT ?1")?;
     let mut rows =
         stmt.query([i64::try_from(MAX_RETAINED_TOPICS + 1).map_err(|_| Fault::Corrupt)?])?;
     while let Some(row) = rows.next()? {
@@ -263,8 +411,10 @@ pub(super) fn snapshot(
         if total > MAX_RETAINED_BYTES {
             return Err(ReadError::LimitExceeded.into());
         }
+        let topic_owned = reader::copy_blob(row, 0, meta.limits.max_topic_bytes)?;
+        lengths.insert(topic_owned.clone(), length);
         out.insert(
-            reader::copy_blob(row, 0, meta.limits.max_topic_bytes)?,
+            topic_owned,
             RetainedRecord {
                 publication: PublicationId::from_be_slice(reader::borrow_blob(row, 1, 32)?)
                     .map_err(|_| Fault::Corrupt)?,
@@ -272,7 +422,7 @@ pub(super) fn snapshot(
             },
         );
     }
-    Ok(out)
+    Ok((out, total, lengths))
 }
 
 /// Drop one retained-owned reference, never an obligation or another owner's ref.
@@ -306,17 +456,13 @@ pub(super) fn prepare_mutation(
     topic: &[u8],
     new_length: u64,
 ) -> Guard<()> {
-    let inventory = snapshot(conn, meta, ReadBudget::SNAPSHOT)?;
+    let (inventory, total_bytes, lengths) =
+        snapshot_with_lengths(conn, meta, ReadBudget::SNAPSHOT)?;
     if new_length > 0 && !inventory.contains_key(topic) && inventory.len() >= MAX_RETAINED_TOPICS {
         return refused(RejectReason::CapacityExceeded(Resource::References));
     }
-    let mut bytes = 0u64;
-    for (name, record) in &inventory {
-        if name.as_slice() != topic {
-            let length:Vec<u8>=conn.prepare_cached("SELECT y.length FROM publications p JOIN payloads y ON y.id=p.payload WHERE p.id=?1")?.query_row([record.publication.to_be_bytes().as_slice()],|row|reader::copy_blob(row,0,8))?;
-            bytes = bytes.checked_add(blob_u64(&length)?).ok_or(Abort::Fault)?;
-        }
-    }
+    let existing = lengths.get(topic).copied().unwrap_or(0);
+    let bytes = total_bytes.checked_sub(existing).ok_or(Abort::Fault)?;
     if bytes
         .checked_add(new_length)
         .is_none_or(|n| n > MAX_RETAINED_BYTES)
@@ -362,6 +508,8 @@ pub(super) fn install(
 pub(super) fn subscribe(
     conn: &Connection,
     meta: &mut Meta,
+    caches: &mut StoreCaches,
+    delta: &TxDelta,
     command: &ReplaySubscriptions,
     observed: Option<MessageTime>,
 ) -> Guard<CommitFacts> {
@@ -383,7 +531,16 @@ pub(super) fn subscribe(
                 .ok_or(Abort::Fault)?,
         ),
     );
-    if identity_was_used(conn, meta, update.operation, first, last, None)? {
+    if identity_was_used(
+        conn,
+        meta,
+        caches,
+        delta,
+        update.operation,
+        first,
+        last,
+        None,
+    )? {
         return refused(RejectReason::PreconditionFailed);
     }
     let inventory = snapshot(conn, meta, ReadBudget::SNAPSHOT)?;
@@ -393,8 +550,12 @@ pub(super) fn subscribe(
             reader::copy_blob(row, 0, MAX_CLIENT_ID_BYTES)
         })?;
     let mut plans = Vec::new();
+    let reserve = inventory
+        .len()
+        .saturating_mul(update.changes.len())
+        .min(MAX_REPLAYS);
     plans
-        .try_reserve_exact(MAX_REPLAYS)
+        .try_reserve_exact(reserve)
         .map_err(|_| ReadError::AllocationFailed)?;
     // Presence is evaluated at each wire-ordered step, not from the final projection.
     for (step, change) in update.changes.as_slice().iter().enumerate() {
@@ -471,7 +632,7 @@ pub(super) fn subscribe(
                 ))
             })?;
         let qos = code_qos(row.1)?.min(granted);
-        conn.prepare_cached("INSERT INTO publications(id,operation,source,qos,retain,payload,retained_version,expiry_domain,expiry_tick,expiry_interval,topic) SELECT ?1,?2,?3,?4,1,?5,?6,expiry_domain,expiry_tick,expiry_interval,?7 FROM publications WHERE id=?6")?.execute(params![publication.to_be_bytes().as_slice(),update.operation.to_be_bytes().as_slice(),row.0,row.1,row.2,version.to_be_bytes().as_slice(),row.3])?;
+        conn.prepare_cached("INSERT INTO publications(id,operation,source,qos,retain,payload,retained_version,expiry_domain,expiry_tick,expiry_interval,topic,properties) SELECT ?1,?2,?3,?4,1,?5,?6,expiry_domain,expiry_tick,expiry_interval,?7,properties FROM publications WHERE id=?6")?.execute(params![publication.to_be_bytes().as_slice(),update.operation.to_be_bytes().as_slice(),row.0,row.1,row.2,version.to_be_bytes().as_slice(),row.3])?;
         conn.prepare_cached("INSERT INTO obligations(publication,idx,target,target_revision,qos,cause,phase,retain) VALUES(?1,0,?2,?3,?4,2,1,1)")?.execute(params![publication.to_be_bytes().as_slice(),update.session.to_be_bytes().as_slice(),update.session_revision.to_be_bytes().as_slice(),qos_code(qos)])?;
         let refs: Vec<u8> = conn
             .prepare_cached("SELECT refs FROM payloads WHERE id=?1")?

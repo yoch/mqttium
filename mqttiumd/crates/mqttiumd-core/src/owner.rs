@@ -21,6 +21,7 @@
 //! identity. The box is replaced through the owner, [`Owner::renew_box`],
 //! and no counter or state of the owner starts again.
 
+use alloc::collections::{BTreeMap, BTreeSet};
 use core::num::{NonZeroU32, NonZeroUsize};
 
 use crate::command::{CommandEvent, CommandPhase, OutcomeClass, Verdict};
@@ -810,13 +811,26 @@ pub struct Owner {
     limits: Option<Limits>,
     route_revision: Option<Revision>,
     routes: BoundedVec<Route>,
+    route_index: routing::RouteIndex,
+    route_by_key: BTreeMap<(SessionId, SharedBytes), usize>,
     sessions: BoundedVec<Session>,
+    session_by_id: BTreeMap<SessionId, usize>,
+    session_by_client: BTreeMap<SharedBytes, usize>,
+    session_by_conn: BTreeMap<ConnectionGeneration, usize>,
     slots: BoundedVec<Slot>,
+    slot_by_key: BTreeMap<(SessionId, InboundPacketId), usize>,
+    slot_by_op: BTreeMap<OperationId, usize>,
+    slot_by_deadline: BTreeMap<DeadlineToken, usize>,
+    slot_by_effect: BTreeMap<EffectId, usize>,
+    slots_by_session: BTreeMap<SessionId, BTreeSet<usize>>,
+    release_retry_slots: BTreeSet<usize>,
     leases: LeaseTable,
     /// The latest operations that ended; see `OwnerConfig`.
     finished: BoundedQueue<Finished>,
+    finished_by_op: BTreeMap<OperationId, Finished>,
     /// The latest connections that were closed; see `OwnerConfig`.
     closed: BoundedQueue<ConnectionGeneration>,
+    closed_set: BTreeSet<ConnectionGeneration>,
     resolution_delay: LogicalDuration,
     pubsub: pubsub::State,
     receipts: receipts::State,
@@ -930,11 +944,24 @@ impl Owner {
             limits: None,
             route_revision: None,
             routes,
+            route_index: routing::RouteIndex::default(),
+            route_by_key: BTreeMap::new(),
             sessions,
+            session_by_id: BTreeMap::new(),
+            session_by_client: BTreeMap::new(),
+            session_by_conn: BTreeMap::new(),
             slots,
+            slot_by_key: BTreeMap::new(),
+            slot_by_op: BTreeMap::new(),
+            slot_by_deadline: BTreeMap::new(),
+            slot_by_effect: BTreeMap::new(),
+            slots_by_session: BTreeMap::new(),
+            release_retry_slots: BTreeSet::new(),
             leases,
             finished,
+            finished_by_op: BTreeMap::new(),
             closed,
+            closed_set: BTreeSet::new(),
             resolution_delay: config.resolution_delay,
             pubsub,
             receipts,
@@ -1059,20 +1086,258 @@ impl Owner {
     /// session and it has one.
     #[must_use]
     pub fn connection_of(&self, session: SessionId) -> Option<ConnectionGeneration> {
-        self.sessions
-            .as_slice()
-            .iter()
-            .find(|held| held.id == session)
+        self.session_by_id
+            .get(&session)
+            .and_then(|&idx| self.sessions.as_slice().get(idx))
             .and_then(|held| held.connection)
+    }
+
+    /// The session bound to `connection`, if any, in O(log S).
+    #[must_use]
+    pub fn session_for_connection(&self, connection: ConnectionGeneration) -> Option<SessionId> {
+        self.session_by_conn
+            .get(&connection)
+            .and_then(|&idx| self.sessions.as_slice().get(idx))
+            .map(|held| held.id)
     }
 
     /// Every session that has a connection, with that connection: what
     /// [`Owner::connection_of`] answers for each of them, in one pass.
     pub fn connections(&self) -> impl Iterator<Item = (SessionId, ConnectionGeneration)> + '_ {
-        self.sessions
-            .as_slice()
+        self.session_by_conn
             .iter()
-            .filter_map(|held| held.connection.map(|connection| (held.id, connection)))
+            .filter_map(|(&connection, &idx)| {
+                self.sessions
+                    .as_slice()
+                    .get(idx)
+                    .map(|held| (held.id, connection))
+            })
+    }
+
+    /// Number of currently bound sessions in O(1).
+    #[must_use]
+    pub fn bound_sessions(&self) -> usize {
+        self.session_by_conn.len()
+    }
+
+    fn is_closed(&self, connection: ConnectionGeneration) -> bool {
+        self.closed_set.contains(&connection)
+    }
+
+    fn remember_closed(&mut self, connection: ConnectionGeneration) -> Result<(), CoreFault> {
+        if self.closed.len() == self.closed.capacity()
+            && let Some(evicted) = self.closed.pop_front()
+            && !self.closed.iter().any(|&g| g == evicted)
+        {
+            self.closed_set.remove(&evicted);
+        }
+        self.closed
+            .try_push_back(connection)
+            .map_err(|_| CoreFault::ReservationOverrun)?;
+        self.closed_set.insert(connection);
+        Ok(())
+    }
+
+    fn remember_finished(&mut self, item: Finished) -> Result<(), CoreFault> {
+        if self.finished.len() == self.finished.capacity()
+            && let Some(evicted) = self.finished.pop_front()
+            && !self
+                .finished
+                .iter()
+                .any(|f| f.operation == evicted.operation)
+        {
+            self.finished_by_op.remove(&evicted.operation);
+        }
+        self.finished
+            .try_push_back(item)
+            .map_err(|_| CoreFault::ReservationOverrun)?;
+        self.finished_by_op.insert(item.operation, item);
+        Ok(())
+    }
+
+    fn push_route(&mut self, route: Route) -> Result<(), CoreFault> {
+        let index = self.routes.len();
+        let key = (route.target, route.topic.clone());
+        self.routes
+            .try_push(route)
+            .map_err(|_| CoreFault::StalePlan)?;
+        self.route_index
+            .insert(index, &self.routes.as_slice()[index]);
+        self.route_by_key.insert(key, index);
+        Ok(())
+    }
+
+    fn rebuild_route_index(&mut self) {
+        self.route_index.rebuild(self.routes.as_slice());
+        self.route_by_key.clear();
+        for (index, route) in self.routes.as_slice().iter().enumerate() {
+            self.route_by_key
+                .insert((route.target, route.topic.clone()), index);
+        }
+    }
+
+    fn index_session(&mut self, index: usize) {
+        let session = &self.sessions.as_slice()[index];
+        self.session_by_id.insert(session.id, index);
+        self.session_by_client
+            .insert(session.client_id.clone(), index);
+        if let Some(conn) = session.connection {
+            self.session_by_conn.insert(conn, index);
+        }
+    }
+
+    fn unindex_session(&mut self, index: usize) {
+        let session = &self.sessions.as_slice()[index];
+        self.session_by_id.remove(&session.id);
+        self.session_by_client.remove(&session.client_id);
+        if let Some(conn) = session.connection {
+            self.session_by_conn.remove(&conn);
+        }
+    }
+
+    fn push_session(&mut self, session: Session) -> Result<(), CoreFault> {
+        let index = self.sessions.len();
+        self.sessions
+            .try_push(session)
+            .map_err(|_| CoreFault::StalePlan)?;
+        self.index_session(index);
+        Ok(())
+    }
+
+    fn replace_session(&mut self, index: usize, session: Session) -> Result<(), CoreFault> {
+        if index >= self.sessions.len() {
+            return Err(CoreFault::StalePlan);
+        }
+        self.unindex_session(index);
+        self.sessions.as_mut_slice()[index] = session;
+        self.index_session(index);
+        Ok(())
+    }
+
+    fn set_session_connection(
+        &mut self,
+        index: usize,
+        connection: Option<ConnectionGeneration>,
+    ) -> Result<(), CoreFault> {
+        let held = self
+            .sessions
+            .as_mut_slice()
+            .get_mut(index)
+            .ok_or(CoreFault::StalePlan)?;
+        if let Some(old) = held.connection {
+            self.session_by_conn.remove(&old);
+        }
+        held.connection = connection;
+        if let Some(new) = connection {
+            self.session_by_conn.insert(new, index);
+        }
+        Ok(())
+    }
+
+    fn remove_session_at(&mut self, index: usize) -> Result<Session, CoreFault> {
+        let last = self
+            .sessions
+            .len()
+            .checked_sub(1)
+            .ok_or(CoreFault::StalePlan)?;
+        if index > last {
+            return Err(CoreFault::StalePlan);
+        }
+        self.unindex_session(index);
+        if index != last {
+            self.unindex_session(last);
+            self.sessions.as_mut_slice().swap(index, last);
+        }
+        let removed = self.sessions.pop().ok_or(CoreFault::StalePlan)?;
+        if index != last {
+            self.index_session(index);
+        }
+        Ok(removed)
+    }
+
+    fn index_slot(&mut self, index: usize) {
+        let slot = self.slots.as_slice()[index];
+        self.slots_by_session
+            .entry(slot.session)
+            .or_default()
+            .insert(index);
+        match slot.state {
+            SlotState::AckPending { effect, .. } => {
+                self.slot_by_effect.insert(effect, index);
+            }
+            SlotState::AdmissionPending(f) | SlotState::ReleasePending(f) => {
+                self.slot_by_key
+                    .insert((slot.session, slot.packet_id), index);
+                self.slot_by_op.insert(f.operation, index);
+                self.slot_by_deadline.insert(f.deadline, index);
+            }
+            SlotState::ReleaseRetry(_) => {
+                self.slot_by_key
+                    .insert((slot.session, slot.packet_id), index);
+                self.release_retry_slots.insert(index);
+            }
+            SlotState::AwaitPubrel | SlotState::AnswerHeld { .. } => {
+                self.slot_by_key
+                    .insert((slot.session, slot.packet_id), index);
+            }
+        }
+    }
+
+    fn unindex_slot(&mut self, index: usize) {
+        let slot = self.slots.as_slice()[index];
+        if let Some(set) = self.slots_by_session.get_mut(&slot.session) {
+            set.remove(&index);
+            if set.is_empty() {
+                self.slots_by_session.remove(&slot.session);
+            }
+        }
+        match slot.state {
+            SlotState::AckPending { effect, .. } => {
+                self.slot_by_effect.remove(&effect);
+            }
+            SlotState::AdmissionPending(f) | SlotState::ReleasePending(f) => {
+                self.slot_by_key.remove(&(slot.session, slot.packet_id));
+                self.slot_by_op.remove(&f.operation);
+                self.slot_by_deadline.remove(&f.deadline);
+            }
+            SlotState::ReleaseRetry(_) => {
+                self.slot_by_key.remove(&(slot.session, slot.packet_id));
+                self.release_retry_slots.remove(&index);
+            }
+            SlotState::AwaitPubrel | SlotState::AnswerHeld { .. } => {
+                self.slot_by_key.remove(&(slot.session, slot.packet_id));
+            }
+        }
+    }
+
+    fn push_slot(&mut self, slot: Slot) -> Result<(), CoreFault> {
+        let index = self.slots.len();
+        self.slots
+            .try_push(slot)
+            .map_err(|_| CoreFault::StalePlan)?;
+        self.index_slot(index);
+        Ok(())
+    }
+
+    fn remove_slot_at(&mut self, index: usize) -> Result<Slot, CoreFault> {
+        let last = self
+            .slots
+            .len()
+            .checked_sub(1)
+            .ok_or(CoreFault::StalePlan)?;
+        if index > last {
+            return Err(CoreFault::StalePlan);
+        }
+        self.unindex_slot(index);
+        if index != last {
+            self.unindex_slot(last);
+            self.slots.as_mut_slice().swap(index, last);
+        }
+        let removed = self.slots.pop().ok_or(CoreFault::StalePlan)?;
+        if index != last {
+            self.index_slot(index);
+        }
+        Ok(removed)
     }
 
     /// The exchange the session holds under this Packet Identifier, and
@@ -1189,7 +1454,7 @@ impl Owner {
                         if self.receipts.enabled
                             && matches!(input, Input::MaintainReceipts | Input::Continue { .. })
                         {
-                            capacity_of(self.slots.capacity())
+                            16
                         } else {
                             0
                         },
@@ -1259,14 +1524,14 @@ impl Owner {
             });
         match planned {
             Ok(change) => {
-                // Once the plan identifies a closed generation, its
-                // bounded ACK cleanup is charged before any mutation or
-                // effect reservation. One inspection and two constant-time
-                // removals per possible slot, plus the binding search.
+                // Once the plan identifies a closed generation, its indexed
+                // per-session ACK and connection cleanup is charged before any
+                // mutation or effect reservation (ADR 0051).
                 let cleanup = if draft.closed.is_some() {
                     capacity_of(self.slots.capacity())
+                        .min(32)
                         .saturating_mul(3)
-                        .saturating_add(capacity_of(self.sessions.capacity()))
+                        .saturating_add(capacity_of(self.sessions.capacity()).min(16))
                         .saturating_add(self.pubsub.close_work())
                 } else {
                     0
@@ -1492,18 +1757,11 @@ impl Owner {
     }
 
     fn session_of(&self, connection: ConnectionGeneration) -> Option<usize> {
-        self.sessions
-            .as_slice()
-            .iter()
-            .position(|session| session.connection == Some(connection))
+        self.session_by_conn.get(&connection).copied()
     }
 
     fn slot_of(&self, session: SessionId, packet_id: InboundPacketId) -> Option<usize> {
-        self.slots.as_slice().iter().position(|slot| {
-            slot.session == session
-                && slot.packet_id == packet_id
-                && !matches!(slot.state, SlotState::AckPending { .. })
-        })
+        self.slot_by_key.get(&(session, packet_id)).copied()
     }
 
     /// Installs only an exclusive writer's confirmed fact. The adapter
@@ -1519,10 +1777,10 @@ impl Owner {
         draft: &mut Draft,
     ) -> Result<Change, Stop> {
         let known = self
-            .sessions
-            .as_slice()
-            .iter()
-            .position(|held| held.id == session || held.client_id == *client_id);
+            .session_by_id
+            .get(&session)
+            .copied()
+            .or_else(|| self.session_by_client.get(client_id).copied());
         if let Some(index) = known {
             let held = &self.sessions.as_slice()[index];
             if held.id != session || held.client_id != *client_id || held.revision != revision {
@@ -1537,8 +1795,7 @@ impl Owner {
             // One transport generation cannot denote two sessions.
             return Err(IMPOSSIBLE);
         }
-        let connection =
-            connection.filter(|connection| !self.closed.iter().any(|closed| closed == connection));
+        let connection = connection.filter(|connection| !self.is_closed(*connection));
         if let Some(index) = known {
             let held = &self.sessions.as_slice()[index];
             let Some(connection) = connection else {
@@ -1610,7 +1867,7 @@ impl Owner {
         if let Some(change) = self.plan_session_transport_closed(connection, draft)? {
             return Ok(change);
         }
-        if self.closed.iter().any(|closed| *closed == connection) {
+        if self.is_closed(connection) {
             return Ok(Change::Nothing);
         }
         draft.end(connection)?;
@@ -1641,7 +1898,7 @@ impl Owner {
     ) -> Result<Change, Stop> {
         // The owner ordered this connection closed, or saw it fail: what
         // it still carries changes nothing and is not answered.
-        if self.closed.iter().any(|closed| *closed == connection) {
+        if self.is_closed(connection) {
             return Ok(Change::Nothing);
         }
         let bound = self.session_of(connection);
@@ -1653,11 +1910,7 @@ impl Owner {
                 // A second CONNECT on one connection.
                 return protocol_error(draft);
             }
-            let known = self
-                .sessions
-                .as_slice()
-                .iter()
-                .position(|session| session.client_id == *client_id);
+            let known = self.session_by_client.get(client_id).copied();
             let Some(index) = known else {
                 // New durable sessions enter through SessionEstablished;
                 // this packet alone can resume only a session already held.
@@ -1905,11 +2158,19 @@ impl Owner {
             payload,
             retain,
             expiry,
+            properties,
             ..
         } = packet
         else {
             return Err(IMPOSSIBLE);
         };
+        if let Some(props) = properties
+            && (props.is_empty()
+                || props.check().is_err()
+                || props.check_payload(payload.as_slice()).is_err())
+        {
+            return Err(IMPOSSIBLE);
+        }
         self.check_message_expiry(*expiry)?;
         let (qos, packet_id) = (*qos, *packet_id);
         let (connection, _) = publish_origin;
@@ -1927,9 +2188,10 @@ impl Owner {
         let source = &self.sessions.as_slice()[session];
         let length = u64::try_from(payload.len()).unwrap_or(u64::MAX);
         let fits = |len: usize, max: u32| u32::try_from(len).is_ok_and(|len| len <= max);
-        let selected = match routing::select(
+        let selected = match self.route_index.select(
             self.routes.as_slice(),
             self.sessions.as_slice(),
+            &self.session_by_id,
             source.id,
             topic.as_slice(),
             qos,
@@ -2042,14 +2304,15 @@ impl Owner {
             targets: list,
         };
         let recipe = if *retain || expiry.is_some() {
-            let mut retain_targets = 0u16;
-            if *retain {
-                for (index, selected) in selected.iter().enumerate() {
-                    if selected.rap {
-                        retain_targets |= 1u16 << index;
-                    }
-                }
-            }
+            let retain_targets = if *retain {
+                let mut iter = selected.iter();
+                crate::contract::retained::RetainMask::from_predicate(selected.len(), |_| {
+                    iter.next().is_some_and(|target| target.rap)
+                })
+                .map_err(|_| IMPOSSIBLE)?
+            } else {
+                crate::contract::retained::RetainMask::EMPTY
+            };
             let retained = crate::contract::retained::RetainedPublication {
                 admission,
                 retain_targets,
@@ -2064,6 +2327,14 @@ impl Owner {
             }
         } else {
             Recipe::AdmitPublication(admission)
+        };
+        let recipe = if let Some(props) = properties {
+            Recipe::AnnotatedPublication(crate::contract::command::AnnotatedPublication {
+                inner: alloc::boxed::Box::new(recipe),
+                properties: props.clone(),
+            })
+        } else {
+            recipe
         };
         let in_flight = self.plan_submission(operation, recipe, Some(payload.clone()), draft)?;
         Ok(Change::Admit {
@@ -2085,12 +2356,8 @@ impl Owner {
         if !self.receipts.enabled
             || self.release_continuation.is_some()
             || !self.receipts.control_available()
-            || !(self
-                .slots
-                .as_slice()
-                .iter()
-                .any(|slot| matches!(slot.state, SlotState::ReleaseRetry(_)))
-                || self.pubsub.has_control_work(self.message_now))
+            || (self.release_retry_slots.is_empty()
+                && !self.pubsub.has_control_work(self.message_now))
         {
             return Ok(None);
         }
@@ -2115,14 +2382,12 @@ impl Owner {
                 return Ok(Change::ReleaseYield);
             }
             let Some((slot, refused)) =
-                self.slots
-                    .as_slice()
-                    .iter()
-                    .enumerate()
-                    .find_map(|(slot, held)| match held.state {
+                self.release_retry_slots.first().copied().and_then(|slot| {
+                    match self.slots.as_slice()[slot].state {
                         SlotState::ReleaseRetry(refused) => Some((slot, refused)),
                         _ => None,
-                    })
+                    }
+                })
             else {
                 return Ok(self
                     .plan_pubsub_control_work(None, draft)?
@@ -2182,25 +2447,25 @@ impl Owner {
     /// or its own answer held. `seen` replaces what the state says of the
     /// one slot the transition being planned changes.
     fn preceded(&self, session: SessionId, order: u64, seen: Option<Seen>) -> bool {
-        self.slots
-            .as_slice()
-            .iter()
-            .enumerate()
-            .filter(|(_, slot)| slot.session == session)
-            .any(|(index, slot)| {
-                let unanswered = match seen {
-                    Some(seen) if seen.slot == index => seen.order,
-                    _ if matches!(
-                        slot.state,
-                        SlotState::AdmissionPending(_) | SlotState::AnswerHeld { .. }
-                    ) =>
-                    {
-                        self.place(slot)
-                    }
-                    _ => None,
-                };
-                unanswered.is_some_and(|earlier| earlier < order)
-            })
+        let Some(indices) = self.slots_by_session.get(&session) else {
+            return false;
+        };
+        let slots = self.slots.as_slice();
+        indices.iter().any(|&index| {
+            let slot = &slots[index];
+            let unanswered = match seen {
+                Some(seen) if seen.slot == index => seen.order,
+                _ if matches!(
+                    slot.state,
+                    SlotState::AdmissionPending(_) | SlotState::AnswerHeld { .. }
+                ) =>
+                {
+                    self.place(slot)
+                }
+                _ => None,
+            };
+            unanswered.is_some_and(|earlier| earlier < order)
+        })
     }
 
     /// Whether the answer of `slot` must wait its turn.
@@ -2225,23 +2490,25 @@ impl Owner {
         let Some(generation) = self.connection_of(session) else {
             return Ok(());
         };
+        let Some(indices) = self.slots_by_session.get(&session) else {
+            return Ok(());
+        };
         let place = |index: usize, slot: &Slot| match seen {
             Some(seen) if seen.slot == index => seen.order,
             _ => self.place(slot),
         };
-        let oldest = self
-            .slots
-            .as_slice()
+        let slots = self.slots.as_slice();
+        let oldest = indices
             .iter()
-            .enumerate()
-            .filter(|(_, slot)| slot.session == session)
+            .copied()
             // A slot the transition answers itself holds nothing to release.
-            .filter(|(index, _)| {
-                !seen.is_some_and(|seen| seen.slot == *index && seen.order.is_none())
-            })
-            .filter_map(|(index, slot)| match slot.state {
-                SlotState::AnswerHeld { frame, .. } => Some((place(index, slot), index, frame)),
-                _ => None,
+            .filter(|index| !seen.is_some_and(|seen| seen.slot == *index && seen.order.is_none()))
+            .filter_map(|index| {
+                let slot = &slots[index];
+                match slot.state {
+                    SlotState::AnswerHeld { frame, .. } => Some((place(index, slot), index, frame)),
+                    _ => None,
+                }
             })
             .min_by_key(|(order, index, _)| (*order, *index));
         let Some((order, index, frame)) = oldest else {
@@ -2384,10 +2651,7 @@ impl Owner {
             return Ok(change);
         }
         let slots = self.slots.as_slice();
-        let waiting = slots.iter().position(|slot| {
-            slot.in_flight()
-                .is_some_and(|held| held.operation == operation)
-        });
+        let waiting = self.slot_by_op.get(&operation).copied();
         let Some(index) = waiting else {
             return self.plan_late_result(effect, operation, reply);
         };
@@ -2558,22 +2822,23 @@ impl Owner {
         reply: &StoreReply,
     ) -> Result<Change, Stop> {
         let known = self
-            .slots
-            .as_slice()
-            .iter()
-            .filter_map(|slot| slot.admission)
-            .chain(
+            .finished_by_op
+            .get(&operation)
+            .copied()
+            .or_else(|| self.pubsub.known(operation))
+            .or_else(|| {
                 self.slots
                     .as_slice()
                     .iter()
-                    .filter_map(|slot| match slot.state {
-                        SlotState::ReleaseRetry(finished) => Some(finished),
-                        _ => None,
-                    }),
-            )
-            .chain(self.finished.iter().copied())
-            .chain(self.pubsub.known(operation))
-            .find(|finished| finished.operation == operation);
+                    .filter_map(|slot| slot.admission)
+                    .chain(self.release_retry_slots.iter().filter_map(|&idx| {
+                        match self.slots.as_slice()[idx].state {
+                            SlotState::ReleaseRetry(finished) => Some(finished),
+                            _ => None,
+                        }
+                    }))
+                    .find(|finished| finished.operation == operation)
+            });
         let Some(known) = known else {
             return Ok(Change::Nothing);
         };
@@ -2619,12 +2884,11 @@ impl Owner {
             return Ok(change);
         }
         let waiting = self
-            .slots
-            .as_slice()
-            .iter()
-            .enumerate()
-            .find_map(|(index, slot)| {
-                let held = slot.in_flight()?;
+            .slot_by_deadline
+            .get(&token)
+            .copied()
+            .and_then(|index| {
+                let held = self.slots.as_slice()[index].in_flight()?;
                 (held.deadline == token).then_some((index, held))
             });
         // A deadline of an operation that is resolved, or that a later
@@ -2671,21 +2935,17 @@ impl Owner {
             progress,
             FrameProgress::Written { confirmed, total } if total > 0 && confirmed == total
         );
-        let ended = self
-            .slots
-            .as_slice()
-            .iter()
-            .enumerate()
-            .find_map(|(index, slot)| {
-                let SlotState::AckPending {
-                    effect: held,
-                    connection: destination,
-                } = slot.state
-                else {
-                    return None;
-                };
-                (held == effect && destination == connection).then_some((index, slot.admission))
-            });
+        let ended = self.slot_by_effect.get(&effect).copied().and_then(|index| {
+            let slot = self.slots.as_slice()[index];
+            let SlotState::AckPending {
+                effect: held,
+                connection: destination,
+            } = slot.state
+            else {
+                return None;
+            };
+            (held == effect && destination == connection).then_some((index, slot.admission))
+        });
         // The receipt of a frame of the current connection is where the
         // next held answer of its session leaves (record 0050): each
         // acknowledgement released brings such a receipt.
@@ -2947,9 +3207,9 @@ impl Owner {
             self.finish_closed_acks(connection)?;
             self.pubsub.close(connection);
             if let Some(session) = self.session_of(connection) {
-                self.sessions.as_mut_slice()[session].connection = None;
+                self.set_session_connection(session, None)?;
             }
-            remember(&mut self.closed, connection)?;
+            self.remember_closed(connection)?;
         }
         self.counters = counters;
         self.revision = revision;
@@ -2988,18 +3248,16 @@ impl Owner {
                 }
             }
             Change::Establish { session } => {
-                self.sessions.try_push(session).map_err(|_| STALE)?;
+                self.push_session(session)?;
             }
             Change::Bind {
                 session,
                 connection,
             } => {
-                let held = self.sessions.as_mut_slice().get_mut(session).ok_or(STALE)?;
-                held.connection = Some(connection);
+                self.set_session_connection(session, Some(connection))?;
             }
             Change::Unbind { session } => {
-                let held = self.sessions.as_mut_slice().get_mut(session).ok_or(STALE)?;
-                held.connection = None;
+                self.set_session_connection(session, None)?;
             }
             Change::Admit {
                 session,
@@ -3028,15 +3286,20 @@ impl Owner {
                     state: SlotState::AdmissionPending(in_flight),
                     retired: false,
                 };
-                self.slots.try_push(slot).map_err(|_| STALE)?;
+                self.push_slot(slot)?;
             }
             Change::Committed { slot, admission } => {
-                let held = self.slots.as_mut_slice().get_mut(slot).ok_or(STALE)?;
-                if !matches!(held.state, SlotState::AdmissionPending(_)) {
+                if !matches!(
+                    self.slots.as_slice().get(slot).map(|h| h.state),
+                    Some(SlotState::AdmissionPending(_))
+                ) {
                     return Err(STALE);
                 }
+                self.unindex_slot(slot);
+                let held = &mut self.slots.as_mut_slice()[slot];
                 held.admission = Some(admission);
                 held.state = SlotState::AwaitPubrel;
+                self.index_slot(slot);
             }
             Change::Replay {
                 slot,
@@ -3051,14 +3314,19 @@ impl Owner {
                 effect,
                 connection,
             } => {
-                let held = self.slots.as_mut_slice().get_mut(slot).ok_or(STALE)?;
-                if !matches!(held.state, SlotState::AdmissionPending(_))
-                    || held.qos != Qos::AtLeastOnce
+                let Some(current) = self.slots.as_slice().get(slot) else {
+                    return Err(STALE);
+                };
+                if !matches!(current.state, SlotState::AdmissionPending(_))
+                    || current.qos != Qos::AtLeastOnce
                 {
                     return Err(STALE);
                 }
+                self.unindex_slot(slot);
+                let held = &mut self.slots.as_mut_slice()[slot];
                 held.admission = Some(admission);
                 held.state = SlotState::AckPending { effect, connection };
+                self.index_slot(slot);
             }
             Change::Hold {
                 slot,
@@ -3067,10 +3335,12 @@ impl Owner {
                 resent,
                 publish_origin,
             } => {
-                let held = self.slots.as_mut_slice().get_mut(slot).ok_or(STALE)?;
+                let Some(current) = self.slots.as_slice().get(slot) else {
+                    return Err(STALE);
+                };
                 // A first answer is held with the result that produced it;
                 // a PUBREC sent again, for an exchange that awaits PUBREL.
-                let expected = match (resent, held.state) {
+                let expected = match (resent, current.state) {
                     (false, SlotState::AdmissionPending(_)) => admission.is_some(),
                     (true, SlotState::AwaitPubrel) => admission.is_none(),
                     _ => false,
@@ -3078,6 +3348,8 @@ impl Owner {
                 if !expected {
                     return Err(STALE);
                 }
+                self.unindex_slot(slot);
+                let held = &mut self.slots.as_mut_slice()[slot];
                 if admission.is_some() {
                     held.admission = admission;
                 }
@@ -3085,31 +3357,36 @@ impl Owner {
                     held.publish_origin = publish_origin;
                 }
                 held.state = SlotState::AnswerHeld { frame, resent };
+                self.index_slot(slot);
             }
             Change::End { slot, finished } => {
-                let slots = self.slots.as_mut_slice();
-                let last = slots.len().checked_sub(1).ok_or(STALE)?;
-                let held = *slots.get(slot).ok_or(STALE)?;
+                let held = *self.slots.as_slice().get(slot).ok_or(STALE)?;
                 if self.leases.release(held.lease) != Ok(ReleaseOutcome::Released) {
                     return Err(STALE);
                 }
-                self.slots.as_mut_slice().swap(slot, last);
-                let _ = self.slots.pop();
+                let _ = self.remove_slot_at(slot)?;
                 // The operations of the exchange stay visible, the latest
                 // last.
                 if let Some(admission) = held.admission
                     && admission.operation != finished.operation
                 {
-                    remember(&mut self.finished, admission)?;
+                    self.remember_finished(admission)?;
                 }
-                remember(&mut self.finished, finished)?;
+                self.remember_finished(finished)?;
             }
             Change::Await {
                 slot,
                 phase,
                 resolution,
             } => {
-                let held = self.slots.as_mut_slice().get_mut(slot).ok_or(STALE)?;
+                if !matches!(
+                    self.slots.as_slice().get(slot).map(|h| h.state),
+                    Some(SlotState::AdmissionPending(_) | SlotState::ReleasePending(_))
+                ) {
+                    return Err(STALE);
+                }
+                self.unindex_slot(slot);
+                let held = &mut self.slots.as_mut_slice()[slot];
                 let (SlotState::AdmissionPending(in_flight) | SlotState::ReleasePending(in_flight)) =
                     &mut held.state
                 else {
@@ -3120,10 +3397,15 @@ impl Owner {
                     in_flight.deadline = deadline;
                     in_flight.answers = in_flight.answers.with(effect);
                 }
+                self.index_slot(slot);
             }
             Change::ReleaseDeferred { slot, refused } => {
-                let held = self.slots.as_mut_slice().get_mut(slot).ok_or(STALE)?;
-                held.state = SlotState::ReleaseRetry(refused);
+                if slot >= self.slots.len() {
+                    return Err(STALE);
+                }
+                self.unindex_slot(slot);
+                self.slots.as_mut_slice()[slot].state = SlotState::ReleaseRetry(refused);
+                self.index_slot(slot);
             }
             Change::ReleaseWake { continuation } => {
                 self.release_continuation = Some(continuation);
@@ -3136,14 +3418,19 @@ impl Owner {
                 in_flight,
                 refused,
             } => {
-                let held = self.slots.as_mut_slice().get_mut(slot).ok_or(STALE)?;
+                if slot >= self.slots.len() {
+                    return Err(STALE);
+                }
+                self.unindex_slot(slot);
+                let held = &mut self.slots.as_mut_slice()[slot];
                 held.state = SlotState::ReleasePending(in_flight);
                 if resumed {
                     self.release_continuation = None;
                 }
                 held.release_preparations = held.release_preparations.saturating_add(1);
+                self.index_slot(slot);
                 if let Some(refused) = refused {
-                    remember(&mut self.finished, refused)?;
+                    self.remember_finished(refused)?;
                 }
             }
         }
@@ -3153,19 +3440,24 @@ impl Owner {
     /// A held answer left: its exchange goes where the answer takes it.
     fn apply_release(&mut self, released: Released) -> Result<(), CoreFault> {
         const STALE: CoreFault = CoreFault::StalePlan;
-        let held = self
-            .slots
-            .as_mut_slice()
-            .get_mut(released.slot)
-            .ok_or(STALE)?;
-        if !matches!(held.state, SlotState::AnswerHeld { .. }) {
+        let Some(current) = self.slots.as_slice().get(released.slot) else {
+            return Err(STALE);
+        };
+        if !matches!(current.state, SlotState::AnswerHeld { .. }) {
             return Err(STALE);
         }
         match released.next {
             Next::Ack { effect, connection } => {
-                held.state = SlotState::AckPending { effect, connection };
+                self.unindex_slot(released.slot);
+                self.slots.as_mut_slice()[released.slot].state =
+                    SlotState::AckPending { effect, connection };
+                self.index_slot(released.slot);
             }
-            Next::AwaitPubrel => held.state = SlotState::AwaitPubrel,
+            Next::AwaitPubrel => {
+                self.unindex_slot(released.slot);
+                self.slots.as_mut_slice()[released.slot].state = SlotState::AwaitPubrel;
+                self.index_slot(released.slot);
+            }
             Next::End => self.end_held(released.slot)?,
         }
         Ok(())
@@ -3180,65 +3472,59 @@ impl Owner {
         if self.leases.release(held.lease) != Ok(ReleaseOutcome::Released) {
             return Err(STALE);
         }
-        let last = self.slots.len().checked_sub(1).ok_or(STALE)?;
-        self.slots.as_mut_slice().swap(index, last);
-        let _ = self.slots.pop();
-        remember(&mut self.finished, finished)
+        let _ = self.remove_slot_at(index)?;
+        self.remember_finished(finished)
     }
 
     fn finish_closed_acks(&mut self, connection: ConnectionGeneration) -> Result<(), CoreFault> {
-        // A held answer does not outlive the connection it waited on. A
-        // PUBREC that accepts leaves its exchange awaiting PUBREL, to be
-        // answered when the client sends the PUBLISH again; a PUBACK, or a
-        // PUBREC that refuses, ends its exchange as it would have with no
-        // connection to answer on (record 0050).
-        let mut index = 0;
-        while index < self.slots.len() {
-            let held = self.slots.as_slice()[index];
-            let SlotState::AnswerHeld { frame, .. } = held.state else {
-                index += 1;
-                continue;
+        // Check only the session's slots when bound; fall back to scanning
+        // slots only if the generation is already unbound.
+        let mut candidates: alloc::vec::Vec<usize> =
+            if let Some(session_idx) = self.session_of(connection) {
+                let sid = self.sessions.as_slice()[session_idx].id;
+                self.slots_by_session
+                    .get(&sid)
+                    .map(|set| set.iter().copied().collect())
+                    .unwrap_or_default()
+            } else {
+                (0..self.slots.len()).collect()
             };
-            if !held
-                .publish_origin
-                .is_some_and(|(origin, _)| origin == connection)
-            {
-                index += 1;
-                continue;
-            }
-            if matches!(
-                frame,
-                OutboundFrame::Pubrec {
-                    reason: AckReason::Success,
-                    ..
-                }
-            ) {
-                self.slots.as_mut_slice()[index].state = SlotState::AwaitPubrel;
-                index += 1;
-            } else {
-                // The last slot takes this place and is looked at next.
-                self.end_held(index)?;
-            }
-        }
-        let mut index = 0;
-        while index < self.slots.len() {
+        // Process in descending index order so swap-removals never invalidate
+        // earlier candidate indices!
+        candidates.sort_unstable();
+        for index in candidates.into_iter().rev() {
             let held = self.slots.as_slice()[index];
-            if matches!(held.state, SlotState::AckPending { connection: key, .. } if key.generation == connection)
-            {
-                let finished = held.admission.ok_or(CoreFault::StalePlan)?;
-                if self.leases.release(held.lease) != Ok(ReleaseOutcome::Released) {
-                    return Err(CoreFault::StalePlan);
+            match held.state {
+                SlotState::AnswerHeld { frame, .. }
+                    if held
+                        .publish_origin
+                        .is_some_and(|(origin, _)| origin == connection) =>
+                {
+                    if matches!(
+                        frame,
+                        OutboundFrame::Pubrec {
+                            reason: AckReason::Success,
+                            ..
+                        }
+                    ) {
+                        self.unindex_slot(index);
+                        self.slots.as_mut_slice()[index].state = SlotState::AwaitPubrel;
+                        self.index_slot(index);
+                    } else {
+                        self.end_held(index)?;
+                    }
                 }
-                let last = self
-                    .slots
-                    .len()
-                    .checked_sub(1)
-                    .ok_or(CoreFault::StalePlan)?;
-                self.slots.as_mut_slice().swap(index, last);
-                let _ = self.slots.pop();
-                remember(&mut self.finished, finished)?;
-            } else {
-                index += 1;
+                SlotState::AckPending {
+                    connection: key, ..
+                } if key.generation == connection => {
+                    let finished = held.admission.ok_or(CoreFault::StalePlan)?;
+                    if self.leases.release(held.lease) != Ok(ReleaseOutcome::Released) {
+                        return Err(CoreFault::StalePlan);
+                    }
+                    let _ = self.remove_slot_at(index)?;
+                    self.remember_finished(finished)?;
+                }
+                _ => {}
             }
         }
         Ok(())
@@ -3292,7 +3578,7 @@ impl Owner {
                     max_qos: *max_qos,
                     options: *options,
                 };
-                self.routes.try_push(route).map_err(|_| STALE)?;
+                self.push_route(route)?;
             }
             RecoveredFact::Session {
                 session,
@@ -3312,7 +3598,7 @@ impl Owner {
                     detached: *detached,
                     will_managed: false,
                 };
-                self.sessions.try_push(session).map_err(|_| STALE)?;
+                self.push_session(session)?;
             }
             RecoveredFact::InboundExchange {
                 exchange,
@@ -3344,7 +3630,7 @@ impl Owner {
                     state: SlotState::AwaitPubrel,
                     retired: false,
                 };
-                self.slots.try_push(slot).map_err(|_| STALE)?;
+                self.push_slot(slot)?;
             }
             // What an older epoch established about its operations
             // changes nothing here: a committed admission is found through
@@ -3597,6 +3883,7 @@ mod tests {
             ingress_order: 0,
             packet: InboundPacket::Publish {
                 expiry: None,
+                properties: None,
                 topic: bytes(b"p1/example"),
                 qos,
                 retain: false,
@@ -3819,7 +4106,8 @@ mod tests {
             };
             assert_eq!(*after, LogicalDuration::new(5));
             let facts = match command.recipe.get() {
-                Recipe::ExpiringPublication(_)
+                Recipe::AnnotatedPublication(_)
+                | Recipe::ExpiringPublication(_)
                 | Recipe::TimedReplaySubscriptions(_)
                 | Recipe::MarkDeliveryStarted(_)
                 | Recipe::PreparePubrel(_)
@@ -3919,7 +4207,7 @@ mod tests {
                 slots: owner.slots.as_slice().to_vec(),
                 outgoing_connections: owner.pubsub.connections.as_slice().to_vec(),
                 outgoing_deliveries: owner.pubsub.deliveries.as_slice().to_vec(),
-                volatile: owner.pubsub.volatile.as_slice().to_vec(),
+                volatile: owner.pubsub.volatile.to_vec(),
                 retained_qos0: owner.pubsub.retained,
                 continuation: (
                     owner.pubsub.continuation,
@@ -3931,7 +4219,10 @@ mod tests {
                     packet_id: c.packet_id,
                     packet: c.packet.clone(),
                     results: c.results,
-                    projected: c.projected.as_slice().to_vec(),
+                    projected: owner
+                        .project_routes(c.session, c.session_revision, c.changes.as_slice())
+                        .map(|r| r.as_slice().to_vec())
+                        .unwrap_or_default(),
                     in_flight: c.in_flight,
                 }),
                 leases: owner.leases.snapshot(),
@@ -4717,6 +5008,7 @@ mod tests {
             ingress_order: 0,
             packet: InboundPacket::Publish {
                 expiry: None,
+                properties: None,
                 topic: bytes(b"p1/example"),
                 qos: Qos::ExactlyOnce,
                 retain: true,
@@ -6690,6 +6982,7 @@ mod tests {
             ingress_order: 0,
             packet: InboundPacket::Publish {
                 expiry: None,
+                properties: None,
                 topic: bytes(b"p1/exampl"),
                 qos,
                 retain,
@@ -6755,6 +7048,7 @@ mod tests {
             ingress_order: 0,
             packet: InboundPacket::Publish {
                 expiry: None,
+                properties: None,
                 topic: bytes(b"p1/exampl"),
                 qos: Qos::ExactlyOnce,
                 retain: false,
@@ -6825,6 +7119,7 @@ mod tests {
             ingress_order: 0,
             packet: InboundPacket::Publish {
                 expiry: None,
+                properties: None,
                 topic: bytes(topic),
                 qos: Qos::ExactlyOnce,
                 retain: false,
@@ -7890,6 +8185,7 @@ mod tests {
         crate::contract::pubsub::WorkItem {
             cause: DeliveryCause::LiveExact,
             expiry: None,
+            properties: None,
             retain: false,
             delivery: DeliveryId {
                 publication: PublicationId::new(
@@ -8099,6 +8395,7 @@ mod tests {
             ingress_order: order,
             packet: InboundPacket::Publish {
                 expiry: None,
+                properties: None,
                 qos: Qos::AtMostOnce,
                 dup: false,
                 retain: false,
@@ -9940,8 +10237,9 @@ mod tests {
         let release = world.submit(pubrel(7));
         assert_eq!(release.operation.sequence().get(), 1);
         world.owner.receipts.test_fill_consumed_window();
-        world.owner.counters.operation = Some(OperationSeq::new(1025));
-        assert_eq!(world.owner.receipt_status().unwrap().1, 1024);
+        let window = crate::contract::receipts::RECEIPT_WINDOW;
+        world.owner.counters.operation = Some(OperationSeq::new(window as u64 + 1));
+        assert_eq!(world.owner.receipt_status().unwrap().1, window);
         let fenced = result(
             &release,
             StoreOutcome::RejectedCertain(RejectReason::Fenced),
@@ -9984,7 +10282,13 @@ mod tests {
         let Effect::CollectReceipts { collection } = collection_effects[0].1 else {
             panic!("collection frees the control window")
         };
-        assert_eq!(collection.closure.through.get(), 128);
+        let expected_removed = crate::contract::receipts::MAX_COLLECTION_ROWS;
+        let expected_retained =
+            (crate::contract::receipts::RECEIPT_WINDOW as u64) - u64::from(expected_removed);
+        assert_eq!(
+            collection.closure.through.get(),
+            u64::from(expected_removed)
+        );
         gc_apply(
             &mut world,
             Input::ReceiptsCollected {
@@ -9992,8 +10296,8 @@ mod tests {
                 collection,
                 reply: crate::contract::receipts::ReceiptCollectionReply::Applied {
                     closure: collection.closure,
-                    removed: 128,
-                    retained: 896,
+                    removed: expected_removed,
+                    retained: expected_retained,
                     more: false,
                 },
             },
@@ -10018,7 +10322,7 @@ mod tests {
         let Recipe::ReleaseInbound(command) = command.recipe.get() else {
             panic!("same business termination")
         };
-        assert_eq!(command.operation.sequence().get(), 1025);
+        assert_eq!(command.operation.sequence().get(), window as u64 + 1);
         assert_eq!(
             command.exchange,
             match release.facts {
@@ -10026,7 +10330,10 @@ mod tests {
                 _ => panic!("release"),
             }
         );
-        assert_eq!(world.owner.receipt_status().unwrap().1, 897);
+        assert_eq!(
+            world.owner.receipt_status().unwrap().1,
+            expected_retained as usize + 1
+        );
         let operation = command.operation;
         let exchange = command.exchange;
         gc_apply(
@@ -10192,6 +10499,7 @@ mod tests {
             ingress_order: 1,
             packet: InboundPacket::Publish {
                 expiry: None,
+                properties: None,
                 topic: bytes(b"retained/q0"),
                 payload: bytes(b"q0"),
                 qos: Qos::AtMostOnce,

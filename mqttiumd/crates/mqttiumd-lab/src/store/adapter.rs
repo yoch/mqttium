@@ -148,6 +148,7 @@ impl FaultAction {
 /// The kind of work the adapter carries.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum WorkKind {
+    AnnotatedPublication,
     WillPublication,
     ExpiringPublication,
     TimedReplaySubscriptions,
@@ -174,6 +175,7 @@ impl WorkKind {
     #[must_use]
     pub const fn name(self) -> &'static str {
         match self {
+            Self::AnnotatedPublication => "AnnotatedPublication",
             Self::WillPublication => "WillPublication",
             Self::ExpiringPublication => "ExpiringPublication",
             Self::TimedReplaySubscriptions => "TimedReplaySubscriptions",
@@ -545,6 +547,15 @@ pub struct Crashed<S> {
 fn describe(work: &Work) -> (WorkKind, Option<OperationId>, Source) {
     match work {
         Work::Persist(command) => match command.recipe.get() {
+            Recipe::AnnotatedPublication(_) => (
+                WorkKind::AnnotatedPublication,
+                Some(command.recipe.operation()),
+                command
+                    .recipe
+                    .get()
+                    .admission()
+                    .map(|a| (a.source.session, a.source.packet_id)),
+            ),
             Recipe::WillPublication(value) => {
                 (WorkKind::WillPublication, Some(value.operation), None)
             }

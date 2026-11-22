@@ -4,6 +4,7 @@ use crate::contract::receipts::{
     MAX_COLLECTION_ROWS, RECEIPT_COLLECTION_TRIGGER, RECEIPT_DATA_WINDOW, RECEIPT_WINDOW,
     ReceiptClass, ReceiptClosure, ReceiptCollection, ReceiptCollectionReply, ReceiptOrigin,
 };
+use alloc::collections::VecDeque;
 
 /// Targeted reception mutant: closing a live unknown hole is never permitted.
 const MUTANT_CONFIRM_UNKNOWN: bool = false;
@@ -27,7 +28,8 @@ pub(super) struct State {
     pub(super) enabled: bool,
     registered: bool,
     acknowledged: ReceiptClosure,
-    entries: BoundedVec<Entry>,
+    entries: VecDeque<Entry>,
+    unconsumed: usize,
     pending: Option<Flight>,
     sweep: bool,
 }
@@ -44,11 +46,16 @@ pub(super) enum Change {
 
 impl State {
     pub(super) fn new(origin: ReceiptOrigin) -> Result<Self, AllocationFailed> {
+        let mut entries = VecDeque::new();
+        entries
+            .try_reserve_exact(RECEIPT_WINDOW)
+            .map_err(|_| AllocationFailed)?;
         Ok(Self {
             enabled: false,
             registered: false,
             acknowledged: ReceiptClosure::empty(origin),
-            entries: BoundedVec::with_capacity(RECEIPT_WINDOW)?,
+            entries,
+            unconsumed: 0,
             pending: None,
             sweep: false,
         })
@@ -79,12 +86,7 @@ impl State {
     fn next_collection(&self) -> Option<ReceiptCollection> {
         let mut closure = self.acknowledged;
         let mut consumed = 0;
-        for entry in self
-            .entries
-            .as_slice()
-            .iter()
-            .take(usize::from(MAX_COLLECTION_ROWS))
-        {
+        for entry in self.entries.iter().take(usize::from(MAX_COLLECTION_ROWS)) {
             if !entry.consumed && !MUTANT_CONFIRM_UNKNOWN {
                 break;
             }
@@ -107,9 +109,13 @@ impl State {
 
     pub(super) fn apply_issued(&mut self, entry: Option<Entry>) -> Result<(), CoreFault> {
         if let Some(entry) = entry {
-            self.entries
-                .try_push(entry)
-                .map_err(|_| CoreFault::ReservationOverrun)?;
+            if self.entries.len() >= RECEIPT_WINDOW {
+                return Err(CoreFault::ReservationOverrun);
+            }
+            if !entry.consumed {
+                self.unconsumed += 1;
+            }
+            self.entries.push_back(entry);
         }
         Ok(())
     }
@@ -119,13 +125,34 @@ impl State {
             return Ok(());
         }
         if let Some(operation) = operation {
-            let Some(entry) = self.entries.as_mut_slice().iter_mut().find(|entry| {
-                entry.boundary.through == operation.sequence()
-                    && entry.boundary.origin == ReceiptOrigin::of(operation)
-            }) else {
-                return Err(CoreFault::ImpossibleInput);
-            };
-            entry.consumed = true;
+            let origin = ReceiptOrigin::of(operation);
+            let seq = operation.sequence();
+            // Sequences are issued strictly monotonically; probe direct offset
+            // first and fall back to binary search in O(log N).
+            let index = self
+                .entries
+                .front()
+                .and_then(|first| {
+                    let offset = seq.get().checked_sub(first.boundary.through.get())?;
+                    let idx = usize::try_from(offset).ok()?;
+                    let candidate = self.entries.get(idx)?;
+                    (candidate.boundary.through == seq && candidate.boundary.origin == origin)
+                        .then_some(idx)
+                })
+                .or_else(|| {
+                    let idx = self
+                        .entries
+                        .partition_point(|entry| entry.boundary.through < seq);
+                    let candidate = self.entries.get(idx)?;
+                    (candidate.boundary.through == seq && candidate.boundary.origin == origin)
+                        .then_some(idx)
+                })
+                .ok_or(CoreFault::ImpossibleInput)?;
+            let entry = &mut self.entries[index];
+            if !entry.consumed {
+                entry.consumed = true;
+                self.unconsumed = self.unconsumed.saturating_sub(1);
+            }
         }
         Ok(())
     }
@@ -137,15 +164,14 @@ impl State {
                 self.pending = Some(flight);
             }
             Change::Confirm { closure, more } => {
-                let remove = self
-                    .entries
-                    .as_slice()
-                    .iter()
-                    .take_while(|entry| entry.boundary.through <= closure.through)
-                    .count();
-                self.entries.as_mut_slice().rotate_left(remove);
-                for _ in 0..remove {
-                    let _ = self.entries.pop();
+                while let Some(front) = self.entries.front() {
+                    if front.boundary.through > closure.through {
+                        break;
+                    }
+                    if !front.consumed {
+                        self.unconsumed = self.unconsumed.saturating_sub(1);
+                    }
+                    let _ = self.entries.pop_front();
                 }
                 self.acknowledged = closure;
                 self.registered = true;
@@ -161,10 +187,10 @@ impl State {
             return 0;
         }
         match input {
-            Input::StoreResult { .. } => u64::try_from(self.entries.len()).unwrap_or(u64::MAX),
-            Input::MaintainReceipts => u64::from(MAX_COLLECTION_ROWS),
-            Input::ReceiptsCollected { .. } => u64::from(MAX_COLLECTION_ROWS)
-                .saturating_add(u64::try_from(self.entries.len()).unwrap_or(u64::MAX)),
+            Input::StoreResult { .. } => 16,
+            Input::MaintainReceipts | Input::ReceiptsCollected { .. } => {
+                u64::from(MAX_COLLECTION_ROWS)
+            }
             _ => 0,
         }
     }
@@ -211,18 +237,11 @@ impl Owner {
     /// holes. Counts are observations, never reusable credit grants.
     #[must_use]
     pub fn receipt_status(&self) -> Option<(ReceiptClosure, usize, usize)> {
-        self.receipts.enabled.then(|| {
-            (
-                self.receipts.acknowledged,
-                self.receipts.entries.len(),
-                self.receipts
-                    .entries
-                    .as_slice()
-                    .iter()
-                    .filter(|entry| !entry.consumed)
-                    .count(),
-            )
-        })
+        self.receipts.enabled.then_some((
+            self.receipts.acknowledged,
+            self.receipts.entries.len(),
+            self.receipts.unconsumed,
+        ))
     }
 
     /// Whether this token is the current collector deadline, as distinct
@@ -240,12 +259,7 @@ impl Owner {
         self.receipts
             .pending
             .is_some_and(|flight| flight.deadline == token)
-            || self
-                .slots
-                .as_slice()
-                .iter()
-                .filter_map(Slot::in_flight)
-                .any(|flight| flight.deadline == token)
+            || self.slot_by_deadline.contains_key(&token)
             || self.pubsub.deadline_is_live(token)
             || self.wills.deadline_is_live(token)
             || self
@@ -391,18 +405,16 @@ mod test_support {
     use super::*;
     impl State {
         pub(crate) fn test_fill_consumed_window(&mut self) {
-            let first = self.entries.as_slice()[0].boundary;
+            let first = self.entries[0].boundary;
             while self.entries.len() < RECEIPT_WINDOW {
                 let sequence = first.through.get() + u64::try_from(self.entries.len()).unwrap();
-                self.entries
-                    .try_push(Entry {
-                        boundary: ReceiptClosure {
-                            through: OperationSeq::new(sequence),
-                            ..first
-                        },
-                        consumed: true,
-                    })
-                    .unwrap();
+                self.entries.push_back(Entry {
+                    boundary: ReceiptClosure {
+                        through: OperationSeq::new(sequence),
+                        ..first
+                    },
+                    consumed: true,
+                });
             }
         }
 
@@ -415,7 +427,7 @@ mod test_support {
                 enabled: self.enabled,
                 registered: self.registered,
                 acknowledged: self.acknowledged,
-                entries: self.entries.as_slice().to_vec(),
+                entries: self.entries.iter().copied().collect(),
                 pending: self.pending,
                 sweep: self.sweep,
             }

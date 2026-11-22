@@ -4,14 +4,15 @@ use crate::capacity::BoundedVec;
 use crate::command::{Costs, DeliveryCause, PayloadRef, Reader, RecipeError, Target};
 use crate::ids::{DeliveryId, OperationId, PayloadId, PublicationId, Revision, SessionId};
 use crate::packet::{Qos, SharedBytes};
+use crate::retained::{LEGACY_MAX_TARGETS, MAX_RETAIN_MASK_TARGETS, RetainMask};
 use alloc::vec::Vec;
 use core::fmt;
 
 pub const MAX_WILL_TOPIC_BYTES: usize = 1024;
 pub const MAX_WILL_PAYLOAD_BYTES: usize = 32_768;
 /// A separate bounded reserve; existing message payload/receipt quotas do not change.
-pub const MAX_WILL_INTENTS: usize = 256;
-pub const MAX_WILL_BYTES: u64 = 8 * 1024 * 1024;
+pub const MAX_WILL_INTENTS: usize = 1_024;
+pub const MAX_WILL_BYTES: u64 = 32 * 1024 * 1024;
 
 /// The supported profile has QoS1, delay=0 and no other properties.
 #[derive(Clone, PartialEq, Eq)]
@@ -90,8 +91,9 @@ pub struct WillIntent {
     pub state: WillState,
 }
 
-/// Kind17 (nonretained) or kind18 (retained): conditional consumption of one
-/// Pending intent and atomic publication admission.
+/// Kind17 (nonretained) or kind18 (retained) for up to 16 targets, or kind22
+/// for 17..=1024 targets: conditional consumption of one Pending intent and
+/// atomic publication admission.
 /// No MQTT inbound Packet Identifier or fabricated exchange is required.
 #[derive(PartialEq, Eq, Debug)]
 pub struct WillPublication {
@@ -104,7 +106,7 @@ pub struct WillPublication {
     pub costs: Costs,
     pub targets: BoundedVec<Target>,
     /// Present for a retained Will. Bit i preserves RETAIN on live target i.
-    pub live_retain: Option<u16>,
+    pub live_retain: Option<RetainMask>,
 }
 impl WillPublication {
     pub(crate) fn check(&self) -> Result<(), RecipeError> {
@@ -120,14 +122,11 @@ impl WillPublication {
         {
             return Err(RecipeError::InvalidField("will_publication"));
         }
-        if self.targets.len() > 16 {
+        if self.targets.len() > MAX_RETAIN_MASK_TARGETS {
             return Err(RecipeError::InvalidField("will_targets"));
         }
-        if self
-            .live_retain
-            .is_some_and(|mask| u32::from(mask) >> self.targets.len() != 0)
-        {
-            return Err(RecipeError::InvalidField("will_live_retain"));
+        if let Some(mask) = &self.live_retain {
+            mask.check(self.targets.len(), "will_live_retain")?;
         }
         let mut last = None;
         for (index, target) in self.targets.as_slice().iter().enumerate() {
@@ -147,7 +146,14 @@ impl WillPublication {
         Ok(())
     }
     pub(crate) fn encode(&self, out: &mut Vec<u8>) {
-        out.push(if self.live_retain.is_some() { 18 } else { 17 });
+        let wide = self.targets.len() > LEGACY_MAX_TARGETS;
+        out.push(if wide {
+            22
+        } else if self.live_retain.is_some() {
+            18
+        } else {
+            17
+        });
         out.extend_from_slice(&self.operation.to_be_bytes());
         out.extend_from_slice(&self.will.to_be_bytes());
         out.extend_from_slice(&self.publication.to_be_bytes());
@@ -164,7 +170,11 @@ impl WillPublication {
         ] {
             out.extend_from_slice(&n.to_be_bytes());
         }
-        out.push(self.targets.len() as u8);
+        if wide {
+            out.extend_from_slice(&(self.targets.len() as u16).to_be_bytes());
+        } else {
+            out.push(self.targets.len() as u8);
+        }
         for target in self.targets.as_slice() {
             out.extend_from_slice(&target.session.to_be_bytes());
             out.extend_from_slice(&target.session_revision.to_be_bytes());
@@ -172,17 +182,24 @@ impl WillPublication {
             out.push(target.effective_qos.to_wire());
             out.push(target.cause as u8);
         }
-        if let Some(mask) = self.live_retain {
-            out.extend_from_slice(&mask.to_be_bytes());
+        if wide {
+            out.push(u8::from(self.live_retain.is_some()));
+            if let Some(mask) = &self.live_retain {
+                mask.encode_wide(self.targets.len(), out);
+            }
+        } else if let Some(mask) = &self.live_retain {
+            let bits = mask.as_u16().unwrap_or(0);
+            out.extend_from_slice(&bits.to_be_bytes());
         }
     }
     pub(crate) fn decode(
         r: &mut Reader<'_>,
         max_targets: usize,
         max_topic: usize,
-        retained: bool,
+        tag: u8,
     ) -> Result<Self, RecipeError> {
         use crate::capacity::{ExchangeSlots, PayloadBytes, ReceiptSlots, References};
+        let wide = tag == 22;
         let operation = r.operation()?;
         let will = r.operation()?;
         let publication =
@@ -204,11 +221,23 @@ impl WillPublication {
             exchange_slots: ExchangeSlots::new(r.u64()?),
             receipt_slots: ReceiptSlots::new(r.u64()?),
         };
-        let count = usize::from(r.u8()?);
-        if count > max_targets.min(16) {
+        let count = if wide {
+            usize::from(r.u16()?)
+        } else {
+            usize::from(r.u8()?)
+        };
+        let ceiling = if wide {
+            max_targets.min(MAX_RETAIN_MASK_TARGETS)
+        } else {
+            max_targets.min(LEGACY_MAX_TARGETS)
+        };
+        if wide && count <= LEGACY_MAX_TARGETS {
+            return Err(RecipeError::InvalidField("noncanonical_wide_targets"));
+        }
+        if count > ceiling {
             return Err(RecipeError::TooManyTargets {
                 count,
-                max: max_targets.min(16),
+                max: ceiling,
             });
         }
         let mut targets =
@@ -231,6 +260,17 @@ impl WillPublication {
                 .try_push(target)
                 .map_err(|_| RecipeError::AllocationFailed)?;
         }
+        let live_retain = if wide {
+            if r.boolean("will_live_retain")? {
+                Some(RetainMask::decode_wide(r, count, "will_live_retain")?)
+            } else {
+                None
+            }
+        } else if tag == 18 {
+            Some(RetainMask::from_u16(r.u16()?))
+        } else {
+            None
+        };
         Ok(Self {
             operation,
             will,
@@ -240,7 +280,7 @@ impl WillPublication {
             payload,
             costs,
             targets,
-            live_retain: if retained { Some(r.u16()?) } else { None },
+            live_retain,
         })
     }
 }

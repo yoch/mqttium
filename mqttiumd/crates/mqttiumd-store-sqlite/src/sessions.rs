@@ -5,7 +5,7 @@ use mqttiumd_contract::session::{
     SessionExpiry, SessionGuard, SessionLifecycle,
 };
 
-pub(super) fn expiry_code(expiry: SessionExpiry) -> i64 {
+pub(crate) fn expiry_code(expiry: SessionExpiry) -> i64 {
     match expiry {
         SessionExpiry::OnDisconnect => 0,
         SessionExpiry::Never => 1,

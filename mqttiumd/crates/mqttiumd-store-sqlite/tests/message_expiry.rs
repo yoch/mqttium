@@ -95,7 +95,7 @@ fn prepared_file() -> (
         recipe: FrozenRecipe::freeze(Recipe::ExpiringPublication(ExpiringPublication {
             admission: ExpiringAdmission::Qos12(RetainedPublication {
                 admission,
-                retain_targets: 0,
+                retain_targets: mqttiumd_contract::retained::RetainMask::EMPTY,
             }),
             expiry: MessageExpiry {
                 observed: now,
@@ -235,7 +235,7 @@ fn maintenance_does_not_read_past_its_publication_budget() {
             recipe: FrozenRecipe::freeze(Recipe::ExpiringPublication(ExpiringPublication {
                 admission: ExpiringAdmission::Qos12(RetainedPublication {
                     admission,
-                    retain_targets: 0,
+                    retain_targets: mqttiumd_contract::retained::RetainMask::EMPTY,
                 }),
                 expiry: MessageExpiry {
                     observed: now,

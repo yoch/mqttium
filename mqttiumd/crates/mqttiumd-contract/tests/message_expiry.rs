@@ -106,7 +106,7 @@ fn qos0() -> RetainedQos0 {
         payload: a.payload,
         costs: a.costs,
         targets: a.targets,
-        retain_targets: 1,
+        retain_targets: mqttiumd_contract::retained::RetainMask::from_u16(1),
     }
 }
 fn replay() -> ReplaySubscriptions {
@@ -222,7 +222,7 @@ fn legacy_admission_and_retained_layouts_have_independent_byte_expectations() {
     assert_eq!(
         encode(&Recipe::RetainedPublication(RetainedPublication {
             admission: admission(Qos::AtLeastOnce, true),
-            retain_targets: 1
+            retain_targets: mqttiumd_contract::retained::RetainMask::from_u16(1)
         })),
         retained
     );
@@ -256,7 +256,7 @@ fn tag13_preserves_each_original_admission_and_strict_bounds() {
             let legacy = if retain {
                 Recipe::RetainedPublication(RetainedPublication {
                     admission: admission(qos, retain),
-                    retain_targets: 1,
+                    retain_targets: mqttiumd_contract::retained::RetainMask::from_u16(1),
                 })
             } else {
                 Recipe::AdmitPublication(admission(qos, retain))
@@ -265,7 +265,9 @@ fn tag13_preserves_each_original_admission_and_strict_bounds() {
             let recipe = Recipe::ExpiringPublication(ExpiringPublication {
                 admission: ExpiringAdmission::Qos12(RetainedPublication {
                     admission: admission(qos, retain),
-                    retain_targets: u16::from(retain),
+                    retain_targets: mqttiumd_contract::retained::RetainMask::from_u16(u16::from(
+                        retain,
+                    )),
                 }),
                 expiry: expiry(),
             });
@@ -309,7 +311,7 @@ fn temporal_wrappers_do_not_admit_recursive_or_noncanonical_aliases() {
     let bad_qos = Recipe::ExpiringPublication(ExpiringPublication {
         admission: ExpiringAdmission::Qos12(RetainedPublication {
             admission: admission(Qos::AtMostOnce, false),
-            retain_targets: 0,
+            retain_targets: mqttiumd_contract::retained::RetainMask::EMPTY,
         }),
         expiry: expiry(),
     });
@@ -317,7 +319,7 @@ fn temporal_wrappers_do_not_admit_recursive_or_noncanonical_aliases() {
     let bad_mask = Recipe::ExpiringPublication(ExpiringPublication {
         admission: ExpiringAdmission::Qos12(RetainedPublication {
             admission: admission(Qos::AtLeastOnce, false),
-            retain_targets: 1,
+            retain_targets: mqttiumd_contract::retained::RetainMask::from_u16(1),
         }),
         expiry: expiry(),
     });

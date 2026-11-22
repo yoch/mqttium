@@ -1,8 +1,13 @@
 //! Bounded MQTT framing and validation for the documented product profiles.
 
+use std::sync::Arc;
+
 use mqttiumd_contract::ids::{InboundPacketId, OutboundPacketId};
 use mqttiumd_contract::packet::{
     AckReason, InboundPacket, OutboundFrame, PubackReason, Qos, Qos2Ack, SharedBytes,
+};
+use mqttiumd_contract::properties::{
+    MAX_PROPERTY_BYTES, MAX_USER_PROPERTIES, PublishProperties, varint_len,
 };
 use mqttiumd_contract::pubsub::{FilterList, MAX_FILTERS, SubscriptionFilter, SubscriptionOptions};
 use mqttiumd_contract::session::SessionExpiry;
@@ -401,6 +406,8 @@ enum Property<'a> {
     Two(u16),
     Four(u32),
     Text(&'a [u8]),
+    Binary(&'a [u8]),
+    Pair(&'a [u8], &'a [u8]),
     Other,
 }
 
@@ -440,15 +447,8 @@ fn property<'a>(id: u32, input: &mut Cursor<'a>) -> Result<Property<'a>, Error> 
             Property::Other
         }
         0x03 | 0x08 | 0x12 | 0x15 | 0x1a | 0x1c | 0x1f => Property::Text(input.string()?),
-        0x09 | 0x16 => {
-            input.binary()?;
-            Property::Other
-        }
-        0x26 => {
-            input.string()?;
-            input.string()?;
-            Property::Other
-        }
+        0x09 | 0x16 => Property::Binary(input.binary()?),
+        0x26 => Property::Pair(input.string()?, input.string()?),
         _ => return Err(malformed("UnknownProperty")),
     };
     if id == 0x08
@@ -460,7 +460,7 @@ fn property<'a>(id: u32, input: &mut Cursor<'a>) -> Result<Property<'a>, Error> 
 }
 
 #[derive(Default)]
-struct Properties {
+struct Properties<'a> {
     expiry: Option<u32>,
     message_expiry: Option<u32>,
     will_delay: Option<u32>,
@@ -468,12 +468,17 @@ struct Properties {
     receive_maximum: Option<u16>,
     alias_maximum: Option<u16>,
     problem_information: Option<bool>,
+    payload_format_indicator: Option<u8>,
+    content_type: Option<&'a [u8]>,
+    response_topic: Option<&'a [u8]>,
+    correlation_data: Option<&'a [u8]>,
+    user_properties: Vec<(&'a [u8], &'a [u8])>,
     unsupported: bool,
     /// An Authentication Method was given: no method is supported.
     authentication: bool,
 }
 
-fn properties(input: &mut Cursor<'_>, context: Context) -> Result<Properties, Error> {
+fn properties<'a>(input: &mut Cursor<'a>, context: Context) -> Result<Properties<'a>, Error> {
     let length =
         usize::try_from(input.variable()?).map_err(|_| oversized("PropertyLengthTooLarge"))?;
     let mut cursor = Cursor::new(input.take(length)?);
@@ -522,7 +527,19 @@ fn properties(input: &mut Cursor<'_>, context: Context) -> Result<Properties, Er
             )
             | (Context::Acknowledge | Context::Disconnect, 0x1f, _) => (),
             (Context::Disconnect, 0x11, Property::Four(n)) => result.expiry = Some(n),
+            (Context::Publish, 0x01, Property::Byte(n)) => {
+                result.payload_format_indicator = Some(n)
+            }
             (Context::Publish, 0x02, Property::Four(n)) => result.message_expiry = Some(n),
+            (Context::Publish, 0x03, Property::Text(s)) => result.content_type = Some(s),
+            (Context::Publish, 0x08, Property::Text(s)) => result.response_topic = Some(s),
+            (Context::Publish, 0x09, Property::Binary(b)) => result.correlation_data = Some(b),
+            (Context::Publish, 0x26, Property::Pair(k, v)) => {
+                if result.user_properties.len() >= MAX_USER_PROPERTIES {
+                    return Err(oversized("TooManyUserProperties"));
+                }
+                result.user_properties.push((k, v));
+            }
             (Context::Will, 0x18, Property::Four(n)) => result.will_delay = Some(n),
             (Context::Publish, 0x23, _) => {
                 return Err(Error {
@@ -708,11 +725,11 @@ fn identifier(input: &mut Cursor<'_>) -> Result<InboundPacketId, Error> {
     InboundPacketId::new(input.u16()?).ok_or_else(|| protocol("ZeroPacketIdentifier"))
 }
 
-fn versioned_properties(
+fn versioned_properties<'a>(
     version: Version,
-    input: &mut Cursor<'_>,
+    input: &mut Cursor<'a>,
     context: Context,
-) -> Result<Properties, Error> {
+) -> Result<Properties<'a>, Error> {
     if version == Version::V5 {
         properties(input, context)
     } else {
@@ -735,13 +752,77 @@ fn publish(version: Version, first: u8, body: &[u8], bounds: Bounds) -> Result<P
     if props.unsupported {
         return Err(unsupported("PublishPropertiesOutsideProfile"));
     }
-    // Check every field before making either application-owned copy.
+    if props.payload_format_indicator == Some(1) && std::str::from_utf8(payload).is_err() {
+        return Err(Error {
+            kind: ErrorKind::Malformed,
+            code: "PayloadFormatInvalid",
+            reason: 0x99,
+            peer_maximum: None,
+            disconnect_expiry: None,
+        });
+    }
+    let has_props = props.payload_format_indicator.is_some()
+        || props.content_type.is_some()
+        || props.response_topic.is_some()
+        || props.correlation_data.is_some()
+        || !props.user_properties.is_empty();
+    if has_props {
+        let logical_bytes = usize::from(props.payload_format_indicator.is_some())
+            .saturating_add(props.content_type.map_or(0, <[u8]>::len))
+            .saturating_add(props.response_topic.map_or(0, <[u8]>::len))
+            .saturating_add(props.correlation_data.map_or(0, <[u8]>::len))
+            .saturating_add(
+                props
+                    .user_properties
+                    .iter()
+                    .map(|(k, v)| k.len().saturating_add(v.len()))
+                    .sum::<usize>(),
+            );
+        if logical_bytes > MAX_PROPERTY_BYTES {
+            return Err(oversized("PublishPropertiesTooLarge"));
+        }
+    }
+    // Check every field before making any application-owned copy.
     if topic_bytes.len() > bounds.max_topic {
         return Err(oversized("TopicTooLarge"));
     }
     if payload.len() > bounds.max_payload {
         return Err(oversized("PayloadTooLarge"));
     }
+    let publish_props = if has_props {
+        let content_type = props
+            .content_type
+            .map(|s| SharedBytes::copy_from(s, MAX_PROPERTY_BYTES))
+            .transpose()
+            .map_err(|_| oversized("PublishPropertiesTooLarge"))?;
+        let response_topic = props
+            .response_topic
+            .map(|s| SharedBytes::copy_from(s, MAX_PROPERTY_BYTES))
+            .transpose()
+            .map_err(|_| oversized("PublishPropertiesTooLarge"))?;
+        let correlation_data = props
+            .correlation_data
+            .map(|b| SharedBytes::copy_from(b, MAX_PROPERTY_BYTES))
+            .transpose()
+            .map_err(|_| oversized("PublishPropertiesTooLarge"))?;
+        let mut pairs = Vec::with_capacity(props.user_properties.len());
+        for (k, v) in props.user_properties {
+            let key = SharedBytes::copy_from(k, MAX_PROPERTY_BYTES)
+                .map_err(|_| oversized("PublishPropertiesTooLarge"))?;
+            let val = SharedBytes::copy_from(v, MAX_PROPERTY_BYTES)
+                .map_err(|_| oversized("PublishPropertiesTooLarge"))?;
+            pairs.push((key, val));
+        }
+        Some(Arc::new(PublishProperties {
+            payload_format_indicator: props.payload_format_indicator,
+            content_type,
+            response_topic,
+            correlation_data,
+            user_properties: Arc::from(pairs),
+        }))
+    } else {
+        None
+    };
     let topic = SharedBytes::copy_from(topic_bytes, bounds.max_topic)
         .map_err(|_| oversized("TopicTooLarge"))?;
     let payload = SharedBytes::copy_from(payload, bounds.max_payload)
@@ -753,6 +834,7 @@ fn publish(version: Version, first: u8, body: &[u8], bounds: Bounds) -> Result<P
         dup: first & 8 != 0,
         packet_id,
         expiry: None,
+        properties: publish_props,
         payload,
     };
     Ok(match props.message_expiry {
@@ -852,7 +934,7 @@ fn legacy_connack_refusal(reason: u8) -> Vec<u8> {
 /// reads frames up to its own bound, which a CONNECT with a large Will
 /// needs before any announcement; the runtime refuses every later MQTT 5
 /// packet larger than the announcement.
-pub const ANNOUNCED_PACKET_BYTES: u32 = 32_768 + 8;
+pub const ANNOUNCED_PACKET_BYTES: u32 = 1_048_576 + 8;
 const ANNOUNCED: [u8; 4] = ANNOUNCED_PACKET_BYTES.to_be_bytes();
 
 /// The size of a packet on the wire: its first byte, the bytes of its
@@ -1392,7 +1474,22 @@ pub fn encode_qos0_for(
     retain: bool,
     remaining: Option<u32>,
 ) -> Result<EncodedPublish, Error> {
-    encode_publication(version, None, topic, payload, false, retain, remaining)
+    encode_publication(
+        version, None, topic, payload, false, retain, remaining, None,
+    )
+}
+
+pub fn encode_qos0_with_properties(
+    version: Version,
+    topic: &SharedBytes,
+    payload: &SharedBytes,
+    retain: bool,
+    remaining: Option<u32>,
+    properties: Option<&PublishProperties>,
+) -> Result<EncodedPublish, Error> {
+    encode_publication(
+        version, None, topic, payload, false, retain, remaining, properties,
+    )
 }
 
 #[cfg(any(test, feature = "test-hooks"))]
@@ -1471,9 +1568,48 @@ pub(crate) fn encode_delivery_for(
         dup,
         retain,
         remaining,
+        None,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn encode_delivery_with_properties(
+    version: Version,
+    packet: (OutboundPacketId, Qos),
+    topic_name: &SharedBytes,
+    payload: &SharedBytes,
+    dup: bool,
+    retain: bool,
+    remaining: Option<u32>,
+    properties: Option<&PublishProperties>,
+) -> Result<EncodedPublish, Error> {
+    encode_publication(
+        version,
+        Some(packet),
+        topic_name,
+        payload,
+        dup,
+        retain,
+        remaining,
+        properties,
+    )
+}
+
+fn push_varint(bytes: &mut Vec<u8>, mut value: usize) {
+    for _ in 0..4 {
+        let mut part = (value % 128) as u8;
+        value /= 128;
+        if value > 0 {
+            part |= 0x80;
+        }
+        bytes.push(part);
+        if value == 0 {
+            break;
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn encode_publication(
     version: Version,
     packet: Option<(OutboundPacketId, Qos)>,
@@ -1482,9 +1618,10 @@ fn encode_publication(
     dup: bool,
     retain: bool,
     remaining: Option<u32>,
+    properties: Option<&PublishProperties>,
 ) -> Result<EncodedPublish, Error> {
     topic(topic_name.as_slice())?;
-    if topic_name.len() > 1024 || payload.len() > 32768 {
+    if topic_name.len() > crate::writer::MAX_TOPIC || payload.len() > crate::writer::MAX_PAYLOAD {
         return Err(oversized("OutgoingFieldTooLarge"));
     }
     let remaining = if version == Version::V5 {
@@ -1492,26 +1629,35 @@ fn encode_publication(
     } else {
         None
     };
+    let props = if version == Version::V5 {
+        properties.filter(|p| !p.is_empty())
+    } else {
+        None
+    };
+    if let Some(p) = props {
+        p.check()
+            .map_err(|_| protocol("InvalidOutgoingProperties"))?;
+    }
+    let prop_bytes = (if remaining.is_some() { 5usize } else { 0usize })
+        .checked_add(props.map_or(0, PublishProperties::wire_len))
+        .ok_or_else(|| oversized("PacketTooLarge"))?;
+    let prop_section = if version == Version::V5 {
+        varint_len(prop_bytes)
+            .checked_add(prop_bytes)
+            .ok_or_else(|| oversized("PacketTooLarge"))?
+    } else {
+        0
+    };
     let body = topic_name
         .len()
         .checked_add(payload.len())
-        .and_then(|n| {
-            n.checked_add(
-                2 + if packet.is_some() { 2 } else { 0 } + usize::from(version == Version::V5),
-            )
-        })
-        .and_then(|n| n.checked_add(if remaining.is_some() { 5 } else { 0 }))
+        .and_then(|n| n.checked_add(2 + if packet.is_some() { 2 } else { 0 }))
+        .and_then(|n| n.checked_add(prop_section))
         .ok_or_else(|| oversized("PacketTooLarge"))?;
-    let length_bytes = if body < 128 {
-        1
-    } else if body < 16384 {
-        2
-    } else {
-        3
-    };
+    let length_bytes = varint_len(body);
     let total = body
         .checked_add(1 + length_bytes)
-        .filter(|n| *n <= 65536)
+        .filter(|n| *n <= crate::net::MAX_PACKET_BYTES)
         .ok_or_else(|| oversized("PacketTooLarge"))?;
     let mut bytes = Vec::new();
     bytes
@@ -1524,35 +1670,56 @@ fn encode_publication(
             0x30
         }) | u8::from(retain),
     );
-    let mut left = body;
-    for _ in 0..4 {
-        let mut part = (left % 128) as u8;
-        left /= 128;
-        if left > 0 {
-            part |= 128;
-        }
-        bytes.push(part);
-        if left == 0 {
-            break;
-        }
-    }
+    push_varint(&mut bytes, body);
     bytes.extend_from_slice(&(topic_name.len() as u16).to_be_bytes());
     bytes.extend_from_slice(topic_name.as_slice());
     if let Some((packet_id, _)) = packet {
         bytes.extend_from_slice(&packet_id.get().to_be_bytes());
     }
-    let expiry_value_offset = if let Some(remaining) = remaining {
-        bytes.extend_from_slice(&[5, 0x02]);
-        let offset = bytes.len();
-        bytes.extend_from_slice(&remaining.to_be_bytes());
-        Some(offset)
-    } else {
-        if version == Version::V5 {
-            bytes.push(0);
+    let expiry_value_offset = if version == Version::V5 {
+        push_varint(&mut bytes, prop_bytes);
+        let offset = if let Some(remaining) = remaining {
+            bytes.push(0x02);
+            let at = bytes.len();
+            bytes.extend_from_slice(&remaining.to_be_bytes());
+            Some(at)
+        } else {
+            None
+        };
+        if let Some(p) = props {
+            if let Some(pfi) = p.payload_format_indicator {
+                bytes.push(0x01);
+                bytes.push(pfi);
+            }
+            if let Some(ct) = &p.content_type {
+                bytes.push(0x03);
+                bytes.extend_from_slice(&(ct.len() as u16).to_be_bytes());
+                bytes.extend_from_slice(ct.as_slice());
+            }
+            if let Some(rt) = &p.response_topic {
+                bytes.push(0x08);
+                bytes.extend_from_slice(&(rt.len() as u16).to_be_bytes());
+                bytes.extend_from_slice(rt.as_slice());
+            }
+            if let Some(cd) = &p.correlation_data {
+                bytes.push(0x09);
+                bytes.extend_from_slice(&(cd.len() as u16).to_be_bytes());
+                bytes.extend_from_slice(cd.as_slice());
+            }
+            for (k, v) in p.user_properties.iter() {
+                bytes.push(0x26);
+                bytes.extend_from_slice(&(k.len() as u16).to_be_bytes());
+                bytes.extend_from_slice(k.as_slice());
+                bytes.extend_from_slice(&(v.len() as u16).to_be_bytes());
+                bytes.extend_from_slice(v.as_slice());
+            }
         }
+        offset
+    } else {
         None
     };
     bytes.extend_from_slice(payload.as_slice());
+    debug_assert_eq!(bytes.len(), total);
     Ok(EncodedPublish {
         bytes,
         expiry_value_offset,
@@ -1631,9 +1798,21 @@ mod tests {
                 .code(),
             "PropertyNotAllowed"
         );
-        kind(
-            decode(0x30, b"\0\x01t\x09\x02\0\0\0\x01\x03\0\x01xp", BOUNDS),
-            ErrorKind::Unsupported,
+        let Packet::TimedPublish {
+            packet:
+                InboundPacket::Publish {
+                    properties: Some(props),
+                    ..
+                },
+            interval,
+        } = decode(0x30, b"\0\x01t\x09\x02\0\0\0\x01\x03\0\x01xp", BOUNDS).unwrap()
+        else {
+            panic!("Message Expiry + Content Type must be accepted");
+        };
+        assert_eq!(interval, 1);
+        assert_eq!(
+            props.content_type.as_ref().map(|b| b.as_slice()),
+            Some(&b"x"[..])
         );
         assert_eq!(
             decode(0x30, b"\0\x01t\x08\x02\0\0\0\x01\x23\0\x01p", BOUNDS)
@@ -2429,6 +2608,7 @@ mod tests {
             packet_id,
             payload,
             expiry: None,
+            properties: None,
         }) = decode(0x3c, body, BOUNDS).unwrap()
         else {
             panic!("PUBLISH")
@@ -2466,6 +2646,7 @@ mod tests {
                 packet_id,
                 payload,
                 expiry: None,
+                properties: None,
             }) = decoded.unwrap()
             else {
                 panic!("PUBLISH")
@@ -2587,8 +2768,8 @@ mod tests {
             decode(0xe0, &[&[0][..], &with(&[REASON, USER])].concat(), BOUNDS).unwrap(),
             decode(0xe0, &[], BOUNDS).unwrap()
         );
-        // A Reason String stays single, and a publication still carries
-        // what it must forward or is refused.
+        // A Reason String stays single, and a PUBLISH carries its User Property
+        // into the core for end-to-end forwarding (ADR 0053).
         assert_eq!(
             decode(
                 0x40,
@@ -2599,16 +2780,21 @@ mod tests {
             .code(),
             "DuplicateProperty"
         );
-        assert_eq!(
-            decode(
-                0x30,
-                &[&[0, 1, b't'][..], &with(&[USER]), b"x"].concat(),
-                BOUNDS
-            )
-            .unwrap_err()
-            .kind(),
-            ErrorKind::Unsupported
-        );
+        let Packet::Core(InboundPacket::Publish {
+            properties: Some(props),
+            ..
+        }) = decode(
+            0x30,
+            &[&[0, 1, b't'][..], &with(&[USER]), b"x"].concat(),
+            BOUNDS,
+        )
+        .unwrap()
+        else {
+            panic!("PUBLISH with User Property must be accepted");
+        };
+        assert_eq!(props.user_properties.len(), 1);
+        assert_eq!(props.user_properties[0].0.as_slice(), b"k");
+        assert_eq!(props.user_properties[0].1.as_slice(), b"v");
     }
 
     #[test]
@@ -2692,7 +2878,25 @@ mod tests {
         assert_eq!(
             &packet[5..],
             &[
-                0x21, 0, 8, 0x27, 0, 0, 0x80, 8, 0x25, 1, 0x22, 0, 0, 0x28, 1, 0x29, 0, 0x2a, 0
+                0x21,
+                0,
+                8,
+                0x27,
+                ANNOUNCED[0],
+                ANNOUNCED[1],
+                ANNOUNCED[2],
+                ANNOUNCED[3],
+                0x25,
+                1,
+                0x22,
+                0,
+                0,
+                0x28,
+                1,
+                0x29,
+                0,
+                0x2a,
+                0
             ]
         );
         assert_eq!(encode(OutboundFrame::Pingresp).unwrap(), [0xd0, 0]);

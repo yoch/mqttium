@@ -63,7 +63,7 @@ fn prepared_file() -> (PathBuf, SqliteStore, mqttiumd_contract::ids::SessionId) 
     let command = Command {
         recipe: FrozenRecipe::freeze(Recipe::RetainedPublication(RetainedPublication {
             admission,
-            retain_targets: 0,
+            retain_targets: mqttiumd_contract::retained::RetainMask::EMPTY,
         }))
         .unwrap(),
         payload: old.payload,

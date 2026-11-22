@@ -1,11 +1,11 @@
-//! The schema of version 10. Every table is `STRICT`; identities and 64-bit
+//! The schema of version 14. Every table is `STRICT`; identities and 64-bit
 //! values are 8-byte big-endian BLOBs (32 bytes for an operation-scoped
 //! identity, 16 for an exchange, 24 for an opening attempt); large BLOBs
 //! come last in their row.
 
 /// `PRAGMA user_version` of the schema below. Any other version is
 /// refused before anything is written.
-pub const SCHEMA_VERSION: i64 = 12;
+pub const SCHEMA_VERSION: i64 = 14;
 
 /// The format named in `meta`.
 pub const FORMAT: &str = "mqttiumd-store-sqlite";
@@ -109,6 +109,7 @@ CREATE TABLE publications (
     expiry_tick BLOB,
     expiry_interval INTEGER,
     topic BLOB NOT NULL,
+    properties BLOB CHECK (properties IS NULL OR length(properties) > 0),
     CHECK ((expiry_domain IS NULL AND expiry_tick IS NULL AND expiry_interval IS NULL) OR
            (typeof(expiry_domain) = 'blob' AND length(expiry_domain) = 32 AND
             typeof(expiry_tick) = 'blob' AND length(expiry_tick) = 8 AND
@@ -143,6 +144,7 @@ CREATE TABLE obligations (
 ) STRICT, WITHOUT ROWID;
 
 CREATE INDEX obligations_by_target ON obligations (target, qos, publication, idx);
+CREATE INDEX obligations_by_target_order ON obligations (target, publication, idx);
 
 CREATE TABLE outbound (
     publication BLOB NOT NULL CHECK(length(publication)=32),

@@ -103,7 +103,7 @@ fn admitted<S: DurableStore>(
             payload: payload_ref,
             costs,
             targets,
-            retain_targets: 0,
+            retain_targets: mqttiumd_contract::retained::RetainMask::EMPTY,
         })
     } else {
         Recipe::RetainedPublication(RetainedPublication {
@@ -128,7 +128,7 @@ fn admitted<S: DurableStore>(
                 costs,
                 targets,
             },
-            retain_targets: 0,
+            retain_targets: mqttiumd_contract::retained::RetainMask::EMPTY,
         })
     };
     frozen(recipe, Some(payload))
@@ -343,7 +343,8 @@ pub fn thirty_two_topics_and_ordered_options<S: DurableStore>(
     else {
         panic!()
     };
-    value.admission.publication = publication_id(w.epoch, 1255);
+    let range_end = 1000 + mqttiumd_contract::retained::MAX_REPLAYS as u64 - 1;
+    value.admission.publication = publication_id(w.epoch, range_end);
     collision.recipe = FrozenRecipe::freeze(Recipe::RetainedPublication(value)).unwrap();
     assert_eq!(
         w.store.apply(&collision).reply,
@@ -356,7 +357,7 @@ pub fn thirty_two_topics_and_ordered_options<S: DurableStore>(
         closure: ReceiptClosure {
             origin: ReceiptOrigin::of(operation_id(w.epoch, 1)),
             through: operation_id(w.epoch, 66).sequence(),
-            publication_through: publication_id(w.epoch, 1254).sequence(),
+            publication_through: publication_id(w.epoch, range_end - 1).sequence(),
             payload_through: PayloadSeq::new(66),
         },
         limit: 128,
@@ -369,7 +370,7 @@ pub fn thirty_two_topics_and_ordered_options<S: DurableStore>(
         "replay_range_not_closed_before_receipt_deletion"
     );
     let closure = ReceiptClosure {
-        publication_through: publication_id(w.epoch, 1255).sequence(),
+        publication_through: publication_id(w.epoch, range_end).sequence(),
         ..collection.closure
     };
     assert!(matches!(
@@ -398,7 +399,7 @@ pub fn thirty_two_topics_and_ordered_options<S: DurableStore>(
         &w,
         68,
         w.c,
-        2000,
+        range_end + 1,
         &[
             (b"atelier/#", Qos::AtMostOnce, 0x20),
             (b"atelier/#", Qos::AtMostOnce, 0x10),
@@ -418,7 +419,9 @@ pub fn thirty_two_topics_and_ordered_options<S: DurableStore>(
 pub fn quota_full_replacement_and_no_local_client_identity<S: DurableStore>(
     make: &dyn Fn(StoreIncarnation, Limits) -> S,
 ) {
-    let mut w = World::with_limits(make, limits());
+    let mut l = limits();
+    l.payload_bytes = PayloadBytes::new(96);
+    let mut w = World::with_limits(make, l);
     for n in 1..=32 {
         let c = admitted(
             &w,
@@ -437,11 +440,11 @@ pub fn quota_full_replacement_and_no_local_client_identity<S: DurableStore>(
             RejectReason::CapacityExceeded(_)
         ))
     ));
-    let replacement = admitted(&w, 34, b"v/1", b"replacement", Qos::AtLeastOnce, &[]);
+    let replacement = admitted(&w, 34, b"v/1", b"new", Qos::AtLeastOnce, &[]);
     commit(&mut w.store, &replacement);
     let clear = admitted(&w, 35, b"v/2", b"", Qos::AtLeastOnce, &[]);
     commit(&mut w.store, &clear);
-    let fresh = admitted(&w, 36, b"v/33", b"fresh", Qos::AtLeastOnce, &[]);
+    let fresh = admitted(&w, 36, b"v/33", b"new", Qos::AtLeastOnce, &[]);
     commit(&mut w.store, &fresh);
     w.store
         .admin(AdminCommand::DeleteSession {
@@ -471,11 +474,12 @@ pub fn quota_full_replacement_and_no_local_client_identity<S: DurableStore>(
             .is_empty(),
         "no_local_forgot_producer_client_id"
     );
+    let next_replay = 1000 + mqttiumd_contract::retained::MAX_REPLAYS as u64;
     let other = subscribe(
         &w,
         38,
         w.b,
-        2000,
+        next_replay,
         &[
             (b"v/#", Qos::AtMostOnce, 0x10),
             (b"v/#", Qos::AtMostOnce, 0x10),
@@ -661,9 +665,10 @@ pub fn rejected_replay_ranges_remain_reserved<S: DurableStore>(
             RejectReason::CapacityExceeded(_)
         ))
     ));
+    let range_end = 1000 + mqttiumd_contract::retained::MAX_REPLAYS as u64 - 1;
     let collision = with_ids(
         &admitted(&w, 3, b"range/x", b"new", Qos::AtLeastOnce, &[]),
-        Some(publication_id(w.epoch, 1255)),
+        Some(publication_id(w.epoch, range_end)),
         None,
         false,
     );
@@ -677,7 +682,7 @@ pub fn rejected_replay_ranges_remain_reserved<S: DurableStore>(
     let closure = ReceiptClosure {
         origin: ReceiptOrigin::of(operation_id(w.epoch, 1)),
         through: operation_id(w.epoch, 3).sequence(),
-        publication_through: publication_id(w.epoch, 1254).sequence(),
+        publication_through: publication_id(w.epoch, range_end - 1).sequence(),
         payload_through: PayloadSeq::new(3),
     };
     assert!(
@@ -693,7 +698,7 @@ pub fn rejected_replay_ranges_remain_reserved<S: DurableStore>(
         "rejected_replay_range_not_closed"
     );
     let closure = ReceiptClosure {
-        publication_through: publication_id(w.epoch, 1255).sequence(),
+        publication_through: publication_id(w.epoch, range_end).sequence(),
         ..closure
     };
     assert!(matches!(
@@ -1237,7 +1242,14 @@ pub mod expiry {
             .unwrap();
         assert_eq!(stale.quarantined, 1);
         // Historical tag 12 has no temporal observation and must skip expiring values.
-        let legacy = subscribe(&w, 3, w.c, 2000, &[(b"expiry/#", Qos::AtMostOnce, 0)]);
+        let next_replay = 1000 + mqttiumd_contract::retained::MAX_REPLAYS as u64;
+        let legacy = subscribe(
+            &w,
+            3,
+            w.c,
+            next_replay,
+            &[(b"expiry/#", Qos::AtMostOnce, 0)],
+        );
         commit(&mut w.store, &legacy);
         assert!(w.store.read_work(w.c, None, 8).unwrap().items.is_empty());
     }
@@ -1303,8 +1315,15 @@ pub mod expiry {
         assert_eq!(removed, 32);
         assert_eq!(retained, 32);
         assert_eq!(w.store.snapshot().unwrap().accounts.references.get(), 0);
+        let next_replay = 1000 + mqttiumd_contract::retained::MAX_REPLAYS as u64;
         let expired = timed(
-            subscribe(&w, 34, w.c, 2000, &[(b"expiry/#", Qos::AtMostOnce, 0)]),
+            subscribe(
+                &w,
+                34,
+                w.c,
+                next_replay,
+                &[(b"expiry/#", Qos::AtMostOnce, 0)],
+            ),
             at(10),
         );
         commit(&mut w.store, &expired);
@@ -1606,7 +1625,8 @@ pub mod expiry {
         let ExpiringAdmission::Qos12(a) = &mut value.admission else {
             panic!()
         };
-        a.admission.publication = publication_id(w.epoch, 1255);
+        let range_end = 1000 + mqttiumd_contract::retained::MAX_REPLAYS as u64 - 1;
+        a.admission.publication = publication_id(w.epoch, range_end);
         collision.recipe = FrozenRecipe::freeze(Recipe::ExpiringPublication(value)).unwrap();
         assert_eq!(
             w.store.apply(&collision).reply,
@@ -1618,7 +1638,7 @@ pub mod expiry {
         let closure = ReceiptClosure {
             origin: ReceiptOrigin::of(operation_id(w.epoch, 1)),
             through: operation_id(w.epoch, 3).sequence(),
-            publication_through: publication_id(w.epoch, 1254).sequence(),
+            publication_through: publication_id(w.epoch, range_end - 1).sequence(),
             payload_through: PayloadSeq::new(3),
         };
         assert!(
@@ -1638,7 +1658,7 @@ pub mod expiry {
             StoreReply::Outcome(StoreOutcome::Committed(facts))
         );
         let closure = ReceiptClosure {
-            publication_through: publication_id(w.epoch, 1255).sequence(),
+            publication_through: publication_id(w.epoch, range_end).sequence(),
             ..closure
         };
         assert!(matches!(

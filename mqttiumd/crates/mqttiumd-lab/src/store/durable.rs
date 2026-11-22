@@ -63,6 +63,7 @@ pub struct MemoryStore {
 #[derive(Clone, Copy)]
 struct Admission<'a> {
     expiry: Option<MessageExpiry>,
+    properties: Option<&'a std::sync::Arc<mqttiumd_contract::properties::PublishProperties>>,
     operation: OperationId,
     request: Option<mqttiumd_contract::ids::RequestId>,
     will_source: Option<&'a [u8]>,
@@ -85,6 +86,7 @@ impl<'a> From<&'a AdmitPublication> for Admission<'a> {
     fn from(a: &'a AdmitPublication) -> Self {
         Self {
             expiry: None,
+            properties: None,
             operation: a.operation,
             request: Some(a.request),
             will_source: None,
@@ -106,6 +108,7 @@ impl<'a> From<&'a mqttiumd_contract::retained::RetainedQos0> for Admission<'a> {
     fn from(a: &'a mqttiumd_contract::retained::RetainedQos0) -> Self {
         Self {
             expiry: None,
+            properties: None,
             operation: a.operation,
             request: Some(a.request),
             will_source: None,
@@ -695,7 +698,7 @@ trait Staging {
     fn stage_publication(
         &mut self,
         admit: Admission<'_>,
-        retained_mask: Option<u16>,
+        retained_mask: Option<&mqttiumd_contract::retained::RetainMask>,
         payload: Option<&SharedBytes>,
     ) -> Guard<CommitFacts>;
     fn stage_release(&mut self, release: &ReleaseInbound) -> Guard<CommitFacts>;
@@ -815,7 +818,7 @@ impl Staging for DurableState {
     fn stage_publication(
         &mut self,
         admit: Admission<'_>,
-        retained_mask: Option<u16>,
+        retained_mask: Option<&mqttiumd_contract::retained::RetainMask>,
         payload: Option<&SharedBytes>,
     ) -> Guard<CommitFacts> {
         let failed = RejectReason::PreconditionFailed;
@@ -866,6 +869,13 @@ impl Staging for DurableState {
         if length != admit.payload.length.get() || bytes.len() > self.limits.max_payload_bytes {
             return Err(failed);
         }
+        if let Some(props) = admit.properties
+            && (props.is_empty()
+                || props.check().is_err()
+                || props.check_payload(bytes.as_slice()).is_err())
+        {
+            return Err(failed);
+        }
         // The costs are part of the frozen recipe. They must be the
         // costs of what the recipe admits: the store releases exactly
         // what it charged, row by row.
@@ -905,6 +915,7 @@ impl Staging for DurableState {
             admit.publication,
             PublicationRecord {
                 expiry: admit.expiry,
+                properties: admit.properties.cloned(),
                 retained_version: None,
                 operation,
                 source: admit.source_session,
@@ -933,7 +944,7 @@ impl Staging for DurableState {
                 continue;
             }
             let obligation = ObligationRecord {
-                retain: retained_mask.is_some_and(|mask| mask & (1 << target_index) != 0),
+                retain: retained_mask.is_some_and(|mask| mask.is_set(target_index)),
                 target: target.session,
                 target_revision: target.session_revision,
                 qos: target.effective_qos,
@@ -2243,6 +2254,49 @@ impl DurableStore for MemoryStore {
         // 2 to 5. Guards, capacities and every row, on a staged copy.
         let mut staged = self.committed.clone();
         let facts = match recipe {
+            Recipe::AnnotatedPublication(annotated) => {
+                let props = Some(&annotated.properties);
+                match annotated.inner.as_ref() {
+                    Recipe::AdmitPublication(admit) => {
+                        let mut a = Admission::from(admit);
+                        a.properties = props;
+                        staged.stage_publication(a, None, command.payload.as_ref())
+                    }
+                    Recipe::RetainedPublication(value) => {
+                        let mut a = Admission::from(&value.admission);
+                        a.properties = props;
+                        staged.stage_publication(
+                            a,
+                            Some(&value.retain_targets),
+                            command.payload.as_ref(),
+                        )
+                    }
+                    Recipe::RetainedQos0(value) => {
+                        let mut a = Admission::from(value);
+                        a.properties = props;
+                        staged.stage_publication(
+                            a,
+                            Some(&value.retain_targets),
+                            command.payload.as_ref(),
+                        )
+                    }
+                    Recipe::ExpiringPublication(value) => {
+                        let (mut admit, mask) = match &value.admission {
+                            ExpiringAdmission::Qos12(v) => (
+                                Admission::from(&v.admission),
+                                v.admission.retain.then_some(&v.retain_targets),
+                            ),
+                            ExpiringAdmission::Qos0(v) => {
+                                (Admission::from(v), Some(&v.retain_targets))
+                            }
+                        };
+                        admit.expiry = Some(value.expiry);
+                        admit.properties = props;
+                        staged.stage_publication(admit, mask, command.payload.as_ref())
+                    }
+                    _ => Err(RejectReason::PreconditionFailed),
+                }
+            }
             Recipe::WillPublication(value) => {
                 will_memory::publish(&mut staged, value, command.payload.as_ref())
             }
@@ -2251,12 +2305,12 @@ impl DurableStore for MemoryStore {
             }
             Recipe::RetainedPublication(value) => staged.stage_publication(
                 Admission::from(&value.admission),
-                Some(value.retain_targets),
+                Some(&value.retain_targets),
                 command.payload.as_ref(),
             ),
             Recipe::RetainedQos0(value) => staged.stage_publication(
                 Admission::from(value),
-                Some(value.retain_targets),
+                Some(&value.retain_targets),
                 command.payload.as_ref(),
             ),
             Recipe::ReplaySubscriptions(value) => {
@@ -2269,9 +2323,9 @@ impl DurableStore for MemoryStore {
                 let (mut admit, mask) = match &value.admission {
                     ExpiringAdmission::Qos12(v) => (
                         Admission::from(&v.admission),
-                        v.admission.retain.then_some(v.retain_targets),
+                        v.admission.retain.then_some(&v.retain_targets),
                     ),
-                    ExpiringAdmission::Qos0(v) => (Admission::from(v), Some(v.retain_targets)),
+                    ExpiringAdmission::Qos0(v) => (Admission::from(v), Some(&v.retain_targets)),
                 };
                 admit.expiry = Some(value.expiry);
                 staged.stage_publication(admit, mask, command.payload.as_ref())
@@ -2458,10 +2512,18 @@ impl DurableStore for MemoryStore {
                 .ok_or(ReadError::InvalidData)?;
             meter.field(publication.topic.len(), state.limits.max_topic_bytes)?;
             meter.field(payload.bytes.len(), state.limits.max_payload_bytes)?;
+            let props_bytes = publication.properties.as_ref().map_or(0, |p| p.wire_len());
+            if props_bytes > 0 {
+                meter.field(
+                    props_bytes,
+                    mqttiumd_contract::properties::MAX_PROPERTY_BYTES + 1024,
+                )?;
+            }
             meter.charge(
                 256usize
                     .checked_add(publication.topic.len())
                     .and_then(|n| n.checked_add(payload.bytes.len()))
+                    .and_then(|n| n.checked_add(props_bytes))
                     .ok_or(ReadError::LimitExceeded)?,
             )?;
             check_delivery_metadata(state, *delivery, record)?;
@@ -2475,6 +2537,7 @@ impl DurableStore for MemoryStore {
                     cause: record.cause,
                     retain: record.retain,
                     expiry: publication.expiry,
+                    properties: publication.properties.clone(),
                     topic: SharedBytes::copy_from(&publication.topic, state.limits.max_topic_bytes)
                         .map_err(|_| ReadError::LimitExceeded)?,
                     payload: SharedBytes::copy_from(&payload.bytes, state.limits.max_payload_bytes)

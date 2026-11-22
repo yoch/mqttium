@@ -50,8 +50,14 @@ pub struct TooLarge {
 /// the inner `Arc` is private, so immutability is a property of this wrapper
 /// rather than a convention (DEM-009). The physical cost stays charged until
 /// the last clone is dropped; each clone has its own reference cost.
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub struct SharedBytes(Arc<[u8]>);
+
+impl core::borrow::Borrow<[u8]> for SharedBytes {
+    fn borrow(&self) -> &[u8] {
+        &self.0
+    }
+}
 
 impl SharedBytes {
     /// Copies `bytes` once into shared storage, refusing more than `max`.
@@ -104,6 +110,8 @@ pub enum InboundPacket {
         packet_id: Option<InboundPacketId>,
         /// Original receipt observation, anchored by the clock adapter.
         expiry: Option<crate::message_expiry::MessageExpiry>,
+        /// Optional MQTT 5 PUBLISH application properties (ADR 0053).
+        properties: Option<Arc<crate::properties::PublishProperties>>,
         payload: SharedBytes,
     },
     /// PUBREL of an inbound QoS 2 exchange.

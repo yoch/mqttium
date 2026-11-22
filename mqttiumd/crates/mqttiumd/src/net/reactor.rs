@@ -36,9 +36,24 @@ const TICK: Duration = Duration::from_millis(5);
 /// Upper bound of a wait with no such task: nothing depends on it.
 const REST: Duration = Duration::from_secs(1);
 /// Consecutive turns one task may take before the others are served.
-const TURNS: usize = 32;
+const TURNS: usize = 64;
 const WAKER: Token = Token(usize::MAX);
 const UNREGISTERED: usize = usize::MAX;
+static CONFIGURED_THREADS: AtomicUsize = AtomicUsize::new(0);
+
+/// Sets the reactor thread count used when the shared pool initializes.
+pub fn configure_threads(threads: usize) {
+    CONFIGURED_THREADS.store(threads.clamp(1, 32), Ordering::Relaxed);
+}
+
+/// Default reactor count: matches available CPU parallelism within `[2, 4]`.
+#[must_use]
+pub fn default_threads() -> usize {
+    thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(2)
+        .clamp(2, 4)
+}
 
 /// What one turn of a task did.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -227,7 +242,13 @@ impl Reactors {
     pub fn shared() -> io::Result<&'static Self> {
         static SHARED: OnceLock<Result<Reactors, io::ErrorKind>> = OnceLock::new();
         SHARED
-            .get_or_init(|| Self::new(2).map_err(|error| error.kind()))
+            .get_or_init(|| {
+                let threads = match CONFIGURED_THREADS.load(Ordering::Relaxed) {
+                    0 => default_threads(),
+                    n => n,
+                };
+                Self::new(threads).map_err(|error| error.kind())
+            })
             .as_ref()
             .map_err(|kind| io::Error::from(*kind))
     }
@@ -284,7 +305,7 @@ fn retire(poll: &Poll, entry: Entry, code: &'static str) {
 }
 
 fn run(mut poll: Poll, shared: &Shared) {
-    let mut events = Events::with_capacity(256);
+    let mut events = Events::with_capacity(1024);
     let mut slots: Vec<Option<Entry>> = Vec::new();
     let mut free: Vec<usize> = Vec::new();
     let mut ready: VecDeque<usize> = VecDeque::new();

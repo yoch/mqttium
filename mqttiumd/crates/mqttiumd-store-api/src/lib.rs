@@ -42,9 +42,9 @@ pub const MAX_CLIENT_ID_BYTES: usize = 65_535;
 /// Positional cursors can scan a prefix; they never enumerate an unbounded one.
 pub const MAX_RECOVERY_INVENTORY_ROWS: usize = 65_536;
 
-/// A sweep visits at most four publications and returns at most 128 deliveries.
+/// A sweep visits at most four publications and returns at most 4096 deliveries.
 pub const MESSAGE_EXPIRY_SWEEP_PUBLICATIONS: u32 = 4;
-pub const MESSAGE_EXPIRY_SWEEP_DELIVERIES: usize = 128;
+pub const MESSAGE_EXPIRY_SWEEP_DELIVERIES: usize = 4_096;
 
 /// Absolute receiptless maintenance knowledge. A lost response can be retried
 /// with the same observation and key cursor without granting credits twice.
@@ -139,24 +139,24 @@ pub struct ReadBudget {
 
 impl ReadBudget {
     pub const SNAPSHOT: Self = Self {
-        max_rows: 65_536,
-        max_bytes: 32 * 1024 * 1024,
-        max_field_bytes: 8 * 1024 * 1024,
+        max_rows: 262_144,
+        max_bytes: 256 * 1024 * 1024,
+        max_field_bytes: 16 * 1024 * 1024,
     };
 
     pub const PAGE: Self = Self {
         max_rows: 4_096,
-        max_bytes: 1024 * 1024,
-        max_field_bytes: 1024 * 1024,
+        max_bytes: 10 * 1024 * 1024,
+        max_field_bytes: 2 * 1024 * 1024,
     };
 
-    /// A closure can validate 128 canonical subscription recipes, each with
-    /// eight legal 1024-byte filters. Their aggregate exceeds a work page.
-    /// Keep a separate finite budget rather than widening every page reader.
+    /// A closure can validate MAX_COLLECTION_ROWS canonical subscription
+    /// recipes or wide-fanout admissions. Keep a separate finite budget rather
+    /// than widening every page reader.
     pub const COLLECTION: Self = Self {
         max_rows: mqttiumd_contract::receipts::MAX_COLLECTION_ROWS as usize,
-        max_bytes: 2 * 1024 * 1024,
-        max_field_bytes: 1024 * 1024,
+        max_bytes: 12 * 1024 * 1024,
+        max_field_bytes: 2 * 1024 * 1024,
     };
 
     pub fn check_field(self, bytes: usize) -> Result<(), ReadError> {
@@ -309,6 +309,7 @@ pub struct PublicationRecord {
     pub qos: Qos,
     pub retain: bool,
     pub expiry: Option<MessageExpiry>,
+    pub properties: Option<std::sync::Arc<mqttiumd_contract::properties::PublishProperties>>,
     pub payload: PayloadId,
 }
 

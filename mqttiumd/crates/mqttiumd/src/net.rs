@@ -30,13 +30,13 @@ mod tls;
 
 use reactor::{Driven, Link, Reactors, Turn};
 
-pub const INPUT_SLOTS: usize = 4;
-pub const OUTPUT_SLOTS: usize = 4;
-pub const MAX_PACKET_BYTES: usize = 65_536;
+pub const INPUT_SLOTS: usize = 32;
+pub const OUTPUT_SLOTS: usize = 64;
+pub const MAX_PACKET_BYTES: usize = 1_048_576 + 65_536;
 // A correlated frame can publish Started and one terminal result. This is a
 // receipt bound; it grants no additional outgoing-frame admission capacity.
 pub const WRITTEN_SLOTS: usize = 2 * (OUTPUT_SLOTS + 1) + 8;
-// Four queued writes, one active write and eight terminal receipts. Wire
+// Queued writes, one active write and eight terminal receipts. Wire
 // progress is an independent bounded lane, not the core's receipt lane.
 const WIRE_PROGRESS_SLOTS: usize = OUTPUT_SLOTS + 1 + 8;
 #[cfg(test)]
@@ -45,9 +45,12 @@ const RESULT_WAIT: Duration = Duration::from_millis(100);
 const PARTIAL_PACKET_TIMEOUT: Duration = Duration::from_secs(5);
 const WRITE_TIMEOUT: Duration = Duration::from_millis(250);
 /// Bytes one plain connection may hold between a socket read and its parser.
-const READ_BUFFER: usize = 4096;
+const READ_BUFFER: usize = 32_768;
 /// Packets or frames one turn may move before other tasks are served.
-const BURST: usize = 32;
+const BURST: usize = 64;
+/// Maximum bytes and frames opportunistically coalesced into one write/TLS record.
+const COALESCE_BYTES: usize = 16_384;
+const MAX_COALESCE_FRAMES: usize = 32;
 
 #[derive(Debug)]
 pub enum Incoming {
@@ -272,6 +275,11 @@ pub struct Connection {
     principal: Option<Arc<OnceLock<Principal>>>,
 }
 
+/// Configures the I/O reactor thread pool size prior to first socket spawn.
+pub fn configure_io_threads(threads: usize) {
+    reactor::configure_threads(threads);
+}
+
 /// Defers the wake-ups of the reactor threads until the guard is dropped.
 /// A caller that serves many lanes in one pass pays one wake-up per thread
 /// instead of one per lane. A deferred wake-up is late, never lost.
@@ -293,7 +301,6 @@ fn open(stream: &TcpStream, wake: Wake) -> io::Result<(Lanes, Connection)> {
     stream.set_nodelay(true)?;
     stream.set_nonblocking(true)?;
     let socket = socket2::SockRef::from(stream);
-    socket.set_send_buffer_size(4096)?;
     let send_buffer = socket.send_buffer_size()?;
     let link = Reactors::shared()?.link(wake.clone());
     let (input, incoming) = lane(INPUT_SLOTS, &wake);
@@ -327,6 +334,7 @@ fn open(stream: &TcpStream, wake: Wake) -> io::Result<(Lanes, Connection)> {
     let lanes = Lanes {
         input,
         output,
+        peeked: None,
         written: written_tx,
         progress,
         link,
@@ -499,13 +507,14 @@ enum Report {
 struct Lanes {
     input: Tx<Incoming>,
     output: Receiver<Write>,
+    /// One frame peeked during opportunistic coalescing that could not join the batch.
+    peeked: Option<Write>,
     written: Tx<Written>,
     progress: Tx<WireProgress>,
     link: Arc<Link>,
     heard: Arc<AtomicU64>,
     held: Option<Incoming>,
-    /// Receipts in publication order. At most three per frame, and no frame
-    /// is taken while one is pending.
+    /// Receipts in publication order.
     reports: VecDeque<Report>,
     stalled: Option<Instant>,
 }
@@ -605,11 +614,23 @@ impl Lanes {
         if !self.reports.is_empty() {
             return Ok(None);
         }
+        if let Some(frame) = self.peeked.take() {
+            return Ok(Some(frame));
+        }
         match self.output.try_recv() {
             Ok(frame) => Ok(Some(frame)),
             Err(TryRecvError::Empty) => Ok(None),
             Err(TryRecvError::Disconnected) => Err("output_producer_closed"),
         }
+    }
+
+    /// Opportunistically pops a queued frame for write coalescing without
+    /// treating a disconnected sender as an error before already-taken frames finish.
+    fn pop_coalesce_candidate(&mut self) -> Option<Write> {
+        if let Some(frame) = self.peeked.take() {
+            return Some(frame);
+        }
+        self.output.try_recv().ok()
     }
 
     /// A value waits for room in a lane: the task holds a deadline.
@@ -618,13 +639,17 @@ impl Lanes {
     }
 
     /// Offers the terminal facts once, without waiting: the pending
-    /// receipts, then a failed receipt for the frame in progress and for
+    /// receipts, then a failed receipt for the frame(s) in progress and for
     /// every accepted frame left in the bounded queue. A lane that is full
     /// refuses them, and a frame the core publishes after this pass gets
     /// none: the core gives every frame of a retired transport its one
     /// result when it closes the connection. A failed receipt says the
     /// bytes are not known complete, never that they were rejected.
-    fn finish(mut self, code: &'static str, active: Option<Write>) {
+    fn finish(
+        mut self,
+        code: &'static str,
+        active: impl IntoIterator<Item = Option<(EffectId, ConnectionKey)>>,
+    ) {
         for report in self.reports.drain(..) {
             let published = match report {
                 Report::Written(result) => self.written.try_send(result).is_ok(),
@@ -634,13 +659,14 @@ impl Lanes {
                 break;
             }
         }
-        for frame in active.into_iter().chain(self.output.try_iter()) {
+        for correlation in active
+            .into_iter()
+            .chain(self.peeked.into_iter().map(|frame| frame.correlation))
+            .chain(self.output.try_iter().map(|frame| frame.correlation))
+        {
             if self
                 .written
-                .try_send(Written::Failed {
-                    correlation: frame.correlation,
-                    code,
-                })
+                .try_send(Written::Failed { correlation, code })
                 .is_err()
             {
                 break;
@@ -894,9 +920,11 @@ enum Attempt {
     Blocked,
 }
 
-/// A frame taken from the output lane and its one absolute write budget.
+/// A frame (or coalesced batch of non-expiring frames) taken from the output
+/// lane and its one absolute write budget.
 struct Active {
     frame: Write,
+    batch: Vec<(Option<(EffectId, ConnectionKey)>, usize)>,
     offset: usize,
     deadline: Instant,
     /// Every byte left within the budget; only the receipts remain.
@@ -907,9 +935,18 @@ impl Active {
     fn new(frame: Write) -> Self {
         Self {
             frame,
+            batch: Vec::new(),
             offset: 0,
             deadline: Instant::now() + WRITE_TIMEOUT,
             written: false,
+        }
+    }
+
+    fn correlations(self) -> Vec<Option<(EffectId, ConnectionKey)>> {
+        if self.batch.is_empty() {
+            vec![self.frame.correlation]
+        } else {
+            self.batch.into_iter().map(|(c, _)| c).collect()
         }
     }
 }
@@ -1028,10 +1065,47 @@ impl Task {
         let mut progressed = false;
         for _ in 0..BURST {
             if self.active.is_none() {
-                let Some(frame) = self.lanes.next_frame()? else {
+                let Some(mut frame) = self.lanes.next_frame()? else {
                     break;
                 };
-                self.active = Some(Active::new(frame));
+                let mut batch = Vec::new();
+                #[cfg(test)]
+                let allow_coalesce = !self.control.pause_progress.load(Ordering::Acquire);
+                #[cfg(not(test))]
+                let allow_coalesce = true;
+                if allow_coalesce
+                    && frame.expiry.is_none()
+                    && frame.bytes.len() <= COALESCE_BYTES
+                    && let Some(next) = self.lanes.pop_coalesce_candidate()
+                {
+                    if next.expiry.is_none()
+                        && frame.bytes.len() + next.bytes.len() <= COALESCE_BYTES
+                    {
+                        batch.push((frame.correlation, frame.bytes.len()));
+                        batch.push((next.correlation, next.bytes.len()));
+                        frame.bytes.extend_from_slice(&next.bytes);
+                        frame.correlation = None;
+                        while batch.len() < MAX_COALESCE_FRAMES {
+                            let Some(more) = self.lanes.pop_coalesce_candidate() else {
+                                break;
+                            };
+                            if more.expiry.is_none()
+                                && frame.bytes.len() + more.bytes.len() <= COALESCE_BYTES
+                            {
+                                batch.push((more.correlation, more.bytes.len()));
+                                frame.bytes.extend_from_slice(&more.bytes);
+                            } else {
+                                self.lanes.peeked = Some(more);
+                                break;
+                            }
+                        }
+                    } else {
+                        self.lanes.peeked = Some(next);
+                    }
+                }
+                let mut active = Active::new(frame);
+                active.batch = batch;
+                self.active = Some(active);
                 progressed = true;
             }
             let active = self.active.as_mut().expect("frame taken above");
@@ -1075,23 +1149,34 @@ impl Task {
                     Err(WriteFailure::Failed(code)) => return Err(code),
                 }
             }
-            let frame = &self.active.as_ref().expect("frame written above").frame;
-            let (correlation, bytes) = (frame.correlation, frame.bytes.len());
-            if let Some((effect, connection)) = correlation {
-                // This publication is deliberately separate from Written: the
-                // reactor may retain a core receipt while MQTT receive credit
-                // has already been returned on the wire. A task preempted
-                // between the last byte and this point is handled by bounded
-                // ingress deferral.
-                #[cfg(test)]
-                if self.held_by_test() {
-                    break;
+            let active = self.active.as_ref().expect("frame written above");
+            if active.batch.is_empty() {
+                let (correlation, bytes) = (active.frame.correlation, active.frame.bytes.len());
+                if let Some((effect, connection)) = correlation {
+                    // This publication is deliberately separate from Written: the
+                    // reactor may retain a core receipt while MQTT receive credit
+                    // has already been returned on the wire. A task preempted
+                    // between the last byte and this point is handled by bounded
+                    // ingress deferral.
+                    #[cfg(test)]
+                    if self.held_by_test() {
+                        break;
+                    }
+                    self.lanes
+                        .wire_progress(WireProgress { effect, connection });
                 }
-                self.lanes
-                    .wire_progress(WireProgress { effect, connection });
+                self.lanes.report(Written::Complete { correlation, bytes });
+                self.active = None;
+            } else {
+                let completed = self.active.take().expect("active batch");
+                for (correlation, bytes) in completed.batch {
+                    if let Some((effect, connection)) = correlation {
+                        self.lanes
+                            .wire_progress(WireProgress { effect, connection });
+                    }
+                    self.lanes.report(Written::Complete { correlation, bytes });
+                }
             }
-            self.lanes.report(Written::Complete { correlation, bytes });
-            self.active = None;
             progressed = true;
             self.lanes.flush()?;
         }
@@ -1144,8 +1229,8 @@ impl Driven for Task {
     fn finish(self: Box<Self>, code: &'static str) {
         let task = *self;
         task.control.stop(&task.source.stream, code);
-        task.lanes
-            .finish(code, task.active.map(|active| active.frame));
+        let active = task.active.map(Active::correlations).unwrap_or_default();
+        task.lanes.finish(code, active);
     }
 }
 

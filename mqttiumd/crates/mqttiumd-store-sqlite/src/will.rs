@@ -107,7 +107,7 @@ fn build(
     })
 }
 const SELECT: &str =
-    "SELECT id,session,state,client_id,topic,payload,retain FROM wills ORDER BY id LIMIT 257";
+    "SELECT id,session,state,client_id,topic,payload,retain FROM wills ORDER BY id LIMIT 1025";
 
 pub(super) fn snapshot(
     conn: &Connection,
@@ -187,7 +187,7 @@ pub(super) fn page(
 
 pub(super) fn has_client(conn: &Connection, client: &[u8]) -> Result<bool, Fault> {
     let meta = read_meta(conn)?;
-    let mut statement=conn.prepare_cached("SELECT w.state,w.client_id,length(w.topic),length(w.payload),w.id,w.session,s.opened_by,s.client_id,s.detached_by,w.retain FROM wills w LEFT JOIN sessions s ON s.id=w.session LIMIT 257")?;
+    let mut statement=conn.prepare_cached("SELECT w.state,w.client_id,length(w.topic),length(w.payload),w.id,w.session,s.opened_by,s.client_id,s.detached_by,w.retain FROM wills w LEFT JOIN sessions s ON s.id=w.session LIMIT 1025")?;
     let mut rows = statement.query([])?;
     let mut count = 0usize;
     let mut found = false;
@@ -406,6 +406,8 @@ pub(super) fn end(
 pub(super) fn publish(
     conn: &Connection,
     meta: &mut Meta,
+    caches: &mut StoreCaches,
+    delta: &TxDelta,
     value: &WillPublication,
     payload: Option<&SharedBytes>,
 ) -> Guard<CommitFacts> {
@@ -429,6 +431,7 @@ pub(super) fn publish(
     drop(statement);
     let admit = Admission {
         expiry: None,
+        properties: None,
         operation: value.operation,
         request: None,
         will_source: Some(intent.client_id.as_slice()),
@@ -444,7 +447,15 @@ pub(super) fn publish(
         costs: value.costs,
         targets: value.targets.as_slice(),
     };
-    stage_publication(conn, meta, admit, value.live_retain, payload)?;
+    stage_publication(
+        conn,
+        meta,
+        caches,
+        delta,
+        admit,
+        value.live_retain.as_ref(),
+        payload,
+    )?;
     if conn
         .prepare_cached("DELETE FROM wills WHERE id=?1 AND state=2")?
         .execute([value.will.to_be_bytes().as_slice()])?
@@ -458,13 +469,16 @@ pub(super) fn publish(
     })
 }
 
-/// Large Open receipts are separately bounded before a new receipt is created.
-/// Exhaustion returns unknown, leaving the small reserved fence path available.
-pub(super) fn receipt_capacity(conn: &Connection, canonical: &[u8]) -> Result<bool, Fault> {
-    const MAX_BYTES: u64 = 8 * 1024 * 1024;
+pub(super) fn is_open_will_recipe(canonical: &[u8]) -> bool {
+    canonical.get(6) == Some(&8) && matches!(canonical.get(39), Some(5 | 7))
+}
+
+const MAX_OPEN_RECEIPT_BYTES: u64 = 8 * 1024 * 1024;
+
+fn receipt_capacity_scan(conn: &Connection) -> Result<(usize, u64), Fault> {
     let mut bytes = 0u64;
     let mut rows_count = 0usize;
-    let mut statement = conn.prepare_cached("SELECT length(recipe) FROM operations WHERE substr(recipe,7,1)=x'08' AND substr(recipe,40,1) IN (x'05',x'07') LIMIT 8193")?;
+    let mut statement = conn.prepare_cached("SELECT length(recipe) FROM operations WHERE substr(recipe,7,1)=x'08' AND substr(recipe,40,1) IN (x'05',x'07') LIMIT 65537")?;
     let mut rows = statement.query([])?;
     while let Some(row) = rows.next()? {
         rows_count = rows_count.checked_add(1).ok_or(ReadError::LimitExceeded)?;
@@ -474,13 +488,49 @@ pub(super) fn receipt_capacity(conn: &Connection, canonical: &[u8]) -> Result<bo
         let length: i64 = row.get(0)?;
         let length = u64::try_from(length).map_err(|_| Corrupt)?;
         bytes = bytes.checked_add(length).ok_or(ReadError::LimitExceeded)?;
-        if bytes > MAX_BYTES {
+        if bytes > MAX_OPEN_RECEIPT_BYTES {
             return Err(ReadError::LimitExceeded.into());
         }
     }
-    let is_open = canonical.get(6) == Some(&8) && matches!(canonical.get(39), Some(5 | 7));
-    Ok(!is_open
+    Ok((rows_count, bytes))
+}
+
+/// Large Open receipts are separately bounded before a new receipt is created.
+/// Exhaustion returns unknown, leaving the small reserved fence path available.
+pub(super) fn receipt_capacity(conn: &Connection, canonical: &[u8]) -> Result<bool, Fault> {
+    let (_, bytes) = receipt_capacity_scan(conn)?;
+    Ok(!is_open_will_recipe(canonical)
         || bytes
             .checked_add(canonical.len() as u64)
-            .is_some_and(|n| n <= MAX_BYTES))
+            .is_some_and(|n| n <= MAX_OPEN_RECEIPT_BYTES))
+}
+
+/// Cached variant guarded by `StoreCaches` (`PRAGMA data_version` + staged delta).
+pub(super) fn receipt_capacity_cached(
+    conn: &Connection,
+    canonical: &[u8],
+    caches: &mut StoreCaches,
+    delta: &TxDelta,
+) -> Result<bool, Fault> {
+    let (base_rows, base_bytes) = match caches.open_receipts {
+        Some(pair) => pair,
+        None => {
+            let pair = receipt_capacity_scan(conn)?;
+            caches.open_receipts = Some(pair);
+            pair
+        }
+    };
+    let rows = base_rows
+        .checked_add(delta.open_rows)
+        .ok_or(ReadError::LimitExceeded)?;
+    let bytes = base_bytes
+        .checked_add(delta.open_bytes)
+        .ok_or(ReadError::LimitExceeded)?;
+    if rows > 8192 || bytes > MAX_OPEN_RECEIPT_BYTES {
+        return Err(ReadError::LimitExceeded.into());
+    }
+    Ok(!is_open_will_recipe(canonical)
+        || bytes
+            .checked_add(canonical.len() as u64)
+            .is_some_and(|n| n <= MAX_OPEN_RECEIPT_BYTES))
 }

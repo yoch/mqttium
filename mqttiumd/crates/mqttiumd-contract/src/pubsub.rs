@@ -7,7 +7,7 @@ use crate::packet::{Qos, SharedBytes, TooLarge};
 use alloc::sync::Arc;
 
 pub const MAX_FILTERS: usize = 8;
-pub const MAX_SUBSCRIPTIONS: usize = 128;
+pub const MAX_SUBSCRIPTIONS: usize = 16_384;
 pub const WORK_PAGE_LIMIT: u32 = 8;
 
 /// Immutable bounded filters, cheaply cloned with a validated packet. The
@@ -194,6 +194,7 @@ pub struct WorkItem {
     pub cause: DeliveryCause,
     pub retain: bool,
     pub expiry: Option<crate::message_expiry::MessageExpiry>,
+    pub properties: Option<Arc<crate::properties::PublishProperties>>,
     pub topic: SharedBytes,
     pub payload: SharedBytes,
     pub claim: Option<DeliveryClaim>,

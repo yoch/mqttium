@@ -9,13 +9,13 @@ use crate::ids::{
     StoreIncarnation,
 };
 
-pub const RECEIPT_WINDOW: usize = 1024;
-/// Leaves 512 positions for 128 inbound, 128 outgoing and at most two
-/// lifecycle continuations for each of 128 sessions behind an unresolved hole.
-pub const RECEIPT_DATA_WINDOW: usize = 512;
+pub const RECEIPT_WINDOW: usize = 4_096;
+/// Leaves 512 control positions behind an unresolved hole while widening the
+/// live business receipt window for sustained high-concurrency QoS 1/2 traffic.
+pub const RECEIPT_DATA_WINDOW: usize = 3_584;
 pub const RECEIPT_CONTROL_RESERVE: u64 = 512;
 pub const MAX_RECEIPT_ORIGINS: usize = 64;
-pub const MAX_COLLECTION_ROWS: u16 = 128;
+pub const MAX_COLLECTION_ROWS: u16 = 256;
 pub const RECEIPT_COLLECTION_TRIGGER: usize = 64;
 
 /// One producer's never-reused sequence spaces.
@@ -133,7 +133,8 @@ impl ReceiptClass {
                 | crate::session::SessionAction::Expire { .. }
                 | crate::session::SessionAction::EndWill { .. } => Self::Control,
             },
-            Recipe::ExpiringPublication(_)
+            Recipe::AnnotatedPublication(_)
+            | Recipe::ExpiringPublication(_)
             | Recipe::TimedReplaySubscriptions(_)
             | Recipe::RetainedPublication(_)
             | Recipe::RetainedQos0(_)

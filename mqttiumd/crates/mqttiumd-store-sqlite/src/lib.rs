@@ -62,8 +62,10 @@ mod retained;
 mod schema;
 mod security;
 mod sessions;
+mod snapshot;
 mod will;
 
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{File, OpenOptions, TryLockError};
 use std::path::{Path, PathBuf};
@@ -114,6 +116,70 @@ use codec::{
 
 pub use group::{GroupRefused, MAX_GROUP};
 
+/// Connection-local derived caches, strictly invalidated whenever SQLite's
+/// `PRAGMA data_version` changes (any commit by another connection) or when
+/// this store retires receipts. Freshly opened stores always start empty.
+#[derive(Default)]
+pub(crate) struct StoreCaches {
+    data_version: Option<i64>,
+    pub(crate) work_verified: BTreeSet<SessionId>,
+    pub(crate) witnesses: BTreeMap<ReceiptOrigin, retained::OriginWitness>,
+    pub(crate) open_receipts: Option<(usize, u64)>,
+}
+
+impl StoreCaches {
+    /// Must NOT use `prepare_cached`: SQLite evaluates `PRAGMA data_version`
+    /// at prepare time.
+    pub(crate) fn sync(&mut self, conn: &Connection) -> Result<(), Fault> {
+        let version: i64 = conn.query_row("PRAGMA data_version", [], |row| row.get(0))?;
+        if self.data_version != Some(version) {
+            self.clear();
+            self.data_version = Some(version);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.work_verified.clear();
+        self.witnesses.clear();
+        self.open_receipts = None;
+    }
+
+    pub(crate) fn clear_receipt_caches(&mut self) {
+        self.witnesses.clear();
+        self.open_receipts = None;
+    }
+}
+
+/// Uncommitted receipt-cache updates staged inside an open write transaction
+/// or savepoint; merged into `StoreCaches` only after `COMMIT` succeeds.
+#[derive(Default)]
+pub(crate) struct TxDelta {
+    pub(crate) witnesses: Vec<(ReceiptOrigin, retained::IdentityBounds)>,
+    pub(crate) open_rows: usize,
+    pub(crate) open_bytes: u64,
+}
+
+impl TxDelta {
+    pub(crate) fn extend_from(&mut self, other: Self) {
+        self.witnesses.extend(other.witnesses);
+        self.open_rows = self.open_rows.saturating_add(other.open_rows);
+        self.open_bytes = self.open_bytes.saturating_add(other.open_bytes);
+    }
+
+    pub(crate) fn commit_into(self, caches: &mut StoreCaches) {
+        for (origin, bounds) in self.witnesses {
+            if let Some(witness) = caches.witnesses.get_mut(&origin) {
+                witness.record(bounds);
+            }
+        }
+        if let Some((rows, bytes)) = &mut caches.open_receipts {
+            *rows = rows.saturating_add(self.open_rows);
+            *bytes = bytes.saturating_add(self.open_bytes);
+        }
+    }
+}
+
 /// Compiled statements one connection keeps. The store has fewer distinct
 /// statements than this; each is a few kilobytes.
 const STATEMENT_CACHE: usize = 512;
@@ -122,10 +188,12 @@ pub use policy_transition::{
 };
 pub use schema::{FORMAT, SCHEMA_VERSION};
 pub use security::{SECURE_SCHEMA_VERSION, StoragePolicy};
+pub use snapshot::save_state_atomic;
 
 #[derive(Clone, Copy)]
 struct Admission<'a> {
     expiry: Option<MessageExpiry>,
+    properties: Option<&'a std::sync::Arc<mqttiumd_contract::properties::PublishProperties>>,
     operation: OperationId,
     request: Option<mqttiumd_contract::ids::RequestId>,
     will_source: Option<&'a [u8]>,
@@ -148,6 +216,7 @@ impl<'a> From<&'a AdmitPublication> for Admission<'a> {
     fn from(a: &'a AdmitPublication) -> Self {
         Self {
             expiry: None,
+            properties: None,
             operation: a.operation,
             request: Some(a.request),
             will_source: None,
@@ -169,6 +238,7 @@ impl<'a> From<&'a mqttiumd_contract::retained::RetainedQos0> for Admission<'a> {
     fn from(a: &'a mqttiumd_contract::retained::RetainedQos0) -> Self {
         Self {
             expiry: None,
+            properties: None,
             operation: a.operation,
             request: Some(a.request),
             will_source: None,
@@ -852,16 +922,28 @@ fn discard_completed_publication(conn: &Connection, publication: &[u8]) -> Resul
 fn stage_admission(
     conn: &Connection,
     meta: &mut Meta,
+    caches: &mut StoreCaches,
+    delta: &TxDelta,
     admit: &AdmitPublication,
     payload: Option<&SharedBytes>,
 ) -> Guard<CommitFacts> {
-    stage_publication(conn, meta, Admission::from(admit), None, payload)
+    stage_publication(
+        conn,
+        meta,
+        caches,
+        delta,
+        Admission::from(admit),
+        None,
+        payload,
+    )
 }
 fn stage_publication(
     conn: &Connection,
     meta: &mut Meta,
+    caches: &mut StoreCaches,
+    delta: &TxDelta,
     admit: Admission<'_>,
-    retained_mask: Option<u16>,
+    retained_mask: Option<&mqttiumd_contract::retained::RetainMask>,
     payload: Option<&SharedBytes>,
 ) -> Guard<CommitFacts> {
     let failed = RejectReason::PreconditionFailed;
@@ -936,6 +1018,8 @@ fn stage_publication(
     if retained::identity_was_used(
         conn,
         meta,
+        caches,
+        delta,
         admit.operation,
         admit.publication,
         admit.publication,
@@ -968,10 +1052,22 @@ fn stage_publication(
             if expired { 0 } else { length },
         )?;
     }
+    let props_blob = if let Some(props) = admit.properties {
+        props
+            .check_payload(bytes.as_slice())
+            .map_err(|_| Abort::Refused(failed))?;
+        let mut encoded = Vec::new();
+        props
+            .encode_canonical(&mut encoded)
+            .map_err(|_| Abort::Refused(failed))?;
+        Some(encoded)
+    } else {
+        None
+    };
     let reference_count = if expired { 0 } else { reference_count };
     conn.prepare_cached(
-        "INSERT INTO publications (id, operation, source, qos, retain, payload, topic, expiry_domain, expiry_tick, expiry_interval)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+        "INSERT INTO publications (id, operation, source, qos, retain, payload, topic, expiry_domain, expiry_tick, expiry_interval, properties)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
     )?
     .execute(params![
         publication.as_slice(),
@@ -984,6 +1080,7 @@ fn stage_publication(
         admit.expiry.map(|e| e.observed.domain.to_vec()),
         admit.expiry.map(|e| u64_blob(e.observed.tick).to_vec()),
         admit.expiry.map(|e| i64::from(e.interval)),
+        props_blob.as_deref(),
     ])?;
     // Its bytes are kept while an obligation refers to them, and only then
     // charged. Without a target they are charged and released in this same
@@ -1029,7 +1126,7 @@ fn stage_publication(
             qos_code(target.effective_qos),
             cause_code(target.cause),
             obligation_phase_code(mqttiumd_store_api::ObligationPhase::Pending),
-            i64::from(retained_mask.is_some_and(|mask| mask & (1 << target_index) != 0)),
+            i64::from(retained_mask.is_some_and(|mask| mask.is_set(target_index))),
         ])?;
     }
     if exactly_once {
@@ -1394,7 +1491,13 @@ enum Recognised {
 /// Recognises an operation that was already decided, on `conn` as it
 /// stands: outside any transaction for `apply`, inside the transaction of
 /// its group for a member, which therefore sees the members before it.
-fn recognise(conn: &Connection, command: &Command, canonical: &[u8]) -> Recognised {
+fn recognise(
+    conn: &Connection,
+    command: &Command,
+    canonical: &[u8],
+    caches: &mut StoreCaches,
+    delta: &TxDelta,
+) -> Recognised {
     let settled = |outcome| Recognised::Settled(answered(outcome, false));
     let unknown = Recognised::Settled(UNKNOWN);
     let recipe = command.recipe.get();
@@ -1461,7 +1564,10 @@ fn recognise(conn: &Connection, command: &Command, canonical: &[u8]) -> Recognis
     ) {
         return unknown;
     }
-    if !matches!(will::receipt_capacity(conn, canonical), Ok(true)) {
+    if !matches!(
+        will::receipt_capacity_cached(conn, canonical, caches, delta),
+        Ok(true)
+    ) {
         return unknown;
     }
     Recognised::Absent(phase)
@@ -1473,42 +1579,109 @@ fn recognise(conn: &Connection, command: &Command, canonical: &[u8]) -> Recognis
 fn stage_command(
     conn: &Connection,
     meta: &mut Meta,
+    caches: &mut StoreCaches,
+    group_delta: &TxDelta,
+    member_delta: &mut TxDelta,
     command: &Command,
     canonical: &[u8],
 ) -> Guard<CommitFacts> {
     let recipe = command.recipe.get();
     let payload = command.payload.as_ref();
     let facts = match recipe {
-        Recipe::WillPublication(value) => will::publish(conn, meta, value, payload)?,
-        Recipe::AdmitPublication(admit) => stage_admission(conn, meta, admit, payload)?,
+        Recipe::AnnotatedPublication(annotated) => {
+            let props = Some(&annotated.properties);
+            match annotated.inner.as_ref() {
+                Recipe::AdmitPublication(admit) => {
+                    let mut a = Admission::from(admit);
+                    a.properties = props;
+                    stage_publication(conn, meta, caches, group_delta, a, None, payload)?
+                }
+                Recipe::RetainedPublication(value) => {
+                    let mut a = Admission::from(&value.admission);
+                    a.properties = props;
+                    stage_publication(
+                        conn,
+                        meta,
+                        caches,
+                        group_delta,
+                        a,
+                        Some(&value.retain_targets),
+                        payload,
+                    )?
+                }
+                Recipe::RetainedQos0(value) => {
+                    let mut a = Admission::from(value);
+                    a.properties = props;
+                    stage_publication(
+                        conn,
+                        meta,
+                        caches,
+                        group_delta,
+                        a,
+                        Some(&value.retain_targets),
+                        payload,
+                    )?
+                }
+                Recipe::ExpiringPublication(value) => {
+                    let (mut admit, mask) = match &value.admission {
+                        ExpiringAdmission::Qos12(v) => (
+                            Admission::from(&v.admission),
+                            v.admission.retain.then_some(&v.retain_targets),
+                        ),
+                        ExpiringAdmission::Qos0(v) => (Admission::from(v), Some(&v.retain_targets)),
+                    };
+                    admit.expiry = Some(value.expiry);
+                    admit.properties = props;
+                    stage_publication(conn, meta, caches, group_delta, admit, mask, payload)?
+                }
+                _ => return refused(RejectReason::PreconditionFailed),
+            }
+        }
+        Recipe::WillPublication(value) => {
+            will::publish(conn, meta, caches, group_delta, value, payload)?
+        }
+        Recipe::AdmitPublication(admit) => {
+            stage_admission(conn, meta, caches, group_delta, admit, payload)?
+        }
         Recipe::RetainedPublication(value) => stage_publication(
             conn,
             meta,
+            caches,
+            group_delta,
             Admission::from(&value.admission),
-            Some(value.retain_targets),
+            Some(&value.retain_targets),
             payload,
         )?,
         Recipe::RetainedQos0(value) => stage_publication(
             conn,
             meta,
+            caches,
+            group_delta,
             Admission::from(value),
-            Some(value.retain_targets),
+            Some(&value.retain_targets),
             payload,
         )?,
-        Recipe::ReplaySubscriptions(value) => retained::subscribe(conn, meta, value, None)?,
-        Recipe::TimedReplaySubscriptions(value) => {
-            retained::subscribe(conn, meta, &value.replay, Some(value.observed))?
+        Recipe::ReplaySubscriptions(value) => {
+            retained::subscribe(conn, meta, caches, group_delta, value, None)?
         }
+        Recipe::TimedReplaySubscriptions(value) => retained::subscribe(
+            conn,
+            meta,
+            caches,
+            group_delta,
+            &value.replay,
+            Some(value.observed),
+        )?,
         Recipe::ExpiringPublication(value) => {
             let (mut admit, mask) = match &value.admission {
                 ExpiringAdmission::Qos12(v) => (
                     Admission::from(&v.admission),
-                    v.admission.retain.then_some(v.retain_targets),
+                    v.admission.retain.then_some(&v.retain_targets),
                 ),
-                ExpiringAdmission::Qos0(v) => (Admission::from(v), Some(v.retain_targets)),
+                ExpiringAdmission::Qos0(v) => (Admission::from(v), Some(&v.retain_targets)),
             };
             admit.expiry = Some(value.expiry);
-            stage_publication(conn, meta, admit, mask, payload)?
+            stage_publication(conn, meta, caches, group_delta, admit, mask, payload)?
         }
         Recipe::MarkDeliveryStarted(command) => pubsub::mark_started(conn, meta, command)?,
         Recipe::ExpireDelivery(command) => pubsub::expire(conn, meta, command)?,
@@ -1521,12 +1694,19 @@ fn stage_command(
         Recipe::UpdateSubscriptions(command) => pubsub::updates(conn, meta, command)?,
         Recipe::SessionLifecycle(command) => sessions::stage(conn, meta, command)?,
     };
-    insert_operation(
-        conn,
-        recipe.operation(),
-        canonical,
-        Decision::Committed(facts),
-    )?;
+    let operation = recipe.operation();
+    insert_operation(conn, operation, canonical, Decision::Committed(facts))?;
+    if let Some(bounds) = retained::bounds(recipe)? {
+        member_delta
+            .witnesses
+            .push((ReceiptOrigin::of(operation), bounds));
+    }
+    if will::is_open_will_recipe(canonical) {
+        member_delta.open_rows = member_delta.open_rows.saturating_add(1);
+        member_delta.open_bytes = member_delta
+            .open_bytes
+            .saturating_add(canonical.len() as u64);
+    }
     Ok(facts)
 }
 
@@ -1535,12 +1715,27 @@ fn stage_command(
 fn stage_rejection(
     conn: &Connection,
     meta: &mut Meta,
+    recipe: &Recipe,
     operation: OperationId,
-    recipe: &[u8],
+    canonical: &[u8],
     reason: RejectReason,
+    member_delta: &mut TxDelta,
 ) -> Result<(), Abort<()>> {
     charge(meta, Accounts::RECEIPT).map_err(|_| Abort::Refused(()))?;
-    insert_operation(conn, operation, recipe, Decision::Rejected(reason))?;
+    insert_operation(conn, operation, canonical, Decision::Rejected(reason))?;
+    if recipe.replay_subscriptions().is_some()
+        && let Some(bounds) = retained::bounds(recipe).ok().flatten()
+    {
+        member_delta
+            .witnesses
+            .push((ReceiptOrigin::of(operation), bounds));
+    }
+    if will::is_open_will_recipe(canonical) {
+        member_delta.open_rows = member_delta.open_rows.saturating_add(1);
+        member_delta.open_bytes = member_delta
+            .open_bytes
+            .saturating_add(canonical.len() as u64);
+    }
     Ok(())
 }
 
@@ -1557,16 +1752,21 @@ pub fn writer_lock_path(path: &Path) -> PathBuf {
 /// Takes the writer's lock of the database at `path`, without waiting.
 /// The lock file is created if it is missing and never truncated or
 /// removed.
+pub fn acquire_writer_lock(path: &Path) -> Result<WriterLease, OpenError> {
+    writer_lock(path)
+}
+
 fn writer_lock(path: &Path) -> Result<WriterLease, OpenError> {
+    let lock_path = writer_lock_path(path);
     let file = OpenOptions::new()
         .read(true)
         .write(true)
         .create(true)
         .truncate(false)
-        .open(writer_lock_path(path))
+        .open(&lock_path)
         .map_err(OpenError::WriterLock)?;
     match file.try_lock() {
-        Ok(()) => Ok(WriterLease { file }),
+        Ok(()) => Ok(WriterLease { file, lock_path }),
         Err(TryLockError::WouldBlock) => Err(OpenError::WriterAlive),
         Err(TryLockError::Error(error)) => Err(OpenError::WriterLock(error)),
     }
@@ -1576,8 +1776,18 @@ fn writer_lock(path: &Path) -> Result<WriterLease, OpenError> {
 /// across fork still refers to the same open file description. The logical
 /// owner explicitly releases its lease; a transient child descriptor carries
 /// no authority after that point. This guard always outlives the connection.
-struct WriterLease {
-    file: File,
+#[derive(Debug)]
+pub struct WriterLease {
+    pub(crate) file: File,
+    lock_path: PathBuf,
+}
+
+impl WriterLease {
+    /// Path of the lock file held by this lease.
+    #[must_use]
+    pub fn lock_path(&self) -> &Path {
+        &self.lock_path
+    }
 }
 
 impl Drop for WriterLease {
@@ -1686,6 +1896,7 @@ fn quick_check(conn: &Connection) -> Result<Vec<String>, OpenError> {
 /// The SQLite store. The connection is the only writer of its file.
 pub struct SqliteStore {
     conn: Connection,
+    caches: RefCell<StoreCaches>,
     settings: Settings,
     durability: Durability,
     /// The writer's lock, held while the store lives. Declared last: the
@@ -1875,6 +2086,7 @@ impl SqliteStore {
         read_meta(&conn).map_err(|fault| OpenError::Read(fault.read_error()))?;
         Ok(Self {
             conn,
+            caches: RefCell::new(StoreCaches::default()),
             settings,
             durability: Durability::Available,
             #[cfg(feature = "kill-points")]
@@ -1890,6 +2102,21 @@ impl SqliteStore {
     /// The durable state, with a stable read cause rather than a panic.
     pub fn try_snapshot(&self) -> Result<DurableState, ReadError> {
         self.snapshot()
+    }
+
+    /// Snapshots the entire state and closes SQLite while retaining the
+    /// exclusive writer lease, allowing another engine (such as the volatile
+    /// store) to assume ownership of `path` with no lock gap.
+    pub fn into_state_and_lease(self) -> Result<(DurableState, Settings, WriterLease), OpenError> {
+        let state = self.snapshot().map_err(OpenError::Read)?;
+        let Self {
+            conn,
+            settings,
+            _writer_lock,
+            ..
+        } = self;
+        conn.close().map_err(|(_, error)| OpenError::Sql(error))?;
+        Ok((state, settings, _writer_lock))
     }
 
     /// Sets the function the store calls at each kill point, or removes it.
@@ -1996,6 +2223,7 @@ impl SqliteStore {
         if tx.commit().is_err() {
             return Ok(ReceiptCollectionReply::PendingOrUnknown);
         }
+        self.caches.get_mut().clear_receipt_caches();
         #[cfg(feature = "kill-points")]
         receipt_points::pass(
             &self.receipt_hook,
@@ -2030,6 +2258,7 @@ impl SqliteStore {
         if failing || tx.commit().is_err() {
             return Ok(ClosedReceiptReply::PendingOrUnknown);
         }
+        self.caches.get_mut().clear_receipt_caches();
         Ok(reply)
     }
 
@@ -2107,16 +2336,69 @@ impl SqliteStore {
         }
     }
 
+    /// Runs one write transaction with access to connection caches and staged
+    /// receipt deltas; commits deltas into `caches` only after `COMMIT` succeeds.
+    fn transact_cached<T, E>(
+        &mut self,
+        prepare: impl FnOnce(
+            &Connection,
+            &mut Meta,
+            &mut StoreCaches,
+            &mut TxDelta,
+        ) -> Result<T, Abort<E>>,
+    ) -> Txn<T, E> {
+        let failing = self.durability == Durability::Failing;
+        let caches = self.caches.get_mut();
+        let mut delta = TxDelta::default();
+        let result = (|| {
+            let tx: Transaction<'_> = self
+                .conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(|_| None)?;
+            caches.sync(&tx).map_err(|fault| Some(fault.read_error()))?;
+            let mut meta = read_meta(&tx).map_err(|fault| Some(fault.read_error()))?;
+            let value = match prepare(&tx, &mut meta, caches, &mut delta) {
+                Ok(value) => value,
+                // Dropping the transaction rolls it back.
+                Err(Abort::Refused(refusal)) => return Ok(Err(refusal)),
+                Err(Abort::Read(error)) => return Err(Some(error)),
+                Err(Abort::Fault) => return Err(None),
+            };
+            meta.revision = meta.revision.checked_add(1).ok_or(None)?;
+            write_meta(&tx, &meta).map_err(|_| None)?;
+            // K1 `store.commit.prepared`: every row written, `COMMIT` not
+            // called; the transaction is open.
+            #[cfg(feature = "kill-points")]
+            kill_points::pass(&self.kill_hook, kill_points::KillPoint::CommitPrepared);
+            if failing {
+                return Err(None);
+            }
+            tx.commit().map_err(|_| None)?;
+            Ok(Ok(value))
+        })();
+        match result {
+            Ok(Ok(value)) => {
+                delta.commit_into(caches);
+                Txn::Committed(value)
+            }
+            Ok(Err(refusal)) => Txn::Refused(refusal),
+            Err(Some(error)) => Txn::ReadFailed(error),
+            Err(None) => Txn::NotWritten,
+        }
+    }
+
     /// Records a certain rejection on a receipt that holds a receipt slot.
     /// Without a slot nothing is written and nothing certain announced.
     fn commit_rejection(
         &mut self,
+        recipe: &Recipe,
         operation: OperationId,
-        recipe: &[u8],
+        canonical: &[u8],
         reason: RejectReason,
     ) -> (StoreOutcome, bool) {
-        let written =
-            self.transact(|conn, meta| stage_rejection(conn, meta, operation, recipe, reason));
+        let written = self.transact_cached(|conn, meta, _caches, delta| {
+            stage_rejection(conn, meta, recipe, operation, canonical, reason, delta)
+        });
         match written {
             Txn::Committed(()) => (StoreOutcome::RejectedCertain(reason), true),
             Txn::Refused(()) | Txn::ReadFailed(_) | Txn::NotWritten => {
@@ -2598,15 +2880,32 @@ fn read_snapshot(conn: &Connection, budget: ReadBudget) -> Result<DurableState, 
         let mut publications = BTreeMap::new();
         {
             let mut statement = conn.prepare(
-                "SELECT id, operation, source, topic, qos, retain, payload, retained_version, expiry_domain, expiry_tick, expiry_interval FROM publications",
+                "SELECT id, operation, source, topic, qos, retain, payload, retained_version, expiry_domain, expiry_tick, expiry_interval, properties FROM publications",
             )?;
             let mut rows = statement.query([])?;
+            let max_props = mqttiumd_contract::properties::MAX_PROPERTY_BYTES + 1024;
             while let Some(row) = rows.next()? {
+                let properties =
+                    match reader::optional_blob(row, 11, max_props.min(budget.max_field_bytes))? {
+                        None => None,
+                        Some(raw) => {
+                            let parsed =
+                                mqttiumd_contract::properties::PublishProperties::decode_canonical(
+                                    &raw,
+                                )
+                                .map_err(|_| Fault::Corrupt)?;
+                            if parsed.is_empty() {
+                                return Err(Fault::Corrupt);
+                            }
+                            Some(std::sync::Arc::new(parsed))
+                        }
+                    };
                 publications.insert(
                     PublicationId::from_be_slice(reader::borrow_blob(row, 0, 32)?)
                         .map_err(|_| Fault::Corrupt)?,
                     PublicationRecord {
                         expiry: message_expiry::decode(row, 8)?,
+                        properties,
                         retained_version: reader::optional_blob(row, 7, 32)?
                             .as_deref()
                             .map(PublicationId::from_be_slice)
@@ -2896,15 +3195,17 @@ impl DurableStore for SqliteStore {
 
     fn open_epoch(&mut self, command: &OpenEpoch) -> Result<OpeningOutcome, ReadError> {
         // The decision is the contract's; only an opening writes.
-        if let LedgerOpening::Opens { ledger } = self.read_ledger()?.open(command)
-            && let Txn::ReadFailed(error) = self.transact(|conn, meta| {
+        if let LedgerOpening::Opens { ledger } = self.read_ledger()?.open(command) {
+            match self.transact(|conn, meta| {
                 meta.ledger = ledger;
                 will::recover(conn, meta)?;
                 sessions::expire(conn, meta)?;
                 Ok::<(), Abort<()>>(())
-            })
-        {
-            return Err(error);
+            }) {
+                Txn::ReadFailed(error) => return Err(error),
+                Txn::Committed(()) => self.caches.get_mut().work_verified.clear(),
+                _ => {}
+            }
         }
         // The answer comes from what is durable now.
         Ok(OpeningOutcome::read(&self.read_ledger()?, command))
@@ -2920,22 +3221,39 @@ impl DurableStore for SqliteStore {
                 false,
             );
         }
-        let phase = match recognise(&self.conn, command, &canonical) {
+        if self.caches.get_mut().sync(&self.conn).is_err() {
+            self.caches.get_mut().clear();
+            return UNKNOWN;
+        }
+        let empty_delta = TxDelta::default();
+        let phase = match recognise(
+            &self.conn,
+            command,
+            &canonical,
+            self.caches.get_mut(),
+            &empty_delta,
+        ) {
             Recognised::Settled(applied) => return applied,
             Recognised::Absent(phase) => phase,
         };
         if phase != EpochPhase::Open {
-            let (outcome, wrote) =
-                self.commit_rejection(operation, &canonical, RejectReason::PreconditionFailed);
+            let (outcome, wrote) = self.commit_rejection(
+                recipe,
+                operation,
+                &canonical,
+                RejectReason::PreconditionFailed,
+            );
             return answered(outcome, wrote);
         }
 
         // 2 to 5. Guards, capacities and every row, in one transaction.
-        let written = self.transact(|conn, meta| stage_command(conn, meta, command, &canonical));
+        let written = self.transact_cached(|conn, meta, caches, delta| {
+            stage_command(conn, meta, caches, &empty_delta, delta, command, &canonical)
+        });
         match written {
             Txn::Committed(facts) => committed(facts),
             Txn::Refused(reason) => {
-                let (outcome, wrote) = self.commit_rejection(operation, &canonical, reason);
+                let (outcome, wrote) = self.commit_rejection(recipe, operation, &canonical, reason);
                 answered(outcome, wrote)
             }
             Txn::ReadFailed(_) | Txn::NotWritten => UNKNOWN,
@@ -2985,8 +3303,14 @@ impl DurableStore for SqliteStore {
     }
 
     fn admin(&mut self, command: AdminCommand) -> Result<AdminDone, AdminRefused> {
+        let clears_receipts = matches!(command, AdminCommand::CollectClosedEpochs { .. });
         match self.transact(|conn, meta| stage_admin(conn, meta, command)) {
-            Txn::Committed(done) => Ok(done),
+            Txn::Committed(done) => {
+                if clears_receipts {
+                    self.caches.get_mut().clear_receipt_caches();
+                }
+                Ok(done)
+            }
             Txn::Refused(refusal) => Err(refusal),
             Txn::ReadFailed(_) | Txn::NotWritten => Err(AdminRefused::WriteFailed),
         }
@@ -3049,7 +3373,9 @@ impl DurableStore for SqliteStore {
         limit: usize,
         budget: ReadBudget,
     ) -> Result<WorkPage, ReadError> {
-        pubsub::work(&self.conn, session, after, limit, budget).map_err(|fault| fault.read_error())
+        let mut caches = self.caches.borrow_mut();
+        pubsub::work(&self.conn, &mut caches, session, after, limit, budget)
+            .map_err(|fault| fault.read_error())
     }
 
     fn snapshot_with_budget(&self, budget: ReadBudget) -> Result<DurableState, ReadError> {

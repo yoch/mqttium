@@ -215,3 +215,75 @@ fn invalid_session_state_is_not_silently_filtered_out_of_recovery() {
         Err(RecoveryRefused::Read(ReadError::InvalidData))
     );
 }
+
+#[test]
+fn external_corruption_invalidates_warm_witness_and_work_caches() {
+    let path = fixture("warm-cache-invalidation");
+    let mut store = SqliteStore::open(&path).expect("healthy fixture");
+    let state = store.snapshot().expect("healthy snapshot");
+    let producer = *state
+        .sessions
+        .iter()
+        .find(|(_, session)| session.client_id == b"p1-producer")
+        .expect("producer")
+        .0;
+    let consumer = *state
+        .sessions
+        .iter()
+        .find(|(_, session)| session.client_id == b"p1-b")
+        .expect("consumer")
+        .0;
+    let first = admission_in(
+        state.ledger.last_opened(),
+        state.route_revision,
+        producer,
+        1,
+        7,
+        b"first",
+        &[consumer],
+    );
+    assert!(store.apply(&first).committed_now);
+    // Warm both caches (work_verified + witness/open_receipts).
+    let page = store.read_work(consumer, None, 8).expect("warm work cache");
+    assert_eq!(page.items.as_slice().len(), 1);
+    let second = admission_in(
+        state.ledger.last_opened(),
+        state.route_revision,
+        producer,
+        2,
+        8,
+        b"second",
+        &[consumer],
+    );
+    assert!(store.apply(&second).committed_now);
+
+    // Corrupt an obligations row via an external connection while `store` stays open.
+    change(&path, "UPDATE obligations SET phase = 99");
+    assert_eq!(
+        store.read_work(consumer, None, 8),
+        Err(ReadError::InvalidData),
+        "external modification must invalidate work_verified via PRAGMA data_version"
+    );
+
+    // Restore obligations, corrupt an operations recipe externally, and verify witness cache invalidates.
+    change(
+        &path,
+        "UPDATE obligations SET phase = 1; UPDATE operations SET recipe = zeroblob(7)",
+    );
+    let third = admission_in(
+        state.ledger.last_opened(),
+        state.route_revision,
+        producer,
+        3,
+        9,
+        b"third",
+        &[],
+    );
+    let applied = store.apply(&third);
+    assert_eq!(
+        applied.reply,
+        StoreReply::Outcome(StoreOutcome::PendingOrUnknown),
+        "external operations corruption must invalidate witness cache via PRAGMA data_version"
+    );
+    assert!(!applied.wrote);
+}

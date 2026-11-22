@@ -110,12 +110,7 @@ impl Owner {
     pub fn session_status(&self) -> SessionStatus {
         SessionStatus {
             sessions: self.sessions.len(),
-            bindings: self
-                .sessions
-                .as_slice()
-                .iter()
-                .filter(|s| s.connection.is_some())
-                .count(),
+            bindings: self.session_by_conn.len(),
             retired_flights: self
                 .slots
                 .as_slice()
@@ -130,7 +125,7 @@ impl Owner {
         }
     }
     pub(super) fn session_work_bound(&self, input: &Input) -> u64 {
-        if !matches!(
+        let is_session_input = matches!(
             input,
             Input::OpenSession { .. }
                 | Input::OpenSessionAt { .. }
@@ -139,16 +134,16 @@ impl Owner {
                 | Input::EndSession { .. }
                 | Input::DetachSession { .. }
                 | Input::ExpireSession { .. }
-        ) && !self.lifecycle_enabled
-        {
+        );
+        if !is_session_input && !self.lifecycle_enabled {
             return 0;
         }
-        capacity_of(self.sessions.capacity())
-            .saturating_mul(4)
-            .saturating_add(capacity_of(self.slots.capacity()).saturating_mul(4))
-            .saturating_add(capacity_of(self.routes.capacity()).saturating_mul(2))
-            .saturating_add(capacity_of(self.pubsub.deliveries.capacity()).saturating_mul(4))
-            .saturating_add(capacity_of(self.pubsub.volatile.capacity()).saturating_mul(2))
+        let base = capacity_of(self.sessions.capacity()).min(32);
+        if is_session_input {
+            base.saturating_mul(2)
+        } else {
+            base
+        }
     }
     fn session_flight(
         &self,
@@ -188,7 +183,7 @@ impl Owner {
         will: Option<Option<&crate::contract::will::WillSpec>>,
         draft: &mut Draft,
     ) -> Result<super::Change, Stop> {
-        if self.closed.iter().any(|g| *g == connection) {
+        if self.is_closed(connection) {
             return Ok(super::Change::Nothing);
         }
         if self.lifecycle.is_some() || self.pubsub.control_pending() {
@@ -203,10 +198,9 @@ impl Owner {
             );
         }
         let known = self
-            .sessions
-            .as_slice()
-            .iter()
-            .find(|s| s.client_id == *client_id);
+            .session_by_client
+            .get(client_id)
+            .and_then(|&idx| self.sessions.as_slice().get(idx));
         if now.is_none() && known.is_some_and(|s| matches!(s.expiry, SessionExpiry::After(_))) {
             // An old untimed interface cannot turn an unobserved expiry into
             // a resume, even when the requested replacement policy is Never.
@@ -281,10 +275,9 @@ impl Owner {
         draft: &mut Draft,
     ) -> Result<super::Change, Stop> {
         let Some(session) = self
-            .sessions
-            .as_slice()
-            .iter()
-            .find(|s| s.id == connection.session)
+            .session_by_id
+            .get(&connection.session)
+            .and_then(|&idx| self.sessions.as_slice().get(idx))
         else {
             return Ok(super::Change::Nothing);
         };
@@ -330,10 +323,9 @@ impl Owner {
         draft: &mut Draft,
     ) -> Result<super::Change, Stop> {
         let Some(session) = self
-            .sessions
-            .as_slice()
-            .iter()
-            .find(|s| s.id == connection.session)
+            .session_by_id
+            .get(&connection.session)
+            .and_then(|&idx| self.sessions.as_slice().get(idx))
         else {
             return Ok(super::Change::Nothing);
         };
@@ -372,10 +364,9 @@ impl Owner {
         draft: &mut Draft,
     ) -> Result<super::Change, Stop> {
         let Some(session) = self
-            .sessions
-            .as_slice()
-            .iter()
-            .find(|s| s.id == connection.session)
+            .session_by_id
+            .get(&connection.session)
+            .and_then(|&idx| self.sessions.as_slice().get(idx))
         else {
             return Ok(super::Change::Nothing);
         };
@@ -419,10 +410,9 @@ impl Owner {
         draft: &mut Draft,
     ) -> Result<super::Change, Stop> {
         let Some(session) = self
-            .sessions
-            .as_slice()
-            .iter()
-            .find(|s| s.id == guard.session)
+            .session_by_id
+            .get(&guard.session)
+            .and_then(|&idx| self.sessions.as_slice().get(idx))
         else {
             return Ok(super::Change::Nothing);
         };
@@ -469,10 +459,8 @@ impl Owner {
             return Ok(Some(changed(Change::TransportClosed)));
         }
         let Some(session) = self
-            .sessions
-            .as_slice()
-            .iter()
-            .find(|s| s.connection == Some(connection))
+            .session_of(connection)
+            .and_then(|idx| self.sessions.as_slice().get(idx))
         else {
             return Ok(None);
         };
@@ -920,7 +908,7 @@ impl Owner {
                             self.retire_session(old)?;
                         }
                         let connection = (!flight.connection_closed
-                            && !self.closed.iter().any(|g| *g == flight.connection))
+                            && !self.is_closed(flight.connection))
                         .then_some(flight.connection);
                         let value = Session {
                             id: session,
@@ -935,17 +923,10 @@ impl Owner {
                                 SessionAction::OpenWillAt { .. }
                             ),
                         };
-                        if let Some(index) = self
-                            .sessions
-                            .as_slice()
-                            .iter()
-                            .position(|s| s.id == session)
-                        {
-                            self.sessions.as_mut_slice()[index] = value;
+                        if let Some(&index) = self.session_by_id.get(&session) {
+                            self.replace_session(index, value)?;
                         } else {
-                            self.sessions
-                                .try_push(value)
-                                .map_err(|_| CoreFault::StalePlan)?;
+                            self.push_session(value)?;
                         }
                         self.route_revision = Some(route_revision);
                     }
@@ -954,13 +935,12 @@ impl Owner {
                         expiry,
                         detached,
                     } => {
-                        let held = self
-                            .sessions
-                            .as_mut_slice()
-                            .iter_mut()
-                            .find(|s| s.id == session)
+                        let &index = self
+                            .session_by_id
+                            .get(&session)
                             .ok_or(CoreFault::StalePlan)?;
-                        held.connection = None;
+                        self.set_session_connection(index, None)?;
+                        let held = &mut self.sessions.as_mut_slice()[index];
                         held.expiry = expiry;
                         held.detached = Some(detached);
                     }
@@ -973,49 +953,47 @@ impl Owner {
                         self.route_revision = Some(route_revision);
                     }
                 }
-                remember(&mut self.finished, finished)?;
+                self.remember_finished(finished)?;
                 self.lifecycle = followup;
             }
             Change::Refused { finished, followup } => {
                 self.lifecycle.take().ok_or(CoreFault::StalePlan)?;
-                remember(&mut self.finished, finished)?;
+                self.remember_finished(finished)?;
                 self.lifecycle = followup;
             }
         }
         Ok(())
     }
     fn retire_session(&mut self, session: SessionId) -> Result<(), CoreFault> {
-        if let Some(index) = self
-            .sessions
-            .as_slice()
-            .iter()
-            .position(|s| s.id == session)
-        {
+        if let Some(&index) = self.session_by_id.get(&session) {
             if let Some(generation) = self.sessions.as_slice()[index].connection {
                 self.pubsub.close(generation);
             }
-            let last = self.sessions.len() - 1;
-            self.sessions.as_mut_slice().swap(index, last);
-            let _ = self.sessions.pop();
+            let _ = self.remove_session_at(index)?;
         }
+        let mut removed_route = false;
         let mut index = 0;
         while index < self.routes.len() {
             if self.routes.as_slice()[index].target == session {
                 self.routes.as_mut_slice()[index..].rotate_left(1);
                 let _ = self.routes.pop();
+                removed_route = true;
             } else {
                 index += 1;
             }
         }
-        let mut index = 0;
-        while index < self.slots.len() {
-            if self.slots.as_slice()[index].session != session {
-                index += 1;
-                continue;
-            }
+        if removed_route {
+            self.rebuild_route_index();
+        }
+        let slot_indices: alloc::vec::Vec<usize> = self
+            .slots_by_session
+            .get(&session)
+            .map(|set| set.iter().copied().collect())
+            .unwrap_or_default();
+        // Process in descending index order so swap-removals preserve lower indices.
+        for index in slot_indices.into_iter().rev() {
             if self.slots.as_slice()[index].in_flight().is_some() {
                 self.slots.as_mut_slice()[index].retired = true;
-                index += 1;
                 continue;
             }
             let held = self.slots.as_slice()[index];
@@ -1023,11 +1001,9 @@ impl Owner {
                 return Err(CoreFault::StalePlan);
             }
             if let Some(done) = held.admission {
-                remember(&mut self.finished, done)?;
+                self.remember_finished(done)?;
             }
-            let last = self.slots.len() - 1;
-            self.slots.as_mut_slice().swap(index, last);
-            let _ = self.slots.pop();
+            let _ = self.remove_slot_at(index)?;
         }
         self.pubsub.retire_session(session);
         Ok(())

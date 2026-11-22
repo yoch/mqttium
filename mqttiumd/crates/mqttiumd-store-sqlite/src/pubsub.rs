@@ -551,6 +551,7 @@ pub(super) fn decode_facts(code: i64, bytes: &[u8]) -> Result<CommitFacts, Corru
 
 pub(super) fn work(
     conn: &Connection,
+    caches: &mut StoreCaches,
     session: SessionId,
     after: Option<DeliveryId>,
     limit: usize,
@@ -560,63 +561,72 @@ pub(super) fn work(
         return Err(Fault::Read(ReadError::LimitExceeded));
     }
     let read = conn.unchecked_transaction()?;
+    caches.sync(&read)?;
     let meta = read_meta(&read)?;
-    sessions::validate_metadata(&read, &meta, Some(session))?;
-    message_expiry::validate(&read, Some(session))?;
-    // Check the target's finite metadata domain before either the QoS or
-    // cursor selection can turn an invalid obligation into apparent absence.
-    // SQL inspects scalars only; no offending value or payload is copied.
-    let obligations: i64 = read.query_row(
-        "SELECT count(*) FROM (SELECT 1 FROM obligations WHERE target=?1 LIMIT ?2)",
-        params![
-            session.to_be_bytes().as_slice(),
-            i64::try_from(MAX_RECOVERY_INVENTORY_ROWS + 1).map_err(|_| Fault::Corrupt)?
-        ],
-        |row| row.get(0),
-    )?;
-    if usize::try_from(obligations).map_err(|_| Fault::Corrupt)? > MAX_RECOVERY_INVENTORY_ROWS {
-        return Err(Fault::Read(ReadError::LimitExceeded));
+    let counts_bounded = meta.accounts.references.get() <= MAX_RECOVERY_INVENTORY_ROWS as u64
+        && meta.accounts.exchange_slots.get() <= MAX_RECOVERY_INVENTORY_ROWS as u64;
+    if !(counts_bounded && caches.work_verified.contains(&session)) {
+        sessions::validate_metadata(&read, &meta, Some(session))?;
+        message_expiry::validate(&read, Some(session))?;
+        // Check the target's finite metadata domain before either the QoS or
+        // cursor selection can turn an invalid obligation into apparent absence.
+        // SQL inspects scalars only; no offending value or payload is copied.
+        let obligations: i64 = read
+            .prepare_cached(
+                "SELECT count(*) FROM (SELECT 1 FROM obligations WHERE target=?1 LIMIT ?2)",
+            )?
+            .query_row(
+                params![
+                    session.to_be_bytes().as_slice(),
+                    i64::try_from(MAX_RECOVERY_INVENTORY_ROWS + 1).map_err(|_| Fault::Corrupt)?
+                ],
+                |row| row.get(0),
+            )?;
+        if usize::try_from(obligations).map_err(|_| Fault::Corrupt)? > MAX_RECOVERY_INVENTORY_ROWS {
+            return Err(Fault::Read(ReadError::LimitExceeded));
+        }
+        let invalid: bool = read
+            .prepare_cached(
+                "SELECT EXISTS(SELECT 1 FROM obligations o LEFT JOIN publications p ON p.id=o.publication WHERE o.target=?1 AND (typeof(o.qos)!='integer' OR o.qos NOT IN (0,1,2) OR typeof(o.cause)!='integer' OR o.cause NOT IN (1,2) OR typeof(o.retain)!='integer' OR o.retain NOT IN (0,1) OR typeof(o.phase)!='integer' OR o.phase NOT IN (1,2) OR (o.phase=2 AND o.qos!=2) OR p.id IS NULL OR typeof(p.qos)!='integer' OR p.qos NOT IN (0,1,2) OR (o.retain=1 AND p.retain!=1) OR (o.cause=2 AND (o.retain!=1 OR p.retained_version IS NULL OR p.retained_version=p.id)) OR (o.cause=1 AND p.retained_version IS NOT NULL)) LIMIT 1)",
+            )?
+            .query_row([session.to_be_bytes().as_slice()], |row| row.get(0))?;
+        if invalid {
+            return Err(Fault::Corrupt);
+        }
+        // A missing obligation must not turn an already claimed delivery into a
+        // successful empty scan. Bound the target's claim set before checking it.
+        let claims: i64 = read
+            .prepare_cached(
+                "SELECT count(*) FROM (SELECT 1 FROM outbound WHERE target=?1 LIMIT ?2)",
+            )?
+            .query_row(
+                params![
+                    session.to_be_bytes().as_slice(),
+                    i64::try_from(MAX_RECOVERY_INVENTORY_ROWS + 1).map_err(|_| Fault::Corrupt)?
+                ],
+                |row| row.get(0),
+            )?;
+        if usize::try_from(claims).map_err(|_| Fault::Corrupt)? > MAX_RECOVERY_INVENTORY_ROWS {
+            return Err(Fault::Read(ReadError::LimitExceeded));
+        }
+        let broken: bool = read
+            .prepare_cached(
+                "SELECT EXISTS(SELECT 1 FROM outbound c LEFT JOIN obligations o ON o.publication=c.publication AND o.idx=c.idx WHERE c.target=?1 AND (o.publication IS NULL OR o.target!=c.target OR o.target_revision!=c.target_revision OR o.qos NOT IN (1,2)) LIMIT 1)",
+            )?
+            .query_row([session.to_be_bytes().as_slice()], |row| row.get(0))?;
+        if broken {
+            return Err(Fault::Corrupt);
+        }
+        if counts_bounded {
+            caches.work_verified.insert(session);
+        }
     }
-    let invalid: bool = read.query_row(
-        "SELECT EXISTS(SELECT 1 FROM obligations o LEFT JOIN publications p ON p.id=o.publication WHERE o.target=?1 AND (typeof(o.qos)!='integer' OR o.qos NOT IN (0,1,2) OR typeof(o.cause)!='integer' OR o.cause NOT IN (1,2) OR typeof(o.retain)!='integer' OR o.retain NOT IN (0,1) OR typeof(o.phase)!='integer' OR o.phase NOT IN (1,2) OR (o.phase=2 AND o.qos!=2) OR p.id IS NULL OR typeof(p.qos)!='integer' OR p.qos NOT IN (0,1,2) OR (o.retain=1 AND p.retain!=1) OR (o.cause=2 AND (o.retain!=1 OR p.retained_version IS NULL OR p.retained_version=p.id)) OR (o.cause=1 AND p.retained_version IS NOT NULL)) LIMIT 1)",
-        [session.to_be_bytes().as_slice()],
-        |row| row.get(0),
-    )?;
-    if invalid {
-        return Err(Fault::Corrupt);
-    }
-    // A missing obligation must not turn an already claimed delivery into a
-    // successful empty scan. Bound the target's claim set before checking it.
-    let claims: i64 = read.query_row(
-        "SELECT count(*) FROM (SELECT 1 FROM outbound WHERE target=?1 LIMIT ?2)",
-        params![
-            session.to_be_bytes().as_slice(),
-            i64::try_from(MAX_RECOVERY_INVENTORY_ROWS + 1).map_err(|_| Fault::Corrupt)?
-        ],
-        |row| row.get(0),
-    )?;
-    if usize::try_from(claims).map_err(|_| Fault::Corrupt)? > MAX_RECOVERY_INVENTORY_ROWS {
-        return Err(Fault::Read(ReadError::LimitExceeded));
-    }
-    let broken: bool = read.query_row(
-        "SELECT EXISTS(SELECT 1 FROM outbound c LEFT JOIN obligations o ON o.publication=c.publication AND o.idx=c.idx WHERE c.target=?1 AND (o.publication IS NULL OR o.target!=c.target OR o.target_revision!=c.target_revision OR o.qos NOT IN (1,2)) LIMIT 1)",
-        [session.to_be_bytes().as_slice()], |row| row.get(0),
-    )?;
-    if broken {
-        return Err(Fault::Corrupt);
-    }
-    let sql = "SELECT o.publication,o.idx,o.target_revision,p.topic,y.bytes,c.packet_id,c.claim,c.target,c.target_revision,s.revision,s.state,o.qos,o.retain,p.expiry_domain,p.expiry_tick,p.expiry_interval,c.started,o.cause,o.phase FROM obligations o LEFT JOIN publications p ON p.id=o.publication LEFT JOIN payloads y ON y.id=p.payload LEFT JOIN outbound c ON c.publication=o.publication AND c.idx=o.idx LEFT JOIN sessions s ON s.id=o.target WHERE o.target=?1 AND (?2 IS NULL OR o.publication>?2 OR (o.publication=?2 AND o.idx>?3)) ORDER BY o.publication,o.idx LIMIT ?4";
+    const SQL_FIRST: &str = "SELECT o.publication,o.idx,o.target_revision,p.topic,y.bytes,c.packet_id,c.claim,c.target,c.target_revision,s.revision,s.state,o.qos,o.retain,p.expiry_domain,p.expiry_tick,p.expiry_interval,c.started,o.cause,o.phase,p.properties FROM obligations o LEFT JOIN publications p ON p.id=o.publication LEFT JOIN payloads y ON y.id=p.payload LEFT JOIN outbound c ON c.publication=o.publication AND c.idx=o.idx LEFT JOIN sessions s ON s.id=o.target WHERE o.target=?1 ORDER BY o.publication,o.idx LIMIT ?2";
+    const SQL_AFTER: &str = "SELECT o.publication,o.idx,o.target_revision,p.topic,y.bytes,c.packet_id,c.claim,c.target,c.target_revision,s.revision,s.state,o.qos,o.retain,p.expiry_domain,p.expiry_tick,p.expiry_interval,c.started,o.cause,o.phase,p.properties FROM obligations o LEFT JOIN publications p ON p.id=o.publication LEFT JOIN payloads y ON y.id=p.payload LEFT JOIN outbound c ON c.publication=o.publication AND c.idx=o.idx LEFT JOIN sessions s ON s.id=o.target WHERE o.target=?1 AND (o.publication,o.idx)>(?2,?3) ORDER BY o.publication,o.idx LIMIT ?4";
     let mut items = BoundedVec::with_capacity(limit).map_err(|_| ReadError::AllocationFailed)?;
     let mut meter = reader::Meter::new(budget);
     let mut more = false;
-    {
-        let mut statement = read.prepare(sql)?;
-        let mut rows = statement.query(params![
-            session.to_be_bytes().as_slice(),
-            after.map(|id| id.publication.to_be_bytes().to_vec()),
-            after.map(|id| i64::from(id.index)).unwrap_or(0),
-            i64::try_from(limit + 1).map_err(|_| Fault::Corrupt)?
-        ])?;
+    let mut decode_rows = |mut rows: rusqlite::Rows<'_>| -> Result<(), Fault> {
         while let Some(row) = rows.next()? {
             if items.len() == limit {
                 more = true;
@@ -625,14 +635,41 @@ pub(super) fn work(
             budget.check_field(32)?;
             let topic = reader::borrow_blob(row, 3, meta.limits.max_topic_bytes)?;
             let payload = reader::borrow_blob(row, 4, meta.limits.max_payload_bytes)?;
+            let max_props = mqttiumd_contract::properties::MAX_PROPERTY_BYTES + 1024;
+            let props_raw = match row.get_ref(19)? {
+                rusqlite::types::ValueRef::Null => None,
+                rusqlite::types::ValueRef::Blob(bytes) => {
+                    if bytes.len() > max_props {
+                        return Err(ReadError::LimitExceeded.into());
+                    }
+                    Some(bytes)
+                }
+                _ => return Err(Fault::Corrupt),
+            };
             budget.check_field(topic.len())?;
             budget.check_field(payload.len())?;
+            if let Some(raw) = props_raw {
+                budget.check_field(raw.len())?;
+            }
             meter.charge(
                 256usize
                     .checked_add(topic.len())
                     .and_then(|n| n.checked_add(payload.len()))
+                    .and_then(|n| n.checked_add(props_raw.map_or(0, <[u8]>::len)))
                     .ok_or(ReadError::LimitExceeded)?,
             )?;
+            let properties = match props_raw {
+                None => None,
+                Some(raw) => {
+                    let parsed =
+                        mqttiumd_contract::properties::PublishProperties::decode_canonical(raw)
+                            .map_err(|_| Fault::Corrupt)?;
+                    if parsed.is_empty() {
+                        return Err(Fault::Corrupt);
+                    }
+                    Some(std::sync::Arc::new(parsed))
+                }
+            };
             let delivery = DeliveryId {
                 publication: PublicationId::from_be_slice(reader::borrow_blob(row, 0, 32)?)
                     .map_err(|_| Fault::Corrupt)?,
@@ -688,6 +725,7 @@ pub(super) fn work(
                     qos,
                     cause: crate::codec::code_cause(row.get(17)?)?,
                     expiry,
+                    properties,
                     retain: match row.get::<_, i64>(12)? {
                         0 => false,
                         1 => true,
@@ -701,6 +739,22 @@ pub(super) fn work(
                 })
                 .map_err(|_| ReadError::LimitExceeded)?;
         }
+        Ok(())
+    };
+    let fetch_limit = i64::try_from(limit + 1).map_err(|_| Fault::Corrupt)?;
+    if let Some(after) = after {
+        let mut statement = read.prepare_cached(SQL_AFTER)?;
+        let rows = statement.query(params![
+            session.to_be_bytes().as_slice(),
+            after.publication.to_be_bytes().as_slice(),
+            i64::from(after.index),
+            fetch_limit
+        ])?;
+        decode_rows(rows)?;
+    } else {
+        let mut statement = read.prepare_cached(SQL_FIRST)?;
+        let rows = statement.query(params![session.to_be_bytes().as_slice(), fetch_limit])?;
+        decode_rows(rows)?;
     }
     let next = if more {
         items.as_slice().last().map(|item| item.delivery)

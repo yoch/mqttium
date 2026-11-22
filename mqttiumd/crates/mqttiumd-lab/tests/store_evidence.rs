@@ -1185,7 +1185,7 @@ fn retained_snapshot_preserves_current_ownership_frozen_versions_and_wire_flags(
     let retained = Command {
         recipe: FrozenRecipe::freeze(Recipe::RetainedPublication(RetainedPublication {
             admission,
-            retain_targets: 1,
+            retain_targets: mqttiumd_contract::retained::RetainMask::from_u16(1),
         }))
         .unwrap(),
         payload: legacy.payload,

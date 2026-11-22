@@ -211,6 +211,7 @@ pub(super) fn publish(
     state.stage_publication(
         Admission {
             expiry: None,
+            properties: None,
             operation: value.operation,
             request: None,
             will_source: Some(source_client.as_slice()),
@@ -226,7 +227,7 @@ pub(super) fn publish(
             costs: value.costs,
             targets: value.targets.as_slice(),
         },
-        value.live_retain,
+        value.live_retain.as_ref(),
         payload,
     )?;
     state.wills.remove(&value.will).ok_or(failed)?;

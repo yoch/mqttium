@@ -36,8 +36,8 @@ pub(super) struct Machine {
     parser: Parser,
     output: Option<Encoded>,
     control_pending: Option<Instant>,
-    /// A frame taken from the lane that could not be sealed.
-    unsealed: Option<Write>,
+    /// Frame correlations taken from the lane that could not be sealed.
+    unsealed: Vec<Option<(EffectId, ConnectionKey)>>,
     /// The transport reported its end; the TLS state names the reason.
     eof: bool,
     eof_reported: bool,
@@ -54,7 +54,7 @@ impl Machine {
             parser: Parser::default(),
             output: None,
             control_pending: None,
-            unsealed: None,
+            unsealed: Vec::new(),
             eof: false,
             eof_reported: false,
         }
@@ -113,11 +113,22 @@ fn tls_failure(error: &Error) -> &'static str {
 
 struct Encoded {
     frame: Write,
+    batch: Vec<(Option<(EffectId, ConnectionKey)>, usize)>,
     ciphertext: Vec<u8>,
     offset: usize,
     deadline: Instant,
     #[cfg(feature = "test-hooks")]
     fragment: bool,
+}
+
+impl Encoded {
+    fn correlations(self) -> Vec<Option<(EffectId, ConnectionKey)>> {
+        if self.batch.is_empty() {
+            vec![self.frame.correlation]
+        } else {
+            self.batch.into_iter().map(|(c, _)| c).collect()
+        }
+    }
 }
 
 fn frame_ciphertext(tls: &mut ServerConnection, bytes: &[u8]) -> Result<Vec<u8>, &'static str> {
@@ -318,6 +329,7 @@ impl Task {
             return Ok((None, false));
         };
         let deadline = Instant::now() + WRITE_TIMEOUT;
+        let mut batch = Vec::new();
         if let Some(expiry) = frame.expiry {
             match prepare_expiry(&mut frame.bytes, expiry, self.clock.as_ref()) {
                 Ok(()) => {}
@@ -330,15 +342,45 @@ impl Task {
                 }
                 Err(WriteFailure::Failed(code)) => {
                     // The frame was taken: it is one of the terminal facts.
-                    self.machine.unsealed = Some(frame);
+                    self.machine.unsealed.push(frame.correlation);
                     return Err(code);
                 }
+            }
+        } else if frame.bytes.len() <= RECORD_BODY
+            && let Some(next) = self.lanes.pop_coalesce_candidate()
+        {
+            if next.expiry.is_none() && frame.bytes.len() + next.bytes.len() <= RECORD_BODY {
+                batch.push((frame.correlation, frame.bytes.len()));
+                batch.push((next.correlation, next.bytes.len()));
+                frame.bytes.extend_from_slice(&next.bytes);
+                frame.correlation = None;
+                while batch.len() < MAX_COALESCE_FRAMES {
+                    let Some(more) = self.lanes.pop_coalesce_candidate() else {
+                        break;
+                    };
+                    if more.expiry.is_none() && frame.bytes.len() + more.bytes.len() <= RECORD_BODY
+                    {
+                        batch.push((more.correlation, more.bytes.len()));
+                        frame.bytes.extend_from_slice(&more.bytes);
+                    } else {
+                        self.lanes.peeked = Some(more);
+                        break;
+                    }
+                }
+            } else {
+                self.lanes.peeked = Some(next);
             }
         }
         let ciphertext = match frame_ciphertext(&mut self.state, &frame.bytes) {
             Ok(ciphertext) => ciphertext,
             Err(code) => {
-                self.machine.unsealed = Some(frame);
+                if batch.is_empty() {
+                    self.machine.unsealed.push(frame.correlation);
+                } else {
+                    self.machine
+                        .unsealed
+                        .extend(batch.into_iter().map(|(c, _)| c));
+                }
                 return Err(code);
             }
         };
@@ -361,6 +403,7 @@ impl Task {
         Ok((
             Some(Encoded {
                 frame,
+                batch,
                 ciphertext,
                 offset: 0,
                 deadline,
@@ -445,15 +488,26 @@ impl Task {
             self.observe_boundary("tls.frame.first_bytes", &encoded.frame, count)?;
         }
         if encoded.offset == encoded.ciphertext.len() {
-            if let Some((effect, connection)) = encoded.frame.correlation {
-                self.lanes
-                    .wire_progress(WireProgress { effect, connection });
+            if encoded.batch.is_empty() {
+                if let Some((effect, connection)) = encoded.frame.correlation {
+                    self.lanes
+                        .wire_progress(WireProgress { effect, connection });
+                }
+                self.lanes.report(Written::Complete {
+                    correlation: encoded.frame.correlation,
+                    bytes: encoded.frame.bytes.len(),
+                });
+                *output = None;
+            } else {
+                let completed = output.take().expect("encoded batch");
+                for (correlation, bytes) in completed.batch {
+                    if let Some((effect, connection)) = correlation {
+                        self.lanes
+                            .wire_progress(WireProgress { effect, connection });
+                    }
+                    self.lanes.report(Written::Complete { correlation, bytes });
+                }
             }
-            self.lanes.report(Written::Complete {
-                correlation: encoded.frame.correlation,
-                bytes: encoded.frame.bytes.len(),
-            });
-            *output = None;
         }
         Ok(true)
     }
@@ -558,8 +612,10 @@ impl Driven for Task {
         let active = task
             .machine
             .output
-            .map(|encoded| encoded.frame)
-            .or(task.machine.unsealed);
+            .map(Encoded::correlations)
+            .unwrap_or_default()
+            .into_iter()
+            .chain(task.machine.unsealed);
         task.lanes.finish(code, active);
     }
 }

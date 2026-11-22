@@ -22,19 +22,19 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-pub const MAX_UNAUTHENTICATED: usize = 8;
+pub const MAX_UNAUTHENTICATED: usize = 64;
 pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(2);
 pub const HANDSHAKE_BYTES: usize = 64 * 1024;
 pub const CERT_BYTES: usize = 8 * 1024;
 pub const CHAIN_BYTES: usize = 32 * 1024;
 pub const CHAIN_CERTS: usize = 4;
-pub const TLS_BUFFER_BYTES: usize = 96 * 1024;
+pub const TLS_BUFFER_BYTES: usize = 2 * 1024 * 1024;
 const PEM_BYTES: usize = 48 * 1024;
-const CONFIG_BYTES: usize = 256 * 1024;
-const MAX_PRINCIPALS: usize = 128;
-const MAX_PINS: usize = 256;
-const MAX_CLIENT_IDS: usize = 128;
-const MAX_RULES: usize = 512;
+const CONFIG_BYTES: usize = 4 * 1024 * 1024;
+const MAX_PRINCIPALS: usize = 4_096;
+const MAX_PINS: usize = 4_096;
+const MAX_CLIENT_IDS: usize = 4_096;
+const MAX_RULES: usize = 16_384;
 const FIELD_BYTES: usize = 1024;
 
 #[derive(Clone)]

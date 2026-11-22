@@ -96,9 +96,13 @@ impl Owner {
         if !matches!(input, Input::WillPage { .. }) {
             return 0;
         }
-        capacity_of(self.routes.capacity())
-            .saturating_mul(capacity_of(self.sessions.capacity()).saturating_add(17))
-            .saturating_add(256)
+        let targets = self
+            .limits
+            .map_or(super::routing::MAX_TARGETS as u64, |limits| {
+                u64::from(limits.max_targets).min(super::routing::MAX_TARGETS as u64)
+            })
+            .min(capacity_of(self.routes.capacity()));
+        targets.saturating_mul(16).saturating_add(256)
     }
     pub(super) fn plan_will_discover(&self, draft: &mut Draft) -> Result<super::Change, Stop> {
         if self.wills.read.is_some()
@@ -167,13 +171,14 @@ impl Owner {
         if !self.receipts.control_available() {
             return Ok(defer(WillDeferredReason::ReceiptCapacity));
         }
-        let selected = match super::routing::select_client(
+        let selected = match self.route_index.select_client(
             self.routes.as_slice(),
             self.sessions.as_slice(),
+            &self.session_by_id,
             Some(intent.client_id.as_slice()),
             intent.spec.topic.as_slice(),
             Qos::AtLeastOnce,
-            limits.max_targets.min(16),
+            limits.max_targets.min(super::routing::MAX_TARGETS as u32),
         ) {
             Ok(selected) => selected,
             Err(super::routing::Refusal::Capacity) => return Ok(defer(WillDeferredReason::Fanout)),
@@ -196,11 +201,7 @@ impl Owner {
             draw(&mut draft.counters.payload, PayloadSeq::checked_next)?,
         );
         let mut targets = BoundedVec::with_capacity(selected.len())?;
-        let mut retain_mask = 0u16;
         for (index, target) in selected.iter().enumerate() {
-            if target.rap {
-                retain_mask |= 1 << index;
-            }
             targets
                 .try_push(Target {
                     session: target.session,
@@ -214,6 +215,17 @@ impl Owner {
                 })
                 .map_err(|_| IMPOSSIBLE)?;
         }
+        let live_retain = if intent.spec.retain {
+            let mut iter = selected.iter();
+            Some(
+                crate::contract::retained::RetainMask::from_predicate(selected.len(), |_| {
+                    iter.next().is_some_and(|target| target.rap)
+                })
+                .map_err(|_| IMPOSSIBLE)?,
+            )
+        } else {
+            None
+        };
         let length = PayloadBytes::new(intent.spec.payload.len() as u64);
         let recipe = Recipe::WillPublication(WillPublication {
             operation,
@@ -234,7 +246,7 @@ impl Owner {
                 receipt_slots: ReceiptSlots::new(1),
             },
             targets,
-            live_retain: intent.spec.retain.then_some(retain_mask),
+            live_retain,
         });
         let in_flight =
             self.plan_submission(operation, recipe, Some(intent.spec.payload.clone()), draft)?;

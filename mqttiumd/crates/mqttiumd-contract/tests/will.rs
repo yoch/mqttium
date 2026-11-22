@@ -97,7 +97,7 @@ fn will_open_end_and_publication_have_distinct_strict_roundtrips() {
             raw.extend_from_slice(&[0, 0]);
             let retained = Recipe::decode_canonical(&raw, 16, 1024).unwrap();
             assert!(
-                matches!(&retained, Recipe::WillPublication(value) if value.live_retain == Some(0))
+                matches!(&retained, Recipe::WillPublication(value) if value.live_retain == Some(mqttiumd_contract::retained::RetainMask::EMPTY))
             );
             let mut encoded = vec![];
             retained.encode_canonical(&mut encoded).unwrap();

@@ -329,8 +329,13 @@ pub(super) fn subscribe(
         .client_id
         .clone();
     let mut plans = Vec::new();
+    let reserve = state
+        .retained
+        .len()
+        .saturating_mul(update.changes.len())
+        .min(MAX_REPLAYS);
     plans
-        .try_reserve_exact(MAX_REPLAYS)
+        .try_reserve_exact(reserve)
         .map_err(|_| RejectReason::CapacityExceeded(Resource::References))?;
     for (step, change) in update.changes.as_slice().iter().enumerate() {
         let existed = update.changes.as_slice()[..step]

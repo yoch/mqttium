@@ -48,6 +48,7 @@
 //!   observed.domain:32 observed.tick:8
 //! ```
 
+use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
@@ -76,6 +77,7 @@ const KIND_FINISH_DELIVERY: u8 = 5;
 const KIND_CONSUME_DELIVERY: u8 = 6;
 const KIND_UPDATE_SUBSCRIPTIONS: u8 = 7;
 const KIND_SUBSCRIPTION_OPTIONS: u8 = 9;
+const KIND_ANNOTATED_PUBLICATION: u8 = 23;
 
 /// Why an obligation exists. The cause stays inspectable by the oracle.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -263,9 +265,86 @@ impl PartialEq for UpdateSubscriptions {
 }
 impl Eq for UpdateSubscriptions {}
 
+/// Wraps a publication admission recipe with non-empty MQTT 5 PUBLISH
+/// application properties (ADR 0053, recipe kind 23).
+#[derive(PartialEq, Eq, Debug)]
+pub struct AnnotatedPublication {
+    pub inner: Box<Recipe>,
+    pub properties: Arc<crate::properties::PublishProperties>,
+}
+
+impl AnnotatedPublication {
+    pub(crate) fn check(&self) -> Result<(), RecipeError> {
+        if self.properties.is_empty() {
+            return Err(RecipeError::InvalidField("empty_publish_properties"));
+        }
+        self.properties.check()?;
+        match self.inner.as_ref() {
+            Recipe::AdmitPublication(_)
+            | Recipe::RetainedPublication(_)
+            | Recipe::RetainedQos0(_)
+            | Recipe::ExpiringPublication(_) => self.inner.check(),
+            _ => Err(RecipeError::InvalidField(
+                "annotated_publication_inner_kind",
+            )),
+        }
+    }
+
+    pub(crate) fn encode(&self, out: &mut Vec<u8>) -> Result<(), RecipeError> {
+        let mut props = Vec::new();
+        self.properties.encode_canonical(&mut props)?;
+        let props_len = u32::try_from(props.len())
+            .map_err(|_| RecipeError::InvalidField("publish_properties_size"))?;
+        let mut nested = Vec::new();
+        self.inner.encode_canonical(&mut nested)?;
+        let nested_len = u32::try_from(nested.len())
+            .map_err(|_| RecipeError::InvalidField("annotated_publication_nested_length"))?;
+        out.push(KIND_ANNOTATED_PUBLICATION);
+        out.extend_from_slice(&props_len.to_be_bytes());
+        out.extend_from_slice(&props);
+        out.extend_from_slice(&nested_len.to_be_bytes());
+        out.extend_from_slice(&nested);
+        Ok(())
+    }
+
+    pub(crate) fn decode(
+        reader: &mut Reader<'_>,
+        max_targets: usize,
+        max_topic_len: usize,
+    ) -> Result<Self, RecipeError> {
+        let props_len = usize::try_from(reader.u32()?)
+            .map_err(|_| RecipeError::InvalidField("publish_properties_size"))?;
+        // Bounded canonical properties size: logical bytes + fixed framing overhead.
+        if props_len == 0 || props_len > crate::properties::MAX_PROPERTY_BYTES + 1024 {
+            return Err(RecipeError::InvalidField("publish_properties_size"));
+        }
+        let props_bytes = reader.take(props_len)?;
+        let properties = Arc::new(crate::properties::PublishProperties::decode_canonical(
+            props_bytes,
+        )?);
+        let nested_len = usize::try_from(reader.u32()?)
+            .map_err(|_| RecipeError::InvalidField("annotated_publication_nested_length"))?;
+        let nested = reader.take(nested_len)?;
+        if nested.len() < 7 || !matches!(nested[6], 1 | 10 | 11 | 13 | 20 | 21) {
+            return Err(RecipeError::InvalidField(
+                "annotated_publication_inner_kind",
+            ));
+        }
+        let inner = Box::new(Recipe::decode_canonical(
+            nested,
+            max_targets,
+            max_topic_len,
+        )?);
+        let value = Self { inner, properties };
+        value.check()?;
+        Ok(value)
+    }
+}
+
 /// The closed set of durable recipes of the received perimeter.
 #[derive(PartialEq, Eq, Debug)]
 pub enum Recipe {
+    AnnotatedPublication(AnnotatedPublication),
     WillPublication(crate::will::WillPublication),
     ExpiringPublication(ExpiringPublication),
     TimedReplaySubscriptions(TimedReplaySubscriptions),
@@ -339,6 +418,7 @@ impl Recipe {
     #[must_use]
     pub fn admission(&self) -> Option<&AdmitPublication> {
         match self {
+            Self::AnnotatedPublication(value) => value.inner.admission(),
             Self::AdmitPublication(admission) => Some(admission),
             Self::RetainedPublication(value) => Some(&value.admission),
             Self::ExpiringPublication(ExpiringPublication {
@@ -352,12 +432,29 @@ impl Recipe {
     #[must_use]
     pub fn retained_qos0(&self) -> Option<&crate::retained::RetainedQos0> {
         match self {
+            Self::AnnotatedPublication(value) => value.inner.retained_qos0(),
             Self::RetainedQos0(value) => Some(value),
             Self::ExpiringPublication(ExpiringPublication {
                 admission: ExpiringAdmission::Qos0(value),
                 ..
             }) => Some(value),
             _ => None,
+        }
+    }
+    /// Optional MQTT 5 PUBLISH application properties carried by this recipe.
+    #[must_use]
+    pub fn properties(&self) -> Option<&Arc<crate::properties::PublishProperties>> {
+        match self {
+            Self::AnnotatedPublication(value) => Some(&value.properties),
+            _ => None,
+        }
+    }
+    /// Unwraps an `AnnotatedPublication` envelope to its inner publication recipe.
+    #[must_use]
+    pub fn inner_publication(&self) -> &Self {
+        match self {
+            Self::AnnotatedPublication(value) => value.inner.as_ref(),
+            other => other,
         }
     }
     /// Subscription plus frozen replay, including its timed envelope.
@@ -373,6 +470,7 @@ impl Recipe {
     #[must_use]
     pub fn operation(&self) -> OperationId {
         match self {
+            Self::AnnotatedPublication(value) => value.inner.operation(),
             Self::WillPublication(value) => value.operation,
             Self::ExpiringPublication(value) => match &value.admission {
                 ExpiringAdmission::Qos12(value) => value.admission.operation,
@@ -398,6 +496,7 @@ impl Recipe {
     /// Checks the internal consistency the canonical layout relies on.
     pub fn check(&self) -> Result<(), RecipeError> {
         match self {
+            Self::AnnotatedPublication(value) => value.check(),
             Self::WillPublication(value) => value.check(),
             Self::ExpiringPublication(value) => value.check(),
             Self::TimedReplaySubscriptions(value) => value.check(),
@@ -449,6 +548,7 @@ impl Recipe {
         out.extend_from_slice(MAGIC);
         out.extend_from_slice(&RECIPE_FORMAT.to_be_bytes());
         match self {
+            Self::AnnotatedPublication(value) => value.encode(out)?,
             Self::WillPublication(value) => value.encode(out),
             Self::ExpiringPublication(value) => value.encode(out)?,
             Self::TimedReplaySubscriptions(value) => value.encode(out)?,
@@ -572,11 +672,16 @@ impl Recipe {
             return Err(RecipeError::UnknownFormat(format));
         }
         let recipe = match reader.u8()? {
-            tag @ (17 | 18) => Self::WillPublication(crate::will::WillPublication::decode(
+            KIND_ANNOTATED_PUBLICATION => Self::AnnotatedPublication(AnnotatedPublication::decode(
                 &mut reader,
                 max_targets,
                 max_topic_len,
-                tag == 18,
+            )?),
+            tag @ (17 | 18 | 22) => Self::WillPublication(crate::will::WillPublication::decode(
+                &mut reader,
+                max_targets,
+                max_topic_len,
+                tag,
             )?),
             13 => Self::ExpiringPublication(ExpiringPublication::decode(
                 &mut reader,
@@ -617,7 +722,7 @@ impl Recipe {
                     observed: crate::message_expiry::MessageTime::decode(&mut reader)?,
                 })
             }
-            kind @ (10..=12) => {
+            kind @ (10..=12 | 20 | 21) => {
                 crate::retained::decode(kind, &mut reader.bytes, max_targets, max_topic_len)?
             }
             8 => {
@@ -1266,7 +1371,7 @@ mod tests {
             payload: a.payload,
             costs: a.costs,
             targets: a.targets,
-            retain_targets: 0,
+            retain_targets: crate::retained::RetainMask::EMPTY,
         });
         assert_eq!(
             recipe.check(),
@@ -1284,7 +1389,7 @@ mod tests {
         admit.qos = Qos::AtMostOnce;
         let recipe = Recipe::RetainedPublication(crate::retained::RetainedPublication {
             admission: admit,
-            retain_targets: 0,
+            retain_targets: crate::retained::RetainMask::EMPTY,
         });
         assert_eq!(
             recipe.check(),
@@ -1300,7 +1405,7 @@ mod tests {
         admit.retain = true;
         let recipe = Recipe::RetainedPublication(crate::retained::RetainedPublication {
             admission: admit,
-            retain_targets: 1,
+            retain_targets: crate::retained::RetainMask::from_u16(1),
         });
         let bytes = encode(&recipe);
         assert_eq!(bytes[6], 10);
@@ -1314,8 +1419,154 @@ mod tests {
         let Recipe::RetainedPublication(mut invalid) = recipe else {
             panic!()
         };
-        invalid.retain_targets = 2;
+        invalid.retain_targets = crate::retained::RetainMask::from_u16(2);
         assert!(Recipe::RetainedPublication(invalid).check().is_err());
+    }
+
+    #[test]
+    fn wide_fanout_retained_and_will_recipes_round_trip_canonically() {
+        let count = 200usize;
+        let list: Vec<Target> = (0..count)
+            .map(|i| target(100 + i as u64, i as u32))
+            .collect();
+        let mask = crate::retained::RetainMask::from_predicate(count, |i| i % 3 == 0).unwrap();
+        assert!(mask.is_set(0));
+        assert!(!mask.is_set(1));
+        assert!(mask.is_set(198));
+        let (incarnation, epoch, owner) = scope();
+        let session = SessionId::new(10);
+        let mut targets = BoundedVec::with_capacity(count).unwrap();
+        for t in &list {
+            targets.try_push(*t).unwrap();
+        }
+        let admit = AdmitPublication {
+            operation: OperationId::new(incarnation, epoch, owner, OperationSeq::new(3)),
+            request: RequestId::new(incarnation, epoch, owner, RequestSeq::new(4)),
+            publication: publication(),
+            source: Source {
+                session,
+                session_revision: Revision::new(1),
+                packet_id: InboundPacketId::new(7).unwrap(),
+                exchange: ExchangeId {
+                    session,
+                    generation: ExchangeGeneration::new(1),
+                },
+            },
+            route_revision: Revision::new(1),
+            qos: Qos::AtLeastOnce,
+            retain: true,
+            topic: SharedBytes::copy_from(b"p1/wide", 64).unwrap(),
+            payload: PayloadRef {
+                id: PayloadId::new(incarnation, epoch, owner, PayloadSeq::new(6)),
+                length: PayloadBytes::new(7),
+            },
+            costs: Costs {
+                payload_bytes: PayloadBytes::new(7),
+                references: References::new(count as u64 + 1),
+                exchange_slots: ExchangeSlots::ZERO,
+                receipt_slots: ReceiptSlots::new(1),
+            },
+            targets,
+        };
+        let retained = Recipe::RetainedPublication(crate::retained::RetainedPublication {
+            admission: admit,
+            retain_targets: mask.clone(),
+        });
+        let bytes = encode(&retained);
+        assert_eq!(bytes[6], 20);
+        assert_eq!(
+            Recipe::decode_canonical(&bytes, 1024, 64).unwrap(),
+            retained
+        );
+        // Wide tag with <= 16 targets is noncanonical and must be rejected.
+        let mut small_targets = BoundedVec::with_capacity(1).unwrap();
+        small_targets.try_push(target(2, 0)).unwrap();
+        let small = Recipe::RetainedQos0(crate::retained::RetainedQos0 {
+            operation: OperationId::new(incarnation, epoch, owner, OperationSeq::new(3)),
+            request: RequestId::new(incarnation, epoch, owner, RequestSeq::new(4)),
+            publication: publication(),
+            session,
+            session_revision: Revision::new(1),
+            connection: crate::ids::ConnectionGeneration::new(1),
+            ingress_order: 1,
+            route_revision: Revision::new(1),
+            topic: SharedBytes::copy_from(b"p1/small", 64).unwrap(),
+            payload: PayloadRef {
+                id: PayloadId::new(incarnation, epoch, owner, PayloadSeq::new(6)),
+                length: PayloadBytes::new(7),
+            },
+            costs: Costs {
+                payload_bytes: PayloadBytes::new(7),
+                references: References::new(2),
+                exchange_slots: ExchangeSlots::ZERO,
+                receipt_slots: ReceiptSlots::new(1),
+            },
+            targets: small_targets,
+            retain_targets: crate::retained::RetainMask::from_u16(1),
+        });
+        assert_eq!(encode(&small)[6], 11);
+        let mut wide_q0_targets = BoundedVec::with_capacity(count).unwrap();
+        for t in &list {
+            wide_q0_targets.try_push(*t).unwrap();
+        }
+        let wide_q0 = Recipe::RetainedQos0(crate::retained::RetainedQos0 {
+            operation: OperationId::new(incarnation, epoch, owner, OperationSeq::new(3)),
+            request: RequestId::new(incarnation, epoch, owner, RequestSeq::new(4)),
+            publication: publication(),
+            session,
+            session_revision: Revision::new(1),
+            connection: crate::ids::ConnectionGeneration::new(1),
+            ingress_order: 1,
+            route_revision: Revision::new(1),
+            topic: SharedBytes::copy_from(b"p1/wideq0", 64).unwrap(),
+            payload: PayloadRef {
+                id: PayloadId::new(incarnation, epoch, owner, PayloadSeq::new(6)),
+                length: PayloadBytes::new(7),
+            },
+            costs: Costs {
+                payload_bytes: PayloadBytes::new(7),
+                references: References::new(count as u64 + 1),
+                exchange_slots: ExchangeSlots::ZERO,
+                receipt_slots: ReceiptSlots::new(1),
+            },
+            targets: wide_q0_targets,
+            retain_targets: mask.clone(),
+        });
+        let q0_bytes = encode(&wide_q0);
+        assert_eq!(q0_bytes[6], 21);
+        assert_eq!(
+            Recipe::decode_canonical(&q0_bytes, 1024, 64).unwrap(),
+            wide_q0
+        );
+        let mut will_targets = BoundedVec::with_capacity(count).unwrap();
+        for t in &list {
+            will_targets.try_push(*t).unwrap();
+        }
+        let wide_will = Recipe::WillPublication(crate::will::WillPublication {
+            operation: OperationId::new(incarnation, epoch, owner, OperationSeq::new(3)),
+            will: OperationId::new(incarnation, epoch, owner, OperationSeq::new(1)),
+            publication: publication(),
+            route_revision: Revision::new(1),
+            topic: SharedBytes::copy_from(b"p1/will", 64).unwrap(),
+            payload: PayloadRef {
+                id: PayloadId::new(incarnation, epoch, owner, PayloadSeq::new(6)),
+                length: PayloadBytes::new(7),
+            },
+            costs: Costs {
+                payload_bytes: PayloadBytes::new(7),
+                references: References::new(count as u64 + 1),
+                exchange_slots: ExchangeSlots::ZERO,
+                receipt_slots: ReceiptSlots::new(1),
+            },
+            targets: will_targets,
+            live_retain: Some(mask),
+        });
+        let will_bytes = encode(&wide_will);
+        assert_eq!(will_bytes[6], 22);
+        assert_eq!(
+            Recipe::decode_canonical(&will_bytes, 1024, 64).unwrap(),
+            wide_will
+        );
     }
 
     #[test]

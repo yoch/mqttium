@@ -3711,29 +3711,35 @@ pub fn live_receipt_frontiers_validate_registration_and_bounds<S: DurableStore>(
     make: &dyn Fn(StoreIncarnation, Limits) -> S,
 ) {
     use mqttiumd_contract::receipts::{
-        MAX_RECEIPT_ORIGINS, ReceiptClosure, ReceiptCollection, ReceiptCollectionRefusal,
-        ReceiptCollectionReply, ReceiptOrigin,
+        MAX_COLLECTION_ROWS, MAX_RECEIPT_ORIGINS, RECEIPT_DATA_WINDOW, RECEIPT_WINDOW,
+        ReceiptClosure, ReceiptCollection, ReceiptCollectionRefusal, ReceiptCollectionReply,
+        ReceiptOrigin,
     };
     let mut limits = fixture_limits();
-    limits.receipt_slots = ReceiptSlots::new(2048);
+    limits.receipt_slots = ReceiptSlots::new(RECEIPT_WINDOW as u64 + 1024);
     let mut world = World::with_limits(make, limits);
     let empty = ReceiptClosure::empty(ReceiptOrigin::of(operation_id(world.epoch, 1)));
     let request = |closure, limit| ReceiptCollection { closure, limit };
     assert!(matches!(
-        world.store.collect_receipts(request(empty, 128)),
+        world
+            .store
+            .collect_receipts(request(empty, MAX_COLLECTION_ROWS)),
         Ok(ReceiptCollectionReply::Applied { .. })
     ));
     let before = world.store.snapshot().unwrap();
     for (request, why) in [
         (request(empty, 0), ReceiptCollectionRefusal::LimitExceeded),
-        (request(empty, 129), ReceiptCollectionRefusal::LimitExceeded),
+        (
+            request(empty, MAX_COLLECTION_ROWS + 1),
+            ReceiptCollectionRefusal::LimitExceeded,
+        ),
         (
             request(
                 ReceiptClosure {
-                    through: OperationSeq::new(129),
+                    through: OperationSeq::new(u64::from(MAX_COLLECTION_ROWS) + 1),
                     ..empty
                 },
-                128,
+                MAX_COLLECTION_ROWS,
             ),
             ReceiptCollectionRefusal::LimitExceeded,
         ),
@@ -3743,7 +3749,7 @@ pub fn live_receipt_frontiers_validate_registration_and_bounds<S: DurableStore>(
                     publication_through: PublicationSeq::new(1),
                     ..empty
                 },
-                128,
+                MAX_COLLECTION_ROWS,
             ),
             ReceiptCollectionRefusal::InvalidFrontier,
         ),
@@ -3756,7 +3762,7 @@ pub fn live_receipt_frontiers_validate_registration_and_bounds<S: DurableStore>(
                     },
                     ..empty
                 },
-                128,
+                MAX_COLLECTION_ROWS,
             ),
             ReceiptCollectionRefusal::OriginMismatch,
         ),
@@ -3769,7 +3775,7 @@ pub fn live_receipt_frontiers_validate_registration_and_bounds<S: DurableStore>(
                     },
                     ..empty
                 },
-                128,
+                MAX_COLLECTION_ROWS,
             ),
             ReceiptCollectionRefusal::FutureEpoch,
         ),
@@ -3780,10 +3786,13 @@ pub fn live_receipt_frontiers_validate_registration_and_bounds<S: DurableStore>(
         );
         assert_eq!(world.store.snapshot().unwrap(), before);
     }
-    let far = altered(&world.admission(769, 7, b"p", &[]), |admit| {
-        admit.qos = Qos::AtLeastOnce;
-        admit.costs.exchange_slots = ExchangeSlots::ZERO;
-    });
+    let far = altered(
+        &world.admission(RECEIPT_DATA_WINDOW as u64 + 1, 7, b"p", &[]),
+        |admit| {
+            admit.qos = Qos::AtLeastOnce;
+            admit.costs.exchange_slots = ExchangeSlots::ZERO;
+        },
+    );
     assert_eq!(
         outcome(world.store.apply(&far).reply),
         StoreOutcome::PendingOrUnknown
@@ -3791,7 +3800,7 @@ pub fn live_receipt_frontiers_validate_registration_and_bounds<S: DurableStore>(
     assert_eq!(
         world
             .store
-            .resolve_and_fence(operation_id(world.epoch, 1025))
+            .resolve_and_fence(operation_id(world.epoch, RECEIPT_WINDOW as u64 + 1))
             .outcome,
         StoreOutcome::PendingOrUnknown
     );
@@ -3953,7 +3962,8 @@ pub fn a_maximum_product_subscription_prefix_fits_the_collection_budget<S: Durab
     use mqttiumd_contract::command::UpdateSubscriptions;
     use mqttiumd_contract::pubsub::{GrantedSubscriptionChange, MAX_FILTERS};
     use mqttiumd_contract::receipts::{
-        ReceiptClosure, ReceiptCollection, ReceiptCollectionReply, ReceiptOrigin,
+        MAX_COLLECTION_ROWS, ReceiptClosure, ReceiptCollection, ReceiptCollectionReply,
+        ReceiptOrigin,
     };
     let limits = Limits {
         payload_bytes: PayloadBytes::new(4 * 1024 * 1024),
@@ -3971,7 +3981,7 @@ pub fn a_maximum_product_subscription_prefix_fits_the_collection_budget<S: Durab
     assert!(matches!(
         world.store.collect_receipts(ReceiptCollection {
             closure: empty,
-            limit: 128
+            limit: MAX_COLLECTION_ROWS
         }),
         Ok(ReceiptCollectionReply::Applied { .. })
     ));
@@ -3987,7 +3997,8 @@ pub fn a_maximum_product_subscription_prefix_fits_the_collection_budget<S: Durab
         })
         .collect();
     let mut metered_bytes = 0usize;
-    for sequence in 1..=128 {
+    let count = u64::from(MAX_COLLECTION_ROWS);
+    for sequence in 1..=count {
         let command = Command {
             recipe: FrozenRecipe::freeze(Recipe::UpdateSubscriptions(UpdateSubscriptions {
                 operation: operation_id(world.epoch, sequence),
@@ -4018,24 +4029,24 @@ pub fn a_maximum_product_subscription_prefix_fits_the_collection_budget<S: Durab
         world.route_revision = route_revision;
     }
     assert!(
-        metered_bytes > ReadBudget::PAGE.max_bytes,
-        "the witness must exceed the ordinary page budget"
+        metered_bytes <= ReadBudget::COLLECTION.max_bytes,
+        "the collection witness must fit within the collection budget"
     );
     let before = world.store.snapshot().unwrap();
-    assert_eq!(before.operations.len(), 128);
-    assert_eq!(before.accounts.receipt_slots.get(), 128);
+    assert_eq!(before.operations.len(), usize::from(MAX_COLLECTION_ROWS));
+    assert_eq!(before.accounts.receipt_slots.get(), count);
     let closure = ReceiptClosure {
-        through: OperationSeq::new(128),
+        through: OperationSeq::new(count),
         ..empty
     };
     assert_eq!(
         world.store.collect_receipts(ReceiptCollection {
             closure,
-            limit: 128
+            limit: MAX_COLLECTION_ROWS
         }),
         Ok(ReceiptCollectionReply::Applied {
             closure,
-            removed: 128,
+            removed: MAX_COLLECTION_ROWS,
             retained: 0,
             more: false
         }),
@@ -4350,7 +4361,7 @@ pub fn a_never_started_claim_is_ended_once_by_its_guarded_finish<S: DurableStore
             Recipe::ExpiringPublication(ExpiringPublication {
                 admission: ExpiringAdmission::Qos12(RetainedPublication {
                     admission,
-                    retain_targets: 0,
+                    retain_targets: mqttiumd_contract::retained::RetainMask::EMPTY,
                 }),
                 expiry,
             })

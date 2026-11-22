@@ -1,7 +1,12 @@
-//! A bounded per-destination projection, shared by durable and volatile admission.
+//! Indexed per-destination routing projection, shared by durable and volatile
+//! admission (ADR 0051).
 use super::*;
+use alloc::boxed::Box;
+use alloc::collections::BTreeMap;
+use alloc::vec::Vec;
 
-pub(super) const MAX_TARGETS: usize = 16;
+pub(super) const MAX_TARGETS: usize = 1_024;
+const INLINE_TARGETS: usize = 8;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(super) struct Selected {
@@ -17,96 +22,417 @@ pub(super) enum Refusal {
 }
 #[derive(Debug)]
 pub(super) struct Selection {
-    items: [Option<Selected>; MAX_TARGETS],
+    inline: [Option<Selected>; INLINE_TARGETS],
+    wide: Option<Vec<Selected>>,
     count: usize,
 }
 impl Selection {
+    const fn empty() -> Self {
+        Self {
+            inline: [None; INLINE_TARGETS],
+            wide: None,
+            count: 0,
+        }
+    }
     pub(super) fn len(&self) -> usize {
         self.count
     }
-    pub(super) fn iter(&self) -> impl Iterator<Item = &Selected> {
-        self.items[..self.count].iter().flatten()
-    }
-}
-
-/// The fixed workspace holds one row per configured output destination, never
-/// one row per matching filter. No effect, lease or publication identity has
-/// been reserved when this function refuses the complete selection.
-pub(super) fn select(
-    routes: &[Route],
-    sessions: &[Session],
-    source: SessionId,
-    topic: &[u8],
-    qos: Qos,
-    maximum: u32,
-) -> Result<Selection, Refusal> {
-    let source = sessions
-        .iter()
-        .find(|session| session.id == source)
-        .map(|session| session.client_id.as_slice());
-    select_client(routes, sessions, source, topic, qos, maximum)
-}
-
-/// A Will retains the producer ClientID independently of the old incarnation.
-pub(super) fn select_client(
-    routes: &[Route],
-    sessions: &[Session],
-    source: Option<&[u8]>,
-    topic: &[u8],
-    qos: Qos,
-    maximum: u32,
-) -> Result<Selection, Refusal> {
-    let mut selected = Selection {
-        items: [None; MAX_TARGETS],
-        count: 0,
-    };
-    if routes.len() > crate::contract::pubsub::MAX_SUBSCRIPTIONS {
-        return Err(Refusal::Capacity);
-    }
-    let limit = usize::try_from(maximum)
-        .unwrap_or(usize::MAX)
-        .min(MAX_TARGETS);
-    for route in routes {
-        if !crate::contract::topic::matches(route.topic.as_slice(), topic) {
-            continue;
+    pub(super) fn iter(&self) -> SelectionIter<'_> {
+        match &self.wide {
+            Some(items) => SelectionIter::Wide(items.iter()),
+            None => SelectionIter::Inline(self.inline[..self.count].iter()),
         }
-        let Some(target_session) = sessions
-            .iter()
-            .find(|s| s.id == route.target && s.revision == route.target_revision)
-        else {
-            return Err(Refusal::Revision);
-        };
-        // No Local removes this contribution before QoS aggregation; another
-        // eligible filter on the same session can still contribute.
-        if route.options.no_local() && source == Some(target_session.client_id.as_slice()) {
-            continue;
-        }
-        let effective = route.max_qos.min(qos);
-        if let Some(held) = selected.items[..selected.count]
-            .iter_mut()
-            .flatten()
-            .find(|held| held.session == route.target)
-        {
-            if held.revision != route.target_revision {
-                return Err(Refusal::Revision);
-            }
-            held.qos = held.qos.max(effective);
-            held.rap |= route.options.retain_as_published();
+    }
+    fn push(&mut self, item: Selected) {
+        if let Some(items) = &mut self.wide {
+            items.push(item);
+            self.count = items.len();
+        } else if self.count < INLINE_TARGETS {
+            self.inline[self.count] = Some(item);
+            self.count += 1;
         } else {
-            if selected.count == limit {
-                return Err(Refusal::Capacity);
+            let mut items = Vec::with_capacity(INLINE_TARGETS * 2);
+            for existing in self.inline.into_iter().flatten() {
+                items.push(existing);
             }
-            selected.items[selected.count] = Some(Selected {
-                session: route.target,
-                revision: route.target_revision,
-                qos: effective,
-                rap: route.options.retain_as_published(),
-            });
-            selected.count += 1;
+            items.push(item);
+            self.count = items.len();
+            self.wide = Some(items);
         }
     }
-    selected.items[..selected.count].sort_unstable_by_key(|item| item.map(|target| target.session));
-    Ok(selected)
+    fn sort_canonical(&mut self) {
+        if self.count <= 1 {
+            return;
+        }
+        if let Some(items) = &mut self.wide {
+            items.sort_unstable_by_key(|item| item.session);
+        } else {
+            self.inline[..self.count]
+                .sort_unstable_by_key(|item| item.map(|target| target.session));
+        }
+    }
+}
+
+pub(super) enum SelectionIter<'a> {
+    Inline(core::slice::Iter<'a, Option<Selected>>),
+    Wide(core::slice::Iter<'a, Selected>),
+}
+
+impl<'a> Iterator for SelectionIter<'a> {
+    type Item = &'a Selected;
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::Inline(iter) => loop {
+                match iter.next()? {
+                    Some(item) => return Some(item),
+                    None => continue,
+                }
+            },
+            Self::Wide(iter) => iter.next(),
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct TrieNode {
+    children: BTreeMap<Box<[u8]>, TrieNode>,
+    plus: Option<Box<TrieNode>>,
+    terminal: Vec<usize>,
+    multi_wildcard: Vec<usize>,
+}
+
+impl TrieNode {
+    fn insert(&mut self, filter: &[u8], route_idx: usize) {
+        let mut node = self;
+        for level in filter.split(|&b| b == b'/') {
+            if level == b"#" {
+                node.multi_wildcard.push(route_idx);
+                return;
+            } else if level == b"+" {
+                node = node
+                    .plus
+                    .get_or_insert_with(|| Box::new(TrieNode::default()));
+            } else {
+                if !node.children.contains_key(level) {
+                    node.children.insert(Box::from(level), TrieNode::default());
+                }
+                node = node.children.get_mut(level).expect("inserted");
+            }
+        }
+        node.terminal.push(route_idx);
+    }
+
+    fn visit<'a, F>(&'a self, levels: &[&[u8]], depth: usize, dollar_topic: bool, f: &mut F)
+    where
+        F: FnMut(&'a [usize]),
+    {
+        if !(depth == 0 && dollar_topic) && !self.multi_wildcard.is_empty() {
+            f(&self.multi_wildcard);
+        }
+        if depth == levels.len() {
+            if !self.terminal.is_empty() {
+                f(&self.terminal);
+            }
+            return;
+        }
+        let level = levels[depth];
+        if let Some(child) = self.children.get(level) {
+            child.visit(levels, depth + 1, dollar_topic, f);
+        }
+        if !(depth == 0 && dollar_topic)
+            && let Some(plus) = &self.plus
+        {
+            plus.visit(levels, depth + 1, dollar_topic, f);
+        }
+    }
+}
+
+/// Deterministic exact-map + wildcard trie pointing at indices in `Owner::routes`.
+#[derive(Debug, Default)]
+pub(super) struct RouteIndex {
+    exact: BTreeMap<SharedBytes, Vec<usize>>,
+    wildcard: TrieNode,
+    wildcard_count: usize,
+    total: usize,
+}
+
+impl RouteIndex {
+    pub(super) fn clear(&mut self) {
+        self.exact.clear();
+        self.wildcard = TrieNode::default();
+        self.wildcard_count = 0;
+        self.total = 0;
+    }
+
+    pub(super) fn has_wildcards(&self) -> bool {
+        self.wildcard_count > 0
+    }
+
+    pub(super) fn insert(&mut self, index: usize, route: &Route) {
+        let bytes = route.topic.as_slice();
+        if bytes.contains(&b'+') || bytes.contains(&b'#') {
+            self.wildcard.insert(bytes, index);
+            self.wildcard_count += 1;
+        } else {
+            self.exact
+                .entry(route.topic.clone())
+                .or_default()
+                .push(index);
+        }
+        self.total += 1;
+    }
+
+    pub(super) fn rebuild(&mut self, routes: &[Route]) {
+        self.clear();
+        for (index, route) in routes.iter().enumerate() {
+            self.insert(index, route);
+        }
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "shared indexed selector accepts read-only owner tables without cloning"
+    )]
+    pub(super) fn select(
+        &self,
+        routes: &[Route],
+        sessions: &[Session],
+        session_by_id: &BTreeMap<SessionId, usize>,
+        source: SessionId,
+        topic: &[u8],
+        qos: Qos,
+        maximum: u32,
+    ) -> Result<Selection, Refusal> {
+        let client = session_by_id
+            .get(&source)
+            .and_then(|&idx| sessions.get(idx))
+            .map(|session| session.client_id.as_slice());
+        self.select_client(routes, sessions, session_by_id, client, topic, qos, maximum)
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "shared indexed selector accepts read-only owner tables without cloning"
+    )]
+    pub(super) fn select_client(
+        &self,
+        routes: &[Route],
+        sessions: &[Session],
+        session_by_id: &BTreeMap<SessionId, usize>,
+        source: Option<&[u8]>,
+        topic: &[u8],
+        qos: Qos,
+        maximum: u32,
+    ) -> Result<Selection, Refusal> {
+        if routes.len() > crate::contract::pubsub::MAX_SUBSCRIPTIONS {
+            return Err(Refusal::Capacity);
+        }
+        let limit = usize::try_from(maximum)
+            .unwrap_or(usize::MAX)
+            .min(MAX_TARGETS);
+        let mut selected = Selection::empty();
+        let mut wide_positions: Option<BTreeMap<SessionId, usize>> = None;
+        let mut refusal: Option<Refusal> = None;
+
+        let mut apply_bucket = |indices: &[usize]| {
+            if refusal.is_some() {
+                return;
+            }
+            for &route_idx in indices {
+                let Some(route) = routes.get(route_idx) else {
+                    refusal = Some(Refusal::Revision);
+                    return;
+                };
+                let Some(target_session) = session_by_id
+                    .get(&route.target)
+                    .and_then(|&idx| sessions.get(idx))
+                    .filter(|s| s.id == route.target && s.revision == route.target_revision)
+                else {
+                    refusal = Some(Refusal::Revision);
+                    return;
+                };
+                if route.options.no_local() && source == Some(target_session.client_id.as_slice()) {
+                    continue;
+                }
+                let effective = route.max_qos.min(qos);
+                let existing = if let Some(positions) = &wide_positions {
+                    positions.get(&route.target).copied()
+                } else {
+                    selected.inline[..selected.count]
+                        .iter()
+                        .position(|item| item.is_some_and(|h| h.session == route.target))
+                };
+                if let Some(pos) = existing {
+                    let held = match &mut selected.wide {
+                        Some(items) => &mut items[pos],
+                        None => selected.inline[pos].as_mut().expect("present"),
+                    };
+                    if held.revision != route.target_revision {
+                        refusal = Some(Refusal::Revision);
+                        return;
+                    }
+                    held.qos = held.qos.max(effective);
+                    held.rap |= route.options.retain_as_published();
+                } else {
+                    if selected.count == limit {
+                        refusal = Some(Refusal::Capacity);
+                        return;
+                    }
+                    let pos = selected.count;
+                    if pos == INLINE_TARGETS && wide_positions.is_none() {
+                        let mut map = BTreeMap::new();
+                        for (i, item) in selected.inline.iter().enumerate() {
+                            if let Some(entry) = item {
+                                map.insert(entry.session, i);
+                            }
+                        }
+                        wide_positions = Some(map);
+                    }
+                    selected.push(Selected {
+                        session: route.target,
+                        revision: route.target_revision,
+                        qos: effective,
+                        rap: route.options.retain_as_published(),
+                    });
+                    if let Some(map) = &mut wide_positions {
+                        map.insert(route.target, pos);
+                    }
+                }
+            }
+        };
+
+        if let Some(exact_indices) = self.exact.get(topic) {
+            apply_bucket(exact_indices);
+        }
+        if self.wildcard_count > 0 {
+            let mut stack_levels: [&[u8]; 32] = [&[]; 32];
+            let mut level_count = 0usize;
+            let mut overflow_levels: Option<Vec<&[u8]>> = None;
+            for seg in topic.split(|&b| b == b'/') {
+                if let Some(v) = &mut overflow_levels {
+                    v.push(seg);
+                } else if level_count < stack_levels.len() {
+                    stack_levels[level_count] = seg;
+                    level_count += 1;
+                } else {
+                    let mut v = Vec::with_capacity(64);
+                    v.extend_from_slice(&stack_levels);
+                    v.push(seg);
+                    overflow_levels = Some(v);
+                }
+            }
+            let levels = match &overflow_levels {
+                Some(v) => v.as_slice(),
+                None => &stack_levels[..level_count],
+            };
+            let dollar_topic = topic.starts_with(b"$");
+            self.wildcard
+                .visit(levels, 0, dollar_topic, &mut apply_bucket);
+        }
+        if let Some(err) = refusal {
+            return Err(err);
+        }
+        selected.sort_canonical();
+        Ok(selected)
+    }
+}
+
+#[cfg(test)]
+mod reference {
+    use super::*;
+
+    /// Linear reference selector kept for tests and differential verification.
+    pub(super) fn select(
+        routes: &[Route],
+        sessions: &[Session],
+        source: SessionId,
+        topic: &[u8],
+        qos: Qos,
+        maximum: u32,
+    ) -> Result<Selection, Refusal> {
+        let source = sessions
+            .iter()
+            .find(|session| session.id == source)
+            .map(|session| session.client_id.as_slice());
+        select_client(routes, sessions, source, topic, qos, maximum)
+    }
+
+    /// Linear reference selector kept for tests and differential verification.
+    pub(super) fn select_client(
+        routes: &[Route],
+        sessions: &[Session],
+        source: Option<&[u8]>,
+        topic: &[u8],
+        qos: Qos,
+        maximum: u32,
+    ) -> Result<Selection, Refusal> {
+        let mut selected = Selection::empty();
+        let mut wide_positions: Option<BTreeMap<SessionId, usize>> = None;
+        if routes.len() > crate::contract::pubsub::MAX_SUBSCRIPTIONS {
+            return Err(Refusal::Capacity);
+        }
+        let limit = usize::try_from(maximum)
+            .unwrap_or(usize::MAX)
+            .min(MAX_TARGETS);
+        for route in routes {
+            if !crate::contract::topic::matches(route.topic.as_slice(), topic) {
+                continue;
+            }
+            let Some(target_session) = sessions
+                .iter()
+                .find(|s| s.id == route.target && s.revision == route.target_revision)
+            else {
+                return Err(Refusal::Revision);
+            };
+            if route.options.no_local() && source == Some(target_session.client_id.as_slice()) {
+                continue;
+            }
+            let effective = route.max_qos.min(qos);
+            let existing = if let Some(positions) = &wide_positions {
+                positions.get(&route.target).copied()
+            } else {
+                selected.inline[..selected.count]
+                    .iter()
+                    .position(|item| item.is_some_and(|h| h.session == route.target))
+            };
+            if let Some(pos) = existing {
+                let held = match &mut selected.wide {
+                    Some(items) => &mut items[pos],
+                    None => selected.inline[pos].as_mut().expect("present"),
+                };
+                if held.revision != route.target_revision {
+                    return Err(Refusal::Revision);
+                }
+                held.qos = held.qos.max(effective);
+                held.rap |= route.options.retain_as_published();
+            } else {
+                if selected.count == limit {
+                    return Err(Refusal::Capacity);
+                }
+                let pos = selected.count;
+                if pos == INLINE_TARGETS && wide_positions.is_none() {
+                    let mut map = BTreeMap::new();
+                    for (i, item) in selected.inline.iter().enumerate() {
+                        if let Some(entry) = item {
+                            map.insert(entry.session, i);
+                        }
+                    }
+                    wide_positions = Some(map);
+                }
+                selected.push(Selected {
+                    session: route.target,
+                    revision: route.target_revision,
+                    qos: effective,
+                    rap: route.options.retain_as_published(),
+                });
+                if let Some(map) = &mut wide_positions {
+                    map.insert(route.target, pos);
+                }
+            }
+        }
+        selected.sort_canonical();
+        Ok(selected)
+    }
 }
 
 impl Owner {
@@ -125,31 +451,38 @@ impl Owner {
         // into the additional bounded selection work, as for pub/sub work.
         if !self.lifecycle_enabled
             && self.pubsub.connections.is_empty()
-            && self.routes.as_slice().iter().all(|route| {
-                !route.topic.as_slice().contains(&b'+')
-                    && !route.topic.as_slice().contains(&b'#')
-                    && route.options == crate::contract::pubsub::SubscriptionOptions::DEFAULT
-            })
+            && !self.route_index.has_wildcards()
+            && self
+                .routes
+                .as_slice()
+                .iter()
+                .all(|route| route.options == crate::contract::pubsub::SubscriptionOptions::DEFAULT)
         {
             return 0;
         }
-        // Per route: matcher invocation, at most one bounded session scan and
-        // one 16-entry aggregate scan. The constant square also bounds sorting
-        // the fixed output table. Topic byte lengths have separate read limits.
+        // Indexed exact lookup plus optional bounded wildcard trie walk,
+        // per-target O(log S) session verification and O(T log T) canonical
+        // sort (ADR 0051).
         let targets = self
             .limits
             .map_or(0, |limits| {
                 u64::from(limits.max_targets).min(MAX_TARGETS as u64)
             })
             .min(capacity_of(self.routes.capacity()));
-        capacity_of(self.routes.capacity())
-            .saturating_mul(capacity_of(self.sessions.capacity()).saturating_add(targets + 1))
-            .saturating_add(targets.saturating_mul(targets))
+        let per_target = if self.route_index.has_wildcards() {
+            16
+        } else {
+            8
+        };
+        targets
+            .saturating_mul(per_target)
+            .saturating_add(capacity_of(self.routes.capacity()).min(16))
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use super::reference::select;
     use super::*;
     use crate::contract::effects::SubmitResult;
     use crate::contract::pubsub::SubscriptionOptions;
@@ -482,6 +815,7 @@ mod tests {
             ingress_order: order,
             packet: InboundPacket::Publish {
                 expiry: None,
+                properties: None,
                 qos,
                 topic: bytes(b"a/x"),
                 payload: bytes(b"payload"),
@@ -917,5 +1251,162 @@ mod tests {
             assert!(selected.rap, "live_overlap_lost_retain_as_published");
             assert_eq!(selected.qos, Qos::AtLeastOnce);
         }
+    }
+
+    #[test]
+    fn route_index_matches_linear_reference_across_wildcards_options_and_revisions() {
+        let filters: &[&[u8]] = &[
+            b"a",
+            b"a/b",
+            b"a/b/c",
+            b"a/#",
+            b"a/+",
+            b"a/+/c",
+            b"+/+",
+            b"a/+/",
+            b"a/+/#",
+            b"#",
+            b"+",
+            b"/#",
+            b"+/x",
+            b"$SYS/#",
+            b"$SYS/broker/+",
+            b"$SYS/broker/load",
+            "温度/+/é".as_bytes(),
+            "é/#".as_bytes(),
+        ];
+        let topics: &[&[u8]] = &[
+            b"a",
+            b"a/",
+            b"a/b",
+            b"a/b/c",
+            b"a//",
+            b"a/x",
+            b"a/x/c",
+            b"a/x/y",
+            b"/",
+            b"/a",
+            b"x/y",
+            b"$SYS",
+            b"$SYS/",
+            b"$SYS/x",
+            b"$SYS/broker/load",
+            b"$SYS/broker/other",
+            "温度//é".as_bytes(),
+            "e/x".as_bytes(),
+            b"A",
+        ];
+        let mut sessions = Vec::new();
+        let mut session_by_id = BTreeMap::new();
+        for id in 1..=20u64 {
+            session_by_id.insert(SessionId::new(id), sessions.len());
+            sessions.push(session(id));
+        }
+        let mut routes = Vec::new();
+        for (i, filter) in filters.iter().enumerate() {
+            let sid = (i as u64 % 16) + 1;
+            let qos = match i % 3 {
+                0 => Qos::AtMostOnce,
+                1 => Qos::AtLeastOnce,
+                _ => Qos::ExactlyOnce,
+            };
+            let bits = match i % 4 {
+                0 => 0,
+                1 => 4,
+                2 => 8,
+                _ => 12,
+            };
+            let mut r = route(filter, sid, qos, false);
+            r.options = SubscriptionOptions::from_bits(bits).unwrap();
+            routes.push(r);
+            // Add overlapping route on same session with different filter/options
+            let mut overlap = route(b"a/#", sid, Qos::AtLeastOnce, i % 2 == 0);
+            overlap.options =
+                SubscriptionOptions::from_bits(if i % 3 == 0 { 8 } else { 0 }).unwrap();
+            routes.push(overlap);
+        }
+        let mut index = RouteIndex::default();
+        index.rebuild(&routes);
+        for &topic in topics {
+            for qos in [Qos::AtMostOnce, Qos::AtLeastOnce, Qos::ExactlyOnce] {
+                for source in [SessionId::new(1), SessionId::new(2), SessionId::new(19)] {
+                    for limit in [1u32, 4, 8, 16, 64] {
+                        let expected = select(&routes, &sessions, source, topic, qos, limit)
+                            .map(|sel| sel.iter().copied().collect::<Vec<_>>());
+                        let actual = index
+                            .select(
+                                &routes,
+                                &sessions,
+                                &session_by_id,
+                                source,
+                                topic,
+                                qos,
+                                limit,
+                            )
+                            .map(|sel| sel.iter().copied().collect::<Vec<_>>());
+                        assert_eq!(
+                            actual,
+                            expected,
+                            "route_index_mismatch topic={:?} qos={qos:?} source={source:?} limit={limit}",
+                            core::str::from_utf8(topic)
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn wide_fanout_1024_targets_selects_in_canonical_order() {
+        let count = MAX_TARGETS;
+        let mut sessions = Vec::with_capacity(count);
+        let mut session_by_id = BTreeMap::new();
+        let mut routes = Vec::with_capacity(count);
+        for i in (1..=count as u64).rev() {
+            session_by_id.insert(SessionId::new(i), sessions.len());
+            sessions.push(session(i));
+            let filter: &[u8] = if i % 2 == 0 {
+                b"fanout/topic"
+            } else {
+                b"fanout/+"
+            };
+            let mut r = route(filter, i, Qos::AtLeastOnce, false);
+            if i % 3 == 0 {
+                r.options = SubscriptionOptions::from_bits(8).unwrap();
+            }
+            routes.push(r);
+        }
+        let mut index = RouteIndex::default();
+        index.rebuild(&routes);
+        let selected = index
+            .select(
+                &routes,
+                &sessions,
+                &session_by_id,
+                SessionId::new(9999),
+                b"fanout/topic",
+                Qos::AtLeastOnce,
+                MAX_TARGETS as u32,
+            )
+            .unwrap();
+        assert_eq!(selected.len(), MAX_TARGETS);
+        let ids: Vec<u64> = selected.iter().map(|s| s.session.get()).collect();
+        let expected: Vec<u64> = (1..=count as u64).collect();
+        assert_eq!(ids, expected);
+        // Exceeding limit by 1 refuses cleanly without truncation.
+        assert_eq!(
+            index
+                .select(
+                    &routes,
+                    &sessions,
+                    &session_by_id,
+                    SessionId::new(9999),
+                    b"fanout/topic",
+                    Qos::AtLeastOnce,
+                    (MAX_TARGETS - 1) as u32,
+                )
+                .err(),
+            Some(Refusal::Capacity)
+        );
     }
 }

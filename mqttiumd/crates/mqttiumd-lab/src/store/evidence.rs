@@ -951,7 +951,8 @@ impl<'a> TraceWriter<'a> {
                             "operation_id": operation_id(*operation),
                         }),
                     ),
-                    WorkKind::WillPublication
+                    WorkKind::AnnotatedPublication
+                    | WorkKind::WillPublication
                     | WorkKind::ExpiringPublication
                     | WorkKind::TimedReplaySubscriptions
                     | WorkKind::MarkDeliveryStarted

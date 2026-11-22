@@ -174,7 +174,7 @@ impl ExpiringPublication {
                     if value.admission.qos == crate::packet::Qos::AtMostOnce {
                         return Err(RecipeError::InvalidField("expiring_qos"));
                     }
-                    if value.retain_targets != 0 {
+                    if !value.retain_targets.is_zero() {
                         return Err(RecipeError::InvalidField("retain_targets"));
                     }
                     Ok(())
@@ -210,14 +210,14 @@ impl ExpiringPublication {
         max_targets: usize,
         max_topic: usize,
     ) -> Result<Self, RecipeError> {
-        let nested = read_nested(reader, &[1, 10, 11])?;
+        let nested = read_nested(reader, &[1, 10, 11, 20, 21])?;
         // No temporal extension can appear within a temporal wrapper. Existing
         // tag 10 retains its single legacy tag-1 envelope.
         let admission = match Recipe::decode_canonical(nested, max_targets, max_topic)? {
             Recipe::AdmitPublication(admission) if !admission.retain => {
                 ExpiringAdmission::Qos12(RetainedPublication {
                     admission,
-                    retain_targets: 0,
+                    retain_targets: crate::retained::RetainMask::EMPTY,
                 })
             }
             Recipe::RetainedPublication(value) => ExpiringAdmission::Qos12(value),

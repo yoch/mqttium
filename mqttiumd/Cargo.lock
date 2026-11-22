@@ -419,6 +419,7 @@ dependencies = [
  "mqttiumd-core",
  "mqttiumd-store-api",
  "mqttiumd-store-sqlite",
+ "mqttiumd-store-volatile",
  "nix",
  "rustls",
  "rustls-pemfile",
@@ -473,6 +474,16 @@ dependencies = [
  "rusqlite",
  "serde_json",
  "sha2",
+]
+
+[[package]]
+name = "mqttiumd-store-volatile"
+version = "0.0.0"
+dependencies = [
+ "mqttiumd-contract",
+ "mqttiumd-lab",
+ "mqttiumd-store-api",
+ "mqttiumd-store-sqlite",
 ]
 
 [[package]]

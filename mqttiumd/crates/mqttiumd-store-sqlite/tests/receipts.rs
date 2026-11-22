@@ -188,15 +188,16 @@ fn partial_sweeps_unknown_commit_and_reopen_have_absolute_accounting() {
 
 #[test]
 fn maintenance_detects_duplicate_evidence_and_oversize_before_copying() {
+    let oversized_recipe = format!(
+        "UPDATE operations SET recipe=zeroblob({})",
+        mqttiumd_store_api::ReadBudget::COLLECTION.max_field_bytes + 1
+    );
     for (mutation, cause) in [
         (
             "INSERT INTO fences(id) SELECT id FROM operations",
             ReadError::InvalidData,
         ),
-        (
-            "UPDATE operations SET recipe=zeroblob(1048577)",
-            ReadError::LimitExceeded,
-        ),
+        (oversized_recipe.as_str(), ReadError::LimitExceeded),
         ("DROP TABLE receipt_origins", ReadError::Unavailable),
     ] {
         let (path, mut sql, _memory, empty) = prepared();

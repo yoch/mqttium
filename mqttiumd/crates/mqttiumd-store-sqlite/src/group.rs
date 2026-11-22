@@ -29,8 +29,8 @@ use mqttiumd_contract::outcome::{RejectReason, StoreOutcome};
 use mqttiumd_store_api::{Applied, Durability, DurableStore};
 
 use crate::{
-    Abort, Meta, Recognised, SqliteStore, Txn, UNKNOWN, answered, committed, read_meta, recognise,
-    stage_command, stage_rejection, write_meta,
+    Abort, Meta, Recognised, SqliteStore, StoreCaches, TxDelta, Txn, UNKNOWN, answered, committed,
+    read_meta, recognise, stage_command, stage_rejection, write_meta,
 };
 
 /// The largest number of commands one group holds (ARC-020: batches are
@@ -94,14 +94,23 @@ impl SqliteStore {
         else {
             return Ok(unknown());
         };
+        let caches = self.caches.get_mut();
+        if caches.sync(&tx).is_err() {
+            caches.clear();
+            return Ok(unknown());
+        }
+        let mut group_delta = TxDelta::default();
         let mut replies = Vec::with_capacity(commands.len());
         for command in commands {
-            match member(&tx, command) {
+            match member(&tx, command, caches, &mut group_delta) {
                 // The engine drops a whole transaction on some errors; a
                 // statement after that would be committed on its own.
                 Ok(applied) if !tx.is_autocommit() => replies.push(applied),
                 // Dropping the transaction rolls back what is left of it.
-                Ok(_) | Err(Lost) => return Ok(unknown()),
+                Ok(_) | Err(Lost) => {
+                    caches.clear_receipt_caches();
+                    return Ok(unknown());
+                }
             }
         }
         if !replies.iter().any(|applied| applied.wrote) {
@@ -118,15 +127,22 @@ impl SqliteStore {
             crate::kill_points::KillPoint::CommitPrepared,
         );
         if failing || tx.commit().is_err() {
+            caches.clear_receipt_caches();
             return Ok(unknown());
         }
+        group_delta.commit_into(caches);
         Ok(replies)
     }
 }
 
 /// One member of a group, on the transaction of the group: the steps of
 /// `apply`, with a savepoint where `apply` has a transaction.
-fn member(conn: &Connection, command: &Command) -> Result<Applied, Lost> {
+fn member(
+    conn: &Connection,
+    command: &Command,
+    caches: &mut StoreCaches,
+    group_delta: &mut TxDelta,
+) -> Result<Applied, Lost> {
     let recipe = command.recipe.get();
     let operation = recipe.operation();
     let mut canonical = Vec::new();
@@ -136,16 +152,29 @@ fn member(conn: &Connection, command: &Command) -> Result<Applied, Lost> {
             false,
         ));
     }
-    let phase = match recognise(conn, command, &canonical) {
+    let phase = match recognise(conn, command, &canonical, caches, group_delta) {
         Recognised::Settled(applied) => return Ok(applied),
         Recognised::Absent(phase) => phase,
     };
     let reason = if phase == EpochPhase::Open {
         let staged = savepoint(conn, |conn, meta| {
-            stage_command(conn, meta, command, &canonical)
+            let mut member_delta = TxDelta::default();
+            let facts = stage_command(
+                conn,
+                meta,
+                caches,
+                group_delta,
+                &mut member_delta,
+                command,
+                &canonical,
+            )?;
+            Ok((facts, member_delta))
         })?;
         match staged {
-            Txn::Committed(facts) => return Ok(committed(facts)),
+            Txn::Committed((facts, member_delta)) => {
+                group_delta.extend_from(member_delta);
+                return Ok(committed(facts));
+            }
             Txn::Refused(reason) => reason,
             Txn::ReadFailed(_) | Txn::NotWritten => return Ok(UNKNOWN),
         }
@@ -155,10 +184,23 @@ fn member(conn: &Connection, command: &Command) -> Result<Applied, Lost> {
     // The rejection is recorded as `commit_rejection` records it, in a
     // savepoint of its own: without a receipt slot nothing certain is said.
     let recorded = savepoint(conn, |conn, meta| {
-        stage_rejection(conn, meta, operation, &canonical, reason)
+        let mut member_delta = TxDelta::default();
+        stage_rejection(
+            conn,
+            meta,
+            recipe,
+            operation,
+            &canonical,
+            reason,
+            &mut member_delta,
+        )?;
+        Ok(member_delta)
     })?;
     Ok(match recorded {
-        Txn::Committed(()) => answered(StoreOutcome::RejectedCertain(reason), true),
+        Txn::Committed(member_delta) => {
+            group_delta.extend_from(member_delta);
+            answered(StoreOutcome::RejectedCertain(reason), true)
+        }
         Txn::Refused(()) | Txn::ReadFailed(_) | Txn::NotWritten => UNKNOWN,
     })
 }

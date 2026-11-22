@@ -13,12 +13,12 @@ is inferred from. The others are not reviewed, which is not a third kind.
 
 | Status | MQTT 5.0 | MQTT 3.1.1 |
 | - | -: | -: |
-| `covered` | 139 | 83 |
+| `covered` | 148 | 83 |
 | of which `direct` | 14 | 6 |
 | of which `partial` | 8 | 15 |
-| not reviewed | 117 | 62 |
+| not reviewed | 126 | 62 |
 | `implemented-untested` | 42 | 31 |
-| `profile-refused` | 37 | 8 |
+| `profile-refused` | 28 | 8 |
 | `open` | 0 | 0 |
 | `not-applicable` | 33 | 17 |
 | statements | 251 | 139 |
@@ -28,7 +28,7 @@ is inferred from. The others are not reviewed, which is not a third kind.
 
 Applies to a server, and either no implementation and no deliberate refusal was found, or the behaviour looks non-conformant. The note says which.
 
-## Refused by the profile (45)
+## Refused by the profile (36)
 
 The broker deliberately rejects or does not offer the feature today. The note says what a client observes.
 
@@ -63,25 +63,6 @@ The broker deliberately rejects or does not offer the feature today. The note sa
 | 5.0 | `MQTT-4.12.0-4` | `mqttiumd/crates/mqttiumd/src/codec.rs:decode_for` | Not offered: the broker never sends AUTH, a CONNECT with an Authentication Method is refused with CONNACK 0x8C, and an AUTH packet from a client is answered with DISCONNECT 0x82. |
 | 5.0 | `MQTT-4.12.0-5` | `mqttiumd/crates/mqttiumd/src/codec.rs:decode_for` | Not offered: the broker never sends AUTH, a CONNECT with an Authentication Method is refused with CONNACK 0x8C, and an AUTH packet from a client is answered with DISCONNECT 0x82. |
 | 5.0 | `MQTT-4.12.1-2` | `mqttiumd/crates/mqttiumd/src/codec.rs:decode_for` | Not offered: the broker never sends AUTH, a CONNECT with an Authentication Method is refused with CONNACK 0x8C, and an AUTH packet from a client is answered with DISCONNECT 0x82. |
-
-### publish-properties (5)
-
-| MQTT | Statement | Code | Note |
-| - | - | - | - |
-| 5.0 | `MQTT-3.3.2-4` | `mqttiumd/crates/mqttiumd/src/codec.rs:publish` | Not offered: a PUBLISH carrying any property other than Message Expiry Interval is refused with DISCONNECT 0x83 and the connection is closed, so nothing is forwarded. |
-| 5.0 | `MQTT-3.3.2-17` | `mqttiumd/crates/mqttiumd/src/codec.rs:publish` | Not offered: a PUBLISH carrying any property other than Message Expiry Interval is refused with DISCONNECT 0x83 and the connection is closed, so nothing is forwarded. |
-| 5.0 | `MQTT-3.3.2-18` | `mqttiumd/crates/mqttiumd/src/codec.rs:publish` | Not offered: a PUBLISH carrying any property other than Message Expiry Interval is refused with DISCONNECT 0x83 and the connection is closed, so nothing is forwarded. |
-| 5.0 | `MQTT-3.3.2-19` | `mqttiumd/crates/mqttiumd/src/codec.rs:publish` | Not offered: a PUBLISH carrying any property other than Message Expiry Interval is refused with DISCONNECT 0x83 and the connection is closed, so nothing is forwarded. |
-| 5.0 | `MQTT-3.3.2-20` | `mqttiumd/crates/mqttiumd/src/codec.rs:publish` | Not offered: a PUBLISH carrying any property other than Message Expiry Interval is refused with DISCONNECT 0x83 and the connection is closed, so nothing is forwarded. |
-
-### request-response (4)
-
-| MQTT | Statement | Code | Note |
-| - | - | - | - |
-| 5.0 | `MQTT-3.3.2-13` | `mqttiumd/crates/mqttiumd/src/codec.rs:publish` | Not offered: a PUBLISH carrying any property other than Message Expiry Interval is refused with DISCONNECT 0x83 and the connection is closed, so nothing is forwarded. The Response Topic is validated first. |
-| 5.0 | `MQTT-3.3.2-14` | `mqttiumd/crates/mqttiumd/src/codec.rs:publish` | Not offered: a PUBLISH carrying any property other than Message Expiry Interval is refused with DISCONNECT 0x83 and the connection is closed, so nothing is forwarded. The Response Topic is validated first. |
-| 5.0 | `MQTT-3.3.2-15` | `mqttiumd/crates/mqttiumd/src/codec.rs:publish` | Not offered: a PUBLISH carrying any property other than Message Expiry Interval is refused with DISCONNECT 0x83 and the connection is closed, so nothing is forwarded. |
-| 5.0 | `MQTT-3.3.2-16` | `mqttiumd/crates/mqttiumd/src/codec.rs:publish` | Not offered: a PUBLISH carrying any property other than Message Expiry Interval is refused with DISCONNECT 0x83 and the connection is closed, so nothing is forwarded. |
 
 ### shared-subscriptions (4)
 

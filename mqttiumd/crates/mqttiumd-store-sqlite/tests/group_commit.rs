@@ -396,7 +396,7 @@ fn retained<S>(world: &World<S>, sequence: u64, payload: &[u8]) -> Command {
     Command {
         recipe: FrozenRecipe::freeze(Recipe::RetainedPublication(RetainedPublication {
             admission,
-            retain_targets: 0,
+            retain_targets: mqttiumd_contract::retained::RetainMask::EMPTY,
         }))
         .expect("well formed"),
         payload: plain.payload,

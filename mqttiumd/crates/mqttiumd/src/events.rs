@@ -5,6 +5,7 @@ use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 /// Same Linux monotonic clock as the independent client measurements.
@@ -77,6 +78,8 @@ const OPS_KINDS: &[&str] = &[
     "stopped",
     "tls_authenticated",
     "tls_profile",
+    "volatile_snapshot_failed",
+    "volatile_snapshot_saved",
     "will_capabilities",
     "will_deferred",
 ];
@@ -84,9 +87,53 @@ const OPS_KINDS: &[&str] = &[
 /// Distinct suppressed kinds a `counters` record can carry.
 const MAX_TALLIES: usize = 96;
 
+/// Hot suppressed event kinds counted lock-free in `Level::Ops`.
+const FAST_TALLIES: [&str; 16] = [
+    "command_submitted",
+    "core_finish_observed",
+    "delivery_discarded",
+    "effect_retained",
+    "frame_failed",
+    "frame_queued",
+    "frame_written",
+    "puback_ignored",
+    "puback_observed",
+    "publish_validated",
+    "qos0_dropped",
+    "receive_credit",
+    "store_group",
+    "store_result",
+    "wire_receive_credit",
+    "work_page_ignored",
+];
+
+#[inline]
+fn fast_tally_index(kind: &str) -> Option<usize> {
+    match kind {
+        "command_submitted" => Some(0),
+        "core_finish_observed" => Some(1),
+        "delivery_discarded" => Some(2),
+        "effect_retained" => Some(3),
+        "frame_failed" => Some(4),
+        "frame_queued" => Some(5),
+        "frame_written" => Some(6),
+        "puback_ignored" => Some(7),
+        "puback_observed" => Some(8),
+        "publish_validated" => Some(9),
+        "qos0_dropped" => Some(10),
+        "receive_credit" => Some(11),
+        "store_group" => Some(12),
+        "store_result" => Some(13),
+        "wire_receive_credit" => Some(14),
+        "work_page_ignored" => Some(15),
+        _ => None,
+    }
+}
+
 #[derive(Clone)]
 pub struct Events {
     log: Arc<Mutex<Log>>,
+    fast_tallies: Arc<[AtomicU64; FAST_TALLIES.len()]>,
     level: Level,
 }
 struct Log {
@@ -105,14 +152,20 @@ impl Events {
 
     /// Whether a record of this kind is written at the current level. A
     /// caller on the data path asks before it builds the fields.
+    #[inline]
     #[must_use]
     pub fn records(&self, kind: &str) -> bool {
         self.level == Level::Audit || OPS_KINDS.binary_search(&kind).is_ok()
     }
 
     /// Counts one observation that the current level does not write.
+    #[inline]
     pub fn tally(&self, kind: &str) {
         if self.records(kind) {
+            return;
+        }
+        if let Some(index) = fast_tally_index(kind) {
+            self.fast_tallies[index].fetch_add(1, Ordering::Relaxed);
             return;
         }
         if let Ok(mut log) = self.log.lock() {
@@ -130,16 +183,23 @@ impl Events {
     /// Writes the counts gathered since the previous call as one `counters`
     /// record, or nothing when no suppressed observation was made.
     pub fn flush_tallies(&self) -> io::Result<()> {
-        let counts = {
+        let mut counts = {
             let mut log = self
                 .log
                 .lock()
                 .map_err(|_| io::Error::other("event lock"))?;
-            if log.tallies.is_empty() {
-                return Ok(());
-            }
             std::mem::take(&mut log.tallies)
         };
+        for (index, kind) in FAST_TALLIES.iter().enumerate() {
+            let delta = self.fast_tallies[index].swap(0, Ordering::Relaxed);
+            if delta != 0 {
+                let entry = counts.entry((*kind).to_owned()).or_insert(0);
+                *entry = entry.saturating_add(delta);
+            }
+        }
+        if counts.is_empty() {
+            return Ok(());
+        }
         let counts: serde_json::Map<String, Value> = counts
             .into_iter()
             .map(|(kind, count)| (kind, Value::String(count.to_string())))
@@ -168,6 +228,7 @@ impl Events {
                 first_seq: 1,
                 tallies: BTreeMap::new(),
             })),
+            fast_tallies: Arc::new(std::array::from_fn(|_| AtomicU64::new(0))),
             level,
         })
     }
@@ -177,6 +238,15 @@ impl Events {
             return Ok(());
         }
         self.write(kind, fields)
+    }
+    /// Lazily builds the JSON fields only when `kind` is actually recorded.
+    #[inline]
+    pub fn emit_with(&self, kind: &str, fields: impl FnOnce() -> Value) -> io::Result<()> {
+        if !self.records(kind) {
+            self.tally(kind);
+            return Ok(());
+        }
+        self.write(kind, fields())
     }
     fn write(&self, kind: &str, fields: Value) -> io::Result<()> {
         let mut log = self

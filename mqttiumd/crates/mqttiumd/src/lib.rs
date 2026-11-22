@@ -2,6 +2,7 @@
 #![forbid(unsafe_code)]
 
 pub mod codec;
+pub mod config;
 
 pub mod events;
 pub mod net;

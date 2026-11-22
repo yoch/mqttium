@@ -1472,12 +1472,18 @@
         "id": "MQTT-3.3.2-4",
         "feature": "publish-properties",
         "applies_to_server": true,
-        "status": "profile-refused",
-        "evidence": [],
-        "code": [
-          "mqttiumd/crates/mqttiumd/src/codec.rs:publish"
+        "status": "covered",
+        "evidence": [
+          {
+            "file": "mqttiumd/crates/mqttiumd/tests/publish_properties.rs",
+            "test": "publish_properties_traverse_qos0_qos1_qos2_and_strip_for_v311"
+          },
+          {
+            "file": "mqttiumd/crates/mqttiumd/tests/publish_properties.rs",
+            "test": "retained_publish_properties_survive_volatile_snapshot_and_durable_restart"
+          }
         ],
-        "note": "Not offered: a PUBLISH carrying any property other than Message Expiry Interval is refused with DISCONNECT 0x83 and the connection is closed, so nothing is forwarded."
+        "note": "Payload Format Indicator (0x01) is validated (UTF-8 enforced when 1) and forwarded unaltered to MQTT 5 subscribers across QoS 0/1/2 and retained restarts (ADR 0053)."
       },
       {
         "id": "MQTT-3.3.2-5",
@@ -1594,89 +1600,113 @@
         "id": "MQTT-3.3.2-13",
         "feature": "request-response",
         "applies_to_server": true,
-        "status": "profile-refused",
-        "evidence": [],
-        "code": [
-          "mqttiumd/crates/mqttiumd/src/codec.rs:publish"
+        "status": "covered",
+        "evidence": [
+          {
+            "file": "mqttiumd/crates/mqttiumd/tests/publish_properties.rs",
+            "test": "publish_properties_traverse_qos0_qos1_qos2_and_strip_for_v311"
+          }
         ],
-        "note": "Not offered: a PUBLISH carrying any property other than Message Expiry Interval is refused with DISCONNECT 0x83 and the connection is closed, so nothing is forwarded. The Response Topic is validated first."
+        "note": "Response Topic (0x08) is validated as a non-empty MQTT UTF-8 topic name without wildcards and forwarded unaltered to MQTT 5 subscribers (ADR 0053)."
       },
       {
         "id": "MQTT-3.3.2-14",
         "feature": "request-response",
         "applies_to_server": true,
-        "status": "profile-refused",
-        "evidence": [],
-        "code": [
-          "mqttiumd/crates/mqttiumd/src/codec.rs:publish"
+        "status": "covered",
+        "evidence": [
+          {
+            "file": "mqttiumd/crates/mqttiumd-contract/src/properties.rs",
+            "test": "noncanonical_and_out_of_domain_properties_are_rejected"
+          },
+          {
+            "file": "mqttiumd/crates/mqttiumd/tests/publish_properties.rs",
+            "test": "publish_properties_traverse_qos0_qos1_qos2_and_strip_for_v311"
+          }
         ],
-        "note": "Not offered: a PUBLISH carrying any property other than Message Expiry Interval is refused with DISCONNECT 0x83 and the connection is closed, so nothing is forwarded. The Response Topic is validated first."
+        "note": "Response Topic containing '+' or '#' is rejected as a protocol error and never forwarded (ADR 0053)."
       },
       {
         "id": "MQTT-3.3.2-15",
         "feature": "request-response",
         "applies_to_server": true,
-        "status": "profile-refused",
-        "evidence": [],
-        "code": [
-          "mqttiumd/crates/mqttiumd/src/codec.rs:publish"
+        "status": "covered",
+        "evidence": [
+          {
+            "file": "mqttiumd/crates/mqttiumd/tests/publish_properties.rs",
+            "test": "publish_properties_traverse_qos0_qos1_qos2_and_strip_for_v311"
+          }
         ],
-        "note": "Not offered: a PUBLISH carrying any property other than Message Expiry Interval is refused with DISCONNECT 0x83 and the connection is closed, so nothing is forwarded."
+        "note": "Response Topic (0x08) is forwarded unaltered on MQTT 5 deliveries and stripped for MQTT 3.1.1 (ADR 0053)."
       },
       {
         "id": "MQTT-3.3.2-16",
         "feature": "request-response",
         "applies_to_server": true,
-        "status": "profile-refused",
-        "evidence": [],
-        "code": [
-          "mqttiumd/crates/mqttiumd/src/codec.rs:publish"
+        "status": "covered",
+        "evidence": [
+          {
+            "file": "mqttiumd/crates/mqttiumd/tests/publish_properties.rs",
+            "test": "publish_properties_traverse_qos0_qos1_qos2_and_strip_for_v311"
+          }
         ],
-        "note": "Not offered: a PUBLISH carrying any property other than Message Expiry Interval is refused with DISCONNECT 0x83 and the connection is closed, so nothing is forwarded."
+        "note": "Correlation Data (0x09) binary bytes are forwarded unaltered on MQTT 5 deliveries and stripped for MQTT 3.1.1 (ADR 0053)."
       },
       {
         "id": "MQTT-3.3.2-17",
         "feature": "publish-properties",
         "applies_to_server": true,
-        "status": "profile-refused",
-        "evidence": [],
-        "code": [
-          "mqttiumd/crates/mqttiumd/src/codec.rs:publish"
+        "status": "covered",
+        "evidence": [
+          {
+            "file": "mqttiumd/crates/mqttiumd/tests/publish_properties.rs",
+            "test": "publish_properties_traverse_qos0_qos1_qos2_and_strip_for_v311"
+          },
+          {
+            "file": "mqttiumd/crates/mqttiumd-contract/src/properties.rs",
+            "test": "canonical_round_trip_preserves_every_property_and_order"
+          }
         ],
-        "note": "Not offered: a PUBLISH carrying any property other than Message Expiry Interval is refused with DISCONNECT 0x83 and the connection is closed, so nothing is forwarded."
+        "note": "User Properties (0x26) preserve exact insertion order, including duplicate keys, across QoS 0/1/2 and retained restarts (ADR 0053)."
       },
       {
         "id": "MQTT-3.3.2-18",
         "feature": "publish-properties",
         "applies_to_server": true,
-        "status": "profile-refused",
-        "evidence": [],
-        "code": [
-          "mqttiumd/crates/mqttiumd/src/codec.rs:publish"
+        "status": "covered",
+        "evidence": [
+          {
+            "file": "mqttiumd/crates/mqttiumd/tests/publish_properties.rs",
+            "test": "publish_properties_traverse_qos0_qos1_qos2_and_strip_for_v311"
+          }
         ],
-        "note": "Not offered: a PUBLISH carrying any property other than Message Expiry Interval is refused with DISCONNECT 0x83 and the connection is closed, so nothing is forwarded."
+        "note": "User Properties (0x26) are forwarded verbatim to MQTT 5 subscribers and stripped for MQTT 3.1.1 (ADR 0053)."
       },
       {
         "id": "MQTT-3.3.2-19",
         "feature": "publish-properties",
         "applies_to_server": true,
-        "status": "profile-refused",
-        "evidence": [],
-        "code": [
-          "mqttiumd/crates/mqttiumd/src/codec.rs:publish"
+        "status": "covered",
+        "evidence": [
+          {
+            "file": "mqttiumd/crates/mqttiumd/tests/publish_properties.rs",
+            "test": "publish_properties_traverse_qos0_qos1_qos2_and_strip_for_v311"
+          }
         ],
-        "note": "Not offered: a PUBLISH carrying any property other than Message Expiry Interval is refused with DISCONNECT 0x83 and the connection is closed, so nothing is forwarded."
+        "note": "Content Type (0x03) is validated as MQTT UTF-8 and forwarded unaltered to MQTT 5 subscribers (ADR 0053)."
       },
       {
         "id": "MQTT-3.3.2-20",
         "feature": "publish-properties",
         "applies_to_server": true,
-        "status": "profile-refused",
-        "evidence": [],
-        "code": [
-          "mqttiumd/crates/mqttiumd/src/codec.rs:publish"
+        "status": "covered",
+        "evidence": [
+          {
+            "file": "mqttiumd/crates/mqttiumd/tests/publish_properties.rs",
+            "test": "retained_publish_properties_survive_volatile_snapshot_and_durable_restart"
+          }
         ],
-        "note": "Not offered: a PUBLISH carrying any property other than Message Expiry Interval is refused with DISCONNECT 0x83 and the connection is closed, so nothing is forwarded."
+        "note": "Content Type (0x03) and all other PUBLISH application properties survive retained storage and broker restarts (ADR 0053)."
       },
       {
         "id": "MQTT-3.3.4-1",
