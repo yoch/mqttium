@@ -166,6 +166,10 @@ pub enum ExchangePhase {
     AwaitPubrel,
     /// The durable termination was submitted; its commit is not known.
     ReleasePending,
+    /// The result of the admission is known and its answer waits for the
+    /// answers of the publications the connection sent before it (record
+    /// 0050).
+    AnswerHeld,
 }
 
 /// The next value of each identity the owner issues, or `None` once the
@@ -6024,6 +6028,255 @@ mod tests {
         });
         assert_eq!(command.recipe.get(), &expected);
         assert_eq!(command.payload, Some(bytes(b"payload")));
+    }
+
+    /// A PUBLISH of the producer with its place in the order of its
+    /// connection.
+    fn ordered(connection: u64, raw: u16, qos: Qos, order: u64) -> Input {
+        let Input::Packet { packet, .. } = publish_with(connection, raw, qos, b"payload") else {
+            panic!("a packet")
+        };
+        Input::Packet {
+            connection: ConnectionGeneration::new(connection),
+            ingress_order: order,
+            packet,
+        }
+    }
+
+    /// The acknowledgements among `effects`, in the order they were made
+    /// eligible: their kind, their Packet Identifier and their connection.
+    fn answered(effects: &[(EffectId, Effect)]) -> Vec<(&'static str, u16, u64)> {
+        effects
+            .iter()
+            .filter_map(|(_, effect)| match effect {
+                Effect::EmitFrame {
+                    connection,
+                    frame: OutboundFrame::Puback { packet_id, .. },
+                    ..
+                } => Some(("PUBACK", packet_id.get(), connection.generation.get())),
+                Effect::EmitFrame {
+                    connection,
+                    frame: OutboundFrame::Pubrec { packet_id, reason },
+                    ..
+                } => Some((
+                    if reason.is_success() {
+                        "PUBREC"
+                    } else {
+                        "PUBREC refusal"
+                    },
+                    packet_id.get(),
+                    connection.generation.get(),
+                )),
+                _ => None,
+            })
+            .collect()
+    }
+
+    const fn answer_of(qos: Qos) -> &'static str {
+        match qos {
+            Qos::AtLeastOnce => "PUBACK",
+            _ => "PUBREC",
+        }
+    }
+
+    /// Record 0050: the acknowledgement of a publication waits for those
+    /// of the publications its connection sent before it. Here the result
+    /// of the later admission is applied first: nothing leaves, and the
+    /// result of the earlier one releases both, in the order of reception.
+    #[test]
+    fn an_acknowledgement_waits_for_those_of_earlier_publications_of_its_connection() {
+        use Qos::{AtLeastOnce, ExactlyOnce};
+        for (first, second) in [
+            (ExactlyOnce, ExactlyOnce),
+            (AtLeastOnce, AtLeastOnce),
+            (ExactlyOnce, AtLeastOnce),
+            (AtLeastOnce, ExactlyOnce),
+        ] {
+            let case = format!("{first:?} then {second:?}");
+            let mut world = World::connected();
+            let earlier = world.submit(ordered(CONN, 7, first, 1));
+            let later = world.submit(ordered(CONN, 8, second, 2));
+            assert!(
+                world.sent(committed(&later)).is_empty(),
+                "{case}: an acknowledgement overtook an earlier publication"
+            );
+            if second == ExactlyOnce {
+                assert_eq!(world.phase(8), Some(ExchangePhase::AnswerHeld), "{case}");
+            }
+            world.applied(committed(&earlier));
+            assert_eq!(
+                answered(&world.drain()),
+                [(answer_of(first), 7, CONN), (answer_of(second), 8, CONN)],
+                "{case}"
+            );
+            if second == ExactlyOnce {
+                assert_eq!(world.phase(8), AWAIT, "{case}");
+                let release = world.submit(pubrel(8));
+                assert_eq!(world.sent(committed(&release)), ["EmitPubcomp"], "{case}");
+            }
+        }
+    }
+
+    /// One held answer leaves with each transition: the result of the
+    /// earliest admission releases the next, and the receipt of each
+    /// acknowledgement written releases the one after it.
+    #[test]
+    fn held_acknowledgements_leave_one_after_the_other_with_the_receipts() {
+        for qos in [Qos::ExactlyOnce, Qos::AtLeastOnce] {
+            let mut world = World::connected();
+            let first = world.submit(ordered(CONN, 7, qos, 1));
+            let second = world.submit(ordered(CONN, 8, qos, 2));
+            let third = world.submit(ordered(CONN, 9, qos, 3));
+            assert!(world.sent(committed(&third)).is_empty(), "{qos:?}");
+            assert!(world.sent(committed(&second)).is_empty(), "{qos:?}");
+            world.applied(committed(&first));
+            let effects = world.drain();
+            let kind = answer_of(qos);
+            assert_eq!(
+                answered(&effects),
+                [(kind, 7, CONN), (kind, 8, CONN)],
+                "{qos:?}"
+            );
+            world.applied(written(&effects[0]));
+            assert_eq!(answered(&world.drain()), [(kind, 9, CONN)], "{qos:?}");
+        }
+    }
+
+    /// A refusal waits like an acceptance, and then ends its exchange.
+    #[test]
+    fn a_held_refusal_leaves_in_its_turn_and_ends_its_exchange() {
+        let mut world = World::connected();
+        let earlier = world.submit(ordered(CONN, 7, Qos::ExactlyOnce, 1));
+        let later = world.submit(ordered(CONN, 8, Qos::ExactlyOnce, 2));
+        assert!(world.sent(rejected(&later)).is_empty());
+        world.applied(committed(&earlier));
+        assert_eq!(
+            answered(&world.drain()),
+            [("PUBREC", 7, CONN), ("PUBREC refusal", 8, CONN)]
+        );
+        assert_eq!(world.phase(8), None, "the refused exchange is over");
+        assert_eq!(world.phase(7), AWAIT);
+        // The same with the refusal in front: it holds the acceptance.
+        let mut world = World::connected();
+        let earlier = world.submit(ordered(CONN, 7, Qos::ExactlyOnce, 1));
+        let later = world.submit(ordered(CONN, 8, Qos::ExactlyOnce, 2));
+        assert!(world.sent(committed(&later)).is_empty());
+        world.applied(rejected(&earlier));
+        assert_eq!(
+            answered(&world.drain()),
+            [("PUBREC refusal", 7, CONN), ("PUBREC", 8, CONN)]
+        );
+        assert_eq!((world.phase(7), world.phase(8)), (None, AWAIT));
+    }
+
+    /// A held answer does not outlive its connection: a held PUBREC that
+    /// accepts leaves the exchange waiting for PUBREL, a held PUBACK ends
+    /// its exchange, as a result applied without a connection does.
+    #[test]
+    fn a_held_acknowledgement_ends_with_its_connection() {
+        let mut world = World::connected();
+        let _earlier = world.submit(ordered(CONN, 7, Qos::ExactlyOnce, 1));
+        let later = world.submit(ordered(CONN, 8, Qos::ExactlyOnce, 2));
+        assert!(world.sent(committed(&later)).is_empty());
+        world.applied(transport_closed(CONN));
+        assert!(answered(&world.drain()).is_empty());
+        assert_eq!(world.phase(8), AWAIT);
+        assert_eq!(world.phase(7), Some(ExchangePhase::AdmissionPending));
+
+        let mut world = World::connected();
+        let _earlier = world.submit(ordered(CONN, 7, Qos::AtLeastOnce, 1));
+        let later = world.submit(ordered(CONN, 8, Qos::AtLeastOnce, 2));
+        assert!(world.sent(committed(&later)).is_empty());
+        let before = world.owner.slots.len();
+        world.applied(transport_closed(CONN));
+        assert!(answered(&world.drain()).is_empty());
+        assert_eq!(world.owner.slots.len(), before - 1, "the held PUBACK ended");
+    }
+
+    /// Only publications of the same connection precede one another: an
+    /// admission still pending from a connection that was replaced does
+    /// not hold the acknowledgements of the new one.
+    #[test]
+    fn a_publication_of_a_replaced_connection_holds_no_acknowledgement() {
+        let mut world = World::connected();
+        let _old = world.submit(ordered(CONN, 7, Qos::ExactlyOnce, 5));
+        assert_eq!(
+            world.sent(connect(11, b"p1-producer")),
+            ["CloseConnection", "EmitConnack"]
+        );
+        let new = world.submit(ordered(11, 8, Qos::ExactlyOnce, 1));
+        world.applied(committed(&new));
+        assert_eq!(answered(&world.drain()), [("PUBREC", 8, 11)]);
+    }
+
+    /// A PUBLISH received again takes a new place in the order: the
+    /// answers it preceded no longer wait for it, and it waits for them.
+    #[test]
+    fn a_publish_received_again_takes_its_new_place_in_the_order() {
+        let mut world = World::connected();
+        let earlier = world.submit(ordered(CONN, 7, Qos::ExactlyOnce, 1));
+        let later = world.submit(ordered(CONN, 8, Qos::ExactlyOnce, 2));
+        assert!(world.sent(committed(&later)).is_empty());
+        world.applied(ordered(CONN, 7, Qos::ExactlyOnce, 3));
+        assert_eq!(answered(&world.drain()), [("PUBREC", 8, CONN)]);
+        world.applied(committed(&earlier));
+        assert_eq!(answered(&world.drain()), [("PUBREC", 7, CONN)]);
+    }
+
+    /// A session that resumes sends its unacknowledged publications again,
+    /// in order. The PUBREC of one whose admission is already committed
+    /// waits for the answer of the one sent again before it.
+    #[test]
+    fn a_pubrec_sent_again_waits_for_the_publications_sent_again_before_it() {
+        let resumed = || {
+            let mut world = World::connected();
+            let earlier = world.submit(ordered(CONN, 7, Qos::ExactlyOnce, 1));
+            let later = world.submit(ordered(CONN, 8, Qos::ExactlyOnce, 2));
+            assert!(world.sent(committed(&later)).is_empty());
+            assert_eq!(
+                world.sent(connect(11, b"p1-producer")),
+                ["CloseConnection", "EmitConnack"]
+            );
+            assert_eq!(world.phase(8), AWAIT);
+            assert!(world.sent(ordered(11, 7, Qos::ExactlyOnce, 1)).is_empty());
+            assert!(
+                world.sent(ordered(11, 8, Qos::ExactlyOnce, 2)).is_empty(),
+                "the PUBREC sent again overtook an earlier publication"
+            );
+            (world, earlier)
+        };
+        let (mut world, earlier) = resumed();
+        world.applied(committed(&earlier));
+        assert_eq!(
+            answered(&world.drain()),
+            [("PUBREC", 7, 11), ("PUBREC", 8, 11)]
+        );
+        // The client may hold a PUBREC of an earlier copy: its PUBREL is
+        // served while the PUBREC sent again is held, which then never
+        // leaves.
+        let (mut world, earlier) = resumed();
+        let release = world.submit(Input::Packet {
+            connection: ConnectionGeneration::new(11),
+            ingress_order: 3,
+            packet: InboundPacket::Pubrel {
+                packet_id: packet_id(8),
+            },
+        });
+        world.applied(committed(&earlier));
+        assert_eq!(answered(&world.drain()), [("PUBREC", 7, 11)]);
+        assert_eq!(world.sent(committed(&release)), ["EmitPubcomp"]);
+    }
+
+    /// A PUBREL for an exchange whose first PUBREC is held answers nothing
+    /// the client can have received: it is the protocol error it is while
+    /// the admission is pending.
+    #[test]
+    fn a_pubrel_for_a_held_first_pubrec_is_a_protocol_error() {
+        let mut world = World::connected();
+        let _earlier = world.submit(ordered(CONN, 7, Qos::ExactlyOnce, 1));
+        let later = world.submit(ordered(CONN, 8, Qos::ExactlyOnce, 2));
+        assert!(world.sent(committed(&later)).is_empty());
+        assert_eq!(world.sent(pubrel(8)), ["CloseConnection"]);
     }
 
     /// A PUBLISH of the producer on a topic no subscription matches.

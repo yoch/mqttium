@@ -1248,15 +1248,28 @@ fn a_connection_keeps_at_most_its_window_of_business_packets_waiting() {
 /// second publication of the same client is admitted and answered. The
 /// subscriber still reads the first, then the second.
 ///
-/// The acknowledgements follow the answers of the store: the second
-/// publication is acknowledged first, and the first once its result is
-/// resolved. That order is recorded here as what a client observes under
-/// this barrier, not as a rule (record 0046, "Left open").
+/// The acknowledgements keep that order too (record 0050; MQTT-4.6.0-2
+/// and -3 of MQTT 3.1.1): the second publication is not acknowledged while
+/// the result of the first is unknown, and once the real store resolves it
+/// the publisher reads the acknowledgement of the first, then that of the
+/// second. Before record 0050 the second was acknowledged at once.
 #[cfg(feature = "test-hooks")]
 #[test]
 fn deliveries_keep_the_order_of_reception_when_an_earlier_store_result_is_late() {
     use codec::Version::{V5, V311};
-    for (version, qos) in [(V5, 1u8), (V5, 2), (V311, 1), (V311, 2)] {
+    // Each case waits for a resolution, which takes seconds: the four run
+    // side by side, each with a runtime and a store of its own.
+    std::thread::scope(|cases| {
+        for (version, qos) in [(V5, 1u8), (V5, 2), (V311, 1), (V311, 2)] {
+            cases.spawn(move || late_first_result(version, qos));
+        }
+    });
+}
+
+#[cfg(feature = "test-hooks")]
+fn late_first_result(version: codec::Version, qos: u8) {
+    use codec::Version::V5;
+    {
         let controls = Directory::new();
         let hold = controls.0.join("hold-admission-result");
         with_runtime_clock_hooks(
@@ -1299,12 +1312,6 @@ fn deliveries_keep_the_order_of_reception_when_an_earlier_store_result_is_late()
                     .packet(publisher, header, publication(8, b'B'))
                     .unwrap();
 
-                let (kind, body) = served_frame(runtime, &mut publishing);
-                assert_eq!(
-                    (kind, &body[..2]),
-                    (acknowledgement, &[0, 8][..]),
-                    "{case}: the publication whose result is known is answered"
-                );
                 let mut read = Vec::new();
                 for _ in 0..2 {
                     let (kind, body) = served_frame(runtime, &mut subscribed);
@@ -1313,34 +1320,52 @@ fn deliveries_keep_the_order_of_reception_when_an_earlier_store_result_is_late()
                 }
                 assert_eq!(read, b"AB", "{case}: the order of reception");
 
-                // The core resolves an unknown result on a deadline of
-                // seconds: one case waits for it, with whole turns and not
-                // only the passes of `pump`.
-                std::fs::remove_file(&hold).unwrap();
-                if (version, qos) != (V5, 1) {
-                    return;
-                }
-                let deadline = Instant::now() + Duration::from_secs(20);
+                // Both publications are delivered, so the second admission
+                // is committed and its result applied. Its acknowledgement
+                // waits for that of the first.
+                let settled = Instant::now() + Duration::from_millis(400);
                 let mut first = [0u8; 1];
                 publishing
                     .set_read_timeout(Some(Duration::from_millis(2)))
                     .unwrap();
-                while publishing.peek(&mut first).is_err() {
+                while Instant::now() < settled {
+                    pump(runtime);
                     assert!(
-                        Instant::now() < deadline,
-                        "{case}: the held result never resolved"
+                        publishing.peek(&mut first).is_err(),
+                        "{case}: an acknowledgement left while that of an earlier publication was unknown"
                     );
-                    runtime.turn().unwrap();
                 }
-                publishing
-                    .set_read_timeout(Some(Duration::from_secs(1)))
-                    .unwrap();
-                let (kind, body) = read_frame(&mut publishing);
+
+                // The core resolves an unknown result on a deadline of
+                // seconds, with whole turns and not only the passes of
+                // `pump`.
+                std::fs::remove_file(&hold).unwrap();
+                let deadline = Instant::now() + Duration::from_secs(20);
+                let mut acknowledged = Vec::new();
+                while acknowledged.len() < 2 {
+                    while publishing.peek(&mut first).is_err() {
+                        assert!(
+                            Instant::now() < deadline,
+                            "{case}: the held result never resolved"
+                        );
+                        runtime.turn().unwrap();
+                    }
+                    publishing
+                        .set_read_timeout(Some(Duration::from_secs(1)))
+                        .unwrap();
+                    let (kind, body) = read_frame(&mut publishing);
+                    assert_eq!(kind, acknowledgement, "{case}");
+                    acknowledged.push(body[1]);
+                    publishing
+                        .set_read_timeout(Some(Duration::from_millis(2)))
+                        .unwrap();
+                }
                 assert_eq!(
-                    (kind, &body[..2]),
-                    (acknowledgement, &[0, 7][..]),
-                    "{case}: the held publication is answered once resolved"
+                    acknowledged,
+                    [7, 8],
+                    "{case}: the acknowledgements in the order of reception"
                 );
+                assert!(runtime.peers[&publisher].closing.is_none(), "{case}");
             },
         );
     }
