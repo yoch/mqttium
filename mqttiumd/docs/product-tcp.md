@@ -393,6 +393,16 @@ OperationId for resolution. Incoming QoS 1 has no durable AwaitPubrel marker,
 no durable exchange charge and no ReleaseInbound; its admission/pending PUBACK
 still holds a bounded volatile lease. Unreferenced publications are collected.
 
+In MQTT 5 the PUBACK of a publication accepted without a matching
+subscription carries 0x10 (No matching subscribers), retained or not; its
+PUBREC is always 0x00, as the reference broker's is
+([record 0049](decisions/0049-functional-compatibility.md)). The PUBACK and
+PUBREC of a connection leave in the order in which the broker received
+their PUBLISH packets: when the result of an earlier admission is unknown,
+the acknowledgements of the later publications of that connection wait for
+its resolution
+([record 0050](decisions/0050-acknowledgements-in-order-of-reception.md)).
+
 After PUBACK is sent another PUBLISH with the same identifier is a new
 occurrence, even with DUP or equal bytes (MQTT-4.3.2-5). Lost PUBACK/restart can
 therefore create another admission. Before knowledge of admission, internal

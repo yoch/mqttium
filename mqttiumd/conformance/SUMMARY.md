@@ -13,27 +13,20 @@ is inferred from. The others are not reviewed, which is not a third kind.
 
 | Status | MQTT 5.0 | MQTT 3.1.1 |
 | - | -: | -: |
-| `covered` | 139 | 81 |
+| `covered` | 139 | 83 |
 | of which `direct` | 14 | 6 |
-| of which `partial` | 8 | 13 |
+| of which `partial` | 8 | 15 |
 | not reviewed | 117 | 62 |
 | `implemented-untested` | 42 | 31 |
 | `profile-refused` | 37 | 8 |
-| `open` | 0 | 2 |
+| `open` | 0 | 0 |
 | `not-applicable` | 33 | 17 |
 | statements | 251 | 139 |
 | of which bind a server | 221 | 125 |
 
-## Open (2)
+## Open (0)
 
 Applies to a server, and either no implementation and no deliberate refusal was found, or the behaviour looks non-conformant. The note says which.
-
-### message-ordering (2)
-
-| MQTT | Statement | Note |
-| - | - | - |
-| 3.1.1 | `MQTT-4.6.0-2` | Written for the Client; MQTT-4.6.0-6 extends 'the rules listed above' to a Server. Looks non-conformant: a PUBACK leaves when the store result of its admission is applied, and no code or test states that PUBACKs keep the arrival order of their PUBLISH packets. The independent audit of 8e4303d, 21 November 2026, observed acknowledgements leaving in the order of the store results: 8 then 7 for publications received as 7 then 8. The compatibility scenario `publish/pipelined-qos1-v4` compares the order of twenty PUBACK with the order of their PUBLISH packets on one topic: as sent in every play read with the broker built from 81acd13, which does not show the order when a store result is late. |
-| 3.1.1 | `MQTT-4.6.0-3` | Written for the Client; MQTT-4.6.0-6 extends 'the rules listed above' to a Server. Looks non-conformant: a PUBREC leaves when the store result of its admission is applied, and no code or test states that PUBRECs keep the arrival order of their PUBLISH packets. The independent audit of 8e4303d, 21 November 2026, observed acknowledgements leaving in the order of the store results: 8 then 7 for publications received as 7 then 8. |
 
 ## Refused by the profile (45)
 

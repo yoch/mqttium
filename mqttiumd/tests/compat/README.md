@@ -111,7 +111,9 @@ python3 -m unittest discover -s tests/compat -p "test_*.py"
 
 Every entry has `id`, `class`, `difference` (one line: what the reference
 does, what mqttiumd does) and `fingerprint`. `statement` is allowed in any
-class. Entries are sorted by `id`.
+class, and so is `decision`: the four-digit number of the decision record
+that chose the behaviour, for a difference the owner decided (record 0049
+says how such a choice is made). Entries are sorted by `id`.
 
 An entry may record a broker incident that is part of the difference that
 was read:

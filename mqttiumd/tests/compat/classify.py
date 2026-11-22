@@ -10,6 +10,7 @@ scenario whose two transcripts differ:
      "statement": "MQTT-3.1.4-2",        (required for reference-nonconformant)
      "mqttiumd": "what mqttiumd does",   (required for reference-nonconformant)
      "lot": "product lot that closes it" (profile-refused and defect, when known)
+     "decision": "0049",                 (the decision record that chose, when one did)
      "incident": {"mqttiumd": ["exited"]} (only when a broker exits, hangs or panics)
      "fingerprint": "16 hex digits"}
 
@@ -45,7 +46,8 @@ INCIDENTS = {
     "panic": "printed a panic",
 }
 BACKENDS = ("reference", "mqttiumd")
-FIELDS = {"id", "class", "difference", "statement", "mqttiumd", "lot", "incident", "fingerprint"}
+FIELDS = {"id", "class", "difference", "statement", "mqttiumd", "lot", "decision", "incident", "fingerprint"}
+DECISION = re.compile(r"\d{4}")
 STATEMENT = re.compile(r"MQTT-\d+(\.\d+)+-\d+")
 
 # Problems that make a run fail.
@@ -96,6 +98,8 @@ def check_divergences(data) -> dict:
             raise DivergenceError(f"{name}: `statement` cites no statement identifier such as MQTT-3.1.4-2")
         if "lot" in entry and kind not in ("profile-refused", "defect"):
             raise DivergenceError(f"{name}: `lot` is for profile-refused and defect entries")
+        if "decision" in entry and not (isinstance(entry["decision"], str) and DECISION.fullmatch(entry["decision"])):
+            raise DivergenceError(f"{name}: `decision` is the four-digit number of a decision record")
         if "incident" in entry:
             check_incident(entry["incident"], name, kind)
         out[name] = entry

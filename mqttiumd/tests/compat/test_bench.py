@@ -143,11 +143,20 @@ class Classification(unittest.TestCase):
                     [entry("a/1-v4", kind="reference-nonconformant")],
                     [entry("a/1-v4", kind="reference-nonconformant", statement="section 3", mqttiumd="x")],
                     [entry("a/1-v4", kind="unspecified", lot="x")], [entry("a/1-v4", note="x")],
+                    [entry("a/1-v4", decision="record 49")], [entry("a/1-v4", decision=49)],
                     [{"id": "a/1-v4", "class": "defect", "difference": "x"}]):
             with self.assertRaises(classify.DivergenceError):
                 classify.check_divergences(bad)
         classify.check_divergences([entry("a/1-v4", kind="reference-nonconformant", statement="MQTT-3.1.4-2",
-                                          mqttiumd="closes")])
+                                          mqttiumd="closes", decision="0049")])
+
+    def test_a_decision_names_a_record_of_the_repository(self):
+        bench = Path(__file__).resolve().parent
+        records = {path.name[:4] for path in (bench.parent.parent / "docs/decisions").glob("[0-9]*.md")}
+        entries = json.loads((bench / "divergences.json").read_text())
+        decided = {item["id"]: item["decision"] for item in entries if "decision" in item}
+        self.assertTrue(decided, "no entry names its decision")
+        self.assertEqual({name: number for name, number in decided.items() if number not in records}, {})
 
     def test_cited_statements_must_exist(self):
         known = {"3.1.1": {"MQTT-3.1.3-9"}, "5.0": {"MQTT-4.13.1-1"}}

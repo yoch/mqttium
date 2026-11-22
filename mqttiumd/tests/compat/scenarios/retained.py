@@ -9,8 +9,9 @@ def store(conn, topic, payload, level, packet_id=1):
     """Publish a retained message and wait until the broker has taken it.
 
     MQTT 3.1.1 uses QoS 1 and its PUBACK. MQTT 5 uses QoS 0 and a PINGREQ
-    round trip: a MQTT 5 PUBACK may say "no matching subscribers", which
-    `publish/no-matching-subscribers-v5` compares and these do not.
+    round trip: a MQTT 5 PUBACK says "no matching subscribers" or not with
+    the subscriptions of the moment, which `publish/no-matching-subscribers-v5`
+    compares and these do not.
     """
     if level == 4:
         return publish_ack(conn, topic, payload, retain=True, packet_id=packet_id, level=4)

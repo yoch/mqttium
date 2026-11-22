@@ -304,7 +304,8 @@ def markdown(matrix) -> str:
         lines += [f"## {name} ({len(chosen)})", ""]
         for row in chosen:
             lines.append(f"- `{row['id']}` (MQTT {row['version']}): {row['difference'] or 'not classified'}")
-            for label, key in (("Statement", "statement"), ("mqttiumd", "mqttiumd"), ("Lot", "lot")):
+            for label, key in (("Statement", "statement"), ("mqttiumd", "mqttiumd"), ("Lot", "lot"),
+                               ("Decision record", "decision")):
                 if row.get(key):
                     lines.append(f"  - {label}: {row[key]}")
             for backend, kinds in sorted(row.get("incident", {}).items()):
@@ -407,6 +408,7 @@ def main(argv=None) -> int:
                "status": result["status"], "result": classes[name], "fingerprint": result["fingerprint"],
                "difference": entry.get("difference", ""), "statement": entry.get("statement", ""),
                "mqttiumd": entry.get("mqttiumd", ""), "lot": entry.get("lot", ""),
+               "decision": entry.get("decision", ""),
                "incident": entry.get("incident", {})}
         rows.append(row)
         diff = write_transcripts(transcripts, result)

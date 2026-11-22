@@ -48,6 +48,7 @@
     "class": "unspecified",
     "difference": "Both close the connection on a Remaining Length of five bytes; Mosquitto without a packet, mqttiumd after DISCONNECT 0x81 (Malformed Packet).",
     "statement": "MQTT-4.13.1-1: both close; the DISCONNECT before the close is recommended, not required",
+    "decision": "0049",
     "fingerprint": "e65f6932e92f4b99"
   },
   {
@@ -67,10 +68,11 @@
   {
     "id": "errors/packet-at-announced-maximum-v5",
     "class": "reference-nonconformant",
-    "difference": "Both acknowledge a PUBLISH of exactly the announced 32 776 bytes (Mosquitto with Reason Code 0x10, no matching subscribers; mqttiumd with 0x00). Mosquitto also acknowledges the next one, of 32 777 bytes, and keeps the connection; mqttiumd answers DISCONNECT 0x95 (Packet too large) and closes.",
+    "difference": "Both acknowledge a PUBLISH of exactly the announced 32 776 bytes with Reason Code 0x10 (No matching subscribers). Mosquitto also acknowledges the next one, of 32 777 bytes, and keeps the connection; mqttiumd answers DISCONNECT 0x95 (Packet too large) and closes.",
     "statement": "MQTT-4.13.1-1, with section 3.2.2.3.6: the size is the whole packet, and a larger one is a Protocol Error with 0x95",
     "mqttiumd": "Measures the whole packet, fixed header included: acknowledges 32 776 bytes, answers 32 777 with DISCONNECT 0x95 (Packet too large) and closes the network connection.",
-    "fingerprint": "1111667a218eb399"
+    "decision": "0049",
+    "fingerprint": "aa2826f0d5268e60"
   },
   {
     "id": "properties/content-type-v5",
@@ -120,13 +122,6 @@
     "fingerprint": "737eee3aa9a2785b"
   },
   {
-    "id": "publish/no-matching-subscribers-v5",
-    "class": "unspecified",
-    "difference": "Mosquitto answers PUBACK and PUBREC with 0x10 (No matching subscribers); mqttiumd with 0x00 (Success). The specification makes 0x10 optional.",
-    "statement": "MQTT-3.4.2-1: both are PUBACK Reason Codes",
-    "fingerprint": "9ca554f1f5dd4ff0"
-  },
-  {
     "id": "publish/payload-40000-bytes-v5",
     "class": "profile-refused",
     "difference": "Mosquitto acknowledges and delivers a 40 000-byte message; mqttiumd announced Maximum Packet Size 32 776, which follows its payload limit of 32 768 bytes, and answers DISCONNECT 0x95 (Packet too large).",
@@ -138,6 +133,7 @@
     "class": "unspecified",
     "difference": "For a PUBREL whose Packet Identifier is no longer known, Mosquitto answers PUBCOMP 0x00 (Success) and mqttiumd PUBCOMP 0x92 (Packet Identifier not found).",
     "statement": "MQTT-4.3.3-11: both answer with PUBCOMP",
+    "decision": "0049",
     "fingerprint": "3e9603aaded3ae83"
   },
   {
@@ -146,6 +142,7 @@
     "difference": "On a ninth QoS 2 PUBLISH while eight exchanges are open, Mosquitto answers PUBREC 0x97 (Quota exceeded) and keeps the connection open; mqttiumd sends DISCONNECT 0x93 (Receive Maximum exceeded) and closes.",
     "statement": "MQTT-4.13.1-1, with section 3.3.4: a client that exceeds Receive Maximum (MQTT-3.3.4-7) makes a Protocol Error for which the Reason Code 0x93 is given, so the server must close the connection",
     "mqttiumd": "Sends DISCONNECT 0x93 (Receive Maximum exceeded) and closes the network connection.",
+    "decision": "0049",
     "fingerprint": "967d3cf1ba4eb6a1"
   },
   {
@@ -153,6 +150,7 @@
     "class": "unspecified",
     "difference": "Both close the connection on a Topic Name with a wildcard; Mosquitto with DISCONNECT 0x81 (Malformed Packet), mqttiumd with DISCONNECT 0x90 (Topic Name invalid).",
     "statement": "MQTT-3.3.2-2 is what the client violates; the Reason Code is not prescribed",
+    "decision": "0049",
     "fingerprint": "3d5fe5d94ba4a6cf"
   },
   {
@@ -174,6 +172,7 @@
     "class": "unspecified",
     "difference": "Both close the connection on the invalid Topic Filter; Mosquitto with DISCONNECT 0x81 (Malformed Packet), mqttiumd with DISCONNECT 0x82 (Protocol Error).",
     "statement": "MQTT-4.13.1-1: both close; the Reason Code is not prescribed",
+    "decision": "0049",
     "fingerprint": "624dc40dd9b77310"
   },
   {
@@ -181,6 +180,7 @@
     "class": "unspecified",
     "difference": "Both close the connection on the invalid Topic Filter; Mosquitto with DISCONNECT 0x81 (Malformed Packet), mqttiumd with DISCONNECT 0x82 (Protocol Error).",
     "statement": "MQTT-4.13.1-1: both close; the Reason Code is not prescribed",
+    "decision": "0049",
     "fingerprint": "6a79447df4524ecc"
   },
   {
@@ -195,6 +195,7 @@
     "class": "unspecified",
     "difference": "For one message matching two subscriptions of a MQTT 5 client, Mosquitto sends one copy per subscription (QoS 0 and QoS 1); mqttiumd sends one copy at the highest granted QoS.",
     "statement": "MQTT-3.3.4-2 requires the copy at the highest QoS; section 3.3.4 allows further copies",
+    "decision": "0049",
     "fingerprint": "041811d9fa699fcb"
   },
   {
@@ -203,6 +204,7 @@
     "difference": "Mosquitto, which offers shared subscriptions to MQTT 3.1.1 clients too, grants `$share/group/lit/t` at QoS 0; mqttiumd reads it as an ordinary Topic Filter of MQTT 3.1.1 and refuses to hold it: SUBACK with return code 0x80 (Failure), connection kept.",
     "statement": "MQTT-3.8.4-5 allows a return code that says the subscription failed",
     "lot": "Shared subscriptions (CMP-002)",
+    "decision": "0049",
     "fingerprint": "427ec304ee5b275f"
   },
   {

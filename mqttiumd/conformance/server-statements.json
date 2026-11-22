@@ -1818,7 +1818,7 @@
             "test": "puback_encodes_only_reasons_valid_for_its_packet_role"
           }
         ],
-        "note": "PUBACK is written with 0x00, 0x97 or 0x83 only; the type cannot hold another reason."
+        "note": "PUBACK is written with 0x00, 0x10 (accepted without a matching subscription, record 0049), 0x97 or 0x83 only; the type cannot hold another reason."
       },
       {
         "id": "MQTT-3.4.2-2",
@@ -1861,7 +1861,7 @@
             "test": "outbound_frames_are_mqtt5_and_advertise_only_implemented_features"
           }
         ],
-        "note": "The encoder refuses a PUBREC with 0x92; 0x00, 0x97 and 0x83 are the only others it can write."
+        "note": "The encoder refuses a PUBREC with 0x92; 0x00, 0x97 and 0x83 are the only others it can write. A PUBREC that accepts is always 0x00, also for a publication without a matching subscription (record 0049)."
       },
       {
         "id": "MQTT-3.5.2-2",
@@ -5207,17 +5207,57 @@
         "id": "MQTT-4.6.0-2",
         "feature": "message-ordering",
         "applies_to_server": true,
-        "status": "open",
-        "evidence": [],
-        "note": "Written for the Client; MQTT-4.6.0-6 extends 'the rules listed above' to a Server. Looks non-conformant: a PUBACK leaves when the store result of its admission is applied, and no code or test states that PUBACKs keep the arrival order of their PUBLISH packets. The independent audit of 8e4303d, 21 November 2026, observed acknowledgements leaving in the order of the store results: 8 then 7 for publications received as 7 then 8. The compatibility scenario `publish/pipelined-qos1-v4` compares the order of twenty PUBACK with the order of their PUBLISH packets on one topic: as sent in every play read with the broker built from 81acd13, which does not show the order when a store result is late."
+        "status": "covered",
+        "evidence": [
+          {
+            "file": "mqttiumd/crates/mqttiumd/src/runtime_tests.rs",
+            "test": "deliveries_keep_the_order_of_reception_when_an_earlier_store_result_is_late"
+          },
+          {
+            "file": "mqttiumd/crates/mqttiumd-core/src/owner.rs",
+            "test": "an_acknowledgement_waits_for_those_of_earlier_publications_of_its_connection"
+          },
+          {
+            "file": "mqttiumd/crates/mqttiumd-core/src/owner.rs",
+            "test": "held_acknowledgements_leave_one_after_the_other_with_the_receipts"
+          }
+        ],
+        "note": "Written for the Client; MQTT-4.6.0-6 extends 'the rules listed above' to a Server. Record 0050 keeps the order whatever the reading: the core holds a PUBACK that would overtake the answer of an earlier publication of the same connection and releases it in its turn. Asserted in the core with the results of two admissions applied in reverse order, and with a chain of three released by the receipts; on real sockets, with the committed result of the first admission kept unknown by a test barrier and then resolved by the SQLite store, no acknowledgement leaves before that of the first publication, in both protocol versions (instrumented build). The independent audit of 8e4303d, 21 November 2026, had observed 8 then 7 for publications received as 7 then 8. Partial: the order is that of one connection; across a takeover by another connection each has its own, and the oracle has no assertion on it.",
+        "evidence_kind": "partial",
+        "code": [
+          "mqttiumd/crates/mqttiumd-core/src/owner.rs:plan_held_release",
+          "mqttiumd/crates/mqttiumd-core/src/owner.rs:must_wait"
+        ]
       },
       {
         "id": "MQTT-4.6.0-3",
         "feature": "message-ordering",
         "applies_to_server": true,
-        "status": "open",
-        "evidence": [],
-        "note": "Written for the Client; MQTT-4.6.0-6 extends 'the rules listed above' to a Server. Looks non-conformant: a PUBREC leaves when the store result of its admission is applied, and no code or test states that PUBRECs keep the arrival order of their PUBLISH packets. The independent audit of 8e4303d, 21 November 2026, observed acknowledgements leaving in the order of the store results: 8 then 7 for publications received as 7 then 8."
+        "status": "covered",
+        "evidence": [
+          {
+            "file": "mqttiumd/crates/mqttiumd/src/runtime_tests.rs",
+            "test": "deliveries_keep_the_order_of_reception_when_an_earlier_store_result_is_late"
+          },
+          {
+            "file": "mqttiumd/crates/mqttiumd-core/src/owner.rs",
+            "test": "an_acknowledgement_waits_for_those_of_earlier_publications_of_its_connection"
+          },
+          {
+            "file": "mqttiumd/crates/mqttiumd-core/src/owner.rs",
+            "test": "held_acknowledgements_leave_one_after_the_other_with_the_receipts"
+          },
+          {
+            "file": "mqttiumd/crates/mqttiumd-lab/tests/bench_order.rs",
+            "test": "a_pubrec_waits_for_that_of_an_earlier_publication_whose_result_is_late"
+          }
+        ],
+        "note": "Written for the Client; MQTT-4.6.0-6 extends 'the rules listed above' to a Server. Record 0050 keeps the order whatever the reading: the core holds a PUBREC that would overtake the answer of an earlier publication of the same connection and releases it in its turn. Asserted in the core with the results of two admissions applied in reverse order, and with a chain of three released by the receipts; on real sockets, with the committed result of the first admission kept unknown by a test barrier and then resolved by the SQLite store, no acknowledgement leaves before that of the first publication, in both protocol versions (instrumented build); on the bench, scenario ORDER-A through the real core on both stores. The independent audit of 8e4303d, 21 November 2026, had observed 8 then 7 for publications received as 7 then 8. Partial: the order is that of one connection; across a takeover by another connection each has its own, and the oracle has no assertion on it.",
+        "evidence_kind": "partial",
+        "code": [
+          "mqttiumd/crates/mqttiumd-core/src/owner.rs:plan_held_release",
+          "mqttiumd/crates/mqttiumd-core/src/owner.rs:must_wait"
+        ]
       },
       {
         "id": "MQTT-4.6.0-4",
