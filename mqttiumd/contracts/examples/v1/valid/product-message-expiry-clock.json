@@ -1,0 +1,19 @@
+{
+  "format": "mqttiumd.product-event",
+  "schema_version": 1,
+  "seq": "3",
+  "pid": 1,
+  "kind": "message_expiry_clock",
+  "details": {
+    "policy": "quarantine-on-unknown-origin",
+    "time_unit": "nanoseconds",
+    "origin_status": "boottime_namespace_unavailable",
+    "domain": "abababababababababababababababababababababababababababababababab",
+    "tick": "100",
+    "scan_ms": 100,
+    "batch": 4,
+    "started_proof": "positive-socket-write-then-durable-marker",
+    "terminal_input_slots": 544,
+    "socket_write_receipt_slots": 18
+  }
+}

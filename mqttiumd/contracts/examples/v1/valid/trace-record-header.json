@@ -12,6 +12,7 @@
   "kind": "TraceHeader",
   "payload": {
     "scenario_id": "P1-02",
-    "backend": "sim-store"
+    "backend": "sim-store",
+    "perimeter": "full"
   }
 }

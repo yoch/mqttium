@@ -1,0 +1,47 @@
+diff --git a/mqttiumd/crates/mqttiumd-core/src/owner.rs b/mqttiumd/crates/mqttiumd-core/src/owner.rs
+index 07c0c686..cc47c61f 100644
+--- a/mqttiumd/crates/mqttiumd-core/src/owner.rs
++++ b/mqttiumd/crates/mqttiumd-core/src/owner.rs
+@@ -1623,6 +1623,9 @@ impl Owner {
+         let Verdict::Transition(phase) = CommandPhase::Prepared.on(CommandEvent::Submit) else {
+             return Err(IMPOSSIBLE);
+         };
++        let recipe_source = recipe
++            .admission()
++            .map(|admit| (admit.source.session, admit.source.packet_id));
+         let recipe = FrozenRecipe::freeze(recipe).map_err(|error| match error {
+             RecipeError::AllocationFailed => Stop::from(AllocationFailed),
+             _ => IMPOSSIBLE,
+@@ -1631,10 +1634,28 @@ impl Owner {
+             command: Command { recipe, payload },
+         })?;
+         let deadline = draw(&mut draft.counters.deadline, DeadlineToken::checked_next)?;
+-        draft.emit(Effect::ArmDeadline {
+-            token: deadline,
+-            after: self.resolution_delay,
+-        })?;
++        // MUTANT M3: PUBREC Success with the submission, before any commit.
++        let early = match recipe_source {
++            Some((session, packet_id)) => self
++                .connection_of(session)
++                .map(|generation| (crate::contract::ids::ConnectionKey { session, generation }, packet_id)),
++            None => None,
++        };
++        match early {
++            Some((connection, packet_id)) => draft.emit(Effect::EmitFrame {
++                connection,
++                publish_order: None,
++                pubrel: None,
++                frame: OutboundFrame::Pubrec {
++                    packet_id,
++                    reason: AckReason::Success,
++                },
++            })?,
++            None => draft.emit(Effect::ArmDeadline {
++                token: deadline,
++                after: self.resolution_delay,
++            })?,
++        };
+         Ok(InFlight {
+             operation,
+             phase,

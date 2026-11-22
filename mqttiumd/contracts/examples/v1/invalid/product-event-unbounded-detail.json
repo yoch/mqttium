@@ -1,0 +1,12 @@
+{
+  "format": "mqttiumd.product-event",
+  "schema_version": 1,
+  "seq": "1",
+  "kind": "startup_refused",
+  "pid": 1,
+  "cause": "InvalidData",
+  "phase": "Snapshot",
+  "details": {
+    "code": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+  }
+}

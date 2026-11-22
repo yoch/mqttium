@@ -1,0 +1,81 @@
+{
+  "module": "MSessionLifecycle.tla",
+  "status": "specification",
+  "summary": "Finite explicit session lifecycle: attachment CAS, monotone incarnation identities, zero/infinite policy, target-only atomic cleanup, bounded physical rows and retained unknown receipts.",
+  "issues": [
+    648
+  ],
+  "tests": [],
+  "configs": [
+    {
+      "config": "MSessionLifecycle-safety.cfg",
+      "expect": "pass",
+      "invariants": [
+        "TypeOK",
+        "SessionRowsBounded",
+        "SessionIdentitiesMonotone",
+        "BusinessRevisionStable",
+        "ActiveMetadata",
+        "CreditsExact",
+        "OtherResponsibilityPreserved",
+        "NoStaleClose",
+        "NoZeroAfterRestart",
+        "OwnerReadyAuthentic",
+        "UnknownResultsRetained",
+        "ClosedPrefixConsumed",
+        "NoReexecution",
+        "ReceiptWindowBounded"
+      ]
+    },
+    {
+      "config": "MSessionLifecycle-startup.cfg",
+      "expect": "pass",
+      "invariants": [
+        "TypeOK",
+        "SessionRowsBounded",
+        "SessionIdentitiesMonotone",
+        "BusinessRevisionStable",
+        "ActiveMetadata",
+        "CreditsExact",
+        "OtherResponsibilityPreserved",
+        "NoStaleClose",
+        "NoZeroAfterRestart",
+        "OwnerReadyAuthentic",
+        "UnknownResultsRetained",
+        "ClosedPrefixConsumed",
+        "NoReexecution",
+        "ReceiptWindowBounded"
+      ]
+    },
+    {
+      "config": "MSessionLifecycle-reach-cleanup.cfg",
+      "expect": "violation",
+      "invariant": "NoCleanupWitness"
+    },
+    {
+      "config": "MSessionLifecycle-mut-terminal-history.cfg",
+      "expect": "violation",
+      "invariant": "SessionRowsBounded"
+    },
+    {
+      "config": "MSessionLifecycle-mut-old-token.cfg",
+      "expect": "violation",
+      "invariant": "NoStaleClose"
+    },
+    {
+      "config": "MSessionLifecycle-mut-delete-other.cfg",
+      "expect": "violation",
+      "invariant": "OtherResponsibilityPreserved"
+    },
+    {
+      "config": "MSessionLifecycle-mut-resume-zero.cfg",
+      "expect": "violation",
+      "invariant": "NoZeroAfterRestart"
+    },
+    {
+      "config": "MSessionLifecycle-mut-double-credit.cfg",
+      "expect": "violation",
+      "invariant": "CreditsExact"
+    }
+  ]
+}

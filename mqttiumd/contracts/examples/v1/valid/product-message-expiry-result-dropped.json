@@ -1,0 +1,12 @@
+{
+  "format": "mqttiumd.product-event",
+  "schema_version": 1,
+  "seq": "8",
+  "pid": 1,
+  "kind": "message_expiry_result_dropped",
+  "details": {
+    "domain": "abababababababababababababababababababababababababababababababab",
+    "tick": "100",
+    "after": "Some(PublicationId { incarnation: StoreIncarnation(1), epoch: RunEpoch(1), owner: LogicalOwnerId(0), sequence: PublicationSeq(1) })"
+  }
+}

@@ -1,0 +1,11 @@
+{
+  "format": "mqttiumd.product-event",
+  "schema_version": 1,
+  "seq": "1",
+  "pid": 1,
+  "kind": "will_connect_deferred",
+  "connection": "7",
+  "details": {
+    "authority": "durable_will_barrier"
+  }
+}

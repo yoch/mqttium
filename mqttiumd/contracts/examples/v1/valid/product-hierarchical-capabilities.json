@@ -1,0 +1,19 @@
+{
+  "format": "mqttiumd.product-event",
+  "schema_version": 1,
+  "seq": "1",
+  "kind": "ready",
+  "pid": 1,
+  "details": {
+    "wildcard_subscriptions": true,
+    "no_local": true,
+    "shared_subscriptions": false,
+    "subscription_identifiers": false,
+    "sqlite_schema": 12,
+    "profile": "tcp-will-pubsub-v1",
+    "retained_available": true,
+    "retained_topics": 32,
+    "retained_bytes": 1048576,
+    "max_replay_candidates": 256
+  }
+}

@@ -1,0 +1,223 @@
+{
+  "format": "mqttiumd.product-transition-registry",
+  "schema_version": 1,
+  "id": "tcp-outgoing-pi-reuse-v1",
+  "decision": "0027",
+  "scope": "product-system-tests",
+  "partition_complete": false,
+  "description": "Descriptive subset for Proposed ADR 0028. Group B covers finite normal PI reuse, C bounded occupancy and uncertainty, D immutable internal observations and callbacks, E same-file recovery, F finite resources and exact mutants. Historical near-bound regression is group A. This is not a complete guard partition, a promise about upstream unobserved bytes, a causal identity wrap, accepted ADR, universal MQTT conformance or fixture-oracle qualification.",
+  "rules": [
+    {
+      "id": "pi.free.claim",
+      "machine": "OutgoingPacketIdentifier",
+      "state_class": "Free",
+      "event_class": "ClaimPrepared",
+      "guard": "Select the smallest free nonzero number for this durable target session among every live claim, including recovered claims not yet loaded. Examine at most live-claim count plus one candidates in bounded metadata. Packet Identifiers are recyclable resources, not causal identities.",
+      "next_state_class": "ClaimPending",
+      "required_actions": [
+        "ReservePacketIdentifier",
+        "PersistClaimDelivery"
+      ],
+      "forbidden_actions": [
+        "WrapOperationIdentity",
+        "IgnoreUnloadedClaim"
+      ],
+      "reception_groups": [
+        "B",
+        "C"
+      ]
+    },
+    {
+      "id": "pi.pending.unknown",
+      "machine": "OutgoingPacketIdentifier",
+      "state_class": "ClaimPending",
+      "event_class": "UnknownClaim",
+      "guard": "A Claim or Finish outcome is unknown. Keep the number, original OperationId and exact recipe reserved, and resolve that same command. Receipt collection or an absence observation never proves terminal business completion.",
+      "next_state_class": "ClaimPending",
+      "required_actions": [
+        "RetainPacketIdentifier",
+        "ResolveSameOperation"
+      ],
+      "forbidden_actions": [
+        "FreeOnTimeout",
+        "FreeOnReceiptCollection"
+      ],
+      "reception_groups": [
+        "C",
+        "F"
+      ]
+    },
+    {
+      "id": "pi.finish.unknown",
+      "machine": "OutgoingPacketIdentifier",
+      "state_class": "FinishPending",
+      "event_class": "UnknownFinish",
+      "guard": "A Claim or Finish outcome is unknown. Keep the number, original OperationId and exact recipe reserved, and resolve that same command. Receipt collection or an absence observation never proves terminal business completion.",
+      "next_state_class": "FinishPending",
+      "required_actions": [
+        "RetainPacketIdentifier",
+        "ResolveSameOperation"
+      ],
+      "forbidden_actions": [
+        "FreeOnTimeout",
+        "FreeOnReceiptCollection"
+      ],
+      "reception_groups": [
+        "C",
+        "F"
+      ]
+    },
+    {
+      "id": "pi.emission.register",
+      "machine": "OutgoingPacketIdentifier",
+      "state_class": "AwaitPuback",
+      "event_class": "FrameQueueAccepted",
+      "guard": "Register exact ConnectionKey, PI, DeliveryId, claim OperationId and frame EffectId before the frame can leave the adapter writer queue. Refused queue transfer leaves no registration. A PUBACK can legitimately precede a local Written callback.",
+      "next_state_class": "AwaitPuback",
+      "required_actions": [
+        "RegisterAcceptedEmission"
+      ],
+      "forbidden_actions": [
+        "WaitForWrittenBeforeAssociation"
+      ],
+      "reception_groups": [
+        "D"
+      ]
+    },
+    {
+      "id": "pi.ack.observe",
+      "machine": "OutgoingPacketIdentifier",
+      "state_class": "AwaitPuback",
+      "event_class": "PubackDequeuedAndDecoded",
+      "guard": "Authority is runtime reader-channel dequeue and codec validation before the owner-input queue. Capture the complete immutable tuple once. Raw reader-channel or socket bytes remain upstream and have no frozen association yet.",
+      "next_state_class": "Observed",
+      "required_actions": [
+        "FreezePubackTarget"
+      ],
+      "forbidden_actions": [
+        "RebindInOwnerInputQueue",
+        "ClaimUpstreamImmutability"
+      ],
+      "reception_groups": [
+        "D"
+      ]
+    },
+    {
+      "id": "pi.ack.no_target",
+      "machine": "OutgoingPacketIdentifier",
+      "state_class": "NoTarget",
+      "event_class": "DelayedObservationDelivered",
+      "guard": "This validated observation had no accepted emission target at its authority boundary. Its explicit None remains None after new work occupies the same numeric identifier.",
+      "next_state_class": "Ignored",
+      "required_actions": [
+        "PreserveNoTarget"
+      ],
+      "forbidden_actions": [
+        "BindNewOccupant",
+        "PersistFinish"
+      ],
+      "reception_groups": [
+        "D",
+        "F"
+      ]
+    },
+    {
+      "id": "pi.ack.stale",
+      "machine": "OutgoingPacketIdentifier",
+      "state_class": "Observed",
+      "event_class": "OldObservationDelivered",
+      "guard": "Any delivery, claim, frame, connection generation or PI no longer matches that same eligible occurrence. Keep the historical observation readable while refusing its business effect; an arbitrary ACK first observed only after reuse is outside this guarantee.",
+      "next_state_class": "Ignored",
+      "required_actions": [
+        "KeepCurrentOccurrence"
+      ],
+      "forbidden_actions": [
+        "FinishNewOccupant",
+        "ReturnNewCredit"
+      ],
+      "reception_groups": [
+        "D",
+        "F"
+      ]
+    },
+    {
+      "id": "pi.ack.current",
+      "machine": "OutgoingPacketIdentifier",
+      "state_class": "Observed",
+      "event_class": "CurrentPubackDelivered",
+      "guard": "Connection, PI, delivery, claim and frame still match the eligible occurrence. A valid positive or negative PUBACK initiates the existing conditional durable Finish; local frame completion is not MQTT acknowledgement.",
+      "next_state_class": "FinishPending",
+      "required_actions": [
+        "PersistFinishDelivery",
+        "RetainPacketIdentifier"
+      ],
+      "forbidden_actions": [
+        "FreeBeforeKnownFinish"
+      ],
+      "reception_groups": [
+        "C",
+        "D"
+      ]
+    },
+    {
+      "id": "pi.finish.applied",
+      "machine": "OutgoingPacketIdentifier",
+      "state_class": "FinishPending",
+      "event_class": "KnownFinishResultApplied",
+      "guard": "The owner applies the correlated known committed Finish result for the exact delivery and claim. Only now remove that responsibility and release its PI/window resources exactly once. A new delivery may reuse the resource number with new non-wrapping causal identities.",
+      "next_state_class": "Free",
+      "required_actions": [
+        "RemoveFinishedDelivery",
+        "ReleasePacketIdentifierExactlyOnce"
+      ],
+      "forbidden_actions": [
+        "FinishNewOccurrenceFromOldResult",
+        "ReturnCreditTwice"
+      ],
+      "reception_groups": [
+        "B",
+        "C",
+        "D",
+        "F"
+      ]
+    },
+    {
+      "id": "pi.recovery.claim",
+      "machine": "OutgoingPacketIdentifier",
+      "state_class": "Reserved",
+      "event_class": "RecoveredLiveClaim",
+      "guard": "Recover every durable claim as an occupied PI before payload loading. Preserve the same delivery, claim and PI on same-file recovery; the existing recovery replay uses DUP1. A new distinct claim starts with DUP0, and a committed Finish never resurrects.",
+      "next_state_class": "AwaitPuback",
+      "required_actions": [
+        "RestoreOccupiedPacketIdentifier",
+        "PreserveRecoveryClaimIdentity"
+      ],
+      "forbidden_actions": [
+        "AllocateConflictingNumber",
+        "ResurrectFinishedDelivery"
+      ],
+      "reception_groups": [
+        "E"
+      ]
+    },
+    {
+      "id": "pi.callback.stale",
+      "machine": "OutgoingPacketIdentifier",
+      "state_class": "AwaitPuback",
+      "event_class": "OldCallbackOrGeneration",
+      "guard": "A local write callback, obsolete connection generation, old result or retired command cannot terminate or free a different current occurrence. QoS0 remains outside PI and Receive Maximum credit accounting.",
+      "next_state_class": "AwaitPuback",
+      "required_actions": [
+        "KeepCurrentOccurrence"
+      ],
+      "forbidden_actions": [
+        "FreeFromLocalWritten",
+        "ReturnQosZeroCredit"
+      ],
+      "reception_groups": [
+        "D",
+        "F"
+      ]
+    }
+  ]
+}

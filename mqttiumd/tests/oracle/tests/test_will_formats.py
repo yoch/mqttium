@@ -1,0 +1,222 @@
+"""Will layouts are independently readable and remain outside qualification."""
+
+import copy
+import json
+from types import SimpleNamespace
+import unittest
+from unittest import mock
+
+from mqttiumd_oracle import recipe, results
+from mqttiumd_oracle.documents import Contracts
+
+from .support import ROOT
+from .test_session_lifecycle import be, guard, scoped
+
+PREFIX = b"MQDR\x00\x01"
+OPERATION = {"incarnation": "1", "epoch": "2", "owner": "3", "sequence": "8"}
+TOPIC = b"atelier/capteur-1/status"
+PAYLOAD = b"offline"
+
+
+def open_will(*, topic=TOPIC, payload=PAYLOAD, present=True, retain=False):
+    value = (PREFIX + b"\x08" + scoped(8) + bytes([7 if retain else 5, 0, 1, 1]) + guard()
+             + be(9, 2) + b"capteur-1" + be(100) + bytes([present]))
+    return value + (be(len(topic), 2) + topic + be(len(payload), 4) + payload if present else b"")
+
+
+def end_will(*, publish=True, observed_at=100):
+    return PREFIX + b"\x08" + scoped(9) + b"\x06" + guard() + b"\x01" + be(observed_at) + bytes([publish])
+
+
+def publication(*, topic=TOPIC, qos=1, cause=1, target=2, count=1, payload_length=7, mask=None):
+    header = (PREFIX + bytes([17 if mask is None else 18]) + scoped(10) + scoped(8) + scoped(11) + be(1)
+              + be(len(topic), 2) + topic + scoped(12) + be(payload_length)
+              + be(7) + be(count) + be(0) + be(1) + bytes([count]))
+    targets = b"".join(be(target + index) + be(1) + be(index, 4) + bytes([qos, cause])
+                       for index in range(count))
+    return header + targets + (be(mask, 2) if mask is not None else b"")
+
+
+class WillRecipes(unittest.TestCase):
+    def test_open_installs_a_bounded_descriptor_and_absence_is_explicit(self):
+        decoded = recipe.decode(open_will())
+        self.assertEqual((decoded.kind, decoded.action), ("SessionLifecycle", "OpenWillAt"))
+        self.assertEqual(decoded.operation, (1, 2, 3, 8))
+        self.assertEqual(decoded.expected, (9, (1, 2, 3, 4)))
+        self.assertEqual(decoded.client_id, b"capteur-1")
+        self.assertEqual((decoded.now, decoded.expiry), (100, "Never"))
+        self.assertEqual((decoded.will.topic, decoded.will.payload), (TOPIC, PAYLOAD))
+        self.assertIsNone(recipe.decode(open_will(present=False)).will)
+
+    def test_end_keeps_the_original_attachment_observation_and_publish_intent(self):
+        for publish in (False, True):
+            decoded = recipe.decode(end_will(publish=publish))
+            self.assertEqual(decoded.action, "EndWill")
+            self.assertEqual(decoded.guard, (9, (1, 2, 3, 4)))
+            self.assertEqual(decoded.observed_at, 100)
+            self.assertEqual(decoded.publish, publish)
+
+    def test_publication_has_a_will_identity_without_a_fictitious_mqtt_packet(self):
+        decoded = recipe.decode(publication())
+        self.assertEqual(decoded.kind, "WillPublication")
+        self.assertEqual(decoded.operation, (1, 2, 3, 10))
+        self.assertEqual(decoded.will, (1, 2, 3, 8))
+        self.assertEqual(decoded.publication, (1, 2, 3, 11))
+        self.assertEqual(decoded.payload, (1, 2, 3, 12))
+        self.assertEqual((decoded.topic, decoded.payload_length), (TOPIC, len(PAYLOAD)))
+        self.assertEqual(decoded.targets, (recipe.Target(2, 1, 0, 1, 1),))
+        self.assertFalse(hasattr(decoded, "packet_id"))
+        self.assertFalse(hasattr(decoded, "exchange_generation"))
+
+    def test_will_layouts_refuse_every_truncation_and_trailing_alias(self):
+        for valid in (open_will(), open_will(present=False), end_will(), publication(),
+                      open_will(retain=True), publication(mask=1)):
+            for data in [valid[:cut] for cut in range(len(valid))] + [valid + b"\x00"]:
+                with self.subTest(data=data.hex()), self.assertRaises(recipe.RecipeError):
+                    recipe.decode(data)
+
+    def test_retained_layouts_use_separate_tags_and_keep_legacy_flags(self):
+        self.assertFalse(recipe.decode(open_will()).will.retain)
+        self.assertTrue(recipe.decode(open_will(retain=True)).will.retain)
+        self.assertIsNone(recipe.decode(publication()).live_retain)
+        self.assertEqual(recipe.decode(publication(mask=0, count=0)).live_retain, 0)
+        self.assertEqual(recipe.decode(publication(mask=1)).live_retain, 1)
+        for raw in (publication(mask=2), publication(mask=1, count=0), open_will(present=False, retain=True)):
+            with self.assertRaises(recipe.RecipeError):
+                recipe.decode(raw)
+
+    def test_will_topic_payload_and_canonical_targets_are_bounded(self):
+        for invalid in (
+            open_will(topic=b""), open_will(topic=b"a/+"), open_will(topic=b"\xff"),
+            open_will(topic=b"x" * 1025), open_will(payload=b"x" * 32769),
+            publication(qos=2), publication(cause=2), publication(count=17),
+            publication(payload_length=32769), publication(topic=b"bad/#"),
+        ):
+            with self.subTest(data=invalid[:48].hex()), self.assertRaises(recipe.RecipeError):
+                recipe.decode(invalid)
+
+
+class WillFormats(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.contracts = Contracts.open(ROOT)
+        cls.snapshot = json.loads((ROOT / "contracts/examples/v1/valid/store-snapshot-after-commit.json").read_text())
+
+    def test_will_commit_facts_keep_both_causal_identities(self):
+        value = copy.deepcopy(self.snapshot)
+        facts = {"kind": "WillPublished", "will_id": OPERATION,
+                 "publication_id": value["publications"][0]["publication_id"]}
+        value["operations"][0]["decision"] = {"kind": "Committed", "facts": facts}
+        self.assertEqual(self.contracts.check_value(value), [], "will_commit_facts_not_described")
+        for field in ("will_id", "publication_id"):
+            invalid = copy.deepcopy(value)
+            del invalid["operations"][0]["decision"]["facts"][field]
+            self.assertTrue(self.contracts.check_value(invalid), field)
+
+    def test_will_format_support_cannot_extend_the_fixture_qualifier(self):
+        def unmet(*, snapshot=None, record=None):
+            run = SimpleNamespace(snapshots={} if snapshot is None else {"0": (None, snapshot)},
+                trace=SimpleNamespace(records=() if record is None else (record,),
+                                      before=lambda _left, _right: True))
+            with mock.patch.object(results.judge.Run, "load", return_value=run):
+                return results._scope_unmet(None, None, None)
+
+        base = {"sessions": [], "outbound": [], "operations": []}
+        for snapshot in (
+            {**base, "wills": [{"state": "Armed"}]},
+            {**base, "operations": [{"recipe_hex": publication().hex(),
+                "decision": {"kind": "Committed", "facts": {"kind": "WillPublished"}}}]},
+        ):
+            self.assertIn("the fixture-based qualifier does not cover product Will publication",
+                          unmet(snapshot=snapshot))
+        self.assertIn("the fixture-based qualifier does not cover product Will publication",
+                      unmet(record=SimpleNamespace(kind="CommandSubmitted",
+                            payload={"command_kind": "WillPublication"})))
+
+    def will_snapshot(self):
+        return {**copy.deepcopy(self.snapshot), "wills": [{
+            "will_id": copy.deepcopy(OPERATION), "source_session": "9", "client_id_hex": b"capteur-1".hex(),
+            "state": "Pending", "topic_hex": TOPIC.hex(), "payload_hex": PAYLOAD.hex()}]}
+
+    def test_intent_survives_an_absent_source_in_the_descriptive_inventory(self):
+        value = self.will_snapshot()
+        self.assertFalse(any(row["session"] == "9" for row in value["sessions"]))
+        self.assertEqual(self.contracts.check_value(value), [], "pending_intent_not_described")
+
+    def test_intent_states_octets_and_cardinality_remain_bounded(self):
+        for change in (
+            {"state": "Published"}, {"topic_hex": "00" * 1025},
+            {"payload_hex": "00" * 32769}, {"client_id_hex": "00" * 1025},
+            {"unexpected": 0},
+        ):
+            value = self.will_snapshot()
+            value["wills"][0].update(change)
+            self.assertTrue(self.contracts.check_value(value), change)
+        value = self.will_snapshot()
+        value["wills"] *= 257
+        self.assertTrue(self.contracts.check_value(value))
+
+    def test_intent_keys_are_numeric_scoped_and_unique(self):
+        value = self.will_snapshot()
+        value["wills"].append(copy.deepcopy(value["wills"][0]))
+        self.assertEqual([(d.code, d.pointer) for d in self.contracts.check_value(value)],
+                         [("duplicate-name", "/wills/1/will_id")])
+        value["wills"][1]["will_id"]["sequence"] = "7"
+        self.assertEqual([(d.code, d.pointer) for d in self.contracts.check_value(value)],
+                         [("rows-out-of-order", "/wills/1/will_id")])
+
+    def test_intent_identity_components_cannot_exceed_u64(self):
+        for member, pointer in (("source_session", "/wills/0/source_session"),
+                                ("sequence", "/wills/0/will_id/sequence")):
+            value = self.will_snapshot()
+            holder = value["wills"][0] if member == "source_session" else value["wills"][0]["will_id"]
+            holder[member] = "18446744073709551616"
+            self.assertEqual([(d.code, d.pointer) for d in self.contracts.check_value(value)],
+                             [("u64-out-of-range", pointer)])
+
+    def test_actual_detachment_diagnostics_are_bounded_and_historical_forms_remain_readable(self):
+        event = {"format": "mqttiumd.product-event", "schema_version": 1,
+                 "seq": "1", "pid": 1, "kind": "session_changed", "operation": OPERATION,
+                 "details": {"action": "Detached", "session": "9", "expiry": "Never",
+                             "detached_by": "1/2/3/8"}}
+        self.assertEqual(self.contracts.check_value(event), [], "actual_infinite_will_detachment_refused")
+        historical = copy.deepcopy(event)
+        historical["details"].update(detached_by=OPERATION, deadline=None)
+        self.assertEqual(self.contracts.check_value(historical), [], "historical_detachment_changed_meaning")
+        finite = copy.deepcopy(event)
+        finite["details"].update(expiry={"After": 1}, deadline="1000000000")
+        self.assertEqual(self.contracts.check_value(finite), [])
+        missing = copy.deepcopy(finite)
+        missing["details"].pop("deadline")
+        self.assertTrue(self.contracts.check_value(missing), "finite_detachment_lost_deadline")
+        missing = copy.deepcopy(event)
+        missing["details"].pop("detached_by")
+        self.assertTrue(self.contracts.check_value(missing), "detachment_lost_occurrence")
+        overflow = copy.deepcopy(event)
+        overflow["details"]["detached_by"] = "1/2/3/18446744073709551616"
+        self.assertEqual([(d.code, d.pointer) for d in self.contracts.check_value(overflow)],
+                         [("u64-out-of-range", "/details/detached_by")])
+        wrong = copy.deepcopy(event)
+        wrong["details"]["deadline"] = "1000000000"
+        self.assertTrue(self.contracts.check_value(wrong), "infinite_detachment_gained_finite_deadline")
+
+    def test_actual_writer_will_events_retain_occurrence_but_never_payload(self):
+        base = {"format": "mqttiumd.product-event", "schema_version": 1,
+                "seq": "1", "pid": 1, "operation": OPERATION, "will": copy.deepcopy(OPERATION)}
+        events = [
+            {**base, "kind": "will_installed", "details": {
+                "topic_bytes": len(TOPIC), "payload_bytes": len(PAYLOAD), "authority": "durable_open_commit"}},
+            {**base, "kind": "will_decided", "details": {
+                "publish": True, "session": "9", "authority": "durable_end_commit"}},
+            {**base, "kind": "will_admitted", "details": {
+                "publication": "1/2/3/11", "targets": 1, "authority": "durable_admission_commit"}},
+        ]
+        for event in events:
+            self.assertEqual(self.contracts.check_value(event), [], event["kind"])
+            invalid = copy.deepcopy(event)
+            invalid["details"]["payload"] = "offline"
+            self.assertTrue(self.contracts.check_value(invalid), "will_bytes_in_product_event")
+        invalid = copy.deepcopy(events[0])
+        invalid["will"]["sequence"] = "18446744073709551616"
+        self.assertEqual([(d.code, d.pointer) for d in self.contracts.check_value(invalid)],
+                         [("u64-out-of-range", "/will/sequence")])

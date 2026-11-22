@@ -1,0 +1,20 @@
+{
+  "format": "mqttiumd.product-event",
+  "schema_version": 1,
+  "seq": "30",
+  "pid": 1,
+  "kind": "session_changed",
+  "operation": {
+    "incarnation": "1",
+    "epoch": "1",
+    "owner": "0",
+    "sequence": "29"
+  },
+  "details": {
+    "action": "Detached",
+    "session": "4",
+    "expiry": "Never",
+    "detached_by": "1/1/0/29",
+    "deadline": "1"
+  }
+}

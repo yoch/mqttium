@@ -1,0 +1,2732 @@
+{
+  "application_budgets": {
+    "archive_budget": 8589934592,
+    "budget": 33554432,
+    "hot_limit": 8192,
+    "producer_budget": 67108864,
+    "segment_limit": 32768,
+    "segment_rows": 512
+  },
+  "application_source": "5f37e61735a6590675e7ed8b1bf103e4050c28bf",
+  "authorized_role_guard": "MQTT5 0x87 with valid TLS client certificate",
+  "broker_binary_sha256": "9ef097977c2cb86669e11e98d7fbceeac87a4f86fd6a24c7deb76ea9c31bf119",
+  "broker_source_sha": "51be4079f7ee42f46500e993315eddc971f0a8d4",
+  "charged_backup": {
+    "charged_events": 131293,
+    "copy_result": {
+      "counts": {
+        "history-dashboard-1": 131493,
+        "history-dashboard-2": 131493
+      },
+      "envelope_sha256": "c72a49cda39b95e4320597956a9190a086af8bcd4e48cd40bad78abe5440ae69",
+      "streams": {
+        "capteur-1": "f9d77b41ae514cf2972b0a7ffb2ca592",
+        "capteur-2": "0b2e57d6a7244fcc9e53e05467d15bab",
+        "capteur-3": "c066830798f240c0a3455c652047a8ec",
+        "capteur-4": "71c5ad7be1c7429abd60ac48201b50ab",
+        "capteur-5": "4c54d67fd0df4adc8c1e4510593d022b",
+        "capteur-6": "b3983d0d5a4d4b83817289fab71609ed",
+        "capteur-7": "2543dbb2298c4ac28c1730aedb5a936a",
+        "capteur-8": "1f576c8f044944fb9507c3c467f212af"
+      }
+    },
+    "end_of_primary": 130893,
+    "fence": {
+      "backup_id": "dd7038908ec14ababe979bce58fff4b9",
+      "manifest_sha256": "e95b91a3a83f541adf01cbd5300a18eec76c544c7776d405faa9f24cf4203d12",
+      "target": "/workspace/rc-qualification/mqttiumd-operated-vm85od37/restored"
+    },
+    "final_events": 131493,
+    "pending_at_backup": 273,
+    "stopped": {
+      "exits": {
+        "broker-history": 0,
+        "broker-live": 0,
+        "capteur-1": 0,
+        "capteur-2": 0,
+        "capteur-3": 0,
+        "capteur-4": 0,
+        "capteur-5": 0,
+        "capteur-6": 0,
+        "capteur-7": 0,
+        "capteur-8": 0,
+        "history-dashboard-1": 0,
+        "live-dashboard": 0
+      },
+      "known_backlog_drained": false
+    }
+  },
+  "component_sha256": {
+    "common.py": "eb28d065e27f6d47dfbb02838418d3f3cbd5a833ab5e04a03a5ab02d8ac1ad0b",
+    "forward_client.py": "107bae1ec989bd05e479c198b7cb6ad7bae0ebe0c0081b9ffb4d789d4f363585",
+    "forward_store.py": "b20e442f6bff275405d59e3e3c740f7b450c85624b04dea82e1ff22053071eda",
+    "operate.py": "b51af6c8e6db140858a4e70353a1e27b16b0a7769ce524cfec333694c733fa45",
+    "rc_reception.py": "791ba726e8f08ae4b7cfd34124d5fadc244a7ee81a1628583e6f97468e72d8c6",
+    "segment_admin.py": "0467ef1d41343541eb8806c5169e15864f8fc3f8a55568c53a677c8ad68b43fc",
+    "segment_store.py": "fab0848379d884e7d80e41d9bd82ad553bf925e53ca85e5fc88555bf56db51c9",
+    "site_backup.py": "645bc6ea33df5f66bf72627f73fa9419aa1cc092a9cf3ec8f31e0592a968aedd",
+    "site_health.py": "1ae61529558d7d5c6459fe19e291efeaf8d2e6bb7132765cff05ac18f8ea5ce5",
+    "site_ops.py": "957bdeec575a63340e308de925668d179aac1399242fe6658bb874aba4e06d62",
+    "site_supervisor.py": "629ab829454ae2d03287623d48f2581674d9b8b2547e4ef9c4ac8f39e61b3d08",
+    "split_client.py": "1d36fe0406976be43e26c72b2d99ab10f0f4ee4d69eee939f8c0f1d82bfae868",
+    "split_reception.py": "43c6db4b133fe69fa04d3633058caf9debcc45f0523661ab1281d6339fe871e0"
+  },
+  "demo_certificate_horizon": {
+    "certificates": 26,
+    "checked_remaining_s": 259200,
+    "demonstration_days": 7,
+    "generator_sha256": "e014488e63fd856e88df8fc9c0d24fd2d5c2cb28aaa643b4aeaf5f2e171b2ac6",
+    "status": "PASS"
+  },
+  "dense_archive": {
+    "cold": {
+      "allocated_directory_bytes": 16777216,
+      "allocated_file_bytes": 218304512,
+      "directories": 4096,
+      "file_bytes": 188692947,
+      "files": 8192
+    },
+    "corruption": {
+      "altered": "archive_manifest_or_data_mismatch",
+      "missing": "archive_missing_segment"
+    },
+    "coverage": "dense/verify/dedup/export/restore/corruption completed; combined catalog build stopped at free-space floor",
+    "elapsed_s": 47.059598853986245,
+    "export_s": 33.080342812,
+    "recovery_s": 8.830096772,
+    "restore_s": 24.910999544,
+    "restored": {
+      "cold": {
+        "allocated_directory_bytes": 16777216,
+        "allocated_file_bytes": 218304512,
+        "directories": 4096,
+        "file_bytes": 188692947,
+        "files": 8192
+      },
+      "manifest": {
+        "archive_charge": 234881024,
+        "archive_id": "7321b30bba5f45c19cd637b7fd8d591e",
+        "archived_count": 2097152,
+        "format": "mqttiumd.pilot.history-backup.v1",
+        "hot_count": 0,
+        "identity": "dashboard-1",
+        "segment_count": 4096,
+        "sqlite_sha256": "410ae98f55c6b8eed45c03d25c7c9bd8bbc8de827dae0494024ad64c7c8f08ee",
+        "stream_count": 8,
+        "unique_count": 2097152
+      }
+    },
+    "state": {
+      "archive_budget": 8589934592,
+      "archive_charge": 234881024,
+      "archive_id": "7321b30bba5f45c19cd637b7fd8d591e",
+      "archived_count": 2097152,
+      "budget": 33554432,
+      "conflicts": 0,
+      "duplicates": 0,
+      "files": {
+        "database": 557056,
+        "shm": 32768,
+        "wal": 391432
+      },
+      "freelist_count": 43,
+      "hot_count": 0,
+      "hot_limit": 8192,
+      "identity": "dashboard-1",
+      "invalid": 0,
+      "last_unique_mono": null,
+      "mqtt_dup": 0,
+      "mqtt_received": 2097152,
+      "occupied_bytes": 981256,
+      "page_count": 136,
+      "segment_count": 4096,
+      "segment_limit": 32768,
+      "segment_rows": 512,
+      "stream_count": 8,
+      "subscribed": 0,
+      "unique_count": 2097152
+    },
+    "verified_duplicate_latency_ms": {
+      "max_ms": 8.356569,
+      "p50_ms": 2.490639,
+      "p95_ms": 3.215588,
+      "p99_ms": 8.356569,
+      "samples": 72
+    }
+  },
+  "extra_primary_restarts_by_role": {},
+  "final_primary_live": {
+    "connections": {
+      "capteur-1/live_producer_ready": 3,
+      "capteur-1/producer_ready": 3,
+      "capteur-2/live_producer_ready": 2,
+      "capteur-2/producer_ready": 2,
+      "capteur-3/live_producer_ready": 2,
+      "capteur-3/producer_ready": 2,
+      "capteur-4/live_producer_ready": 2,
+      "capteur-4/producer_ready": 2,
+      "capteur-5/live_producer_ready": 2,
+      "capteur-5/producer_ready": 2,
+      "capteur-6/live_producer_ready": 2,
+      "capteur-6/producer_ready": 2,
+      "capteur-7/live_producer_ready": 2,
+      "capteur-7/producer_ready": 2,
+      "capteur-8/live_producer_ready": 2,
+      "capteur-8/producer_ready": 2,
+      "history-dashboard-1/history_ready": 3,
+      "history-dashboard-2/history_ready": 3,
+      "live-dashboard/live_ready": 2
+    },
+    "drop_count_by_service": {
+      "capteur-1": 18,
+      "capteur-2": 15,
+      "capteur-3": 15,
+      "capteur-4": 14,
+      "capteur-5": 16,
+      "capteur-6": 14,
+      "capteur-7": 16,
+      "capteur-8": 17
+    },
+    "gaps": 145,
+    "invalid_latency": 0,
+    "latency": {
+      "maximum_ms_bucket": 479,
+      "p99_ms_rounded_up": 9,
+      "received": 130748
+    },
+    "max_gap_ms": 2918.51166,
+    "per_sensor": {
+      "capteur-1": {
+        "age_ms": 212.535246,
+        "last_interval_ms": 160.399867,
+        "sequence": 16362,
+        "stream": "f9d77b41ae514cf2972b0a7ffb2ca592"
+      },
+      "capteur-2": {
+        "age_ms": 193.273745,
+        "last_interval_ms": 159.72871,
+        "sequence": 16362,
+        "stream": "0b2e57d6a7244fcc9e53e05467d15bab"
+      },
+      "capteur-3": {
+        "age_ms": 171.806004,
+        "last_interval_ms": 160.556387,
+        "sequence": 16362,
+        "stream": "c066830798f240c0a3455c652047a8ec"
+      },
+      "capteur-4": {
+        "age_ms": 152.356361,
+        "last_interval_ms": 160.443447,
+        "sequence": 16362,
+        "stream": "71c5ad7be1c7429abd60ac48201b50ab"
+      },
+      "capteur-5": {
+        "age_ms": 132.543793,
+        "last_interval_ms": 159.713417,
+        "sequence": 16362,
+        "stream": "4c54d67fd0df4adc8c1e4510593d022b"
+      },
+      "capteur-6": {
+        "age_ms": 272.830957,
+        "last_interval_ms": 160.699937,
+        "sequence": 16361,
+        "stream": "b3983d0d5a4d4b83817289fab71609ed"
+      },
+      "capteur-7": {
+        "age_ms": 253.386161,
+        "last_interval_ms": 159.610752,
+        "sequence": 16361,
+        "stream": "2543dbb2298c4ac28c1730aedb5a936a"
+      },
+      "capteur-8": {
+        "age_ms": 232.893268,
+        "last_interval_ms": 160.643216,
+        "sequence": 16361,
+        "stream": "1f576c8f044944fb9507c3c467f212af"
+      }
+    },
+    "received": 130748,
+    "retained_presence": {
+      "capteur-1": "online",
+      "capteur-2": "online",
+      "capteur-3": "online",
+      "capteur-4": "online",
+      "capteur-5": "online",
+      "capteur-6": "online",
+      "capteur-7": "online",
+      "capteur-8": "online"
+    },
+    "window": {
+      "max_gap_ms": 385.884885,
+      "maximum_ms_bucket": 479,
+      "ordinals": [
+        15000,
+        105000
+      ],
+      "p99_ms_rounded_up": 8,
+      "received": 90000
+    }
+  },
+  "format": "mqttiumd.private-site.qualification.v1",
+  "hardware_qualification": "not_established",
+  "health_errors": {
+    "closed_guards": {
+      "damaged_archive": {
+        "diagnostic": null,
+        "last_exit": 0,
+        "launches": 1,
+        "paused": false,
+        "pid": null,
+        "ready": false,
+        "suspended": "archive_scrub_data_mismatch"
+      },
+      "missing_session": {
+        "diagnostic": null,
+        "last_exit": 1,
+        "launches": 2,
+        "paused": false,
+        "pid": null,
+        "ready": false,
+        "suspended": "history_session_missing"
+      }
+    },
+    "late_copy": "backup_stale_or_source_changed_reconcile",
+    "missing_store": {
+      "exit": 1,
+      "recreated": false
+    },
+    "source_fence_on_refused_restore": false,
+    "status": "PASS"
+  },
+  "minimum_available_bytes": 283463680,
+  "observations": 408,
+  "observed_generation_s": 2617.977131688,
+  "outbox_pressure": {
+    "at_refusal": {
+      "attempts": 0,
+      "blocked": 0,
+      "budget": 1048576,
+      "confirmed": 0,
+      "enqueued": 1260,
+      "files": {
+        "database": 380928,
+        "shm": 32768,
+        "wal": 0
+      },
+      "freelist_count": 0,
+      "head_attempts": 0,
+      "identity": "capteur-1",
+      "inflight": 0,
+      "last_ack_mono": null,
+      "last_ack_ns": null,
+      "last_reason": null,
+      "no_match": 0,
+      "occupied_bytes": 413696,
+      "oldest_age_ms": 1114.330116,
+      "oldest_ns": 1795043218107125884,
+      "page_count": 93,
+      "pending": 1260,
+      "quota": 0,
+      "rejected": 0,
+      "retries": 0,
+      "rows": 1260,
+      "streak": 0,
+      "stream": "b4689bb78fc54c3898833147e1872d57",
+      "unknown": 0
+    },
+    "database_page_limit": 93,
+    "levels": {
+      "70": {
+        "action": "Slow generation and restore HISTORY drain capacity.",
+        "cause": "outbox_page_capacity",
+        "percent": 70.968,
+        "role": "capteur-1",
+        "severity": "notice",
+        "threshold": 70
+      },
+      "85": {
+        "action": "Slow generation and restore HISTORY drain capacity.",
+        "cause": "outbox_page_capacity",
+        "percent": 86.022,
+        "role": "capteur-1",
+        "severity": "warning",
+        "threshold": 85
+      },
+      "95": {
+        "action": "Slow generation and restore HISTORY drain capacity.",
+        "cause": "outbox_page_capacity",
+        "percent": 95.699,
+        "role": "capteur-1",
+        "severity": "critical",
+        "threshold": 95
+      }
+    },
+    "refusal": "local_disk_budget_or_filesystem_full",
+    "status": "PASS"
+  },
+  "peaks": {
+    "archive_segments_per_receiver": 256,
+    "charged_archive_bytes": 14680064,
+    "history_references": 128,
+    "hot_rows": 4044,
+    "outbox_bytes": 4397064
+  },
+  "phases": [
+    {
+      "actors": {
+        "broker-history": {
+          "diagnostic": null,
+          "last_exit": null,
+          "launches": 1,
+          "paused": false,
+          "pid": 2007851,
+          "ready": true,
+          "suspended": null
+        },
+        "broker-live": {
+          "diagnostic": null,
+          "last_exit": null,
+          "launches": 1,
+          "paused": false,
+          "pid": 2007850,
+          "ready": true,
+          "suspended": null
+        },
+        "capteur-1": {
+          "diagnostic": null,
+          "last_exit": null,
+          "launches": 1,
+          "paused": false,
+          "pid": 2007864,
+          "ready": true,
+          "suspended": null
+        },
+        "capteur-2": {
+          "diagnostic": null,
+          "last_exit": null,
+          "launches": 1,
+          "paused": false,
+          "pid": 2007865,
+          "ready": true,
+          "suspended": null
+        },
+        "capteur-3": {
+          "diagnostic": null,
+          "last_exit": null,
+          "launches": 1,
+          "paused": false,
+          "pid": 2007866,
+          "ready": true,
+          "suspended": null
+        },
+        "capteur-4": {
+          "diagnostic": null,
+          "last_exit": null,
+          "launches": 1,
+          "paused": false,
+          "pid": 2007867,
+          "ready": true,
+          "suspended": null
+        },
+        "capteur-5": {
+          "diagnostic": null,
+          "last_exit": null,
+          "launches": 1,
+          "paused": false,
+          "pid": 2007868,
+          "ready": true,
+          "suspended": null
+        },
+        "capteur-6": {
+          "diagnostic": null,
+          "last_exit": null,
+          "launches": 1,
+          "paused": false,
+          "pid": 2007869,
+          "ready": true,
+          "suspended": null
+        },
+        "capteur-7": {
+          "diagnostic": null,
+          "last_exit": null,
+          "launches": 1,
+          "paused": false,
+          "pid": 2007870,
+          "ready": true,
+          "suspended": null
+        },
+        "capteur-8": {
+          "diagnostic": null,
+          "last_exit": null,
+          "launches": 1,
+          "paused": false,
+          "pid": 2007871,
+          "ready": true,
+          "suspended": null
+        },
+        "history-dashboard-1": {
+          "diagnostic": null,
+          "last_exit": null,
+          "launches": 1,
+          "paused": false,
+          "pid": 2007858,
+          "ready": true,
+          "suspended": null
+        },
+        "history-dashboard-2": {
+          "diagnostic": null,
+          "last_exit": null,
+          "launches": 1,
+          "paused": false,
+          "pid": 2007859,
+          "ready": true,
+          "suspended": null
+        },
+        "live-dashboard": {
+          "diagnostic": null,
+          "last_exit": null,
+          "launches": 1,
+          "paused": false,
+          "pid": 2007862,
+          "ready": true,
+          "suspended": null
+        }
+      },
+      "confirmed": 0,
+      "enqueued": 0,
+      "live": 0,
+      "observed_mono_ns": 273629908061023,
+      "pending": 0,
+      "phase": "ready",
+      "supervisor_pid": 2007849
+    },
+    {
+      "actors": {
+        "broker-history": {
+          "diagnostic": null,
+          "last_exit": null,
+          "launches": 1,
+          "paused": false,
+          "pid": 2007851,
+          "ready": true,
+          "suspended": null
+        },
+        "broker-live": {
+          "diagnostic": null,
+          "last_exit": null,
+          "launches": 1,
+          "paused": false,
+          "pid": 2007850,
+          "ready": true,
+          "suspended": null
+        },
+        "capteur-1": {
+          "diagnostic": null,
+          "last_exit": null,
+          "launches": 1,
+          "paused": false,
+          "pid": 2007864,
+          "ready": true,
+          "suspended": null
+        },
+        "capteur-2": {
+          "diagnostic": null,
+          "last_exit": null,
+          "launches": 1,
+          "paused": false,
+          "pid": 2007865,
+          "ready": true,
+          "suspended": null
+        },
+        "capteur-3": {
+          "diagnostic": null,
+          "last_exit": null,
+          "launches": 1,
+          "paused": false,
+          "pid": 2007866,
+          "ready": true,
+          "suspended": null
+        },
+        "capteur-4": {
+          "diagnostic": null,
+          "last_exit": null,
+          "launches": 1,
+          "paused": false,
+          "pid": 2007867,
+          "ready": true,
+          "suspended": null
+        },
+        "capteur-5": {
+          "diagnostic": null,
+          "last_exit": null,
+          "launches": 1,
+          "paused": false,
+          "pid": 2007868,
+          "ready": true,
+          "suspended": null
+        },
+        "capteur-6": {
+          "diagnostic": null,
+          "last_exit": null,
+          "launches": 1,
+          "paused": false,
+          "pid": 2007869,
+          "ready": true,
+          "suspended": null
+        },
+        "capteur-7": {
+          "diagnostic": null,
+          "last_exit": null,
+          "launches": 1,
+          "paused": false,
+          "pid": 2007870,
+          "ready": true,
+          "suspended": null
+        },
+        "capteur-8": {
+          "diagnostic": null,
+          "last_exit": null,
+          "launches": 1,
+          "paused": false,
+          "pid": 2007871,
+          "ready": true,
+          "suspended": null
+        },
+        "history-dashboard-1": {
+          "diagnostic": null,
+          "last_exit": null,
+          "launches": 1,
+          "paused": false,
+          "pid": 2007858,
+          "ready": true,
+          "suspended": null
+        },
+        "history-dashboard-2": {
+          "diagnostic": null,
+          "last_exit": 0,
+          "launches": 1,
+          "paused": true,
+          "pid": null,
+          "ready": false,
+          "suspended": null
+        },
+        "live-dashboard": {
+          "diagnostic": null,
+          "last_exit": null,
+          "launches": 1,
+          "paused": false,
+          "pid": 2007862,
+          "ready": true,
+          "suspended": null
+        }
+      },
+      "confirmed": 15096,
+      "enqueued": 105006,
+      "live": 104999,
+      "observed_mono_ns": 275730501231229,
+      "pending": 89910,
+      "phase": "history_saturated",
+      "references": 127,
+      "supervisor_pid": 2007849,
+      "sustained_s": 1800.865989998
+    },
+    {
+      "actors": {
+        "broker-history": {
+          "diagnostic": null,
+          "last_exit": null,
+          "launches": 1,
+          "paused": false,
+          "pid": 2007851,
+          "ready": true,
+          "suspended": null
+        },
+        "broker-live": {
+          "diagnostic": null,
+          "last_exit": null,
+          "launches": 1,
+          "paused": false,
+          "pid": 2007850,
+          "ready": true,
+          "suspended": null
+        },
+        "capteur-1": {
+          "diagnostic": null,
+          "last_exit": null,
+          "launches": 1,
+          "paused": false,
+          "pid": 2007864,
+          "ready": true,
+          "suspended": null
+        },
+        "capteur-2": {
+          "diagnostic": null,
+          "last_exit": null,
+          "launches": 1,
+          "paused": false,
+          "pid": 2007865,
+          "ready": true,
+          "suspended": null
+        },
+        "capteur-3": {
+          "diagnostic": null,
+          "last_exit": null,
+          "launches": 1,
+          "paused": false,
+          "pid": 2007866,
+          "ready": true,
+          "suspended": null
+        },
+        "capteur-4": {
+          "diagnostic": null,
+          "last_exit": null,
+          "launches": 1,
+          "paused": false,
+          "pid": 2007867,
+          "ready": true,
+          "suspended": null
+        },
+        "capteur-5": {
+          "diagnostic": null,
+          "last_exit": null,
+          "launches": 1,
+          "paused": false,
+          "pid": 2007868,
+          "ready": true,
+          "suspended": null
+        },
+        "capteur-6": {
+          "diagnostic": null,
+          "last_exit": null,
+          "launches": 1,
+          "paused": false,
+          "pid": 2007869,
+          "ready": true,
+          "suspended": null
+        },
+        "capteur-7": {
+          "diagnostic": null,
+          "last_exit": null,
+          "launches": 1,
+          "paused": false,
+          "pid": 2007870,
+          "ready": true,
+          "suspended": null
+        },
+        "capteur-8": {
+          "diagnostic": null,
+          "last_exit": null,
+          "launches": 1,
+          "paused": false,
+          "pid": 2007871,
+          "ready": true,
+          "suspended": null
+        },
+        "history-dashboard-1": {
+          "diagnostic": null,
+          "last_exit": null,
+          "launches": 1,
+          "paused": false,
+          "pid": 2007858,
+          "ready": true,
+          "suspended": null
+        },
+        "history-dashboard-2": {
+          "diagnostic": null,
+          "last_exit": 0,
+          "launches": 2,
+          "paused": false,
+          "pid": 2011152,
+          "ready": true,
+          "suspended": null
+        },
+        "live-dashboard": {
+          "diagnostic": null,
+          "last_exit": null,
+          "launches": 1,
+          "paused": false,
+          "pid": 2007862,
+          "ready": true,
+          "suspended": null
+        }
+      },
+      "admissions_per_s": 228.80142788686908,
+      "confirmed": 130147,
+      "duration_s": 502.842141601,
+      "enqueued": 130148,
+      "generated_per_s": 49.99978705036603,
+      "live": 130143,
+      "live_window": {
+        "max_gap_ms": 385.884885,
+        "maximum_ms_bucket": 479,
+        "ordinals": [
+          15000,
+          105000
+        ],
+        "p99_ms_rounded_up": 8,
+        "received": 90000
+      },
+      "net_per_s": 178.80164083650305,
+      "observed_mono_ns": 276233343372830,
+      "pending": 1,
+      "phase": "history_caught_up",
+      "quota_replies": 45796,
+      "supervisor_pid": 2007849
+    },
+    {
+      "actors": {
+        "broker-history": {
+          "diagnostic": null,
+          "last_exit": 0,
+          "launches": 1,
+          "paused": true,
+          "pid": null,
+          "ready": false,
+          "suspended": null
+        },
+        "broker-live": {
+          "diagnostic": null,
+          "last_exit": null,
+          "launches": 1,
+          "paused": false,
+          "pid": 2007850,
+          "ready": true,
+          "suspended": null
+        },
+        "capteur-1": {
+          "diagnostic": null,
+          "last_exit": null,
+          "launches": 1,
+          "paused": false,
+          "pid": 2007864,
+          "ready": true,
+          "suspended": null
+        },
+        "capteur-2": {
+          "diagnostic": null,
+          "last_exit": null,
+          "launches": 1,
+          "paused": false,
+          "pid": 2007865,
+          "ready": true,
+          "suspended": null
+        },
+        "capteur-3": {
+          "diagnostic": null,
+          "last_exit": null,
+          "launches": 1,
+          "paused": false,
+          "pid": 2007866,
+          "ready": true,
+          "suspended": null
+        },
+        "capteur-4": {
+          "diagnostic": null,
+          "last_exit": null,
+          "launches": 1,
+          "paused": false,
+          "pid": 2007867,
+          "ready": true,
+          "suspended": null
+        },
+        "capteur-5": {
+          "diagnostic": null,
+          "last_exit": null,
+          "launches": 1,
+          "paused": false,
+          "pid": 2007868,
+          "ready": true,
+          "suspended": null
+        },
+        "capteur-6": {
+          "diagnostic": null,
+          "last_exit": null,
+          "launches": 1,
+          "paused": false,
+          "pid": 2007869,
+          "ready": true,
+          "suspended": null
+        },
+        "capteur-7": {
+          "diagnostic": null,
+          "last_exit": null,
+          "launches": 1,
+          "paused": false,
+          "pid": 2007870,
+          "ready": true,
+          "suspended": null
+        },
+        "capteur-8": {
+          "diagnostic": null,
+          "last_exit": null,
+          "launches": 1,
+          "paused": false,
+          "pid": 2007871,
+          "ready": true,
+          "suspended": null
+        },
+        "history-dashboard-1": {
+          "diagnostic": "connect_failed",
+          "last_exit": null,
+          "launches": 1,
+          "paused": false,
+          "pid": 2007858,
+          "ready": true,
+          "suspended": null
+        },
+        "history-dashboard-2": {
+          "diagnostic": "connect_failed",
+          "last_exit": 0,
+          "launches": 2,
+          "paused": false,
+          "pid": 2011152,
+          "ready": true,
+          "suspended": null
+        },
+        "live-dashboard": {
+          "diagnostic": null,
+          "last_exit": null,
+          "launches": 1,
+          "paused": false,
+          "pid": 2007862,
+          "ready": true,
+          "suspended": null
+        }
+      },
+      "confirmed": 130150,
+      "enqueued": 130253,
+      "expected_interruption": true,
+      "live": 130250,
+      "observed_mono_ns": 276235442230554,
+      "pending": 103,
+      "phase": "history_stopped_other_lane_progress",
+      "supervisor_pid": 2007849
+    },
+    {
+      "actors": {
+        "broker-history": {
+          "diagnostic": null,
+          "last_exit": 0,
+          "launches": 2,
+          "paused": false,
+          "pid": 2011712,
+          "ready": true,
+          "suspended": null
+        },
+        "broker-live": {
+          "diagnostic": null,
+          "last_exit": null,
+          "launches": 1,
+          "paused": false,
+          "pid": 2007850,
+          "ready": true,
+          "suspended": null
+        },
+        "capteur-1": {
+          "diagnostic": null,
+          "last_exit": null,
+          "launches": 1,
+          "paused": false,
+          "pid": 2007864,
+          "ready": true,
+          "suspended": null
+        },
+        "capteur-2": {
+          "diagnostic": null,
+          "last_exit": null,
+          "launches": 1,
+          "paused": false,
+          "pid": 2007865,
+          "ready": true,
+          "suspended": null
+        },
+        "capteur-3": {
+          "diagnostic": null,
+          "last_exit": null,
+          "launches": 1,
+          "paused": false,
+          "pid": 2007866,
+          "ready": true,
+          "suspended": null
+        },
+        "capteur-4": {
+          "diagnostic": null,
+          "last_exit": null,
+          "launches": 1,
+          "paused": false,
+          "pid": 2007867,
+          "ready": true,
+          "suspended": null
+        },
+        "capteur-5": {
+          "diagnostic": null,
+          "last_exit": null,
+          "launches": 1,
+          "paused": false,
+          "pid": 2007868,
+          "ready": true,
+          "suspended": null
+        },
+        "capteur-6": {
+          "diagnostic": null,
+          "last_exit": null,
+          "launches": 1,
+          "paused": false,
+          "pid": 2007869,
+          "ready": true,
+          "suspended": null
+        },
+        "capteur-7": {
+          "diagnostic": null,
+          "last_exit": null,
+          "launches": 1,
+          "paused": false,
+          "pid": 2007870,
+          "ready": true,
+          "suspended": null
+        },
+        "capteur-8": {
+          "diagnostic": null,
+          "last_exit": null,
+          "launches": 1,
+          "paused": false,
+          "pid": 2007871,
+          "ready": true,
+          "suspended": null
+        },
+        "history-dashboard-1": {
+          "diagnostic": "connect_failed",
+          "last_exit": null,
+          "launches": 1,
+          "paused": false,
+          "pid": 2007858,
+          "ready": true,
+          "suspended": null
+        },
+        "history-dashboard-2": {
+          "diagnostic": "connect_failed",
+          "last_exit": 0,
+          "launches": 2,
+          "paused": false,
+          "pid": 2011152,
+          "ready": true,
+          "suspended": null
+        },
+        "live-dashboard": {
+          "diagnostic": null,
+          "last_exit": null,
+          "launches": 1,
+          "paused": false,
+          "pid": 2007862,
+          "ready": true,
+          "suspended": null
+        }
+      },
+      "confirmed": 130361,
+      "enqueued": 130362,
+      "live": 130356,
+      "observed_mono_ns": 276237609386664,
+      "pending": 1,
+      "phase": "history_restarted",
+      "supervisor_pid": 2007849
+    },
+    {
+      "actors": {
+        "broker-history": {
+          "diagnostic": null,
+          "last_exit": 0,
+          "launches": 2,
+          "paused": false,
+          "pid": 2011712,
+          "ready": true,
+          "suspended": null
+        },
+        "broker-live": {
+          "diagnostic": null,
+          "last_exit": 0,
+          "launches": 1,
+          "paused": true,
+          "pid": null,
+          "ready": false,
+          "suspended": null
+        },
+        "capteur-1": {
+          "diagnostic": null,
+          "last_exit": null,
+          "launches": 1,
+          "paused": false,
+          "pid": 2007864,
+          "ready": true,
+          "suspended": null
+        },
+        "capteur-2": {
+          "diagnostic": null,
+          "last_exit": null,
+          "launches": 1,
+          "paused": false,
+          "pid": 2007865,
+          "ready": true,
+          "suspended": null
+        },
+        "capteur-3": {
+          "diagnostic": null,
+          "last_exit": null,
+          "launches": 1,
+          "paused": false,
+          "pid": 2007866,
+          "ready": true,
+          "suspended": null
+        },
+        "capteur-4": {
+          "diagnostic": null,
+          "last_exit": null,
+          "launches": 1,
+          "paused": false,
+          "pid": 2007867,
+          "ready": true,
+          "suspended": null
+        },
+        "capteur-5": {
+          "diagnostic": null,
+          "last_exit": null,
+          "launches": 1,
+          "paused": false,
+          "pid": 2007868,
+          "ready": true,
+          "suspended": null
+        },
+        "capteur-6": {
+          "diagnostic": null,
+          "last_exit": null,
+          "launches": 1,
+          "paused": false,
+          "pid": 2007869,
+          "ready": true,
+          "suspended": null
+        },
+        "capteur-7": {
+          "diagnostic": null,
+          "last_exit": null,
+          "launches": 1,
+          "paused": false,
+          "pid": 2007870,
+          "ready": true,
+          "suspended": null
+        },
+        "capteur-8": {
+          "diagnostic": null,
+          "last_exit": null,
+          "launches": 1,
+          "paused": false,
+          "pid": 2007871,
+          "ready": true,
+          "suspended": null
+        },
+        "history-dashboard-1": {
+          "diagnostic": "connect_failed",
+          "last_exit": null,
+          "launches": 1,
+          "paused": false,
+          "pid": 2007858,
+          "ready": true,
+          "suspended": null
+        },
+        "history-dashboard-2": {
+          "diagnostic": "connect_failed",
+          "last_exit": 0,
+          "launches": 2,
+          "paused": false,
+          "pid": 2011152,
+          "ready": true,
+          "suspended": null
+        },
+        "live-dashboard": {
+          "diagnostic": null,
+          "last_exit": null,
+          "launches": 1,
+          "paused": false,
+          "pid": 2007862,
+          "ready": true,
+          "suspended": null
+        }
+      },
+      "confirmed": 130467,
+      "enqueued": 130468,
+      "expected_interruption": true,
+      "live": 130365,
+      "observed_mono_ns": 276239729873688,
+      "pending": 1,
+      "phase": "live_stopped_other_lane_progress",
+      "supervisor_pid": 2007849
+    },
+    {
+      "actors": {
+        "broker-history": {
+          "diagnostic": null,
+          "last_exit": 0,
+          "launches": 2,
+          "paused": false,
+          "pid": 2011712,
+          "ready": true,
+          "suspended": null
+        },
+        "broker-live": {
+          "diagnostic": null,
+          "last_exit": 0,
+          "launches": 2,
+          "paused": false,
+          "pid": 2011728,
+          "ready": true,
+          "suspended": null
+        },
+        "capteur-1": {
+          "diagnostic": null,
+          "last_exit": null,
+          "launches": 1,
+          "paused": false,
+          "pid": 2007864,
+          "ready": true,
+          "suspended": null
+        },
+        "capteur-2": {
+          "diagnostic": null,
+          "last_exit": null,
+          "launches": 1,
+          "paused": false,
+          "pid": 2007865,
+          "ready": true,
+          "suspended": null
+        },
+        "capteur-3": {
+          "diagnostic": null,
+          "last_exit": null,
+          "launches": 1,
+          "paused": false,
+          "pid": 2007866,
+          "ready": true,
+          "suspended": null
+        },
+        "capteur-4": {
+          "diagnostic": null,
+          "last_exit": null,
+          "launches": 1,
+          "paused": false,
+          "pid": 2007867,
+          "ready": true,
+          "suspended": null
+        },
+        "capteur-5": {
+          "diagnostic": null,
+          "last_exit": null,
+          "launches": 1,
+          "paused": false,
+          "pid": 2007868,
+          "ready": true,
+          "suspended": null
+        },
+        "capteur-6": {
+          "diagnostic": null,
+          "last_exit": null,
+          "launches": 1,
+          "paused": false,
+          "pid": 2007869,
+          "ready": true,
+          "suspended": null
+        },
+        "capteur-7": {
+          "diagnostic": null,
+          "last_exit": null,
+          "launches": 1,
+          "paused": false,
+          "pid": 2007870,
+          "ready": true,
+          "suspended": null
+        },
+        "capteur-8": {
+          "diagnostic": null,
+          "last_exit": null,
+          "launches": 1,
+          "paused": false,
+          "pid": 2007871,
+          "ready": true,
+          "suspended": null
+        },
+        "history-dashboard-1": {
+          "diagnostic": "connect_failed",
+          "last_exit": null,
+          "launches": 1,
+          "paused": false,
+          "pid": 2007858,
+          "ready": true,
+          "suspended": null
+        },
+        "history-dashboard-2": {
+          "diagnostic": "connect_failed",
+          "last_exit": 0,
+          "launches": 2,
+          "paused": false,
+          "pid": 2011152,
+          "ready": true,
+          "suspended": null
+        },
+        "live-dashboard": {
+          "diagnostic": null,
+          "last_exit": null,
+          "launches": 1,
+          "paused": false,
+          "pid": 2007862,
+          "ready": true,
+          "suspended": null
+        }
+      },
+      "confirmed": 130575,
+      "enqueued": 130575,
+      "live": 130423,
+      "observed_mono_ns": 276241875811483,
+      "pending": 0,
+      "phase": "live_restarted",
+      "supervisor_pid": 2007849
+    },
+    {
+      "actors": {
+        "broker-history": {
+          "diagnostic": null,
+          "last_exit": 0,
+          "launches": 2,
+          "paused": false,
+          "pid": 2011712,
+          "ready": true,
+          "suspended": null
+        },
+        "broker-live": {
+          "diagnostic": null,
+          "last_exit": 0,
+          "launches": 2,
+          "paused": false,
+          "pid": 2011728,
+          "ready": true,
+          "suspended": null
+        },
+        "capteur-1": {
+          "diagnostic": null,
+          "last_exit": -9,
+          "launches": 2,
+          "paused": false,
+          "pid": 2011742,
+          "ready": true,
+          "suspended": null
+        },
+        "capteur-2": {
+          "diagnostic": null,
+          "last_exit": null,
+          "launches": 1,
+          "paused": false,
+          "pid": 2007865,
+          "ready": true,
+          "suspended": null
+        },
+        "capteur-3": {
+          "diagnostic": null,
+          "last_exit": null,
+          "launches": 1,
+          "paused": false,
+          "pid": 2007866,
+          "ready": true,
+          "suspended": null
+        },
+        "capteur-4": {
+          "diagnostic": null,
+          "last_exit": null,
+          "launches": 1,
+          "paused": false,
+          "pid": 2007867,
+          "ready": true,
+          "suspended": null
+        },
+        "capteur-5": {
+          "diagnostic": null,
+          "last_exit": null,
+          "launches": 1,
+          "paused": false,
+          "pid": 2007868,
+          "ready": true,
+          "suspended": null
+        },
+        "capteur-6": {
+          "diagnostic": null,
+          "last_exit": null,
+          "launches": 1,
+          "paused": false,
+          "pid": 2007869,
+          "ready": true,
+          "suspended": null
+        },
+        "capteur-7": {
+          "diagnostic": null,
+          "last_exit": null,
+          "launches": 1,
+          "paused": false,
+          "pid": 2007870,
+          "ready": true,
+          "suspended": null
+        },
+        "capteur-8": {
+          "diagnostic": null,
+          "last_exit": null,
+          "launches": 1,
+          "paused": false,
+          "pid": 2007871,
+          "ready": true,
+          "suspended": null
+        },
+        "history-dashboard-1": {
+          "diagnostic": "connect_failed",
+          "last_exit": null,
+          "launches": 1,
+          "paused": false,
+          "pid": 2007858,
+          "ready": true,
+          "suspended": null
+        },
+        "history-dashboard-2": {
+          "diagnostic": "connect_failed",
+          "last_exit": 0,
+          "launches": 2,
+          "paused": false,
+          "pid": 2011152,
+          "ready": true,
+          "suspended": null
+        },
+        "live-dashboard": {
+          "diagnostic": null,
+          "last_exit": null,
+          "launches": 1,
+          "paused": false,
+          "pid": 2007862,
+          "ready": true,
+          "suspended": null
+        }
+      },
+      "confirmed": 130681,
+      "enqueued": 130682,
+      "expected_interruption": true,
+      "killed_pid": 2007864,
+      "live": 130531,
+      "observed_mono_ns": 276244022254277,
+      "pending": 1,
+      "phase": "producer_killed_and_restarted",
+      "supervisor_pid": 2007849
+    },
+    {
+      "actors": {
+        "broker-history": {
+          "diagnostic": null,
+          "last_exit": 0,
+          "launches": 2,
+          "paused": false,
+          "pid": 2011712,
+          "ready": true,
+          "suspended": null
+        },
+        "broker-live": {
+          "diagnostic": null,
+          "last_exit": 0,
+          "launches": 2,
+          "paused": false,
+          "pid": 2011728,
+          "ready": true,
+          "suspended": null
+        },
+        "capteur-1": {
+          "diagnostic": null,
+          "last_exit": -9,
+          "launches": 2,
+          "paused": false,
+          "pid": 2011742,
+          "ready": true,
+          "suspended": null
+        },
+        "capteur-2": {
+          "diagnostic": null,
+          "last_exit": null,
+          "launches": 1,
+          "paused": false,
+          "pid": 2007865,
+          "ready": true,
+          "suspended": null
+        },
+        "capteur-3": {
+          "diagnostic": null,
+          "last_exit": null,
+          "launches": 1,
+          "paused": false,
+          "pid": 2007866,
+          "ready": true,
+          "suspended": null
+        },
+        "capteur-4": {
+          "diagnostic": null,
+          "last_exit": null,
+          "launches": 1,
+          "paused": false,
+          "pid": 2007867,
+          "ready": true,
+          "suspended": null
+        },
+        "capteur-5": {
+          "diagnostic": null,
+          "last_exit": null,
+          "launches": 1,
+          "paused": false,
+          "pid": 2007868,
+          "ready": true,
+          "suspended": null
+        },
+        "capteur-6": {
+          "diagnostic": null,
+          "last_exit": null,
+          "launches": 1,
+          "paused": false,
+          "pid": 2007869,
+          "ready": true,
+          "suspended": null
+        },
+        "capteur-7": {
+          "diagnostic": null,
+          "last_exit": null,
+          "launches": 1,
+          "paused": false,
+          "pid": 2007870,
+          "ready": true,
+          "suspended": null
+        },
+        "capteur-8": {
+          "diagnostic": null,
+          "last_exit": null,
+          "launches": 1,
+          "paused": false,
+          "pid": 2007871,
+          "ready": true,
+          "suspended": null
+        },
+        "history-dashboard-1": {
+          "diagnostic": "connect_failed",
+          "last_exit": 0,
+          "launches": 2,
+          "paused": false,
+          "pid": 2011749,
+          "ready": true,
+          "suspended": null
+        },
+        "history-dashboard-2": {
+          "diagnostic": "connect_failed",
+          "last_exit": 0,
+          "launches": 2,
+          "paused": false,
+          "pid": 2011152,
+          "ready": true,
+          "suspended": null
+        },
+        "live-dashboard": {
+          "diagnostic": null,
+          "last_exit": null,
+          "launches": 1,
+          "paused": false,
+          "pid": 2007862,
+          "ready": true,
+          "suspended": null
+        }
+      },
+      "confirmed": 130790,
+      "enqueued": 130790,
+      "live": 130638,
+      "observed_mono_ns": 276246179101809,
+      "pending": 0,
+      "phase": "history_consumer_restarted",
+      "supervisor_pid": 2007849
+    },
+    {
+      "actors": {
+        "broker-history": {
+          "diagnostic": null,
+          "last_exit": 0,
+          "launches": 2,
+          "paused": false,
+          "pid": 2011712,
+          "ready": true,
+          "suspended": null
+        },
+        "broker-live": {
+          "diagnostic": null,
+          "last_exit": 0,
+          "launches": 2,
+          "paused": false,
+          "pid": 2011728,
+          "ready": true,
+          "suspended": null
+        },
+        "capteur-1": {
+          "diagnostic": null,
+          "last_exit": -9,
+          "launches": 2,
+          "paused": false,
+          "pid": 2011742,
+          "ready": true,
+          "suspended": null
+        },
+        "capteur-2": {
+          "diagnostic": null,
+          "last_exit": null,
+          "launches": 1,
+          "paused": false,
+          "pid": 2007865,
+          "ready": true,
+          "suspended": null
+        },
+        "capteur-3": {
+          "diagnostic": null,
+          "last_exit": null,
+          "launches": 1,
+          "paused": false,
+          "pid": 2007866,
+          "ready": true,
+          "suspended": null
+        },
+        "capteur-4": {
+          "diagnostic": null,
+          "last_exit": null,
+          "launches": 1,
+          "paused": false,
+          "pid": 2007867,
+          "ready": true,
+          "suspended": null
+        },
+        "capteur-5": {
+          "diagnostic": null,
+          "last_exit": null,
+          "launches": 1,
+          "paused": false,
+          "pid": 2007868,
+          "ready": true,
+          "suspended": null
+        },
+        "capteur-6": {
+          "diagnostic": null,
+          "last_exit": null,
+          "launches": 1,
+          "paused": false,
+          "pid": 2007869,
+          "ready": true,
+          "suspended": null
+        },
+        "capteur-7": {
+          "diagnostic": null,
+          "last_exit": null,
+          "launches": 1,
+          "paused": false,
+          "pid": 2007870,
+          "ready": true,
+          "suspended": null
+        },
+        "capteur-8": {
+          "diagnostic": null,
+          "last_exit": null,
+          "launches": 1,
+          "paused": false,
+          "pid": 2007871,
+          "ready": true,
+          "suspended": null
+        },
+        "history-dashboard-1": {
+          "diagnostic": "connect_failed",
+          "last_exit": 0,
+          "launches": 2,
+          "paused": false,
+          "pid": 2011749,
+          "ready": true,
+          "suspended": null
+        },
+        "history-dashboard-2": {
+          "diagnostic": "connect_failed",
+          "last_exit": 0,
+          "launches": 2,
+          "paused": false,
+          "pid": 2011152,
+          "ready": true,
+          "suspended": null
+        },
+        "live-dashboard": {
+          "diagnostic": null,
+          "last_exit": null,
+          "launches": 1,
+          "paused": false,
+          "pid": 2007862,
+          "ready": true,
+          "suspended": null
+        }
+      },
+      "confirmed": 130893,
+      "enqueued": 130893,
+      "live": 130748,
+      "observed_mono_ns": 276248355361402,
+      "pending": 0,
+      "phase": "all_responsibilities_drained",
+      "supervisor_pid": 2007849
+    },
+    {
+      "actors": {
+        "broker-history": {
+          "diagnostic": null,
+          "last_exit": 0,
+          "launches": 2,
+          "paused": false,
+          "pid": 2011712,
+          "ready": true,
+          "suspended": null
+        },
+        "broker-live": {
+          "diagnostic": null,
+          "last_exit": 0,
+          "launches": 2,
+          "paused": false,
+          "pid": 2011728,
+          "ready": true,
+          "suspended": null
+        },
+        "capteur-1": {
+          "diagnostic": null,
+          "last_exit": -9,
+          "launches": 2,
+          "paused": false,
+          "pid": 2011742,
+          "ready": true,
+          "suspended": null
+        },
+        "capteur-2": {
+          "diagnostic": null,
+          "last_exit": null,
+          "launches": 1,
+          "paused": false,
+          "pid": 2007865,
+          "ready": true,
+          "suspended": null
+        },
+        "capteur-3": {
+          "diagnostic": null,
+          "last_exit": null,
+          "launches": 1,
+          "paused": false,
+          "pid": 2007866,
+          "ready": true,
+          "suspended": null
+        },
+        "capteur-4": {
+          "diagnostic": null,
+          "last_exit": null,
+          "launches": 1,
+          "paused": false,
+          "pid": 2007867,
+          "ready": true,
+          "suspended": null
+        },
+        "capteur-5": {
+          "diagnostic": null,
+          "last_exit": null,
+          "launches": 1,
+          "paused": false,
+          "pid": 2007868,
+          "ready": true,
+          "suspended": null
+        },
+        "capteur-6": {
+          "diagnostic": null,
+          "last_exit": null,
+          "launches": 1,
+          "paused": false,
+          "pid": 2007869,
+          "ready": true,
+          "suspended": null
+        },
+        "capteur-7": {
+          "diagnostic": null,
+          "last_exit": null,
+          "launches": 1,
+          "paused": false,
+          "pid": 2007870,
+          "ready": true,
+          "suspended": null
+        },
+        "capteur-8": {
+          "diagnostic": null,
+          "last_exit": null,
+          "launches": 1,
+          "paused": false,
+          "pid": 2007871,
+          "ready": true,
+          "suspended": null
+        },
+        "history-dashboard-1": {
+          "diagnostic": "connect_failed",
+          "last_exit": 0,
+          "launches": 2,
+          "paused": false,
+          "pid": 2011749,
+          "ready": true,
+          "suspended": null
+        },
+        "history-dashboard-2": {
+          "diagnostic": "connect_failed",
+          "last_exit": 0,
+          "launches": 2,
+          "paused": true,
+          "pid": null,
+          "ready": false,
+          "suspended": null
+        },
+        "live-dashboard": {
+          "diagnostic": null,
+          "last_exit": null,
+          "launches": 1,
+          "paused": false,
+          "pid": 2007862,
+          "ready": true,
+          "suspended": null
+        }
+      },
+      "confirmed": 131020,
+      "enqueued": 131293,
+      "live": 131148,
+      "observed_mono_ns": 276257068200287,
+      "pending": 273,
+      "phase": "charged_backup",
+      "supervisor_pid": 2007849
+    },
+    {
+      "actors": {
+        "broker-history": {
+          "diagnostic": null,
+          "last_exit": null,
+          "launches": 1,
+          "paused": false,
+          "pid": 2011810,
+          "ready": true,
+          "suspended": null
+        },
+        "broker-live": {
+          "diagnostic": null,
+          "last_exit": null,
+          "launches": 1,
+          "paused": false,
+          "pid": 2011809,
+          "ready": true,
+          "suspended": null
+        },
+        "capteur-1": {
+          "diagnostic": null,
+          "last_exit": null,
+          "launches": 1,
+          "paused": false,
+          "pid": 2011823,
+          "ready": true,
+          "suspended": null
+        },
+        "capteur-2": {
+          "diagnostic": null,
+          "last_exit": null,
+          "launches": 1,
+          "paused": false,
+          "pid": 2011824,
+          "ready": true,
+          "suspended": null
+        },
+        "capteur-3": {
+          "diagnostic": null,
+          "last_exit": null,
+          "launches": 1,
+          "paused": false,
+          "pid": 2011825,
+          "ready": true,
+          "suspended": null
+        },
+        "capteur-4": {
+          "diagnostic": null,
+          "last_exit": null,
+          "launches": 1,
+          "paused": false,
+          "pid": 2011826,
+          "ready": true,
+          "suspended": null
+        },
+        "capteur-5": {
+          "diagnostic": null,
+          "last_exit": null,
+          "launches": 1,
+          "paused": false,
+          "pid": 2011827,
+          "ready": true,
+          "suspended": null
+        },
+        "capteur-6": {
+          "diagnostic": null,
+          "last_exit": null,
+          "launches": 1,
+          "paused": false,
+          "pid": 2011828,
+          "ready": true,
+          "suspended": null
+        },
+        "capteur-7": {
+          "diagnostic": null,
+          "last_exit": null,
+          "launches": 1,
+          "paused": false,
+          "pid": 2011829,
+          "ready": true,
+          "suspended": null
+        },
+        "capteur-8": {
+          "diagnostic": null,
+          "last_exit": null,
+          "launches": 1,
+          "paused": false,
+          "pid": 2011830,
+          "ready": true,
+          "suspended": null
+        },
+        "history-dashboard-1": {
+          "diagnostic": null,
+          "last_exit": null,
+          "launches": 1,
+          "paused": false,
+          "pid": 2011817,
+          "ready": true,
+          "suspended": null
+        },
+        "history-dashboard-2": {
+          "diagnostic": null,
+          "last_exit": null,
+          "launches": 1,
+          "paused": false,
+          "pid": 2011818,
+          "ready": true,
+          "suspended": null
+        },
+        "live-dashboard": {
+          "diagnostic": null,
+          "last_exit": null,
+          "launches": 1,
+          "paused": false,
+          "pid": 2011821,
+          "ready": true,
+          "suspended": null
+        }
+      },
+      "confirmed": 131199,
+      "enqueued": 131293,
+      "live": 0,
+      "observed_mono_ns": 276273431926792,
+      "pending": 94,
+      "phase": "ready",
+      "supervisor_pid": 2011808
+    },
+    {
+      "actors": {
+        "broker-history": {
+          "diagnostic": null,
+          "last_exit": null,
+          "launches": 1,
+          "paused": false,
+          "pid": 2011810,
+          "ready": true,
+          "suspended": null
+        },
+        "broker-live": {
+          "diagnostic": null,
+          "last_exit": null,
+          "launches": 1,
+          "paused": false,
+          "pid": 2011809,
+          "ready": true,
+          "suspended": null
+        },
+        "capteur-1": {
+          "diagnostic": null,
+          "last_exit": null,
+          "launches": 1,
+          "paused": false,
+          "pid": 2011823,
+          "ready": true,
+          "suspended": null
+        },
+        "capteur-2": {
+          "diagnostic": null,
+          "last_exit": null,
+          "launches": 1,
+          "paused": false,
+          "pid": 2011824,
+          "ready": true,
+          "suspended": null
+        },
+        "capteur-3": {
+          "diagnostic": null,
+          "last_exit": null,
+          "launches": 1,
+          "paused": false,
+          "pid": 2011825,
+          "ready": true,
+          "suspended": null
+        },
+        "capteur-4": {
+          "diagnostic": null,
+          "last_exit": null,
+          "launches": 1,
+          "paused": false,
+          "pid": 2011826,
+          "ready": true,
+          "suspended": null
+        },
+        "capteur-5": {
+          "diagnostic": null,
+          "last_exit": null,
+          "launches": 1,
+          "paused": false,
+          "pid": 2011827,
+          "ready": true,
+          "suspended": null
+        },
+        "capteur-6": {
+          "diagnostic": null,
+          "last_exit": null,
+          "launches": 1,
+          "paused": false,
+          "pid": 2011828,
+          "ready": true,
+          "suspended": null
+        },
+        "capteur-7": {
+          "diagnostic": null,
+          "last_exit": null,
+          "launches": 1,
+          "paused": false,
+          "pid": 2011829,
+          "ready": true,
+          "suspended": null
+        },
+        "capteur-8": {
+          "diagnostic": null,
+          "last_exit": null,
+          "launches": 1,
+          "paused": false,
+          "pid": 2011830,
+          "ready": true,
+          "suspended": null
+        },
+        "history-dashboard-1": {
+          "diagnostic": null,
+          "last_exit": null,
+          "launches": 1,
+          "paused": false,
+          "pid": 2011817,
+          "ready": true,
+          "suspended": null
+        },
+        "history-dashboard-2": {
+          "diagnostic": null,
+          "last_exit": null,
+          "launches": 1,
+          "paused": false,
+          "pid": 2011818,
+          "ready": true,
+          "suspended": null
+        },
+        "live-dashboard": {
+          "diagnostic": null,
+          "last_exit": null,
+          "launches": 1,
+          "paused": false,
+          "pid": 2011821,
+          "ready": true,
+          "suspended": null
+        }
+      },
+      "confirmed": 131293,
+      "enqueued": 131293,
+      "live": 0,
+      "observed_mono_ns": 276275598546459,
+      "pending": 0,
+      "phase": "restored_pending_acknowledged",
+      "supervisor_pid": 2011808
+    },
+    {
+      "actors": {
+        "broker-history": {
+          "diagnostic": null,
+          "last_exit": null,
+          "launches": 1,
+          "paused": false,
+          "pid": 2011810,
+          "ready": true,
+          "suspended": null
+        },
+        "broker-live": {
+          "diagnostic": null,
+          "last_exit": null,
+          "launches": 1,
+          "paused": false,
+          "pid": 2011809,
+          "ready": true,
+          "suspended": null
+        },
+        "capteur-1": {
+          "diagnostic": null,
+          "last_exit": null,
+          "launches": 1,
+          "paused": false,
+          "pid": 2011823,
+          "ready": true,
+          "suspended": null
+        },
+        "capteur-2": {
+          "diagnostic": null,
+          "last_exit": null,
+          "launches": 1,
+          "paused": false,
+          "pid": 2011824,
+          "ready": true,
+          "suspended": null
+        },
+        "capteur-3": {
+          "diagnostic": null,
+          "last_exit": null,
+          "launches": 1,
+          "paused": false,
+          "pid": 2011825,
+          "ready": true,
+          "suspended": null
+        },
+        "capteur-4": {
+          "diagnostic": null,
+          "last_exit": null,
+          "launches": 1,
+          "paused": false,
+          "pid": 2011826,
+          "ready": true,
+          "suspended": null
+        },
+        "capteur-5": {
+          "diagnostic": null,
+          "last_exit": null,
+          "launches": 1,
+          "paused": false,
+          "pid": 2011827,
+          "ready": true,
+          "suspended": null
+        },
+        "capteur-6": {
+          "diagnostic": null,
+          "last_exit": null,
+          "launches": 1,
+          "paused": false,
+          "pid": 2011828,
+          "ready": true,
+          "suspended": null
+        },
+        "capteur-7": {
+          "diagnostic": null,
+          "last_exit": null,
+          "launches": 1,
+          "paused": false,
+          "pid": 2011829,
+          "ready": true,
+          "suspended": null
+        },
+        "capteur-8": {
+          "diagnostic": null,
+          "last_exit": null,
+          "launches": 1,
+          "paused": false,
+          "pid": 2011830,
+          "ready": true,
+          "suspended": null
+        },
+        "history-dashboard-1": {
+          "diagnostic": null,
+          "last_exit": null,
+          "launches": 1,
+          "paused": false,
+          "pid": 2011817,
+          "ready": true,
+          "suspended": null
+        },
+        "history-dashboard-2": {
+          "diagnostic": null,
+          "last_exit": null,
+          "launches": 1,
+          "paused": false,
+          "pid": 2011818,
+          "ready": true,
+          "suspended": null
+        },
+        "live-dashboard": {
+          "diagnostic": null,
+          "last_exit": null,
+          "launches": 1,
+          "paused": false,
+          "pid": 2011821,
+          "ready": true,
+          "suspended": null
+        }
+      },
+      "confirmed": 131493,
+      "enqueued": 131493,
+      "live": 200,
+      "observed_mono_ns": 276282071392059,
+      "pending": 0,
+      "phase": "restored_new_measurements",
+      "supervisor_pid": 2011808
+    }
+  ],
+  "platform": {
+    "affinity": [
+      0,
+      1,
+      2,
+      3,
+      4
+    ],
+    "cgroup_io": "259:0 rbytes=124719104 wbytes=0 rios=30207 wios=0 dbytes=0 dios=0\n254:0 rbytes=67194007552 wbytes=782628962304 rios=3217193 wios=35800679 dbytes=0 dios=0",
+    "cpu_max": "400000 100000",
+    "cpu_model": "AMD EPYC 9V74 80-Core Processor",
+    "cpuset": "0-4",
+    "free_bytes": 428527616,
+    "fs": "overlayfs",
+    "glibc": [
+      "glibc",
+      "2.41"
+    ],
+    "inspector_sqlite": "3.46.1",
+    "memory_current": "5180239872",
+    "memory_max": "17179869184",
+    "paho": "2.1.0",
+    "paho_module_sha256": "5a3f0f73b344541828586a90f79a6beecb8e4396d8b81064bc2920c1a853618a",
+    "platform": "Linux-6.18.57-x86_64-with-glibc2.41",
+    "python": "3.13.5",
+    "storage": "overlay[/workspace] overlay",
+    "uname": [
+      "Linux",
+      "92430b1a8840",
+      "6.18.57",
+      "#1 SMP Tue Oct 20 21:56:04 UTC 2026",
+      "x86_64"
+    ]
+  },
+  "process_peaks_by_pid": {
+    "broker-history:2007851": {
+      "cpu_system_s": 171.57,
+      "cpu_user_s": 547.46,
+      "peak_-shm_bytes": 32768,
+      "peak_-wal_bytes": 4231272,
+      "peak_database_bytes": 217088,
+      "rss_kib": 9892,
+      "wchar": 23708696199,
+      "write_bytes": 26607886336
+    },
+    "broker-history:2011712": {
+      "cpu_system_s": 1.37,
+      "cpu_user_s": 3.71,
+      "peak_-shm_bytes": 32768,
+      "peak_-wal_bytes": 4165352,
+      "peak_database_bytes": 225280,
+      "rss_kib": 9796,
+      "wchar": 140607327,
+      "write_bytes": 158203904
+    },
+    "broker-history:2011810": {
+      "cpu_system_s": 0.76,
+      "cpu_user_s": 1.8,
+      "peak_-shm_bytes": 32768,
+      "peak_-wal_bytes": 4173592,
+      "peak_database_bytes": 229376,
+      "rss_kib": 10180,
+      "wchar": 87751436,
+      "write_bytes": 100286464
+    },
+    "broker-live:2007850": {
+      "cpu_system_s": 107.85,
+      "cpu_user_s": 195.02,
+      "peak_-shm_bytes": 32768,
+      "peak_-wal_bytes": 4136512,
+      "peak_database_bytes": 114688,
+      "rss_kib": 9536,
+      "wchar": 375157738,
+      "write_bytes": 385650688
+    },
+    "broker-live:2011728": {
+      "cpu_system_s": 0.74,
+      "cpu_user_s": 1.28,
+      "peak_-shm_bytes": 32768,
+      "peak_-wal_bytes": 1825192,
+      "peak_database_bytes": 114688,
+      "rss_kib": 9532,
+      "wchar": 3972931,
+      "write_bytes": 4304896
+    },
+    "broker-live:2011809": {
+      "cpu_system_s": 0.46,
+      "cpu_user_s": 0.69,
+      "peak_-shm_bytes": 32768,
+      "peak_-wal_bytes": 1664512,
+      "peak_database_bytes": 118784,
+      "rss_kib": 9528,
+      "wchar": 2492323,
+      "write_bytes": 2793472
+    },
+    "capteur-1:2007864": {
+      "cpu_system_s": 14.15,
+      "cpu_user_s": 41.68,
+      "peak_-shm_bytes": 32768,
+      "peak_-wal_bytes": 1054752,
+      "peak_database_bytes": 3317760,
+      "rss_kib": 28864,
+      "wchar": 458901069,
+      "write_bytes": 705605632
+    },
+    "capteur-1:2011742": {
+      "cpu_system_s": 0.11,
+      "cpu_user_s": 0.34,
+      "peak_-shm_bytes": 32768,
+      "peak_-wal_bytes": 795192,
+      "peak_database_bytes": 3317760,
+      "rss_kib": 25380,
+      "wchar": 1602067,
+      "write_bytes": 2699264
+    },
+    "capteur-1:2011823": {
+      "cpu_system_s": 0.12,
+      "cpu_user_s": 0.23,
+      "peak_-shm_bytes": 32768,
+      "peak_-wal_bytes": 959992,
+      "peak_database_bytes": 3317760,
+      "rss_kib": 25364,
+      "wchar": 993185,
+      "write_bytes": 1683456
+    },
+    "capteur-2:2007865": {
+      "cpu_system_s": 13.85,
+      "cpu_user_s": 42.76,
+      "peak_-shm_bytes": 32768,
+      "peak_-wal_bytes": 1054752,
+      "peak_database_bytes": 3313664,
+      "rss_kib": 29880,
+      "wchar": 457463746,
+      "write_bytes": 704716800
+    },
+    "capteur-2:2011824": {
+      "cpu_system_s": 0.1,
+      "cpu_user_s": 0.26,
+      "peak_-shm_bytes": 32768,
+      "peak_-wal_bytes": 947632,
+      "peak_database_bytes": 3313664,
+      "rss_kib": 25364,
+      "wchar": 980502,
+      "write_bytes": 1650688
+    },
+    "capteur-3:2007866": {
+      "cpu_system_s": 14.22,
+      "cpu_user_s": 42.09,
+      "peak_-shm_bytes": 32768,
+      "peak_-wal_bytes": 1054752,
+      "peak_database_bytes": 3313664,
+      "rss_kib": 28860,
+      "wchar": 451372546,
+      "write_bytes": 696553472
+    },
+    "capteur-3:2011825": {
+      "cpu_system_s": 0.17,
+      "cpu_user_s": 0.23,
+      "peak_-shm_bytes": 32768,
+      "peak_-wal_bytes": 955872,
+      "peak_database_bytes": 3313664,
+      "rss_kib": 25360,
+      "wchar": 989062,
+      "write_bytes": 1671168
+    },
+    "capteur-4:2007867": {
+      "cpu_system_s": 14.15,
+      "cpu_user_s": 42.24,
+      "peak_-shm_bytes": 32768,
+      "peak_-wal_bytes": 1054752,
+      "peak_database_bytes": 3313664,
+      "rss_kib": 28856,
+      "wchar": 458725096,
+      "write_bytes": 706555904
+    },
+    "capteur-4:2011826": {
+      "cpu_system_s": 0.11,
+      "cpu_user_s": 0.25,
+      "peak_-shm_bytes": 32768,
+      "peak_-wal_bytes": 955872,
+      "peak_database_bytes": 3313664,
+      "rss_kib": 25372,
+      "wchar": 989068,
+      "write_bytes": 1667072
+    },
+    "capteur-5:2007868": {
+      "cpu_system_s": 14.07,
+      "cpu_user_s": 42.7,
+      "peak_-shm_bytes": 32768,
+      "peak_-wal_bytes": 1054752,
+      "peak_database_bytes": 3313664,
+      "rss_kib": 29860,
+      "wchar": 454420051,
+      "write_bytes": 700809216
+    },
+    "capteur-5:2011827": {
+      "cpu_system_s": 0.13,
+      "cpu_user_s": 0.28,
+      "peak_-shm_bytes": 32768,
+      "peak_-wal_bytes": 976472,
+      "peak_database_bytes": 3313664,
+      "rss_kib": 25364,
+      "wchar": 1010310,
+      "write_bytes": 1703936
+    },
+    "capteur-6:2007869": {
+      "cpu_system_s": 14.2,
+      "cpu_user_s": 42.32,
+      "peak_-shm_bytes": 32768,
+      "peak_-wal_bytes": 1054752,
+      "peak_database_bytes": 3313664,
+      "rss_kib": 29840,
+      "wchar": 461668768,
+      "write_bytes": 709910528
+    },
+    "capteur-6:2011828": {
+      "cpu_system_s": 0.15,
+      "cpu_user_s": 0.22,
+      "peak_-shm_bytes": 32768,
+      "peak_-wal_bytes": 968232,
+      "peak_database_bytes": 3313664,
+      "rss_kib": 25368,
+      "wchar": 1001745,
+      "write_bytes": 1691648
+    },
+    "capteur-7:2007870": {
+      "cpu_system_s": 14.11,
+      "cpu_user_s": 42.16,
+      "peak_-shm_bytes": 32768,
+      "peak_-wal_bytes": 1054752,
+      "peak_database_bytes": 3313664,
+      "rss_kib": 28940,
+      "wchar": 460259115,
+      "write_bytes": 708521984
+    },
+    "capteur-7:2011829": {
+      "cpu_system_s": 0.12,
+      "cpu_user_s": 0.23,
+      "peak_-shm_bytes": 32768,
+      "peak_-wal_bytes": 968232,
+      "peak_database_bytes": 3313664,
+      "rss_kib": 25368,
+      "wchar": 1001743,
+      "write_bytes": 1691648
+    },
+    "capteur-8:2007871": {
+      "cpu_system_s": 14.71,
+      "cpu_user_s": 41.69,
+      "peak_-shm_bytes": 32768,
+      "peak_-wal_bytes": 1058872,
+      "peak_database_bytes": 3317760,
+      "rss_kib": 28900,
+      "wchar": 461529696,
+      "write_bytes": 709578752
+    },
+    "capteur-8:2011830": {
+      "cpu_system_s": 0.1,
+      "cpu_user_s": 0.25,
+      "peak_-shm_bytes": 32768,
+      "peak_-wal_bytes": 984712,
+      "peak_database_bytes": 3317760,
+      "rss_kib": 25352,
+      "wchar": 1018865,
+      "write_bytes": 1720320
+    },
+    "history-dashboard-1:2007858": {
+      "cpu_system_s": 40.88,
+      "cpu_user_s": 111.38,
+      "peak_-shm_bytes": 32768,
+      "peak_-wal_bytes": 1050632,
+      "peak_database_bytes": 1466368,
+      "rss_kib": 27688,
+      "wchar": 2349515288,
+      "write_bytes": 2903760896
+    },
+    "history-dashboard-1:2011749": {
+      "cpu_system_s": 0.31,
+      "cpu_user_s": 0.96,
+      "peak_-shm_bytes": 32768,
+      "peak_-wal_bytes": 918792,
+      "peak_database_bytes": 1466368,
+      "rss_kib": 25648,
+      "wchar": 5954227,
+      "write_bytes": 7421952
+    },
+    "history-dashboard-1:2011817": {
+      "cpu_system_s": 0.19,
+      "cpu_user_s": 1.0,
+      "peak_-shm_bytes": 32768,
+      "peak_-wal_bytes": 935272,
+      "peak_database_bytes": 1466368,
+      "rss_kib": 26036,
+      "wchar": 10863150,
+      "write_bytes": 20217856
+    },
+    "history-dashboard-2:2007859": {
+      "cpu_system_s": 5.44,
+      "cpu_user_s": 13.67,
+      "peak_-shm_bytes": 32768,
+      "peak_-wal_bytes": 1025912,
+      "peak_database_bytes": 1466368,
+      "rss_kib": 27068,
+      "wchar": 263558158,
+      "write_bytes": 324866048
+    },
+    "history-dashboard-2:2011152": {
+      "cpu_system_s": 34.87,
+      "cpu_user_s": 91.04,
+      "peak_-shm_bytes": 32768,
+      "peak_-wal_bytes": 1050632,
+      "peak_database_bytes": 1466368,
+      "rss_kib": 27676,
+      "wchar": 2080819188,
+      "write_bytes": 2562154496
+    },
+    "history-dashboard-2:2011818": {
+      "cpu_system_s": 0.24,
+      "cpu_user_s": 1.33,
+      "peak_-shm_bytes": 32768,
+      "peak_-wal_bytes": 836392,
+      "peak_database_bytes": 1466368,
+      "rss_kib": 26160,
+      "wchar": 13233086,
+      "write_bytes": 25612288
+    },
+    "live-dashboard:2007862": {
+      "cpu_system_s": 2.8,
+      "cpu_user_s": 35.53,
+      "peak_-shm_bytes": 0,
+      "peak_-wal_bytes": 0,
+      "peak_database_bytes": 0,
+      "rss_kib": 24104,
+      "wchar": 51094678,
+      "write_bytes": 0
+    },
+    "live-dashboard:2011821": {
+      "cpu_system_s": 0.09,
+      "cpu_user_s": 0.12,
+      "peak_-shm_bytes": 0,
+      "peak_-wal_bytes": 0,
+      "peak_database_bytes": 0,
+      "rss_kib": 23784,
+      "wchar": 81308,
+      "write_bytes": 0
+    }
+  },
+  "qualification": {
+    "bounded_private_reference_pilot": "GO_WITH_RESTRICTIONS",
+    "continuous_72_hours": "NOT_RECEIVED",
+    "recovery_without_original_authority": "NOT_RECEIVED",
+    "strong_real_time": "NO_GO"
+  },
+  "segment_ceiling": {
+    "cold": {
+      "allocated_directory_bytes": 134217728,
+      "allocated_file_bytes": 268795904,
+      "directories": 32768,
+      "file_bytes": 15501505,
+      "files": 65536
+    },
+    "elapsed_s": 120.59064519498497,
+    "recovery_s": 2.480362739,
+    "refusal": "archive_budget_exhausted",
+    "state": {
+      "archive_budget": 8589934592,
+      "archive_charge": 403013632,
+      "archive_id": "0fa5347424054dcf8ea3883497ddb1bf",
+      "archived_count": 36856,
+      "budget": 33554432,
+      "conflicts": 0,
+      "duplicates": 72,
+      "files": {
+        "database": 2658304,
+        "shm": 32768,
+        "wal": 927032
+      },
+      "freelist_count": 0,
+      "hot_count": 1,
+      "hot_limit": 8192,
+      "identity": "dashboard-1",
+      "invalid": 0,
+      "last_unique_mono": 273174953998421,
+      "mqtt_dup": 72,
+      "mqtt_received": 36929,
+      "occupied_bytes": 3618104,
+      "page_count": 649,
+      "segment_count": 32768,
+      "segment_limit": 32768,
+      "segment_rows": 512,
+      "stream_count": 8,
+      "subscribed": 0,
+      "unique_count": 36857
+    }
+  },
+  "sha256": {
+    "archive-scale.log": "bea6f8c9ba4eaea259b7389f98fd718ab20b189800f369d58dbc00f55814a39d",
+    "archive-scale/result.json": "dea2076044723fad2d1406211fcdefb81105122e6b7a24f87ca8eccae9913ea4",
+    "catalog-full/result.json": "7503ce0bc628206027cac78df17e75203e930a822e160f3db2a9027711dc2e9c",
+    "certificate-horizon.json": "3bb1003de1df680de2f3e0b8bbbf235b40c49b069abb1640bb3718964df6d43b",
+    "guard-green/result.json": "f43fe68c7f317a5f4920328cf9b5dd96911eed2ca37675aaa15b72b3d0f1f74c",
+    "guard-red.log": "303522637947e7419d0b77ca5b0e547b00a8241c4cf52fb7c97686d31a8f5c59",
+    "package-rc-check/site/result.json": "0256d72a5ee119e4f52a4ca304c1bf9853151b6723662164b394fc3c5bddba20",
+    "pressure-green/result.json": "878316ecf76e89d936e69c328371c26d6f7ea3f75ea2e8f637fbaa9e61fc3475",
+    "pressure-red.log": "0be6e467fd009e2c47274e71cebfe55f4aff7ac5b3418051f8b7cdc0ae96c427",
+    "python-gates.log": "53105616f0de12a816c513d97fd2b166914df351dff0b379ed792293c92a3493",
+    "received-endurance/result.json": "3e4c150b1a6f9ea4a2ade2ff14c1b68dcbad0c94fc4afe228d1c247f0ae8dcf1",
+    "received-endurance/samples.jsonl": "51114769921fcb259160cf73208f223754aebf10e04f0fa6eb9563518a3ece41",
+    "received-endurance/site-backup-manifest.json": "e95b91a3a83f541adf01cbd5300a18eec76c544c7776d405faa9f24cf4203d12",
+    "rust-gates.log": "eb880615d82b2b9508e33bfeb4b410f83648f407b543c5009e36bb1b4356c5dd",
+    "storage/result.json": "88b6158601ef5944dcc68cb562a8df57b16cf1103d03fc1636571f678ae7389e"
+  },
+  "storage_check": {
+    "after": {
+      "cgroup_io": [
+        "259:0 rbytes=124071936 wbytes=0 rios=30049 wios=0 dbytes=0 dios=0",
+        "254:0 rbytes=66748727296 wbytes=759296335872 rios=3180397 wios=31837587 dbytes=0 dios=0"
+      ],
+      "device": null,
+      "self_io": {
+        "cancelled_write_bytes": 32768,
+        "rchar": 4733263,
+        "read_bytes": 49152,
+        "syscr": 588,
+        "syscw": 898,
+        "wchar": 2439198,
+        "write_bytes": 3600384
+      },
+      "sqlite": {
+        "image_bytes": 81920,
+        "journal_mode": "wal",
+        "page_count": 20,
+        "synchronous": 2,
+        "wal_autocheckpoint": 128,
+        "wal_bytes": 309032
+      }
+    },
+    "before": {
+      "cgroup_io": [
+        "259:0 rbytes=124071936 wbytes=0 rios=30049 wios=0 dbytes=0 dios=0",
+        "254:0 rbytes=66748727296 wbytes=759287029760 rios=3180397 wios=31835286 dbytes=0 dios=0"
+      ],
+      "device": null,
+      "self_io": {
+        "cancelled_write_bytes": 0,
+        "rchar": 4608614,
+        "read_bytes": 49152,
+        "syscr": 547,
+        "syscw": 12,
+        "wchar": 59922,
+        "write_bytes": 94208
+      }
+    },
+    "elapsed_s": 0.165726019,
+    "latency_statistics_ms": {
+      "append": {
+        "max_ms": 0.940372,
+        "p50_ms": 0.018838,
+        "p95_ms": 0.044828,
+        "p99_ms": 0.187853,
+        "samples": 256
+      },
+      "checkpoint": {
+        "max_ms": 0.627792,
+        "p50_ms": 0.430236,
+        "p95_ms": 0.627792,
+        "p99_ms": 0.627792,
+        "samples": 4
+      },
+      "fsync": {
+        "max_ms": 1.454765,
+        "p50_ms": 0.29942,
+        "p95_ms": 0.815484,
+        "p99_ms": 1.202035,
+        "samples": 256
+      },
+      "sqlite_commit": {
+        "max_ms": 1.158841,
+        "p50_ms": 0.172179,
+        "p95_ms": 0.529665,
+        "p99_ms": 0.840993,
+        "samples": 256
+      }
+    },
+    "machine": {
+      "affinity": [
+        0,
+        1,
+        2,
+        3,
+        4
+      ],
+      "cgroup_io": "259:0 rbytes=124071936 wbytes=0 rios=30049 wios=0 dbytes=0 dios=0\n254:0 rbytes=66748727296 wbytes=759286804480 rios=3180397 wios=31835251 dbytes=0 dios=0",
+      "cpu_max": "400000 100000",
+      "cpu_model": "AMD EPYC 9V74 80-Core Processor",
+      "cpuset": "0-4",
+      "free_bytes": 681721856,
+      "fs": "overlayfs",
+      "glibc": [
+        "glibc",
+        "2.41"
+      ],
+      "inspector_sqlite": "3.46.1",
+      "memory_current": "4685836288",
+      "memory_max": "17179869184",
+      "paho": "2.1.0",
+      "paho_module_sha256": "5a3f0f73b344541828586a90f79a6beecb8e4396d8b81064bc2920c1a853618a",
+      "platform": "Linux-6.18.57-x86_64-with-glibc2.41",
+      "python": "3.13.5",
+      "storage": "overlay[/workspace] overlay",
+      "uname": [
+        "Linux",
+        "92430b1a8840",
+        "6.18.57",
+        "#1 SMP Tue Oct 20 21:56:04 UTC 2026",
+        "x86_64"
+      ]
+    },
+    "mapped_device": null,
+    "mount": {
+      "fstype": "overlay",
+      "maj:min": "0:27",
+      "options": [
+        "rw",
+        "nosuid",
+        "nodev",
+        "relatime",
+        "lowerdir",
+        "upperdir",
+        "workdir",
+        "index=off",
+        "metacopy=off"
+      ],
+      "source": "overlay[/workspace]"
+    },
+    "physical_hardware_qualification": "not_established",
+    "samples": 256,
+    "scope": "logical writes and visible operating-system counters",
+    "status": "PASS",
+    "tool_sha256": "d0a792a30b92d791dac535839688ea4ebe8a480483155150967156e9400d56b8",
+    "wchar_delta": 2379276,
+    "write_bytes_delta": 3506176
+  },
+  "unknown_after_incidents": 0
+}

@@ -1,0 +1,19 @@
+{
+  "format": "mqttiumd.product-event",
+  "schema_version": 1,
+  "seq": "3",
+  "kind": "delivery_discarded",
+  "pid": 1,
+  "operation": {
+    "incarnation": "1",
+    "epoch": "2",
+    "owner": "0",
+    "sequence": "7"
+  },
+  "command_kind": "Finish",
+  "details": {
+    "delivery": "1/2/0/3/0",
+    "reason": "packet_too_large",
+    "target": "2"
+  }
+}

@@ -32,7 +32,7 @@
     {
       "decision": "0001",
       "path": "docs/decisions/0001-live-indeterminate-path.md",
-      "sha256": "cde61e64e2d2445f78315bf431a25241c376755066058e506990e2c58e6d0c96"
+      "sha256": "15310da20e073608b940909b1df47af2537603588a1a433e274f755d61f34fd4"
     },
     {
       "decision": "0002",
@@ -57,7 +57,7 @@
     {
       "decision": "0006",
       "path": "docs/decisions/0006-plan-then-apply.md",
-      "sha256": "5b3a0789a24bfa8e4157b73b1fcd96393657d57772d299f0ec86637e2e9a0a21"
+      "sha256": "3dd8ac5594bb876f5aa42140083ec55822be074aa07c52e73d6cf0cdb5a98a89"
     },
     {
       "decision": "0007",
@@ -72,7 +72,207 @@
     {
       "decision": "0009",
       "path": "docs/decisions/0009-owner-authority.md",
-      "sha256": "f11d4c72d57a5a52816edd951ef17eb1af1a0cb74e77850d4d599ceb2e8b0979"
+      "sha256": "182d01822e3f6c3c5fec05f3d8fe2b55daba83e005b896121e0e10530d030107"
+    },
+    {
+      "decision": "0010",
+      "path": "docs/decisions/0010-credits-interface.md",
+      "sha256": "2fbaad5b8792b920704bd9939d73dd7558433ddde937006df3baa72a67093da7"
+    },
+    {
+      "decision": "0011",
+      "path": "docs/decisions/0011-epoch-opening.md",
+      "sha256": "10405a4f8633677b7a4bb61f3b95526e3c520d7dc6f278b7c3cb00526a2e1eb9"
+    },
+    {
+      "decision": "0012",
+      "path": "docs/decisions/0012-reservation-refusals.md",
+      "sha256": "909a1e6886b8115220a6081f90e78d45eb628413f3d1f7fa9a2ee1a58f25ec1b"
+    },
+    {
+      "decision": "0013",
+      "path": "docs/decisions/0013-broker-behaviours-left-open.md",
+      "sha256": "bbde877a1c7b3db0f5a6111716907c7610fc3192051407255dded82ffab8ab39"
+    },
+    {
+      "decision": "0014",
+      "path": "docs/decisions/0014-recovered-facts-order.md",
+      "sha256": "108db37a0c834d7a7cefb403865619d087b893238e3b1e79231d9e1474b7b917"
+    },
+    {
+      "decision": "0015",
+      "path": "docs/decisions/0015-scenario-vocabulary-and-fence-point.md",
+      "sha256": "cccd639c04aec8bdd0384739c09cf06577b88b21ce6311652cc843605ab65839"
+    },
+    {
+      "decision": "0016",
+      "path": "docs/decisions/0016-evidence-formats.md",
+      "sha256": "37f6eb93a9e378da2a1feb51aeba17f47c39fc7063dab1e9e461ab998c8abfa2"
+    },
+    {
+      "decision": "0017",
+      "path": "docs/decisions/0017-binary-tied-to-its-source.md",
+      "sha256": "8afca7df4c178f6321741bee7ce17f34b7f924796e18c7bd3e69dc1cf391dd06"
+    },
+    {
+      "decision": "0019",
+      "path": "docs/decisions/0019-real-kill-of-the-broker.md",
+      "sha256": "e1864ac92f0d372c045260318f8d1ef90656e3cb1aec67d81a5601c00c8d51da"
+    },
+    {
+      "decision": "0020",
+      "path": "docs/decisions/0020-kill-inside-a-transaction.md",
+      "sha256": "223e95d21c3bedcecd2c0eb43c3d5cde578dc7209ea07dceed1c4db07c3cac8e"
+    },
+    {
+      "decision": "0021",
+      "path": "docs/decisions/0021-typed-bounded-durable-reads.md",
+      "sha256": "e32ff2a160a055f2561d7ec6079870af4bab162722d3213fe2e2fd13abb01e25"
+    },
+    {
+      "decision": "0022",
+      "path": "docs/decisions/0022-product-tcp-qos2.md",
+      "sha256": "562176f54e6c5b64af42233c6d73308e20bb5a74645fc4b7c49d25454bf82041"
+    },
+    {
+      "decision": "0023",
+      "path": "docs/decisions/0023-incoming-qos1.md",
+      "sha256": "d53af5a60e7fbbe46d1fd4a917418df9a23b1f874eafff44ab797a9a8461ca40"
+    },
+    {
+      "decision": "0024",
+      "path": "docs/decisions/0024-receive-wire-progress.md",
+      "sha256": "f62529a9634cda6a305acb805118b63f378b262300aeee03df0eb8bfcc8d9ef0"
+    },
+    {
+      "decision": "0025",
+      "path": "docs/decisions/0025-exact-pubsub.md",
+      "sha256": "5f730e52f5100e94f624587e7b7b949f93937b1fee54c83850586c6ffd291337"
+    },
+    {
+      "decision": "0026",
+      "path": "docs/decisions/0026-qos0-volatile-and-consumed.md",
+      "sha256": "ff41182e0f5c5f9592f2f0c6f0972324d31326ec1348450fe5b6c53e2e5a7275"
+    },
+    {
+      "decision": "0027",
+      "path": "docs/decisions/0027-live-receipt-retirement.md",
+      "sha256": "bd2215b96e85b53ea5150bbc1442a9863900f426764d6fc0f6cf28ffea4c24f2"
+    },
+    {
+      "decision": "0028",
+      "path": "docs/decisions/0028-outgoing-packet-identifier-reuse.md",
+      "sha256": "3876330a6cd14f66d293cc1be17eae659ef5b3ce0b2dcf3c724348a7e3a77054"
+    },
+    {
+      "decision": "0029",
+      "path": "docs/decisions/0029-explicit-session-lifecycle.md",
+      "sha256": "84e58357ca50ef13e7e5d519a7e9eed74b28f855865d4486e3dabd5589e64d56"
+    },
+    {
+      "decision": "0030",
+      "path": "docs/decisions/0030-finite-session-expiry.md",
+      "sha256": "194d718ee596b2c07aa54508b0846cc5fb8e9f2b3ef5b66cd8495feb9270680a"
+    },
+    {
+      "decision": "0031",
+      "path": "docs/decisions/0031-hierarchical-subscriptions.md",
+      "sha256": "0f83d8bca6503b1367217f43ffdaee20d108a54adb9093eb2a884bebe61a1000"
+    },
+    {
+      "decision": "0032",
+      "path": "docs/decisions/0032-durable-retained.md",
+      "sha256": "126dcbc0f7447c1f4fa9e4cbe0ff770d4c3a4d19558d8a6e05231ccc78d80f13"
+    },
+    {
+      "decision": "0033",
+      "path": "docs/decisions/0033-message-expiry.md",
+      "sha256": "a9327913722e031c163843c43b864157bfeb7bb383d6546b7cba2571d9fa6eb9"
+    },
+    {
+      "decision": "0034",
+      "path": "docs/decisions/0034-durable-will.md",
+      "sha256": "da07e9b28e79abac0bd0840defc593cd9ac610f18d366baef977a9a91880f377"
+    },
+    {
+      "decision": "0035",
+      "path": "docs/decisions/0035-private-mtls-profile.md",
+      "sha256": "657ab09220b08a4c599803045097973102cfb221fd1773dfa097280fa6de4ef1"
+    },
+    {
+      "decision": "0036",
+      "path": "docs/decisions/0036-offline-monotone-policy.md",
+      "sha256": "ae0a2118e47d60651da15eba8aea0e460b638e186ac8d3f62c48192fcc577768"
+    },
+    {
+      "decision": "0037",
+      "path": "docs/decisions/0037-retained-will.md",
+      "sha256": "3322f9990a0e5c0aea656c8988df7baa235c59558d780be1f8d12ec569c0d140"
+    },
+    {
+      "decision": "0038",
+      "path": "docs/decisions/0038-mqtt311-wire-profile.md",
+      "sha256": "1cd5cc2f71a0e3f9e7facfa3f06e2b156459d24c46c6c7acc93a056db935c57e"
+    },
+    {
+      "decision": "0039",
+      "path": "docs/decisions/0039-per-filter-subscribe-authorization.md",
+      "sha256": "c0f4bcfa2f0ccffdf89111bb06c551c3cffeecef2f688f507ecf380a51006c24"
+    },
+    {
+      "decision": "0040",
+      "path": "docs/decisions/0040-mqtt311-incoming-qos2.md",
+      "sha256": "b84f7f205a0cee800d5dcd688fe0cdfcba022e53f35e20629eec4eea5b52b0c9"
+    },
+    {
+      "decision": "0041",
+      "path": "docs/decisions/0041-outgoing-qos2.md",
+      "sha256": "435b0d11b1a20b3b1925492fb9c97f3c2149a254e99d2a1c5df66a4008b2fbe4"
+    },
+    {
+      "decision": "0042",
+      "path": "docs/decisions/0042-mosquitto-mtls-cutover.md",
+      "sha256": "f7d57b9169417df6b57657e0afea31e1f2333fe9d570b94873f2412e00dad208"
+    },
+    {
+      "decision": "0043",
+      "path": "docs/decisions/0043-bounded-reactor-pressure.md",
+      "sha256": "2b24a3dded94b64730cc2a09a8140b7fb3187acf2d33c55e913a1ebe2ed21cfb"
+    },
+    {
+      "decision": "0044",
+      "path": "docs/decisions/0044-reactor-runtime-and-evidence-tiers.md",
+      "sha256": "7f2ac6b8eea8d8f55bff64afc25fa9341cd0dc3e825ae134bb6a054735b8d763"
+    },
+    {
+      "decision": "0045",
+      "path": "docs/decisions/0045-group-commit.md",
+      "sha256": "2ce338365bfb985e85bdecf30eaf0c4dd37b1ce3216643cfc98ecacfaa7beda2"
+    },
+    {
+      "decision": "0046",
+      "path": "docs/decisions/0046-input-backpressure.md",
+      "sha256": "d2a77b383674b952d14c0079e19a72227df986efe39b89dae442def2a23a8c3f"
+    },
+    {
+      "decision": "0047",
+      "path": "docs/decisions/0047-precedence-between-records.md",
+      "sha256": "82c170d7eacd3ab54226049780253314e72599a92baa667ab1c01e9d1f354baf"
+    },
+    {
+      "decision": "0048",
+      "path": "docs/decisions/0048-runtime-limits.md",
+      "sha256": "8d11753aea3d61ecd0ecd75cba2e3500398675a02896cfc2ff08db0edb73501b"
+    },
+    {
+      "decision": "0049",
+      "path": "docs/decisions/0049-functional-compatibility.md",
+      "sha256": "ddcd8456870c4de36e2dda5ab9e534e239175a344e8040a595c2d7714453326f"
+    },
+    {
+      "decision": "0050",
+      "path": "docs/decisions/0050-acknowledgements-in-order-of-reception.md",
+      "sha256": "e9528d104f839803a7abcc3080e797c06805ab2c126ec7307a280c7bdfe784cb"
     }
   ],
   "entries": [

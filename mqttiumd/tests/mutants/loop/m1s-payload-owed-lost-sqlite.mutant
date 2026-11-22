@@ -1,0 +1,12 @@
+diff --git a/mqttiumd/crates/mqttiumd-store-sqlite/src/lib.rs b/mqttiumd/crates/mqttiumd-store-sqlite/src/lib.rs
+--- a/mqttiumd/crates/mqttiumd-store-sqlite/src/lib.rs
++++ b/mqttiumd/crates/mqttiumd-store-sqlite/src/lib.rs
+@@ -943,6 +943,8 @@
+     };
+     conn.prepare_cached("DELETE FROM inbound WHERE session = ?1 AND packet_id = ?2")?
+         .execute(params![session.as_slice(), packet])?;
++    // MUTANT M1 (SQLite): the payload still owed by its obligations is lost.
++    conn.prepare_cached("DELETE FROM payloads")?.execute([])?;
+     meta.accounts.exchange_slots = meta
+         .accounts
+         .exchange_slots

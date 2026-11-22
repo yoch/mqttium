@@ -91,7 +91,6 @@
         "additionalProperties": false,
         "required": [
           "id",
-          "expected_hits",
           "hits"
         ],
         "properties": {
@@ -101,10 +100,26 @@
           "expected_hits": {
             "$ref": "primitives.schema.json#/$defs/u64"
           },
+          "expected_hits_at_least": {
+            "description": "For a repeated fault: the minimum its scenario expects (record 0018).",
+            "$ref": "primitives.schema.json#/$defs/u64"
+          },
           "hits": {
             "$ref": "primitives.schema.json#/$defs/u64"
           }
-        }
+        },
+        "oneOf": [
+          {
+            "required": [
+              "expected_hits"
+            ]
+          },
+          {
+            "required": [
+              "expected_hits_at_least"
+            ]
+          }
+        ]
       },
       "maxItems": 64
     },
@@ -126,6 +141,84 @@
         "$ref": "primitives.schema.json#/$defs/artifact"
       },
       "maxItems": 1024
+    },
+    "failures": {
+      "description": "The first at most 64 typed durable-reader or process-control failures in trace order; failure_count records the untruncated total. Absent on a healthy run.",
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 64,
+      "items": {
+        "oneOf": [
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "kind",
+              "code",
+              "phase",
+              "process_incarnation",
+              "record_sequence"
+            ],
+            "properties": {
+              "kind": {
+                "const": "DurableReadFailed"
+              },
+              "code": {
+                "$ref": "primitives.schema.json#/$defs/durableReadCode"
+              },
+              "phase": {
+                "$ref": "primitives.schema.json#/$defs/durableReadPhase"
+              },
+              "process_incarnation": {
+                "$ref": "primitives.schema.json#/$defs/u64"
+              },
+              "record_sequence": {
+                "$ref": "primitives.schema.json#/$defs/u64"
+              },
+              "message": {
+                "$ref": "primitives.schema.json#/$defs/text"
+              },
+              "page": {
+                "$ref": "primitives.schema.json#/$defs/u64"
+              }
+            }
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "kind",
+              "code",
+              "phase",
+              "process_incarnation",
+              "record_sequence"
+            ],
+            "properties": {
+              "kind": {
+                "const": "ProcessControlFailed"
+              },
+              "code": {
+                "$ref": "primitives.schema.json#/$defs/processControlCode"
+              },
+              "phase": {
+                "$ref": "primitives.schema.json#/$defs/processControlPhase"
+              },
+              "process_incarnation": {
+                "$ref": "primitives.schema.json#/$defs/u64"
+              },
+              "record_sequence": {
+                "$ref": "primitives.schema.json#/$defs/u64"
+              },
+              "message": {
+                "$ref": "primitives.schema.json#/$defs/text"
+              }
+            }
+          }
+        ]
+      }
+    },
+    "failure_count": {
+      "$ref": "primitives.schema.json#/$defs/u64"
     }
   },
   "allOf": [
@@ -219,5 +312,13 @@
         }
       }
     }
-  ]
+  ],
+  "dependentRequired": {
+    "failures": [
+      "failure_count"
+    ],
+    "failure_count": [
+      "failures"
+    ]
+  }
 }

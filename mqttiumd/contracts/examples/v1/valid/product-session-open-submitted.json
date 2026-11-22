@@ -1,0 +1,20 @@
+{
+  "format": "mqttiumd.product-event",
+  "schema_version": 1,
+  "seq": "10",
+  "kind": "command_submitted",
+  "pid": 1,
+  "operation": {
+    "incarnation": "1",
+    "epoch": "1",
+    "owner": "0",
+    "sequence": "26"
+  },
+  "details": {
+    "recipe_kind": "SessionOpen",
+    "action": "Open",
+    "clean_start": true,
+    "expiry": "OnDisconnect",
+    "expected_session": null
+  }
+}

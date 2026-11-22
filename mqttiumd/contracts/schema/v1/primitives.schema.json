@@ -12,6 +12,15 @@
         "pattern": "[\\n\\r]"
       }
     },
+    "u32": {
+      "description": "Canonical decimal string of an unsigned 32-bit value. The semantic pass also enforces the upper bound 4294967295.",
+      "type": "string",
+      "pattern": "^(0|[1-9][0-9]{0,9})$",
+      "maxLength": 10,
+      "not": {
+        "pattern": "[\\n\\r]"
+      }
+    },
     "sha256": {
       "type": "string",
       "pattern": "^[0-9a-f]{64}$",
@@ -130,6 +139,56 @@
         }
       }
     },
+    "publication_id": {
+      "description": "One internal publication, independent of any Packet Identifier.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "incarnation",
+        "epoch",
+        "owner",
+        "sequence"
+      ],
+      "properties": {
+        "incarnation": {
+          "$ref": "primitives.schema.json#/$defs/u64"
+        },
+        "epoch": {
+          "$ref": "primitives.schema.json#/$defs/u64"
+        },
+        "owner": {
+          "$ref": "primitives.schema.json#/$defs/u64"
+        },
+        "sequence": {
+          "$ref": "primitives.schema.json#/$defs/u64"
+        }
+      }
+    },
+    "payload_id": {
+      "description": "One durable immutable payload object.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "incarnation",
+        "epoch",
+        "owner",
+        "sequence"
+      ],
+      "properties": {
+        "incarnation": {
+          "$ref": "primitives.schema.json#/$defs/u64"
+        },
+        "epoch": {
+          "$ref": "primitives.schema.json#/$defs/u64"
+        },
+        "owner": {
+          "$ref": "primitives.schema.json#/$defs/u64"
+        },
+        "sequence": {
+          "$ref": "primitives.schema.json#/$defs/u64"
+        }
+      }
+    },
     "effect_id": {
       "type": "object",
       "additionalProperties": false,
@@ -187,7 +246,14 @@
         "Committed",
         "RejectedCertain",
         "PendingOrUnknown",
-        "RetiredOutcomeUnavailable"
+        "RetiredOutcomeUnavailable",
+        "Violation"
+      ]
+    },
+    "store_violation": {
+      "description": "The contract violation a store reports instead of an outcome (StoreViolation).",
+      "enum": [
+        "RecipeMismatch"
       ]
     },
     "verdict": {
@@ -215,6 +281,413 @@
         },
         "bytes": {
           "$ref": "primitives.schema.json#/$defs/u64"
+        }
+      }
+    },
+    "reject_reason": {
+      "description": "Why the store rejected an operation for certain, in the vocabulary of RejectReason.",
+      "enum": [
+        "PreconditionFailed",
+        "CapacityExceeded",
+        "Fenced",
+        "EpochClosed",
+        "SessionCapacityExceeded"
+      ]
+    },
+    "durableReadCode": {
+      "enum": [
+        "InvalidData",
+        "LimitExceeded",
+        "Unavailable",
+        "Io",
+        "AllocationFailed",
+        "FrontierMoved",
+        "EmptyPage"
+      ]
+    },
+    "durableReadPhase": {
+      "enum": [
+        "Open",
+        "Ledger",
+        "Opening",
+        "Lookup",
+        "Snapshot",
+        "Inspect",
+        "Recovery",
+        "Work",
+        "Maintenance"
+      ]
+    },
+    "processControlCode": {
+      "enum": [
+        "TruncatedFrame",
+        "FrameTooLarge",
+        "InvalidFrame",
+        "Io",
+        "ClosedChannel",
+        "DuplicateTermination",
+        "ReportBudgetExceeded",
+        "ActionDeadlineExceeded",
+        "DrainDeadlineExceeded",
+        "LateEvidence",
+        "LateReport",
+        "InvalidOrdering",
+        "InvalidParked"
+      ]
+    },
+    "processControlPhase": {
+      "enum": [
+        "Start",
+        "Action",
+        "KillDrain",
+        "Stop"
+      ]
+    },
+    "delivery_id": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "publication_id",
+        "index"
+      ],
+      "properties": {
+        "publication_id": {
+          "$ref": "primitives.schema.json#/$defs/publication_id"
+        },
+        "index": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295
+        }
+      }
+    },
+    "receipt_origin": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "incarnation",
+        "epoch",
+        "owner"
+      ],
+      "properties": {
+        "incarnation": {
+          "$ref": "#/$defs/u64"
+        },
+        "epoch": {
+          "$ref": "#/$defs/u64"
+        },
+        "owner": {
+          "$ref": "#/$defs/u64"
+        }
+      }
+    },
+    "receipt_closure": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "A committed non-execution prefix, not a rejection receipt. Physical rows below the boundary may remain until later bounded sweeps. Identity boundaries are producer issuance guards, never reconstructed from the largest retained admission.",
+      "required": [
+        "origin",
+        "through",
+        "publication_through",
+        "payload_through"
+      ],
+      "properties": {
+        "origin": {
+          "$ref": "#/$defs/receipt_origin"
+        },
+        "through": {
+          "$ref": "#/$defs/u64"
+        },
+        "publication_through": {
+          "$ref": "#/$defs/u64"
+        },
+        "payload_through": {
+          "$ref": "#/$defs/u64"
+        }
+      }
+    },
+    "session_expiry": {
+      "description": "Omitted legacy fixtures mean Never. Finite seconds use an explicit After discriminant; zero and infinity have distinct representations. SQLite schema6 persists and validates every policy.",
+      "oneOf": [
+        {
+          "enum": [
+            "OnDisconnect",
+            "Never"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "After"
+          ],
+          "properties": {
+            "After": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 4294967294
+            }
+          }
+        }
+      ]
+    },
+    "session_opening": {
+      "description": "OperationId of the durable open attachment, or null for a legacy Admin fixture. Omitted legacy JSON means null.",
+      "oneOf": [
+        {
+          "type": "null"
+        },
+        {
+          "$ref": "primitives.schema.json#/$defs/operation_id"
+        }
+      ]
+    },
+    "session_cancellations": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "inbound",
+        "deliveries",
+        "routes"
+      ],
+      "properties": {
+        "inbound": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295
+        },
+        "deliveries": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295
+        },
+        "routes": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295
+        }
+      }
+    },
+    "session_change": {
+      "description": "Known committed lifecycle business facts; cancellation is distinct from successful delivery. The attachment of an Open is its enclosing OperationId.",
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "session",
+            "route_revision",
+            "cancelled",
+            "revision",
+            "session_present",
+            "expiry",
+            "retired"
+          ],
+          "properties": {
+            "kind": {
+              "const": "Opened"
+            },
+            "session": {
+              "$ref": "primitives.schema.json#/$defs/u64"
+            },
+            "route_revision": {
+              "$ref": "primitives.schema.json#/$defs/u64"
+            },
+            "cancelled": {
+              "$ref": "primitives.schema.json#/$defs/session_cancellations"
+            },
+            "revision": {
+              "$ref": "primitives.schema.json#/$defs/u64"
+            },
+            "session_present": {
+              "type": "boolean"
+            },
+            "expiry": {
+              "$ref": "primitives.schema.json#/$defs/session_expiry"
+            },
+            "retired": {
+              "oneOf": [
+                {
+                  "type": "null"
+                },
+                {
+                  "$ref": "primitives.schema.json#/$defs/u64"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "session",
+            "route_revision",
+            "cancelled"
+          ],
+          "properties": {
+            "kind": {
+              "const": "Closed"
+            },
+            "session": {
+              "$ref": "primitives.schema.json#/$defs/u64"
+            },
+            "route_revision": {
+              "$ref": "primitives.schema.json#/$defs/u64"
+            },
+            "cancelled": {
+              "$ref": "primitives.schema.json#/$defs/session_cancellations"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "session",
+            "expiry",
+            "detached"
+          ],
+          "properties": {
+            "kind": {
+              "const": "Detached"
+            },
+            "session": {
+              "$ref": "primitives.schema.json#/$defs/u64"
+            },
+            "expiry": {
+              "$ref": "primitives.schema.json#/$defs/session_expiry"
+            },
+            "detached": {
+              "$ref": "primitives.schema.json#/$defs/session_detachment"
+            }
+          }
+        }
+      ]
+    },
+    "session_detachment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "operation",
+        "deadline"
+      ],
+      "properties": {
+        "operation": {
+          "$ref": "primitives.schema.json#/$defs/operation_id"
+        },
+        "deadline": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "primitives.schema.json#/$defs/u64"
+            }
+          ]
+        }
+      },
+      "description": "One immutable durable offline occurrence; deadline is logical nanoseconds, or null for retained infinity. Omission/null in legacy Session JSON means no durable detachment."
+    },
+    "session_detachment_optional": {
+      "oneOf": [
+        {
+          "type": "null"
+        },
+        {
+          "$ref": "primitives.schema.json#/$defs/session_detachment"
+        }
+      ]
+    },
+    "session_clock_anchor": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "reading",
+        "logical"
+      ],
+      "properties": {
+        "reading": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "domain",
+            "tick"
+          ],
+          "properties": {
+            "domain": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{64}$",
+              "minLength": 64,
+              "maxLength": 64
+            },
+            "tick": {
+              "$ref": "primitives.schema.json#/$defs/u64"
+            }
+          }
+        },
+        "logical": {
+          "$ref": "primitives.schema.json#/$defs/u64"
+        }
+      },
+      "description": "The one overwritable BOOTTIME anchor. A changed/unproven domain preserves committed logical progress and does not invent downtime. UTC is not an expiry authority."
+    },
+    "subscription_options": {
+      "description": "MQTT5 subscription option bits excluding QoS: No Local, RAP and RH0/1/2. Missing on historical route evidence means0; writers omit0.",
+      "type": "integer",
+      "enum": [
+        0,
+        4,
+        8,
+        12,
+        16,
+        20,
+        24,
+        28,
+        32,
+        36,
+        40,
+        44
+      ]
+    },
+    "message_time": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "domain_hex",
+        "tick"
+      ],
+      "properties": {
+        "domain_hex": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$",
+          "minLength": 64,
+          "maxLength": 64
+        },
+        "tick": {
+          "$ref": "primitives.schema.json#/$defs/u64"
+        }
+      }
+    },
+    "message_expiry": {
+      "description": "Original reception origin and finite MQTT seconds, including zero and 0xffffffff. A changed domain is uncertainty; UTC and renewed observations cannot extend lifetime. Deadline overflow is refused by the semantic readers.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "observed",
+        "interval"
+      ],
+      "properties": {
+        "observed": {
+          "$ref": "primitives.schema.json#/$defs/message_time"
+        },
+        "interval": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295
         }
       }
     }

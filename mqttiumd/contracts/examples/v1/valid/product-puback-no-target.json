@@ -1,0 +1,20 @@
+{
+  "format": "mqttiumd.product-event",
+  "schema_version": 1,
+  "seq": "5",
+  "kind": "puback_observed",
+  "pid": 1,
+  "connection": "7",
+  "details": {
+    "authority": "reader_dequeue"
+  },
+  "puback": {
+    "connection": {
+      "session": "2",
+      "generation": "7"
+    },
+    "packet_id": 1,
+    "reason_code": 0,
+    "target": null
+  }
+}

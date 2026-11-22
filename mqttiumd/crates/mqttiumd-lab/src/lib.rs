@@ -7,10 +7,12 @@
 
 #![forbid(unsafe_code)]
 
+pub mod bench;
 pub mod diagnostic;
 pub mod files;
 pub mod manifest;
 pub mod schemas;
 pub mod semantic;
+pub mod store;
 pub mod strict;
 pub mod workspace;

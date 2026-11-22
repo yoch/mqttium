@@ -1,0 +1,180 @@
+[
+  {
+    "id": "connect/connack-capabilities-v5",
+    "class": "profile-refused",
+    "difference": "Mosquitto announces Receive Maximum 20 and Topic Alias Maximum 10 and leaves every other capability at its default; mqttiumd announces Receive Maximum 8, Maximum Packet Size 1 048 584, Topic Alias Maximum 0, and shared subscriptions and Subscription Identifiers not available.",
+    "lot": "The capabilities of the v0.1 profile: Topic Alias from client to server (Topic Alias Maximum above 0); Shared subscriptions (CMP-002); Subscription Identifiers; Receive Maximum and Maximum Packet Size of the runtime profile",
+    "fingerprint": "b52c6f8738fb9477"
+  },
+  {
+    "id": "connect/empty-clientid-v4",
+    "class": "profile-refused",
+    "difference": "Mosquitto accepts a zero-length ClientID with Clean Session 1 (CONNACK 0); mqttiumd refuses it with return code 2 (Identifier rejected) and closes.",
+    "statement": "MQTT-3.1.3-6 makes accepting it optional; MQTT-3.1.3-9 is how mqttiumd refuses",
+    "lot": "Server-assigned Client Identifier for a zero-length ClientID",
+    "fingerprint": "fe2dce2e4484b2b2"
+  },
+  {
+    "id": "connect/empty-clientid-v5",
+    "class": "profile-refused",
+    "difference": "Mosquitto accepts a zero-length ClientID and returns an Assigned Client Identifier; mqttiumd refuses it with CONNACK 0x85 (Client Identifier not valid) and closes.",
+    "statement": "MQTT-3.1.3-6 makes accepting it optional",
+    "lot": "Server-assigned Client Identifier for a zero-length ClientID",
+    "fingerprint": "2affe3825567206a"
+  },
+  {
+    "id": "connect/legacy-mqtt31",
+    "class": "profile-refused",
+    "difference": "Mosquitto accepts a MQTT 3.1 CONNECT (protocol name MQIsdp, level 3) with CONNACK 0; mqttiumd closes the connection without CONNACK.",
+    "lot": "MQTT 3.1 (MQIsdp): a separate extension, outside the v0.1 profile (chapter 1, section 3)",
+    "fingerprint": "9deea20bbff11a05"
+  },
+  {
+    "id": "connect/username-password-v4",
+    "class": "profile-refused",
+    "difference": "Mosquitto, which accepts anonymous clients here, accepts a CONNECT with User Name and Password; mqttiumd refuses any credentials with return code 4 (Bad user name or password) and closes.",
+    "lot": "Authentication: user name and password checked against a password file (chapter 1, section 3, row Authentification; CFG-004, CFG-005)",
+    "fingerprint": "9551f31d70c05831"
+  },
+  {
+    "id": "connect/username-password-v5",
+    "class": "profile-refused",
+    "difference": "Mosquitto, which accepts anonymous clients here, accepts a CONNECT with User Name and Password; mqttiumd refuses any credentials with CONNACK 0x83 (Implementation specific error) and closes.",
+    "lot": "Authentication: user name and password checked against a password file (chapter 1, section 3, row Authentification; CFG-004, CFG-005)",
+    "fingerprint": "551665967d28f40f"
+  },
+  {
+    "id": "errors/malformed-remaining-length-v5",
+    "class": "unspecified",
+    "difference": "Both close the connection on a Remaining Length of five bytes; Mosquitto without a packet, mqttiumd after DISCONNECT 0x81 (Malformed Packet).",
+    "statement": "MQTT-4.13.1-1: both close; the DISCONNECT before the close is recommended, not required",
+    "decision": "0049",
+    "fingerprint": "e65f6932e92f4b99"
+  },
+  {
+    "id": "errors/packet-at-announced-maximum-v5",
+    "class": "reference-nonconformant",
+    "difference": "Both acknowledge a PUBLISH of exactly the announced 1 048 584 bytes with Reason Code 0x10 (No matching subscribers). Mosquitto also acknowledges the next one, of 1 048 585 bytes, and keeps the connection; mqttiumd answers DISCONNECT 0x95 (Packet too large) and closes.",
+    "statement": "MQTT-4.13.1-1, with section 3.2.2.3.6: the size is the whole packet, and a larger one is a Protocol Error with 0x95",
+    "mqttiumd": "Measures the whole packet, fixed header included: acknowledges 1 048 584 bytes, answers 1 048 585 with DISCONNECT 0x95 (Packet too large) and closes the network connection.",
+    "decision": "0049",
+    "fingerprint": "b11195bc5d8f4afa"
+  },
+  {
+    "id": "properties/topic-alias-v5",
+    "class": "profile-refused",
+    "difference": "Mosquitto (Topic Alias Maximum 10) resolves the alias and delivers both messages; mqttiumd (Topic Alias Maximum 0) answers the first PUBLISH with DISCONNECT 0x94 (Topic Alias invalid) and closes.",
+    "statement": "MQTT-3.2.2-18: with Topic Alias Maximum 0 the client is the one at fault",
+    "lot": "Topic Alias from client to server (Topic Alias Maximum above 0)",
+    "fingerprint": "36e59be75d5309a5"
+  },
+  {
+    "id": "publish/pubrel-retransmit-v5",
+    "class": "unspecified",
+    "difference": "For a PUBREL whose Packet Identifier is no longer known, Mosquitto answers PUBCOMP 0x00 (Success) and mqttiumd PUBCOMP 0x92 (Packet Identifier not found).",
+    "statement": "MQTT-4.3.3-11: both answer with PUBCOMP",
+    "decision": "0049",
+    "fingerprint": "3e9603aaded3ae83"
+  },
+  {
+    "id": "publish/receive-maximum-inbound-v5",
+    "class": "reference-nonconformant",
+    "difference": "On a ninth QoS 2 PUBLISH while eight exchanges are open, Mosquitto answers PUBREC 0x97 (Quota exceeded) and keeps the connection open; mqttiumd sends DISCONNECT 0x93 (Receive Maximum exceeded) and closes.",
+    "statement": "MQTT-4.13.1-1, with section 3.3.4: a client that exceeds Receive Maximum (MQTT-3.3.4-7) makes a Protocol Error for which the Reason Code 0x93 is given, so the server must close the connection",
+    "mqttiumd": "Sends DISCONNECT 0x93 (Receive Maximum exceeded) and closes the network connection.",
+    "decision": "0049",
+    "fingerprint": "967d3cf1ba4eb6a1"
+  },
+  {
+    "id": "publish/topic-with-wildcard-v5",
+    "class": "unspecified",
+    "difference": "Both close the connection on a Topic Name with a wildcard; Mosquitto with DISCONNECT 0x81 (Malformed Packet), mqttiumd with DISCONNECT 0x90 (Topic Name invalid).",
+    "statement": "MQTT-3.3.2-2 is what the client violates; the Reason Code is not prescribed",
+    "decision": "0049",
+    "fingerprint": "3d5fe5d94ba4a6cf"
+  },
+  {
+    "id": "subscribe/invalid-empty-filter-v5",
+    "class": "unspecified",
+    "difference": "Both close the connection on the invalid Topic Filter; Mosquitto with DISCONNECT 0x81 (Malformed Packet), mqttiumd with DISCONNECT 0x82 (Protocol Error).",
+    "statement": "MQTT-4.13.1-1: both close; the Reason Code is not prescribed",
+    "decision": "0049",
+    "fingerprint": "624dc40dd9b77310"
+  },
+  {
+    "id": "subscribe/invalid-hash-not-last-v5",
+    "class": "unspecified",
+    "difference": "Both close the connection on the invalid Topic Filter; Mosquitto with DISCONNECT 0x81 (Malformed Packet), mqttiumd with DISCONNECT 0x82 (Protocol Error).",
+    "statement": "MQTT-4.13.1-1: both close; the Reason Code is not prescribed",
+    "decision": "0049",
+    "fingerprint": "6a79447df4524ecc"
+  },
+  {
+    "id": "subscribe/overlapping-subscriptions-v5",
+    "class": "unspecified",
+    "difference": "For one message matching two subscriptions of a MQTT 5 client, Mosquitto sends one copy per subscription (QoS 0 and QoS 1); mqttiumd sends one copy at the highest granted QoS.",
+    "statement": "MQTT-3.3.4-2 requires the copy at the highest QoS; section 3.3.4 allows further copies",
+    "decision": "0049",
+    "fingerprint": "041811d9fa699fcb"
+  },
+  {
+    "id": "subscribe/share-literal-filter-v4",
+    "class": "profile-refused",
+    "difference": "Mosquitto, which offers shared subscriptions to MQTT 3.1.1 clients too, grants `$share/group/lit/t` at QoS 0; mqttiumd reads it as an ordinary Topic Filter of MQTT 3.1.1 and refuses to hold it: SUBACK with return code 0x80 (Failure), connection kept.",
+    "statement": "MQTT-3.8.4-5 allows a return code that says the subscription failed",
+    "lot": "Shared subscriptions (CMP-002)",
+    "decision": "0049",
+    "fingerprint": "427ec304ee5b275f"
+  },
+  {
+    "id": "subscribe/shared-subscription-v5",
+    "class": "profile-refused",
+    "difference": "Mosquitto grants `$share/group/shared/t` and delivers to it; mqttiumd, whose CONNACK announces Shared Subscription Available 0, answers the SUBSCRIBE with DISCONNECT 0x9E (Shared Subscriptions not supported) and closes; the plain subscription of the other client is served by both.",
+    "statement": "MQTT-4.13.1-1, with section 3.2.2.3.13: how a broker that announced the feature as not available refuses it",
+    "lot": "Shared subscriptions (CMP-002)",
+    "fingerprint": "123224fc7a862456"
+  },
+  {
+    "id": "subscribe/subscription-identifier-v5",
+    "class": "profile-refused",
+    "difference": "Mosquitto accepts the Subscription Identifier and returns it in the PUBLISH; mqttiumd, whose CONNACK announces Subscription Identifier Available 0, answers the SUBSCRIBE with DISCONNECT 0xA1 (Subscription Identifiers not supported) and closes.",
+    "statement": "MQTT-4.13.1-1, with section 3.2.2.3.12: how a broker that announced the feature as not available refuses it",
+    "lot": "Subscription Identifiers",
+    "fingerprint": "1f9b87b6eeac5463"
+  },
+  {
+    "id": "subscribe/sys-explicit-filter-v4",
+    "class": "profile-refused",
+    "difference": "Mosquitto sends its retained `$SYS/broker/version` message; mqttiumd grants the subscription and publishes nothing under `$SYS`.",
+    "lot": "Operations: metrics published under `$SYS` (chapter 1, section 3, row Exploitation)",
+    "fingerprint": "b026513ceb42f74a"
+  },
+  {
+    "id": "will/abrupt-close-qos0-v4",
+    "class": "profile-refused",
+    "difference": "Mosquitto accepts a QoS 0 Will and publishes it on abrupt close; mqttiumd supports QoS 1 Wills only and refuses the CONNECT with return code 3 (Server unavailable).",
+    "lot": "Will messages beyond QoS 1 without delay: Will QoS 0 and 2, Will Delay Interval",
+    "fingerprint": "8b26fd3480594a4d"
+  },
+  {
+    "id": "will/abrupt-close-qos2-v4",
+    "class": "profile-refused",
+    "difference": "Mosquitto accepts a QoS 2 Will and publishes it on abrupt close; mqttiumd supports QoS 1 Wills only and refuses the CONNECT with return code 3 (Server unavailable).",
+    "lot": "Will messages beyond QoS 1 without delay: Will QoS 0 and 2, Will Delay Interval",
+    "fingerprint": "560bb8ddb7fd44fe"
+  },
+  {
+    "id": "will/abrupt-close-qos2-v5",
+    "class": "profile-refused",
+    "difference": "Mosquitto accepts a QoS 2 Will and publishes it on abrupt close; mqttiumd supports QoS 1 Wills only and refuses the CONNECT with CONNACK 0x83 (the code MQTT-3.2.2-12 recommends is 0x9B).",
+    "lot": "Will messages beyond QoS 1 without delay: Will QoS 0 and 2, Will Delay Interval",
+    "fingerprint": "af83dd101364a6f7"
+  },
+  {
+    "id": "will/delay-interval-v5",
+    "class": "profile-refused",
+    "difference": "Mosquitto accepts Will Delay Interval 1 and publishes the Will after the delay; mqttiumd refuses the CONNECT with CONNACK 0x83 (Implementation specific error).",
+    "lot": "Will messages beyond QoS 1 without delay: Will QoS 0 and 2, Will Delay Interval",
+    "fingerprint": "d099e2268f9c64c9"
+  }
+]

@@ -1,0 +1,13 @@
+[package]
+name = "mqttiumd-proof-credits"
+description = "Kani proof of release_if_current, on the production body of mqttiumd-core (DEM-021)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+mqttiumd-core.workspace = true
+
+[lints]
+workspace = true

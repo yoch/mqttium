@@ -1,0 +1,62 @@
+{
+  "module": "MRetainedOwnership.tla",
+  "status": "specification",
+  "summary": "Finite durable retained ownership: independent retained/delivery references, immutable replay versions, replacement/clear, producer disappearance and same-operation resolution/retirement.",
+  "issues": [
+    648
+  ],
+  "tests": [],
+  "configs": [
+    {
+      "config": "MRetainedOwnership-safety.cfg",
+      "expect": "pass",
+      "invariants": [
+        "TypeOK",
+        "ReferencesExact",
+        "PayloadLifetimeExact",
+        "FrozenReplay",
+        "RetainedIndependentOfProducer",
+        "NoReexecution",
+        "RetirementRequiresConsumption"
+      ]
+    },
+    {
+      "config": "MRetainedOwnership-recovery.cfg",
+      "expect": "pass",
+      "invariants": [
+        "TypeOK",
+        "ReferencesExact",
+        "PayloadLifetimeExact",
+        "FrozenReplay",
+        "RetainedIndependentOfProducer",
+        "NoReexecution",
+        "RetirementRequiresConsumption"
+      ]
+    },
+    {
+      "config": "MRetainedOwnership-mut-free-old-payload.cfg",
+      "expect": "violation",
+      "invariant": "ReferencesExact"
+    },
+    {
+      "config": "MRetainedOwnership-mut-retarget-replay.cfg",
+      "expect": "violation",
+      "invariant": "FrozenReplay"
+    },
+    {
+      "config": "MRetainedOwnership-mut-reexecute-retired.cfg",
+      "expect": "violation",
+      "invariant": "NoReexecution"
+    },
+    {
+      "config": "MRetainedOwnership-mut-producer-ownership.cfg",
+      "expect": "violation",
+      "invariant": "RetainedIndependentOfProducer"
+    },
+    {
+      "config": "MRetainedOwnership-reach-ownership.cfg",
+      "expect": "violation",
+      "invariant": "NoOwnershipWitness"
+    }
+  ]
+}

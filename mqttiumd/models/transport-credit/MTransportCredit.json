@@ -1,0 +1,30 @@
+{
+  "module": "MTransportCredit.tla",
+  "status": "refinement",
+  "summary": "Frames and receipts of one connection (net.rs Lanes and Task, net/tls.rs Task, runtime.rs collect_written and finish_close): the frame lane is the only bound on frames in flight, receipts are queued in order and published without blocking, the task produces at most one terminal receipt per frame and nothing after `finished`, and every accepted frame gets exactly one terminal result at the core, from its receipt or from the close.",
+  "issues": [648],
+  "tests": ["mqttiumd/crates/mqttiumd/src/net.rs", "mqttiumd/crates/mqttiumd/src/net/reactor.rs", "mqttiumd/crates/mqttiumd/src/runtime_tests.rs"],
+  "replays": [{"file": "mqttiumd/crates/mqttiumd/src/net.rs", "test": "cancellation_reports_every_accepted_output_frame"}, {"file": "mqttiumd/crates/mqttiumd/src/net.rs", "test": "a_started_receipt_and_peer_ack_precede_the_local_completion_receipt"}, {"file": "mqttiumd/crates/mqttiumd/src/net.rs", "test": "expired_queued_publication_is_disposed_without_closing_the_transport"}, {"file": "mqttiumd/crates/mqttiumd/src/net.rs", "test": "nonreading_peer_expires_one_absolute_write_budget"}, {"file": "mqttiumd/crates/mqttiumd/src/net/reactor.rs", "test": "a_terminal_turn_publishes_its_facts_before_the_link_reads_finished"}, {"file": "mqttiumd/crates/mqttiumd/src/runtime_tests.rs", "test": "closing_qos0_without_collecting_written_retires_the_exact_attempt"}],
+  "not_replayed": "No test fills the receipt lane before the task ends (reach-refused-at-end) or submits a frame while the task is ending (reach-late-submit); the close that covers both is replayed by closing_qos0_without_collecting_written_retires_the_exact_attempt. No test makes a TLS frame fail to seal (mut-drop-unsealed-frame): a_bad_expiry_value_offset_closes_without_touching_socket_bytes covers the failure on write_attempt only. No test replays mut-double-receipt, mut-take-while-pending or mut-flush-newest-first.",
+  "configs": [
+    {"config": "MTransportCredit-safety.cfg", "expect": "pass", "invariants": ["TypeOK", "LanesFit", "ReportsBounded", "AtMostOneTerminal", "StartedBeforeTerminal", "NothingAfterFinished", "TerminalWhenRoom", "OneResultPerFrame", "RetiredFramesResolved"]},
+    {"config": "MTransportCredit-safety-preserve.cfg", "expect": "pass", "invariants": ["TypeOK", "LanesFit", "ReportsBounded", "AtMostOneTerminal", "StartedBeforeTerminal", "NothingAfterFinished", "TerminalWhenRoom", "OneResultPerFrame", "RetiredFramesResolved", "FactsPreserved"]},
+    {"config": "MTransportCredit-safety-roomy.cfg", "expect": "pass", "invariants": ["TypeOK", "LanesFit", "ReportsBounded", "AtMostOneTerminal", "StartedBeforeTerminal", "NothingAfterFinished", "TerminalWhenRoom", "OneResultPerFrame", "RetiredFramesResolved", "FactsPreserved"]},
+    {"config": "MTransportCredit-liveness.cfg", "expect": "pass", "property": "EveryFrameResolved"},
+    {"config": "MTransportCredit-liveness-unwritable.cfg", "expect": "pass", "property": "EveryFrameResolved"},
+    {"config": "MTransportCredit-reach-backpressure.cfg", "expect": "violation", "invariant": "NoBackpressureWitness"},
+    {"config": "MTransportCredit-reach-refused-at-end.cfg", "expect": "violation", "invariant": "NoRefusedAtEndWitness"},
+    {"config": "MTransportCredit-reach-late-submit.cfg", "expect": "violation", "invariant": "NoLateSubmitWitness"},
+    {"config": "MTransportCredit-reach-mixed-outcome.cfg", "expect": "violation", "invariant": "NoMixedOutcomeWitness"},
+    {"config": "MTransportCredit-reach-fact-replaced.cfg", "expect": "violation", "invariant": "FactsPreserved"},
+    {"config": "MTransportCredit-mut-double-receipt.cfg", "expect": "violation", "invariant": "AtMostOneTerminal"},
+    {"config": "MTransportCredit-mut-double-receipt-at-core.cfg", "expect": "violation", "invariant": "OneResultPerFrame"},
+    {"config": "MTransportCredit-mut-lost-receipt-on-close.cfg", "expect": "violation", "invariant": "TerminalWhenRoom"},
+    {"config": "MTransportCredit-mut-drop-unsealed-frame.cfg", "expect": "violation", "invariant": "TerminalWhenRoom"},
+    {"config": "MTransportCredit-mut-no-close-sweep.cfg", "expect": "violation", "invariant": "RetiredFramesResolved"},
+    {"config": "MTransportCredit-mut-no-close-sweep-liveness.cfg", "expect": "liveness", "property": "EveryFrameResolved"},
+    {"config": "MTransportCredit-mut-finished-first.cfg", "expect": "violation", "invariant": "NothingAfterFinished"},
+    {"config": "MTransportCredit-mut-take-while-pending.cfg", "expect": "violation", "invariant": "ReportsBounded"},
+    {"config": "MTransportCredit-mut-flush-newest-first.cfg", "expect": "violation", "invariant": "StartedBeforeTerminal"}
+  ]
+}

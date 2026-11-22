@@ -1,0 +1,23 @@
+{
+  "format": "mqttiumd.product-event",
+  "schema_version": 1,
+  "seq": "8",
+  "kind": "receipt_collection_applied",
+  "pid": 1,
+  "command_kind": "ReceiptCollection",
+  "details": {
+    "effect": "1/0/9",
+    "incarnation": "1",
+    "epoch": "1",
+    "owner": "0",
+    "through": "18446744073709551616",
+    "publication_through": "32",
+    "payload_through": "32",
+    "limit": 128,
+    "attempt": 1,
+    "outcome": "Applied",
+    "removed": 64,
+    "retained": "8",
+    "more": false
+  }
+}

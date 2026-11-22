@@ -1,0 +1,21 @@
+{
+  "format": "mqttiumd.product-event",
+  "schema_version": 1,
+  "seq": "12",
+  "kind": "session_changed",
+  "pid": 1,
+  "operation": {
+    "incarnation": "1",
+    "epoch": "1",
+    "owner": "0",
+    "sequence": "27"
+  },
+  "details": {
+    "action": "Closed",
+    "session": "1",
+    "route_revision": "2",
+    "cancelled_inbound": 1,
+    "cancelled_deliveries": 0,
+    "cancelled_routes": 0
+  }
+}

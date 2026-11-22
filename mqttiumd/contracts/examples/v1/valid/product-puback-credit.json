@@ -1,0 +1,15 @@
+{
+  "format": "mqttiumd.product-event",
+  "schema_version": 1,
+  "seq": "3",
+  "kind": "receive_credit",
+  "pid": 1,
+  "connection": "1",
+  "details": {
+    "packet_kind": "PUBACK",
+    "effect": "2/0/7",
+    "packet_id": 1,
+    "publish_order": "3",
+    "released": false
+  }
+}

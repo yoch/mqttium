@@ -1,0 +1,224 @@
+{
+  "broker_and_site": {
+    "archive_sha256": "8ea28eda6be48e1ddfe07c623b51deff43d658ee7ac5d8b3edef012ac6f957a2",
+    "binary_sha256": "9ef097977c2cb86669e11e98d7fbceeac87a4f86fd6a24c7deb76ea9c31bf119",
+    "broker_source": "51be4079f7ee42f46500e993315eddc971f0a8d4",
+    "components": {
+      "common.py": "eb28d065e27f6d47dfbb02838418d3f3cbd5a833ab5e04a03a5ab02d8ac1ad0b",
+      "forward_client.py": "107bae1ec989bd05e479c198b7cb6ad7bae0ebe0c0081b9ffb4d789d4f363585",
+      "forward_store.py": "b20e442f6bff275405d59e3e3c740f7b450c85624b04dea82e1ff22053071eda",
+      "operate.py": "b51af6c8e6db140858a4e70353a1e27b16b0a7769ce524cfec333694c733fa45",
+      "rc_reception.py": "791ba726e8f08ae4b7cfd34124d5fadc244a7ee81a1628583e6f97468e72d8c6",
+      "segment_admin.py": "0467ef1d41343541eb8806c5169e15864f8fc3f8a55568c53a677c8ad68b43fc",
+      "segment_store.py": "fab0848379d884e7d80e41d9bd82ad553bf925e53ca85e5fc88555bf56db51c9",
+      "site_backup.py": "645bc6ea33df5f66bf72627f73fa9419aa1cc092a9cf3ec8f31e0592a968aedd",
+      "site_health.py": "1ae61529558d7d5c6459fe19e291efeaf8d2e6bb7132765cff05ac18f8ea5ce5",
+      "site_ops.py": "957bdeec575a63340e308de925668d179aac1399242fe6658bb874aba4e06d62",
+      "site_supervisor.py": "629ab829454ae2d03287623d48f2581674d9b8b2547e4ef9c4ac8f39e61b3d08",
+      "split_client.py": "1d36fe0406976be43e26c72b2d99ab10f0f4ee4d69eee939f8c0f1d82bfae868",
+      "split_reception.py": "43c6db4b133fe69fa04d3633058caf9debcc45f0523661ab1281d6339fe871e0"
+    },
+    "elf_machine": "x86_64",
+    "minimum_glibc_symbols": "2.34",
+    "package_source": "91e53652a7e4f2b95cabc34476048538e9a64ad7",
+    "site_source": "5f37e61735a6590675e7ed8b1bf103e4050c28bf"
+  },
+  "cloud_observation": {
+    "capacity_by_filesystem": {
+      "0:27": {
+        "available_bytes": 356597760,
+        "available_inodes": 3511620,
+        "required_bytes": 66236448768,
+        "required_inodes": 602112,
+        "roles": [
+          "data",
+          "backup",
+          "restore"
+        ]
+      }
+    },
+    "format": "mqttiumd.field-preflight.v1",
+    "host": {
+      "available_cpus": 5,
+      "board": null,
+      "container": "container-other",
+      "cpu_cgroup": "400000 100000",
+      "cpu_model": "AMD EPYC 9V74 80-Core Processor",
+      "glibc": [
+        "glibc",
+        "2.41"
+      ],
+      "kernel": "6.18.57",
+      "machine": "x86_64",
+      "memory_cgroup": "17179869184",
+      "memory_kib": 18440100,
+      "mqttium": "1.3.0",
+      "openssl": "OpenSSL 3.5.7 9 Jun 2026",
+      "openssl_command": "OpenSSL 3.5.7 9 Jun 2026 (Library: OpenSSL 3.5.7 9 Jun 2026)",
+      "os": "Linux",
+      "paho": "2.1.0",
+      "power_supplies": [],
+      "python": "3.13.5",
+      "rpi_throttled": null,
+      "smartctl_available": false,
+      "sqlite": "3.46.1",
+      "ssh": "not_probed",
+      "systemd": false,
+      "uid": 1000,
+      "ups": "unverified",
+      "vm": "kvm"
+    },
+    "mode": "read_only",
+    "network": {
+      "address": null,
+      "link": null,
+      "peer_exchange": "not_executed",
+      "server_certificate": {}
+    },
+    "observed_unix_s": 1795069571,
+    "operator_write_assessments": {},
+    "preflight": "HOLD",
+    "qualification": "not_executed",
+    "refusals": [
+      {
+        "code": "physical_backing_device_unverified",
+        "role": "data"
+      },
+      {
+        "code": "physical_backing_device_unverified",
+        "role": "backup"
+      },
+      {
+        "code": "physical_backing_device_unverified",
+        "role": "restore"
+      },
+      {
+        "code": "insufficient_free_bytes",
+        "filesystem_device": "0:27"
+      },
+      {
+        "code": "private_lan_not_selected"
+      }
+    ],
+    "release_site_listener": "loopback_only",
+    "volumes": {
+      "backup": {
+        "available_bytes": 356597760,
+        "available_inodes": 3511620,
+        "device": "0:27",
+        "disk": null,
+        "filesystem": "overlay",
+        "mount_options": [
+          "rw",
+          "nosuid",
+          "nodev",
+          "relatime",
+          "lowerdir",
+          "upperdir",
+          "workdir",
+          "index=off",
+          "metacopy=off"
+        ],
+        "path": "/workspace/pilot-field/backup",
+        "private_writable": true
+      },
+      "data": {
+        "available_bytes": 356597760,
+        "available_inodes": 3511620,
+        "device": "0:27",
+        "disk": null,
+        "filesystem": "overlay",
+        "mount_options": [
+          "rw",
+          "nosuid",
+          "nodev",
+          "relatime",
+          "lowerdir",
+          "upperdir",
+          "workdir",
+          "index=off",
+          "metacopy=off"
+        ],
+        "path": "/workspace/pilot-field/data",
+        "private_writable": true
+      },
+      "restore": {
+        "available_bytes": 356597760,
+        "available_inodes": 3511620,
+        "device": "0:27",
+        "disk": null,
+        "filesystem": "overlay",
+        "mount_options": [
+          "rw",
+          "nosuid",
+          "nodev",
+          "relatime",
+          "lowerdir",
+          "upperdir",
+          "workdir",
+          "index=off",
+          "metacopy=off"
+        ],
+        "path": "/workspace/pilot-field/backup",
+        "private_writable": true
+      }
+    }
+  },
+  "configuration": {
+    "field_deployed": null,
+    "listener": "loopback_only",
+    "mqtt_contracts_changed": false
+  },
+  "evidence_sha256": {
+    "cloud-preflight.json": "51c53792e047f1711c2e744a7f24d72c2425cbc6b9138f9fb915caabac78c86d",
+    "rpi5-manifest.json": "503fe30204e0e8559c3e369b607f758192338561fc779510f983ef6a7a551814",
+    "rpi5-recent-arm64.zip": "75f4069a77992e131ca186a91b7c984727736a774a3bd13c98d31fc6f1291636"
+  },
+  "format": "mqttiumd.field-observations.v1",
+  "pi5_observation": {
+    "artifact": 14410109734,
+    "completed_utc": "2026-11-18T08:33:21Z",
+    "disk_mapping": null,
+    "environment": {
+      "architecture": "aarch64",
+      "asyncio_event_loop": "asyncio.unix_events._UnixSelectorEventLoop",
+      "core_count": 4,
+      "cpu_model": "Raspberry Pi 5 Model B Rev 1.0",
+      "dependencies": {
+        "hypothesis": "6.170.15",
+        "mqttium": "1.3.0",
+        "pytest": "9.2.0",
+        "pytest-asyncio": "1.5.0"
+      },
+      "os": "Linux-6.18.50+rpt-rpi-2712-aarch64-with-glibc2.43",
+      "python": "3.14.10 (main, Oct 26 2026, 15:12:11) [GCC 16.2.0]",
+      "ram_bytes": 8453947392,
+      "runner_id": "rpi5",
+      "runner_kind": "github-self-hosted",
+      "runner_labels": "self-hosted,linux,ARM64,rpi5"
+    },
+    "job": 134676372555,
+    "manifest_path_in_artifact": "nightly-v1-run-89-44267745156-arm64/manifest.json",
+    "mqttiumd_execution": false,
+    "origin": "historical GitHub Actions Python-client campaign",
+    "power_or_ups": null,
+    "reason": "native_architecture_mismatch",
+    "remote_lan_exchange": null,
+    "run": 44267745156,
+    "run_source": "874f298b4de7c3a13006cb1ff767dfb09e4031ac"
+  },
+  "preflight_sha256": "c05e65fa659fe71cbbfe904b8ceddc73e09582dfb52ba28c7ba48d06a5dc44bf",
+  "qualification": {
+    "current_observed_field_duration_seconds": 0,
+    "hardware_72h": "not_qualified",
+    "permanent_primary_loss_recovery": "NO_GO",
+    "previous_local_synthetic": {
+      "seconds": 2617.977131688,
+      "status": "GO_WITH_RESTRICTIONS"
+    },
+    "remote_device": "not_qualified",
+    "second_host_planned_recovery": "not_qualified",
+    "strong_real_time": "NO_GO"
+  },
+  "reference_head": "91e53652a7e4f2b95cabc34476048538e9a64ad7"
+}

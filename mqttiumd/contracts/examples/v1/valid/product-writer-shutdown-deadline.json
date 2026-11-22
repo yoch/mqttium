@@ -1,0 +1,11 @@
+{
+  "format": "mqttiumd.product-event",
+  "schema_version": 1,
+  "seq": "16",
+  "kind": "shutdown_incomplete",
+  "pid": 1,
+  "details": {
+    "code": "writer_deadline",
+    "accepted_outcome": "unknown"
+  }
+}

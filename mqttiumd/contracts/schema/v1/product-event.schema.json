@@ -1,0 +1,1541 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "format",
+    "schema_version",
+    "seq",
+    "kind",
+    "pid"
+  ],
+  "properties": {
+    "format": {
+      "const": "mqttiumd.product-event"
+    },
+    "schema_version": {
+      "const": 1
+    },
+    "seq": {
+      "type": "string",
+      "pattern": "^(0|[1-9][0-9]{0,19})$"
+    },
+    "kind": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_]{0,47}$"
+    },
+    "pid": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 4294967295
+    },
+    "connection": {
+      "type": "string",
+      "pattern": "^(0|[1-9][0-9]{0,19})$"
+    },
+    "operation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "incarnation",
+        "epoch",
+        "owner",
+        "sequence"
+      ],
+      "properties": {
+        "incarnation": {
+          "type": "string",
+          "pattern": "^(0|[1-9][0-9]{0,19})$"
+        },
+        "epoch": {
+          "type": "string",
+          "pattern": "^(0|[1-9][0-9]{0,19})$"
+        },
+        "owner": {
+          "type": "string",
+          "pattern": "^(0|[1-9][0-9]{0,19})$"
+        },
+        "sequence": {
+          "type": "string",
+          "pattern": "^(0|[1-9][0-9]{0,19})$"
+        }
+      }
+    },
+    "point": {
+      "enum": [
+        "admission.prepared",
+        "release.prepared",
+        "admission.committed",
+        "ack.receipt",
+        "subscription.prepared",
+        "claim.prepared",
+        "finish.prepared",
+        "claim.committed",
+        "finish.committed",
+        "consume.prepared",
+        "consume.committed",
+        "consume.emission",
+        "receipt.close.prepared",
+        "receipt.close.committed",
+        "session.open.prepared",
+        "session.close.prepared",
+        "session.open.committed",
+        "session.close.committed",
+        "session.detach.prepared",
+        "session.detach.committed",
+        "session.expire.prepared",
+        "session.expire.committed",
+        "retained.prepared",
+        "retained.committed",
+        "subscription.committed",
+        "delivery.started.prepared",
+        "delivery.started.committed",
+        "message.delivery.expire.prepared",
+        "message.delivery.expire.committed",
+        "message.expire.prepared",
+        "message.expire.committed",
+        "publish.emission",
+        "will.admission.prepared",
+        "will.admission.committed",
+        "will.end.prepared",
+        "will.end.committed",
+        "work.read.before",
+        "tls.frame.sealed",
+        "tls.frame.first_bytes"
+      ]
+    },
+    "command_kind": {
+      "enum": [
+        "Admission",
+        "Release",
+        "Subscriptions",
+        "Claim",
+        "Finish",
+        "Consume",
+        "ReceiptCollection",
+        "SessionOpen",
+        "SessionClose",
+        "SessionDetach",
+        "SessionExpire",
+        "SessionLifecycle",
+        "RetainedQoS0",
+        "DeliveryStarted",
+        "DeliveryPubrelReady",
+        "MessageExpire",
+        "MessageExpiry",
+        "WillPublication",
+        "WillAdmission",
+        "WillEnd"
+      ]
+    },
+    "cause": {
+      "enum": [
+        "InvalidData",
+        "LimitExceeded",
+        "Unavailable",
+        "Io",
+        "AllocationFailed"
+      ]
+    },
+    "phase": {
+      "enum": [
+        "Open",
+        "Ledger",
+        "Opening",
+        "Lookup",
+        "Snapshot",
+        "Inspect",
+        "Recovery",
+        "Work",
+        "Maintenance"
+      ]
+    },
+    "details": {
+      "type": "object",
+      "maxProperties": 40,
+      "propertyNames": {
+        "pattern": "^[a-z][a-z_]{0,47}$"
+      },
+      "additionalProperties": {
+        "oneOf": [
+          {
+            "type": "string",
+            "maxLength": 256
+          },
+          {
+            "type": "boolean"
+          },
+          {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 4294967295
+          }
+        ]
+      },
+      "properties": {
+        "returned_incarnation": {
+          "$ref": "primitives.schema.json#/$defs/u64"
+        },
+        "returned_epoch": {
+          "$ref": "primitives.schema.json#/$defs/u64"
+        },
+        "returned_owner": {
+          "$ref": "primitives.schema.json#/$defs/u64"
+        },
+        "returned_through": {
+          "$ref": "primitives.schema.json#/$defs/u64"
+        },
+        "returned_publication_through": {
+          "$ref": "primitives.schema.json#/$defs/u64"
+        },
+        "returned_payload_through": {
+          "$ref": "primitives.schema.json#/$defs/u64"
+        },
+        "session": {
+          "$ref": "primitives.schema.json#/$defs/u64"
+        },
+        "route_revision": {
+          "$ref": "primitives.schema.json#/$defs/u64"
+        },
+        "revision": {
+          "$ref": "primitives.schema.json#/$defs/u64"
+        },
+        "retired_session": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "primitives.schema.json#/$defs/u64"
+            }
+          ]
+        },
+        "expected_session": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "primitives.schema.json#/$defs/u64"
+            }
+          ]
+        },
+        "expiry": {
+          "oneOf": [
+            {
+              "$ref": "primitives.schema.json#/$defs/session_expiry"
+            },
+            {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 4294967295
+            }
+          ]
+        },
+        "detached_by": {
+          "oneOf": [
+            {
+              "$ref": "primitives.schema.json#/$defs/operation_id"
+            },
+            {
+              "type": "string",
+              "maxLength": 83,
+              "pattern": "^(0|[1-9][0-9]{0,19})/(0|[1-9][0-9]{0,19})/(0|[1-9][0-9]{0,19})/(0|[1-9][0-9]{0,19})$"
+            }
+          ]
+        },
+        "deadline": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "primitives.schema.json#/$defs/u64"
+            }
+          ]
+        },
+        "logical": {
+          "$ref": "primitives.schema.json#/$defs/u64"
+        },
+        "tick": {
+          "$ref": "primitives.schema.json#/$defs/u64"
+        },
+        "age_ms": {
+          "$ref": "primitives.schema.json#/$defs/u64"
+        }
+      }
+    },
+    "puback": {
+      "$ref": "#/$defs/puback_observation"
+    },
+    "will": {
+      "description": "Immutable installing Open OperationId of the Will occurrence; null only for a Will-aware End without a registered Will. No Will topic or payload bytes are logged.",
+      "oneOf": [
+        {
+          "type": "null"
+        },
+        {
+          "$ref": "primitives.schema.json#/$defs/operation_id"
+        }
+      ]
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "required": [
+          "command_kind"
+        ],
+        "properties": {
+          "command_kind": {
+            "const": "ReceiptCollection"
+          }
+        }
+      },
+      "then": {
+        "not": {
+          "required": [
+            "operation"
+          ]
+        }
+      }
+    },
+    {
+      "if": {
+        "required": [
+          "kind"
+        ],
+        "properties": {
+          "kind": {
+            "enum": [
+              "puback_observed",
+              "puback_ignored"
+            ]
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "puback",
+          "details"
+        ],
+        "properties": {
+          "details": {
+            "required": [
+              "authority"
+            ],
+            "properties": {
+              "authority": {
+                "const": "reader_dequeue"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": [
+          "kind"
+        ],
+        "properties": {
+          "kind": {
+            "const": "session_changed"
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "operation",
+          "details"
+        ],
+        "properties": {
+          "details": {
+            "required": [
+              "action",
+              "session"
+            ],
+            "properties": {
+              "action": {
+                "enum": [
+                  "Opened",
+                  "Closed",
+                  "Detached"
+                ]
+              },
+              "cancelled_inbound": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 128
+              },
+              "cancelled_deliveries": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 4096
+              },
+              "cancelled_routes": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 128
+              }
+            },
+            "allOf": [
+              {
+                "if": {
+                  "properties": {
+                    "action": {
+                      "const": "Opened"
+                    }
+                  }
+                },
+                "then": {
+                  "required": [
+                    "revision",
+                    "session_present",
+                    "expiry",
+                    "retired_session",
+                    "route_revision",
+                    "cancelled_inbound",
+                    "cancelled_deliveries",
+                    "cancelled_routes"
+                  ],
+                  "properties": {
+                    "expiry": {
+                      "$ref": "primitives.schema.json#/$defs/session_expiry"
+                    },
+                    "session_present": {
+                      "type": "boolean"
+                    }
+                  }
+                }
+              },
+              {
+                "if": {
+                  "properties": {
+                    "action": {
+                      "const": "Closed"
+                    }
+                  }
+                },
+                "then": {
+                  "required": [
+                    "route_revision",
+                    "cancelled_inbound",
+                    "cancelled_deliveries",
+                    "cancelled_routes"
+                  ]
+                }
+              },
+              {
+                "if": {
+                  "properties": {
+                    "action": {
+                      "const": "Detached"
+                    }
+                  }
+                },
+                "then": {
+                  "required": [
+                    "expiry",
+                    "detached_by"
+                  ],
+                  "properties": {
+                    "expiry": {
+                      "$ref": "primitives.schema.json#/$defs/session_expiry"
+                    }
+                  },
+                  "allOf": [
+                    {
+                      "if": {
+                        "required": [
+                          "expiry"
+                        ],
+                        "properties": {
+                          "expiry": {
+                            "const": "Never"
+                          }
+                        }
+                      },
+                      "then": {
+                        "properties": {
+                          "deadline": {
+                            "type": "null"
+                          }
+                        }
+                      },
+                      "else": {
+                        "required": [
+                          "deadline"
+                        ],
+                        "properties": {
+                          "deadline": {
+                            "$ref": "primitives.schema.json#/$defs/u64"
+                          }
+                        }
+                      }
+                    }
+                  ]
+                }
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": [
+          "kind"
+        ],
+        "properties": {
+          "kind": {
+            "const": "session_refused"
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "connection",
+          "details"
+        ],
+        "properties": {
+          "details": {
+            "required": [
+              "reason_code"
+            ],
+            "properties": {
+              "reason_code": {
+                "enum": [
+                  128,
+                  129,
+                  130,
+                  131,
+                  132,
+                  133,
+                  134,
+                  135,
+                  136,
+                  137,
+                  138,
+                  140,
+                  144,
+                  149,
+                  151,
+                  153,
+                  154,
+                  155,
+                  156,
+                  157,
+                  159
+                ]
+              }
+            },
+            "not": {
+              "required": [
+                "session"
+              ]
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": [
+          "kind"
+        ],
+        "properties": {
+          "kind": {
+            "const": "session_cardinality"
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "details"
+        ],
+        "properties": {
+          "details": {
+            "required": [
+              "session_cache",
+              "owner_sessions",
+              "owner_bindings",
+              "work_requests",
+              "work_ready",
+              "emit_registrations",
+              "lifecycle_requests",
+              "closed_generations",
+              "retired_flights",
+              "owner_inbound",
+              "owner_outgoing",
+              "frames",
+              "timers"
+            ],
+            "additionalProperties": false,
+            "properties": {
+              "session_cache": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 4096
+              },
+              "owner_sessions": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 4096
+              },
+              "owner_bindings": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 4096
+              },
+              "work_requests": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 4096
+              },
+              "work_ready": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 4096
+              },
+              "emit_registrations": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 4096
+              },
+              "lifecycle_requests": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 4096
+              },
+              "closed_generations": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 4096
+              },
+              "retired_flights": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 4096
+              },
+              "owner_inbound": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 4096
+              },
+              "owner_outgoing": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 4096
+              },
+              "frames": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 4096
+              },
+              "timers": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 4096
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": [
+          "details"
+        ],
+        "properties": {
+          "details": {
+            "required": [
+              "expected_session"
+            ],
+            "properties": {
+              "expected_session": {
+                "type": "null"
+              }
+            }
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "kind": {
+            "const": "command_submitted"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": [
+          "details"
+        ],
+        "properties": {
+          "details": {
+            "required": [
+              "retired_session"
+            ],
+            "properties": {
+              "retired_session": {
+                "type": "null"
+              }
+            }
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "kind": {
+            "const": "session_changed"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": [
+          "kind"
+        ],
+        "properties": {
+          "kind": {
+            "enum": [
+              "session_change_copied",
+              "session_change_replayed"
+            ]
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "operation",
+          "details"
+        ],
+        "properties": {
+          "details": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "action",
+              "session"
+            ],
+            "properties": {
+              "action": {
+                "enum": [
+                  "Opened",
+                  "Closed",
+                  "Detached"
+                ]
+              },
+              "session": {
+                "$ref": "primitives.schema.json#/$defs/u64"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": [
+          "kind"
+        ],
+        "properties": {
+          "kind": {
+            "enum": [
+              "session_close_copied",
+              "session_close_replayed"
+            ]
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "connection",
+          "details"
+        ],
+        "properties": {
+          "details": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "session"
+            ],
+            "properties": {
+              "session": {
+                "$ref": "primitives.schema.json#/$defs/u64"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": [
+          "kind"
+        ],
+        "properties": {
+          "kind": {
+            "const": "session_shutdown_completed"
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "details"
+        ],
+        "properties": {
+          "details": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "persistent_sessions",
+              "owner_bindings"
+            ],
+            "properties": {
+              "persistent_sessions": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 128
+              },
+              "owner_bindings": {
+                "const": 0
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": [
+          "kind",
+          "details"
+        ],
+        "properties": {
+          "kind": {
+            "const": "shutdown_incomplete"
+          },
+          "details": {
+            "required": [
+              "code"
+            ],
+            "properties": {
+              "code": {
+                "const": "pending_or_unknown"
+              }
+            }
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "details"
+        ],
+        "properties": {
+          "details": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "code",
+              "phase",
+              "lifecycle_pending",
+              "retired_flights",
+              "in_flight",
+              "closing_inputs"
+            ],
+            "properties": {
+              "code": {
+                "const": "pending_or_unknown"
+              },
+              "phase": {
+                "const": "Shutdown"
+              },
+              "lifecycle_pending": {
+                "type": "boolean"
+              },
+              "retired_flights": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 256
+              },
+              "in_flight": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 17
+              },
+              "closing_inputs": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 32
+              }
+            }
+          }
+        },
+        "allOf": [
+          {
+            "if": {
+              "properties": {
+                "details": {
+                  "required": [
+                    "lifecycle_pending"
+                  ],
+                  "properties": {
+                    "lifecycle_pending": {
+                      "const": true
+                    }
+                  }
+                }
+              }
+            },
+            "then": {
+              "required": [
+                "operation"
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "if": {
+        "required": [
+          "kind"
+        ],
+        "properties": {
+          "kind": {
+            "const": "expiry_inventory"
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "details"
+        ],
+        "properties": {
+          "details": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "finite_timers",
+              "checkpoint_inflight",
+              "queued",
+              "period_ms"
+            ],
+            "properties": {
+              "finite_timers": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 128
+              },
+              "checkpoint_inflight": {
+                "type": "boolean"
+              },
+              "queued": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 128
+              },
+              "period_ms": {
+                "const": 30000
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": [
+          "kind"
+        ],
+        "properties": {
+          "kind": {
+            "const": "session_clock_checkpoint"
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "details"
+        ],
+        "properties": {
+          "details": {
+            "oneOf": [
+              {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "logical",
+                  "tick"
+                ],
+                "properties": {
+                  "logical": {
+                    "$ref": "primitives.schema.json#/$defs/u64"
+                  },
+                  "tick": {
+                    "$ref": "primitives.schema.json#/$defs/u64"
+                  }
+                }
+              },
+              {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "logical",
+                  "tick",
+                  "same_domain",
+                  "source"
+                ],
+                "properties": {
+                  "logical": {
+                    "$ref": "primitives.schema.json#/$defs/u64"
+                  },
+                  "tick": {
+                    "$ref": "primitives.schema.json#/$defs/u64"
+                  },
+                  "same_domain": {
+                    "type": "boolean"
+                  },
+                  "source": {
+                    "const": "maintenance_commit"
+                  }
+                }
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": [
+          "kind"
+        ],
+        "properties": {
+          "kind": {
+            "const": "session_clock_degraded"
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "details"
+        ],
+        "properties": {
+          "details": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "code",
+              "age_ms"
+            ],
+            "properties": {
+              "code": {
+                "const": "checkpoint_late"
+              },
+              "age_ms": {
+                "$ref": "primitives.schema.json#/$defs/u64"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "kind": {
+            "const": "session_clock_anchor"
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "details"
+        ],
+        "properties": {
+          "details": {
+            "required": [
+              "domain",
+              "tick",
+              "logical",
+              "origin_status"
+            ],
+            "properties": {
+              "domain": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{64}$"
+              },
+              "origin_status": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 64
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": [
+          "command_kind"
+        ],
+        "properties": {
+          "command_kind": {
+            "const": "MessageExpiry"
+          }
+        }
+      },
+      "then": {
+        "not": {
+          "required": [
+            "operation"
+          ]
+        }
+      }
+    },
+    {
+      "if": {
+        "required": [
+          "kind"
+        ],
+        "properties": {
+          "kind": {
+            "const": "will_installed"
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "operation",
+          "will",
+          "details"
+        ],
+        "properties": {
+          "will": {
+            "$ref": "primitives.schema.json#/$defs/operation_id"
+          },
+          "details": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "topic_bytes",
+              "payload_bytes",
+              "authority"
+            ],
+            "properties": {
+              "topic_bytes": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 1024
+              },
+              "payload_bytes": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 32768
+              },
+              "authority": {
+                "const": "durable_open_commit"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": [
+          "kind"
+        ],
+        "properties": {
+          "kind": {
+            "const": "will_decided"
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "operation",
+          "will",
+          "details"
+        ],
+        "properties": {
+          "will": {
+            "description": "Immutable installing Open OperationId of the Will occurrence; null only for a Will-aware End without a registered Will. No Will topic or payload bytes are logged.",
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "primitives.schema.json#/$defs/operation_id"
+              }
+            ]
+          },
+          "details": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "publish",
+              "session",
+              "authority"
+            ],
+            "properties": {
+              "publish": {
+                "type": "boolean"
+              },
+              "session": {
+                "$ref": "primitives.schema.json#/$defs/u64"
+              },
+              "authority": {
+                "const": "durable_end_commit"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": [
+          "kind"
+        ],
+        "properties": {
+          "kind": {
+            "const": "will_admitted"
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "operation",
+          "will",
+          "details"
+        ],
+        "properties": {
+          "will": {
+            "$ref": "primitives.schema.json#/$defs/operation_id"
+          },
+          "details": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "publication",
+              "targets",
+              "authority"
+            ],
+            "properties": {
+              "publication": {
+                "type": "string",
+                "pattern": "^[0-9]+/[0-9]+/[0-9]+/[0-9]+$",
+                "maxLength": 83
+              },
+              "targets": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 16
+              },
+              "retained": {
+                "type": "boolean"
+              },
+              "authority": {
+                "const": "durable_admission_commit"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": [
+          "kind"
+        ],
+        "properties": {
+          "kind": {
+            "const": "will_connect_deferred"
+          }
+        }
+      },
+      "then": {
+        "required": ["connection", "details"],
+        "properties": {
+          "details": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["authority"],
+            "properties": {
+              "authority": {"const": "durable_will_barrier"}
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": [
+          "kind"
+        ],
+        "properties": {
+          "kind": {
+            "const": "tls_profile"
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "details"
+        ],
+        "properties": {
+          "details": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "version",
+              "client_certificate",
+              "policy_fingerprint",
+              "max_handshakes",
+              "handshake_ms",
+              "handshake_bytes",
+              "certificate_bytes",
+              "chain_bytes",
+              "chain_certificates",
+              "tls_buffer_bytes",
+              "resumption",
+              "early_data"
+            ],
+            "properties": {
+              "version": {
+                "const": "TLS1.3"
+              },
+              "client_certificate": {
+                "const": "required"
+              },
+              "policy_fingerprint": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{64}$"
+              },
+              "max_handshakes": {
+                "const": 8
+              },
+              "handshake_ms": {
+                "const": 2000
+              },
+              "handshake_bytes": {
+                "const": 65536
+              },
+              "certificate_bytes": {
+                "const": 8192
+              },
+              "chain_bytes": {
+                "const": 32768
+              },
+              "chain_certificates": {
+                "const": 4
+              },
+              "tls_buffer_bytes": {
+                "const": 98304
+              },
+              "resumption": {
+                "const": false
+              },
+              "early_data": {
+                "const": false
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": [
+          "kind"
+        ],
+        "properties": {
+          "kind": {
+            "const": "tls_authenticated"
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "connection",
+          "details"
+        ],
+        "properties": {
+          "details": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "version",
+              "handshake_us"
+            ],
+            "properties": {
+              "version": {
+                "const": "TLS1.3"
+              },
+              "handshake_us": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 2000000
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": [
+          "kind"
+        ],
+        "properties": {
+          "kind": {
+            "const": "authorization_refused"
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "connection",
+          "details"
+        ],
+        "properties": {
+          "details": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "stage",
+              "reason"
+            ],
+            "properties": {
+              "stage": {
+                "enum": [
+                  "client_id",
+                  "will",
+                  "publish",
+                  "subscribe",
+                  "unsubscribe"
+                ]
+              },
+              "reason": {
+                "const": 135
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": [
+          "kind"
+        ],
+        "properties": {
+          "kind": {
+            "const": "will_commit_observed"
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "operation",
+          "details"
+        ],
+        "properties": {
+          "details": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "monotonic_ns",
+              "authority"
+            ],
+            "properties": {
+              "monotonic_ns": {
+                "$ref": "primitives.schema.json#/$defs/u64"
+              },
+              "authority": {
+                "const": "sqlite_commit_return"
+              }
+            }
+          }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "puback_target": {
+      "description": "Immutable internal target selected after runtime reader-channel dequeue and decoding, before the owner-input queue. These identities are absent from the MQTT PUBACK wire packet. An older target is readable evidence, never automatically rebound to a current Packet Identifier occupant.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "delivery_id",
+        "claim_operation_id",
+        "frame_effect_id"
+      ],
+      "properties": {
+        "delivery_id": {
+          "$ref": "primitives.schema.json#/$defs/delivery_id"
+        },
+        "claim_operation_id": {
+          "$ref": "primitives.schema.json#/$defs/operation_id"
+        },
+        "frame_effect_id": {
+          "$ref": "primitives.schema.json#/$defs/effect_id"
+        }
+      }
+    },
+    "puback_observation": {
+      "description": "A validated PUBACK observed at runtime dequeue. The complete connection/number/reason/optional target survives internal delay or replay unchanged. Null is explicit no-target knowledge. Upstream reader-channel/socket bytes are outside this association boundary.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "connection",
+        "packet_id",
+        "reason_code",
+        "target"
+      ],
+      "properties": {
+        "connection": {
+          "$ref": "primitives.schema.json#/$defs/connection_key"
+        },
+        "packet_id": {
+          "$ref": "primitives.schema.json#/$defs/packet_id"
+        },
+        "reason_code": {
+          "enum": [
+            0,
+            16,
+            128,
+            131,
+            135,
+            144,
+            145,
+            151,
+            153
+          ]
+        },
+        "target": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/$defs/puback_target"
+            }
+          ]
+        },
+        "source_observation_sequence": {
+          "$ref": "primitives.schema.json#/$defs/u64",
+          "description": "Optional identifier of the original runtime-dequeue observation within this process, used to link a retained internal copy. This is not event.seq, a wire field, or a causal-order claim."
+        }
+      }
+    }
+  }
+}

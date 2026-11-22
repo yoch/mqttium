@@ -1,0 +1,15 @@
+diff --git a/mqttiumd/crates/mqttiumd-lab/src/bench/runner.rs b/mqttiumd/crates/mqttiumd-lab/src/bench/runner.rs
+--- a/mqttiumd/crates/mqttiumd-lab/src/bench/runner.rs
++++ b/mqttiumd/crates/mqttiumd-lab/src/bench/runner.rs
+@@ -856,8 +856,9 @@
+                             // Keep the OS receipt independently of whether the
+                             // collector can retain its trace announcement.
+                             self.kills.push(killed);
+-                            self.emit(Origin::BenchSupervisor, "BrokerKilled", &[], payload)
+-                                .map(|_| ())
++                            // MUTANT N5: the kill is not written in the trace.
++                            let _ = payload;
++                            Ok::<(), Stop>(())
+                         } else {
+                             Ok(())
+                         };

@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "mqttiumd trace record",
-  "description": "One line of a JSON Lines trace: header, versioned record or footer (DEM-016). The digest of the trace lives in the external artifact inventory, never inside the trace.",
+  "description": "One line of a JSON Lines trace: header, versioned record or footer (DEM-016). Each kind is stated by one origin only; hidden store truth and the inputs the core consumed never share an origin (ADR 0003). The digest of the trace lives in the external artifact inventory, never inside the trace.",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -35,10 +35,12 @@
       "enum": [
         "bench-supervisor",
         "broker-core",
+        "dispatcher",
         "fault-injector",
         "peer",
         "store-adapter",
         "store-evidence",
+        "timer",
         "transport"
       ]
     },
@@ -63,10 +65,12 @@
             "enum": [
               "bench-supervisor",
               "broker-core",
+              "dispatcher",
               "fault-injector",
               "peer",
               "store-adapter",
               "store-evidence",
+              "timer",
               "transport"
             ]
           },
@@ -103,7 +107,32 @@
         "PeerPacketObserved",
         "FaultHit",
         "BrokerCrashed",
-        "BrokerRecovered"
+        "BrokerRecovered",
+        "PeerConnectionOpened",
+        "PeerConnectionClosed",
+        "PeerPacketSent",
+        "ClientBytesReceived",
+        "PacketDelivered",
+        "ResolveSubmitted",
+        "StoreFenceStable",
+        "DeadlineArmed",
+        "DeadlineDelivered",
+        "RecoveryPageRead",
+        "RecoveryPageDelivered",
+        "InputRefused",
+        "HeldItemReleased",
+        "DurableStateInspected",
+        "StoreFenceRefused",
+        "StoreResultHandedOver",
+        "OpeningSubmitted",
+        "StoreEpochOpened",
+        "OpeningReplyDelivered",
+        "OpeningAbandoned",
+        "EpochGrantHandedOver",
+        "StepBlocked",
+        "BrokerKilled",
+        "DurableReadFailed",
+        "ProcessControlFailed"
       ]
     },
     "payload": {
@@ -398,6 +427,602 @@
           }
         }
       }
+    },
+    {
+      "if": {
+        "required": [
+          "kind"
+        ],
+        "properties": {
+          "kind": {
+            "const": "PeerConnectionOpened"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "$ref": "#/$defs/PeerConnectionOpened"
+          },
+          "origin_component": {
+            "enum": [
+              "peer"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": [
+          "kind"
+        ],
+        "properties": {
+          "kind": {
+            "const": "PeerConnectionClosed"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "$ref": "#/$defs/PeerConnectionClosed"
+          },
+          "origin_component": {
+            "enum": [
+              "peer"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": [
+          "kind"
+        ],
+        "properties": {
+          "kind": {
+            "const": "PeerPacketSent"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "$ref": "#/$defs/PeerPacketSent"
+          },
+          "origin_component": {
+            "enum": [
+              "peer"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": [
+          "kind"
+        ],
+        "properties": {
+          "kind": {
+            "const": "ClientBytesReceived"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "$ref": "#/$defs/ClientBytesReceived"
+          },
+          "origin_component": {
+            "enum": [
+              "transport"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": [
+          "kind"
+        ],
+        "properties": {
+          "kind": {
+            "const": "PacketDelivered"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "$ref": "#/$defs/PacketDelivered"
+          },
+          "origin_component": {
+            "enum": [
+              "broker-core"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": [
+          "kind"
+        ],
+        "properties": {
+          "kind": {
+            "const": "ResolveSubmitted"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "$ref": "#/$defs/ResolveSubmitted"
+          },
+          "origin_component": {
+            "enum": [
+              "store-adapter"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": [
+          "kind"
+        ],
+        "properties": {
+          "kind": {
+            "const": "StoreFenceStable"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "$ref": "#/$defs/StoreFenceStable"
+          },
+          "origin_component": {
+            "enum": [
+              "store-evidence"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": [
+          "kind"
+        ],
+        "properties": {
+          "kind": {
+            "const": "DeadlineArmed"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "$ref": "#/$defs/DeadlineArmed"
+          },
+          "origin_component": {
+            "enum": [
+              "timer"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": [
+          "kind"
+        ],
+        "properties": {
+          "kind": {
+            "const": "DeadlineDelivered"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "$ref": "#/$defs/DeadlineDelivered"
+          },
+          "origin_component": {
+            "enum": [
+              "broker-core"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": [
+          "kind"
+        ],
+        "properties": {
+          "kind": {
+            "const": "RecoveryPageRead"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "$ref": "#/$defs/RecoveryPageRead"
+          },
+          "origin_component": {
+            "enum": [
+              "store-adapter"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": [
+          "kind"
+        ],
+        "properties": {
+          "kind": {
+            "const": "RecoveryPageDelivered"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "$ref": "#/$defs/RecoveryPageDelivered"
+          },
+          "origin_component": {
+            "enum": [
+              "broker-core"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": [
+          "kind"
+        ],
+        "properties": {
+          "kind": {
+            "const": "InputRefused"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "$ref": "#/$defs/InputRefused"
+          },
+          "origin_component": {
+            "enum": [
+              "dispatcher"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": [
+          "kind"
+        ],
+        "properties": {
+          "kind": {
+            "const": "HeldItemReleased"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "$ref": "#/$defs/HeldItemReleased"
+          },
+          "origin_component": {
+            "enum": [
+              "fault-injector"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": [
+          "kind"
+        ],
+        "properties": {
+          "kind": {
+            "const": "DurableStateInspected"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "$ref": "#/$defs/DurableStateInspected"
+          },
+          "origin_component": {
+            "enum": [
+              "bench-supervisor"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": [
+          "kind"
+        ],
+        "properties": {
+          "kind": {
+            "const": "StoreFenceRefused"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "$ref": "#/$defs/StoreFenceRefused"
+          },
+          "origin_component": {
+            "enum": [
+              "store-evidence"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": [
+          "kind"
+        ],
+        "properties": {
+          "kind": {
+            "const": "StoreResultHandedOver"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "$ref": "#/$defs/StoreResultHandedOver"
+          },
+          "origin_component": {
+            "enum": [
+              "store-adapter"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": [
+          "kind"
+        ],
+        "properties": {
+          "kind": {
+            "const": "OpeningSubmitted"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "$ref": "#/$defs/OpeningSubmitted"
+          },
+          "origin_component": {
+            "enum": [
+              "store-adapter"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": [
+          "kind"
+        ],
+        "properties": {
+          "kind": {
+            "const": "StoreEpochOpened"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "$ref": "#/$defs/StoreEpochOpened"
+          },
+          "origin_component": {
+            "enum": [
+              "store-evidence"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": [
+          "kind"
+        ],
+        "properties": {
+          "kind": {
+            "const": "OpeningReplyDelivered"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "$ref": "#/$defs/OpeningReplyDelivered"
+          },
+          "origin_component": {
+            "enum": [
+              "broker-core"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": [
+          "kind"
+        ],
+        "properties": {
+          "kind": {
+            "const": "OpeningAbandoned"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "$ref": "#/$defs/OpeningAbandoned"
+          },
+          "origin_component": {
+            "enum": [
+              "broker-core"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": [
+          "kind"
+        ],
+        "properties": {
+          "kind": {
+            "const": "EpochGrantHandedOver"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "$ref": "#/$defs/EpochGrantHandedOver"
+          },
+          "origin_component": {
+            "enum": [
+              "broker-core"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": [
+          "kind"
+        ],
+        "properties": {
+          "kind": {
+            "const": "StepBlocked"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "$ref": "#/$defs/StepBlocked"
+          },
+          "origin_component": {
+            "enum": [
+              "bench-supervisor"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": [
+          "kind"
+        ],
+        "properties": {
+          "kind": {
+            "const": "BrokerKilled"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "$ref": "#/$defs/BrokerKilled"
+          },
+          "origin_component": {
+            "enum": [
+              "bench-supervisor"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": [
+          "kind"
+        ],
+        "properties": {
+          "kind": {
+            "const": "DurableReadFailed"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "$ref": "#/$defs/DurableReadFailed"
+          },
+          "origin_component": {
+            "const": "bench-supervisor"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": [
+          "kind"
+        ],
+        "properties": {
+          "kind": {
+            "const": "ProcessControlFailed"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "$ref": "#/$defs/ProcessControlFailed"
+          },
+          "origin_component": {
+            "const": "bench-supervisor"
+          }
+        }
+      }
     }
   ],
   "$defs": {
@@ -406,7 +1031,8 @@
       "additionalProperties": false,
       "required": [
         "scenario_id",
-        "backend"
+        "backend",
+        "perimeter"
       ],
       "properties": {
         "scenario_id": {
@@ -416,6 +1042,20 @@
           "enum": [
             "sim-store",
             "sqlite"
+          ]
+        },
+        "perimeter": {
+          "description": "What a run exercises. `full`: client bytes through the transport, with independent peers. `core-without-bytes`: the core is driven with validated packets; no transport and no peer observes anything.",
+          "enum": [
+            "full",
+            "core-without-bytes"
+          ]
+        },
+        "broker": {
+          "description": "Where the broker ran (record 0019): in the process of the bench, or as a child process the supervisor kills for real. Absent means in-process.",
+          "enum": [
+            "in-process",
+            "child-process"
           ]
         }
       }
@@ -460,11 +1100,15 @@
       "type": "object",
       "additionalProperties": false,
       "required": [
-        "operation_id"
+        "operation_id",
+        "command_kind"
       ],
       "properties": {
         "operation_id": {
           "$ref": "primitives.schema.json#/$defs/operation_id"
+        },
+        "command_kind": {
+          "$ref": "primitives.schema.json#/$defs/type_name"
         }
       }
     },
@@ -472,17 +1116,77 @@
       "type": "object",
       "additionalProperties": false,
       "required": [
+        "effect_id",
         "operation_id",
         "outcome"
       ],
       "properties": {
+        "effect_id": {
+          "$ref": "primitives.schema.json#/$defs/effect_id"
+        },
         "operation_id": {
           "$ref": "primitives.schema.json#/$defs/operation_id"
         },
         "outcome": {
           "$ref": "primitives.schema.json#/$defs/store_outcome"
+        },
+        "reject_reason": {
+          "$ref": "primitives.schema.json#/$defs/reject_reason"
+        },
+        "violation": {
+          "$ref": "primitives.schema.json#/$defs/store_violation"
         }
-      }
+      },
+      "allOf": [
+        {
+          "if": {
+            "required": [
+              "outcome"
+            ],
+            "properties": {
+              "outcome": {
+                "const": "RejectedCertain"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "reject_reason"
+            ]
+          },
+          "else": {
+            "not": {
+              "required": [
+                "reject_reason"
+              ]
+            }
+          }
+        },
+        {
+          "if": {
+            "required": [
+              "outcome"
+            ],
+            "properties": {
+              "outcome": {
+                "const": "Violation"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "violation"
+            ]
+          },
+          "else": {
+            "not": {
+              "required": [
+                "violation"
+              ]
+            }
+          }
+        }
+      ]
     },
     "StoreResultDelivered": {
       "type": "object",
@@ -501,8 +1205,64 @@
         },
         "outcome": {
           "$ref": "primitives.schema.json#/$defs/store_outcome"
+        },
+        "reject_reason": {
+          "$ref": "primitives.schema.json#/$defs/reject_reason"
+        },
+        "violation": {
+          "$ref": "primitives.schema.json#/$defs/store_violation"
         }
-      }
+      },
+      "allOf": [
+        {
+          "if": {
+            "required": [
+              "outcome"
+            ],
+            "properties": {
+              "outcome": {
+                "const": "RejectedCertain"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "reject_reason"
+            ]
+          },
+          "else": {
+            "not": {
+              "required": [
+                "reject_reason"
+              ]
+            }
+          }
+        },
+        {
+          "if": {
+            "required": [
+              "outcome"
+            ],
+            "properties": {
+              "outcome": {
+                "const": "Violation"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "violation"
+            ]
+          },
+          "else": {
+            "not": {
+              "required": [
+                "violation"
+              ]
+            }
+          }
+        }
+      ]
     },
     "FrameEligible": {
       "type": "object",
@@ -528,8 +1288,64 @@
         },
         "packet_id": {
           "$ref": "primitives.schema.json#/$defs/packet_id"
+        },
+        "reason": {
+          "description": "The outcome the frame carries, in the vocabulary of the subset. A PUBREC that refuses an admission carries QuotaExceeded when a capacity is the cause and ImplementationSpecificError otherwise.",
+          "enum": [
+            "Success",
+            "PacketIdentifierNotFound",
+            "QuotaExceeded",
+            "ImplementationSpecificError"
+          ]
+        },
+        "session_present": {
+          "type": "boolean"
         }
-      }
+      },
+      "allOf": [
+        {
+          "if": {
+            "required": [
+              "packet_kind"
+            ],
+            "properties": {
+              "packet_kind": {
+                "const": "CONNACK"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "session_present"
+            ],
+            "not": {
+              "anyOf": [
+                {
+                  "required": [
+                    "reason"
+                  ]
+                },
+                {
+                  "required": [
+                    "packet_id"
+                  ]
+                }
+              ]
+            }
+          },
+          "else": {
+            "required": [
+              "reason",
+              "packet_id"
+            ],
+            "not": {
+              "required": [
+                "session_present"
+              ]
+            }
+          }
+        }
+      ]
     },
     "FrameWriteProgress": {
       "type": "object",
@@ -561,6 +1377,7 @@
       "required": [
         "client",
         "packet_kind",
+        "reason_code",
         "bytes_hex"
       ],
       "properties": {
@@ -577,10 +1394,53 @@
         "packet_id": {
           "$ref": "primitives.schema.json#/$defs/packet_id"
         },
+        "reason_code": {
+          "description": "The reason code the peer decoded; 0 when the packet omits it.",
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 255
+        },
+        "session_present": {
+          "type": "boolean"
+        },
         "bytes_hex": {
           "$ref": "primitives.schema.json#/$defs/hex_bytes"
         }
-      }
+      },
+      "allOf": [
+        {
+          "if": {
+            "required": [
+              "packet_kind"
+            ],
+            "properties": {
+              "packet_kind": {
+                "const": "CONNACK"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "session_present"
+            ],
+            "not": {
+              "required": [
+                "packet_id"
+              ]
+            }
+          },
+          "else": {
+            "required": [
+              "packet_id"
+            ],
+            "not": {
+              "required": [
+                "session_present"
+              ]
+            }
+          }
+        }
+      ]
     },
     "FaultHit": {
       "type": "object",
@@ -599,6 +1459,12 @@
         },
         "occurrence": {
           "$ref": "primitives.schema.json#/$defs/u64"
+        },
+        "operation_id": {
+          "$ref": "primitives.schema.json#/$defs/operation_id"
+        },
+        "effect_id": {
+          "$ref": "primitives.schema.json#/$defs/effect_id"
         }
       }
     },
@@ -625,6 +1491,1188 @@
       "properties": {
         "run_epoch": {
           "$ref": "primitives.schema.json#/$defs/u64"
+        }
+      }
+    },
+    "PeerConnectionOpened": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "client"
+      ],
+      "properties": {
+        "client": {
+          "$ref": "primitives.schema.json#/$defs/name"
+        }
+      }
+    },
+    "PeerConnectionClosed": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "client"
+      ],
+      "properties": {
+        "client": {
+          "$ref": "primitives.schema.json#/$defs/name"
+        }
+      }
+    },
+    "PeerPacketSent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "client",
+        "packet_kind",
+        "bytes_hex"
+      ],
+      "properties": {
+        "client": {
+          "$ref": "primitives.schema.json#/$defs/name"
+        },
+        "packet_kind": {
+          "enum": [
+            "CONNECT",
+            "PUBLISH",
+            "PUBREL"
+          ]
+        },
+        "packet_id": {
+          "$ref": "primitives.schema.json#/$defs/packet_id"
+        },
+        "dup": {
+          "type": "boolean"
+        },
+        "bytes_hex": {
+          "$ref": "primitives.schema.json#/$defs/hex_bytes"
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "required": [
+              "packet_kind"
+            ],
+            "properties": {
+              "packet_kind": {
+                "const": "PUBLISH"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "dup"
+            ]
+          },
+          "else": {
+            "not": {
+              "required": [
+                "dup"
+              ]
+            }
+          }
+        },
+        {
+          "if": {
+            "required": [
+              "packet_kind"
+            ],
+            "properties": {
+              "packet_kind": {
+                "const": "PUBREL"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "packet_id"
+            ]
+          }
+        },
+        {
+          "if": {
+            "required": [
+              "packet_kind"
+            ],
+            "properties": {
+              "packet_kind": {
+                "const": "CONNECT"
+              }
+            }
+          },
+          "then": {
+            "not": {
+              "required": [
+                "packet_id"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "ClientBytesReceived": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "connection_generation",
+        "bytes_hex"
+      ],
+      "properties": {
+        "connection_generation": {
+          "$ref": "primitives.schema.json#/$defs/u64"
+        },
+        "bytes_hex": {
+          "$ref": "primitives.schema.json#/$defs/hex_bytes"
+        }
+      }
+    },
+    "PacketDelivered": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "connection_generation",
+        "ingress_order",
+        "packet_kind"
+      ],
+      "properties": {
+        "connection_generation": {
+          "$ref": "primitives.schema.json#/$defs/u64"
+        },
+        "ingress_order": {
+          "$ref": "primitives.schema.json#/$defs/u64"
+        },
+        "packet_kind": {
+          "enum": [
+            "CONNECT",
+            "PUBLISH",
+            "PUBREL"
+          ]
+        },
+        "packet_id": {
+          "$ref": "primitives.schema.json#/$defs/packet_id"
+        }
+      }
+    },
+    "ResolveSubmitted": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "effect_id",
+        "operation_id"
+      ],
+      "properties": {
+        "effect_id": {
+          "$ref": "primitives.schema.json#/$defs/effect_id"
+        },
+        "operation_id": {
+          "$ref": "primitives.schema.json#/$defs/operation_id"
+        }
+      }
+    },
+    "StoreFenceStable": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "operation_id"
+      ],
+      "properties": {
+        "operation_id": {
+          "$ref": "primitives.schema.json#/$defs/operation_id"
+        }
+      }
+    },
+    "DeadlineArmed": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "effect_id",
+        "token",
+        "after"
+      ],
+      "properties": {
+        "effect_id": {
+          "$ref": "primitives.schema.json#/$defs/effect_id"
+        },
+        "token": {
+          "$ref": "primitives.schema.json#/$defs/u64"
+        },
+        "after": {
+          "$ref": "primitives.schema.json#/$defs/u64"
+        }
+      }
+    },
+    "DeadlineDelivered": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "token",
+        "now"
+      ],
+      "properties": {
+        "token": {
+          "$ref": "primitives.schema.json#/$defs/u64"
+        },
+        "now": {
+          "$ref": "primitives.schema.json#/$defs/u64"
+        }
+      }
+    },
+    "recovered_fact": {
+      "description": "One fact of a recovery page, as the store adapter reads it from the store the broker opened. The semantic pass enforces the order of the facts of a page: Epoch, Limits, RouteTable, Route, Session, InboundExchange, OutboundDelivery, ReceiptFrontier, Operation.",
+      "type": "object",
+      "required": [
+        "kind"
+      ],
+      "properties": {
+        "kind": {
+          "enum": [
+            "Epoch",
+            "Limits",
+            "RouteTable",
+            "Route",
+            "Session",
+            "InboundExchange",
+            "OutboundDelivery",
+            "ReceiptFrontier",
+            "Operation"
+          ]
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "required": [
+              "kind"
+            ],
+            "properties": {
+              "kind": {
+                "const": "Epoch"
+              }
+            }
+          },
+          "then": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "kind",
+              "incarnation",
+              "epoch"
+            ],
+            "properties": {
+              "kind": {
+                "const": "Epoch"
+              },
+              "incarnation": {
+                "$ref": "primitives.schema.json#/$defs/u64"
+              },
+              "epoch": {
+                "$ref": "primitives.schema.json#/$defs/u64"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "required": [
+              "kind"
+            ],
+            "properties": {
+              "kind": {
+                "const": "Limits"
+              }
+            }
+          },
+          "then": {
+            "description": "The bounds the core needs to refuse before any mutation. Every bound is a decimal string; the two 32-bit ones are bounded by the semantic pass.",
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "kind",
+              "max_targets_per_admission",
+              "max_topic_bytes",
+              "max_payload_bytes"
+            ],
+            "properties": {
+              "kind": {
+                "const": "Limits"
+              },
+              "max_targets_per_admission": {
+                "$ref": "primitives.schema.json#/$defs/u32"
+              },
+              "max_topic_bytes": {
+                "$ref": "primitives.schema.json#/$defs/u32"
+              },
+              "max_payload_bytes": {
+                "$ref": "primitives.schema.json#/$defs/u64"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "required": [
+              "kind"
+            ],
+            "properties": {
+              "kind": {
+                "const": "RouteTable"
+              }
+            }
+          },
+          "then": {
+            "description": "The durable revision of the route table. The routes that follow belong to it.",
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "kind",
+              "revision"
+            ],
+            "properties": {
+              "kind": {
+                "const": "RouteTable"
+              },
+              "revision": {
+                "$ref": "primitives.schema.json#/$defs/u64"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "required": [
+              "kind"
+            ],
+            "properties": {
+              "kind": {
+                "const": "Route"
+              }
+            }
+          },
+          "then": {
+            "description": "One destination of one literal subscription filter; ordered by filter bytes. Absent options means the historical default0.",
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "kind",
+              "topic_hex",
+              "target",
+              "target_revision",
+              "max_qos"
+            ],
+            "properties": {
+              "kind": {
+                "const": "Route"
+              },
+              "topic_hex": {
+                "$ref": "primitives.schema.json#/$defs/hex_bytes"
+              },
+              "target": {
+                "$ref": "primitives.schema.json#/$defs/u64"
+              },
+              "target_revision": {
+                "$ref": "primitives.schema.json#/$defs/u64"
+              },
+              "max_qos": {
+                "$ref": "primitives.schema.json#/$defs/qos"
+              },
+              "options": {
+                "$ref": "primitives.schema.json#/$defs/subscription_options"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "required": [
+              "kind"
+            ],
+            "properties": {
+              "kind": {
+                "const": "Session"
+              }
+            }
+          },
+          "then": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "kind",
+              "session",
+              "client_id_hex",
+              "revision"
+            ],
+            "properties": {
+              "kind": {
+                "const": "Session"
+              },
+              "session": {
+                "$ref": "primitives.schema.json#/$defs/u64"
+              },
+              "client_id_hex": {
+                "$ref": "primitives.schema.json#/$defs/hex_bytes"
+              },
+              "revision": {
+                "$ref": "primitives.schema.json#/$defs/u64"
+              },
+              "expiry": {
+                "$ref": "primitives.schema.json#/$defs/session_expiry"
+              },
+              "opened_by": {
+                "$ref": "primitives.schema.json#/$defs/session_opening"
+              },
+              "detached": {
+                "$ref": "primitives.schema.json#/$defs/session_detachment_optional"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "required": [
+              "kind"
+            ],
+            "properties": {
+              "kind": {
+                "const": "InboundExchange"
+              }
+            }
+          },
+          "then": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "kind",
+              "exchange",
+              "packet_id",
+              "publication",
+              "phase"
+            ],
+            "properties": {
+              "kind": {
+                "const": "InboundExchange"
+              },
+              "exchange": {
+                "$ref": "primitives.schema.json#/$defs/exchange_id"
+              },
+              "packet_id": {
+                "$ref": "primitives.schema.json#/$defs/packet_id"
+              },
+              "publication": {
+                "$ref": "primitives.schema.json#/$defs/publication_id"
+              },
+              "phase": {
+                "enum": [
+                  "AwaitPubrel"
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "required": [
+              "kind"
+            ],
+            "properties": {
+              "kind": {
+                "const": "OutboundDelivery"
+              }
+            }
+          },
+          "then": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "kind",
+              "delivery_id",
+              "target_session",
+              "target_revision",
+              "qos",
+              "claim"
+            ],
+            "properties": {
+              "kind": {
+                "const": "OutboundDelivery"
+              },
+              "delivery_id": {
+                "$ref": "primitives.schema.json#/$defs/delivery_id"
+              },
+              "target_session": {
+                "$ref": "primitives.schema.json#/$defs/u64"
+              },
+              "target_revision": {
+                "$ref": "primitives.schema.json#/$defs/u64"
+              },
+              "claim": {
+                "oneOf": [
+                  {
+                    "type": "null"
+                  },
+                  {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": [
+                      "operation_id",
+                      "packet_id"
+                    ],
+                    "properties": {
+                      "operation_id": {
+                        "$ref": "primitives.schema.json#/$defs/operation_id"
+                      },
+                      "packet_id": {
+                        "$ref": "primitives.schema.json#/$defs/packet_id"
+                      },
+                      "started": {
+                        "type": "boolean"
+                      },
+                      "await_pubcomp": {
+                        "const": true
+                      }
+                    }
+                  }
+                ]
+              },
+              "qos": {
+                "$ref": "primitives.schema.json#/$defs/qos"
+              },
+              "expiry": {
+                "$ref": "primitives.schema.json#/$defs/message_expiry"
+              },
+              "started": {
+                "type": "boolean"
+              }
+            },
+            "allOf": [
+              {
+                "if": {
+                  "required": [
+                    "qos"
+                  ],
+                  "properties": {
+                    "qos": {
+                      "const": 0
+                    }
+                  }
+                },
+                "then": {
+                  "properties": {
+                    "claim": {
+                      "type": "null"
+                    }
+                  }
+                }
+              },
+              {
+                "if": {
+                  "required": [
+                    "started"
+                  ],
+                  "properties": {
+                    "started": {
+                      "const": true
+                    }
+                  }
+                },
+                "then": {
+                  "properties": {
+                    "qos": {
+                      "const": 1
+                    },
+                    "claim": {
+                      "type": "object",
+                      "required": [
+                        "started"
+                      ],
+                      "properties": {
+                        "started": {
+                          "const": true
+                        }
+                      }
+                    }
+                  }
+                },
+                "else": {
+                  "properties": {
+                    "claim": {
+                      "oneOf": [
+                        {
+                          "type": "null"
+                        },
+                        {
+                          "type": "object",
+                          "properties": {
+                            "started": {
+                              "const": false
+                            }
+                          }
+                        }
+                      ]
+                    }
+                  }
+                }
+              }
+            ]
+          }
+        },
+        {
+          "if": {
+            "required": [
+              "kind"
+            ],
+            "properties": {
+              "kind": {
+                "const": "ReceiptFrontier"
+              }
+            }
+          },
+          "then": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "kind",
+              "origin",
+              "through",
+              "publication_through",
+              "payload_through"
+            ],
+            "properties": {
+              "kind": {
+                "const": "ReceiptFrontier"
+              },
+              "origin": {
+                "$ref": "primitives.schema.json#/$defs/receipt_origin"
+              },
+              "through": {
+                "$ref": "primitives.schema.json#/$defs/u64"
+              },
+              "publication_through": {
+                "$ref": "primitives.schema.json#/$defs/u64"
+              },
+              "payload_through": {
+                "$ref": "primitives.schema.json#/$defs/u64"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "required": [
+              "kind"
+            ],
+            "properties": {
+              "kind": {
+                "const": "Operation"
+              }
+            }
+          },
+          "then": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "kind",
+              "operation_id",
+              "knowledge"
+            ],
+            "properties": {
+              "kind": {
+                "const": "Operation"
+              },
+              "operation_id": {
+                "$ref": "primitives.schema.json#/$defs/operation_id"
+              },
+              "knowledge": {
+                "enum": [
+                  "Unknown",
+                  "Retired",
+                  "Committed",
+                  "RejectedCertain"
+                ]
+              }
+            }
+          }
+        }
+      ]
+    },
+    "recovery_page": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "run_epoch",
+        "page",
+        "last",
+        "facts"
+      ],
+      "properties": {
+        "run_epoch": {
+          "$ref": "primitives.schema.json#/$defs/u64"
+        },
+        "page": {
+          "$ref": "primitives.schema.json#/$defs/u64"
+        },
+        "last": {
+          "type": "boolean"
+        },
+        "facts": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/recovered_fact"
+          },
+          "maxItems": 4096
+        }
+      }
+    },
+    "RecoveryPageRead": {
+      "$ref": "#/$defs/recovery_page"
+    },
+    "RecoveryPageDelivered": {
+      "$ref": "#/$defs/recovery_page"
+    },
+    "InputRefused": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "input",
+        "effect_id",
+        "operation_id",
+        "reason"
+      ],
+      "properties": {
+        "input": {
+          "enum": [
+            "StoreResult"
+          ]
+        },
+        "effect_id": {
+          "$ref": "primitives.schema.json#/$defs/effect_id"
+        },
+        "operation_id": {
+          "$ref": "primitives.schema.json#/$defs/operation_id"
+        },
+        "reason": {
+          "enum": [
+            "no-effect-in-flight",
+            "operation-mismatch"
+          ]
+        }
+      }
+    },
+    "HeldItemReleased": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "fault_id"
+      ],
+      "properties": {
+        "fault_id": {
+          "$ref": "primitives.schema.json#/$defs/name"
+        }
+      }
+    },
+    "DurableStateInspected": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "checkpoint",
+        "snapshot"
+      ],
+      "properties": {
+        "checkpoint": {
+          "$ref": "primitives.schema.json#/$defs/name"
+        },
+        "snapshot": {
+          "$ref": "primitives.schema.json#/$defs/artifact"
+        }
+      }
+    },
+    "StoreFenceRefused": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "effect_id",
+        "operation_id"
+      ],
+      "properties": {
+        "effect_id": {
+          "$ref": "primitives.schema.json#/$defs/effect_id"
+        },
+        "operation_id": {
+          "$ref": "primitives.schema.json#/$defs/operation_id"
+        }
+      }
+    },
+    "opening_attempt": {
+      "description": "The identity of an opening attempt: the nonce its start-up drew and its number there.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "startup_hex",
+        "ticket"
+      ],
+      "properties": {
+        "startup_hex": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{32}$"
+        },
+        "ticket": {
+          "$ref": "primitives.schema.json#/$defs/u64"
+        }
+      }
+    },
+    "StoreResultHandedOver": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "effect_id",
+        "operation_id",
+        "outcome"
+      ],
+      "properties": {
+        "effect_id": {
+          "$ref": "primitives.schema.json#/$defs/effect_id"
+        },
+        "operation_id": {
+          "$ref": "primitives.schema.json#/$defs/operation_id"
+        },
+        "outcome": {
+          "$ref": "primitives.schema.json#/$defs/store_outcome"
+        },
+        "reject_reason": {
+          "$ref": "primitives.schema.json#/$defs/reject_reason"
+        },
+        "violation": {
+          "$ref": "primitives.schema.json#/$defs/store_violation"
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "required": [
+              "outcome"
+            ],
+            "properties": {
+              "outcome": {
+                "const": "RejectedCertain"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "reject_reason"
+            ]
+          },
+          "else": {
+            "not": {
+              "required": [
+                "reject_reason"
+              ]
+            }
+          }
+        },
+        {
+          "if": {
+            "required": [
+              "outcome"
+            ],
+            "properties": {
+              "outcome": {
+                "const": "Violation"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "violation"
+            ]
+          },
+          "else": {
+            "not": {
+              "required": [
+                "violation"
+              ]
+            }
+          }
+        }
+      ],
+      "description": "The result the store adapter hands over towards the core: the content of the result the store produced."
+    },
+    "OpeningSubmitted": {
+      "description": "The command OpenEpoch, whole, as the store adapter hands it to the writer.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "attempt",
+        "incarnation",
+        "after"
+      ],
+      "properties": {
+        "attempt": {
+          "$ref": "#/$defs/opening_attempt"
+        },
+        "incarnation": {
+          "$ref": "primitives.schema.json#/$defs/u64"
+        },
+        "after": {
+          "$ref": "primitives.schema.json#/$defs/u64"
+        }
+      }
+    },
+    "StoreEpochOpened": {
+      "description": "Hidden truth: the epoch the ledger holds as opened, and the attempt that opened it, once durable.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "incarnation",
+        "epoch",
+        "attempt"
+      ],
+      "properties": {
+        "incarnation": {
+          "$ref": "primitives.schema.json#/$defs/u64"
+        },
+        "epoch": {
+          "$ref": "primitives.schema.json#/$defs/u64"
+        },
+        "attempt": {
+          "$ref": "#/$defs/opening_attempt"
+        }
+      }
+    },
+    "OpeningReplyDelivered": {
+      "description": "The reply to an OpenEpoch the core consumed: the whole command it answers and its outcome. A committed reply names the epoch, a rejected one its reason.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "attempt",
+        "incarnation",
+        "after",
+        "outcome"
+      ],
+      "properties": {
+        "attempt": {
+          "$ref": "#/$defs/opening_attempt"
+        },
+        "incarnation": {
+          "$ref": "primitives.schema.json#/$defs/u64"
+        },
+        "after": {
+          "$ref": "primitives.schema.json#/$defs/u64"
+        },
+        "outcome": {
+          "enum": [
+            "Committed",
+            "RejectedCertain",
+            "Superseded",
+            "Unknown"
+          ]
+        },
+        "epoch": {
+          "$ref": "primitives.schema.json#/$defs/u64"
+        },
+        "reject_reason": {
+          "enum": [
+            "EpochsExhausted",
+            "ForeignIncarnation",
+            "PredecessorMoved",
+            "AttemptReused"
+          ]
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "required": [
+              "outcome"
+            ],
+            "properties": {
+              "outcome": {
+                "const": "Committed"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "epoch"
+            ]
+          },
+          "else": {
+            "not": {
+              "required": [
+                "epoch"
+              ]
+            }
+          }
+        },
+        {
+          "if": {
+            "required": [
+              "outcome"
+            ],
+            "properties": {
+              "outcome": {
+                "const": "RejectedCertain"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "reject_reason"
+            ]
+          },
+          "else": {
+            "not": {
+              "required": [
+                "reject_reason"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "OpeningAbandoned": {
+      "description": "Start-up stopped waiting for the reply of this attempt. Not terminal: the reply is still honoured if it arrives before a new submission.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "attempt"
+      ],
+      "properties": {
+        "attempt": {
+          "$ref": "#/$defs/opening_attempt"
+        }
+      }
+    },
+    "EpochGrantHandedOver": {
+      "description": "The grant of an opened epoch moved to the creator of owners.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "incarnation",
+        "epoch"
+      ],
+      "properties": {
+        "incarnation": {
+          "$ref": "primitives.schema.json#/$defs/u64"
+        },
+        "epoch": {
+          "$ref": "primitives.schema.json#/$defs/u64"
+        }
+      }
+    },
+    "StepBlocked": {
+      "description": "The bench stopped the run before its last step: at `step`, of kind `step_kind`, because no action was eligible and the awaited event had not happened (`quiescent`), or because the budget of steps ran out (`budget`). For diagnosis only, what still waited at the stop: `armed_deadlines`, the deadlines armed and not fired, and `holding_faults`, the faults that still hold an item. The verdict depends on `cause` alone.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "step",
+        "step_kind",
+        "cause",
+        "armed_deadlines",
+        "holding_faults"
+      ],
+      "properties": {
+        "step": {
+          "$ref": "primitives.schema.json#/$defs/u64"
+        },
+        "step_kind": {
+          "$ref": "primitives.schema.json#/$defs/type_name"
+        },
+        "cause": {
+          "enum": [
+            "quiescent",
+            "budget"
+          ]
+        },
+        "armed_deadlines": {
+          "$ref": "primitives.schema.json#/$defs/u64"
+        },
+        "holding_faults": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "primitives.schema.json#/$defs/name"
+          }
+        }
+      }
+    },
+    "BrokerKilled": {
+      "description": "The supervisor killed the broker, a child process, and wait() returned its status (record 0019). Written after that status and before BrokerCrashed; no pid: it goes to campaign.json.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "signal_sent",
+        "wait_status"
+      ],
+      "properties": {
+        "signal_sent": {
+          "enum": [
+            "SIGKILL"
+          ]
+        },
+        "wait_status": {
+          "description": "The status wait() returned: the process ended by this signal. A process that exited is no kill and is not written here.",
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "signal"
+          ],
+          "properties": {
+            "signal": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 64
+            }
+          }
+        }
+      }
+    },
+    "DurableReadFailed": {
+      "description": "An observed refusal to establish complete evidence. The code and context, never the optional text, carry its meaning. The process incarnation can be reported before Started.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "code",
+        "phase",
+        "process_incarnation"
+      ],
+      "properties": {
+        "code": {
+          "$ref": "primitives.schema.json#/$defs/durableReadCode"
+        },
+        "phase": {
+          "$ref": "primitives.schema.json#/$defs/durableReadPhase"
+        },
+        "process_incarnation": {
+          "$ref": "primitives.schema.json#/$defs/u64"
+        },
+        "message": {
+          "$ref": "primitives.schema.json#/$defs/text"
+        },
+        "page": {
+          "$ref": "primitives.schema.json#/$defs/u64"
+        }
+      }
+    },
+    "ProcessControlFailed": {
+      "description": "An observed refusal to establish complete evidence. The code and context, never the optional text, carry its meaning. The process incarnation can be reported before Started.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "code",
+        "phase",
+        "process_incarnation"
+      ],
+      "properties": {
+        "code": {
+          "$ref": "primitives.schema.json#/$defs/processControlCode"
+        },
+        "phase": {
+          "$ref": "primitives.schema.json#/$defs/processControlPhase"
+        },
+        "process_incarnation": {
+          "$ref": "primitives.schema.json#/$defs/u64"
+        },
+        "message": {
+          "$ref": "primitives.schema.json#/$defs/text"
         }
       }
     }

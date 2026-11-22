@@ -1,0 +1,14 @@
+{
+  "format": "mqttiumd.product-event",
+  "schema_version": 1,
+  "seq": "10",
+  "pid": 1,
+  "kind": "barrier_hit",
+  "point": "message.expire.prepared",
+  "command_kind": "MessageExpiry",
+  "details": {
+    "domain": "abababababababababababababababababababababababababababababababab",
+    "tick": "100",
+    "after": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+  }
+}
