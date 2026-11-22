@@ -6,19 +6,21 @@
 //! a value from a lane the task had found full.
 
 use std::collections::VecDeque;
-use std::io::{self, Read, Write as _};
+use std::io::{self, IoSlice, Read, Write as _};
 use std::net::{Shutdown, TcpStream};
-use std::ops::Deref;
 use std::os::fd::{AsRawFd, RawFd};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{self, Receiver, SendError, SyncSender, TryRecvError, TrySendError};
-use std::sync::{Arc, Mutex, OnceLock};
+#[cfg(test)]
+use std::sync::mpsc::{Receiver, RecvTimeoutError, SendError, SyncSender};
+use std::sync::mpsc::{TryRecvError, TrySendError};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use mqttiumd_contract::ids::{ConnectionKey, EffectId};
 use mqttiumd_contract::message_expiry::{
     ExpiryState, MessageExpiry, MessageExpiryBlock, MessageTime,
 };
+use mqttiumd_contract::packet::SharedBytes;
 
 use crate::codec::{self, ErrorKind};
 use crate::security::{Policy, Principal};
@@ -44,13 +46,17 @@ const POLL: Duration = Duration::from_millis(20);
 const RESULT_WAIT: Duration = Duration::from_millis(100);
 const PARTIAL_PACKET_TIMEOUT: Duration = Duration::from_secs(5);
 const WRITE_TIMEOUT: Duration = Duration::from_millis(250);
-/// Bytes one plain connection may hold between a socket read and its parser.
-const READ_BUFFER: usize = 32_768;
+/// Bytes one reactor thread scratch read buffer holds per turn.
+pub(crate) const READ_BUFFER: usize = 32_768;
 /// Packets or frames one turn may move before other tasks are served.
 const BURST: usize = 64;
 /// Maximum bytes and frames opportunistically coalesced into one write/TLS record.
 const COALESCE_BYTES: usize = 16_384;
 const MAX_COALESCE_FRAMES: usize = 32;
+/// Payloads above this threshold bypass coalescing and stream zero-copy via `writev` / TLS slices.
+const SEGMENTED_PAYLOAD_THRESHOLD: usize = 1_024;
+/// Empty lazy queues shrink back to zero heap bytes when their capacity exceeded this threshold.
+const LANE_SHRINK_THRESHOLD: usize = 8;
 
 #[derive(Debug)]
 pub enum Incoming {
@@ -81,7 +87,41 @@ pub type FrameObservation = Result<MessageTime, TimeError>;
 pub struct Write {
     pub correlation: Option<(EffectId, ConnectionKey)>,
     pub bytes: Vec<u8>,
+    pub payload: Option<SharedBytes>,
     pub expiry: Option<WriteExpiry>,
+}
+
+impl Write {
+    #[inline]
+    #[must_use]
+    pub fn total_len(&self) -> usize {
+        self.bytes.len() + self.payload.as_ref().map_or(0, SharedBytes::len)
+    }
+
+    #[inline]
+    fn can_coalesce(&self, limit: usize) -> bool {
+        self.expiry.is_none()
+            && self.total_len() <= limit
+            && self
+                .payload
+                .as_ref()
+                .is_none_or(|p| p.len() <= SEGMENTED_PAYLOAD_THRESHOLD)
+    }
+
+    #[inline]
+    fn flatten_into_bytes(&mut self) {
+        if let Some(payload) = self.payload.take() {
+            self.bytes.extend_from_slice(payload.as_slice());
+        }
+    }
+
+    #[inline]
+    fn append_to(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&self.bytes);
+        if let Some(payload) = &self.payload {
+            out.extend_from_slice(payload.as_slice());
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -118,22 +158,229 @@ pub struct WireProgress {
     pub connection: ConnectionKey,
 }
 
-use crate::wake::Signalled as Tx;
+/// Lazy bounded single-producer/single-consumer queue.
+///
+/// Unlike `std::sync::mpsc::sync_channel(N)`, this allocates zero ring-buffer
+/// memory when created and shrinks back to zero when drained after bursts,
+/// cutting idle per-connection lane RAM from ~30 KiB to ~288 bytes while
+/// preserving exact bounded backpressure and disconnect semantics.
+struct LaneState<T> {
+    queue: VecDeque<T>,
+    sender_alive: bool,
+    receiver_alive: bool,
+}
 
-fn lane<T>(slots: usize, wake: &Wake) -> (Tx<T>, Receiver<T>) {
-    crate::wake::signalled(slots, wake)
+struct LaneInner<T> {
+    cap: usize,
+    pending: AtomicBool,
+    state: Mutex<LaneState<T>>,
+    changed: Condvar,
+}
+
+struct LaneTx<T> {
+    inner: Arc<LaneInner<T>>,
+    control: Option<Control>,
+}
+
+impl<T> LaneTx<T> {
+    fn try_send(&self, value: T) -> Result<(), TrySendError<T>> {
+        let mut state = match self.inner.state.lock() {
+            Ok(guard) => guard,
+            Err(_) => return Err(TrySendError::Disconnected(value)),
+        };
+        if !state.receiver_alive {
+            return Err(TrySendError::Disconnected(value));
+        }
+        if state.queue.len() >= self.inner.cap {
+            return Err(TrySendError::Full(value));
+        }
+        state.queue.push_back(value);
+        self.inner.pending.store(true, Ordering::Release);
+        drop(state);
+        self.inner.changed.notify_one();
+        if let Some(control) = &self.control {
+            control.mark_active();
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn send(&self, value: T) -> Result<(), SendError<T>> {
+        let mut state = match self.inner.state.lock() {
+            Ok(guard) => guard,
+            Err(_) => return Err(SendError(value)),
+        };
+        while state.receiver_alive && state.queue.len() >= self.inner.cap {
+            state = match self.inner.changed.wait(state) {
+                Ok(guard) => guard,
+                Err(_) => return Err(SendError(value)),
+            };
+        }
+        if !state.receiver_alive {
+            return Err(SendError(value));
+        }
+        state.queue.push_back(value);
+        self.inner.pending.store(true, Ordering::Release);
+        drop(state);
+        self.inner.changed.notify_one();
+        if let Some(control) = &self.control {
+            control.mark_active();
+        }
+        Ok(())
+    }
+}
+
+impl<T> Drop for LaneTx<T> {
+    fn drop(&mut self) {
+        if let Ok(mut state) = self.inner.state.lock() {
+            state.sender_alive = false;
+            self.inner.pending.store(true, Ordering::Release);
+        }
+        self.inner.changed.notify_all();
+        if let Some(control) = &self.control {
+            control.mark_active();
+        }
+    }
+}
+
+struct LaneRx<T> {
+    inner: Arc<LaneInner<T>>,
+}
+
+impl<T> LaneRx<T> {
+    #[inline]
+    fn has_pending(&self) -> bool {
+        self.inner.pending.load(Ordering::Acquire)
+    }
+
+    fn try_recv(&self) -> Result<T, TryRecvError> {
+        let mut state = match self.inner.state.lock() {
+            Ok(guard) => guard,
+            Err(_) => return Err(TryRecvError::Disconnected),
+        };
+        if let Some(value) = state.queue.pop_front() {
+            if state.queue.is_empty() && state.queue.capacity() > LANE_SHRINK_THRESHOLD {
+                state.queue = VecDeque::new();
+            }
+            self.inner.pending.store(
+                !state.queue.is_empty() || !state.sender_alive,
+                Ordering::Release,
+            );
+            drop(state);
+            self.inner.changed.notify_one();
+            return Ok(value);
+        }
+        if !state.sender_alive {
+            self.inner.pending.store(true, Ordering::Release);
+            Err(TryRecvError::Disconnected)
+        } else {
+            self.inner.pending.store(false, Ordering::Release);
+            Err(TryRecvError::Empty)
+        }
+    }
+
+    #[cfg(test)]
+    fn recv_timeout(&self, timeout: Duration) -> Result<T, RecvTimeoutError> {
+        let deadline = Instant::now().checked_add(timeout);
+        let mut state = match self.inner.state.lock() {
+            Ok(guard) => guard,
+            Err(_) => return Err(RecvTimeoutError::Disconnected),
+        };
+        loop {
+            if let Some(value) = state.queue.pop_front() {
+                if state.queue.is_empty() && state.queue.capacity() > LANE_SHRINK_THRESHOLD {
+                    state.queue = VecDeque::new();
+                }
+                self.inner.pending.store(
+                    !state.queue.is_empty() || !state.sender_alive,
+                    Ordering::Release,
+                );
+                drop(state);
+                self.inner.changed.notify_one();
+                return Ok(value);
+            }
+            if !state.sender_alive {
+                self.inner.pending.store(true, Ordering::Release);
+                return Err(RecvTimeoutError::Disconnected);
+            }
+            self.inner.pending.store(false, Ordering::Release);
+            let remaining = match deadline {
+                Some(deadline) => deadline.saturating_duration_since(Instant::now()),
+                None => timeout,
+            };
+            if remaining.is_zero() {
+                return Err(RecvTimeoutError::Timeout);
+            }
+            state = match self.inner.changed.wait_timeout(state, remaining) {
+                Ok((guard, _)) => guard,
+                Err(_) => return Err(RecvTimeoutError::Disconnected),
+            };
+        }
+    }
+
+    fn try_iter(&self) -> impl Iterator<Item = T> + '_ {
+        std::iter::from_fn(|| self.try_recv().ok())
+    }
+}
+
+impl<T> Drop for LaneRx<T> {
+    fn drop(&mut self) {
+        if let Ok(mut state) = self.inner.state.lock() {
+            state.receiver_alive = false;
+        }
+        self.inner.changed.notify_all();
+    }
+}
+
+fn lazy_lane<T>(cap: usize, control: Option<Control>) -> (LaneTx<T>, LaneRx<T>) {
+    let inner = Arc::new(LaneInner {
+        cap,
+        pending: AtomicBool::new(false),
+        state: Mutex::new(LaneState {
+            queue: VecDeque::new(),
+            sender_alive: true,
+            receiver_alive: true,
+        }),
+        changed: Condvar::new(),
+    });
+    (
+        LaneTx {
+            inner: inner.clone(),
+            control,
+        },
+        LaneRx { inner },
+    )
 }
 
 /// The core's end of a lane a task publishes into. Taking a value tells
 /// the reactor when the task had found the lane full.
 pub struct Inbound<T> {
-    receiver: Receiver<T>,
+    receiver: InboundRx<T>,
     link: Option<Arc<Link>>,
 }
 
+enum InboundRx<T> {
+    Lazy(LaneRx<T>),
+    #[cfg(test)]
+    Std(Receiver<T>),
+}
+
 impl<T> Inbound<T> {
+    #[inline]
+    pub fn has_pending(&self) -> bool {
+        match &self.receiver {
+            InboundRx::Lazy(rx) => rx.has_pending(),
+            #[cfg(test)]
+            InboundRx::Std(_) => true,
+        }
+    }
+
     pub fn try_recv(&self) -> Result<T, TryRecvError> {
-        let value = self.receiver.try_recv();
+        let value = match &self.receiver {
+            InboundRx::Lazy(rx) => rx.try_recv(),
+            #[cfg(test)]
+            InboundRx::Std(rx) => rx.try_recv(),
+        };
         if value.is_ok()
             && let Some(link) = &self.link
         {
@@ -141,22 +388,32 @@ impl<T> Inbound<T> {
         }
         value
     }
-}
 
-impl<T> Deref for Inbound<T> {
-    type Target = Receiver<T>;
+    #[cfg(test)]
+    pub fn recv_timeout(&self, timeout: Duration) -> Result<T, RecvTimeoutError> {
+        let value = match &self.receiver {
+            InboundRx::Lazy(rx) => rx.recv_timeout(timeout),
+            InboundRx::Std(rx) => rx.recv_timeout(timeout),
+        };
+        if value.is_ok()
+            && let Some(link) = &self.link
+        {
+            link.consumed();
+        }
+        value
+    }
 
-    fn deref(&self) -> &Receiver<T> {
-        &self.receiver
+    #[cfg(test)]
+    pub fn try_iter(&self) -> impl Iterator<Item = T> + '_ {
+        std::iter::from_fn(|| self.try_recv().ok())
     }
 }
 
-/// A lane no task feeds: its values were published by the holder of the
-/// sending half.
+#[cfg(test)]
 impl<T> From<Receiver<T>> for Inbound<T> {
     fn from(receiver: Receiver<T>) -> Self {
         Self {
-            receiver,
+            receiver: InboundRx::Std(receiver),
             link: None,
         }
     }
@@ -164,8 +421,14 @@ impl<T> From<Receiver<T>> for Inbound<T> {
 
 /// The core's end of the frame lane. A published frame runs the task.
 pub struct Outbound {
-    sender: SyncSender<Write>,
+    sender: OutboundTx,
     link: Option<Arc<Link>>,
+}
+
+enum OutboundTx {
+    Lazy(LaneTx<Write>),
+    #[cfg(test)]
+    Std(SyncSender<Write>),
 }
 
 // Both methods keep the contract of the standard sender: a refused frame
@@ -173,7 +436,11 @@ pub struct Outbound {
 #[expect(clippy::result_large_err, reason = "the refused frame is handed back")]
 impl Outbound {
     pub fn try_send(&self, frame: Write) -> Result<(), TrySendError<Write>> {
-        let result = self.sender.try_send(frame);
+        let result = match &self.sender {
+            OutboundTx::Lazy(tx) => tx.try_send(frame),
+            #[cfg(test)]
+            OutboundTx::Std(tx) => tx.try_send(frame),
+        };
         if result.is_ok()
             && let Some(link) = &self.link
         {
@@ -182,8 +449,12 @@ impl Outbound {
         result
     }
 
+    #[cfg(test)]
     pub fn send(&self, frame: Write) -> Result<(), SendError<Write>> {
-        let result = self.sender.send(frame);
+        let result = match &self.sender {
+            OutboundTx::Lazy(tx) => tx.send(frame),
+            OutboundTx::Std(tx) => tx.send(frame),
+        };
         if result.is_ok()
             && let Some(link) = &self.link
         {
@@ -193,26 +464,34 @@ impl Outbound {
     }
 }
 
-/// A lane no task drains.
+#[cfg(test)]
 impl From<SyncSender<Write>> for Outbound {
     fn from(sender: SyncSender<Write>) -> Self {
-        Self { sender, link: None }
+        Self {
+            sender: OutboundTx::Std(sender),
+            link: None,
+        }
     }
 }
 
-#[derive(Clone)]
-struct Control {
-    cancelled: Arc<AtomicBool>,
-    terminal: Arc<Mutex<Option<Terminal>>>,
+struct ControlInner {
+    cancelled: AtomicBool,
+    /// Set whenever a reactor task publishes to any core-bound lane or records
+    /// a terminal state, letting the core skip idle peers in O(1).
+    activity: AtomicBool,
+    terminal: Mutex<Option<Terminal>>,
     wake: Wake,
     /// When the task framed its last complete packet: nanoseconds since
     /// the process epoch, plus one; zero while it has framed none.
-    heard: Arc<AtomicU64>,
+    heard: AtomicU64,
     #[cfg(test)]
-    pause_progress: Arc<AtomicBool>,
+    pause_progress: AtomicBool,
     #[cfg(test)]
-    progress_waiting: Arc<AtomicBool>,
+    progress_waiting: AtomicBool,
 }
+
+#[derive(Clone)]
+struct Control(Arc<ControlInner>);
 
 #[derive(Clone, Copy)]
 struct Terminal {
@@ -222,38 +501,44 @@ struct Terminal {
 
 impl Control {
     fn new(wake: Wake) -> Self {
-        Self {
-            cancelled: Arc::new(AtomicBool::new(false)),
-            terminal: Arc::new(Mutex::new(None)),
+        Self(Arc::new(ControlInner {
+            cancelled: AtomicBool::new(false),
+            activity: AtomicBool::new(true),
+            terminal: Mutex::new(None),
             wake,
-            heard: Arc::new(AtomicU64::new(0)),
+            heard: AtomicU64::new(0),
             #[cfg(test)]
-            pause_progress: Arc::new(AtomicBool::new(false)),
+            pause_progress: AtomicBool::new(false),
             #[cfg(test)]
-            progress_waiting: Arc::new(AtomicBool::new(false)),
-        }
+            progress_waiting: AtomicBool::new(false),
+        }))
     }
 
     fn is_cancelled(&self) -> bool {
-        self.cancelled.load(Ordering::Acquire)
+        self.0.cancelled.load(Ordering::Acquire)
+    }
+
+    fn mark_active(&self) {
+        self.0.activity.store(true, Ordering::Release);
+        self.0.wake.wake();
     }
 
     fn record(&self, code: &'static str) {
-        if let Ok(mut terminal) = self.terminal.lock() {
+        if let Ok(mut terminal) = self.0.terminal.lock() {
             terminal.get_or_insert_with(|| Terminal {
                 code,
                 observed_ns: crate::events::monotonic_ns(),
             });
         }
         // The terminal reason is read by the core outside any lane.
-        self.wake.wake();
+        self.mark_active();
     }
 
     /// The socket is shut before the reason is recorded: once a reader of
     /// the reason sees it, no byte can leave any more. The flag alone
     /// would not stop a write that already passed its check.
     fn stop(&self, stream: &TcpStream, code: &'static str) {
-        self.cancelled.store(true, Ordering::Release);
+        self.0.cancelled.store(true, Ordering::Release);
         let _ = stream.shutdown(Shutdown::Both);
         self.record(code);
     }
@@ -268,7 +553,7 @@ pub struct Connection {
     pub outgoing: Outbound,
     pub written: Inbound<Written>,
     pub wire_progress: Inbound<WireProgress>,
-    stream: TcpStream,
+    stream: Arc<TcpStream>,
     control: Control,
     link: Arc<Link>,
     send_buffer: usize,
@@ -297,35 +582,36 @@ pub fn spawn_with_clock(stream: TcpStream, clock: Arc<dyn SessionClock>) -> io::
 }
 
 /// The lanes of one connection and the socket settings both transports share.
-fn open(stream: &TcpStream, wake: Wake) -> io::Result<(Lanes, Connection)> {
+fn open(stream: TcpStream, wake: Wake) -> io::Result<(Arc<TcpStream>, Lanes, Connection)> {
     stream.set_nodelay(true)?;
     stream.set_nonblocking(true)?;
-    let socket = socket2::SockRef::from(stream);
+    let socket = socket2::SockRef::from(&stream);
     let send_buffer = socket.send_buffer_size()?;
+    let stream = Arc::new(stream);
     let link = Reactors::shared()?.link(wake.clone());
-    let (input, incoming) = lane(INPUT_SLOTS, &wake);
-    let (outgoing, output) = mpsc::sync_channel(OUTPUT_SLOTS);
-    let (written_tx, written) = lane(WRITTEN_SLOTS, &wake);
-    let (progress, wire_progress) = lane(WIRE_PROGRESS_SLOTS, &wake);
     let control = Control::new(wake);
+    let (input, incoming) = lazy_lane(INPUT_SLOTS, Some(control.clone()));
+    let (outgoing, output) = lazy_lane(OUTPUT_SLOTS, None);
+    let (written_tx, written) = lazy_lane(WRITTEN_SLOTS, Some(control.clone()));
+    let (progress, wire_progress) = lazy_lane(WIRE_PROGRESS_SLOTS, Some(control.clone()));
     let connection = Connection {
         incoming: Inbound {
-            receiver: incoming,
+            receiver: InboundRx::Lazy(incoming),
             link: Some(link.clone()),
         },
         outgoing: Outbound {
-            sender: outgoing,
+            sender: OutboundTx::Lazy(outgoing),
             link: Some(link.clone()),
         },
         written: Inbound {
-            receiver: written,
+            receiver: InboundRx::Lazy(written),
             link: Some(link.clone()),
         },
         wire_progress: Inbound {
-            receiver: wire_progress,
+            receiver: InboundRx::Lazy(wire_progress),
             link: Some(link.clone()),
         },
-        stream: stream.try_clone()?,
+        stream: stream.clone(),
         control: control.clone(),
         link: link.clone(),
         send_buffer,
@@ -338,12 +624,12 @@ fn open(stream: &TcpStream, wake: Wake) -> io::Result<(Lanes, Connection)> {
         written: written_tx,
         progress,
         link,
-        heard: control.heard.clone(),
+        control,
         held: None,
         reports: VecDeque::new(),
         stalled: None,
     };
-    Ok((lanes, connection))
+    Ok((stream, lanes, connection))
 }
 
 /// `wake` is signalled whenever the task publishes towards the core.
@@ -352,13 +638,12 @@ pub fn spawn_with_wake(
     clock: Arc<dyn SessionClock>,
     wake: Wake,
 ) -> io::Result<Connection> {
-    let (lanes, connection) = open(&stream, wake)?;
+    let (stream, lanes, connection) = open(stream, wake)?;
     let task = Task {
         source: Buffered {
             stream,
-            bytes: vec![0; READ_BUFFER].into_boxed_slice(),
+            leftover: Vec::new(),
             start: 0,
-            end: 0,
         },
         parser: Parser::default(),
         clock,
@@ -380,7 +665,7 @@ pub(crate) fn spawn_tls(
     wake: Wake,
     #[cfg(feature = "test-hooks")] trace: (crate::writer::Hooks, crate::events::Events),
 ) -> io::Result<Connection> {
-    let (lanes, mut connection) = open(&stream, wake)?;
+    let (stream, lanes, mut connection) = open(stream, wake)?;
     let principal = Arc::new(OnceLock::new());
     let state = rustls::ServerConnection::new(config).map_err(io::Error::other)?;
     let mut task = tls::Task {
@@ -417,14 +702,36 @@ impl Connection {
         self.principal.as_ref()?.get().copied()
     }
 
+    /// Consumes and reports whether the transport task published any new
+    /// incoming packet, write receipt, wire progress, or terminal state since
+    /// the last check.
+    #[inline]
+    pub fn take_activity(&self) -> bool {
+        let active = self.control.0.activity.swap(false, Ordering::AcqRel);
+        active
+            || self.incoming.has_pending()
+            || self.written.has_pending()
+            || self.wire_progress.has_pending()
+    }
+
+    /// Re-arms the activity flag when the core could not drain a lane fully
+    /// (for example due to ordinary-input backpressure).
+    #[inline]
+    pub fn mark_activity(&self) {
+        self.control.0.activity.store(true, Ordering::Release);
+    }
+
     #[cfg(test)]
     pub fn pause_wire_progress(&self, pause: bool) {
-        self.control.pause_progress.store(pause, Ordering::Release);
+        self.control
+            .0
+            .pause_progress
+            .store(pause, Ordering::Release);
     }
 
     #[cfg(test)]
     pub fn wire_progress_is_waiting(&self) -> bool {
-        self.control.progress_waiting.load(Ordering::Acquire)
+        self.control.0.progress_waiting.load(Ordering::Acquire)
     }
 
     /// When the transport received its last complete packet, whether or
@@ -432,7 +739,7 @@ impl Connection {
     /// the peer sent counts when the broker hears it, and a packet the
     /// broker holds does not stop the clock.
     pub fn last_heard(&self) -> Option<Instant> {
-        match self.control.heard.load(Ordering::Relaxed) {
+        match self.control.0.heard.load(Ordering::Relaxed) {
             0 => None,
             since => epoch().checked_add(Duration::from_nanos(since - 1)),
         }
@@ -455,6 +762,7 @@ impl Connection {
 
     pub fn terminal_reason(&self) -> Option<&'static str> {
         self.control
+            .0
             .terminal
             .lock()
             .ok()
@@ -464,6 +772,7 @@ impl Connection {
 
     pub fn terminal_observed_ns(&self) -> Option<u64> {
         self.control
+            .0
             .terminal
             .lock()
             .ok()
@@ -505,14 +814,14 @@ enum Report {
 /// value or at the next tick. A held packet has no deadline; a held
 /// receipt has one, counted from its first refusal.
 struct Lanes {
-    input: Tx<Incoming>,
-    output: Receiver<Write>,
+    input: LaneTx<Incoming>,
+    output: LaneRx<Write>,
     /// One frame peeked during opportunistic coalescing that could not join the batch.
     peeked: Option<Write>,
-    written: Tx<Written>,
-    progress: Tx<WireProgress>,
+    written: LaneTx<Written>,
+    progress: LaneTx<WireProgress>,
     link: Arc<Link>,
-    heard: Arc<AtomicU64>,
+    control: Control,
     held: Option<Incoming>,
     /// Receipts in publication order.
     reports: VecDeque<Report>,
@@ -523,7 +832,7 @@ struct Lanes {
 /// `Err` means the consumer is gone. The consumer that takes a value after
 /// the mark runs the task; the second attempt covers one that took it just
 /// before.
-fn publish<T>(lane: &Tx<T>, link: &Link, mut value: T) -> Result<Option<T>, ()> {
+fn publish<T>(lane: &LaneTx<T>, link: &Link, mut value: T) -> Result<Option<T>, ()> {
     for attempt in 0..2 {
         match lane.try_send(value) {
             Ok(()) => return Ok(None),
@@ -547,7 +856,7 @@ impl Lanes {
         // A refused header is not a packet the peer was heard to send.
         if matches!(incoming, Incoming::Packet { .. }) {
             let since = u64::try_from(epoch().elapsed().as_nanos()).unwrap_or(u64::MAX - 1);
-            self.heard.store(since + 1, Ordering::Relaxed);
+            self.control.0.heard.store(since + 1, Ordering::Relaxed);
         }
         self.held = Some(incoming);
     }
@@ -682,22 +991,45 @@ trait Source {
     fn pull(&mut self, into: &mut [u8], partial: bool) -> Result<usize, &'static str>;
 }
 
-/// A plain socket behind a small read buffer.
+/// A plain socket with zero-allocation idle buffering: reads go into the
+/// reactor thread's reusable scratch buffer, and only unread partial-packet
+/// tail bytes are stashed in `leftover`.
 struct Buffered {
-    stream: TcpStream,
-    bytes: Box<[u8]>,
+    stream: Arc<TcpStream>,
+    leftover: Vec<u8>,
     start: usize,
-    end: usize,
+}
+
+struct ScratchSource<'a> {
+    buffered: &'a mut Buffered,
+    scratch: &'a mut [u8],
+    scratch_start: usize,
+    scratch_end: usize,
+}
+
+impl Drop for ScratchSource<'_> {
+    fn drop(&mut self) {
+        let rem = self.scratch_end - self.scratch_start;
+        if rem > 0 {
+            debug_assert_eq!(self.buffered.start, self.buffered.leftover.len());
+            self.buffered.leftover.clear();
+            self.buffered
+                .leftover
+                .extend_from_slice(&self.scratch[self.scratch_start..self.scratch_end]);
+            self.buffered.start = 0;
+        } else if !self.buffered.leftover.is_empty()
+            && self.buffered.start == self.buffered.leftover.len()
+        {
+            self.buffered.leftover = Vec::new();
+            self.buffered.start = 0;
+        }
+    }
 }
 
 /// One read of a non-blocking socket. Zero means nothing is available now.
-fn read_some(
-    stream: &mut TcpStream,
-    into: &mut [u8],
-    partial: bool,
-) -> Result<usize, &'static str> {
+fn read_some(stream: &TcpStream, into: &mut [u8], partial: bool) -> Result<usize, &'static str> {
     loop {
-        match stream.read(into) {
+        match (&*stream).read(into) {
             Ok(0) => {
                 return Err(if partial { "truncated_packet" } else { "eof" });
             }
@@ -709,22 +1041,36 @@ fn read_some(
     }
 }
 
-impl Source for Buffered {
+impl Source for ScratchSource<'_> {
     fn pull(&mut self, into: &mut [u8], partial: bool) -> Result<usize, &'static str> {
-        if self.start == self.end {
-            // A large body is read straight into its packet.
-            if into.len() >= self.bytes.len() {
-                return read_some(&mut self.stream, into, partial);
+        if self.buffered.start < self.buffered.leftover.len() {
+            let avail = self.buffered.leftover.len() - self.buffered.start;
+            let count = into.len().min(avail);
+            into[..count].copy_from_slice(
+                &self.buffered.leftover[self.buffered.start..self.buffered.start + count],
+            );
+            self.buffered.start += count;
+            if self.buffered.start == self.buffered.leftover.len() {
+                self.buffered.leftover = Vec::new();
+                self.buffered.start = 0;
             }
-            self.start = 0;
-            self.end = read_some(&mut self.stream, &mut self.bytes, partial)?;
-            if self.end == 0 {
+            return Ok(count);
+        }
+        if self.scratch_start == self.scratch_end {
+            // A large body is read straight into its packet.
+            if into.len() >= self.scratch.len() {
+                return read_some(&self.buffered.stream, into, partial);
+            }
+            self.scratch_start = 0;
+            self.scratch_end = read_some(&self.buffered.stream, self.scratch, partial)?;
+            if self.scratch_end == 0 {
                 return Ok(0);
             }
         }
-        let count = into.len().min(self.end - self.start);
-        into[..count].copy_from_slice(&self.bytes[self.start..self.start + count]);
-        self.start += count;
+        let count = into.len().min(self.scratch_end - self.scratch_start);
+        into[..count]
+            .copy_from_slice(&self.scratch[self.scratch_start..self.scratch_start + count]);
+        self.scratch_start += count;
         Ok(count)
     }
 }
@@ -959,14 +1305,14 @@ fn write_attempt(
     active: &mut Active,
     control: &Control,
     clock: &dyn SessionClock,
-    write: &mut impl FnMut(&[u8], Duration) -> io::Result<usize>,
+    write: &mut impl FnMut(&[u8], &[u8], Duration) -> io::Result<usize>,
     started: &mut impl FnMut() -> bool,
 ) -> Result<Attempt, WriteFailure> {
-    let bytes = &mut active.frame.bytes;
-    if bytes.len() > MAX_PACKET_BYTES {
+    let total = active.frame.total_len();
+    if total > MAX_PACKET_BYTES {
         return Err(WriteFailure::Failed("output_packet_too_large"));
     }
-    if active.offset < bytes.len() {
+    if active.offset < total {
         if control.is_cancelled() {
             return Err(WriteFailure::Failed("cancelled"));
         }
@@ -977,12 +1323,30 @@ fn write_attempt(
         if active.offset == 0
             && let Some(expiry) = active.frame.expiry
         {
-            prepare_expiry(bytes, expiry, clock)?;
+            prepare_expiry(&mut active.frame.bytes, expiry, clock)?;
         }
-        match write(&bytes[active.offset..], remaining) {
+        let hdr_len = active.frame.bytes.len();
+        let (first_part, second_part): (&[u8], &[u8]) = if active.offset < hdr_len {
+            (
+                &active.frame.bytes[active.offset..],
+                active
+                    .frame
+                    .payload
+                    .as_ref()
+                    .map_or(&[], SharedBytes::as_slice),
+            )
+        } else {
+            let pay = active
+                .frame
+                .payload
+                .as_ref()
+                .map_or(&[][..], SharedBytes::as_slice);
+            (&pay[active.offset - hdr_len..], &[])
+        };
+        match write(first_part, second_part, remaining) {
             Ok(0) => return Err(WriteFailure::Failed("write_zero")),
             Ok(count) => {
-                if count > bytes.len() - active.offset {
+                if count > total - active.offset {
                     return Err(WriteFailure::Failed("invalid_write_progress"));
                 }
                 let first = active.offset == 0;
@@ -994,7 +1358,7 @@ fn write_attempt(
             Err(error) if retryable(&error) => return Ok(Attempt::Blocked),
             Err(_) => return Err(WriteFailure::Failed("write_io")),
         }
-        if active.offset < bytes.len() {
+        if active.offset < total {
             return Ok(Attempt::Advanced);
         }
     }
@@ -1018,10 +1382,12 @@ fn write_attempts(
     let mut active = Active::new(Write {
         correlation: None,
         bytes: bytes.to_vec(),
+        payload: None,
         expiry,
     });
     let result = loop {
-        let mut bounded = |part: &[u8], remaining: Duration| write(part, remaining.min(POLL));
+        let mut bounded =
+            |part: &[u8], _tail: &[u8], remaining: Duration| write(part, remaining.min(POLL));
         match write_attempt(&mut active, control, clock, &mut bounded, &mut started) {
             Ok(Attempt::Done) => break Ok(()),
             Ok(_) => {}
@@ -1048,14 +1414,18 @@ impl Task {
     /// Holds the completion of a correlated frame while a test asks for it.
     #[cfg(test)]
     fn held_by_test(&mut self) -> bool {
-        if self.control.pause_progress.load(Ordering::Acquire)
+        if self.control.0.pause_progress.load(Ordering::Acquire)
             && self.paused.get_or_insert_with(Instant::now).elapsed() <= Duration::from_secs(2)
         {
-            self.control.progress_waiting.store(true, Ordering::Release);
+            self.control
+                .0
+                .progress_waiting
+                .store(true, Ordering::Release);
             return true;
         }
         self.paused = None;
         self.control
+            .0
             .progress_waiting
             .store(false, Ordering::Release);
         false
@@ -1070,30 +1440,32 @@ impl Task {
                 };
                 let mut batch = Vec::new();
                 #[cfg(test)]
-                let allow_coalesce = !self.control.pause_progress.load(Ordering::Acquire);
+                let allow_coalesce = !self.control.0.pause_progress.load(Ordering::Acquire);
                 #[cfg(not(test))]
                 let allow_coalesce = true;
                 if allow_coalesce
-                    && frame.expiry.is_none()
-                    && frame.bytes.len() <= COALESCE_BYTES
+                    && frame.can_coalesce(COALESCE_BYTES)
                     && let Some(next) = self.lanes.pop_coalesce_candidate()
                 {
-                    if next.expiry.is_none()
-                        && frame.bytes.len() + next.bytes.len() <= COALESCE_BYTES
+                    if next.can_coalesce(COALESCE_BYTES)
+                        && frame.total_len() + next.total_len() <= COALESCE_BYTES
                     {
-                        batch.push((frame.correlation, frame.bytes.len()));
-                        batch.push((next.correlation, next.bytes.len()));
-                        frame.bytes.extend_from_slice(&next.bytes);
+                        let first_len = frame.total_len();
+                        let next_len = next.total_len();
+                        batch.push((frame.correlation, first_len));
+                        batch.push((next.correlation, next_len));
+                        frame.flatten_into_bytes();
+                        next.append_to(&mut frame.bytes);
                         frame.correlation = None;
                         while batch.len() < MAX_COALESCE_FRAMES {
                             let Some(more) = self.lanes.pop_coalesce_candidate() else {
                                 break;
                             };
-                            if more.expiry.is_none()
-                                && frame.bytes.len() + more.bytes.len() <= COALESCE_BYTES
+                            if more.can_coalesce(COALESCE_BYTES)
+                                && frame.bytes.len() + more.total_len() <= COALESCE_BYTES
                             {
-                                batch.push((more.correlation, more.bytes.len()));
-                                frame.bytes.extend_from_slice(&more.bytes);
+                                batch.push((more.correlation, more.total_len()));
+                                more.append_to(&mut frame.bytes);
                             } else {
                                 self.lanes.peeked = Some(more);
                                 break;
@@ -1112,13 +1484,19 @@ impl Task {
             if !active.written {
                 let correlation = active.frame.correlation;
                 let reports_start = active.frame.expiry.is_some() && correlation.is_some();
-                let stream = &mut self.source.stream;
+                let stream = &*self.source.stream;
                 let lanes = &mut self.lanes;
                 let attempt = write_attempt(
                     active,
                     &self.control,
                     self.clock.as_ref(),
-                    &mut |part, _| stream.write(part),
+                    &mut |head, tail, _| {
+                        if tail.is_empty() {
+                            (&*stream).write(head)
+                        } else {
+                            (&*stream).write_vectored(&[IoSlice::new(head), IoSlice::new(tail)])
+                        }
+                    },
                     &mut || {
                         if reports_start {
                             lanes.report(Written::Started { correlation });
@@ -1151,7 +1529,7 @@ impl Task {
             }
             let active = self.active.as_ref().expect("frame written above");
             if active.batch.is_empty() {
-                let (correlation, bytes) = (active.frame.correlation, active.frame.bytes.len());
+                let (correlation, bytes) = (active.frame.correlation, active.frame.total_len());
                 if let Some((effect, connection)) = correlation {
                     // This publication is deliberately separate from Written: the
                     // reactor may retain a core receipt while MQTT receive credit
@@ -1183,14 +1561,20 @@ impl Task {
         Ok(progressed)
     }
 
-    fn input_turn(&mut self) -> Result<bool, &'static str> {
+    fn input_turn(&mut self, scratch: &mut [u8]) -> Result<bool, &'static str> {
         let mut progressed = false;
+        let mut source = ScratchSource {
+            buffered: &mut self.source,
+            scratch,
+            scratch_start: 0,
+            scratch_end: 0,
+        };
         for _ in 0..BURST {
             if !self.lanes.deliver()? {
                 break;
             }
             let before = self.parser.consumed;
-            match self.parser.packet(&mut self.source, self.clock.as_ref())? {
+            match self.parser.packet(&mut source, self.clock.as_ref())? {
                 Some(packet) => {
                     self.lanes.hold(packet);
                     progressed = true;
@@ -1201,6 +1585,7 @@ impl Task {
                 }
             }
         }
+        drop(source);
         // A packet parsed by the last pass is offered before the turn ends.
         self.lanes.deliver()?;
         Ok(progressed)
@@ -1212,14 +1597,14 @@ impl Driven for Task {
         self.source.stream.as_raw_fd()
     }
 
-    fn turn(&mut self) -> Result<Turn, &'static str> {
+    fn turn(&mut self, scratch: &mut [u8]) -> Result<Turn, &'static str> {
         if self.control.is_cancelled() {
             return Err("cancelled");
         }
         let mut progress = self.lanes.flush()?;
         progress |= self.output_turn()?;
         progress |= self.lanes.flush()?;
-        progress |= self.input_turn()?;
+        progress |= self.input_turn(scratch)?;
         Ok(Turn {
             progress,
             waiting: self.active.is_some() || self.parser.is_partial() || self.lanes.pending(),
@@ -1587,6 +1972,7 @@ mod tests {
             .send(Write {
                 correlation: correlation(1),
                 bytes: vec![0xd0, 0],
+                payload: None,
                 expiry: None,
             })
             .unwrap();
@@ -1604,6 +1990,7 @@ mod tests {
             .send(Write {
                 correlation: correlation(2),
                 bytes,
+                payload: None,
                 expiry: Some(expiry),
             })
             .unwrap();
@@ -1612,6 +1999,7 @@ mod tests {
             .send(Write {
                 correlation: None,
                 bytes: vec![0xd0, 0],
+                payload: None,
                 expiry: None,
             })
             .unwrap();
@@ -1670,6 +2058,7 @@ mod tests {
             .send(Write {
                 correlation: correlation(1),
                 bytes,
+                payload: None,
                 expiry: Some(expiry),
             })
             .unwrap();
@@ -1723,6 +2112,7 @@ mod tests {
             .try_send(Write {
                 correlation: None,
                 bytes: vec![0xe0, 2, 0x95, 0],
+                payload: None,
                 expiry: None,
             })
             .unwrap();
@@ -1757,6 +2147,7 @@ mod tests {
             .send(Write {
                 correlation: None,
                 bytes: vec![0xd0, 0],
+                payload: None,
                 expiry: None,
             })
             .unwrap();
@@ -1793,6 +2184,7 @@ mod tests {
                 .send(Write {
                     correlation: None,
                     bytes: vec![0; 65_536],
+                    payload: None,
                     expiry: None,
                 })
                 .unwrap();
@@ -1882,6 +2274,7 @@ mod tests {
                 .send(Write {
                     correlation: None,
                     bytes: vec![0; 65_536],
+                    payload: None,
                     expiry: None,
                 })
                 .unwrap();

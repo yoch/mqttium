@@ -1048,32 +1048,57 @@ impl<'a> Reader<'a> {
     }
 }
 
+#[derive(Debug)]
+struct FrozenInner {
+    recipe: Recipe,
+    canonical: Box<[u8]>,
+}
+
 /// A recipe that can no longer change.
 ///
 /// The `Arc` is private and no method hands out a mutable reference, so
 /// neither interior mutation nor copy-on-write is reachable: immutability is
 /// the contract of this wrapper (DEM-009). The owner keeps one clone until
-/// the operation is resolved.
-#[derive(Clone, PartialEq, Eq, Debug)]
-pub struct FrozenRecipe(Arc<Recipe>);
+/// the operation is resolved. Its exact canonical bytes are frozen once at
+/// construction so stores never re-encode the same command.
+#[derive(Clone, Debug)]
+pub struct FrozenRecipe(Arc<FrozenInner>);
+
+impl PartialEq for FrozenRecipe {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.canonical == other.0.canonical
+    }
+}
+
+impl Eq for FrozenRecipe {}
 
 impl FrozenRecipe {
-    /// Freezes a well-formed recipe.
+    /// Freezes a well-formed recipe together with its canonical encoding.
     pub fn freeze(recipe: Recipe) -> Result<Self, RecipeError> {
-        recipe.check()?;
-        Ok(Self(Arc::new(recipe)))
+        let mut canonical = Vec::new();
+        recipe.encode_canonical(&mut canonical)?;
+        Ok(Self(Arc::new(FrozenInner {
+            recipe,
+            canonical: canonical.into_boxed_slice(),
+        })))
     }
 
     /// The frozen recipe.
     #[must_use]
     pub fn get(&self) -> &Recipe {
-        &self.0
+        &self.0.recipe
+    }
+
+    /// The exact canonical bytes of this frozen recipe (DEM-009).
+    #[must_use]
+    pub fn canonical_bytes(&self) -> &[u8] {
+        &self.0.canonical
     }
 
     /// The operation this recipe belongs to.
     #[must_use]
     pub fn operation(&self) -> OperationId {
-        self.0.operation()
+        self.0.recipe.operation()
     }
 }
 

@@ -648,6 +648,93 @@ impl State {
         self.expiring_deliveries.remove(&index);
     }
 
+    /// Updates a `Delivery` in place when `id`, `target`, `payload`, and `expiry`
+    /// are unchanged, touching only the secondary indices whose keys changed.
+    fn mutate_delivery(&mut self, index: usize, f: impl FnOnce(&mut Delivery)) {
+        let d = &self.deliveries.as_slice()[index];
+        let old_flight = d.in_flight().map(|fl| (fl.operation, fl.deadline));
+        let old_frame = d.frame.map(|(e, _)| e);
+        let old_claim = d.claim.map(|c| c.operation);
+        let old_claim_res = d.claim_result.map(|r| r.operation);
+        let old_window = d.window;
+        let old_ctrl = Self::is_control_candidate(d);
+
+        f(&mut self.deliveries.as_mut_slice()[index]);
+
+        let d = &self.deliveries.as_slice()[index];
+        let new_flight = d.in_flight().map(|fl| (fl.operation, fl.deadline));
+        let new_frame = d.frame.map(|(e, _)| e);
+        let new_claim = d.claim.map(|c| c.operation);
+        let new_claim_res = d.claim_result.map(|r| r.operation);
+        let new_window = d.window;
+        let new_ctrl = Self::is_control_candidate(d);
+
+        if old_flight != new_flight {
+            if let Some((op, dl)) = old_flight {
+                self.delivery_by_op.remove(&op);
+                self.delivery_by_deadline.remove(&dl);
+            }
+            if let Some((op, dl)) = new_flight {
+                self.delivery_by_op.insert(op, index);
+                self.delivery_by_deadline.insert(dl, index);
+            }
+        }
+        if old_frame != new_frame {
+            if let Some(e) = old_frame {
+                self.delivery_by_frame.remove(&e);
+            }
+            if let Some(e) = new_frame {
+                self.delivery_by_frame.insert(e, index);
+            }
+        }
+        if old_claim != new_claim {
+            if let Some(op) = old_claim {
+                self.delivery_by_claim_op.remove(&op);
+            }
+            if let Some(op) = new_claim {
+                self.delivery_by_claim_op.insert(op, index);
+            }
+        }
+        if old_claim_res != new_claim_res {
+            if let Some(op) = old_claim_res {
+                self.delivery_by_claim_result_op.remove(&op);
+            }
+            if let Some(op) = new_claim_res {
+                self.delivery_by_claim_result_op.insert(op, index);
+            }
+        }
+        if old_window != new_window {
+            if let Some(generation) = old_window {
+                if let Some(count) = self.active_by_gen.get_mut(&generation) {
+                    *count = count.saturating_sub(1);
+                    if *count == 0 {
+                        self.active_by_gen.remove(&generation);
+                    }
+                }
+                if let Some(set) = self.deliveries_by_window.get_mut(&generation) {
+                    set.remove(&index);
+                    if set.is_empty() {
+                        self.deliveries_by_window.remove(&generation);
+                    }
+                }
+            }
+            if let Some(generation) = new_window {
+                *self.active_by_gen.entry(generation).or_insert(0) += 1;
+                self.deliveries_by_window
+                    .entry(generation)
+                    .or_default()
+                    .insert(index);
+            }
+        }
+        if old_ctrl != new_ctrl {
+            if new_ctrl {
+                self.control_candidates.insert(index);
+            } else {
+                self.control_candidates.remove(&index);
+            }
+        }
+    }
+
     fn push_delivery(&mut self, delivery: Delivery) -> Result<(), CoreFault> {
         let index = self.deliveries.len();
         self.deliveries
@@ -729,6 +816,28 @@ impl State {
             return OutboundPacketId::new(1).filter(|id| id.get() <= maximum);
         };
         let slice = self.deliveries.as_slice();
+        if indices.len() <= 64 {
+            let mut used = [0u16; 64];
+            let mut count = 0usize;
+            for &idx in indices {
+                let delivery = &slice[idx];
+                if Self::reserves_packet_id(delivery, session)
+                    && let Some(claim) = delivery.claim
+                {
+                    used[count] = claim.packet_id.get();
+                    count += 1;
+                }
+            }
+            let used = &used[..count];
+            let candidates = count.saturating_add(1).min(usize::from(maximum));
+            for raw in 1..=candidates {
+                let id = u16::try_from(raw).ok()?;
+                if MUTANT_IGNORE_OCCUPIED_PI || !used.contains(&id) {
+                    return OutboundPacketId::new(id);
+                }
+            }
+            return None;
+        }
         let mut used = BTreeSet::new();
         for &idx in indices {
             let delivery = &slice[idx];
@@ -903,6 +1012,63 @@ impl State {
             (_, Some(_)) => pubrel,
             _ => publish,
         }
+    }
+
+    /// Finds the next queued QoS 1/2 delivery eligible for pipelined claiming
+    /// when every earlier waiting delivery on this destination is a healthy
+    /// in-flight `ClaimPending(Submitted)` or an `AwaitPuback` waiting behind
+    /// such a claim. Any `Indeterminate` (unknown) claim, `ConsumePending`,
+    /// QoS 0 delivery, or unloaded delivery forms a strict barrier ahead of
+    /// later deliveries.
+    ///
+    /// Also returns whether all waiting non-PUBREL deliveries are healthy
+    /// in-flight claims (allowing `LoadWork` prefetch when `after`/`rescan`
+    /// indicates more work in the store).
+    fn next_pipelined_claim(
+        &self,
+        session: SessionId,
+        generation: ConnectionGeneration,
+        now: Option<MessageTime>,
+        room: bool,
+    ) -> (Option<(usize, &Delivery)>, bool) {
+        if !room {
+            return (None, false);
+        }
+        let Some(indices) = self.deliveries_by_session.get(&session) else {
+            return (None, true);
+        };
+        let slice = self.deliveries.as_slice();
+        let mut blocker: Option<DeliveryId> = None;
+        let mut best_queued: Option<(usize, &Delivery)> = None;
+        let mut blocked_all = false;
+        for &idx in indices {
+            let d = &slice[idx];
+            if !d.waiting_to_send(generation, now) || d.awaits_pubcomp() {
+                continue;
+            }
+            match d.phase {
+                Phase::ClaimPending(f) if f.phase == CommandPhase::Submitted => {}
+                Phase::AwaitPuback => {}
+                Phase::Queued if d.qos != Qos::AtMostOnce && d.payload.is_some() => {
+                    if best_queued.is_none_or(|(_, prev)| d.id < prev.id) {
+                        best_queued = Some((idx, d));
+                    }
+                }
+                _ => {
+                    blocked_all = true;
+                    if blocker.is_none_or(|prev| d.id < prev) {
+                        blocker = Some(d.id);
+                    }
+                }
+            }
+        }
+        if let Some((idx, d)) = best_queued {
+            if blocker.is_none_or(|b| d.id < b) {
+                return (Some((idx, d)), false);
+            }
+            return (None, false);
+        }
+        (None, !blocked_all)
     }
     fn loaded_bytes(&self) -> Option<u64> {
         Some(self.loaded_payload_bytes)
@@ -1135,7 +1301,15 @@ impl Owner {
                 delivery.phase,
                 Phase::ClaimPending(_) | Phase::ConsumePending(_, _)
             ) {
-                return false;
+                let (candidate, can_prefetch) =
+                    self.pubsub
+                        .next_pipelined_claim(session, generation, self.message_now, room);
+                if candidate.is_some() {
+                    return true;
+                }
+                if !can_prefetch {
+                    return false;
+                }
             }
         }
         room && settings.loading.is_none() && (settings.after.is_some() || settings.rescan_needed)
@@ -2360,17 +2534,37 @@ impl Owner {
         let next = self
             .pubsub
             .next_send(session, generation, self.message_now, room);
+        let mut claim_target = None;
+        let mut allow_prefetch = true;
         if let Some((_, d)) = next
             && matches!(
                 d.phase,
                 Phase::ClaimPending(_) | Phase::ConsumePending(_, _)
             )
         {
-            // A lost claim result must be reconciled before a later
-            // publication can become eligible on this destination.
-            return Ok(super::Change::Nothing);
+            // A lost (Indeterminate) claim result or a pending QoS 0 consume
+            // must be reconciled before a later publication can be claimed on
+            // this destination. Healthy in-flight Submitted claims allow
+            // pipelining further QoS 1/2 claims within Receive Maximum while
+            // `plan_delivery_emit` continues to enforce strict wire order.
+            let (candidate, can_prefetch) =
+                self.pubsub
+                    .next_pipelined_claim(session, generation, self.message_now, room);
+            if let Some(pair) = candidate {
+                claim_target = Some(pair);
+            } else if can_prefetch
+                && settings.loading.is_none()
+                && (settings.after.is_some() || settings.rescan_needed)
+            {
+                allow_prefetch = true;
+            } else {
+                return Ok(super::Change::Nothing);
+            }
+        } else {
+            allow_prefetch = false;
         }
-        if let Some((slot, d)) = next
+        if claim_target.is_none()
+            && let Some((slot, d)) = next
             && d.phase == Phase::AwaitPuback
             && d.ready_to_send(generation, room)
         {
@@ -2398,7 +2592,8 @@ impl Owner {
                 Emission::Held => {}
             }
         }
-        if let Some((slot, d)) = next
+        if claim_target.is_none()
+            && let Some((slot, d)) = next
             && d.phase == Phase::Queued
             && d.qos == Qos::AtMostOnce
             && d.payload.is_some()
@@ -2420,11 +2615,14 @@ impl Owner {
                 },
             }));
         }
-        if room
-            && let Some((slot, d)) = next
-            && d.phase == Phase::Queued
-            && d.payload.is_some()
-        {
+        let claim_candidate = claim_target.or_else(|| {
+            if room {
+                next.filter(|(_, d)| d.phase == Phase::Queued && d.payload.is_some())
+            } else {
+                None
+            }
+        });
+        if room && let Some((slot, d)) = claim_candidate {
             let Some(packet_id) = self.pubsub.free_packet_id(session, u16::MAX) else {
                 draft.close(generation, CloseReason::CapacityExceeded)?;
                 return Ok(super::Change::Nothing);
@@ -2451,7 +2649,16 @@ impl Owner {
                 connection,
             }));
         }
-        if room && settings.loading.is_none() {
+        if room
+            && settings.loading.is_none()
+            && (allow_prefetch
+                || next.is_none_or(|(_, d)| {
+                    !matches!(
+                        d.phase,
+                        Phase::ClaimPending(_) | Phase::ConsumePending(_, _)
+                    )
+                }))
+        {
             let effect = draft.emit(Effect::LoadWork {
                 session,
                 limit: WORK_PAGE_LIMIT,
@@ -3459,10 +3666,9 @@ impl Owner {
                 if slot >= self.pubsub.deliveries.len() {
                     return Err(stale);
                 }
-                self.pubsub.unindex_delivery(slot);
-                self.pubsub.deliveries.as_mut_slice()[slot].phase =
-                    Phase::ConsumePending(in_flight, connection);
-                self.pubsub.index_delivery(slot);
+                self.pubsub.mutate_delivery(slot, |d| {
+                    d.phase = Phase::ConsumePending(in_flight, connection);
+                });
             }
             Change::Consumed {
                 slot,
@@ -3477,12 +3683,11 @@ impl Owner {
                     self.remember_finished(finished)?;
                     self.pubsub.remove_delivery_at(slot);
                 } else {
-                    self.pubsub.unindex_delivery(slot);
-                    let d = &mut self.pubsub.deliveries.as_mut_slice()[slot];
-                    d.phase = Phase::Qos0Writing(finished);
-                    d.claim_result = Some(finished);
-                    d.frame = emission;
-                    self.pubsub.index_delivery(slot);
+                    self.pubsub.mutate_delivery(slot, |d| {
+                        d.phase = Phase::Qos0Writing(finished);
+                        d.claim_result = Some(finished);
+                        d.frame = emission;
+                    });
                 }
                 self.pubsub.invalidate_reads(target);
             }
@@ -3613,12 +3818,11 @@ impl Owner {
                 if slot >= self.pubsub.deliveries.len() {
                     return Err(stale);
                 }
-                self.pubsub.unindex_delivery(slot);
-                let d = &mut self.pubsub.deliveries.as_mut_slice()[slot];
-                d.claim = Some(claim);
-                d.phase = Phase::ClaimPending(in_flight);
-                d.window = Some(generation);
-                self.pubsub.index_delivery(slot);
+                self.pubsub.mutate_delivery(slot, |d| {
+                    d.claim = Some(claim);
+                    d.phase = Phase::ClaimPending(in_flight);
+                    d.window = Some(generation);
+                });
             }
             Change::Claimed {
                 slot,
@@ -3628,20 +3832,19 @@ impl Owner {
                 if slot >= self.pubsub.deliveries.len() {
                     return Err(stale);
                 }
-                self.pubsub.unindex_delivery(slot);
-                let d = &mut self.pubsub.deliveries.as_mut_slice()[slot];
-                d.claim_result = Some(finished);
-                d.phase = Phase::AwaitPuback;
-                if let Some((effect, connection)) = emission {
-                    d.window = Some(connection.generation);
-                    if d.frame.is_some() {
-                        d.certain_never_started = false;
+                self.pubsub.mutate_delivery(slot, |d| {
+                    d.claim_result = Some(finished);
+                    d.phase = Phase::AwaitPuback;
+                    if let Some((effect, connection)) = emission {
+                        d.window = Some(connection.generation);
+                        if d.frame.is_some() {
+                            d.certain_never_started = false;
+                        }
+                        d.frame = Some((effect, connection));
+                        d.may_have_started = true;
+                        d.local_write_completed = false;
                     }
-                    d.frame = Some((effect, connection));
-                    d.may_have_started = true;
-                    d.local_write_completed = false;
-                }
-                self.pubsub.index_delivery(slot);
+                });
             }
             Change::Emit {
                 slot,
@@ -3651,37 +3854,34 @@ impl Owner {
                 if slot >= self.pubsub.deliveries.len() {
                     return Err(stale);
                 }
-                self.pubsub.unindex_delivery(slot);
-                let d = &mut self.pubsub.deliveries.as_mut_slice()[slot];
-                if !d.awaits_pubcomp() {
-                    d.window = Some(connection.generation);
-                }
-                if d.frame.is_some() {
-                    d.certain_never_started = false;
-                }
-                d.frame = Some((effect, connection));
-                d.may_have_started = true;
-                d.local_write_completed = false;
-                self.pubsub.index_delivery(slot);
+                self.pubsub.mutate_delivery(slot, |d| {
+                    if !d.awaits_pubcomp() {
+                        d.window = Some(connection.generation);
+                    }
+                    if d.frame.is_some() {
+                        d.certain_never_started = false;
+                    }
+                    d.frame = Some((effect, connection));
+                    d.may_have_started = true;
+                    d.local_write_completed = false;
+                });
             }
             Change::Finish { slot, in_flight } => {
                 if slot >= self.pubsub.deliveries.len() {
                     return Err(stale);
                 }
-                self.pubsub.unindex_delivery(slot);
-                let d = &mut self.pubsub.deliveries.as_mut_slice()[slot];
-                d.early_pubrec = None;
-                d.phase = Phase::FinishPending(in_flight);
-                self.pubsub.index_delivery(slot);
+                self.pubsub.mutate_delivery(slot, |d| {
+                    d.early_pubrec = None;
+                    d.phase = Phase::FinishPending(in_flight);
+                });
             }
             Change::Discard { slot, in_flight } => {
                 if slot >= self.pubsub.deliveries.len() {
                     return Err(stale);
                 }
-                self.pubsub.unindex_delivery(slot);
-                self.pubsub.deliveries.as_mut_slice()[slot].phase =
-                    Phase::DiscardPending(in_flight);
-                self.pubsub.index_delivery(slot);
+                self.pubsub.mutate_delivery(slot, |d| {
+                    d.phase = Phase::DiscardPending(in_flight);
+                });
             }
             Change::PreparePubrel {
                 slot,
@@ -3691,16 +3891,19 @@ impl Owner {
                 if slot >= self.pubsub.deliveries.len() {
                     return Err(stale);
                 }
-                self.pubsub.unindex_delivery(slot);
-                let d = &mut self.pubsub.deliveries.as_mut_slice()[slot];
-                d.early_pubrec = None;
-                if d.pubrec_rank.is_none() {
-                    d.pubrec_rank = Some(rank);
+                let mut advance_rank = false;
+                self.pubsub.mutate_delivery(slot, |d| {
+                    d.early_pubrec = None;
+                    if d.pubrec_rank.is_none() {
+                        d.pubrec_rank = Some(rank);
+                        advance_rank = true;
+                    }
+                    d.phase = Phase::PubrelPending(in_flight);
+                });
+                if advance_rank {
                     self.pubsub.next_pubrec_rank =
                         self.pubsub.next_pubrec_rank.max(rank.saturating_add(1));
                 }
-                d.phase = Phase::PubrelPending(in_flight);
-                self.pubsub.index_delivery(slot);
             }
             Change::PubrelReady { slot, finished } => {
                 if slot >= self.pubsub.deliveries.len() {
@@ -3709,31 +3912,29 @@ impl Owner {
                 if self.pubsub.deliveries.as_slice()[slot].claim.is_none() {
                     return Err(stale);
                 }
-                self.pubsub.unindex_delivery(slot);
-                let d = &mut self.pubsub.deliveries.as_mut_slice()[slot];
-                d.claim.as_mut().ok_or(stale)?.await_pubcomp = true;
-                d.phase = Phase::AwaitPuback;
-                d.frame = None;
-                d.certain_never_started = false;
-                self.pubsub.index_delivery(slot);
+                self.pubsub.mutate_delivery(slot, |d| {
+                    if let Some(claim) = d.claim.as_mut() {
+                        claim.await_pubcomp = true;
+                    }
+                    d.phase = Phase::AwaitPuback;
+                    d.frame = None;
+                    d.certain_never_started = false;
+                });
                 self.remember_finished(finished)?;
             }
             Change::Finished { slot, finished } => {
-                let d = self
-                    .pubsub
-                    .deliveries
-                    .as_slice()
-                    .get(slot)
-                    .ok_or(stale)?
-                    .clone();
-                if let Some(known) = d.claim_result
+                let (claim_result, target) = {
+                    let d = self.pubsub.deliveries.as_slice().get(slot).ok_or(stale)?;
+                    (d.claim_result, d.target)
+                };
+                if let Some(known) = claim_result
                     && known.operation != finished.operation
                 {
                     self.remember_finished(known)?;
                 }
                 self.remember_finished(finished)?;
                 self.pubsub.remove_delivery_at(slot);
-                self.pubsub.invalidate_reads(d.target);
+                self.pubsub.invalidate_reads(target);
             }
             Change::Refused {
                 slot,
@@ -3743,16 +3944,15 @@ impl Owner {
                 if slot >= self.pubsub.deliveries.len() {
                     return Err(stale);
                 }
-                self.pubsub.unindex_delivery(slot);
-                let d = &mut self.pubsub.deliveries.as_mut_slice()[slot];
-                d.window = None;
-                if claiming {
-                    d.claim = None;
-                    d.phase = Phase::Queued;
-                } else {
-                    d.phase = Phase::AwaitPuback;
-                }
-                self.pubsub.index_delivery(slot);
+                self.pubsub.mutate_delivery(slot, |d| {
+                    d.window = None;
+                    if claiming {
+                        d.claim = None;
+                        d.phase = Phase::Queued;
+                    } else {
+                        d.phase = Phase::AwaitPuback;
+                    }
+                });
                 self.remember_finished(finished)?;
             }
             Change::Await {
@@ -3811,35 +4011,37 @@ impl Owner {
                 if slot >= self.pubsub.deliveries.len() {
                     return Err(stale);
                 }
-                self.pubsub.unindex_delivery(slot);
-                self.pubsub.deliveries.as_mut_slice()[slot].early_puback = true;
-                self.pubsub.index_delivery(slot);
+                self.pubsub.mutate_delivery(slot, |d| {
+                    d.early_puback = true;
+                });
             }
             Change::PubrecObserved { slot, reason, rank } => {
                 if slot >= self.pubsub.deliveries.len() {
                     return Err(stale);
                 }
-                self.pubsub.unindex_delivery(slot);
-                let d = &mut self.pubsub.deliveries.as_mut_slice()[slot];
-                d.early_pubrec = Some(reason);
-                if let Some(rank) = rank
-                    && d.pubrec_rank.is_none()
-                {
-                    d.pubrec_rank = Some(rank);
+                let mut advance_rank = false;
+                self.pubsub.mutate_delivery(slot, |d| {
+                    d.early_pubrec = Some(reason);
+                    if let Some(rank) = rank
+                        && d.pubrec_rank.is_none()
+                    {
+                        d.pubrec_rank = Some(rank);
+                        advance_rank = true;
+                    }
+                });
+                if advance_rank && let Some(rank) = rank {
                     self.pubsub.next_pubrec_rank =
                         self.pubsub.next_pubrec_rank.max(rank.saturating_add(1));
                 }
-                self.pubsub.index_delivery(slot);
             }
             Change::Start { slot, in_flight } => {
                 if slot >= self.pubsub.deliveries.len() {
                     return Err(stale);
                 }
-                self.pubsub.unindex_delivery(slot);
-                let d = &mut self.pubsub.deliveries.as_mut_slice()[slot];
-                d.certain_never_started = false;
-                d.phase = Phase::StartPending(in_flight);
-                self.pubsub.index_delivery(slot);
+                self.pubsub.mutate_delivery(slot, |d| {
+                    d.certain_never_started = false;
+                    d.phase = Phase::StartPending(in_flight);
+                });
             }
             Change::Started {
                 slot,
@@ -3851,35 +4053,40 @@ impl Owner {
                 {
                     return Err(stale);
                 }
-                self.pubsub.unindex_delivery(slot);
-                let d = &mut self.pubsub.deliveries.as_mut_slice()[slot];
-                d.claim.as_mut().ok_or(stale)?.started = true;
-                match follow_up {
-                    None => d.phase = Phase::AwaitPuback,
-                    Some(StartFollowUp::Finish(in_flight)) => {
-                        d.early_pubrec = None;
-                        d.phase = Phase::FinishPending(in_flight);
+                let mut advance_rank: Option<u64> = None;
+                self.pubsub.mutate_delivery(slot, |d| {
+                    if let Some(claim) = d.claim.as_mut() {
+                        claim.started = true;
                     }
-                    Some(StartFollowUp::PreparePubrel { in_flight, rank }) => {
-                        d.early_pubrec = None;
-                        if d.pubrec_rank.is_none() {
-                            d.pubrec_rank = Some(rank);
-                            self.pubsub.next_pubrec_rank =
-                                self.pubsub.next_pubrec_rank.max(rank.saturating_add(1));
+                    match follow_up {
+                        None => d.phase = Phase::AwaitPuback,
+                        Some(StartFollowUp::Finish(in_flight)) => {
+                            d.early_pubrec = None;
+                            d.phase = Phase::FinishPending(in_flight);
                         }
-                        d.phase = Phase::PubrelPending(in_flight);
+                        Some(StartFollowUp::PreparePubrel { in_flight, rank }) => {
+                            d.early_pubrec = None;
+                            if d.pubrec_rank.is_none() {
+                                d.pubrec_rank = Some(rank);
+                                advance_rank = Some(rank);
+                            }
+                            d.phase = Phase::PubrelPending(in_flight);
+                        }
                     }
+                });
+                if let Some(rank) = advance_rank {
+                    self.pubsub.next_pubrec_rank =
+                        self.pubsub.next_pubrec_rank.max(rank.saturating_add(1));
                 }
-                self.pubsub.index_delivery(slot);
                 self.remember_finished(finished)?;
             }
             Change::Expire { slot, in_flight } => {
                 if slot >= self.pubsub.deliveries.len() {
                     return Err(stale);
                 }
-                self.pubsub.unindex_delivery(slot);
-                self.pubsub.deliveries.as_mut_slice()[slot].phase = Phase::ExpirePending(in_flight);
-                self.pubsub.index_delivery(slot);
+                self.pubsub.mutate_delivery(slot, |d| {
+                    d.phase = Phase::ExpirePending(in_flight);
+                });
             }
             Change::RetryDeferred {
                 slot,
@@ -3889,32 +4096,30 @@ impl Owner {
                 if slot >= self.pubsub.deliveries.len() {
                     return Err(stale);
                 }
-                self.pubsub.unindex_delivery(slot);
-                let d = &mut self.pubsub.deliveries.as_mut_slice()[slot];
-                d.phase = if expiring {
-                    Phase::ExpireRetry
-                } else {
-                    Phase::StartRetry
-                };
-                if expiring {
-                    d.frame = None;
-                    d.window = None;
-                }
-                self.pubsub.index_delivery(slot);
+                self.pubsub.mutate_delivery(slot, |d| {
+                    d.phase = if expiring {
+                        Phase::ExpireRetry
+                    } else {
+                        Phase::StartRetry
+                    };
+                    if expiring {
+                        d.frame = None;
+                        d.window = None;
+                    }
+                });
                 self.remember_finished(finished)?;
             }
             Change::NotStarted { slot } => {
                 if slot >= self.pubsub.deliveries.len() {
                     return Err(stale);
                 }
-                self.pubsub.unindex_delivery(slot);
-                let d = &mut self.pubsub.deliveries.as_mut_slice()[slot];
-                d.frame = None;
-                d.window = None;
-                if d.certain_never_started {
-                    d.may_have_started = false;
-                }
-                self.pubsub.index_delivery(slot);
+                self.pubsub.mutate_delivery(slot, |d| {
+                    d.frame = None;
+                    d.window = None;
+                    if d.certain_never_started {
+                        d.may_have_started = false;
+                    }
+                });
             }
             Change::MessagesExpired => {
                 let Input::MessagesExpired { deliveries } = input else {
@@ -3951,11 +4156,10 @@ impl Owner {
                 if slot >= self.pubsub.deliveries.len() {
                     return Err(stale);
                 }
-                self.pubsub.unindex_delivery(slot);
-                let d = &mut self.pubsub.deliveries.as_mut_slice()[slot];
-                d.local_write_completed |= complete;
-                d.certain_never_started = false;
-                self.pubsub.index_delivery(slot);
+                self.pubsub.mutate_delivery(slot, |d| {
+                    d.local_write_completed |= complete;
+                    d.certain_never_started = false;
+                });
             }
         }
         Ok(())

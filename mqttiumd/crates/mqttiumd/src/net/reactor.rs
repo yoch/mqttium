@@ -68,8 +68,9 @@ pub(crate) struct Turn {
 pub(crate) trait Driven: Send {
     /// The descriptor whose readiness runs the task.
     fn descriptor(&self) -> RawFd;
-    /// One bounded, non-blocking step. An error is terminal.
-    fn turn(&mut self) -> Result<Turn, &'static str>;
+    /// One bounded, non-blocking step using the reactor thread's reusable
+    /// read scratch buffer. An error is terminal.
+    fn turn(&mut self, scratch: &mut [u8]) -> Result<Turn, &'static str>;
     /// Publishes the terminal facts of the task. Called once, last.
     fn finish(self: Box<Self>, code: &'static str);
 }
@@ -309,6 +310,9 @@ fn run(mut poll: Poll, shared: &Shared) {
     let mut slots: Vec<Option<Entry>> = Vec::new();
     let mut free: Vec<usize> = Vec::new();
     let mut ready: VecDeque<usize> = VecDeque::new();
+    // Single reusable scratch read buffer shared across all tasks on this
+    // reactor thread so idle plain TCP connections hold zero read buffer RAM.
+    let mut scratch = vec![0u8; super::READ_BUFFER].into_boxed_slice();
     let mut waiting = 0usize;
     let mut last_tick = Instant::now();
     loop {
@@ -384,7 +388,7 @@ fn run(mut poll: Poll, shared: &Shared) {
             let mut ended = None;
             for turn in 0..TURNS {
                 // A panic ends one connection, not every task of the thread.
-                let outcome = catch_unwind(AssertUnwindSafe(|| entry.task.turn()))
+                let outcome = catch_unwind(AssertUnwindSafe(|| entry.task.turn(&mut scratch)))
                     .unwrap_or(Err("task_panicked"));
                 match outcome {
                     Ok(done) => {
@@ -490,7 +494,7 @@ mod tests {
         fn descriptor(&self) -> RawFd {
             self.stream.as_raw_fd()
         }
-        fn turn(&mut self) -> Result<Turn, &'static str> {
+        fn turn(&mut self, _scratch: &mut [u8]) -> Result<Turn, &'static str> {
             self.turns.fetch_add(1, Ordering::SeqCst);
             if self.hold.load(Ordering::SeqCst) {
                 return Ok(Turn {

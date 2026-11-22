@@ -13,7 +13,7 @@ const RECORD_BODY: usize = 16 * 1024;
 const MUTANT_TLS_EARLY_STARTED: bool = false;
 
 pub(super) struct Task {
-    pub stream: TcpStream,
+    pub stream: Arc<TcpStream>,
     pub state: ServerConnection,
     pub clock: Arc<dyn SessionClock>,
     pub control: Control,
@@ -131,11 +131,20 @@ impl Encoded {
     }
 }
 
-fn frame_ciphertext(tls: &mut ServerConnection, bytes: &[u8]) -> Result<Vec<u8>, &'static str> {
-    if bytes.is_empty() || bytes.len() > MAX_PACKET_BYTES || tls.wants_write() {
+fn frame_ciphertext(
+    tls: &mut ServerConnection,
+    header: &[u8],
+    payload: Option<&[u8]>,
+) -> Result<Vec<u8>, &'static str> {
+    let payload = payload.unwrap_or(&[]);
+    let total = header
+        .len()
+        .checked_add(payload.len())
+        .ok_or("tls_application_boundary")?;
+    if total == 0 || total > MAX_PACKET_BYTES || tls.wants_write() {
         return Err("tls_application_boundary");
     }
-    let expected = bytes.len() + bytes.len().div_ceil(RECORD_BODY) * RECORD_OVERHEAD;
+    let expected = total + total.div_ceil(RECORD_BODY) * RECORD_OVERHEAD;
     let mut ciphertext = Vec::new();
     ciphertext
         .try_reserve_exact(expected)
@@ -143,13 +152,45 @@ fn frame_ciphertext(tls: &mut ServerConnection, bytes: &[u8]) -> Result<Vec<u8>,
     // Control output was drained. Seal exactly one MQTT frame and verify
     // its ciphertext extent before letting any record near the transport.
     // An unexpected key-update/alert insertion fails closed at this boundary.
-    if tls
-        .writer()
-        .write(bytes)
-        .map_err(|_| "tls_application_encode")?
-        != bytes.len()
-    {
-        return Err("tls_application_buffer");
+    // Pass the frame as one contiguous plaintext slice so rustls emits
+    // ceil(total / RECORD_BODY) records rather than splitting header and payload
+    // into separate AEAD records.
+    if payload.is_empty() {
+        if tls
+            .writer()
+            .write(header)
+            .map_err(|_| "tls_application_encode")?
+            != header.len()
+        {
+            return Err("tls_application_buffer");
+        }
+    } else if total <= 2048 {
+        let mut stack = [0u8; 2048];
+        stack[..header.len()].copy_from_slice(header);
+        stack[header.len()..total].copy_from_slice(payload);
+        if tls
+            .writer()
+            .write(&stack[..total])
+            .map_err(|_| "tls_application_encode")?
+            != total
+        {
+            return Err("tls_application_buffer");
+        }
+    } else {
+        let mut merged = Vec::new();
+        merged
+            .try_reserve_exact(total)
+            .map_err(|_| "allocation_failed")?;
+        merged.extend_from_slice(header);
+        merged.extend_from_slice(payload);
+        if tls
+            .writer()
+            .write(&merged)
+            .map_err(|_| "tls_application_encode")?
+            != total
+        {
+            return Err("tls_application_buffer");
+        }
     }
     let mut sink = BoundedCiphertext {
         bytes: &mut ciphertext,
@@ -157,7 +198,7 @@ fn frame_ciphertext(tls: &mut ServerConnection, bytes: &[u8]) -> Result<Vec<u8>,
     };
     // The default Write::write_vectored accepts only its first nonempty
     // slice. Each pass therefore extracts one record, within this bound.
-    for _ in 0..bytes.len().div_ceil(RECORD_BODY) {
+    for _ in 0..total.div_ceil(RECORD_BODY) {
         if !tls.wants_write() {
             break;
         }
@@ -216,7 +257,7 @@ impl Task {
         self.trace.0.barrier_fields(point, serde_json::json!({"point":point,
             "connection":connection.generation.get().to_string(), "details":{
                 "effect":format!("{}/{}/{}",effect.epoch.get(),effect.owner.get(),effect.sequence.get()),
-                "ciphertext_bytes_sent":sent}}), &self.trace.1, &self.control.cancelled)
+                "ciphertext_bytes_sent":sent}}), &self.trace.1, &self.control.0.cancelled)
             .map_err(|_| "tls_hook_failed")
     }
 
@@ -224,9 +265,10 @@ impl Task {
         if !self.state.wants_read() {
             return Ok(0);
         }
+        let mut reader = &*self.stream;
         match self
             .state
-            .read_tls(&mut (&mut self.stream).take(limit.min(READ_CHUNK) as u64))
+            .read_tls(&mut (&mut reader).take(limit.min(READ_CHUNK) as u64))
         {
             Ok(0) if handshake => Err("tls_handshake_eof"),
             Ok(count) => {
@@ -234,7 +276,8 @@ impl Task {
                 if let Err(error) = self.state.process_new_packets() {
                     // A best-effort fatal alert carries no application data.
                     if handshake {
-                        let _ = self.state.write_tls(&mut self.stream);
+                        let mut writer = &*self.stream;
+                        let _ = self.state.write_tls(&mut writer);
                     }
                     return Err(tls_failure(&error));
                 }
@@ -249,7 +292,8 @@ impl Task {
         if !self.state.wants_write() {
             return Ok(0);
         }
-        match self.state.write_tls(&mut self.stream) {
+        let mut writer = &*self.stream;
+        match self.state.write_tls(&mut writer) {
             Ok(0) => Err("tls_write_zero"),
             Ok(count) => Ok(count),
             Err(error) if retryable(&error) => Ok(0),
@@ -346,22 +390,27 @@ impl Task {
                     return Err(code);
                 }
             }
-        } else if frame.bytes.len() <= RECORD_BODY
+        } else if frame.can_coalesce(RECORD_BODY)
             && let Some(next) = self.lanes.pop_coalesce_candidate()
         {
-            if next.expiry.is_none() && frame.bytes.len() + next.bytes.len() <= RECORD_BODY {
-                batch.push((frame.correlation, frame.bytes.len()));
-                batch.push((next.correlation, next.bytes.len()));
-                frame.bytes.extend_from_slice(&next.bytes);
+            if next.can_coalesce(RECORD_BODY) && frame.total_len() + next.total_len() <= RECORD_BODY
+            {
+                let first_len = frame.total_len();
+                let next_len = next.total_len();
+                batch.push((frame.correlation, first_len));
+                batch.push((next.correlation, next_len));
+                frame.flatten_into_bytes();
+                next.append_to(&mut frame.bytes);
                 frame.correlation = None;
                 while batch.len() < MAX_COALESCE_FRAMES {
                     let Some(more) = self.lanes.pop_coalesce_candidate() else {
                         break;
                     };
-                    if more.expiry.is_none() && frame.bytes.len() + more.bytes.len() <= RECORD_BODY
+                    if more.can_coalesce(RECORD_BODY)
+                        && frame.bytes.len() + more.total_len() <= RECORD_BODY
                     {
-                        batch.push((more.correlation, more.bytes.len()));
-                        frame.bytes.extend_from_slice(&more.bytes);
+                        batch.push((more.correlation, more.total_len()));
+                        more.append_to(&mut frame.bytes);
                     } else {
                         self.lanes.peeked = Some(more);
                         break;
@@ -371,7 +420,11 @@ impl Task {
                 self.lanes.peeked = Some(next);
             }
         }
-        let ciphertext = match frame_ciphertext(&mut self.state, &frame.bytes) {
+        let ciphertext = match frame_ciphertext(
+            &mut self.state,
+            &frame.bytes,
+            frame.payload.as_ref().map(SharedBytes::as_slice),
+        ) {
             Ok(ciphertext) => ciphertext,
             Err(code) => {
                 if batch.is_empty() {
@@ -470,7 +523,7 @@ impl Task {
         } else {
             ciphertext
         };
-        let count = match self.stream.write(ciphertext) {
+        let count = match (&*self.stream).write(ciphertext) {
             Ok(0) => return Err("tls_write_zero"),
             Ok(count) => count,
             Err(error) if retryable(&error) => return Ok(false),
@@ -495,7 +548,7 @@ impl Task {
                 }
                 self.lanes.report(Written::Complete {
                     correlation: encoded.frame.correlation,
-                    bytes: encoded.frame.bytes.len(),
+                    bytes: encoded.frame.total_len(),
                 });
                 *output = None;
             } else {
@@ -596,7 +649,7 @@ impl Driven for Task {
         self.stream.as_raw_fd()
     }
 
-    fn turn(&mut self) -> Result<Turn, &'static str> {
+    fn turn(&mut self, _scratch: &mut [u8]) -> Result<Turn, &'static str> {
         if self.control.is_cancelled() {
             return Err("cancelled");
         }

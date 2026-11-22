@@ -155,7 +155,7 @@ impl ReadBudget {
     /// than widening every page reader.
     pub const COLLECTION: Self = Self {
         max_rows: mqttiumd_contract::receipts::MAX_COLLECTION_ROWS as usize,
-        max_bytes: 12 * 1024 * 1024,
+        max_bytes: 24 * 1024 * 1024,
         max_field_bytes: 2 * 1024 * 1024,
     };
 

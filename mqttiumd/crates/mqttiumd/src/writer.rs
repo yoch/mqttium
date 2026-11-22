@@ -40,6 +40,10 @@ pub enum StorageMode {
     /// SQLite WAL + `synchronous=FULL` (every commit fsynced before reply).
     #[default]
     Durable,
+    /// Log-first durable store: CRC-32C-framed append-only journal (`.mlog`)
+    /// with per-group `fdatasync` before reply + indexed in-memory state +
+    /// periodic and shutdown atomic Schema-14 / Schema-15 SQLite checkpoints.
+    Log,
     /// Indexed in-memory `VolatileStore` with optional periodic atomic SQLite
     /// snapshots. Never implicitly substitutes for `Durable`.
     Volatile {
@@ -53,6 +57,7 @@ impl StorageMode {
     pub const fn mode_name(self) -> &'static str {
         match self {
             Self::Durable => "durable",
+            Self::Log => "log",
             Self::Volatile { .. } => "volatile",
         }
     }
@@ -61,6 +66,7 @@ impl StorageMode {
     pub const fn durability_guarantee(self) -> &'static str {
         match self {
             Self::Durable => "per_commit_fsync_wal_full",
+            Self::Log => "per_commit_fdatasync_append_log",
             Self::Volatile {
                 snapshot_interval: Some(_),
             } => "periodic_atomic_snapshot",
@@ -73,7 +79,7 @@ impl StorageMode {
     #[must_use]
     pub const fn snapshot_interval_secs(self) -> u64 {
         match self {
-            Self::Durable => 0,
+            Self::Durable | Self::Log => 0,
             Self::Volatile { snapshot_interval } => match snapshot_interval {
                 Some(duration) => duration.as_secs(),
                 None => 0,
@@ -85,6 +91,7 @@ impl StorageMode {
 #[allow(clippy::large_enum_variant)]
 enum StoreBackend {
     Durable(SqliteStore),
+    Log(mqttiumd_store_volatile::LogStore),
     Volatile {
         handle: mqttiumd_store_volatile::VolatileHandle,
         snapshot_interval: Option<Duration>,
@@ -97,6 +104,7 @@ impl StoreBackend {
     fn has_will_for_client(&self, client: &[u8]) -> Result<bool, ReadError> {
         match self {
             Self::Durable(s) => s.has_will_for_client(client),
+            Self::Log(s) => s.has_will_for_client(client),
             Self::Volatile { handle, .. } => handle.has_will_for_client(client),
         }
     }
@@ -107,6 +115,7 @@ impl StoreBackend {
     ) -> Result<Vec<mqttiumd_store_api::Applied>, mqttiumd_store_sqlite::GroupRefused> {
         match self {
             Self::Durable(s) => s.apply_group(commands),
+            Self::Log(s) => s.apply_group(commands),
             Self::Volatile { handle, dirty, .. } => {
                 let res = handle.apply_group(commands)?;
                 if res.iter().any(|r| r.wrote) {
@@ -118,37 +127,62 @@ impl StoreBackend {
     }
 
     fn maybe_snapshot(&mut self, events: &Events, force: bool) -> Result<(), Failure> {
-        let Self::Volatile {
-            handle,
-            snapshot_interval: Some(interval),
-            last_snapshot,
-            dirty,
-        } = self
-        else {
-            return Ok(());
-        };
-        if !*dirty || (!force && last_snapshot.elapsed() < *interval) {
-            return Ok(());
-        }
-        match handle.save_snapshot() {
-            Ok(()) => {
-                *last_snapshot = Instant::now();
-                *dirty = false;
-                let _ = events.emit(
-                    "volatile_snapshot_saved",
-                    json!({"details":{"forced":force}}),
-                );
-                Ok(())
+        match self {
+            Self::Durable(_) => Ok(()),
+            Self::Log(store) => {
+                if !force {
+                    return Ok(());
+                }
+                match store.compact() {
+                    Ok(()) => {
+                        let _ =
+                            events.emit("log_checkpoint_saved", json!({"details":{"forced":true}}));
+                        Ok(())
+                    }
+                    Err(error) => {
+                        let read_err = error.read_error();
+                        let _ = events.emit(
+                            "log_checkpoint_failed",
+                            json!({"details":{"cause":read_err.code(),"forced":true}}),
+                        );
+                        Err(Failure::read(read_err, ReadPhase::Snapshot))
+                    }
+                }
             }
-            Err(error) => {
-                *last_snapshot = Instant::now();
-                let read_err = error.read_error();
-                let _ = events.emit(
-                    "volatile_snapshot_failed",
-                    json!({"details":{"cause":read_err.code(),"forced":force}}),
-                );
-                Err(Failure::read(read_err, ReadPhase::Snapshot))
+            Self::Volatile {
+                handle,
+                snapshot_interval: Some(interval),
+                last_snapshot,
+                dirty,
+            } => {
+                if !*dirty || (!force && last_snapshot.elapsed() < *interval) {
+                    return Ok(());
+                }
+                match handle.save_snapshot() {
+                    Ok(()) => {
+                        *last_snapshot = Instant::now();
+                        *dirty = false;
+                        let _ = events.emit(
+                            "volatile_snapshot_saved",
+                            json!({"details":{"forced":force}}),
+                        );
+                        Ok(())
+                    }
+                    Err(error) => {
+                        *last_snapshot = Instant::now();
+                        let read_err = error.read_error();
+                        let _ = events.emit(
+                            "volatile_snapshot_failed",
+                            json!({"details":{"cause":read_err.code(),"forced":force}}),
+                        );
+                        Err(Failure::read(read_err, ReadPhase::Snapshot))
+                    }
+                }
             }
+            Self::Volatile {
+                snapshot_interval: None,
+                ..
+            } => Ok(()),
         }
     }
 
@@ -159,7 +193,7 @@ impl StoreBackend {
     ) -> Result<(), mqttiumd_store_sqlite::OpenError> {
         match self {
             Self::Durable(s) => s.set_kill_hook(hook),
-            Self::Volatile { .. } => Ok(()),
+            Self::Log(_) | Self::Volatile { .. } => Ok(()),
         }
     }
 
@@ -180,6 +214,7 @@ impl DurableStore for StoreBackend {
     ) -> Result<WillPage, ReadError> {
         match self {
             Self::Durable(s) => s.read_wills(after, limit, budget),
+            Self::Log(s) => s.read_wills(after, limit, budget),
             Self::Volatile { handle, .. } => handle.read_wills(after, limit, budget),
         }
     }
@@ -192,6 +227,7 @@ impl DurableStore for StoreBackend {
     ) -> Result<mqttiumd_store_api::MessageExpirySweep, ReadError> {
         match self {
             Self::Durable(s) => s.expire_messages(now, after, limit),
+            Self::Log(s) => s.expire_messages(now, after, limit),
             Self::Volatile { handle, dirty, .. } => {
                 let res = handle.expire_messages(now, after, limit)?;
                 if !res.removed.is_empty() || res.retained_removed > 0 {
@@ -209,6 +245,7 @@ impl DurableStore for StoreBackend {
     ) -> Result<SessionClockAnchor, ReadError> {
         match self {
             Self::Durable(s) => s.checkpoint_session_clock(expected, reading),
+            Self::Log(s) => s.checkpoint_session_clock(expected, reading),
             Self::Volatile { handle, dirty, .. } => {
                 let anchor = handle.checkpoint_session_clock(expected, reading)?;
                 *dirty = true;
@@ -223,6 +260,7 @@ impl DurableStore for StoreBackend {
     ) -> Result<ReceiptCollectionReply, ReadError> {
         match self {
             Self::Durable(s) => s.collect_receipts(collection),
+            Self::Log(s) => s.collect_receipts(collection),
             Self::Volatile { handle, dirty, .. } => {
                 let reply = handle.collect_receipts(collection)?;
                 if matches!(reply, ReceiptCollectionReply::Applied { .. }) {
@@ -239,6 +277,7 @@ impl DurableStore for StoreBackend {
     ) -> Result<Option<mqttiumd_contract::receipts::ReceiptClosure>, ReadError> {
         match self {
             Self::Durable(s) => s.receipt_frontier(origin),
+            Self::Log(s) => s.receipt_frontier(origin),
             Self::Volatile { handle, .. } => handle.receipt_frontier(origin),
         }
     }
@@ -249,6 +288,7 @@ impl DurableStore for StoreBackend {
     ) -> Result<ClosedReceiptReply, ReadError> {
         match self {
             Self::Durable(s) => s.collect_closed_receipts(collection),
+            Self::Log(s) => s.collect_closed_receipts(collection),
             Self::Volatile { handle, dirty, .. } => {
                 let reply = handle.collect_closed_receipts(collection)?;
                 if matches!(reply, ClosedReceiptReply::Applied { .. }) {
@@ -262,6 +302,7 @@ impl DurableStore for StoreBackend {
     fn ledger(&self) -> Result<mqttiumd_contract::command::EpochLedger, ReadError> {
         match self {
             Self::Durable(s) => s.ledger(),
+            Self::Log(s) => s.ledger(),
             Self::Volatile { handle, .. } => handle.ledger(),
         }
     }
@@ -272,6 +313,7 @@ impl DurableStore for StoreBackend {
     ) -> Result<mqttiumd_contract::outcome::OpeningOutcome, ReadError> {
         match self {
             Self::Durable(s) => s.open_epoch(command),
+            Self::Log(s) => s.open_epoch(command),
             Self::Volatile { handle, dirty, .. } => {
                 let res = handle.open_epoch(command)?;
                 *dirty = true;
@@ -286,6 +328,7 @@ impl DurableStore for StoreBackend {
     ) -> mqttiumd_store_api::Applied {
         match self {
             Self::Durable(s) => s.apply(command),
+            Self::Log(s) => s.apply(command),
             Self::Volatile { handle, dirty, .. } => {
                 let res = handle.apply(command);
                 if res.wrote {
@@ -302,6 +345,7 @@ impl DurableStore for StoreBackend {
     ) -> Result<Option<mqttiumd_contract::outcome::StoreOutcome>, ReadError> {
         match self {
             Self::Durable(s) => s.established(operation),
+            Self::Log(s) => s.established(operation),
             Self::Volatile { handle, .. } => handle.established(operation),
         }
     }
@@ -309,6 +353,7 @@ impl DurableStore for StoreBackend {
     fn resolve_and_fence(&mut self, operation: OperationId) -> mqttiumd_store_api::Resolved {
         match self {
             Self::Durable(s) => s.resolve_and_fence(operation),
+            Self::Log(s) => s.resolve_and_fence(operation),
             Self::Volatile { handle, dirty, .. } => {
                 let res = handle.resolve_and_fence(operation);
                 if res.fenced_now {
@@ -325,6 +370,7 @@ impl DurableStore for StoreBackend {
     ) -> Result<AdminDone, mqttiumd_store_api::AdminRefused> {
         match self {
             Self::Durable(s) => s.admin(command),
+            Self::Log(s) => s.admin(command),
             Self::Volatile { handle, dirty, .. } => {
                 let res = handle.admin(command)?;
                 *dirty = true;
@@ -341,6 +387,7 @@ impl DurableStore for StoreBackend {
     ) -> Result<RecoveryPage, RecoveryRefused> {
         match self {
             Self::Durable(s) => s.recover_with_budget(cursor, limit, budget),
+            Self::Log(s) => s.recover_with_budget(cursor, limit, budget),
             Self::Volatile { handle, .. } => handle.recover_with_budget(cursor, limit, budget),
         }
     }
@@ -354,6 +401,7 @@ impl DurableStore for StoreBackend {
     ) -> Result<WorkPage, ReadError> {
         match self {
             Self::Durable(s) => s.read_work_with_budget(session, after, limit, budget),
+            Self::Log(s) => s.read_work_with_budget(session, after, limit, budget),
             Self::Volatile { handle, .. } => {
                 handle.read_work_with_budget(session, after, limit, budget)
             }
@@ -366,6 +414,7 @@ impl DurableStore for StoreBackend {
     ) -> Result<mqttiumd_store_api::DurableState, ReadError> {
         match self {
             Self::Durable(s) => s.snapshot_with_budget(budget),
+            Self::Log(s) => s.snapshot_with_budget(budget),
             Self::Volatile { handle, .. } => handle.snapshot_with_budget(budget),
         }
     }
@@ -738,6 +787,7 @@ impl Writer {
         let handle = thread::Builder::new()
             .name(match storage_mode {
                 StorageMode::Durable => "sqlite-writer".into(),
+                StorageMode::Log => "log-writer".into(),
                 StorageMode::Volatile { .. } => "volatile-writer".into(),
             })
             .spawn(move || -> Result<(), Failure> {
@@ -761,7 +811,13 @@ impl Writer {
                 let mut pending_control = None;
                 // Barriers and one-shot controls of a test run address one
                 // command at a time: no group is formed while they exist.
-                let group = if hooks.directory.is_some() { 1 } else { GROUP };
+                let group = if hooks.directory.is_some() {
+                    1
+                } else if storage_mode == StorageMode::Log {
+                    QUEUE.min(mqttiumd_store_volatile::LOG_MAX_GROUP)
+                } else {
+                    GROUP
+                };
                 let mut stopping = false;
                 let mut stop_result: Result<(), Failure> = Ok(());
                 let mut state = BusinessState::default();
@@ -1959,6 +2015,26 @@ fn bootstrap_bound(
             };
             StoreBackend::Durable(sqlite)
         }
+        StorageMode::Log => {
+            let exists = path
+                .try_exists()
+                .map_err(|e| Failure::read(io_cause(e.kind()), ReadPhase::Open))?;
+            if !exists && require_existing {
+                return Err(Failure::plain("existing_database_missing"));
+            }
+            let mut random = [0u8; 8];
+            getrandom::fill(&mut random).map_err(|_| Failure::plain("random_unavailable"))?;
+            let incarnation = StoreIncarnation::new(u64::from_be_bytes(random).max(1));
+            let log_store = mqttiumd_store_volatile::LogStore::open_or_create(
+                path,
+                incarnation,
+                limits(),
+                policy,
+                require_existing,
+            )
+            .map_err(database_open_error)?;
+            StoreBackend::Log(log_store)
+        }
         StorageMode::Volatile {
             snapshot_interval: None,
         } if !require_existing => {
@@ -2082,6 +2158,7 @@ fn bootstrap_bound(
         state.receipt_frontiers.len() >= 32 || state.accounts.receipt_slots.get() >= 4096;
     let sqlite = match &store {
         StoreBackend::Durable(s) => Some(s.effective_settings().clone()),
+        StoreBackend::Log(s) => s.sqlite_settings().cloned(),
         StoreBackend::Volatile { handle, .. } => handle.sqlite_settings().cloned(),
     };
     Ok((

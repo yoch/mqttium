@@ -57,6 +57,8 @@ const OPS_KINDS: &[&str] = &[
     "counters",
     "expiry_inventory",
     "input_capacity_refused",
+    "log_checkpoint_failed",
+    "log_checkpoint_saved",
     "log_rotated",
     "message_expiry_clock",
     "message_expiry_retry_exhausted",
@@ -161,9 +163,20 @@ impl Events {
     /// Counts one observation that the current level does not write.
     #[inline]
     pub fn tally(&self, kind: &str) {
+        if self.level == Level::Ops
+            && let Some(index) = fast_tally_index(kind)
+        {
+            self.fast_tallies[index].fetch_add(1, Ordering::Relaxed);
+            return;
+        }
         if self.records(kind) {
             return;
         }
+        self.tally_slow(kind);
+    }
+
+    #[cold]
+    fn tally_slow(&self, kind: &str) {
         if let Some(index) = fast_tally_index(kind) {
             self.fast_tallies[index].fetch_add(1, Ordering::Relaxed);
             return;
@@ -270,19 +283,32 @@ impl Events {
             level,
         })
     }
+    #[inline]
     pub fn emit(&self, kind: &str, fields: Value) -> io::Result<()> {
-        if !self.records(kind) {
-            self.tally(kind);
-            return Ok(());
+        if self.level == Level::Ops {
+            if let Some(index) = fast_tally_index(kind) {
+                self.fast_tallies[index].fetch_add(1, Ordering::Relaxed);
+                return Ok(());
+            }
+            if OPS_KINDS.binary_search(&kind).is_err() {
+                self.tally_slow(kind);
+                return Ok(());
+            }
         }
         self.write(kind, fields)
     }
     /// Lazily builds the JSON fields only when `kind` is actually recorded.
     #[inline]
     pub fn emit_with(&self, kind: &str, fields: impl FnOnce() -> Value) -> io::Result<()> {
-        if !self.records(kind) {
-            self.tally(kind);
-            return Ok(());
+        if self.level == Level::Ops {
+            if let Some(index) = fast_tally_index(kind) {
+                self.fast_tallies[index].fetch_add(1, Ordering::Relaxed);
+                return Ok(());
+            }
+            if OPS_KINDS.binary_search(&kind).is_err() {
+                self.tally_slow(kind);
+                return Ok(());
+            }
         }
         self.write(kind, fields())
     }

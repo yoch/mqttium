@@ -827,7 +827,7 @@ pub struct Owner {
     leases: LeaseTable,
     /// The latest operations that ended; see `OwnerConfig`.
     finished: BoundedQueue<Finished>,
-    finished_by_op: BTreeMap<OperationId, Finished>,
+    finished_by_op: BTreeMap<OperationId, (Finished, u32)>,
     /// The latest connections that were closed; see `OwnerConfig`.
     closed: BoundedQueue<ConnectionGeneration>,
     closed_set: BTreeSet<ConnectionGeneration>,
@@ -1148,17 +1148,25 @@ impl Owner {
     fn remember_finished(&mut self, item: Finished) -> Result<(), CoreFault> {
         if self.finished.len() == self.finished.capacity()
             && let Some(evicted) = self.finished.pop_front()
-            && !self
-                .finished
-                .iter()
-                .any(|f| f.operation == evicted.operation)
+            && let Some((_, count)) = self.finished_by_op.get_mut(&evicted.operation)
         {
-            self.finished_by_op.remove(&evicted.operation);
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                self.finished_by_op.remove(&evicted.operation);
+            }
         }
         self.finished
             .try_push_back(item)
             .map_err(|_| CoreFault::ReservationOverrun)?;
-        self.finished_by_op.insert(item.operation, item);
+        match self.finished_by_op.get_mut(&item.operation) {
+            Some((stored, count)) => {
+                *stored = item;
+                *count = count.saturating_add(1);
+            }
+            None => {
+                self.finished_by_op.insert(item.operation, (item, 1));
+            }
+        }
         Ok(())
     }
 
@@ -2831,7 +2839,7 @@ impl Owner {
         let known = self
             .finished_by_op
             .get(&operation)
-            .copied()
+            .map(|(item, _)| *item)
             .or_else(|| self.pubsub.known(operation))
             .or_else(|| {
                 self.slots

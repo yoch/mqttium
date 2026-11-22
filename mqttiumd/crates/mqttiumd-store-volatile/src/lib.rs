@@ -9,6 +9,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod log;
 mod read;
 mod snapshot;
 mod witness;
@@ -63,6 +64,7 @@ use mqttiumd_store_api::{
     SessionClockReading, SessionRecord, SessionState, WillPage, WorkPage,
 };
 
+pub use log::{LOG_MAX_GROUP, LogStore};
 pub use mqttiumd_store_sqlite::{GroupRefused, MAX_GROUP, OpenError, Settings, StoragePolicy};
 pub use snapshot::VolatileHandle;
 
@@ -539,6 +541,28 @@ impl VolatileStore {
             }
             phase => Established::Absent(phase),
         }
+    }
+
+    pub(crate) fn is_command_already_settled(&self, command: &Command) -> bool {
+        let recipe = command.recipe.get();
+        let operation = recipe.operation();
+        match self.established_inner(operation) {
+            Established::Outcome(_) => true,
+            Established::Absent(_) => {
+                !self.receipt_capacity(operation, Some(ReceiptClass::of(recipe)))
+                    || !matches!(
+                        self.will_receipt_capacity(command.recipe.canonical_bytes()),
+                        Ok(true)
+                    )
+            }
+        }
+    }
+
+    pub(crate) fn can_fence(&self, operation: OperationId) -> bool {
+        matches!(self.established_inner(operation), Established::Absent(_))
+            && self.receipt_capacity(operation, None)
+            && check_charge(self.accounts, self.limits, Accounts::RECEIPT).is_ok()
+            && self.revision.checked_add(1).is_some()
     }
 
     fn active_session(&self, session: SessionId, revision: Revision) -> Result<(), RejectReason> {
@@ -2841,12 +2865,7 @@ impl DurableStore for VolatileStore {
         ) {
             return settled(StoreOutcome::RetiredOutcomeUnavailable);
         }
-        let mut canonical = Vec::with_capacity(128);
-        if recipe.encode_canonical(&mut canonical).is_err() {
-            return settled(StoreOutcome::RejectedCertain(
-                RejectReason::PreconditionFailed,
-            ));
-        }
+        let canonical = command.recipe.canonical_bytes();
         if let Some(record) = self.operations.get(&operation) {
             let same_payload = match (recipe, &command.payload, record.decision) {
                 (recipe, Some(bytes), Decision::Committed(_))
@@ -2866,7 +2885,7 @@ impl DurableStore for VolatileStore {
                 }
                 _ => true,
             };
-            if record.recipe != canonical || !same_payload {
+            if record.recipe.as_slice() != canonical || !same_payload {
                 return Applied {
                     reply: StoreReply::Violation(StoreViolation::RecipeMismatch),
                     committed_now: false,
@@ -2881,14 +2900,14 @@ impl DurableStore for VolatileStore {
         if !self.receipt_capacity(operation, Some(ReceiptClass::of(recipe))) {
             return settled(StoreOutcome::PendingOrUnknown);
         }
-        if !matches!(self.will_receipt_capacity(&canonical), Ok(true)) {
+        if !matches!(self.will_receipt_capacity(canonical), Ok(true)) {
             return settled(StoreOutcome::PendingOrUnknown);
         }
         if phase != EpochPhase::Open {
             return rejected(self.commit_rejection(
                 recipe,
                 operation,
-                canonical,
+                canonical.to_vec(),
                 RejectReason::PreconditionFailed,
             ));
         }
@@ -2898,7 +2917,7 @@ impl DurableStore for VolatileStore {
                 return rejected(self.commit_rejection(
                     recipe,
                     operation,
-                    canonical,
+                    canonical.to_vec(),
                     RejectReason::PreconditionFailed,
                 ));
             }
@@ -3066,7 +3085,7 @@ impl DurableStore for VolatileStore {
                 let witness_bounds = witness::bounds(recipe).ok().flatten();
                 self.record_operation(
                     operation,
-                    canonical,
+                    canonical.to_vec(),
                     Decision::Committed(facts),
                     witness_bounds,
                 );
@@ -3078,7 +3097,7 @@ impl DurableStore for VolatileStore {
                 }
             }
             Err(CommitErr::Refused(reason)) => {
-                rejected(self.commit_rejection(recipe, operation, canonical, reason))
+                rejected(self.commit_rejection(recipe, operation, canonical.to_vec(), reason))
             }
             Err(CommitErr::NotWritten) => settled(StoreOutcome::PendingOrUnknown),
         }

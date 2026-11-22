@@ -127,10 +127,13 @@ fn with_runtime_clock_hooks(
         next_session_request: 0,
         generation: ConnectionGeneration::new(0),
         peer_cursor: 0,
+        peer_keys: Vec::new(),
+        last_peer_deadline_scan: Instant::now(),
         inputs: VecDeque::new(),
         control_inputs: VecDeque::new(),
         closing_inputs: VecDeque::new(),
         terminal_inputs: VecDeque::new(),
+        terminal_effects: BTreeMap::new(),
         deferred_inputs: VecDeque::new(),
         effects_awaited: false,
         deferred_retries: 0,
@@ -144,11 +147,15 @@ fn with_runtime_clock_hooks(
         work_reads: BTreeMap::new(),
         pending_work: VecDeque::new(),
         pending_work_set: BTreeSet::new(),
+        queued_work_sessions: BTreeSet::new(),
         cached_bindings: BTreeMap::new(),
         bindings_dirty: true,
         stale_frames_dirty: false,
+        timers_dirty: false,
+        receipt_pressure_blocked: false,
         last_work_scan: Instant::now(),
         last_will_scan: Instant::now(),
+        last_maintenance_flush: Instant::now(),
         maintenance_needed: false,
         #[cfg(feature = "test-hooks")]
         work_cache: BTreeMap::new(),
@@ -2429,6 +2436,7 @@ fn finish_retained_durable_publish(close_before_enqueue: bool) {
                     expiry: None,
                     correlation: None,
                     bytes: vec![0xd0, 0],
+                    payload: None,
                 })
                 .unwrap();
         }
@@ -2637,6 +2645,7 @@ fn a_slow_transport_holds_its_acks_while_an_independent_exchange_progresses() {
                         expiry: None,
                         correlation: None,
                         bytes: vec![0xd0, 0],
+                        payload: None,
                     })
                     .unwrap();
             }
@@ -2979,6 +2988,7 @@ fn a_saturated_four_slot_output_retains_the_committed_puback_until_terminal_fail
                     expiry: None,
                     correlation: None,
                     bytes: vec![0xd0, 0],
+                    payload: None,
                 })
                 .unwrap();
         }
@@ -6359,6 +6369,7 @@ fn blocked_output_and_full_input_preserve_independent_work_and_reconnect_credit(
                         expiry: None,
                         correlation: None,
                         bytes: vec![0xd0, 0],
+                        payload: None,
                     })
                     .unwrap();
             }

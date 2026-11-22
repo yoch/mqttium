@@ -673,7 +673,7 @@ fn charge(meta: &mut Meta, costs: Accounts) -> Guard<()> {
 /// What is already established about an operation, before any guard.
 enum Established {
     Outcome(StoreOutcome),
-    Absent(EpochPhase),
+    Absent,
 }
 
 fn decision_of(row: &rusqlite::Row<'_>, first: usize) -> rusqlite::Result<DecisionColumns> {
@@ -833,7 +833,7 @@ fn established(
         EpochPhase::Closed => {
             Established::Outcome(StoreOutcome::RejectedCertain(RejectReason::EpochClosed))
         }
-        phase => Established::Absent(phase),
+        EpochPhase::Open | EpochPhase::Unopened => Established::Absent,
     })
 }
 
@@ -1498,21 +1498,39 @@ fn recognise(
     caches: &mut StoreCaches,
     delta: &TxDelta,
 ) -> Recognised {
+    let Ok(meta) = read_meta(conn) else {
+        return Recognised::Settled(UNKNOWN);
+    };
+    recognise_with_meta(conn, &meta, command, canonical, caches, delta)
+}
+
+fn recognise_with_meta(
+    conn: &Connection,
+    meta: &Meta,
+    command: &Command,
+    canonical: &[u8],
+    caches: &mut StoreCaches,
+    delta: &TxDelta,
+) -> Recognised {
     let settled = |outcome| Recognised::Settled(answered(outcome, false));
     let unknown = Recognised::Settled(UNKNOWN);
     let recipe = command.recipe.get();
     let operation = recipe.operation();
-    let Ok(meta) = read_meta(conn) else {
+
+    if operation.incarnation() != meta.ledger.incarnation() {
+        return settled(StoreOutcome::RejectedCertain(
+            RejectReason::PreconditionFailed,
+        ));
+    }
+    // Logical retirement wins even while a bounded sweep leaves physical rows.
+    if operation.epoch() <= meta.collected_through && operation.epoch().get() != 0 {
+        return settled(StoreOutcome::RetiredOutcomeUnavailable);
+    }
+    let Ok(frontier) = receipts::frontier(conn, meta, ReceiptOrigin::of(operation)) else {
         return unknown;
     };
-
-    // Logical retirement wins even while a bounded sweep leaves physical rows.
-    match established(conn, &meta, operation) {
-        Ok(Established::Outcome(StoreOutcome::RetiredOutcomeUnavailable)) => {
-            return settled(StoreOutcome::RetiredOutcomeUnavailable);
-        }
-        Err(_) => return unknown,
-        _ => {}
+    if frontier.is_some_and(|closure| operation.sequence() <= closure.through) {
+        return settled(StoreOutcome::RetiredOutcomeUnavailable);
     }
     // 1. Recognise an operation that was already decided.
     let Ok(record) = read_operation(conn, operation) else {
@@ -1552,14 +1570,30 @@ fn recognise(
                 wrote: false,
             });
         }
+        return settled(match record.decision {
+            Decision::Committed(facts) => StoreOutcome::Committed(facts),
+            Decision::Rejected(reason) => StoreOutcome::RejectedCertain(reason),
+        });
     }
-    let phase = match established(conn, &meta, operation) {
-        Ok(Established::Outcome(outcome)) => return settled(outcome),
-        Ok(Established::Absent(phase)) => phase,
+    match fenced(conn, operation) {
+        Ok(true) => return settled(StoreOutcome::RejectedCertain(RejectReason::Fenced)),
+        Ok(false) => {}
         Err(_) => return unknown,
+    }
+    let phase = match meta.ledger.phase_of(operation.epoch()) {
+        EpochPhase::Closed => {
+            return settled(StoreOutcome::RejectedCertain(RejectReason::EpochClosed));
+        }
+        phase => phase,
     };
     if !matches!(
-        receipts::capacity(conn, &meta, operation, Some(ReceiptClass::of(recipe))),
+        receipts::capacity_with_frontier(
+            conn,
+            meta,
+            operation,
+            Some(ReceiptClass::of(recipe)),
+            frontier
+        ),
         Ok(true)
     ) {
         return unknown;
@@ -3214,13 +3248,7 @@ impl DurableStore for SqliteStore {
     fn apply(&mut self, command: &Command) -> Applied {
         let recipe = command.recipe.get();
         let operation = recipe.operation();
-        let mut canonical = Vec::new();
-        if recipe.encode_canonical(&mut canonical).is_err() {
-            return answered(
-                StoreOutcome::RejectedCertain(RejectReason::PreconditionFailed),
-                false,
-            );
-        }
+        let canonical = command.recipe.canonical_bytes();
         if self.caches.get_mut().sync(&self.conn).is_err() {
             self.caches.get_mut().clear();
             return UNKNOWN;
@@ -3229,7 +3257,7 @@ impl DurableStore for SqliteStore {
         let phase = match recognise(
             &self.conn,
             command,
-            &canonical,
+            canonical,
             self.caches.get_mut(),
             &empty_delta,
         ) {
@@ -3240,7 +3268,7 @@ impl DurableStore for SqliteStore {
             let (outcome, wrote) = self.commit_rejection(
                 recipe,
                 operation,
-                &canonical,
+                canonical,
                 RejectReason::PreconditionFailed,
             );
             return answered(outcome, wrote);
@@ -3248,12 +3276,12 @@ impl DurableStore for SqliteStore {
 
         // 2 to 5. Guards, capacities and every row, in one transaction.
         let written = self.transact_cached(|conn, meta, caches, delta| {
-            stage_command(conn, meta, caches, &empty_delta, delta, command, &canonical)
+            stage_command(conn, meta, caches, &empty_delta, delta, command, canonical)
         });
         match written {
             Txn::Committed(facts) => committed(facts),
             Txn::Refused(reason) => {
-                let (outcome, wrote) = self.commit_rejection(recipe, operation, &canonical, reason);
+                let (outcome, wrote) = self.commit_rejection(recipe, operation, canonical, reason);
                 answered(outcome, wrote)
             }
             Txn::ReadFailed(_) | Txn::NotWritten => UNKNOWN,
@@ -3264,7 +3292,7 @@ impl DurableStore for SqliteStore {
         let meta = read_meta(&self.conn).map_err(|fault| fault.read_error())?;
         match established(&self.conn, &meta, operation).map_err(|fault| fault.read_error())? {
             Established::Outcome(outcome) => Ok(Some(outcome)),
-            Established::Absent(_) => Ok(None),
+            Established::Absent => Ok(None),
         }
     }
 
@@ -3278,7 +3306,7 @@ impl DurableStore for SqliteStore {
             // on an absence established in it.
             match established(conn, meta, operation)? {
                 Established::Outcome(outcome) => return Err(Abort::Refused(Some(outcome))),
-                Established::Absent(_) => {}
+                Established::Absent => {}
             }
             if !receipts::capacity(conn, meta, operation, None)? {
                 return Err(Abort::Refused(None));
@@ -3463,7 +3491,7 @@ mod transaction_read_tests {
         static HEALTHY_READS: Cell<u32> = const { Cell::new(0) };
     }
 
-    pub(super) fn take_if_transaction(conn: &Connection) -> Option<ReadError> {
+    pub(crate) fn take_if_transaction(conn: &Connection) -> Option<ReadError> {
         if conn.is_autocommit() || FAILURE.with(|failure| failure.get().is_none()) {
             return None;
         }

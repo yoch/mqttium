@@ -30,7 +30,7 @@ use mqttiumd_store_api::{Applied, Durability, DurableStore};
 
 use crate::{
     Abort, Meta, Recognised, SqliteStore, StoreCaches, TxDelta, Txn, UNKNOWN, answered, committed,
-    read_meta, recognise, stage_command, stage_rejection, write_meta,
+    read_meta, recognise_with_meta, stage_command, stage_rejection, write_meta,
 };
 
 /// The largest number of commands one group holds (ARC-020: batches are
@@ -99,13 +99,18 @@ impl SqliteStore {
             caches.clear();
             return Ok(unknown());
         }
+        let mut cached_meta: Option<Meta> = None;
         let mut group_delta = TxDelta::default();
         let mut replies = Vec::with_capacity(commands.len());
+        let mut any_wrote = false;
         for command in commands {
-            match member(&tx, command, caches, &mut group_delta) {
+            match member(&tx, &mut cached_meta, command, caches, &mut group_delta) {
                 // The engine drops a whole transaction on some errors; a
                 // statement after that would be committed on its own.
-                Ok(applied) if !tx.is_autocommit() => replies.push(applied),
+                Ok(applied) if !tx.is_autocommit() => {
+                    any_wrote |= applied.wrote;
+                    replies.push(applied);
+                }
                 // Dropping the transaction rolls back what is left of it.
                 Ok(_) | Err(Lost) => {
                     caches.clear_receipt_caches();
@@ -113,11 +118,19 @@ impl SqliteStore {
                 }
             }
         }
-        if !replies.iter().any(|applied| applied.wrote) {
+        if !any_wrote {
             // No savepoint was kept: every answer was read from the state
             // that was durable before the group, and there is nothing to
             // commit. Dropping the transaction ends it.
             return Ok(replies);
+        }
+        let Some(meta) = cached_meta.as_ref() else {
+            caches.clear_receipt_caches();
+            return Ok(unknown());
+        };
+        if write_meta(&tx, meta).is_err() {
+            caches.clear_receipt_caches();
+            return Ok(unknown());
         }
         // K1 `store.commit.prepared`: every row of every member written,
         // `COMMIT` not called; the transaction is open.
@@ -139,34 +152,42 @@ impl SqliteStore {
 /// `apply`, with a savepoint where `apply` has a transaction.
 fn member(
     conn: &Connection,
+    cached_meta: &mut Option<Meta>,
     command: &Command,
     caches: &mut StoreCaches,
     group_delta: &mut TxDelta,
 ) -> Result<Applied, Lost> {
+    let meta = match cached_meta {
+        Some(meta) => {
+            #[cfg(test)]
+            if crate::transaction_read_tests::take_if_transaction(conn).is_some() {
+                return Ok(UNKNOWN);
+            }
+            meta
+        }
+        None => match read_meta(conn) {
+            Ok(loaded) => cached_meta.insert(loaded),
+            Err(_) => return Ok(UNKNOWN),
+        },
+    };
     let recipe = command.recipe.get();
     let operation = recipe.operation();
-    let mut canonical = Vec::new();
-    if recipe.encode_canonical(&mut canonical).is_err() {
-        return Ok(answered(
-            StoreOutcome::RejectedCertain(RejectReason::PreconditionFailed),
-            false,
-        ));
-    }
-    let phase = match recognise(conn, command, &canonical, caches, group_delta) {
+    let canonical = command.recipe.canonical_bytes();
+    let phase = match recognise_with_meta(conn, meta, command, canonical, caches, group_delta) {
         Recognised::Settled(applied) => return Ok(applied),
         Recognised::Absent(phase) => phase,
     };
     let reason = if phase == EpochPhase::Open {
-        let staged = savepoint(conn, |conn, meta| {
+        let staged = savepoint(conn, meta, |conn, member_meta| {
             let mut member_delta = TxDelta::default();
             let facts = stage_command(
                 conn,
-                meta,
+                member_meta,
                 caches,
                 group_delta,
                 &mut member_delta,
                 command,
-                &canonical,
+                canonical,
             )?;
             Ok((facts, member_delta))
         })?;
@@ -183,14 +204,14 @@ fn member(
     };
     // The rejection is recorded as `commit_rejection` records it, in a
     // savepoint of its own: without a receipt slot nothing certain is said.
-    let recorded = savepoint(conn, |conn, meta| {
+    let recorded = savepoint(conn, meta, |conn, member_meta| {
         let mut member_delta = TxDelta::default();
         stage_rejection(
             conn,
-            meta,
+            member_meta,
             recipe,
             operation,
-            &canonical,
+            canonical,
             reason,
             &mut member_delta,
         )?;
@@ -206,32 +227,38 @@ fn member(
 }
 
 /// Runs `prepare` in a savepoint of the open transaction, as `transact`
-/// runs it in a transaction: on success `meta` is written one revision
-/// later and the savepoint released into the group; otherwise everything
-/// `prepare` wrote is rolled back and the group goes on without it.
+/// runs it in a transaction: on success `meta` advances one revision in
+/// memory (written once before `COMMIT`) and the savepoint is released into
+/// the group; otherwise everything `prepare` wrote is rolled back and `meta`
+/// stays unchanged.
 /// `Txn::Committed` means staged here: nothing is durable before the
 /// commit of the group.
 fn savepoint<T, E>(
     conn: &Connection,
+    meta: &mut Meta,
     prepare: impl FnOnce(&Connection, &mut Meta) -> Result<T, Abort<E>>,
 ) -> Result<Txn<T, E>, Lost> {
     let run = |sql: &str| conn.execute_batch(sql).map_err(|_| Lost);
     run("SAVEPOINT member")?;
+    let mut member_meta = *meta;
     let staged = (|| {
-        let mut meta = read_meta(conn).map_err(|fault| Some(fault.read_error()))?;
-        let value = match prepare(conn, &mut meta) {
+        #[cfg(test)]
+        if let Some(error) = crate::transaction_read_tests::take_if_transaction(conn) {
+            return Err(Some(error));
+        }
+        let value = match prepare(conn, &mut member_meta) {
             Ok(value) => value,
             Err(Abort::Refused(refusal)) => return Ok(Err(refusal)),
             Err(Abort::Read(error)) => return Err(Some(error)),
             Err(Abort::Fault) => return Err(None),
         };
-        meta.revision = meta.revision.checked_add(1).ok_or(None)?;
-        write_meta(conn, &meta).map_err(|_| None)?;
+        member_meta.revision = member_meta.revision.checked_add(1).ok_or(None)?;
         Ok(Ok(value))
     })();
     let undone = match staged {
         Ok(Ok(value)) => {
             run("RELEASE member")?;
+            *meta = member_meta;
             return Ok(Txn::Committed(value));
         }
         Ok(Err(refusal)) => Txn::Refused(refusal),

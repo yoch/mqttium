@@ -368,10 +368,13 @@ struct Runtime<'a> {
     next_session_request: u64,
     generation: ConnectionGeneration,
     peer_cursor: usize,
+    peer_keys: Vec<ConnectionGeneration>,
+    last_peer_deadline_scan: Instant,
     inputs: VecDeque<Input>,
     control_inputs: VecDeque<Input>,
     closing_inputs: VecDeque<Input>,
     terminal_inputs: VecDeque<Input>,
+    terminal_effects: BTreeMap<EffectId, u32>,
     deferred_inputs: VecDeque<Input>,
     /// A packet waits in `deferred_inputs` for room in the effect box.
     effects_awaited: bool,
@@ -398,11 +401,15 @@ struct Runtime<'a> {
     work_reads: BTreeMap<EffectId, SessionId>,
     pending_work: VecDeque<SessionId>,
     pending_work_set: BTreeSet<SessionId>,
+    queued_work_sessions: BTreeSet<SessionId>,
     cached_bindings: BTreeMap<SessionId, ConnectionGeneration>,
     bindings_dirty: bool,
     stale_frames_dirty: bool,
+    timers_dirty: bool,
+    receipt_pressure_blocked: bool,
     last_work_scan: Instant,
     last_will_scan: Instant,
+    last_maintenance_flush: Instant,
     maintenance_needed: bool,
     #[cfg(feature = "test-hooks")]
     work_cache: BTreeMap<DeliveryId, WorkItem>,
@@ -623,28 +630,30 @@ impl Runtime<'_> {
     /// One keyed wakeup per live detached session, four due inputs per turn.
     /// The periodic work scan and socket controls retain their own budgets.
     fn expire_sessions(&mut self) -> Result<(), Failure> {
-        let now = self.session_now()?;
-        let mut budget = 4;
-        for timer in self.expiry_timers.values_mut() {
-            if budget == 0 {
-                break;
-            }
-            if !timer.queued
-                && timer
-                    .detached
-                    .deadline
-                    .is_some_and(|deadline| now >= deadline)
-            {
-                if self.expiry_inputs.len() >= crate::writer::SESSIONS {
-                    return Err(Failure::plain("expiry_input_budget"));
+        if !self.expiry_timers.is_empty() {
+            let now = self.session_now()?;
+            let mut budget = 4;
+            for timer in self.expiry_timers.values_mut() {
+                if budget == 0 {
+                    break;
                 }
-                self.expiry_inputs.push_back(Input::ExpireSession {
-                    guard: timer.guard,
-                    detached: timer.detached,
-                    now,
-                });
-                timer.queued = true;
-                budget -= 1;
+                if !timer.queued
+                    && timer
+                        .detached
+                        .deadline
+                        .is_some_and(|deadline| now >= deadline)
+                {
+                    if self.expiry_inputs.len() >= crate::writer::SESSIONS {
+                        return Err(Failure::plain("expiry_input_budget"));
+                    }
+                    self.expiry_inputs.push_back(Input::ExpireSession {
+                        guard: timer.guard,
+                        detached: timer.detached,
+                        now,
+                    });
+                    timer.queued = true;
+                    budget -= 1;
+                }
             }
         }
         if !self.expiry_timers.is_empty()
@@ -828,11 +837,17 @@ impl Runtime<'_> {
             return Ok(());
         }
         if Self::terminal_input(&input) {
-            if self.terminal_inputs.iter().any(|queued| queued == &input) {
+            let eid = Self::terminal_effect(&input);
+            if eid.is_some_and(|id| self.terminal_effects.contains_key(&id))
+                && self.terminal_inputs.iter().any(|queued| queued == &input)
+            {
                 return Ok(());
             }
             if self.terminal_inputs.len() >= self.limits.terminal_inputs {
                 return Err(Failure::plain("terminal_input_budget"));
+            }
+            if let Some(id) = eid {
+                *self.terminal_effects.entry(id).or_insert(0) += 1;
             }
             self.terminal_inputs.push_back(input);
             self.session_cardinality_dirty = true;
@@ -859,11 +874,13 @@ impl Runtime<'_> {
             return Ok(());
         }
         if Self::writer_input(&input) {
-            if self.writer_input_count() >= WRITER_INPUTS {
+            if self.inputs.len() >= WRITER_INPUTS && self.writer_input_count() >= WRITER_INPUTS {
                 return Err(Failure::plain("writer_input_budget"));
             }
         } else if matches!(input, Input::Deadline { .. }) {
-            if self.ordinary_deadline_count() >= DEADLINE_INPUTS {
+            if self.inputs.len() >= DEADLINE_INPUTS
+                && self.ordinary_deadline_count() >= DEADLINE_INPUTS
+            {
                 return Err(Failure::plain("deadline_input_budget"));
             }
         } else if self.ordinary_room() == 0 {
@@ -951,6 +968,7 @@ impl Runtime<'_> {
                 expiry: None,
                 correlation: None,
                 bytes,
+                payload: None,
             })
             .is_ok()
         {
@@ -1001,6 +1019,27 @@ impl Runtime<'_> {
             input,
             Input::FrameResult { .. } | Input::Qos0EmitRefused { .. }
         )
+    }
+    #[inline]
+    fn terminal_effect(input: &Input) -> Option<EffectId> {
+        match input {
+            Input::FrameResult { effect, .. } | Input::Qos0EmitRefused { effect, .. } => {
+                Some(*effect)
+            }
+            _ => None,
+        }
+    }
+    fn pop_terminal_input(&mut self) -> Option<Input> {
+        let popped = self.terminal_inputs.pop_front()?;
+        if let Some(id) = Self::terminal_effect(&popped)
+            && let Some(count) = self.terminal_effects.get_mut(&id)
+        {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                self.terminal_effects.remove(&id);
+            }
+        }
+        Some(popped)
     }
     fn closing_input(input: &Input) -> bool {
         matches!(
@@ -1542,6 +1581,7 @@ impl Runtime<'_> {
         self.inputs.retain(
             |input| !matches!(input, Input::WorkAvailable { session } if *session == retired),
         );
+        self.queued_work_sessions.remove(&retired);
         self.deferred_inputs.retain(
             |input| !matches!(input, Input::WorkAvailable { session } if *session == retired),
         );
@@ -1619,7 +1659,7 @@ impl Runtime<'_> {
                 .or_else(|| {
                     if terminal_budget > 0 {
                         terminal_budget -= 1;
-                        self.terminal_inputs.pop_front()
+                        self.pop_terminal_input()
                     } else {
                         None
                     }
@@ -1633,7 +1673,13 @@ impl Runtime<'_> {
                     }
                 })
                 .or_else(|| self.message_expiry_input.take())
-                .or_else(|| self.inputs.pop_front())
+                .or_else(|| {
+                    let popped = self.inputs.pop_front()?;
+                    if let Input::WorkAvailable { session } = &popped {
+                        self.queued_work_sessions.remove(session);
+                    }
+                    Some(popped)
+                })
             else {
                 break;
             };
@@ -1898,25 +1944,85 @@ impl Runtime<'_> {
                             ..
                         }
                 );
-            let may_change_outgoing_bindings = !self.outgoing_bindings.is_empty()
-                && !matches!(
-                    &input,
-                    Input::Packet {
-                        packet: InboundPacket::Publish { .. }
+            let outgoing_binding_prune = if self.outgoing_bindings.is_empty() {
+                OutgoingPrune::None
+            } else {
+                match &input {
+                    Input::ObservedPuback {
+                        connection,
+                        packet_id,
+                        ..
+                    }
+                    | Input::ObservedQos2Ack {
+                        connection,
+                        packet_id,
+                        ..
+                    } => OutgoingPrune::Key((*connection, *packet_id)),
+                    Input::StoreResult {
+                        reply:
+                            StoreReply::Outcome(StoreOutcome::Committed(
+                                CommitFacts::DeliveryFinished {
+                                    target, packet_id, ..
+                                }
+                                | CommitFacts::DeliveryStarted {
+                                    target, packet_id, ..
+                                }
+                                | CommitFacts::DeliveryPubrelReady {
+                                    target, packet_id, ..
+                                }
+                                | CommitFacts::DeliveryExpired {
+                                    target, packet_id, ..
+                                },
+                            )),
+                        ..
+                    } => match self.owner.connection_of(*target) {
+                        Some(generation) => OutgoingPrune::Key((
+                            ConnectionKey {
+                                session: *target,
+                                generation,
+                            },
+                            *packet_id,
+                        )),
+                        None => OutgoingPrune::Full,
+                    },
+                    Input::StoreResult {
+                        reply:
+                            StoreReply::Outcome(StoreOutcome::Committed(
+                                CommitFacts::PublicationAdmitted { .. }
+                                | CommitFacts::RetainedQos0Stored { .. }
+                                | CommitFacts::InboundReleased { .. }
+                                | CommitFacts::SubscriptionsChanged { .. }
+                                | CommitFacts::DeliveryClaimed { .. }
+                                | CommitFacts::DeliveryConsumed { .. }
+                                | CommitFacts::WillPublished { .. },
+                            )),
+                        ..
+                    }
+                    | Input::FrameResult {
+                        progress: FrameProgress::Written { .. } | FrameProgress::Started,
+                        ..
+                    }
+                    | Input::Packet {
+                        packet:
+                            InboundPacket::Publish { .. }
                             | InboundPacket::Subscribe { .. }
                             | InboundPacket::Unsubscribe { .. }
                             | InboundPacket::Pingreq,
                         ..
-                    } | Input::Continue { .. }
-                        | Input::WorkAvailable { .. }
-                        | Input::WorkPage { .. }
-                        | Input::MessageClock { .. }
-                        | Input::MaintainReceipts
-                        | Input::ReceiptsCollected { .. }
-                        | Input::DiscoverWills
-                        | Input::WillPage { .. }
-                        | Input::Qos0EmitRefused { .. }
-                );
+                    }
+                    | Input::Continue { .. }
+                    | Input::WorkAvailable { .. }
+                    | Input::WorkPage { .. }
+                    | Input::MessageClock { .. }
+                    | Input::MaintainReceipts
+                    | Input::ReceiptsCollected { .. }
+                    | Input::DiscoverWills
+                    | Input::WillPage { .. }
+                    | Input::Qos0EmitRefused { .. } => OutgoingPrune::None,
+                    _ => OutgoingPrune::Full,
+                }
+            };
+            let is_receipt_collected = matches!(&input, Input::ReceiptsCollected { .. });
             let may_change_timers = !self.timers.is_empty()
                 && !matches!(
                     &input,
@@ -1930,12 +2036,42 @@ impl Runtime<'_> {
                         ..
                     } | Input::ObservedPuback { .. }
                         | Input::ObservedQos2Ack { .. }
+                        | Input::FrameResult { .. }
                         | Input::Continue { .. }
                         | Input::WorkAvailable { .. }
                         | Input::WorkPage { .. }
                         | Input::MessageClock { .. }
                         | Input::Qos0EmitRefused { .. }
                 );
+            let fast_batch_step = matches!(
+                &input,
+                Input::StoreResult {
+                    reply: StoreReply::Outcome(StoreOutcome::Committed(
+                        CommitFacts::PublicationAdmitted { .. }
+                            | CommitFacts::DeliveryClaimed { .. }
+                            | CommitFacts::DeliveryFinished { .. }
+                            | CommitFacts::DeliveryStarted { .. }
+                            | CommitFacts::DeliveryPubrelReady { .. }
+                            | CommitFacts::InboundReleased { .. },
+                    )),
+                    ..
+                } | Input::WorkAvailable { .. }
+                    | Input::WorkPage { .. }
+                    | Input::ObservedPuback { .. }
+                    | Input::ObservedQos2Ack { .. }
+                    | Input::FrameResult {
+                        progress: FrameProgress::Written { .. } | FrameProgress::Started,
+                        ..
+                    }
+                    | Input::Packet {
+                        packet: InboundPacket::Publish {
+                            qos: mqttiumd_contract::packet::Qos::AtLeastOnce
+                                | mqttiumd_contract::packet::Qos::ExactlyOnce,
+                            ..
+                        } | InboundPacket::Pubrel { .. },
+                        ..
+                    }
+            );
             let work_limit = if is_recovery {
                 WorkUnits::new(u64::MAX)
             } else {
@@ -1945,6 +2081,9 @@ impl Runtime<'_> {
                 StepOutcome::Applied { .. } => {
                     applied = true;
                     self.progress = self.progress.wrapping_add(1);
+                    if is_receipt_collected {
+                        self.receipt_pressure_blocked = false;
+                    }
                     if let Some(peer) = business.and_then(|key| self.peers.get_mut(&key)) {
                         peer.capacity_wait = None;
                     }
@@ -1962,16 +2101,23 @@ impl Runtime<'_> {
                         self.maintenance_needed = true;
                     }
                     if let Some((collection, closure, removed, retained, more)) = collected {
-                        let mut details = crate::writer::collection_details(collection);
-                        crate::writer::returned_closure_details(&mut details, closure);
-                        details["removed"] = json!(removed);
-                        details["retained"] = json!(retained.to_string());
-                        details["more"] = json!(more);
+                        if more
+                            || self.owner.receipt_status().is_some_and(|(_, span, holes)| {
+                                span >= mqttiumd_contract::receipts::RECEIPT_COLLECTION_TRIGGER
+                                    && span > holes
+                            })
+                        {
+                            self.maintenance_needed = true;
+                        }
                         self.events
-                            .emit(
-                                "receipt_collection_applied",
-                                json!({"command_kind":"ReceiptCollection","details":details}),
-                            )
+                            .emit_with("receipt_collection_applied", || {
+                                let mut details = crate::writer::collection_details(collection);
+                                crate::writer::returned_closure_details(&mut details, closure);
+                                details["removed"] = json!(removed);
+                                details["retained"] = json!(retained.to_string());
+                                details["more"] = json!(more);
+                                json!({"command_kind":"ReceiptCollection","details":details})
+                            })
                             .map_err(event_failure)?;
                     }
                     if let Some((id, delivery)) = finish {
@@ -1979,15 +2125,15 @@ impl Runtime<'_> {
                     }
                     if wakes_business || returns_credit {
                         self.credit_progress = Instant::now();
-                    }
-                    if wakes_business || returns_credit {
-                        // What the deferred packets wait for may be there
-                        // now. They are tried again from the oldest, each
-                        // ahead of later bytes of its connection, until one
-                        // still cannot be served. Control packets can still
-                        // pass while a durable routing mutation remains
-                        // unresolved.
-                        self.deferred_retries = self.deferred_inputs.len();
+                        if is_receipt_collected || !self.receipt_pressure_blocked {
+                            // What the deferred packets wait for may be there
+                            // now. They are tried again from the oldest, each
+                            // ahead of later bytes of its connection, until one
+                            // still cannot be served. Control packets can still
+                            // pass while a durable routing mutation remains
+                            // unresolved.
+                            self.deferred_retries = self.deferred_inputs.len();
+                        }
                     }
                 }
                 StepOutcome::NeedCapacity { input, need, .. } => {
@@ -2002,12 +2148,17 @@ impl Runtime<'_> {
                             ) && need.wake == WakeCondition::ResultDelivered =>
                         {
                             if need.resource == Resource::ReceiptSlots {
-                                let (span, holes) = self
-                                    .owner
-                                    .receipt_status()
-                                    .map(|(_, s, h)| (s, h))
-                                    .unwrap_or((0, 0));
-                                self.events.emit("receipt_window_pressure",json!({"details":{"resource":"ReceiptSlots","code":"receipt_window_business_full","span":span,"unconsumed_holes":holes}})).map_err(event_failure)?;
+                                let was_blocked = self.receipt_pressure_blocked;
+                                self.receipt_pressure_blocked = true;
+                                self.maintenance_needed = true;
+                                if !was_blocked && !from_retry {
+                                    let (span, holes) = self
+                                        .owner
+                                        .receipt_status()
+                                        .map(|(_, s, h)| (s, h))
+                                        .unwrap_or((0, 0));
+                                    self.events.emit("receipt_window_pressure",json!({"details":{"resource":"ReceiptSlots","code":"receipt_window_business_full","span":span,"unconsumed_holes":holes}})).map_err(event_failure)?;
+                                }
                             }
                             self.defer(packet, from_retry)
                         }
@@ -2051,7 +2202,10 @@ impl Runtime<'_> {
                             self.close(connection, "input_capacity")?;
                         }
                         other if Self::terminal_input(&other) => {
-                            self.terminal_inputs.push_back(other)
+                            if let Some(id) = Self::terminal_effect(&other) {
+                                *self.terminal_effects.entry(id).or_insert(0) += 1;
+                            }
+                            self.terminal_inputs.push_back(other);
                         }
                         other if Self::closing_input(&other) => {
                             self.closing_inputs.push_back(other)
@@ -2060,7 +2214,12 @@ impl Runtime<'_> {
                         other if self.maintenance_input(&other) => {
                             self.control_inputs.push_back(other)
                         }
-                        other => self.inputs.push_back(other),
+                        other => {
+                            if let Input::WorkAvailable { session } = &other {
+                                self.queued_work_sessions.insert(*session);
+                            }
+                            self.inputs.push_back(other);
+                        }
                     }
                 }
                 StepOutcome::Exhausted { .. } => return Err(Failure::plain("core_exhausted")),
@@ -2079,19 +2238,29 @@ impl Runtime<'_> {
                 if may_change_bindings {
                     self.bindings_dirty = true;
                 }
-                if may_change_outgoing_bindings {
-                    self.prune_outgoing_bindings();
+                match outgoing_binding_prune {
+                    OutgoingPrune::None => {}
+                    OutgoingPrune::Key(key) => self.prune_outgoing_binding_key(key),
+                    OutgoingPrune::Full => self.prune_outgoing_bindings(),
                 }
                 // A terminal result is consumed only after the exact input was
-                // applied. The pure owner, rather than elapsed wall time or a
-                // received reply, decides which deadlines remain meaningful.
+                // applied. Defer the full timer sweep to the end of the pass
+                // (or when `ArmDeadline` nears its cap) to avoid O(N) scans per step.
                 if may_change_timers {
-                    self.timers
-                        .retain(|token, _| self.owner.deadline_is_live(*token));
+                    self.timers_dirty = true;
                 }
             }
             let inputs_before_dispatch = self.inputs.len();
-            self.dispatch()?;
+            let must_dispatch = !applied
+                || !fast_batch_step
+                || cfg!(feature = "test-hooks")
+                || self
+                    .owner
+                    .outbox()
+                    .is_some_and(|box_| box_.len() >= 32 || box_.free_slots() < 16);
+            if must_dispatch {
+                self.dispatch()?;
+            }
             if applied
                 && let Some(operation) = lifecycle_result
                 && !self.owner.lifecycle_operation_is_live(operation)
@@ -2124,6 +2293,12 @@ impl Runtime<'_> {
                     .min(self.limits.drain_steps);
             }
         }
+        if self.timers_dirty {
+            self.timers_dirty = false;
+            self.timers
+                .retain(|token, _| self.owner.deadline_is_live(*token));
+        }
+        self.dispatch()?;
         self.schedule_maintenance();
         let deferred = self.owner.will_status().deferred;
         if deferred != self.last_will_deferred {
@@ -2141,6 +2316,15 @@ impl Runtime<'_> {
         self.emit_session_cardinality()?;
         Ok(())
     }
+    fn prune_outgoing_binding_key(&mut self, key: (ConnectionKey, OutboundPacketId)) {
+        if let Some(&target) = self.outgoing_bindings.get(&key) {
+            let live = self.owner.puback_target(key.0, key.1) == Some(target)
+                || self.owner.qos2_ack_target(key.0, key.1, Qos2Ack::Pubrec) == Some(target);
+            if !live {
+                self.outgoing_bindings.remove(&key);
+            }
+        }
+    }
     fn prune_outgoing_bindings(&mut self) {
         let owner = &self.owner;
         self.outgoing_bindings
@@ -2151,8 +2335,22 @@ impl Runtime<'_> {
             });
     }
     fn schedule_maintenance(&mut self) {
-        if self.maintenance_needed
-            && self.control_inputs.len() < crate::writer::CONTROL_QUEUE
+        if !self.maintenance_needed {
+            return;
+        }
+        // Under high-throughput traffic, let receipts accumulate up to one full
+        // MAX_COLLECTION_ROWS sweep before issuing a control transaction; under
+        // low traffic or idle ticks (20ms), flush promptly at the contract trigger.
+        let urgent = cfg!(any(test, feature = "test-hooks"))
+            || self.receipt_pressure_blocked
+            || self.last_maintenance_flush.elapsed() >= IDLE_TICK
+            || self.owner.receipt_status().is_some_and(|(_, span, _)| {
+                span >= usize::from(mqttiumd_contract::receipts::MAX_COLLECTION_ROWS)
+            });
+        if !urgent {
+            return;
+        }
+        if self.control_inputs.len() < crate::writer::CONTROL_QUEUE
             && !self
                 .control_inputs
                 .iter()
@@ -2160,6 +2358,7 @@ impl Runtime<'_> {
         {
             self.control_inputs.push_back(Input::MaintainReceipts);
             self.maintenance_needed = false;
+            self.last_maintenance_flush = Instant::now();
         }
     }
     fn due_deadlines(&mut self) -> Result<(), Failure> {
@@ -2210,6 +2409,11 @@ impl Runtime<'_> {
         if self.owner.outbox().is_some_and(|box_| box_.is_empty()) {
             return Ok(());
         }
+        if self.timers_dirty && self.timers.len() >= self.limits.timers.saturating_sub(16) {
+            self.timers_dirty = false;
+            self.timers
+                .retain(|token, _| self.owner.deadline_is_live(*token));
+        }
         if self.bindings_dirty {
             self.cached_bindings = self.bindings();
             self.bindings_dirty = false;
@@ -2236,7 +2440,9 @@ impl Runtime<'_> {
             releasing_qos0: false,
             timers: &mut self.timers,
             inputs: &mut self.inputs,
+            queued_work_sessions: &mut self.queued_work_sessions,
             terminal_inputs: &mut self.terminal_inputs,
+            terminal_effects: &mut self.terminal_effects,
             ordinary_reserved: self.deferred_inputs.len() + self.will_connects.len(),
             queued_writer_replies: None,
             frames: &mut self.frames,
@@ -2477,7 +2683,12 @@ impl Runtime<'_> {
             };
             self.apply_control_response(response)?;
         }
-        for _ in 0..WRITER_INPUTS.saturating_sub(self.writer_input_count()) {
+        let writer_budget = if self.inputs.is_empty() {
+            WRITER_INPUTS
+        } else {
+            WRITER_INPUTS.saturating_sub(self.writer_input_count())
+        };
+        for _ in 0..writer_budget {
             let response = match self.writer.receiver.try_recv() {
                 Ok(r) => {
                     self.progress = self.progress.wrapping_add(1);
@@ -2700,11 +2911,7 @@ impl Runtime<'_> {
     }
     fn queue_work_front(&mut self, session: SessionId) {
         if self.ordinary_room() != 0 {
-            if !self
-                .inputs
-                .iter()
-                .any(|i| matches!(i, Input::WorkAvailable { session: s } if *s == session))
-            {
+            if self.queued_work_sessions.insert(session) {
                 self.inputs.push_front(Input::WorkAvailable { session });
             }
         } else if self.pending_work.len() < crate::writer::SESSIONS
@@ -2715,11 +2922,7 @@ impl Runtime<'_> {
     }
     fn queue_work(&mut self, session: SessionId) {
         if self.ordinary_room() != 0 {
-            if !self
-                .inputs
-                .iter()
-                .any(|i| matches!(i,Input::WorkAvailable{session:s} if *s==session))
-            {
+            if self.queued_work_sessions.insert(session) {
                 self.inputs.push_back(Input::WorkAvailable { session });
             }
         } else if self.pending_work.len() < crate::writer::SESSIONS
@@ -2734,11 +2937,7 @@ impl Runtime<'_> {
                 break;
             };
             self.pending_work_set.remove(&session);
-            if !self
-                .inputs
-                .iter()
-                .any(|i| matches!(i, Input::WorkAvailable { session: s } if *s == session))
-            {
+            if self.queued_work_sessions.insert(session) {
                 self.inputs.push_back(Input::WorkAvailable { session });
             }
         }
@@ -2891,6 +3090,7 @@ impl Runtime<'_> {
                     expiry: None,
                     correlation: None,
                     bytes,
+                    payload: None,
                 })
                 .is_ok()
             {
@@ -3012,6 +3212,7 @@ impl Runtime<'_> {
                     .try_send(net::Write {
                         correlation: None,
                         bytes,
+                        payload: None,
                         expiry: None,
                     })
                     .is_ok()
@@ -3057,6 +3258,7 @@ impl Runtime<'_> {
                         expiry: None,
                         correlation: None,
                         bytes,
+                        payload: None,
                     })
                     .is_ok()
             {
@@ -3123,6 +3325,7 @@ impl Runtime<'_> {
                                 expiry: None,
                                 correlation: None,
                                 bytes,
+                                payload: None,
                             })
                             .is_ok()
                     {
@@ -3197,6 +3400,10 @@ impl Runtime<'_> {
                 // This may be older than the reactor's latest clock reading:
                 // channel and pending-CONNECT waits consume message lifetime.
                 let observed = observed.map_err(|error| Failure::plain(error.code()))?;
+                if observed.domain != self.clock_anchor.reading.domain {
+                    return Err(Failure::plain("session_clock_domain_changed"));
+                }
+                let _ = self.session_now()?;
                 let expiry = MessageExpiry { observed, interval };
                 expiry
                     .deadline()
@@ -3222,7 +3429,6 @@ impl Runtime<'_> {
             }
             other => other,
         };
-        let observed_at = self.session_now()?;
         let p = self
             .peers
             .get_mut(&generation)
@@ -3269,6 +3475,7 @@ impl Runtime<'_> {
                                 expiry: None,
                                 correlation: None,
                                 bytes,
+                                payload: None,
                             })
                             .is_ok()
                     {
@@ -3277,6 +3484,11 @@ impl Runtime<'_> {
                     }
                     return self.close(generation, "packet_refused");
                 }
+                let observed_at = self.session_now()?;
+                let p = self
+                    .peers
+                    .get_mut(&generation)
+                    .ok_or_else(|| Failure::plain("generation_missing"))?;
                 p.will_disconnect = Some(publish_will);
                 p.disconnect_expiry = expiry;
                 p.close_observed_at = Some(observed_at);
@@ -3390,6 +3602,7 @@ impl Runtime<'_> {
                                 expiry: None,
                                 correlation: None,
                                 bytes,
+                                payload: None,
                             })
                             .is_ok()
                     {
@@ -3519,235 +3732,273 @@ impl Runtime<'_> {
     }
     fn connections(&mut self) -> Result<(), Failure> {
         self.pump_will_connects()?;
-        let mut keys: Vec<_> = self.peers.keys().copied().collect();
+        let mut keys = std::mem::take(&mut self.peer_keys);
+        keys.clear();
+        keys.extend(self.peers.keys().copied());
         if !keys.is_empty() {
             let start = self.peer_cursor % keys.len();
             keys.rotate_left(start);
             self.peer_cursor = start + 1;
         }
-        for generation in keys {
-            if let Some(code) = self
-                .peers
-                .get(&generation)
-                .and_then(|peer| peer.retire_code)
-            {
-                self.wire_progress(generation)?;
-                self.collect_written(generation)?;
-                self.drain_inputs()?;
-                if !self
-                    .peers
-                    .get(&generation)
-                    .is_some_and(|peer| peer.io.is_finished())
+        let now = Instant::now();
+        let deadline_sweep = now.saturating_duration_since(self.last_peer_deadline_scan)
+            >= Duration::from_millis(100);
+        if deadline_sweep {
+            self.last_peer_deadline_scan = now;
+        }
+        let result = (|| -> Result<(), Failure> {
+            for &generation in &keys {
+                let (active, needs_deadline_check, is_retiring) = match self.peers.get(&generation)
                 {
-                    continue;
-                }
-                // JoinHandle completion makes the producer's final sends visible.
-                self.collect_written(generation)?;
-                self.drain_inputs()?;
-                if self
-                    .terminal_inputs
-                    .iter()
-                    .any(|input| matches!(input, Input::FrameResult {connection,..} | Input::Qos0EmitRefused {connection,..} if connection.generation == generation))
-                {
-                    continue;
-                }
-                self.finish_close(generation, code)?;
-                continue;
-            }
-            let tls = self
-                .peers
-                .get(&generation)
-                .is_some_and(|peer| peer.io.is_tls());
-            let mut tls_close = None;
-            let mut input_ended = false;
-            self.wire_progress(generation)?;
-            let backpressured = self.peers.get_mut(&generation).is_some_and(|peer| {
-                if let Some(effect) = peer.blocked_output
-                    && self.owner.outbox().is_some_and(|outbox| {
-                        outbox.pending().any(|pending| pending.id() == effect)
-                    })
-                {
-                    peer.io.terminal_reason().is_none()
-                } else {
-                    peer.blocked_output = None;
-                    false
-                }
-            });
-            if !backpressured {
-                self.retry_deferred_publish(generation)?;
-            }
-            self.serve_requests(generation)?;
-            for _ in 0..32 {
-                // A CONNECT can use one slot now and reserve one for Open.
-                // Leave the bytes with their socket reader until both fit.
-                if backpressured || self.ordinary_room() < 2 {
-                    break;
-                }
-                let business_waits = self.business_waits(generation);
-                let incoming = match self.peers.get_mut(&generation) {
-                    Some(p)
-                        if p.closing.is_some()
-                            || p.deferred_publish.is_some()
-                            || p.requests.is_some() =>
-                    {
-                        break;
+                    Some(peer) => {
+                        let io_active = peer.io.take_activity();
+                        let state_active = io_active
+                            || peer.retire_code.is_some()
+                            || peer.held_packet.is_some()
+                            || peer.deferred_publish.is_some()
+                            || peer.requests.is_some()
+                            || peer.blocked_output.is_some()
+                            || peer.closing.is_some();
+                        let needs_deadline = deadline_sweep
+                            || peer.closing.is_some()
+                            || peer.pending
+                            || !peer.connected
+                            || peer.capacity_wait.is_some();
+                        (state_active, needs_deadline, peer.retire_code)
                     }
-                    Some(p) if p.pending && p.held_packet.is_some() => break,
-                    Some(p)
-                        if business_waits
-                            && p.held_packet
-                                .as_ref()
-                                .is_some_and(|(first, ..)| business_header(*first)) =>
-                    {
-                        break;
-                    }
-                    Some(p) => match p.held_packet.take() {
-                        Some((first, body, observed)) => Ok(net::Incoming::Packet {
-                            first,
-                            body,
-                            observed,
-                        }),
-                        None => p.io.incoming.try_recv(),
-                    },
-                    None => break,
+                    None => continue,
                 };
-                if incoming.is_ok() {
-                    self.progress = self.progress.wrapping_add(1);
+                if !active && !needs_deadline_check {
+                    continue;
                 }
-                match incoming {
-                    Ok(net::Incoming::Authenticated { elapsed }) => {
-                        self.events.emit("tls_authenticated", json!({"connection":generation.get().to_string(),
-                            "details":{"version":"TLS1.3","handshake_us":elapsed.as_micros() as u64}}))
-                            .map_err(event_failure)?;
-                    }
-                    Ok(net::Incoming::Packet {
-                        first,
-                        body,
-                        observed,
-                    }) => {
-                        if first >> 4 != 14
-                            && self.peers.get(&generation).is_some_and(|p| p.pending)
-                        {
-                            self.peers
-                                .get_mut(&generation)
-                                .expect("checked peer")
-                                .held_packet = Some((first, body, observed));
-                            break;
-                        }
-                        // It was taken from the lane to learn what it is;
-                        // it goes no further for now (record 0046).
-                        if business_waits
-                            && business_header(first)
-                            && let Some(peer) = self.peers.get_mut(&generation)
-                        {
-                            peer.held_packet = Some((first, body, observed));
-                            break;
-                        }
-                        self.packet_at(generation, first, body, observed)?
-                    }
-                    Ok(net::Incoming::Refused { code }) => {
-                        self.header_refused(generation, code)?;
-                        break;
-                    }
-                    Ok(net::Incoming::Closed { code }) => {
-                        if tls {
-                            input_ended = true;
-                            tls_close = Some(code);
-                            break;
-                        }
-                        self.drain_inputs()?;
-                        self.close(generation, code)?;
-                        break;
-                    }
-                    Err(TryRecvError::Empty) => break,
-                    Err(TryRecvError::Disconnected) => {
-                        let code = self
-                            .peers
-                            .get(&generation)
-                            .and_then(|p| p.io.terminal_reason())
-                            .unwrap_or("reader_closed");
-                        if tls {
-                            input_ended = true;
-                            tls_close = Some(code);
-                            break;
-                        }
-                        self.drain_inputs()?;
-                        self.close(generation, code)?;
-                        break;
-                    }
-                }
-            }
-            if let Some(code) = self.collect_written(generation)? {
-                if tls {
-                    tls_close.get_or_insert(code);
-                } else {
-                    self.close(generation, code)?;
-                }
-            }
-            // A TLS write terminal can precede a decoded normal DISCONNECT.
-            // Defer this close until the ordered input terminal. Keep running
-            // connection deadlines while earlier input is held behind Open.
-            if let Some(code) = tls_close
-                && (input_ended
-                    || self
+                if let Some(code) = is_retiring {
+                    self.wire_progress(generation)?;
+                    self.collect_written(generation)?;
+                    self.drain_inputs()?;
+                    if !self
                         .peers
                         .get(&generation)
-                        .is_some_and(|peer| peer.closing.is_some()))
-            {
-                // The two queue observations may race even though they come
-                // from one TLS task. Apply the frame facts while the exact
-                // generation still owns its exchange.
-                self.drain_inputs()?;
-                if let Some(peer) = self.peers.get_mut(&generation)
-                    && self.terminal_inputs.iter().any(|input| matches!(input,
-                        Input::FrameResult { connection, .. } | Input::Qos0EmitRefused { connection, .. }
-                            if connection.generation == generation))
-                {
-                    let (_, since) = peer.closing.get_or_insert((code, Instant::now()));
-                    if since.elapsed() < Duration::from_millis(300) {
+                        .is_some_and(|peer| peer.io.is_finished())
+                    {
                         continue;
                     }
+                    // JoinHandle completion makes the producer's final sends visible.
+                    self.collect_written(generation)?;
+                    self.drain_inputs()?;
+                    if self
+                        .terminal_inputs
+                        .iter()
+                        .any(|input| matches!(input, Input::FrameResult {connection,..} | Input::Qos0EmitRefused {connection,..} if connection.generation == generation))
+                    {
+                        continue;
+                    }
+                    self.finish_close(generation, code)?;
+                    continue;
                 }
-                self.close(generation, code)?;
-            }
-            if let Some(p) = self.peers.get(&generation) {
-                let expired = if let Some((code, since)) = p.closing
-                    && since.elapsed() > Duration::from_millis(300)
-                {
-                    Some(code)
-                } else if (p.pending || !p.connected)
-                    && p.created.elapsed() > Duration::from_secs(3)
-                {
-                    Some("connect_deadline")
-                } else if p
-                    .capacity_wait
-                    .is_some_and(|since| since.max(self.credit_progress).elapsed() > CAPACITY_WAIT)
-                {
-                    Some("input_capacity")
-                } else if p.keep_alive != 0
-                    // The clock runs from the last complete packet the
-                    // transport received, taken by the core or not: a peer
-                    // the broker keeps hearing is not silent, a packet the
-                    // broker holds does not stop the clock, and taking an
-                    // old packet does not restart it. The time the core
-                    // took a packet stands in only for a transport that
-                    // has reported no reception.
-                    && p
-                        .io
-                        .last_heard()
-                        .unwrap_or(p.last_packet)
-                        .elapsed()
-                        > Duration::from_millis(u64::from(p.keep_alive) * 1500)
-                {
-                    Some("keep_alive")
-                } else {
-                    None
-                };
-                if let Some(code) = expired {
-                    self.close(generation, code)?;
+                if active {
+                    let tls = self
+                        .peers
+                        .get(&generation)
+                        .is_some_and(|peer| peer.io.is_tls());
+                    let mut tls_close = None;
+                    let mut input_ended = false;
+                    self.wire_progress(generation)?;
+                    let backpressured = self.peers.get_mut(&generation).is_some_and(|peer| {
+                        if let Some(effect) = peer.blocked_output
+                            && self.owner.outbox().is_some_and(|outbox| {
+                                outbox.pending().any(|pending| pending.id() == effect)
+                            })
+                        {
+                            peer.io.terminal_reason().is_none()
+                        } else {
+                            peer.blocked_output = None;
+                            false
+                        }
+                    });
+                    if !backpressured {
+                        self.retry_deferred_publish(generation)?;
+                    }
+                    self.serve_requests(generation)?;
+                    let mut drained_incoming = false;
+                    for _ in 0..32 {
+                        // A CONNECT can use one slot now and reserve one for Open.
+                        // Leave the bytes with their socket reader until both fit.
+                        if backpressured || self.ordinary_room() < 2 {
+                            break;
+                        }
+                        let business_waits = self.business_waits(generation);
+                        let incoming = match self.peers.get_mut(&generation) {
+                            Some(p)
+                                if p.closing.is_some()
+                                    || p.deferred_publish.is_some()
+                                    || p.requests.is_some() =>
+                            {
+                                break;
+                            }
+                            Some(p) if p.pending && p.held_packet.is_some() => break,
+                            Some(p)
+                                if business_waits
+                                    && p.held_packet
+                                        .as_ref()
+                                        .is_some_and(|(first, ..)| business_header(*first)) =>
+                            {
+                                break;
+                            }
+                            Some(p) => match p.held_packet.take() {
+                                Some((first, body, observed)) => Ok(net::Incoming::Packet {
+                                    first,
+                                    body,
+                                    observed,
+                                }),
+                                None => p.io.incoming.try_recv(),
+                            },
+                            None => break,
+                        };
+                        if incoming.is_ok() {
+                            self.progress = self.progress.wrapping_add(1);
+                        }
+                        match incoming {
+                            Ok(net::Incoming::Authenticated { elapsed }) => {
+                                self.events.emit("tls_authenticated", json!({"connection":generation.get().to_string(),
+                                    "details":{"version":"TLS1.3","handshake_us":elapsed.as_micros() as u64}}))
+                                    .map_err(event_failure)?;
+                            }
+                            Ok(net::Incoming::Packet {
+                                first,
+                                body,
+                                observed,
+                            }) => {
+                                if first >> 4 != 14
+                                    && self.peers.get(&generation).is_some_and(|p| p.pending)
+                                {
+                                    self.peers
+                                        .get_mut(&generation)
+                                        .expect("checked peer")
+                                        .held_packet = Some((first, body, observed));
+                                    break;
+                                }
+                                // It was taken from the lane to learn what it is;
+                                // it goes no further for now (record 0046).
+                                if business_waits
+                                    && business_header(first)
+                                    && let Some(peer) = self.peers.get_mut(&generation)
+                                {
+                                    peer.held_packet = Some((first, body, observed));
+                                    break;
+                                }
+                                self.packet_at(generation, first, body, observed)?
+                            }
+                            Ok(net::Incoming::Refused { code }) => {
+                                self.header_refused(generation, code)?;
+                                break;
+                            }
+                            Ok(net::Incoming::Closed { code }) => {
+                                if tls {
+                                    input_ended = true;
+                                    tls_close = Some(code);
+                                    break;
+                                }
+                                self.drain_inputs()?;
+                                self.close(generation, code)?;
+                                break;
+                            }
+                            Err(TryRecvError::Empty) => {
+                                drained_incoming = true;
+                                break;
+                            }
+                            Err(TryRecvError::Disconnected) => {
+                                drained_incoming = true;
+                                let code = self
+                                    .peers
+                                    .get(&generation)
+                                    .and_then(|p| p.io.terminal_reason())
+                                    .unwrap_or("reader_closed");
+                                if tls {
+                                    input_ended = true;
+                                    tls_close = Some(code);
+                                    break;
+                                }
+                                self.drain_inputs()?;
+                                self.close(generation, code)?;
+                                break;
+                            }
+                        }
+                    }
+                    if !drained_incoming && let Some(peer) = self.peers.get(&generation) {
+                        peer.io.mark_activity();
+                    }
+                    if let Some(code) = self.collect_written(generation)? {
+                        if tls {
+                            tls_close.get_or_insert(code);
+                        } else {
+                            self.close(generation, code)?;
+                        }
+                    }
+                    // A TLS write terminal can precede a decoded normal DISCONNECT.
+                    // Defer this close until the ordered input terminal. Keep running
+                    // connection deadlines while earlier input is held behind Open.
+                    if let Some(code) = tls_close
+                        && (input_ended
+                            || self
+                                .peers
+                                .get(&generation)
+                                .is_some_and(|peer| peer.closing.is_some()))
+                    {
+                        // The two queue observations may race even though they come
+                        // from one TLS task. Apply the frame facts while the exact
+                        // generation still owns its exchange.
+                        self.drain_inputs()?;
+                        if let Some(peer) = self.peers.get_mut(&generation)
+                            && self.terminal_inputs.iter().any(|input| matches!(input,
+                                Input::FrameResult { connection, .. } | Input::Qos0EmitRefused { connection, .. }
+                                    if connection.generation == generation))
+                        {
+                            let (_, since) = peer.closing.get_or_insert((code, now));
+                            if now.saturating_duration_since(*since) < Duration::from_millis(300) {
+                                continue;
+                            }
+                        }
+                        self.close(generation, code)?;
+                    }
+                }
+                if needs_deadline_check && let Some(p) = self.peers.get(&generation) {
+                    let expired = if let Some((code, since)) = p.closing
+                        && now.saturating_duration_since(since) > Duration::from_millis(300)
+                    {
+                        Some(code)
+                    } else if (p.pending || !p.connected)
+                        && now.saturating_duration_since(p.created) > Duration::from_secs(3)
+                    {
+                        Some("connect_deadline")
+                    } else if p.capacity_wait.is_some_and(|since| {
+                        now.saturating_duration_since(since.max(self.credit_progress))
+                            > CAPACITY_WAIT
+                    }) {
+                        Some("input_capacity")
+                    } else if p.keep_alive != 0
+                        // The clock runs from the last complete packet the
+                        // transport received, taken by the core or not: a peer
+                        // the broker keeps hearing is not silent, a packet the
+                        // broker holds does not stop the clock, and taking an
+                        // old packet does not restart it. The time the core
+                        // took a packet stands in only for a transport that
+                        // has reported no reception.
+                        && now.saturating_duration_since(p.io.last_heard().unwrap_or(p.last_packet))
+                            > Duration::from_millis(u64::from(p.keep_alive) * 1500)
+                    {
+                        Some("keep_alive")
+                    } else {
+                        None
+                    };
+                    if let Some(code) = expired {
+                        self.close(generation, code)?;
+                    }
                 }
             }
-        }
+            Ok(())
+        })();
+        self.peer_keys = keys;
+        result?;
         // Accepted frames whose socket closed still receive terminal failure; commits are separate.
         if self.stale_frames_dirty {
             self.stale_frames_dirty = false;
@@ -4328,6 +4579,12 @@ struct HeldEmission {
     since: Instant,
     released: bool,
 }
+enum OutgoingPrune {
+    None,
+    Key((ConnectionKey, OutboundPacketId)),
+    Full,
+}
+
 struct Sink<'a> {
     writer: &'a Writer,
     peers: &'a mut BTreeMap<ConnectionGeneration, Peer>,
@@ -4349,7 +4606,9 @@ struct Sink<'a> {
     releasing_qos0: bool,
     timers: &'a mut BTreeMap<DeadlineToken, Instant>,
     inputs: &'a mut VecDeque<Input>,
+    queued_work_sessions: &'a mut BTreeSet<SessionId>,
     terminal_inputs: &'a mut VecDeque<Input>,
+    terminal_effects: &'a mut BTreeMap<EffectId, u32>,
     ordinary_reserved: usize,
     queued_writer_replies: Option<usize>,
     frames: &'a mut BTreeMap<EffectId, PendingFrame>,
@@ -4360,18 +4619,26 @@ struct Sink<'a> {
     error: Option<Failure>,
 }
 impl Sink<'_> {
+    fn push_terminal(&mut self, input: Input) {
+        if let Some(id) = Runtime::terminal_effect(&input) {
+            *self.terminal_effects.entry(id).or_insert(0) += 1;
+        }
+        self.terminal_inputs.push_back(input);
+    }
+
     fn writer_reply_room(&mut self) -> bool {
+        let pending =
+            self.inflight.len() + self.work_reads.len() + usize::from(self.will_reads.is_some());
+        if self.inputs.len() + pending < WRITER_INPUTS {
+            return true;
+        }
         let queued = *self.queued_writer_replies.get_or_insert_with(|| {
             self.inputs
                 .iter()
                 .filter(|input| Runtime::writer_input(input))
                 .count()
         });
-        queued
-            + self.inflight.len()
-            + self.work_reads.len()
-            + usize::from(self.will_reads.is_some())
-            < WRITER_INPUTS
+        queued + pending < WRITER_INPUTS
     }
 }
 impl Sink<'_> {
@@ -4513,6 +4780,7 @@ impl EffectSink for Sink<'_> {
                                 expiry: None,
                                 correlation: None,
                                 bytes,
+                                payload: None,
                             })
                             .is_ok()
                     {
@@ -4609,7 +4877,7 @@ impl EffectSink for Sink<'_> {
                         && self.bindings.get(&connection.session) == Some(&generation)
                 }) {
                     let version = peer.version.unwrap_or_default();
-                    match codec::encode_qos0_with_properties(
+                    match codec::encode_qos0_segments(
                         version,
                         topic,
                         payload,
@@ -4618,34 +4886,35 @@ impl EffectSink for Sink<'_> {
                         expiry.map(|value| value.interval),
                         properties.as_deref(),
                     ) {
-                        Ok(encoded) if encoded.bytes.len() <= peer.max_packet => {
+                        Ok(encoded) if encoded.total_len <= peer.max_packet => {
                             let write_expiry = expiry.map(|expiry| net::WriteExpiry {
                                 expiry,
                                 value_offset: encoded.expiry_value_offset,
                                 started: false,
                             });
-                            let bytes = encoded.bytes;
                             #[cfg(feature = "test-hooks")]
                             let duplicate = if MUTANT_REPLAY_QOS0
                                 && matches!(origin, Qos0Origin::Consumed { .. })
                             {
-                                Some(bytes.clone())
+                                Some((encoded.header.clone(), encoded.payload.clone()))
                             } else {
                                 None
                             };
                             let result = peer.io.outgoing.try_send(net::Write {
                                 expiry: write_expiry,
                                 correlation: Some((id, connection)),
-                                bytes,
+                                bytes: encoded.header,
+                                payload: encoded.payload,
                             });
                             #[cfg(feature = "test-hooks")]
                             if result.is_ok()
-                                && let Some(bytes) = duplicate
+                                && let Some((bytes, payload)) = duplicate
                             {
                                 let _ = peer.io.outgoing.try_send(net::Write {
                                     expiry: None,
                                     correlation: None,
                                     bytes,
+                                    payload,
                                 });
                             }
                             match result {
@@ -4677,7 +4946,7 @@ impl EffectSink for Sink<'_> {
                         );
                         if self.events.emit_with("frame_queued",||json!({"connection":generation.get().to_string(),"details":{"packet_kind":"PUBLISH","qos":0,"origin":qos0_origin(origin),"effect":effect_text(id)}})).is_err(){self.error=Some(Failure::plain("events_unavailable"));}
                     }
-                    Err(reason) => self.terminal_inputs.push_back(Input::Qos0EmitRefused {
+                    Err(reason) => self.push_terminal(Input::Qos0EmitRefused {
                         effect: id,
                         connection,
                         reason,
@@ -4736,6 +5005,7 @@ impl EffectSink for Sink<'_> {
                         expiry: None,
                         correlation: None,
                         bytes,
+                        payload: None,
                     });
                 }
                 #[cfg(feature = "test-hooks")]
@@ -4770,6 +5040,7 @@ impl EffectSink for Sink<'_> {
                         expiry: None,
                         correlation: None,
                         bytes,
+                        payload: None,
                     });
                 }
                 #[cfg(feature = "test-hooks")]
@@ -4791,6 +5062,7 @@ impl EffectSink for Sink<'_> {
                             reason: mqttiumd_contract::packet::AckReason::Success,
                         })
                         .unwrap_or_default(),
+                        payload: None,
                     });
                 }
                 #[cfg(feature = "test-hooks")]
@@ -4812,6 +5084,7 @@ impl EffectSink for Sink<'_> {
                             reason: mqttiumd_contract::packet::PubackReason::Success,
                         })
                         .unwrap_or_default(),
+                        payload: None,
                     });
                 }
                 match self.writer.sender.try_send(Request::Effect(effect)) {
@@ -4933,7 +5206,7 @@ impl EffectSink for Sink<'_> {
                 }) else {
                     let _ = effect.into_parts();
                     if self.events.emit("frame_failed",json!({"connection":generation.get().to_string(),"details":{"effect":effect_text(id),"packet_kind":kind,"code":"unusable_generation"}})).is_err(){self.error=Some(Failure::plain("events_unavailable"));}
-                    self.terminal_inputs.push_back(Input::FrameResult {
+                    self.push_terminal(Input::FrameResult {
                         effect: id,
                         connection,
                         progress: FrameProgress::Failed,
@@ -4961,7 +5234,7 @@ impl EffectSink for Sink<'_> {
                         .extend_from_slice(codec::filter_ack_codes(version, &bytes));
                     requests.awaiting = false;
                     let _ = effect.into_parts();
-                    self.terminal_inputs.push_back(Input::FrameResult {
+                    self.push_terminal(Input::FrameResult {
                         effect: id,
                         connection,
                         progress: FrameProgress::Written {
@@ -5000,6 +5273,7 @@ impl EffectSink for Sink<'_> {
                     expiry: None,
                     correlation: Some((id, connection)),
                     bytes,
+                    payload: None,
                 }) {
                     Ok(()) => {
                         if let Some((key, target)) = binding {
@@ -5013,8 +5287,10 @@ impl EffectSink for Sink<'_> {
                             // CONNACK enters the bounded writer queue. The
                             // earlier cache-install fence deliberately kept
                             // this destination ineligible for discovery.
-                            if !self.inputs.iter().any(|input| matches!(input, Input::WorkAvailable { session } if *session == connection.session)) {
-                                self.inputs.push_back(Input::WorkAvailable { session: connection.session });
+                            if self.queued_work_sessions.insert(connection.session) {
+                                self.inputs.push_back(Input::WorkAvailable {
+                                    session: connection.session,
+                                });
                             }
                         }
                         self.frames.insert(
@@ -5067,6 +5343,7 @@ impl EffectSink for Sink<'_> {
                                     expiry: None,
                                     correlation: None,
                                     bytes,
+                                    payload: None,
                                 })
                                 .is_ok()
                         {
@@ -5248,7 +5525,7 @@ impl EffectSink for Sink<'_> {
                     {
                         self.error = Some(Failure::plain("events_unavailable"));
                     }
-                    self.terminal_inputs.push_back(Input::FrameResult {
+                    self.push_terminal(Input::FrameResult {
                         effect: id,
                         connection,
                         progress: FrameProgress::Failed,
@@ -5258,7 +5535,7 @@ impl EffectSink for Sink<'_> {
                 let version = peer.version.unwrap_or_default();
                 let retain =
                     retain && (version == Version::V5 || *cause == DeliveryCause::RetainedReplay);
-                let encoded = match codec::encode_delivery_with_properties(
+                let encoded = match codec::encode_delivery_segments(
                     version,
                     (packet_id, *qos),
                     topic,
@@ -5268,7 +5545,7 @@ impl EffectSink for Sink<'_> {
                     expiry.map(|value| value.interval),
                     properties.as_deref(),
                 ) {
-                    Ok(encoded) if encoded.bytes.len() <= peer.max_packet => encoded,
+                    Ok(encoded) if encoded.total_len <= peer.max_packet => encoded,
                     _ => {
                         self.close.push((generation, "outgoing_packet_limit"));
                         return refused(effect, SubmitBlock::Closed);
@@ -5279,7 +5556,6 @@ impl EffectSink for Sink<'_> {
                     value_offset: encoded.expiry_value_offset,
                     started: *started,
                 });
-                let bytes = encoded.bytes;
                 let binding_key = (connection, packet_id);
                 let binding = PubackTarget {
                     delivery,
@@ -5299,7 +5575,8 @@ impl EffectSink for Sink<'_> {
                 match peer.io.outgoing.try_send(net::Write {
                     expiry: write_expiry,
                     correlation: Some((id, connection)),
-                    bytes,
+                    bytes: encoded.header,
+                    payload: encoded.payload,
                 }) {
                     Ok(()) => {
                         self.frames.insert(
@@ -5555,6 +5832,7 @@ fn paths_collide_with_db(events: &std::path::Path, db: &std::path::Path) -> bool
         db_norm.clone(),
         path_with_suffix(&db_norm, "-wal"),
         path_with_suffix(&db_norm, "-shm"),
+        path_with_suffix(&db_norm, ".mlog"),
         path_with_suffix(&db_norm, ".writer-lock"),
     ];
     db_paths.iter().any(|p| *p == ev || *p == ev_prev)
@@ -5564,6 +5842,7 @@ pub fn run(config: Config) -> Result<(), Failure> {
     let disk_db_active = matches!(
         config.storage_mode,
         crate::writer::StorageMode::Durable
+            | crate::writer::StorageMode::Log
             | crate::writer::StorageMode::Volatile {
                 snapshot_interval: Some(_),
             }
@@ -5840,10 +6119,13 @@ fn run_inner(
         next_session_request: 0,
         generation: ConnectionGeneration::new(0),
         peer_cursor: 0,
+        peer_keys: Vec::new(),
+        last_peer_deadline_scan: Instant::now(),
         inputs: VecDeque::new(),
         control_inputs: VecDeque::new(),
         closing_inputs: VecDeque::new(),
         terminal_inputs: VecDeque::new(),
+        terminal_effects: BTreeMap::new(),
         deferred_inputs: VecDeque::new(),
         effects_awaited: false,
         deferred_retries: 0,
@@ -5857,11 +6139,15 @@ fn run_inner(
         work_reads: BTreeMap::new(),
         pending_work: VecDeque::new(),
         pending_work_set: BTreeSet::new(),
+        queued_work_sessions: BTreeSet::new(),
         cached_bindings: BTreeMap::new(),
         bindings_dirty: true,
         stale_frames_dirty: false,
+        timers_dirty: false,
+        receipt_pressure_blocked: false,
         last_work_scan: Instant::now(),
         last_will_scan: Instant::now(),
+        last_maintenance_flush: Instant::now(),
         maintenance_needed: false,
         #[cfg(feature = "test-hooks")]
         work_cache: BTreeMap::new(),
@@ -6091,6 +6377,12 @@ fn run_inner(
         match storage_mode {
             crate::writer::StorageMode::Durable => {
                 println!("mqttiumd ready {address} ({profile})");
+            }
+            crate::writer::StorageMode::Log => {
+                println!(
+                    "mqttiumd ready {address} ({profile}, storage=log, durability={})",
+                    storage_mode.durability_guarantee()
+                );
             }
             crate::writer::StorageMode::Volatile { .. } => {
                 println!(

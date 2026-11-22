@@ -221,7 +221,7 @@ fn parse_arguments(args_iter: impl Iterator<Item = String>) -> Result<Config, St
 
     let storage_mode = if let Some(mode) = storage_mode_from_file {
         match (mode, snapshot_interval_secs) {
-            (StorageMode::Durable, Some(_)) => {
+            (StorageMode::Durable | StorageMode::Log, Some(_)) => {
                 return Err("--snapshot-interval requires --storage-mode volatile".to_owned());
             }
             (StorageMode::Volatile { .. }, Some(0)) => StorageMode::Volatile {
@@ -240,6 +240,12 @@ fn parse_arguments(args_iter: impl Iterator<Item = String>) -> Result<Config, St
                 }
                 StorageMode::Durable
             }
+            Some("log") => {
+                if snapshot_interval_secs.is_some() {
+                    return Err("--snapshot-interval requires --storage-mode volatile".to_owned());
+                }
+                StorageMode::Log
+            }
             Some("volatile") => {
                 let snapshot_interval = match snapshot_interval_secs {
                     None | Some(0) => None,
@@ -248,7 +254,7 @@ fn parse_arguments(args_iter: impl Iterator<Item = String>) -> Result<Config, St
                 StorageMode::Volatile { snapshot_interval }
             }
             Some(_) => {
-                return Err("invalid storage mode (expected durable or volatile)".to_owned());
+                return Err("invalid storage mode (expected durable, log, or volatile)".to_owned());
             }
         }
     };
@@ -263,6 +269,7 @@ fn parse_arguments(args_iter: impl Iterator<Item = String>) -> Result<Config, St
     let needs_db = matches!(
         storage_mode,
         StorageMode::Durable
+            | StorageMode::Log
             | StorageMode::Volatile {
                 snapshot_interval: Some(_),
             }
@@ -370,7 +377,7 @@ fn main() {
         Ok(c) => c,
         Err(e) => {
             eprintln!(
-                "mqttiumd: {e}\nusage: mqttiumd [-c CONFIG_PATH] (--db PATH | --existing-db PATH) --listen ADDRESS --events NEW_JSONL_PATH [--storage-mode durable|volatile] [--snapshot-interval SECS] [--io-threads N] [--max-connections N] [--event-level audit|ops] [--tls-cert PATH --tls-key PATH --client-ca PATH --identities PATH]"
+                "mqttiumd: {e}\nusage: mqttiumd [-c CONFIG_PATH] (--db PATH | --existing-db PATH) --listen ADDRESS --events NEW_JSONL_PATH [--storage-mode durable|log|volatile] [--snapshot-interval SECS] [--io-threads N] [--max-connections N] [--event-level audit|ops] [--tls-cert PATH --tls-key PATH --client-ca PATH --identities PATH]"
             );
             std::process::exit(2);
         }
@@ -496,6 +503,22 @@ mod tests {
                 snapshot_interval: Some(Duration::from_secs(30))
             }
         );
+
+        // Log-first durable mode (--storage-mode log).
+        let mut log_mode = base.to_vec();
+        log_mode.extend(["--storage-mode".to_owned(), "log".to_owned()]);
+        assert_eq!(
+            parse_arguments(log_mode.into_iter()).unwrap().storage_mode,
+            StorageMode::Log
+        );
+        let mut bad_log_interval = base.to_vec();
+        bad_log_interval.extend([
+            "--storage-mode".to_owned(),
+            "log".to_owned(),
+            "--snapshot-interval".to_owned(),
+            "10".to_owned(),
+        ]);
+        assert!(parse_arguments(bad_log_interval.into_iter()).is_err());
 
         // Unknown mode refused.
         let mut bad_mode = base.to_vec();

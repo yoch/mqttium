@@ -92,7 +92,18 @@ pub(crate) fn capacity(
     operation: OperationId,
     class: Option<ReceiptClass>,
 ) -> Result<bool, Fault> {
-    if let Some(closure) = frontier(conn, meta, ReceiptOrigin::of(operation))? {
+    let closure = frontier(conn, meta, ReceiptOrigin::of(operation))?;
+    capacity_with_frontier(conn, meta, operation, class, closure)
+}
+
+pub(crate) fn capacity_with_frontier(
+    conn: &Connection,
+    meta: &Meta,
+    operation: OperationId,
+    class: Option<ReceiptClass>,
+    closure: Option<ReceiptClosure>,
+) -> Result<bool, Fault> {
+    if let Some(closure) = closure {
         let span = operation
             .sequence()
             .get()
@@ -106,20 +117,18 @@ pub(crate) fn capacity(
             return Ok(false);
         }
     }
-    if class == Some(ReceiptClass::Business) {
-        let enabled: bool = conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM receipt_origins LIMIT 1)",
-            [],
-            |row| row.get(0),
-        )?;
-        if enabled
-            && meta.accounts.receipt_slots.get()
-                >= meta
-                    .limits
-                    .receipt_slots
-                    .get()
-                    .saturating_sub(RECEIPT_CONTROL_RESERVE)
-        {
+    if class == Some(ReceiptClass::Business)
+        && meta.accounts.receipt_slots.get()
+            >= meta
+                .limits
+                .receipt_slots
+                .get()
+                .saturating_sub(RECEIPT_CONTROL_RESERVE)
+    {
+        let enabled: bool = conn
+            .prepare_cached("SELECT EXISTS(SELECT 1 FROM receipt_origins LIMIT 1)")?
+            .query_row([], |row| row.get(0))?;
+        if enabled {
             return Ok(false);
         }
     }

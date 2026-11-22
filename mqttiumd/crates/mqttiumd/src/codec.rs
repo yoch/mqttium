@@ -1458,6 +1458,16 @@ pub struct EncodedPublish {
     pub expiry_value_offset: Option<usize>,
 }
 
+/// Segmented MQTT publication keeping the immutable payload shared across
+/// fan-out recipients without copying it into each subscriber's frame buffer.
+#[derive(Debug, PartialEq, Eq)]
+pub struct EncodedSegments {
+    pub header: Vec<u8>,
+    pub payload: Option<SharedBytes>,
+    pub total_len: usize,
+    pub expiry_value_offset: Option<usize>,
+}
+
 pub fn encode_qos0_expiring(
     topic: &SharedBytes,
     payload: &SharedBytes,
@@ -1488,6 +1498,19 @@ pub fn encode_qos0_with_properties(
     properties: Option<&PublishProperties>,
 ) -> Result<EncodedPublish, Error> {
     encode_publication(
+        version, None, topic, payload, false, retain, remaining, properties,
+    )
+}
+
+pub fn encode_qos0_segments(
+    version: Version,
+    topic: &SharedBytes,
+    payload: &SharedBytes,
+    retain: bool,
+    remaining: Option<u32>,
+    properties: Option<&PublishProperties>,
+) -> Result<EncodedSegments, Error> {
+    encode_publication_segments(
         version, None, topic, payload, false, retain, remaining, properties,
     )
 }
@@ -1573,7 +1596,7 @@ pub(crate) fn encode_delivery_for(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn encode_delivery_with_properties(
+pub(crate) fn encode_delivery_segments(
     version: Version,
     packet: (OutboundPacketId, Qos),
     topic_name: &SharedBytes,
@@ -1582,8 +1605,8 @@ pub(crate) fn encode_delivery_with_properties(
     retain: bool,
     remaining: Option<u32>,
     properties: Option<&PublishProperties>,
-) -> Result<EncodedPublish, Error> {
-    encode_publication(
+) -> Result<EncodedSegments, Error> {
+    encode_publication_segments(
         version,
         Some(packet),
         topic_name,
@@ -1610,7 +1633,7 @@ fn push_varint(bytes: &mut Vec<u8>, mut value: usize) {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn encode_publication(
+fn encode_publication_segments(
     version: Version,
     packet: Option<(OutboundPacketId, Qos)>,
     topic_name: &SharedBytes,
@@ -1619,7 +1642,7 @@ fn encode_publication(
     retain: bool,
     remaining: Option<u32>,
     properties: Option<&PublishProperties>,
-) -> Result<EncodedPublish, Error> {
+) -> Result<EncodedSegments, Error> {
     topic(topic_name.as_slice())?;
     if topic_name.len() > crate::writer::MAX_TOPIC || payload.len() > crate::writer::MAX_PAYLOAD {
         return Err(oversized("OutgoingFieldTooLarge"));
@@ -1659,70 +1682,101 @@ fn encode_publication(
         .checked_add(1 + length_bytes)
         .filter(|n| *n <= crate::net::MAX_PACKET_BYTES)
         .ok_or_else(|| oversized("PacketTooLarge"))?;
-    let mut bytes = Vec::new();
-    bytes
-        .try_reserve_exact(total)
+    let header_len = total - payload.len();
+    let mut header = Vec::new();
+    header
+        .try_reserve_exact(header_len)
         .map_err(|_| protocol("OutgoingAllocationFailed"))?;
-    bytes.push(
+    header.push(
         (if let Some((_, qos)) = packet {
             0x30 | (qos.to_wire() << 1) | if dup { 8 } else { 0 }
         } else {
             0x30
         }) | u8::from(retain),
     );
-    push_varint(&mut bytes, body);
-    bytes.extend_from_slice(&(topic_name.len() as u16).to_be_bytes());
-    bytes.extend_from_slice(topic_name.as_slice());
+    push_varint(&mut header, body);
+    header.extend_from_slice(&(topic_name.len() as u16).to_be_bytes());
+    header.extend_from_slice(topic_name.as_slice());
     if let Some((packet_id, _)) = packet {
-        bytes.extend_from_slice(&packet_id.get().to_be_bytes());
+        header.extend_from_slice(&packet_id.get().to_be_bytes());
     }
     let expiry_value_offset = if version == Version::V5 {
-        push_varint(&mut bytes, prop_bytes);
+        push_varint(&mut header, prop_bytes);
         let offset = if let Some(remaining) = remaining {
-            bytes.push(0x02);
-            let at = bytes.len();
-            bytes.extend_from_slice(&remaining.to_be_bytes());
+            header.push(0x02);
+            let at = header.len();
+            header.extend_from_slice(&remaining.to_be_bytes());
             Some(at)
         } else {
             None
         };
         if let Some(p) = props {
             if let Some(pfi) = p.payload_format_indicator {
-                bytes.push(0x01);
-                bytes.push(pfi);
+                header.push(0x01);
+                header.push(pfi);
             }
             if let Some(ct) = &p.content_type {
-                bytes.push(0x03);
-                bytes.extend_from_slice(&(ct.len() as u16).to_be_bytes());
-                bytes.extend_from_slice(ct.as_slice());
+                header.push(0x03);
+                header.extend_from_slice(&(ct.len() as u16).to_be_bytes());
+                header.extend_from_slice(ct.as_slice());
             }
             if let Some(rt) = &p.response_topic {
-                bytes.push(0x08);
-                bytes.extend_from_slice(&(rt.len() as u16).to_be_bytes());
-                bytes.extend_from_slice(rt.as_slice());
+                header.push(0x08);
+                header.extend_from_slice(&(rt.len() as u16).to_be_bytes());
+                header.extend_from_slice(rt.as_slice());
             }
             if let Some(cd) = &p.correlation_data {
-                bytes.push(0x09);
-                bytes.extend_from_slice(&(cd.len() as u16).to_be_bytes());
-                bytes.extend_from_slice(cd.as_slice());
+                header.push(0x09);
+                header.extend_from_slice(&(cd.len() as u16).to_be_bytes());
+                header.extend_from_slice(cd.as_slice());
             }
             for (k, v) in p.user_properties.iter() {
-                bytes.push(0x26);
-                bytes.extend_from_slice(&(k.len() as u16).to_be_bytes());
-                bytes.extend_from_slice(k.as_slice());
-                bytes.extend_from_slice(&(v.len() as u16).to_be_bytes());
-                bytes.extend_from_slice(v.as_slice());
+                header.push(0x26);
+                header.extend_from_slice(&(k.len() as u16).to_be_bytes());
+                header.extend_from_slice(k.as_slice());
+                header.extend_from_slice(&(v.len() as u16).to_be_bytes());
+                header.extend_from_slice(v.as_slice());
             }
         }
         offset
     } else {
         None
     };
-    bytes.extend_from_slice(payload.as_slice());
-    debug_assert_eq!(bytes.len(), total);
+    debug_assert_eq!(header.len(), header_len);
+    Ok(EncodedSegments {
+        header,
+        payload: (!payload.is_empty()).then(|| payload.clone()),
+        total_len: total,
+        expiry_value_offset,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn encode_publication(
+    version: Version,
+    packet: Option<(OutboundPacketId, Qos)>,
+    topic_name: &SharedBytes,
+    payload: &SharedBytes,
+    dup: bool,
+    retain: bool,
+    remaining: Option<u32>,
+    properties: Option<&PublishProperties>,
+) -> Result<EncodedPublish, Error> {
+    let seg = encode_publication_segments(
+        version, packet, topic_name, payload, dup, retain, remaining, properties,
+    )?;
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(seg.total_len)
+        .map_err(|_| protocol("OutgoingAllocationFailed"))?;
+    bytes.extend_from_slice(&seg.header);
+    if let Some(p) = seg.payload {
+        bytes.extend_from_slice(p.as_slice());
+    }
+    debug_assert_eq!(bytes.len(), seg.total_len);
     Ok(EncodedPublish {
         bytes,
-        expiry_value_offset,
+        expiry_value_offset: seg.expiry_value_offset,
     })
 }
 
