@@ -157,10 +157,6 @@ impl Qos2Ack {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum AckReason {
     Success,
-    /// PUBREC for a publication the broker accepted and gave to no
-    /// subscriber (MQTT 5 section 3.5.2.1, reason code 0x10). It is a
-    /// success: the exchange goes on to its PUBREL (record 0049).
-    NoMatchingSubscribers,
     /// PUBCOMP for a PUBREL whose identifier is not in use.
     PacketIdentifierNotFound,
     /// PUBREC refusing the admission for lack of capacity (MQTT 5
@@ -178,13 +174,6 @@ pub enum AckReason {
 }
 
 impl AckReason {
-    /// Whether the acknowledgement accepts what it answers: `Success`, or
-    /// the success that also says no subscription matched.
-    #[must_use]
-    pub const fn is_success(self) -> bool {
-        matches!(self, Self::Success | Self::NoMatchingSubscribers)
-    }
-
     /// The reason of the PUBREC that refuses an admission the store
     /// certainly rejected. Nothing was admitted, the exchange ends and the
     /// Packet Identifier is free again (MQTT 5 section 4.3.3).
@@ -207,7 +196,9 @@ impl AckReason {
 pub enum PubackReason {
     Success,
     /// The publication was accepted and matched no subscription (MQTT 5
-    /// section 3.4.2.1, reason code 0x10; record 0049).
+    /// section 3.4.2.1, reason code 0x10; record 0049). A PUBACK only: the
+    /// PUBREC of such a publication stays the plain success, as the
+    /// reference broker's does.
     NoMatchingSubscribers,
     QuotaExceeded,
     ImplementationSpecificError,
@@ -315,21 +306,13 @@ mod tests {
         }
     }
 
-    // Record 0049: 0x10 is a success of the two acknowledgements that
-    // answer a publication, and no refusal maps to it.
+    // Record 0049: 0x10 is a success of the PUBACK, and no refusal maps to
+    // it.
     #[test]
     fn no_matching_subscribers_is_a_success_and_never_a_refusal() {
         assert_eq!(PubackReason::NoMatchingSubscribers.to_wire(), 0x10);
         assert!(PubackReason::NoMatchingSubscribers.is_success());
-        assert!(AckReason::NoMatchingSubscribers.is_success());
-        assert!(PubackReason::Success.is_success() && AckReason::Success.is_success());
-        for refusal in [
-            AckReason::PacketIdentifierNotFound,
-            AckReason::QuotaExceeded,
-            AckReason::ImplementationSpecificError,
-        ] {
-            assert!(!refusal.is_success(), "{refusal:?}");
-        }
+        assert!(PubackReason::Success.is_success());
         for refusal in [
             PubackReason::QuotaExceeded,
             PubackReason::ImplementationSpecificError,
@@ -343,7 +326,6 @@ mod tests {
             RejectReason::PreconditionFailed,
             RejectReason::EpochClosed,
         ] {
-            assert!(!AckReason::refusing(rejection).is_success());
             assert!(!PubackReason::refusing(rejection).is_success());
         }
     }

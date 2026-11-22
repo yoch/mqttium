@@ -435,10 +435,9 @@ struct Slot {
     /// The latest PUBLISH of this active occurrence. Recovery supplies no
     /// invented network ingress order.
     publish_origin: Option<(ConnectionGeneration, u64)>,
-    /// The admission of this exchange named no target: its positive
-    /// acknowledgement says that no subscription matched (record 0049).
-    /// `false` for an exchange read from durable data, whose targets this
-    /// owner never selected.
+    /// The admission of this exchange named no target: its PUBACK says
+    /// that no subscription matched (record 0049). `false` for an exchange
+    /// read from durable data, whose targets this owner never selected.
     unmatched: bool,
     /// The lease of the exchange in the account of the owner, held until
     /// the exchange ends.
@@ -456,15 +455,6 @@ struct Slot {
 }
 
 impl Slot {
-    /// The reason of the PUBREC that accepts this exchange.
-    const fn pubrec_reason(&self) -> AckReason {
-        if self.unmatched {
-            AckReason::NoMatchingSubscribers
-        } else {
-            AckReason::Success
-        }
-    }
-
     /// The reason of the PUBACK that accepts this exchange.
     const fn puback_reason(&self) -> PubackReason {
         if self.unmatched {
@@ -1780,7 +1770,7 @@ impl Owner {
                     SlotState::AwaitPubrel => {
                         let frame = OutboundFrame::Pubrec {
                             packet_id,
-                            reason: held.pubrec_reason(),
+                            reason: AckReason::Success,
                         };
                         // The PUBREC sent again waits for the answers of
                         // the publications received before this copy.
@@ -2267,7 +2257,10 @@ impl Owner {
         let effect = draft.publish_frame(connection, frame, order)?;
         let next = match frame {
             OutboundFrame::Puback { .. } => Next::Ack { effect, connection },
-            OutboundFrame::Pubrec { reason, .. } if reason.is_success() => Next::AwaitPubrel,
+            OutboundFrame::Pubrec {
+                reason: AckReason::Success,
+                ..
+            } => Next::AwaitPubrel,
             _ => Next::End,
         };
         draft.released = Some(Released { slot: index, next });
@@ -2456,7 +2449,6 @@ impl Owner {
                         return self.plan_puback(index, finished, slot.puback_reason(), draft);
                     }
                     // PUBREC becomes eligible here and nowhere earlier.
-                    let reason = slot.pubrec_reason();
                     let frame = OutboundFrame::Pubrec { packet_id, reason };
                     if self.must_wait(slot) {
                         return Ok(Change::Hold {
@@ -3214,7 +3206,13 @@ impl Owner {
                 index += 1;
                 continue;
             }
-            if matches!(frame, OutboundFrame::Pubrec { reason, .. } if reason.is_success()) {
+            if matches!(
+                frame,
+                OutboundFrame::Pubrec {
+                    reason: AckReason::Success,
+                    ..
+                }
+            ) {
                 self.slots.as_mut_slice()[index].state = SlotState::AwaitPubrel;
                 index += 1;
             } else {
@@ -3678,7 +3676,10 @@ mod tests {
                 OutboundFrame::Puback { .. } => "EmitPuback",
                 OutboundFrame::Pingresp => "EmitPingresp",
                 OutboundFrame::Connack { .. } => "EmitConnack",
-                OutboundFrame::Pubrec { reason, .. } if reason.is_success() => "EmitPubrec",
+                OutboundFrame::Pubrec {
+                    reason: AckReason::Success,
+                    ..
+                } => "EmitPubrec",
                 OutboundFrame::Pubrec { .. } => "EmitPubrecRefusal",
                 OutboundFrame::Pubcomp {
                     reason: AckReason::Success,
@@ -6426,7 +6427,7 @@ mod tests {
                     frame: OutboundFrame::Pubrec { packet_id, reason },
                     ..
                 } => Some((
-                    if reason.is_success() {
+                    if *reason == AckReason::Success {
                         "PUBREC"
                     } else {
                         "PUBREC refusal"
@@ -6699,22 +6700,21 @@ mod tests {
         }
     }
 
-    /// Record 0049: a publication the broker accepted and gave to no
-    /// subscriber is acknowledged with "No matching subscribers", at the
-    /// commit and when its PUBREC is sent again. One with a target keeps
-    /// the plain success (every other test of this module).
+    /// Record 0049: the PUBACK of a publication the broker accepted and
+    /// gave to no subscriber says "No matching subscribers". One with a
+    /// target keeps the plain success (every other test of this module),
+    /// and so does a PUBREC, with or without a target, at the commit and
+    /// when it is sent again: the reference broker sends no other.
     #[test]
     fn an_admitted_publication_without_a_target_is_acknowledged_as_matching_no_subscription() {
         let mut world = World::connected();
         let admission = world.submit(unmatched(7, Qos::ExactlyOnce, false));
         world.applied(committed(&admission));
-        let unmatched_pubrec = frame_to(CONN, pubrec(AckReason::NoMatchingSubscribers));
-        assert_eq!(world.drain()[0].1, unmatched_pubrec);
-        assert_eq!(world.phase(7), AWAIT, "the exchange goes on to its PUBREL");
-        // The PUBREC sent again says the same.
+        let plain_pubrec = frame_to(CONN, pubrec(AckReason::Success));
+        assert_eq!(world.drain()[0].1, plain_pubrec);
+        assert_eq!(world.phase(7), AWAIT);
         world.applied(unmatched(7, Qos::ExactlyOnce, false));
-        assert_eq!(world.drain()[0].1, unmatched_pubrec);
-        // The release is the ordinary one.
+        assert_eq!(world.drain()[0].1, plain_pubrec);
         let release = world.submit(pubrel(7));
         assert_eq!(world.sent(committed(&release)), ["EmitPubcomp"]);
 

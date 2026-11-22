@@ -1480,11 +1480,12 @@ fn pubrels_keep_the_order_of_the_pubrecs_when_an_earlier_store_result_is_late() 
     }
 }
 
-/// Record 0049: a publication the broker accepts and gives to no subscriber
-/// is acknowledged "No matching subscribers" (0x10) in MQTT 5, retained or
-/// not, and with the plain acknowledgement in MQTT 3.1.1, which has no
-/// reason code. Once a subscription matches, the acknowledgement is the
-/// plain success. The QoS 2 exchange goes on to its PUBCOMP either way.
+/// Record 0049: the PUBACK of a publication the broker accepts and gives to
+/// no subscriber says "No matching subscribers" (0x10) in MQTT 5, retained
+/// or not. MQTT 3.1.1 has no reason code, and a PUBREC stays the plain one
+/// in both versions, as the reference broker's does. Once a subscription
+/// matches, the PUBACK is the plain success. The QoS 2 exchange goes on to
+/// its PUBCOMP either way.
 #[test]
 fn a_publication_without_a_subscriber_is_acknowledged_as_matching_no_subscription() {
     use codec::Version::{V5, V311};
@@ -1524,7 +1525,7 @@ fn a_publication_without_a_subscriber_is_acknowledged_as_matching_no_subscriptio
                     );
                 }
             };
-            if version == V5 {
+            if version == V5 && qos == 1 {
                 publish(runtime, 1, 0, &[0, 1, 0x10]);
                 publish(runtime, 2, 1, &[0, 2, 0x10]);
             } else {
@@ -2122,9 +2123,9 @@ fn a_real_puback_write_receipt_returns_its_receive_credit() {
     });
 }
 
-/// The body of the PUBACK or PUBREC that accepts a publication of an
-/// MQTT 5 client on a topic nobody subscribed to: "No matching
-/// subscribers" (record 0049).
+/// The body of the PUBACK that accepts a publication of an MQTT 5 client
+/// on a topic nobody subscribed to: "No matching subscribers" (record
+/// 0049).
 fn unmatched(id: u16) -> Vec<u8> {
     [&id.to_be_bytes()[..], &[0x10]].concat()
 }
@@ -2138,7 +2139,7 @@ fn seven_qos2(runtime: &mut Runtime<'_>, generation: ConnectionGeneration, clien
                 .exchange(session, InboundPacketId::new(id).unwrap())
                 .is_some_and(|(_, phase)| phase == ExchangePhase::AwaitPubrel)
         });
-        assert_eq!(read_frame(client), (0x50, unmatched(id)));
+        assert_eq!(read_frame(client), (0x50, id.to_be_bytes().to_vec()));
     }
 }
 
@@ -2269,7 +2270,7 @@ fn eight_live_qos2_exchanges_still_refuse_a_genuine_ninth_identifier() {
                 .exchange(session, InboundPacketId::new(8).unwrap())
                 .is_some_and(|(_, phase)| phase == ExchangePhase::AwaitPubrel)
         });
-        assert_eq!(read_frame(&mut client), (0x50, unmatched(8)));
+        assert_eq!(read_frame(&mut client), (0x50, vec![0, 8]));
         runtime.packet(generation, 0x32, publish_body(9)).unwrap();
         assert_eq!(
             runtime.peers[&generation].closing.map(|v| v.0),

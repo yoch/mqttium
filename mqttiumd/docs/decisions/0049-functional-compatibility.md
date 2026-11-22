@@ -1,10 +1,9 @@
 # ADR 0049 — Compatibility with the reference broker is functional
 
 Status: **Accepted** (22 November 2026, by the repository owner). It adds
-one variant to two public types of the contract tier (`AckReason`,
-`PubackReason`) and one value to the `reason` of a `FrameEligible` trace
-record, so the contract digest that `validate` prints changes. It changes
-no durable encoding.
+one variant to a public type of the contract tier (`PubackReason`). It
+changes no schema and no durable encoding; the contract digest that
+`validate` prints moves because the register lists the accepted records.
 
 ## Context
 
@@ -40,16 +39,24 @@ with the statement it rests on. Two cases stand today:
 the application, not for the transcript.** Each choice is recorded here
 and the bench entry names this record.
 
-1. *A publication that matches no subscription is answered 0x10 in
-   MQTT 5.* The PUBACK or PUBREC of a publication the broker accepted and
+1. *A QoS 1 publication that matches no subscription is acknowledged
+   0x10 in MQTT 5.* The PUBACK of a publication the broker accepted and
    gave to no subscriber carries "No matching subscribers", as Mosquitto's
-   does and as section 3.4.2.1 permits. The broker says so only when it
-   knows: an exchange read back after a restart is answered 0x00. A
-   retained publication without a live subscriber is answered 0x10 too;
-   it is stored all the same. MQTT 3.1.1 has no reason code: the
-   acknowledgement is the plain one. 0x10 is a success: every rule that
-   holds for a positive acknowledgement holds for it, first of all that
-   it follows the commit.
+   does and as section 3.4.2.1 permits. A retained publication without a
+   live subscriber is answered 0x10 too; it is stored all the same.
+   MQTT 3.1.1 has no reason code: the acknowledgement is the plain one.
+   0x10 is a success: every rule that holds for a positive
+   acknowledgement holds for it, first of all that it follows the commit.
+   *The PUBREC of such a publication stays 0x00.* Section 3.5.2.1 permits
+   0x10 there as well, and Mosquitto does not send it: its PUBREC is the
+   plain success whatever the subscriptions. Clients written and tested
+   against Mosquitto have never received a PUBREC with a reason other
+   than a success of one byte or a refusal; sending them one the
+   specification does not require would test code that was never run,
+   for information the application rarely sees. The first form of this
+   choice answered 0x10 on both acknowledgements; the bench showed the
+   reference's PUBREC, and the choice was narrowed before it was
+   published.
 2. *A message that matches several subscriptions of one client is sent
    once, at the highest granted QoS.* MQTT-3.3.4-2 requires that copy and
    allows more; Mosquitto sends one for each subscription. One copy is
@@ -77,14 +84,12 @@ it to a record.
 
 ## Consequences
 
-- `AckReason` and `PubackReason` gain `NoMatchingSubscribers` (0x10 on
-  the wire). The core keeps, with each inbound exchange in flight,
-  whether its publication had a target, and answers accordingly at the
-  commit and when it sends a PUBREC again. The product codec writes 0x10
-  in MQTT 5 and the plain acknowledgement in 3.1.1. The oracle reads the
-  reason as positive: `no_positive_ack_before_confirmed_commit` covers
-  it, and `refusal_carries_the_reason_of_its_rejection` does not take it
-  for a refusal.
+- `PubackReason` gains `NoMatchingSubscribers` (0x10 on the wire). The
+  core keeps, with each inbound exchange in flight, whether its
+  publication had a target, and its PUBACK says so at the commit. The
+  product codec writes 0x10 in MQTT 5 and the plain acknowledgement in
+  3.1.1. `AckReason`, the reason of a PUBREC, is unchanged, and so are
+  the trace schema and the oracle, whose bench plays QoS 2 only.
 - The bench entry `publish/no-matching-subscribers-v5` disappears: the
   two transcripts are equal. An entry of `divergences.json` may carry
   `decision`, the number of the record that decided it.

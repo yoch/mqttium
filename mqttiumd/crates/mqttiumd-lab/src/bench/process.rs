@@ -208,7 +208,6 @@ fn ack_reason(frame: OutboundFrame) -> Option<&'static str> {
     };
     Some(match reason {
         AckReason::Success => "Success",
-        AckReason::NoMatchingSubscribers => "NoMatchingSubscribers",
         AckReason::PacketIdentifierNotFound => "PacketIdentifierNotFound",
         AckReason::QuotaExceeded => "QuotaExceeded",
         AckReason::ImplementationSpecificError => "ImplementationSpecificError",

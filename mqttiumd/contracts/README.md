@@ -239,12 +239,6 @@ contract crate, and the assertion
 rejection a refusing frame answers is the latest certain rejection among
 its causes, delivered to the same incarnation of the core.
 
-A PUBREC that accepts an admission carries `Success`, or
-`NoMatchingSubscribers` when the admission named no target (record 0049:
-reason code 0x10). Both are positive: the assertion
-`no_positive_ack_before_confirmed_commit` holds either to the commit the
-core learned, and neither is a refusal.
-
 A store may answer with no outcome at all: a contract violation
 (`StoreReply::Violation`), today only `RecipeMismatch`, for an
 `OperationId` presented again with a different recipe. The three result

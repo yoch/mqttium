@@ -1108,7 +1108,6 @@ pub fn encode(frame: OutboundFrame) -> Result<Vec<u8>, Error> {
     let ack = |first: u8, packet_id: InboundPacketId, reason: AckReason| {
         let reason = match reason {
             AckReason::Success => 0,
-            AckReason::NoMatchingSubscribers => 0x10,
             AckReason::PacketIdentifierNotFound => 0x92,
             AckReason::QuotaExceeded => 0x97,
             AckReason::ImplementationSpecificError => 0x83,
@@ -1229,13 +1228,6 @@ pub fn encode_for(version: Version, frame: OutboundFrame) -> Result<Vec<u8>, Err
         } => encode(OutboundFrame::Puback {
             packet_id,
             reason: PubackReason::Success,
-        }),
-        OutboundFrame::Pubrec {
-            packet_id,
-            reason: AckReason::NoMatchingSubscribers,
-        } => encode(OutboundFrame::Pubrec {
-            packet_id,
-            reason: AckReason::Success,
         }),
         OutboundFrame::Pubcomp {
             packet_id,
