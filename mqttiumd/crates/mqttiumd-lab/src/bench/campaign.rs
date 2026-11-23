@@ -24,7 +24,6 @@
 //! run was not judged, and the oracle's verdict is the only one.
 
 use std::fs;
-use std::num::{NonZeroU32, NonZeroUsize};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -33,25 +32,13 @@ use serde_json::{Value, json};
 use super::backend::{Backend, Memory};
 use super::child::Config as ChildConfig;
 use super::collector::{Collector, KindTable};
-use super::mqtt::transport::Bounds;
-use super::process::{Settings, Stop, owner_config};
-use super::runner::{Outcome, Plan, Population, SCHEDULER_VERSION, failed_before_start, run};
+use super::runner::{Outcome, Plan, SCHEDULER_VERSION, failed_before_start, run};
 use super::scenario::Scenario;
+use super::setup::{RECOVERY_PAGE_FACTS, RESOLUTION_DELAY, Setup};
 use crate::files;
 use crate::manifest;
-use crate::store::adapter::AdapterLimits;
-use crate::store::durable::MAX_CLIENT_ID_BYTES;
-use crate::store::fixture;
 use crate::strict;
 use crate::workspace::Workspace;
-use mqttiumd_store_api::ReadPhase;
-
-/// The resolution delay of the owner, in logical time units. The
-/// specification fixes none for S0; the corpus uses 30.
-pub const RESOLUTION_DELAY: u64 = 30;
-
-/// Ordinary campaigns request this many facts per bounded recovery page.
-pub const RECOVERY_PAGE_FACTS: usize = 64;
 
 /// What a campaign is asked to do.
 #[derive(Clone, Debug)]
@@ -284,119 +271,6 @@ fn slug(text: &str) -> String {
     slug
 }
 
-fn capacity(fixture: &Value, name: &str) -> Result<u64, String> {
-    fixture
-        .pointer(&format!("/capacities/{name}"))
-        .and_then(Value::as_str)
-        .ok_or_else(|| format!("the fixture has no capacity {name}"))
-        .and_then(|text| {
-            mqttiumd_contract::decimal::parse_u64(text)
-                .map_err(|error| format!("{name}: {error:?}"))
-        })
-}
-
-fn narrow<T: TryFrom<u64>>(value: u64, name: &str) -> Result<T, String> {
-    T::try_from(value).map_err(|_| format!("{name} does not fit"))
-}
-
-/// The settings of the process a fixture fixes, the same at every
-/// start-up, in the supervisor and in a child process alike.
-pub fn settings_of(
-    fixture_document: &Value,
-    run_id: &str,
-    seed: u64,
-    faults: usize,
-) -> Result<Settings, String> {
-    let plan = fixture::plan(fixture_document).map_err(|error| format!("{error:?}"))?;
-    let limits = plan.limits;
-    let owner = owner_config(
-        narrow(limits.max_sessions as u64, "max_sessions")?,
-        narrow(limits.max_route_targets as u64, "max_route_targets")?,
-        narrow(limits.exchange_slots.get(), "exchange_slots")?,
-        limits.payload_bytes.get(),
-        RESOLUTION_DELAY,
-    )
-    .map_err(|error| error.to_string())?;
-    let effect_slots: usize = narrow(capacity(fixture_document, "effect_slots")?, "effect_slots")?;
-    let effect_slots = NonZeroUsize::new(effect_slots).ok_or("no effect slot")?;
-    let reservations = NonZeroU32::new(narrow(effect_slots.get() as u64, "reservations")?)
-        .ok_or("no reservation")?;
-    let leaked: &'static str = Box::leak(run_id.to_owned().into_boxed_str());
-    let settings = Settings {
-        run_id: leaked,
-        seed,
-        resolution_delay: RESOLUTION_DELAY,
-        work_limit: 4096,
-        recovery_page: RECOVERY_PAGE_FACTS,
-        effect_slots,
-        reservations,
-        adapter: AdapterLimits {
-            operations_in_flight: plan.operations_in_flight,
-            result_slots: plan.result_slots,
-            faults: faults.max(1),
-            events: 4096,
-        },
-        owner,
-        bounds: Bounds {
-            max_client_id: MAX_CLIENT_ID_BYTES,
-            max_topic: limits.max_topic_bytes,
-            max_payload: limits.max_payload_bytes,
-        },
-        retained_enabled: false,
-    };
-    Ok(settings)
-}
-
-/// The process under test as a fixture sets it up: its settings, the
-/// data set installed through store commands, and the clients.
-pub struct Setup<S> {
-    pub settings: Settings,
-    pub store: S,
-    pub population: Population,
-}
-
-impl<S: crate::store::durable::DurableStore> Setup<S> {
-    /// Reads a fixture document (already validated) and installs it in a
-    /// new data set of `backend`.
-    pub fn from_fixture<B: Backend<Store = S>>(
-        backend: &mut B,
-        fixture_document: &Value,
-        run_id: &str,
-        seed: u64,
-        faults: usize,
-    ) -> Result<Self, Stop> {
-        let plan =
-            fixture::plan(fixture_document).map_err(|error| Stop::new(format!("{error:?}")))?;
-        let mut store = backend
-            .create(plan.incarnation, plan.limits)
-            .map_err(|error| Stop::read(error, ReadPhase::Open, 1, None))?;
-        let installed = fixture::install(&mut store, &plan).map_err(|error| match error {
-            fixture::FixtureError::Read(error) => Stop::read(error, ReadPhase::Snapshot, 1, None),
-            other => Stop::new(format!("{other:?}")),
-        })?;
-        let settings = settings_of(fixture_document, run_id, seed, faults).map_err(Stop::new)?;
-        let population = Population {
-            clients: plan
-                .sessions
-                .iter()
-                .map(|session| {
-                    installed
-                        .sessions
-                        .get(&session.client)
-                        .map(|id| (session.client.clone(), session.client_id.clone(), *id))
-                        .ok_or_else(|| format!("{} has no session", session.client))
-                })
-                .collect::<Result<_, _>>()
-                .map_err(Stop::new)?,
-        };
-        Ok(Self {
-            settings,
-            store,
-            population,
-        })
-    }
-}
-
 /// Runs one campaign. An error is returned when nothing could be run;
 /// a run that stopped still leaves its directory.
 pub fn execute(request: &Request) -> Result<Report, String> {
@@ -621,7 +495,7 @@ fn execute_with<B: Backend>(request: &Request, mut backend: B) -> Result<Report,
         &fixture_document,
         &run_id,
         request.seed,
-        scenario.faults.len(),
+        scenario.fault_count(),
     )
     .map(|mut s| {
         s.settings.retained_enabled = scenario.uses_retained();
@@ -770,16 +644,13 @@ fn execute_with<B: Backend>(request: &Request, mut backend: B) -> Result<Report,
     }
     reasons.truncate(256);
     let faults: Vec<Value> = scenario
-        .faults
-        .iter()
-        .zip(&outcome.hits)
-        .map(|(fault, hits)| {
-            json!({"id": fault.id, "expected_hits": fault.expected_hits.to_string(), "hits": hits.to_string()})
+        .tallies(&outcome.hits)
+        .map(|tally| {
+            json!({"id": tally.fault, "expected_hits": tally.expected.to_string(), "hits": tally.hits.to_string()})
         })
         .collect();
     let assertions: Vec<Value> = scenario
-        .assertions
-        .iter()
+        .assertions()
         .map(|name| json!({"name": name, "status": "INCONCLUSIVE", "detail": "not judged by the bench"}))
         .collect();
     let mut artifacts = vec![artifact(out, "trace.jsonl")?];
@@ -921,7 +792,7 @@ fn execute_with<B: Backend>(request: &Request, mut backend: B) -> Result<Report,
         "resolution_delay": RESOLUTION_DELAY.to_string(),
         "elementary_choices": outcome.elementary.to_string(),
         "steps_played": outcome.steps_played,
-        "steps": scenario.steps.len(),
+        "steps": scenario.step_count(),
         "stopped": outcome.stopped,
         "faults_not_reached": outcome.not_reached,
         "records_refused": outcome.refused,

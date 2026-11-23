@@ -20,10 +20,10 @@ use mqttiumd_contract::ids::{ConnectionGeneration, OperationId};
 use mqttiumd_contract::outcome::{OpeningOutcome, StoreOutcome};
 use mqttiumd_contract::packet::SharedBytes;
 use mqttiumd_lab::bench::backend::Memory;
-use mqttiumd_lab::bench::campaign::Setup;
 use mqttiumd_lab::bench::collector::{Collector, KindTable, Origin};
 use mqttiumd_lab::bench::mqtt::peer;
 use mqttiumd_lab::bench::process::{Books, Choice, Process};
+use mqttiumd_lab::bench::setup::Setup;
 use mqttiumd_lab::store::adapter::StoreAction;
 use mqttiumd_lab::store::durable::{
     AdminCommand, AdminDone, AdminRefused, Applied, DurableState, DurableStore, MemoryStore,

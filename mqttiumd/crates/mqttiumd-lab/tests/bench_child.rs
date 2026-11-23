@@ -412,7 +412,7 @@ fn sessions() -> Vec<(String, mqttiumd_contract::ids::SessionId)> {
         .unwrap(),
     )
     .unwrap();
-    let setup = mqttiumd_lab::bench::campaign::Setup::from_fixture(
+    let setup = mqttiumd_lab::bench::setup::Setup::from_fixture(
         &mut mqttiumd_lab::bench::backend::Memory,
         &fixture,
         "sessions",

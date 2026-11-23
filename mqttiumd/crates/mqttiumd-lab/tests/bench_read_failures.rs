@@ -15,11 +15,11 @@ use std::time::{Duration, Instant};
 
 use mqttiumd_contract::ids::StoreIncarnation;
 use mqttiumd_lab::bench::backend::{Backend, Sqlite};
-use mqttiumd_lab::bench::campaign::Setup;
 use mqttiumd_lab::bench::child::Config;
 use mqttiumd_lab::bench::collector::{Collector, KindTable};
 use mqttiumd_lab::bench::runner::{Plan, run};
 use mqttiumd_lab::bench::scenario::Scenario;
+use mqttiumd_lab::bench::setup::Setup;
 use mqttiumd_lab::store::durable::{DurableState, Limits};
 use mqttiumd_store_api::ReadError;
 use mqttiumd_store_sqlite::{SqliteStore, writer_lock_path};
@@ -326,7 +326,7 @@ fn receive(root: &Path, out: &Path, case: Case) {
         &fixture,
         "typed-read-reception",
         1,
-        scenario.faults.len(),
+        scenario.fault_count(),
     )
     .unwrap();
     drop(store);
@@ -639,7 +639,7 @@ fn a_collector_refusal_cannot_erase_a_confirmed_sigkill() {
         &fixture,
         "kill-receipt-refusal",
         1,
-        scenario.faults.len(),
+        scenario.fault_count(),
     )
     .unwrap();
     let mut schema = read_json(&out.join("contracts/schema/v1/trace-record.schema.json"));

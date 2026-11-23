@@ -402,12 +402,12 @@ fn flush<S: DurableStore>(
     collector: &mut Collector,
     books: &mut Books,
 ) -> Result<Option<Cause>, Stop> {
-    if store.evidence_lost() {
-        return Err(Stop::new("the store adapter lost evidence"));
-    }
-    books.groups.absorb(store.take_group_evidence());
+    let recorded = store
+        .drain_evidence()
+        .ok_or_else(|| Stop::new("the store adapter lost evidence"))?;
+    books.groups.absorb(recorded.groups);
     let mut page = None;
-    for event in store.take_events() {
+    for event in recorded.events {
         // A submission names, as its cause, the record of the core input
         // whose step published the effect it carries (record 0016).
         let causes: Vec<EvidenceCause> = match &event {
@@ -733,8 +733,7 @@ impl<S: DurableStore> Process<S> {
             .map_err(|error| Stop::read(error, ReadPhase::Ledger, process_incarnation, None))?;
         let command = opening
             .submit(
-                sim.store()
-                    .ledger()
+                sim.ledger()
                     .map_err(|error| {
                         Stop::read(error, ReadPhase::Ledger, process_incarnation, None)
                     })?

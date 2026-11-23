@@ -4,7 +4,8 @@
 //! campaign directory that the independent oracle judges:
 //!
 //! - `backend`: the durable store a campaign runs on;
-//! - `scenario`: the scenario as the runner plays it;
+//! - `scenario`: the scenario as the runner plays it, and its faults;
+//! - `setup`: the settings, data set and clients a fixture sets up;
 //! - `mqtt`: the bytes of the subset, for the peers and the transport;
 //! - `collector`: the one writer of the trace, origin by channel;
 //! - `process`: the process under test, the real core and the
@@ -33,3 +34,4 @@ pub mod protocol;
 pub mod rebuild;
 pub mod runner;
 pub mod scenario;
+pub mod setup;

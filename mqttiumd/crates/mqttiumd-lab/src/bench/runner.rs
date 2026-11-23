@@ -24,7 +24,7 @@ use std::collections::BTreeMap;
 
 use serde_json::{Value, json};
 
-use mqttiumd_contract::ids::{ConnectionGeneration, InboundPacketId, SessionId};
+use mqttiumd_contract::ids::{ConnectionGeneration, SessionId};
 
 use super::backend::Backend;
 use super::broker::Broker;
@@ -32,8 +32,9 @@ use super::child::{Child, Config as ChildConfig, Killed};
 use super::collector::{Cause, Collector, Origin};
 use super::mqtt::{Kind, peer};
 use super::process::{Books, Process, Settings, Stop, Written};
-use super::scenario::{Event, Fault, Scenario, Step};
-use crate::store::adapter::{FaultSpec, WorkKind};
+use super::scenario::{Event, Scenario, Step};
+use super::setup::Population;
+use crate::store::adapter::FaultSpec;
 use crate::store::evidence::{SnapshotContext, snapshot};
 use mqttiumd_store_api::ReadPhase;
 
@@ -119,13 +120,6 @@ pub struct Outcome {
     pub groups: crate::store::adapter::GroupEvidence,
 }
 
-/// The fixture as the runner needs it: clients and their sessions.
-#[derive(Clone, Debug)]
-pub struct Population {
-    /// Client name, ClientID and the session the store created.
-    pub clients: Vec<(String, Vec<u8>, SessionId)>,
-}
-
 /// Everything a run needs.
 pub struct Plan<'a, B: Backend> {
     pub scenario: &'a Scenario,
@@ -180,75 +174,6 @@ fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-/// The selection of a fault, in the terms of the store adapter.
-///
-/// The bench knows the exchange a binding names (the client's session
-/// and Packet Identifier), never an operation (ADR 0003). A resolution
-/// carries no source in the adapter: at the fence point, and for the
-/// result of a `ResolveAndFence`, the fault selects by kind only. Each
-/// scenario of S0 has one exchange, so that selection is the same set.
-pub(crate) fn specification(
-    fault: &Fault,
-    exchanges: &BTreeMap<String, (SessionId, u16)>,
-) -> Result<FaultSpec, Stop> {
-    let source = match &fault.publication_binding {
-        Some(binding) => {
-            let (session, raw) = exchanges.get(binding).copied().ok_or_else(|| {
-                Stop::new(format!(
-                    "{}: the binding {binding} names no exchange",
-                    fault.id
-                ))
-            })?;
-            let packet_id = InboundPacketId::new(raw)
-                .ok_or_else(|| Stop::new(format!("{}: Packet Identifier 0", fault.id)))?;
-            Some((session, packet_id))
-        }
-        None => None,
-    };
-    use crate::store::adapter::FaultPoint;
-    let resolution = fault.point == FaultPoint::FenceTransit
-        || fault.result_of.as_deref() == Some("ResolveAndFence");
-    let (kind, source) = if resolution {
-        (Some(WorkKind::ResolveAndFence), None)
-    } else {
-        (fault.command_kind, source)
-    };
-    Ok(FaultSpec {
-        point: fault.point,
-        action: fault.action,
-        kind,
-        source,
-        occurrence: fault.occurrence,
-    })
-}
-
-/// The exchanges the scenario binds, by the step that binds them: the
-/// session of the client and the Packet Identifier.
-pub(crate) fn bound_exchanges(
-    scenario: &Scenario,
-    population: &Population,
-) -> Result<BTreeMap<String, (SessionId, u16)>, Stop> {
-    let mut bound = BTreeMap::new();
-    for step in &scenario.steps {
-        if let Step::ClientPublish {
-            client,
-            packet_id: Some(packet_id),
-            bind_exchange_as: Some(binding),
-            ..
-        } = step
-        {
-            let session = population
-                .clients
-                .iter()
-                .find(|(name, _, _)| name == client)
-                .map(|(_, _, session)| *session)
-                .ok_or_else(|| Stop::new(format!("no client {client} in the fixture")))?;
-            bound.insert(binding.clone(), (session, *packet_id));
-        }
-    }
-    Ok(bound)
-}
-
 impl<B: Backend> Runner<'_, B> {
     fn process(&mut self) -> Result<&mut Broker<B::Store>, Stop> {
         self.process
@@ -270,23 +195,14 @@ impl<B: Backend> Runner<'_, B> {
 
     /// The faults to arm at a start-up: those not reached yet.
     fn faults(&self) -> Result<Vec<(usize, FaultSpec, &'static str)>, Stop> {
-        let population = Population {
-            clients: self
-                .clients
-                .iter()
-                .map(|(name, client)| (name.clone(), client.client_id.clone(), client.session))
-                .collect(),
-        };
-        let bound = bound_exchanges(self.scenario, &population)?;
-        let mut armed = Vec::new();
-        for (index, fault) in self.scenario.faults.iter().enumerate() {
-            if self.books.hits.get(index).copied().unwrap_or(0) > 0 {
-                continue;
-            }
-            let name: &'static str = Box::leak(fault.id.clone().into_boxed_str());
-            armed.push((index, specification(fault, &bound)?, name));
-        }
-        Ok(armed)
+        let unreached = (0..self.scenario.fault_count())
+            .filter(|&index| self.books.hits.get(index).copied().unwrap_or(0) == 0);
+        self.scenario
+            .arm(
+                |name| self.clients.get(name).map(|client| client.session),
+                unreached,
+            )
+            .map_err(Stop::new)
     }
 
     /// Record the stable type independently of the optional human diagnostic.
@@ -382,12 +298,15 @@ impl<B: Backend> Runner<'_, B> {
     /// The `StepBlocked` record of a run that stopped in a wait: the step,
     /// why, and what still waited. Written at the stop, before the footer.
     fn write_blocked(&mut self, cause: &'static str) -> Result<(), Stop> {
-        let step = &self.scenario.steps[self.step_index];
+        let step = self
+            .scenario
+            .step(self.step_index)
+            .ok_or_else(|| Stop::new(format!("no step {}", self.step_index)))?;
         let armed = self.process.as_ref().map_or(0, Broker::armed_deadlines);
         let holding: Vec<&str> = self
             .holding()
             .into_iter()
-            .map(|index| self.scenario.faults[index].id.as_str())
+            .filter_map(|index| self.scenario.fault_name(index))
             .collect();
         let payload = json!({
             "step": self.step_index.to_string(),
@@ -562,9 +481,7 @@ impl<B: Backend> Runner<'_, B> {
 
     fn fault_index(&self, name: &str) -> Result<usize, Stop> {
         self.scenario
-            .faults
-            .iter()
-            .position(|fault| fault.id == name)
+            .fault_index(name)
             .ok_or_else(|| Stop::new(format!("no fault {name}")))
     }
 
@@ -770,8 +687,7 @@ impl<B: Backend> Runner<'_, B> {
             }
             Step::LeaveBarrier { fault } => {
                 let index = self.fault_index(fault)?;
-                let declared = &self.scenario.faults[index];
-                if declared.action != crate::store::adapter::FaultAction::Barrier {
+                if !self.scenario.is_barrier(index) {
                     return Err(Stop::new(format!("{fault} is not a barrier")));
                 }
                 if self.books.hits.get(index).copied().unwrap_or(0) == 0 {
@@ -971,11 +887,10 @@ pub(crate) fn failed_before_start(
         stopped: Some(format!("setup: {error}")),
         failure_count: failures.len() as u64,
         failures,
-        hits: vec![0; scenario.faults.len()],
+        hits: vec![0; scenario.fault_count()],
         not_reached: scenario
-            .faults
-            .iter()
-            .map(|fault| format!("{}: 0 hits, {} expected", fault.id, fault.expected_hits))
+            .tallies(&[])
+            .map(|tally| tally.to_string())
             .collect(),
         refused: refused.iter().map(ToString::to_string).collect(),
         unwritten: BTreeMap::new(),
@@ -1030,7 +945,7 @@ pub fn run<B: Backend>(plan: Plan<'_, B>) -> Outcome {
         run_id: settings.run_id,
         settings,
         collector,
-        books: Books::new(scenario.faults.len()),
+        books: Books::new(scenario.fault_count()),
         process: None,
         child,
         kills: Vec::new(),
@@ -1045,7 +960,7 @@ pub fn run<B: Backend>(plan: Plan<'_, B>) -> Outcome {
         choices: Vec::new(),
         elementary: 0,
         snapshots: Vec::new(),
-        awaited: vec![0; scenario.faults.len()],
+        awaited: vec![0; scenario.fault_count()],
         left_barriers: std::collections::BTreeSet::new(),
         step_index: 0,
         blocked: None,
@@ -1061,7 +976,7 @@ pub fn run<B: Backend>(plan: Plan<'_, B>) -> Outcome {
     }
     let mut played = 0;
     if stopped.is_none() {
-        for (index, step) in scenario.steps.iter().enumerate() {
+        for (index, step) in scenario.steps().enumerate() {
             runner.step_index = index;
             if let Err(error) = runner.play(step) {
                 runner.retain_failure(&error);
@@ -1073,16 +988,9 @@ pub fn run<B: Backend>(plan: Plan<'_, B>) -> Outcome {
         }
     }
     let not_reached: Vec<String> = scenario
-        .faults
-        .iter()
-        .zip(&runner.books.hits)
-        .filter(|(fault, hits)| **hits != fault.expected_hits)
-        .map(|(fault, hits)| {
-            format!(
-                "{}: {hits} hits, {} expected",
-                fault.id, fault.expected_hits
-            )
-        })
+        .tallies(&runner.books.hits)
+        .filter(|tally| !tally.met())
+        .map(|tally| tally.to_string())
         .collect();
     // A wait that could not be met is a fact of the run, stated before the
     // footer; the trace stays complete. Any other stop cuts it.

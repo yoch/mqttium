@@ -727,7 +727,14 @@ trait Staging {
     fn discard_completed_publication(&mut self, publication: PublicationId);
     fn end_obligation(&mut self, delivery: DeliveryId) -> Result<(), AdminRefused>;
     fn stage_admin(&mut self, command: AdminCommand) -> Result<AdminDone, AdminRefused>;
+    /// A change of session. One that opens or ends a will goes to the
+    /// will memory, which changes the session through
+    /// [`Staging::change_session`]; any other is that change.
     fn stage_session(&mut self, command: &SessionLifecycle) -> Guard<CommitFacts>;
+    /// A change of session that carries no will: open, detach, close and
+    /// their timed forms. The will memory builds on it; a will action
+    /// given here is refused.
+    fn change_session(&mut self, command: &SessionLifecycle) -> Guard<CommitFacts>;
     fn inventory(&self) -> impl Iterator<Item = FactRef<'_>>;
 }
 
@@ -1508,13 +1515,15 @@ impl Staging for DurableState {
     }
 
     fn stage_session(&mut self, command: &SessionLifecycle) -> Guard<CommitFacts> {
+        match command.action {
+            SessionAction::OpenWillAt { .. } => will_memory::open(self, command),
+            SessionAction::EndWill { .. } => will_memory::end(self, command),
+            _ => self.change_session(command),
+        }
+    }
+
+    fn change_session(&mut self, command: &SessionLifecycle) -> Guard<CommitFacts> {
         let failed = RejectReason::PreconditionFailed;
-        if matches!(command.action, SessionAction::OpenWillAt { .. }) {
-            return will_memory::open(self, command);
-        }
-        if matches!(command.action, SessionAction::EndWill { .. }) {
-            return will_memory::end(self, command);
-        }
         let change = match &command.action {
             SessionAction::OpenWillAt { .. } | SessionAction::EndWill { .. } => return Err(failed),
             SessionAction::Open {

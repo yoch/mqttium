@@ -15,18 +15,22 @@
 # - shallow-module mqttiumd_contract: a contract crate shows its types. Moving
 #   the generic maps out (a crate of their own) reverses record 0057 and is a
 #   separate proposal.
+# - field-leak mqttiumd_lab::bench::collector::Collector::lines: the child
+#   relays the records its collector wrote, byte for byte, and reads each one
+#   again for its origin and kind; loop mutant n1 is anchored on that reading.
+#   Handing the buffer to a closure instead is the same lending, and the
+#   linter says so.
+# - field-leak mqttiumd_lab::store::adapter::SimStore::store: the inspector
+#   of the backend reads the durable state beside the adapter, unrecorded and
+#   unfaulted, by design. Every other use goes through the adapter.
 #
-# The other entries are fixed lot by lot.
+# The other entries are fixed lot by lot. After lot 1 (lab): 78 entries.
 module-cycle mqttiumd::codec,mqttiumd::net,mqttiumd::security
 module-cycle mqttiumd_contract::command,mqttiumd_contract::message_expiry,mqttiumd_contract::outcome,mqttiumd_contract::packet,mqttiumd_contract::properties,mqttiumd_contract::pubsub,mqttiumd_contract::retained,mqttiumd_contract::session,mqttiumd_contract::will
 module-cycle mqttiumd_core::owner::pubsub,mqttiumd_core::owner::receipts,mqttiumd_core::owner::routing,mqttiumd_core::owner::sessions,mqttiumd_core::owner::will
-module-cycle mqttiumd_lab::bench::broker,mqttiumd_lab::bench::campaign,mqttiumd_lab::bench::child,mqttiumd_lab::bench::runner
-module-cycle mqttiumd_lab::semantic,mqttiumd_lab::workspace
 module-cycle mqttiumd_store_sqlite::message_expiry,mqttiumd_store_sqlite::pubsub,mqttiumd_store_sqlite::receipts,mqttiumd_store_sqlite::retained
 module-cycle mqttiumd_store_sqlite::reader,mqttiumd_store_sqlite::sessions,mqttiumd_store_sqlite::will
 tangle mqttiumd_contract::command::AnnotatedPublication,mqttiumd_contract::command::Recipe,mqttiumd_contract::message_expiry::ExpiringPublication,mqttiumd_contract::message_expiry::TimedReplaySubscriptions,mqttiumd_contract::retained::check,mqttiumd_contract::retained::decode,mqttiumd_contract::retained::encode
-tangle mqttiumd_lab::semantic::check,mqttiumd_lab::semantic::fixture,mqttiumd_lab::semantic::registry,mqttiumd_lab::semantic::requirements_known,mqttiumd_lab::semantic::run_result,mqttiumd_lab::semantic::scenario,mqttiumd_lab::workspace::Workspace
-tangle mqttiumd_lab::store::durable::<DurableState as Staging>::stage_session,mqttiumd_lab::store::durable::will_memory::end,mqttiumd_lab::store::durable::will_memory::open
 tangle mqttiumd_store_sqlite::sessions::stage,mqttiumd_store_sqlite::will::end,mqttiumd_store_sqlite::will::open
 tangle mqttiumd_store_volatile::VolatileStore,mqttiumd_store_volatile::read::FactRef,mqttiumd_store_volatile::read::build_snapshot,mqttiumd_store_volatile::read::check_delivery_metadata,mqttiumd_store_volatile::read::check_inventory_bound,mqttiumd_store_volatile::read::check_message_candidate,mqttiumd_store_volatile::read::check_message_observation,mqttiumd_store_volatile::read::delivery_claim,mqttiumd_store_volatile::read::inventory,mqttiumd_store_volatile::read::recover_page,mqttiumd_store_volatile::read::validate_retained,mqttiumd_store_volatile::read::validate_wills,mqttiumd_store_volatile::read::will_page,mqttiumd_store_volatile::read::work_page
 field-leak mqttiumd::net::reactor::Shared::dead
@@ -67,11 +71,6 @@ field-leak mqttiumd_core::owner::pubsub::State::volatile
 field-leak mqttiumd_core::owner::receipts::State::entries
 field-leak mqttiumd_core::owner::receipts::State::pending
 field-leak mqttiumd_lab::bench::collector::Collector::lines
-field-leak mqttiumd_lab::bench::scenario::Scenario::assertions
-field-leak mqttiumd_lab::bench::scenario::Scenario::faults
-field-leak mqttiumd_lab::bench::scenario::Scenario::steps
-field-leak mqttiumd_lab::store::adapter::SimStore::events
-field-leak mqttiumd_lab::store::adapter::SimStore::grouped
 field-leak mqttiumd_lab::store::adapter::SimStore::store
 field-leak mqttiumd_store_sqlite::SqliteStore::settings
 field-leak mqttiumd_store_sqlite::StoreCaches::open_receipts

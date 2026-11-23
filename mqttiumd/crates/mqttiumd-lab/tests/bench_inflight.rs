@@ -15,7 +15,7 @@ fn the_scenario_reader_preserves_the_transaction_points() {
         document["faults"][0]["point"] = json!(point);
         document["faults"][0]["action"] = json!("barrier");
         let scenario = Scenario::read(&document).expect("a declared transaction point");
-        assert_eq!(scenario.faults[0].point.name(), point);
+        assert_eq!(scenario.faults()[0].point.name(), point);
     }
 }
 

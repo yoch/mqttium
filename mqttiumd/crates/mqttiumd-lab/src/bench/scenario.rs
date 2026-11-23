@@ -6,14 +6,17 @@
 //! and `op_A` stay names of the bench: they select faults and exchanges
 //! and never reach the broker (ADR 0003).
 
+use std::collections::BTreeMap;
+use std::fmt;
 use std::sync::Arc;
 
 use mqttiumd_contract::decimal::parse_u64;
+use mqttiumd_contract::ids::{InboundPacketId, SessionId};
 use mqttiumd_contract::packet::SharedBytes;
 use mqttiumd_contract::properties::{MAX_PROPERTY_BYTES, PublishProperties};
 use serde_json::Value;
 
-use crate::store::adapter::{FaultAction, FaultPoint, WorkKind};
+use crate::store::adapter::{FaultAction, FaultPoint, FaultSpec, WorkKind};
 
 /// One fault the scenario declares.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -114,6 +117,9 @@ impl Step {
 }
 
 /// A scenario the runner can play.
+///
+/// Its faults, steps and assertions are read through what the runner and
+/// the campaign ask of them, by index, by name or as tallies.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Scenario {
     pub id: String,
@@ -121,9 +127,92 @@ pub struct Scenario {
     pub initial_fixture: String,
     pub max_steps: u64,
     pub max_trace_bytes: u64,
-    pub faults: Vec<Fault>,
-    pub steps: Vec<Step>,
-    pub assertions: Vec<String>,
+    faults: Vec<Fault>,
+    steps: Vec<Step>,
+    assertions: Vec<String>,
+}
+
+/// The exchanges a scenario binds, by binding: the session of the client
+/// and the Packet Identifier.
+pub type Exchanges = BTreeMap<String, (SessionId, u16)>;
+
+/// How often a fault was hit against how often the scenario expects it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Tally<'a> {
+    pub fault: &'a str,
+    pub hits: u64,
+    pub expected: u64,
+}
+
+impl Tally<'_> {
+    /// Whether the fault was hit as often as the scenario expects.
+    #[must_use]
+    pub fn met(&self) -> bool {
+        self.hits == self.expected
+    }
+}
+
+impl fmt::Display for Tally<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{}: {} hits, {} expected",
+            self.fault, self.hits, self.expected
+        )
+    }
+}
+
+impl Fault {
+    /// The selection of this fault, in the terms of the store adapter.
+    ///
+    /// The bench knows the exchange a binding names (the client's session
+    /// and Packet Identifier), never an operation (ADR 0003). A resolution
+    /// carries no source in the adapter: at the fence point, and for the
+    /// result of a `ResolveAndFence`, the fault selects by kind only. Each
+    /// scenario of S0 has one exchange, so that selection is the same set.
+    fn spec(&self, exchanges: &Exchanges) -> Result<FaultSpec, String> {
+        let source = match &self.publication_binding {
+            Some(binding) => {
+                let (session, raw) = exchanges.get(binding).copied().ok_or_else(|| {
+                    format!("{}: the binding {binding} names no exchange", self.id)
+                })?;
+                let packet_id = InboundPacketId::new(raw)
+                    .ok_or_else(|| format!("{}: Packet Identifier 0", self.id))?;
+                Some((session, packet_id))
+            }
+            None => None,
+        };
+        let resolution = self.point == FaultPoint::FenceTransit
+            || self.result_of.as_deref() == Some("ResolveAndFence");
+        let (kind, source) = if resolution {
+            (Some(WorkKind::ResolveAndFence), None)
+        } else {
+            (self.command_kind, source)
+        };
+        Ok(FaultSpec {
+            point: self.point,
+            action: self.action,
+            kind,
+            source,
+            occurrence: self.occurrence,
+        })
+    }
+
+    /// The selection of this fault and the name it is armed under, which
+    /// lives as long as the process: the adapter keeps it.
+    fn armed(&self, exchanges: &Exchanges) -> Result<(FaultSpec, &'static str), String> {
+        let spec = self.spec(exchanges)?;
+        let name: &'static str = Box::leak(self.id.clone().into_boxed_str());
+        Ok((spec, name))
+    }
+
+    fn tally(&self, hits: u64) -> Tally<'_> {
+        Tally {
+            fault: &self.id,
+            hits,
+            expected: self.expected_hits,
+        }
+    }
 }
 
 fn text<'a>(value: &'a Value, name: &str) -> Result<&'a str, String> {
@@ -503,5 +592,110 @@ impl Scenario {
         self.steps
             .iter()
             .any(|step| matches!(step, Step::ClientPublish { retain: true, .. }))
+    }
+
+    /// The steps, in the order they are played.
+    pub fn steps(&self) -> impl Iterator<Item = &Step> {
+        self.steps.iter()
+    }
+
+    #[must_use]
+    pub fn step(&self, index: usize) -> Option<&Step> {
+        self.steps.get(index)
+    }
+
+    #[must_use]
+    pub fn step_count(&self) -> usize {
+        self.steps.len()
+    }
+
+    /// The names of the assertions the oracle judges.
+    pub fn assertions(&self) -> impl Iterator<Item = &str> {
+        self.assertions.iter().map(String::as_str)
+    }
+
+    /// The faults the scenario declares, in order.
+    #[must_use]
+    pub fn faults(&self) -> &[Fault] {
+        &self.faults
+    }
+
+    #[must_use]
+    pub fn fault_count(&self) -> usize {
+        self.faults.len()
+    }
+
+    /// The index of the fault named `name`.
+    #[must_use]
+    pub fn fault_index(&self, name: &str) -> Option<usize> {
+        self.faults.iter().position(|fault| fault.id == name)
+    }
+
+    /// The name of the fault at `index`.
+    #[must_use]
+    pub fn fault_name(&self, index: usize) -> Option<&str> {
+        self.faults.get(index).map(|fault| fault.id.as_str())
+    }
+
+    /// Whether the fault at `index` holds its operation at a barrier.
+    #[must_use]
+    pub fn is_barrier(&self, index: usize) -> bool {
+        self.faults
+            .get(index)
+            .is_some_and(|fault| fault.action == FaultAction::Barrier)
+    }
+
+    /// Each fault with the hits `hits` counted for it, in order; a fault
+    /// `hits` has no count for was not hit.
+    pub fn tallies<'a>(&'a self, hits: &'a [u64]) -> impl Iterator<Item = Tally<'a>> {
+        self.faults
+            .iter()
+            .enumerate()
+            .map(|(index, fault)| fault.tally(hits.get(index).copied().unwrap_or(0)))
+    }
+
+    /// The exchanges the scenario binds, by the step that binds them:
+    /// the session `session_of` gives the client and the Packet
+    /// Identifier.
+    pub fn bound_exchanges(
+        &self,
+        session_of: impl Fn(&str) -> Option<SessionId>,
+    ) -> Result<Exchanges, String> {
+        let mut bound = BTreeMap::new();
+        for step in &self.steps {
+            if let Step::ClientPublish {
+                client,
+                packet_id: Some(packet_id),
+                bind_exchange_as: Some(binding),
+                ..
+            } = step
+            {
+                let session = session_of(client)
+                    .ok_or_else(|| format!("no client {client} in the fixture"))?;
+                bound.insert(binding.clone(), (session, *packet_id));
+            }
+        }
+        Ok(bound)
+    }
+
+    /// The faults at `indices` to arm at a start-up: each index, its
+    /// selection in the terms of the store adapter, and its name. The
+    /// clients' sessions come from `session_of`.
+    pub fn arm(
+        &self,
+        session_of: impl Fn(&str) -> Option<SessionId>,
+        indices: impl IntoIterator<Item = usize>,
+    ) -> Result<Vec<(usize, FaultSpec, &'static str)>, String> {
+        let bound = self.bound_exchanges(session_of)?;
+        let mut armed = Vec::new();
+        for index in indices {
+            let fault = self
+                .faults
+                .get(index)
+                .ok_or_else(|| format!("no fault {index}"))?;
+            let (spec, name) = fault.armed(&bound)?;
+            armed.push((index, spec, name));
+        }
+        Ok(armed)
     }
 }
