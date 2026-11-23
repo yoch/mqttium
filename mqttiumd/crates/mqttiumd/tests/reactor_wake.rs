@@ -1237,3 +1237,58 @@ fn every_acknowledged_qos1_message_is_owed_to_and_reaches_each_subscriber() {
         std::thread::sleep(Duration::from_millis(10));
     }
 }
+
+/// Upstream ticket 1460 on this broker. The count of connections stays
+/// exact through connections that come and go: after forty of them, a
+/// limit of two still admits two and no third, and a place that is freed
+/// is given again.
+#[test]
+fn the_connection_limit_stays_exact_after_many_connections_came_and_went() {
+    let broker = Broker::start_with("limit-exact", &["--max-connections", "2"]);
+    let refused = |address: SocketAddr| {
+        let mut transport = TcpStream::connect(address).unwrap();
+        transport
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        let mut byte = [0u8; 1];
+        transport.read(&mut byte).unwrap_or(0) == 0
+    };
+    // A place is free once the broker has seen the end of its transport.
+    let admitted = |client_id: &str| {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let mut stream = TcpStream::connect(broker.address).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            let mut body = Vec::new();
+            text("MQTT", &mut body);
+            body.extend_from_slice(&[5, 0x02, 0, 60, 0]);
+            text(client_id, &mut body);
+            stream.write_all(&packet(0x10, &body)).unwrap();
+            let mut head = [0u8; 2];
+            if stream.read_exact(&mut head).is_ok() {
+                let mut connack = vec![0; usize::from(head[1])];
+                stream.read_exact(&mut connack).unwrap();
+                assert_eq!((head[0], connack[1]), (0x20, 0));
+                return stream;
+            }
+            assert!(Instant::now() < deadline, "{client_id} was never admitted");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    };
+    for round in 0..20 {
+        let one = admitted(&format!("limit-a-{round}"));
+        let two = admitted(&format!("limit-b-{round}"));
+        // One leaves with a DISCONNECT, the other without a word.
+        let mut one = one;
+        one.write_all(&[0xe0, 0]).unwrap();
+        drop((one, two));
+    }
+    let first = admitted("limit-first");
+    let _second = admitted("limit-second");
+    assert!(refused(broker.address), "a third connection was admitted");
+    drop(first);
+    let _again = admitted("limit-again");
+    assert!(refused(broker.address), "a third connection was admitted");
+}

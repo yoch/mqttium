@@ -483,6 +483,77 @@ fn volatile_mode_returns_to_its_last_snapshot_after_a_kill() {
     );
 }
 
+/// Upstream ticket 1165 on this broker. The broker is killed while a client
+/// with a Will is connected, and only the broker comes back: the Will the
+/// client registered is published, with the payload it registered, and the
+/// session it had asked to keep is kept (record 0034: surviving Armed
+/// occurrences become Pending on restart).
+#[test]
+fn a_kill_with_a_client_connected_publishes_its_will_after_the_restart() {
+    let case = Case::new("will-connected");
+    setup(&case, DURABLE);
+    let broker = case.run("cut", DURABLE, &[]);
+    let (target, present) = connect(broker.address, TARGET, true);
+    assert!(present);
+    broker.kill();
+    drop(target);
+    assert_eq!(
+        restart(&case, DURABLE, false),
+        Observed {
+            client_saw_end_of_stream: false,
+            ended_session_present: true,
+            witness_session_present: true,
+            monitor_received_will: true,
+        }
+    );
+    assert_eq!(published_wills(&case.store()), 1);
+}
+
+/// Upstream ticket 2811 on this broker. Three QoS 1 messages wait for an
+/// offline subscriber. It comes back, reads the first without
+/// acknowledging it, and the broker is killed. After the restart it
+/// receives the three, in order, the one it had read marked as a
+/// redelivery ([MQTT-4.4.0-1]).
+#[test]
+fn queued_messages_survive_a_kill_with_one_delivery_in_flight() {
+    let delivery = |stream: &mut TcpStream| -> (bool, Vec<u8>) {
+        let (first, body) = read_frame(stream).unwrap();
+        assert_eq!(first & 0xf6, 0x32, "a QoS 1 PUBLISH, got {first:#x}");
+        let topic = usize::from(u16::from_be_bytes([body[0], body[1]]));
+        let properties = usize::from(body[4 + topic]);
+        (first & 0x08 != 0, body[5 + topic + properties..].to_vec())
+    };
+    let case = Case::new("queued");
+    setup(&case, DURABLE);
+    let broker = case.run("cut", DURABLE, &[]);
+    let (mut publisher, _) = connect(broker.address, "durability-publisher", false);
+    for id in 1..=3u8 {
+        let mut body = Vec::new();
+        text(STATUS.as_bytes(), &mut body);
+        body.extend_from_slice(&[0, id, 0]);
+        body.extend_from_slice(format!("queued-{id}").as_bytes());
+        publisher.write_all(&packet(0x32, &body)).unwrap();
+        let (first, puback) = read_frame(&mut publisher).unwrap();
+        assert_eq!((first, &puback[..2]), (0x40, &[0, id][..]));
+    }
+    let (mut monitor, present) = connect(broker.address, MONITOR, false);
+    assert!(present);
+    assert_eq!(delivery(&mut monitor), (false, b"queued-1".to_vec()));
+    broker.kill();
+    drop((monitor, publisher));
+
+    let broker = case.run("restart", DURABLE, &[]);
+    let (mut monitor, present) = connect(broker.address, MONITOR, false);
+    assert!(present);
+    assert_eq!(delivery(&mut monitor), (true, b"queued-1".to_vec()));
+    // The broker may have sent the two others before it was killed: they
+    // can be marked as redeliveries too, which the client cannot tell.
+    assert_eq!(delivery(&mut monitor).1, b"queued-2");
+    assert_eq!(delivery(&mut monitor).1, b"queued-3");
+    drop(monitor);
+    broker.stop();
+}
+
 #[cfg(feature = "test-hooks")]
 mod killed {
     use super::*;
