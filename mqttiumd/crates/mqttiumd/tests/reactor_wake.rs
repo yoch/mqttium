@@ -418,6 +418,77 @@ fn a_fan_in_burst_closes_no_publisher() {
     );
 }
 
+/// Record 0063. A subscriber that reads receives a QoS 0 burst whole:
+/// eight publishers write a hundred and twenty-five messages each at once,
+/// a thousand in all, within what the broker keeps waiting for one
+/// subscriber. The output queue of a connection holds sixty-four frames and
+/// the core used to emit a burst without waiting for it, dropping what
+/// found it full; with one I/O thread the subscriber is never drained while
+/// the publishers are read.
+#[test]
+fn a_reading_subscriber_receives_a_qos0_burst_whole() {
+    const PUBLISHERS: u8 = 8;
+    const BURST: u16 = 125;
+    let broker = Broker::start_with("qos0-burst-whole", &["--io-threads", "1"]);
+    let mut subscriber = connect(broker.address, "burst-whole-subscriber");
+    subscribe(&mut subscriber, "burst/whole");
+    let start = std::sync::Arc::new(std::sync::Barrier::new(usize::from(PUBLISHERS)));
+    let writers: Vec<_> = (0..PUBLISHERS)
+        .map(|publisher| {
+            let mut stream = connect(broker.address, &format!("burst-whole-{publisher}"));
+            let start = start.clone();
+            std::thread::spawn(move || {
+                let mut burst = Vec::new();
+                for sequence in 0..BURST {
+                    let mut body = Vec::new();
+                    text("burst/whole", &mut body);
+                    body.push(0);
+                    body.push(publisher);
+                    body.extend_from_slice(&sequence.to_be_bytes());
+                    burst.extend_from_slice(&packet(0x30, &body));
+                }
+                start.wait();
+                stream.write_all(&burst).unwrap();
+                stream.write_all(&[0xc0, 0]).unwrap();
+                assert_eq!(read_packet(&mut stream).0, 0xd0, "PINGRESP");
+                stream
+            })
+        })
+        .collect();
+    let publishers: Vec<TcpStream> = writers
+        .into_iter()
+        .map(|writer| writer.join().unwrap())
+        .collect();
+
+    let mut received = vec![Vec::new(); usize::from(PUBLISHERS)];
+    subscriber
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    let total = usize::from(PUBLISHERS) * usize::from(BURST);
+    // topic 2 + 11, property length 1, payload 3: every packet is the same.
+    let mut frame = [0u8; 2 + 13 + 1 + 3];
+    let mut count = 0;
+    while count < total && subscriber.read_exact(&mut frame).is_ok() {
+        assert_eq!(frame[..2], [0x30, 17], "a QoS 0 PUBLISH");
+        received[usize::from(frame[16])].push(u16::from_be_bytes([frame[17], frame[18]]));
+        count += 1;
+    }
+    assert_eq!(
+        count,
+        total,
+        "messages of the burst are missing: {:?} received per publisher",
+        received.iter().map(Vec::len).collect::<Vec<_>>()
+    );
+    for (publisher, sequence) in received.iter().enumerate() {
+        assert_eq!(
+            sequence,
+            &(0..BURST).collect::<Vec<_>>(),
+            "the burst of publisher {publisher}, whole and in order"
+        );
+    }
+    drop(publishers);
+}
+
 /// The size of the packet is the only bound on the filters of a request:
 /// sixty-five are served as nine unit requests and acknowledged once
 /// (MQTT-3.8.4-5, MQTT-3.10.4-6), and the connection goes on.

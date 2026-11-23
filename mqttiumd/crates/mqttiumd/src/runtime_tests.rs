@@ -456,6 +456,139 @@ fn closing_qos0_without_collecting_written_retires_the_exact_attempt() {
     });
 }
 
+/// The QoS 0 drops the broker recorded, read from complete event lines.
+fn qos0_drops(directory: &Path) -> usize {
+    let events = std::fs::read_to_string(directory.join("events.jsonl")).unwrap();
+    let complete = events.rfind('\n').map_or("", |end| &events[..end]);
+    complete
+        .lines()
+        .filter(|line| line.contains("\"qos0_dropped\""))
+        .count()
+}
+
+/// A subscriber at QoS 0 whose output the test holds: nothing drains it
+/// until the test takes a frame and reports it written. The hundred
+/// messages are published by `publish`, which returns once the broker has
+/// taken each one. No message may be dropped for the queue of the
+/// subscriber, and the hundred leave in the order of their publication.
+fn burst_reaches_a_subscriber_whose_output_is_held(
+    client: &'static [u8],
+    publish: impl Fn(&mut Runtime<'_>, ConnectionGeneration, &mut TcpStream, u8),
+) {
+    const MESSAGES: u8 = 100;
+    with_runtime(128, |runtime, directory| {
+        let (subscriber, mut reader) = peer(runtime);
+        runtime.connect(subscriber, connect_packet(client)).unwrap();
+        until(runtime, |r| r.session_requests.is_empty());
+        assert_eq!(read_frame(&mut reader).0, 0x20);
+        runtime
+            .packet(subscriber, 0x82, vec![0, 1, 0, 0, 1, b't', 0])
+            .unwrap();
+        assert_eq!(served_frame(runtime, &mut reader).0, 0x90);
+        let (publisher, mut writer) = peer(runtime);
+        runtime
+            .connect(publisher, connect_packet(b"burst-publisher"))
+            .unwrap();
+        until(runtime, |r| r.session_requests.is_empty());
+        assert_eq!(read_frame(&mut writer).0, 0x20);
+        until(runtime, |r| {
+            r.inflight.is_empty() && r.inputs.is_empty() && r.frames.is_empty()
+        });
+
+        let (lane, held) = std::sync::mpsc::sync_channel(net::OUTPUT_SLOTS);
+        let original = std::mem::replace(
+            &mut runtime.peers.get_mut(&subscriber).unwrap().io.outgoing,
+            lane.into(),
+        );
+        for index in 0..MESSAGES {
+            publish(runtime, publisher, &mut writer, index);
+        }
+        let settle = |runtime: &mut Runtime<'_>| {
+            for _ in 0..40 {
+                pump(runtime);
+                thread::sleep(Duration::from_millis(1));
+            }
+        };
+        settle(runtime);
+        assert_eq!(
+            qos0_drops(directory),
+            0,
+            "a message was dropped for the output queue of a connected subscriber"
+        );
+        assert!(
+            runtime.peers[&subscriber].closing.is_none(),
+            "the subscriber was closed for its output queue"
+        );
+
+        // Each frame the test takes is reported written; the next ones follow.
+        let mut delivered = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while delivered.len() < usize::from(MESSAGES) && Instant::now() < deadline {
+            let frames: Vec<net::Write> = held.try_iter().collect();
+            assert!(
+                frames.len() <= net::OUTPUT_SLOTS / 2,
+                "{} QoS 0 frames at once leave no room for acknowledgements",
+                frames.len()
+            );
+            for frame in frames {
+                let (effect, connection) = frame.correlation.expect("a correlated PUBLISH");
+                let last = frame
+                    .payload
+                    .as_ref()
+                    .and_then(|payload| payload.as_slice().last().copied())
+                    .or_else(|| frame.bytes.as_slice().last().copied())
+                    .expect("a payload");
+                delivered.push(last);
+                runtime
+                    .written_complete(effect, connection, frame.total_len())
+                    .unwrap();
+            }
+            settle(runtime);
+        }
+        assert_eq!(delivered, (0..MESSAGES).collect::<Vec<_>>());
+        assert_eq!(qos0_drops(directory), 0);
+        runtime.peers.get_mut(&subscriber).unwrap().io.outgoing = original;
+        runtime.packet(subscriber, 0xc0, vec![]).unwrap();
+        assert_eq!(served_frame(runtime, &mut reader), (0xd0, vec![]));
+    });
+}
+
+/// Record 0063. A QoS 0 publication waits for the output of its subscriber
+/// as an acknowledgement does: the core emits a window of frames and the
+/// next ones when a write completes. The broker used to emit the burst at
+/// once and drop what found the queue full, although the subscriber was
+/// connected and its queue the broker's own.
+#[test]
+fn a_qos0_burst_waits_for_the_output_of_its_subscriber_and_keeps_its_order() {
+    burst_reaches_a_subscriber_whose_output_is_held(
+        b"burst-volatile",
+        |runtime, publisher, _, index| {
+            runtime
+                .packet(publisher, 0x30, vec![0, 1, b't', 0, index])
+                .unwrap();
+        },
+    );
+}
+
+/// The same for durable publications delivered to a QoS 0 subscription:
+/// each is consumed in the store before its frame is emitted, so a frame
+/// dropped for a full queue is a message the store no longer owes.
+#[test]
+fn durable_publications_to_a_qos0_subscription_wait_for_its_output() {
+    burst_reaches_a_subscriber_whose_output_is_held(
+        b"burst-consumed",
+        |runtime, publisher, writer, index| {
+            let id = u16::from(index) + 1;
+            let [high, low] = id.to_be_bytes();
+            runtime
+                .packet(publisher, 0x32, vec![0, 1, b't', high, low, 0, index])
+                .unwrap();
+            until(runtime, |r| r.inputs.is_empty() && r.inflight.is_empty());
+            assert_eq!(served_frame(runtime, writer).0, 0x40);
+        },
+    );
+}
+
 fn event_turn_without_scan(runtime: &mut Runtime<'_>) {
     runtime.writer_results().unwrap();
     runtime.connections().unwrap();

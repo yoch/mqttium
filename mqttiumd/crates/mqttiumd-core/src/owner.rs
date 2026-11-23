@@ -9187,6 +9187,154 @@ mod tests {
         result
     }
 
+    /// A world for bursts: the producer on `CONN`, the two subscribers of
+    /// `p1/example` connected on 11 and 12, and room for a thousand
+    /// volatile deliveries.
+    fn burst_world() -> World {
+        let mut wide = config();
+        wide.max_routes = bound(4);
+        wide.max_exchanges = bound(4096);
+        wide.payload_bytes = PayloadBytes::new(1 << 20);
+        let mut world = World::with(wide, EPOCH, CAPACITY);
+        world.applied(page(&fixture(EPOCH), true));
+        for (connection, client) in [(CONN, &b"p1-producer"[..]), (11, b"p1-b"), (12, b"p1-c")] {
+            world.applied(connect(connection, client));
+            let _ = world.drain();
+            world.applied(product_settings(connection, 8));
+            let _ = world.drain();
+        }
+        world
+    }
+
+    /// Runs the continuation of the volatile deliveries until it rests and
+    /// returns what it published besides `Continue`.
+    fn run_volatile(world: &mut World) -> Vec<(EffectId, Effect)> {
+        let mut seen = Vec::new();
+        loop {
+            let mut continuations = Vec::new();
+            for (id, effect) in world.drain() {
+                match effect {
+                    Effect::Continue { continuation } => continuations.push(continuation),
+                    other => seen.push((id, other)),
+                }
+            }
+            if continuations.is_empty() {
+                return seen;
+            }
+            for continuation in continuations {
+                world.applied(Input::Continue {
+                    continuation,
+                    budget: WorkUnits::new(65536),
+                });
+            }
+        }
+    }
+
+    /// The QoS 0 frames among `effects` for the connection `generation`:
+    /// their effect, their connection and the order of their publication.
+    fn volatile_frames(
+        effects: &[(EffectId, Effect)],
+        generation: u64,
+    ) -> Vec<(EffectId, ConnectionKey, u64)> {
+        effects
+            .iter()
+            .filter_map(|(id, effect)| match effect {
+                Effect::EmitQos0 {
+                    connection,
+                    origin: crate::contract::pubsub::Qos0Origin::Volatile { publication },
+                    ..
+                } if connection.generation.get() == generation => {
+                    Some((*id, *connection, publication.ingress_order))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn frame_written(effect: EffectId, connection: ConnectionKey) -> Input {
+        Input::FrameResult {
+            effect,
+            connection,
+            progress: FrameProgress::Written {
+                confirmed: 9,
+                total: 9,
+            },
+        }
+    }
+
+    /// Record 0063: the owner emits a window of QoS 0 frames to a
+    /// connection and the next ones as their writes complete. A burst is
+    /// not handed whole to an output queue that drops what it cannot hold.
+    #[test]
+    fn product_qos0_burst_is_paced_by_the_window_and_resumes_in_order() {
+        const BURST: u64 = 100;
+        const WINDOW: usize = 32;
+        let mut world = burst_world();
+        for order in 1..=BURST {
+            world.applied(qos0_packet(CONN, order, b"p1/example"));
+        }
+        let first = run_volatile(&mut world);
+        assert!(
+            !kinds(&first).contains(&"Qos0Dropped"),
+            "nothing is dropped for a connected subscriber"
+        );
+        let mut waiting = BTreeMap::new();
+        let mut delivered = BTreeMap::new();
+        for generation in [11, 12] {
+            let frames = volatile_frames(&first, generation);
+            assert_eq!(
+                frames.len(),
+                WINDOW,
+                "one window of frames for connection {generation}"
+            );
+            delivered.insert(
+                generation,
+                frames.iter().map(|frame| frame.2).collect::<Vec<_>>(),
+            );
+            waiting.insert(generation, std::collections::VecDeque::from(frames));
+        }
+        assert!(
+            world.owner.pubsub.continuation.is_none(),
+            "nothing runs while every connection has its window in flight"
+        );
+
+        // One write of connection 11 completes: one frame follows, for that
+        // connection, and it is the next publication.
+        let (effect, connection, _) = waiting.get_mut(&11).unwrap().pop_front().unwrap();
+        world.applied(frame_written(effect, connection));
+        let next = run_volatile(&mut world);
+        assert!(volatile_frames(&next, 12).is_empty());
+        let frames = volatile_frames(&next, 11);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].2, 33);
+        delivered.get_mut(&11).unwrap().push(33);
+        waiting.get_mut(&11).unwrap().push_back(frames[0]);
+
+        // Every write completes in its turn.
+        while let Some((&generation, _)) = waiting.iter().find(|(_, frames)| !frames.is_empty()) {
+            let (effect, connection, _) =
+                waiting.get_mut(&generation).unwrap().pop_front().unwrap();
+            world.applied(frame_written(effect, connection));
+            let next = run_volatile(&mut world);
+            assert!(!kinds(&next).contains(&"Qos0Dropped"));
+            for other in [11, 12] {
+                for frame in volatile_frames(&next, other) {
+                    delivered.get_mut(&other).unwrap().push(frame.2);
+                    waiting.get_mut(&other).unwrap().push_back(frame);
+                }
+            }
+        }
+        for generation in [11, 12] {
+            assert_eq!(
+                delivered[&generation],
+                (1..=BURST).collect::<Vec<_>>(),
+                "connection {generation} has the burst whole and in order"
+            );
+        }
+        assert!(world.owner.pubsub.volatile.is_empty());
+        assert!(world.owner.pubsub.continuation.is_none());
+    }
+
     #[test]
     fn product_qos0_write_failure_is_observed_once_and_does_not_touch_mqtt_credits() {
         let mut world = volatile_world();
