@@ -476,8 +476,11 @@ fn until_without_scan(runtime: &mut Runtime<'_>, condition: impl Fn(&Runtime<'_>
 }
 
 fn queued_publications(directory: &Path, generation: ConnectionGeneration) -> usize {
-    std::fs::read_to_string(directory.join("events.jsonl"))
-        .unwrap()
+    // The file is read while the broker writes it: a last line without its
+    // end is an event still being written, not an event.
+    let events = std::fs::read_to_string(directory.join("events.jsonl")).unwrap();
+    let complete = events.rfind('\n').map_or("", |end| &events[..end]);
+    complete
         .lines()
         .filter(|line| {
             let event: serde_json::Value = serde_json::from_str(line).unwrap();
