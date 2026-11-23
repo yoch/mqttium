@@ -894,7 +894,17 @@ fn clients_that_fill_their_announced_window_together_all_complete() {
 /// [MQTT-4.5.0-1], [MQTT-4.6.0-5]).
 #[test]
 fn a_3_1_1_client_with_more_qos2_exchanges_than_the_window_completes_them_all() {
-    const EXCHANGES: u16 = 12;
+    // Twelve; the twenty a common client library keeps in flight; and the
+    // most the broker reads past the publication that waits: its window of
+    // eight, that publication, and one lane of thirty-two packets behind.
+    for exchanges in [12, 20, 41] {
+        qos2_pipeline_completes(exchanges);
+    }
+}
+
+fn qos2_pipeline_completes(exchanges: u16) {
+    #[allow(non_snake_case)]
+    let EXCHANGES = exchanges;
     let broker = Broker::start("qos2-pipeline-311");
     let mut subscriber = Peer::connect(broker.address, "pipeline-subscriber", false);
     let mut body = subscriber.head(1);
@@ -940,8 +950,17 @@ fn a_3_1_1_client_with_more_qos2_exchanges_than_the_window_completes_them_all() 
     completed.sort_unstable();
     assert_eq!(completed, (1..=EXCHANGES).collect::<Vec<_>>());
 
+    let delivered = receive_qos2(&mut subscriber, usize::from(EXCHANGES));
+    let expected: Vec<_> = (1..=EXCHANGES).map(|id| format!("message-{id}")).collect();
+    assert_eq!(delivered, expected, "each message once, in order");
+}
+
+/// The payloads of the next `count` QoS 2 deliveries of a 3.1.1 subscriber,
+/// each exchange completed.
+fn receive_qos2(subscriber: &mut Peer, count: usize) -> Vec<String> {
     let mut delivered = Vec::new();
-    while delivered.len() < usize::from(EXCHANGES) {
+    let mut completed = 0;
+    while completed < count {
         let (first, body) = read_packet(&mut subscriber.stream);
         match first & 0xf0 {
             0x30 => {
@@ -954,13 +973,131 @@ fn a_3_1_1_client_with_more_qos2_exchanges_than_the_window_completes_them_all() 
                     .write_all(&[0x50, 2, id[0], id[1]])
                     .unwrap();
             }
-            0x60 => subscriber
-                .stream
-                .write_all(&[0x70, 2, body[0], body[1]])
-                .unwrap(),
+            0x60 => {
+                subscriber
+                    .stream
+                    .write_all(&[0x70, 2, body[0], body[1]])
+                    .unwrap();
+                completed += 1;
+            }
             other => panic!("packet {other:#x} {body:?}"),
         }
     }
-    let expected: Vec<_> = (1..=EXCHANGES).map(|id| format!("message-{id}")).collect();
-    assert_eq!(delivered, expected, "each message once, in order");
+    delivered
+}
+
+/// A 3.1.1 client that keeps its session (Clean Session 0), and the
+/// Session Present flag of its CONNACK.
+fn resume_311(address: SocketAddr, client_id: &str) -> (TcpStream, bool) {
+    let mut stream = TcpStream::connect(address).unwrap();
+    stream.set_nodelay(true).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    let mut body = Vec::new();
+    text("MQTT", &mut body);
+    body.extend_from_slice(&[4, 0x00, 0, 60]);
+    text(client_id, &mut body);
+    stream.write_all(&packet(0x10, &body)).unwrap();
+    let (first, connack) = read_packet(&mut stream);
+    assert_eq!((first, connack[1]), (0x20, 0), "CONNACK");
+    (stream, connack[0] & 1 == 1)
+}
+
+fn qos2_publish(stream: &mut TcpStream, duplicate: bool, id: u16, payload: &str) {
+    let mut body = Vec::new();
+    text("stale/t", &mut body);
+    body.extend_from_slice(&id.to_be_bytes());
+    body.extend_from_slice(payload.as_bytes());
+    stream
+        .write_all(&packet(if duplicate { 0x3c } else { 0x34 }, &body))
+        .unwrap();
+}
+
+/// The case of upstream ticket 3809: QoS 2 exchanges a 3.1.1 session left
+/// at PUBREC on earlier connections, more of them than the window of one
+/// connection. A PUBREC follows the commit that routes the publication, so
+/// a publication that is acknowledged is delivered: the old ones were
+/// delivered when they were acknowledged, a new one is acknowledged and
+/// delivered once, a duplicate of an old one is acknowledged again and not
+/// delivered again, and every old exchange can still be completed
+/// (MQTT 3.1.1 §4.3.3, §4.4, [MQTT-4.5.0-1]).
+#[test]
+fn stale_qos2_exchanges_of_a_3_1_1_session_do_not_stop_or_lose_a_publication() {
+    const ROUNDS: u16 = 3;
+    const WINDOW: u16 = 8;
+    let broker = Broker::start("stale-qos2-311");
+    let mut subscriber = Peer::connect(broker.address, "stale-subscriber", false);
+    let mut body = subscriber.head(1);
+    text("stale/#", &mut body);
+    body.push(2);
+    subscriber.stream.write_all(&packet(0x82, &body)).unwrap();
+    assert_eq!(subscriber.acknowledged(0x90, 1), [2], "QoS 2 granted");
+
+    // Each connection leaves a full window of exchanges at PUBREC.
+    for round in 0..ROUNDS {
+        let (mut publisher, present) = resume_311(broker.address, "stale-publisher");
+        assert_eq!(present, round > 0, "round {round}");
+        for id in round * WINDOW + 1..=(round + 1) * WINDOW {
+            qos2_publish(&mut publisher, false, id, &format!("old-{id}"));
+        }
+        let mut acknowledged = Vec::new();
+        for _ in 0..WINDOW {
+            let (first, body) = read_packet(&mut publisher);
+            assert_eq!(first, 0x50, "PUBREC, got {body:?}\n{}", broker.refusals());
+            acknowledged.push(u16::from_be_bytes([body[0], body[1]]));
+        }
+        assert_eq!(
+            acknowledged,
+            (round * WINDOW + 1..=(round + 1) * WINDOW).collect::<Vec<_>>()
+        );
+    }
+    let stale = ROUNDS * WINDOW;
+    assert_eq!(
+        receive_qos2(&mut subscriber, usize::from(stale)),
+        (1..=stale)
+            .map(|id| format!("old-{id}"))
+            .collect::<Vec<_>>(),
+        "what was acknowledged was delivered"
+    );
+
+    let (mut publisher, present) = resume_311(broker.address, "stale-publisher");
+    assert!(present);
+    qos2_publish(&mut publisher, false, 1000, "new");
+    assert_eq!(
+        read_packet(&mut publisher),
+        (0x50, vec![3, 232]),
+        "{}",
+        broker.refusals()
+    );
+    assert_eq!(receive_qos2(&mut subscriber, 1), ["new"]);
+    publisher.write_all(&[0x62, 2, 3, 232]).unwrap();
+    assert_eq!(read_packet(&mut publisher), (0x70, vec![3, 232]));
+
+    // A duplicate of an old PUBLISH is acknowledged, not delivered again.
+    qos2_publish(&mut publisher, true, 1, "old-1");
+    assert_eq!(read_packet(&mut publisher), (0x50, vec![0, 1]));
+    for id in 1..=stale {
+        let [high, low] = id.to_be_bytes();
+        publisher.write_all(&[0x62, 2, high, low]).unwrap();
+        assert_eq!(
+            read_packet(&mut publisher),
+            (0x70, vec![high, low]),
+            "{}",
+            broker.refusals()
+        );
+    }
+    // The connection goes on, and the subscriber was sent nothing more.
+    publisher.write_all(&[0xc0, 0]).unwrap();
+    assert_eq!(read_packet(&mut publisher).0, 0xd0);
+    subscriber
+        .stream
+        .set_read_timeout(Some(Duration::from_millis(300)))
+        .unwrap();
+    let mut byte = [0u8; 1];
+    let more = subscriber.stream.read(&mut byte);
+    assert!(
+        matches!(&more, Err(error) if matches!(error.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut)),
+        "a second delivery: {more:?} {byte:?}"
+    );
 }
