@@ -6033,6 +6033,176 @@ fn disconnect_four_before_real_open_reply_survives_source_cleanup_and_admits_onc
     });
 }
 
+/// Serves the runtime for a bounded while and says whether the client stayed
+/// without a frame. A closed socket is silent too.
+fn stays_silent(runtime: &mut Runtime<'_>, client: &mut TcpStream) -> bool {
+    let deadline = Instant::now() + Duration::from_millis(100);
+    let mut first = [0u8; 1];
+    client
+        .set_read_timeout(Some(Duration::from_millis(2)))
+        .unwrap();
+    let mut silent = true;
+    while silent && Instant::now() < deadline {
+        pump(runtime);
+        silent = !client.peek(&mut first).is_ok_and(|read| read > 0);
+    }
+    client
+        .set_read_timeout(Some(Duration::from_secs(1)))
+        .unwrap();
+    silent
+}
+
+/// MQTT 5 §3.14.2.2.2, §3.1.2.11.2 and §4.1: the Session Expiry Interval of a
+/// DISCONNECT replaces the CONNECT value whatever legal reason code carries
+/// it, and zero ends the session with the network connection. §3.1.2.5
+/// [MQTT-3.1.2-8, -10]: only reason 0x00 discards the Will. Each fact is
+/// checked on its own: the durable session, the reply to the client, the
+/// Will, Session Present at the next CONNECT, and the former subscription.
+fn disconnect_with_zero_expiry_ends_the_session(reason: u8, expected_wills: usize) {
+    with_runtime(128, |runtime, directory| {
+        const STATUS: &[u8] = b"atelier/sensor/status";
+        const COMMAND: &[u8] = b"atelier/sensor/command";
+        let subscribe = |filter: &[u8]| {
+            let mut body = vec![0, 1, 0, 0, filter.len() as u8];
+            body.extend_from_slice(filter);
+            body.push(1);
+            body
+        };
+        let inspect = |directory: &Path| {
+            mqttiumd_store_sqlite::SqliteStore::inspect(&directory.join("store.sqlite")).unwrap()
+        };
+        let (monitor, mut monitor_client) = peer(runtime);
+        runtime
+            .connect(monitor, connect_packet(b"will-monitor"))
+            .unwrap();
+        until(runtime, |r| r.session_requests.is_empty());
+        assert_eq!(read_frame(&mut monitor_client).0, 0x20);
+        runtime.packet(monitor, 0x82, subscribe(STATUS)).unwrap();
+        until(runtime, |r| r.inflight.is_empty() && r.inputs.is_empty());
+        assert_eq!(read_frame(&mut monitor_client).0, 0x90);
+
+        let name = b"expiring-sensor";
+        let (generation, mut client) = peer(runtime);
+        runtime
+            .connect(generation, will_connect(name, SessionExpiry::After(600)))
+            .unwrap();
+        until(runtime, |r| r.session_requests.is_empty());
+        assert_eq!(read_frame(&mut client).0, 0x20);
+        let original = runtime.peers[&generation].session.unwrap();
+        runtime
+            .packet(generation, 0x82, subscribe(COMMAND))
+            .unwrap();
+        until(runtime, |r| r.inflight.is_empty() && r.inputs.is_empty());
+        assert_eq!(read_frame(&mut client).0, 0x90);
+        let before = inspect(directory);
+        assert!(before.sessions.contains_key(&original));
+        assert_eq!(before.routes.len(), 2);
+
+        runtime
+            .packet(generation, 0xe0, vec![reason, 5, 0x11, 0, 0, 0, 0])
+            .unwrap();
+        until(runtime, |r| {
+            !r.peers.contains_key(&generation)
+                && !r.owner.session_status().lifecycle_pending
+                && r.lifecycle_inflight.is_empty()
+                && r.closing_inputs.is_empty()
+        });
+        let after = inspect(directory);
+        assert!(
+            !after.sessions.contains_key(&original),
+            "disconnect_{reason:#04x}_expiry_zero_kept_the_session"
+        );
+        assert_eq!(
+            after.routes.len(),
+            1,
+            "disconnect_{reason:#04x}_expiry_zero_kept_the_subscription"
+        );
+        // A DISCONNECT is the last packet of its sender and has no answer.
+        let mut byte = [0u8; 1];
+        assert_eq!(
+            client.read(&mut byte).unwrap(),
+            0,
+            "disconnect_{reason:#04x}_was_answered_with_{:#04x}",
+            byte[0]
+        );
+
+        runtime.queue(Input::DiscoverWills).unwrap();
+        runtime.drain_inputs().unwrap();
+        until(runtime, |r| {
+            !r.owner.will_status().reading
+                && !r.owner.will_status().admission_pending
+                && r.will_reads.is_none()
+        });
+        let settled = inspect(directory);
+        assert!(settled.wills.is_empty(), "will_left_armed_after_disconnect");
+        let published = settled
+            .operations
+            .values()
+            .filter(|row| {
+                matches!(
+                    row.decision,
+                    mqttiumd_store_api::Decision::Committed(CommitFacts::WillPublished { .. })
+                )
+            })
+            .count();
+        assert_eq!(
+            published, expected_wills,
+            "disconnect_{reason:#04x}_will_admissions"
+        );
+        if expected_wills == 1 {
+            let (header, body) = served_frame(runtime, &mut monitor_client);
+            assert_eq!(header & 0xf0, 0x30);
+            assert_eq!(&body[2..2 + STATUS.len()], STATUS);
+            assert!(body.ends_with(b"offline-private"));
+        }
+        assert!(
+            stays_silent(runtime, &mut monitor_client),
+            "disconnect_{reason:#04x}_extra_will_delivery"
+        );
+
+        let (next, mut next_client) = peer(runtime);
+        runtime.connect(next, connect_packet(name)).unwrap();
+        until(runtime, |r| r.session_requests.is_empty());
+        let (kind, body) = read_frame(&mut next_client);
+        assert_eq!(kind, 0x20);
+        assert_eq!(
+            &body[..2],
+            &[0, 0],
+            "disconnect_{reason:#04x}_expiry_zero_session_present"
+        );
+        let mut command = vec![0, COMMAND.len() as u8];
+        command.extend_from_slice(COMMAND);
+        command.extend_from_slice(&[0, 9, 0, b'v']);
+        runtime.packet(monitor, 0x32, command).unwrap();
+        let (header, body) = served_frame(runtime, &mut monitor_client);
+        assert_eq!((header, &body[..2]), (0x40, &[0, 9][..]));
+        assert!(
+            stays_silent(runtime, &mut next_client),
+            "disconnect_{reason:#04x}_former_subscription_delivered"
+        );
+    });
+}
+
+#[test]
+fn normal_disconnect_with_zero_expiry_ends_the_session_and_discards_the_will() {
+    disconnect_with_zero_expiry_ends_the_session(0x00, 0);
+}
+
+#[test]
+fn disconnect_with_will_message_and_zero_expiry_ends_the_session_and_publishes_the_will_once() {
+    disconnect_with_zero_expiry_ends_the_session(0x04, 1);
+}
+
+#[test]
+fn unspecified_error_disconnect_with_zero_expiry_ends_the_session_and_publishes_the_will_once() {
+    disconnect_with_zero_expiry_ends_the_session(0x80, 1);
+}
+
+#[test]
+fn implementation_error_disconnect_with_zero_expiry_ends_the_session_and_publishes_the_will_once() {
+    disconnect_with_zero_expiry_ends_the_session(0x83, 1);
+}
+
 #[test]
 fn takeover_waits_for_old_will_admission_and_old_close_cannot_publish_new_will() {
     with_runtime(128, |runtime, directory| {

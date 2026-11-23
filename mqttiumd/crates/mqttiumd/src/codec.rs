@@ -2436,6 +2436,34 @@ mod tests {
         );
     }
 
+    /// MQTT 5 §3.14.2.1: every reason code a client may send is a
+    /// disconnection, not a refused packet. §3.14.2.2.2: its Session Expiry
+    /// Interval is carried whatever the reason. §3.1.2.5: only 0x00 discards
+    /// the Will.
+    #[test]
+    fn every_legal_client_disconnect_reason_carries_its_expiry_and_publishes_the_will() {
+        for reason in [
+            4u8, 0x80, 0x81, 0x82, 0x83, 0x90, 0x93, 0x94, 0x95, 0x96, 0x97, 0x98, 0x99,
+        ] {
+            assert_eq!(
+                decode(0xe0, &[reason], BOUNDS),
+                Ok(Packet::Disconnect {
+                    expiry: None,
+                    publish_will: true
+                }),
+                "reason {reason:#04x}"
+            );
+            assert_eq!(
+                decode(0xe0, &[reason, 5, 0x11, 0, 0, 0, 0], BOUNDS),
+                Ok(Packet::Disconnect {
+                    expiry: Some(SessionExpiry::OnDisconnect),
+                    publish_will: true
+                }),
+                "reason {reason:#04x} with Session Expiry Interval 0"
+            );
+        }
+    }
+
     #[test]
     fn session_connect_matrix_keeps_absent_zero_infinite_and_clean_start_explicit() {
         for clean_start in [false, true] {
