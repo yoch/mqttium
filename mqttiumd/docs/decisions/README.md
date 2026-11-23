@@ -73,6 +73,7 @@ its source; a test fails when the register and the records drift apart.
 | [0056](0056-claimed-publication-and-core-optimizations.md) | Proposed | Atomic online admission+claim (`Recipe::ClaimedPublication`, kind 24), `ScopedMap` prefix stripping, Redis-compact runtime/core tables, O(1) `Outbox` control counters, and hash-indexed exact `RouteIndex` | Contract, core, stores, runtime |
 | [0057](0057-flatmap-direct-volatile-and-zero-alloc-framing.md) | Proposed | Deterministic open-addressed `FlatMap`, direct synchronous `VolatileStore`, inline `FrameBytes` and the active-peer `ReadyQueue` (Lot 7) | Contract, core, `mqttiumd-store-volatile`, runtime |
 | [0058](0058-client-disconnect-reasons-and-tls-close-notify.md) | Proposed | Every legal client DISCONNECT reason code applies its Session Expiry Interval and publishes the Will unless 0x00; Will QoS 3 is malformed; an empty Topic Name is Protocol Error 0x82; close_notify on an orderly TLS close | Runtime |
+| [0059](0059-disconnect-durability-boundary.md) | Proposed | The end of a session is durable at its commit and at nothing earlier; the end of the client's stream is not an acknowledgement; the event by storage mode | Runtime |
 
 What each record leaves open is tracked in
 [`../reception/open-conditions.md`](../reception/open-conditions.md).

@@ -112,7 +112,7 @@ From `mqttiumd/`, with `env -u CARGO_TARGET_DIR -u CARGO_ENCODED_RUSTFLAGS`:
 | `cargo clippy -p mqttiumd --all-targets --features test-hooks --locked -- -D warnings` | clean |
 | `cargo test -p mqttiumd --locked` | pass: 193 unit tests of the library, 3 of the binary and 45 in the nine integration files, 0 failed |
 | `cargo test -p mqttiumd --features test-hooks --locked` | pass: 203 unit tests of the library, 3 of the binary and 45 in the nine integration files, 0 failed |
-| `cargo test --workspace --locked` | pass: 39 test binaries, 768 tests, 0 failed |
+| `cargo test --workspace --locked` | pass, 0 failed. Corrected on 23 November 2026: the count first written here (39 test binaries, 768 tests) came from a summary command that truncated the output. Report 0032, one test file later, counts 83 result lines and 1341 tests |
 | `cargo run -q -p mqttiumd-lab -- validate --contracts contracts/v1 --scenario tests/scenarios/p1/P1-02.json` | `accepted: 17 documents checked`, `contracts sha256:ee48f76f754069226c0a28f6aa577d60608be41e4609c53b75cc0c0ed7ab6a5b` |
 | `python3 tools/build_corpus.py --check` | 624 derived files, 0 not up to date, 0 stale |
 | `python3 conformance/check.py --check` (from the repository root) | pass; MQTT 5.0: 251 statements, 148 covered; MQTT 3.1.1: 139 statements, 83 covered |

@@ -196,6 +196,23 @@ malformed encodings remain protocol/malformed errors. Finite overrides are
 supported; they do not reset a deadline when a command result is delayed. DISCONNECT has no MQTT ACK:
 local client completion alone does not establish durable termination.
 
+The broker closes the transport before it commits the end of the session
+([ADR 0059](decisions/0059-disconnect-durability-boundary.md)). The end of
+the client's stream, or close_notify, is therefore not an acknowledgement.
+The end is durable when the lifecycle command commits:
+
+| `--storage-mode` | The end of a session is durable when |
+| - | - |
+| `durable` | the SQLite `COMMIT` returns |
+| `log` | the `fdatasync` of the record returns |
+| `volatile` | the next snapshot is written, or never without snapshots |
+
+If the process is lost before that commit, a session opened with a non-zero
+interval and ended with interval 0 is resumed (Session Present 1), and a
+Will that a normal DISCONNECT cancelled is published by the restart. The
+`session_changed` event (`Closed` or `Detached`) is written once the store
+has answered.
+
 [ADR 0029](decisions/0029-explicit-session-lifecycle.md) defines the
 atomic target-only cancellation and lifecycle authority. Ending a session
 cancels its own filters, deliveries, claims and incoming markers. Publications
