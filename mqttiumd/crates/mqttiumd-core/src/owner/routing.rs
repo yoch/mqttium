@@ -147,10 +147,68 @@ impl TrieNode {
     }
 }
 
-/// Deterministic exact-map + wildcard trie pointing at indices in `Owner::routes`.
+/// Deterministic 64-bit FNV-1a hash for exact-topic bucket lookup.
+/// Buckets always verify full byte equality so collisions are handled exactly
+/// with deterministic ordering (FlashMQ/Redis-inspired fast exact routing).
+fn topic_hash64(bytes: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in bytes {
+        h ^= u64::from(b);
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
+#[derive(Debug)]
+enum ExactBucket {
+    Single(SharedBytes, Vec<usize>),
+    Collision(Vec<(SharedBytes, Vec<usize>)>),
+}
+
+impl ExactBucket {
+    fn get(&self, topic: &[u8]) -> Option<&[usize]> {
+        match self {
+            Self::Single(key, indices) => (key.as_slice() == topic).then_some(indices.as_slice()),
+            Self::Collision(entries) => entries
+                .iter()
+                .find(|(key, _)| key.as_slice() == topic)
+                .map(|(_, indices)| indices.as_slice()),
+        }
+    }
+
+    fn insert(&mut self, topic: SharedBytes, route_idx: usize) {
+        match self {
+            Self::Single(key, indices) => {
+                if key.as_slice() == topic.as_slice() {
+                    indices.push(route_idx);
+                } else {
+                    let prev_key = key.clone();
+                    let prev_indices = core::mem::take(indices);
+                    *self = Self::Collision(alloc::vec![
+                        (prev_key, prev_indices),
+                        (topic, alloc::vec![route_idx]),
+                    ]);
+                }
+            }
+            Self::Collision(entries) => {
+                if let Some((_, indices)) = entries
+                    .iter_mut()
+                    .find(|(key, _)| key.as_slice() == topic.as_slice())
+                {
+                    indices.push(route_idx);
+                } else {
+                    entries.push((topic, alloc::vec![route_idx]));
+                }
+            }
+        }
+    }
+}
+
+/// Deterministic hash-indexed exact-map + wildcard trie pointing at indices in
+/// `Owner::routes`.
 #[derive(Debug, Default)]
 pub(super) struct RouteIndex {
-    exact: BTreeMap<SharedBytes, Vec<usize>>,
+    exact: FlatMap<u64, ExactBucket>,
     wildcard: TrieNode,
     wildcard_count: usize,
     total: usize,
@@ -178,10 +236,15 @@ impl RouteIndex {
             self.wildcard.insert(bytes, index);
             self.wildcard_count += 1;
         } else {
-            self.exact
-                .entry(route.topic.clone())
-                .or_default()
-                .push(index);
+            let hash = topic_hash64(bytes);
+            if let Some(bucket) = self.exact.get_mut(&hash) {
+                bucket.insert(route.topic.clone(), index);
+            } else {
+                self.exact.insert(
+                    hash,
+                    ExactBucket::Single(route.topic.clone(), alloc::vec![index]),
+                );
+            }
         }
         self.total += 1;
     }
@@ -201,7 +264,7 @@ impl RouteIndex {
         &self,
         routes: &[Route],
         sessions: &[Session],
-        session_by_id: &BTreeMap<SessionId, usize>,
+        session_by_id: &FlatMap<SessionId, usize>,
         source: SessionId,
         topic: &[u8],
         qos: Qos,
@@ -222,7 +285,7 @@ impl RouteIndex {
         &self,
         routes: &[Route],
         sessions: &[Session],
-        session_by_id: &BTreeMap<SessionId, usize>,
+        session_by_id: &FlatMap<SessionId, usize>,
         source: Option<&[u8]>,
         topic: &[u8],
         qos: Qos,
@@ -305,7 +368,11 @@ impl RouteIndex {
             }
         };
 
-        if let Some(exact_indices) = self.exact.get(topic) {
+        if let Some(exact_indices) = self
+            .exact
+            .get(&topic_hash64(topic))
+            .and_then(|bucket| bucket.get(topic))
+        {
             apply_bucket(exact_indices);
         }
         if self.wildcard_count > 0 {
@@ -742,6 +809,7 @@ mod tests {
                 max_sessions: bound(128),
                 max_routes: bound(128),
                 max_exchanges: bound(128),
+                session_qos2_exchanges: NonZeroU32::MAX,
                 account: AccountId::new(1),
                 payload_bytes: PayloadBytes::new(4 * 1024 * 1024),
                 resolution_delay: LogicalDuration::new(10000),
@@ -968,7 +1036,7 @@ mod tests {
         apply(
             owner,
             Input::StoreResult {
-                effect: flight.answers.persist,
+                effect: flight.answers.persist_id(),
                 operation: flight.operation,
                 reply: StoreReply::Outcome(reply),
             },
@@ -1304,7 +1372,7 @@ mod tests {
             b"A",
         ];
         let mut sessions = Vec::new();
-        let mut session_by_id = BTreeMap::new();
+        let mut session_by_id = FlatMap::new();
         for id in 1..=20u64 {
             session_by_id.insert(SessionId::new(id), sessions.len());
             sessions.push(session(id));
@@ -1367,7 +1435,7 @@ mod tests {
     fn wide_fanout_1024_targets_selects_in_canonical_order() {
         let count = MAX_TARGETS;
         let mut sessions = Vec::with_capacity(count);
-        let mut session_by_id = BTreeMap::new();
+        let mut session_by_id = FlatMap::new();
         let mut routes = Vec::with_capacity(count);
         for i in (1..=count as u64).rev() {
             session_by_id.insert(SessionId::new(i), sessions.len());

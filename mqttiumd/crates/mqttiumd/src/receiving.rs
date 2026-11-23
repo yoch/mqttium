@@ -2,8 +2,6 @@
 //! not only its reusable packet identifier. A delayed terminal ACK receipt
 //! cannot free a later exchange's slot, including a use with another QoS.
 
-use std::collections::BTreeMap;
-
 use mqttiumd_contract::packet::Qos;
 
 pub const MAXIMUM: usize = 8;
@@ -30,27 +28,69 @@ struct Occurrence {
     qos: Qos,
 }
 
-#[derive(Default)]
+const EMPTY_OCCURRENCE: Occurrence = Occurrence {
+    serial: 0,
+    qos: Qos::AtMostOnce,
+};
+
+/// Inline compact receive-window table (`MAXIMUM = 8`), inspired by Redis
+/// `listpack`: zero heap allocation per connection and single-cache-line scan.
 pub struct Window {
-    receiving: BTreeMap<u16, Occurrence>,
+    entries: [(u16, Occurrence); MAXIMUM],
+    len: u8,
+}
+
+impl Default for Window {
+    fn default() -> Self {
+        Self {
+            entries: [(0, EMPTY_OCCURRENCE); MAXIMUM],
+            len: 0,
+        }
+    }
 }
 
 impl Window {
+    #[inline]
+    fn find(&self, id: u16) -> Option<usize> {
+        let len = usize::from(self.len);
+        self.entries[..len].iter().position(|(key, _)| *key == id)
+    }
+
+    #[inline]
+    fn remove_at(&mut self, idx: usize) {
+        let last = usize::from(self.len) - 1;
+        self.entries[idx] = self.entries[last];
+        self.len = last as u8;
+    }
+
     /// Isolated test mutation: deliberately discard the occurrence and QoS
     /// guards. This entry point is absent from a normal product build.
     #[cfg(feature = "test-hooks")]
     pub fn complete_current(&mut self, id: u16) -> bool {
-        self.receiving.remove(&id).is_some()
+        if let Some(idx) = self.find(id) {
+            self.remove_at(idx);
+            true
+        } else {
+            false
+        }
     }
+
     /// Refreshing a reusable identifier does not consume another receive
     /// slot. Older accepted frames retain their own frozen occurrence serial.
     pub fn publish_qos(&mut self, id: u16, serial: u64, qos: Qos) -> Result<(), ()> {
-        if qos == Qos::AtMostOnce
-            || (!self.receiving.contains_key(&id) && self.receiving.len() >= MAXIMUM)
-        {
+        if qos == Qos::AtMostOnce {
             return Err(());
         }
-        self.receiving.insert(id, Occurrence { serial, qos });
+        if let Some(idx) = self.find(id) {
+            self.entries[idx].1 = Occurrence { serial, qos };
+            return Ok(());
+        }
+        let len = usize::from(self.len);
+        if len >= MAXIMUM {
+            return Err(());
+        }
+        self.entries[len] = (id, Occurrence { serial, qos });
+        self.len = (len + 1) as u8;
         Ok(())
     }
 
@@ -58,28 +98,37 @@ impl Window {
     /// releases its credit. The caller supplies a core-frozen serial, never
     /// one inferred later from the current use of the Packet Identifier.
     pub fn complete_frame(&mut self, id: u16, serial: Option<u64>, terminal: Terminal) -> bool {
-        if self.can_complete_frame(id, serial, terminal) {
-            self.receiving.remove(&id);
-            return true;
+        let Some(serial) = serial else {
+            return false;
+        };
+        let Some(idx) = self.find(id) else {
+            return false;
+        };
+        let occurrence = self.entries[idx].1;
+        if occurrence.serial == serial && occurrence.qos == terminal.qos() {
+            self.remove_at(idx);
+            true
+        } else {
+            false
         }
-        false
     }
 
     pub fn can_complete_frame(&self, id: u16, serial: Option<u64>, terminal: Terminal) -> bool {
         serial.is_some_and(|serial| {
-            self.receiving.get(&id).is_some_and(|occurrence| {
+            self.find(id).is_some_and(|idx| {
+                let occurrence = self.entries[idx].1;
                 occurrence.serial == serial && occurrence.qos == terminal.qos()
             })
         })
     }
 
     pub fn contains(&self, id: u16) -> bool {
-        self.receiving.contains_key(&id)
+        self.find(id).is_some()
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
     pub fn serial(&self, id: u16) -> Option<u64> {
-        self.receiving.get(&id).map(|occurrence| occurrence.serial)
+        self.find(id).map(|idx| self.entries[idx].1.serial)
     }
 }
 

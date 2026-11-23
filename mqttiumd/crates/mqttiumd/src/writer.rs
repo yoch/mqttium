@@ -40,6 +40,10 @@ pub enum StorageMode {
     /// SQLite WAL + `synchronous=FULL` (every commit fsynced before reply).
     #[default]
     Durable,
+    /// Log-first durable store: CRC-32C-framed append-only journal (`.mlog`)
+    /// with per-group `fdatasync` before reply + indexed in-memory state +
+    /// periodic and shutdown atomic Schema-14 / Schema-15 SQLite checkpoints.
+    Log,
     /// Indexed in-memory `VolatileStore` with optional periodic atomic SQLite
     /// snapshots. Never implicitly substitutes for `Durable`.
     Volatile {
@@ -53,6 +57,7 @@ impl StorageMode {
     pub const fn mode_name(self) -> &'static str {
         match self {
             Self::Durable => "durable",
+            Self::Log => "log",
             Self::Volatile { .. } => "volatile",
         }
     }
@@ -61,6 +66,7 @@ impl StorageMode {
     pub const fn durability_guarantee(self) -> &'static str {
         match self {
             Self::Durable => "per_commit_fsync_wal_full",
+            Self::Log => "per_commit_fdatasync_append_log",
             Self::Volatile {
                 snapshot_interval: Some(_),
             } => "periodic_atomic_snapshot",
@@ -73,7 +79,7 @@ impl StorageMode {
     #[must_use]
     pub const fn snapshot_interval_secs(self) -> u64 {
         match self {
-            Self::Durable => 0,
+            Self::Durable | Self::Log => 0,
             Self::Volatile { snapshot_interval } => match snapshot_interval {
                 Some(duration) => duration.as_secs(),
                 None => 0,
@@ -85,6 +91,7 @@ impl StorageMode {
 #[allow(clippy::large_enum_variant)]
 enum StoreBackend {
     Durable(SqliteStore),
+    Log(mqttiumd_store_volatile::LogStore),
     Volatile {
         handle: mqttiumd_store_volatile::VolatileHandle,
         snapshot_interval: Option<Duration>,
@@ -97,6 +104,7 @@ impl StoreBackend {
     fn has_will_for_client(&self, client: &[u8]) -> Result<bool, ReadError> {
         match self {
             Self::Durable(s) => s.has_will_for_client(client),
+            Self::Log(s) => s.has_will_for_client(client),
             Self::Volatile { handle, .. } => handle.has_will_for_client(client),
         }
     }
@@ -107,6 +115,7 @@ impl StoreBackend {
     ) -> Result<Vec<mqttiumd_store_api::Applied>, mqttiumd_store_sqlite::GroupRefused> {
         match self {
             Self::Durable(s) => s.apply_group(commands),
+            Self::Log(s) => s.apply_group(commands),
             Self::Volatile { handle, dirty, .. } => {
                 let res = handle.apply_group(commands)?;
                 if res.iter().any(|r| r.wrote) {
@@ -118,37 +127,62 @@ impl StoreBackend {
     }
 
     fn maybe_snapshot(&mut self, events: &Events, force: bool) -> Result<(), Failure> {
-        let Self::Volatile {
-            handle,
-            snapshot_interval: Some(interval),
-            last_snapshot,
-            dirty,
-        } = self
-        else {
-            return Ok(());
-        };
-        if !*dirty || (!force && last_snapshot.elapsed() < *interval) {
-            return Ok(());
-        }
-        match handle.save_snapshot() {
-            Ok(()) => {
-                *last_snapshot = Instant::now();
-                *dirty = false;
-                let _ = events.emit(
-                    "volatile_snapshot_saved",
-                    json!({"details":{"forced":force}}),
-                );
-                Ok(())
+        match self {
+            Self::Durable(_) => Ok(()),
+            Self::Log(store) => {
+                if !force {
+                    return Ok(());
+                }
+                match store.compact() {
+                    Ok(()) => {
+                        let _ =
+                            events.emit("log_checkpoint_saved", json!({"details":{"forced":true}}));
+                        Ok(())
+                    }
+                    Err(error) => {
+                        let read_err = error.read_error();
+                        let _ = events.emit(
+                            "log_checkpoint_failed",
+                            json!({"details":{"cause":read_err.code(),"forced":true}}),
+                        );
+                        Err(Failure::read(read_err, ReadPhase::Snapshot))
+                    }
+                }
             }
-            Err(error) => {
-                *last_snapshot = Instant::now();
-                let read_err = error.read_error();
-                let _ = events.emit(
-                    "volatile_snapshot_failed",
-                    json!({"details":{"cause":read_err.code(),"forced":force}}),
-                );
-                Err(Failure::read(read_err, ReadPhase::Snapshot))
+            Self::Volatile {
+                handle,
+                snapshot_interval: Some(interval),
+                last_snapshot,
+                dirty,
+            } => {
+                if !*dirty || (!force && last_snapshot.elapsed() < *interval) {
+                    return Ok(());
+                }
+                match handle.save_snapshot() {
+                    Ok(()) => {
+                        *last_snapshot = Instant::now();
+                        *dirty = false;
+                        let _ = events.emit(
+                            "volatile_snapshot_saved",
+                            json!({"details":{"forced":force}}),
+                        );
+                        Ok(())
+                    }
+                    Err(error) => {
+                        *last_snapshot = Instant::now();
+                        let read_err = error.read_error();
+                        let _ = events.emit(
+                            "volatile_snapshot_failed",
+                            json!({"details":{"cause":read_err.code(),"forced":force}}),
+                        );
+                        Err(Failure::read(read_err, ReadPhase::Snapshot))
+                    }
+                }
             }
+            Self::Volatile {
+                snapshot_interval: None,
+                ..
+            } => Ok(()),
         }
     }
 
@@ -159,7 +193,7 @@ impl StoreBackend {
     ) -> Result<(), mqttiumd_store_sqlite::OpenError> {
         match self {
             Self::Durable(s) => s.set_kill_hook(hook),
-            Self::Volatile { .. } => Ok(()),
+            Self::Log(_) | Self::Volatile { .. } => Ok(()),
         }
     }
 
@@ -180,6 +214,7 @@ impl DurableStore for StoreBackend {
     ) -> Result<WillPage, ReadError> {
         match self {
             Self::Durable(s) => s.read_wills(after, limit, budget),
+            Self::Log(s) => s.read_wills(after, limit, budget),
             Self::Volatile { handle, .. } => handle.read_wills(after, limit, budget),
         }
     }
@@ -192,6 +227,7 @@ impl DurableStore for StoreBackend {
     ) -> Result<mqttiumd_store_api::MessageExpirySweep, ReadError> {
         match self {
             Self::Durable(s) => s.expire_messages(now, after, limit),
+            Self::Log(s) => s.expire_messages(now, after, limit),
             Self::Volatile { handle, dirty, .. } => {
                 let res = handle.expire_messages(now, after, limit)?;
                 if !res.removed.is_empty() || res.retained_removed > 0 {
@@ -209,6 +245,7 @@ impl DurableStore for StoreBackend {
     ) -> Result<SessionClockAnchor, ReadError> {
         match self {
             Self::Durable(s) => s.checkpoint_session_clock(expected, reading),
+            Self::Log(s) => s.checkpoint_session_clock(expected, reading),
             Self::Volatile { handle, dirty, .. } => {
                 let anchor = handle.checkpoint_session_clock(expected, reading)?;
                 *dirty = true;
@@ -223,6 +260,7 @@ impl DurableStore for StoreBackend {
     ) -> Result<ReceiptCollectionReply, ReadError> {
         match self {
             Self::Durable(s) => s.collect_receipts(collection),
+            Self::Log(s) => s.collect_receipts(collection),
             Self::Volatile { handle, dirty, .. } => {
                 let reply = handle.collect_receipts(collection)?;
                 if matches!(reply, ReceiptCollectionReply::Applied { .. }) {
@@ -239,6 +277,7 @@ impl DurableStore for StoreBackend {
     ) -> Result<Option<mqttiumd_contract::receipts::ReceiptClosure>, ReadError> {
         match self {
             Self::Durable(s) => s.receipt_frontier(origin),
+            Self::Log(s) => s.receipt_frontier(origin),
             Self::Volatile { handle, .. } => handle.receipt_frontier(origin),
         }
     }
@@ -249,6 +288,7 @@ impl DurableStore for StoreBackend {
     ) -> Result<ClosedReceiptReply, ReadError> {
         match self {
             Self::Durable(s) => s.collect_closed_receipts(collection),
+            Self::Log(s) => s.collect_closed_receipts(collection),
             Self::Volatile { handle, dirty, .. } => {
                 let reply = handle.collect_closed_receipts(collection)?;
                 if matches!(reply, ClosedReceiptReply::Applied { .. }) {
@@ -262,6 +302,7 @@ impl DurableStore for StoreBackend {
     fn ledger(&self) -> Result<mqttiumd_contract::command::EpochLedger, ReadError> {
         match self {
             Self::Durable(s) => s.ledger(),
+            Self::Log(s) => s.ledger(),
             Self::Volatile { handle, .. } => handle.ledger(),
         }
     }
@@ -272,6 +313,7 @@ impl DurableStore for StoreBackend {
     ) -> Result<mqttiumd_contract::outcome::OpeningOutcome, ReadError> {
         match self {
             Self::Durable(s) => s.open_epoch(command),
+            Self::Log(s) => s.open_epoch(command),
             Self::Volatile { handle, dirty, .. } => {
                 let res = handle.open_epoch(command)?;
                 *dirty = true;
@@ -286,6 +328,7 @@ impl DurableStore for StoreBackend {
     ) -> mqttiumd_store_api::Applied {
         match self {
             Self::Durable(s) => s.apply(command),
+            Self::Log(s) => s.apply(command),
             Self::Volatile { handle, dirty, .. } => {
                 let res = handle.apply(command);
                 if res.wrote {
@@ -302,6 +345,7 @@ impl DurableStore for StoreBackend {
     ) -> Result<Option<mqttiumd_contract::outcome::StoreOutcome>, ReadError> {
         match self {
             Self::Durable(s) => s.established(operation),
+            Self::Log(s) => s.established(operation),
             Self::Volatile { handle, .. } => handle.established(operation),
         }
     }
@@ -309,6 +353,7 @@ impl DurableStore for StoreBackend {
     fn resolve_and_fence(&mut self, operation: OperationId) -> mqttiumd_store_api::Resolved {
         match self {
             Self::Durable(s) => s.resolve_and_fence(operation),
+            Self::Log(s) => s.resolve_and_fence(operation),
             Self::Volatile { handle, dirty, .. } => {
                 let res = handle.resolve_and_fence(operation);
                 if res.fenced_now {
@@ -325,6 +370,7 @@ impl DurableStore for StoreBackend {
     ) -> Result<AdminDone, mqttiumd_store_api::AdminRefused> {
         match self {
             Self::Durable(s) => s.admin(command),
+            Self::Log(s) => s.admin(command),
             Self::Volatile { handle, dirty, .. } => {
                 let res = handle.admin(command)?;
                 *dirty = true;
@@ -341,6 +387,7 @@ impl DurableStore for StoreBackend {
     ) -> Result<RecoveryPage, RecoveryRefused> {
         match self {
             Self::Durable(s) => s.recover_with_budget(cursor, limit, budget),
+            Self::Log(s) => s.recover_with_budget(cursor, limit, budget),
             Self::Volatile { handle, .. } => handle.recover_with_budget(cursor, limit, budget),
         }
     }
@@ -354,6 +401,7 @@ impl DurableStore for StoreBackend {
     ) -> Result<WorkPage, ReadError> {
         match self {
             Self::Durable(s) => s.read_work_with_budget(session, after, limit, budget),
+            Self::Log(s) => s.read_work_with_budget(session, after, limit, budget),
             Self::Volatile { handle, .. } => {
                 handle.read_work_with_budget(session, after, limit, budget)
             }
@@ -366,6 +414,7 @@ impl DurableStore for StoreBackend {
     ) -> Result<mqttiumd_store_api::DurableState, ReadError> {
         match self {
             Self::Durable(s) => s.snapshot_with_budget(budget),
+            Self::Log(s) => s.snapshot_with_budget(budget),
             Self::Volatile { handle, .. } => handle.snapshot_with_budget(budget),
         }
     }
@@ -430,7 +479,9 @@ pub fn recipe_kind(recipe: &Recipe) -> &'static str {
         Recipe::MarkDeliveryStarted(_) => "DeliveryStarted",
         Recipe::PreparePubrel(_) => "DeliveryPubrelReady",
         Recipe::ExpireDelivery(_) => "MessageExpire",
-        Recipe::RetainedPublication(_) | Recipe::AdmitPublication(_) => "Admission",
+        Recipe::RetainedPublication(_)
+        | Recipe::AdmitPublication(_)
+        | Recipe::ClaimedPublication(_) => "Admission",
         Recipe::RetainedQos0(_) => "RetainedQoS0",
         Recipe::ReplaySubscriptions(_) => "Subscriptions",
         Recipe::ReleaseInbound(_) => "Release",
@@ -738,6 +789,7 @@ impl Writer {
         let handle = thread::Builder::new()
             .name(match storage_mode {
                 StorageMode::Durable => "sqlite-writer".into(),
+                StorageMode::Log => "log-writer".into(),
                 StorageMode::Volatile { .. } => "volatile-writer".into(),
             })
             .spawn(move || -> Result<(), Failure> {
@@ -761,10 +813,18 @@ impl Writer {
                 let mut pending_control = None;
                 // Barriers and one-shot controls of a test run address one
                 // command at a time: no group is formed while they exist.
-                let group = if hooks.directory.is_some() { 1 } else { GROUP };
+                let group = if hooks.directory.is_some() {
+                    1
+                } else if storage_mode == StorageMode::Log {
+                    QUEUE.min(mqttiumd_store_volatile::LOG_MAX_GROUP)
+                } else {
+                    GROUP
+                };
                 let mut stopping = false;
                 let mut stop_result: Result<(), Failure> = Ok(());
                 let mut state = BusinessState::default();
+                let mut members: Vec<Member> = Vec::with_capacity(group);
+                let mut deferred_reads: Vec<(EffectId, Effect)> = Vec::new();
                 #[cfg(feature="test-hooks")]
                 let mut duplicate_control: Option<ControlResponse> = None;
                 loop {
@@ -851,8 +911,8 @@ impl Writer {
                         // one group. Interleaved read-only LoadWork requests do
                         // not shatter the write group: they run immediately
                         // after the group commit so they see the committed rows.
-                        let mut members: Vec<Member> = Vec::new();
-                        let mut deferred_reads: Vec<(EffectId, Effect)> = Vec::new();
+                        members.clear();
+                        deferred_reads.clear();
                         let mut other = None;
                         let mut closed = false;
                         while members.len() < group && deferred_reads.len() < group {
@@ -883,9 +943,10 @@ impl Writer {
                         let idle_turn =
                             members.is_empty() && deferred_reads.is_empty() && other.is_none();
                         if !members.is_empty() {
-                            pending.extend(group_responses(&mut store, members, &events, &cancel));
+                            group_responses_into(&mut store, &members, &events, &cancel, &mut pending);
+                            members.clear();
                         }
-                        for (effect, work) in deferred_reads {
+                        for (effect, work) in deferred_reads.drain(..) {
                             pending.push_back(effect_response(
                                 &mut store, effect, work, &events, &hooks, &cancel, &mut state,
                             ));
@@ -946,6 +1007,243 @@ impl Writer {
         }
     }
 }
+
+/// Single-threaded synchronous store engine for `--storage-mode volatile`
+/// (when test-hooks are inactive), eliminating cross-thread channels, mutex
+/// handoffs, Condvar wakeups, and `Arc` cache-line bouncing on every durable
+/// command while preserving the exact `VolatileStore`, `DurableStore`, and
+/// atomic SQLite snapshot semantics.
+pub(crate) struct DirectWriter {
+    store: StoreBackend,
+    events: Events,
+    hooks: Hooks,
+    cancel: Arc<AtomicBool>,
+    state: BusinessState,
+    responses: VecDeque<Response>,
+    control_responses: VecDeque<ControlResponse>,
+    last_snapshot_check: Instant,
+}
+
+impl DirectWriter {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn open(
+        path: PathBuf,
+        events: Events,
+        hooks: Hooks,
+        cancel: Arc<AtomicBool>,
+        policy: Option<mqttiumd_store_sqlite::StoragePolicy>,
+        require_existing: bool,
+        storage_mode: StorageMode,
+    ) -> Result<(Self, Boot), Failure> {
+        if hooks.directory.is_some() {
+            return Err(Failure::plain("volatile_test_hooks_unsupported"));
+        }
+        let clock = Arc::new(SystemClock::new().map_err(|error| Failure::plain(error.code()))?);
+        let (store, boot) = bootstrap_bound(&path, clock, policy, require_existing, storage_mode)?;
+        Ok((
+            Self {
+                store,
+                events,
+                hooks,
+                cancel,
+                state: BusinessState::default(),
+                responses: VecDeque::new(),
+                control_responses: VecDeque::new(),
+                last_snapshot_check: Instant::now(),
+            },
+            boot,
+        ))
+    }
+
+    pub(crate) fn apply_persist_inline(
+        &mut self,
+        command: &mqttiumd_contract::command::Command,
+    ) -> (StoreReply, Vec<SessionId>) {
+        use mqttiumd_contract::outcome::{CommitFacts, StoreOutcome};
+        let recipe = command.recipe.get();
+        let applied = self.store.apply(command);
+        record_applied(recipe, &applied, &self.events, &self.cancel);
+        record_result(recipe, &applied, &self.events, &self.cancel);
+        let targets = if matches!(
+            applied.reply,
+            StoreReply::Outcome(StoreOutcome::Committed(
+                CommitFacts::PublicationAdmitted { .. }
+                    | CommitFacts::RetainedQos0Stored { .. }
+                    | CommitFacts::SubscriptionsChanged { .. }
+            ))
+        ) {
+            targets_of(recipe)
+        } else {
+            Vec::new()
+        };
+        (applied.reply, targets)
+    }
+
+    pub(crate) fn exec_request(&mut self, request: Request) {
+        let reply = business_response(
+            &mut self.store,
+            request,
+            &self.events,
+            &self.hooks,
+            &self.cancel,
+            &mut self.state,
+        );
+        self.responses.push_back(reply);
+    }
+
+    pub(crate) fn exec_control(&mut self, request: ControlRequest) {
+        let reply = control_response(
+            &mut self.store,
+            request,
+            &self.events,
+            &self.hooks,
+            &self.cancel,
+            &mut self.state,
+        );
+        self.control_responses.push_back(reply);
+    }
+
+    pub(crate) fn try_recv(&mut self) -> Result<Response, TryRecvError> {
+        self.responses.pop_front().ok_or(TryRecvError::Empty)
+    }
+
+    pub(crate) fn try_recv_control(&mut self) -> Result<ControlResponse, TryRecvError> {
+        self.control_responses
+            .pop_front()
+            .ok_or(TryRecvError::Empty)
+    }
+
+    pub(crate) fn maybe_periodic_snapshot(&mut self, now: Instant) {
+        if now.saturating_duration_since(self.last_snapshot_check) >= Duration::from_millis(100) {
+            self.last_snapshot_check = now;
+            let _ = self.store.maybe_snapshot(&self.events, false);
+        }
+    }
+
+    pub(crate) fn finish(mut self) -> Result<(), Failure> {
+        self.store.maybe_snapshot(&self.events, true)
+    }
+}
+
+/// Abstracts the exclusive store worker between the threaded writer (SQLite
+/// durable, `.mlog` log-first, and test-hook runs) and the zero-hop in-thread
+/// `DirectWriter` used for `--storage-mode volatile`.
+pub(crate) enum StoreHandle<'a> {
+    Threaded(&'a mut Writer),
+    Direct(&'a mut DirectWriter),
+}
+
+#[expect(
+    clippy::result_large_err,
+    reason = "the refused request is handed back by value"
+)]
+impl StoreHandle<'_> {
+    #[cfg(test)]
+    pub(crate) fn threaded_mut(&mut self) -> &mut Writer {
+        match self {
+            Self::Threaded(writer) => writer,
+            Self::Direct(_) => panic!("expected threaded writer"),
+        }
+    }
+
+    #[inline]
+    pub(crate) fn is_direct(&self) -> bool {
+        matches!(self, Self::Direct(_))
+    }
+
+    pub(crate) fn try_send(&mut self, request: Request) -> Result<(), TrySendError<Request>> {
+        match self {
+            Self::Threaded(writer) => writer.sender.try_send(request),
+            Self::Direct(direct) => {
+                direct.exec_request(request);
+                Ok(())
+            }
+        }
+    }
+
+    pub(crate) fn try_recv(&mut self) -> Result<Response, TryRecvError> {
+        match self {
+            Self::Threaded(writer) => writer.receiver.try_recv(),
+            Self::Direct(direct) => direct.try_recv(),
+        }
+    }
+
+    pub(crate) fn try_send_control(
+        &mut self,
+        request: ControlRequest,
+    ) -> Result<(), TrySendError<ControlRequest>> {
+        match self {
+            Self::Threaded(writer) => writer.control_sender.try_send(request),
+            Self::Direct(direct) => {
+                direct.exec_control(request);
+                Ok(())
+            }
+        }
+    }
+
+    pub(crate) fn try_recv_control(&mut self) -> Result<ControlResponse, TryRecvError> {
+        match self {
+            Self::Threaded(writer) => writer.control_receiver.try_recv(),
+            Self::Direct(direct) => direct.try_recv_control(),
+        }
+    }
+
+    #[inline]
+    pub(crate) fn apply_persist_direct(
+        &mut self,
+        command: &mqttiumd_contract::command::Command,
+    ) -> Option<(StoreReply, Vec<SessionId>)> {
+        match self {
+            Self::Threaded(_) => None,
+            Self::Direct(direct) => Some(direct.apply_persist_inline(command)),
+        }
+    }
+
+    #[inline]
+    pub(crate) fn maybe_periodic_snapshot(&mut self, now: Instant) {
+        if let Self::Direct(direct) = self {
+            direct.maybe_periodic_snapshot(now);
+        }
+    }
+
+    pub(crate) fn exec_recovery(
+        &mut self,
+        cursor: Option<RecoveryCursor>,
+    ) -> Result<Option<Response>, Failure> {
+        match self {
+            Self::Threaded(writer) => {
+                writer
+                    .sender
+                    .send(Request::Recovery(cursor))
+                    .map_err(|_| Failure::plain("writer_closed"))?;
+                Ok(None)
+            }
+            Self::Direct(direct) => {
+                direct.exec_request(Request::Recovery(cursor));
+                Ok(direct.responses.pop_front())
+            }
+        }
+    }
+
+    pub(crate) fn exec_closed_collection(
+        &mut self,
+        collection: ClosedReceiptCollection,
+    ) -> Result<Option<ControlResponse>, Failure> {
+        match self {
+            Self::Threaded(writer) => {
+                writer
+                    .control_sender
+                    .send(ControlRequest::Closed(collection))
+                    .map_err(|_| Failure::plain("writer_control_disconnected"))?;
+                Ok(None)
+            }
+            Self::Direct(direct) => {
+                direct.exec_control(ControlRequest::Closed(collection));
+                Ok(direct.control_responses.pop_front())
+            }
+        }
+    }
+}
 #[derive(Default)]
 struct BusinessState {
     #[cfg(feature = "test-hooks")]
@@ -996,6 +1294,21 @@ fn business_response(
 
 /// The sessions a committed command may have given work to.
 fn targets_of(recipe: &Recipe) -> Vec<SessionId> {
+    if let Recipe::ClaimedPublication(claimed) = recipe.inner_publication() {
+        let claimed_idx = usize::from(claimed.claim.target_index);
+        if claimed.admission.targets.len() <= 1 {
+            return Vec::new();
+        }
+        return claimed
+            .admission
+            .targets
+            .as_slice()
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != claimed_idx)
+            .map(|(_, t)| t.session)
+            .collect();
+    }
     if let Recipe::WillPublication(a) = recipe {
         a.targets.as_slice().iter().map(|t| t.session).collect()
     } else if let Some(a) = recipe.admission() {
@@ -1095,14 +1408,15 @@ struct Member {
     command: mqttiumd_contract::command::Command,
 }
 
-/// Applies the commands in one transaction (record 0045) and answers each
-/// in order. No answer exists before the commit of the group returned.
-fn group_responses(
+/// Applies the commands in one transaction (record 0045) and appends each
+/// answer in order into `out`. No answer exists before the commit returned.
+fn group_responses_into(
     store: &mut StoreBackend,
-    members: Vec<Member>,
+    members: &[Member],
     events: &Events,
     cancel: &AtomicBool,
-) -> Vec<Response> {
+    out: &mut VecDeque<Response>,
+) {
     let commands: Vec<_> = members.iter().map(|member| &member.command).collect();
     let count = commands.len();
     if events
@@ -1118,21 +1432,18 @@ fn group_responses(
             .map(|command| store.apply(command))
             .collect()
     });
-    members
-        .iter()
-        .zip(applied)
-        .map(|(member, applied)| {
-            let recipe = member.command.recipe.get();
-            record_applied(recipe, &applied, events, cancel);
-            record_result(recipe, &applied, events, cancel);
-            Response::Store {
-                effect: member.effect,
-                operation: recipe.operation(),
-                reply: applied.reply,
-                targets: targets_of(recipe),
-            }
-        })
-        .collect()
+    out.reserve(members.len());
+    for (member, applied) in members.iter().zip(applied) {
+        let recipe = member.command.recipe.get();
+        record_applied(recipe, &applied, events, cancel);
+        record_result(recipe, &applied, events, cancel);
+        out.push_back(Response::Store {
+            effect: member.effect,
+            operation: recipe.operation(),
+            reply: applied.reply,
+            targets: targets_of(recipe),
+        });
+    }
 }
 
 fn effect_response(
@@ -1492,6 +1803,7 @@ fn replay_controls(
                 .map_err(|_| Failure::plain("receipt_replay_recipe"))?;
         let admission = match &mut recipe {
             Recipe::AdmitPublication(a) => a,
+            Recipe::ClaimedPublication(a) => &mut a.admission,
             Recipe::RetainedPublication(a) => &mut a.admission,
             _ => return Err(Failure::plain("receipt_replay_kind")),
         };
@@ -1959,6 +2271,26 @@ fn bootstrap_bound(
             };
             StoreBackend::Durable(sqlite)
         }
+        StorageMode::Log => {
+            let exists = path
+                .try_exists()
+                .map_err(|e| Failure::read(io_cause(e.kind()), ReadPhase::Open))?;
+            if !exists && require_existing {
+                return Err(Failure::plain("existing_database_missing"));
+            }
+            let mut random = [0u8; 8];
+            getrandom::fill(&mut random).map_err(|_| Failure::plain("random_unavailable"))?;
+            let incarnation = StoreIncarnation::new(u64::from_be_bytes(random).max(1));
+            let log_store = mqttiumd_store_volatile::LogStore::open_or_create(
+                path,
+                incarnation,
+                limits(),
+                policy,
+                require_existing,
+            )
+            .map_err(database_open_error)?;
+            StoreBackend::Log(log_store)
+        }
         StorageMode::Volatile {
             snapshot_interval: None,
         } if !require_existing => {
@@ -2082,6 +2414,7 @@ fn bootstrap_bound(
         state.receipt_frontiers.len() >= 32 || state.accounts.receipt_slots.get() >= 4096;
     let sqlite = match &store {
         StoreBackend::Durable(s) => Some(s.effective_settings().clone()),
+        StoreBackend::Log(s) => s.sqlite_settings().cloned(),
         StoreBackend::Volatile { handle, .. } => handle.sqlite_settings().cloned(),
     };
     Ok((

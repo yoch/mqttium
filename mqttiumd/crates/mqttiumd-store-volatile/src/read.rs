@@ -330,12 +330,12 @@ pub(crate) fn check_inventory_bound(store: &VolatileStore) -> Result<(), ReadErr
     if rows > MAX_RECOVERY_INVENTORY_ROWS {
         return Err(ReadError::LimitExceeded);
     }
-    for delivery in store.outbound.keys() {
+    for (delivery, _) in store.outbound.iter() {
         let record = store
             .obligations
-            .get(delivery)
+            .get(&delivery)
             .ok_or(ReadError::InvalidData)?;
-        delivery_claim(store, *delivery, record)?;
+        delivery_claim(store, delivery, record)?;
     }
     Ok(())
 }
@@ -387,9 +387,11 @@ pub(crate) fn check_message_candidate(
         check_delivery_metadata(store, *delivery, record)?;
         delivery_claim(store, *delivery, record)?;
     }
-    for (delivery, _) in store.outbound.range(range) {
-        if !store.obligations.contains_key(delivery) {
-            return Err(ReadError::InvalidData);
+    if !store.validated {
+        for (delivery, _) in store.outbound.iter() {
+            if delivery.publication == id && !store.obligations.contains_key(&delivery) {
+                return Err(ReadError::InvalidData);
+            }
         }
     }
     if store.retained.len() > MAX_RETAINED_TOPICS {
@@ -615,7 +617,7 @@ enum FactRef<'a> {
     Route(&'a [u8], &'a RouteTarget),
     Session(SessionId, &'a SessionRecord),
     Inbound(mqttiumd_contract::ids::InboundPacketId, &'a InboundRecord),
-    Operation(OperationId, &'a OperationRecord),
+    Operation(OperationId, &'a crate::VOperation),
     Fence(OperationId),
     Outbound(DeliveryId, &'a ObligationRecord),
     ReceiptFrontier(ReceiptClosure),
@@ -756,9 +758,9 @@ fn inventory(store: &VolatileStore) -> impl Iterator<Item = FactRef<'_>> {
         .map(|((_, packet), marker)| FactRef::Inbound(*packet, marker));
     let operations = store
         .operations
-        .iter()
+        .iter_ordered()
         .filter(move |(operation, _)| older(operation))
-        .map(|(operation, record)| FactRef::Operation(*operation, record));
+        .map(|(operation, record)| FactRef::Operation(operation, record));
     let fences = store
         .fences
         .iter()
@@ -976,7 +978,7 @@ pub(crate) fn build_snapshot(
         );
     }
     let mut payloads = BTreeMap::new();
-    for (id, record) in &store.payloads {
+    for (id, record) in store.payloads.iter() {
         meter.field(32, 32)?;
         meter.field(record.bytes.len(), store.limits.max_payload_bytes)?;
         meter.charge(
@@ -985,7 +987,7 @@ pub(crate) fn build_snapshot(
                 .ok_or(ReadError::LimitExceeded)?,
         )?;
         payloads.insert(
-            *id,
+            id,
             PayloadRecord {
                 bytes: record.bytes.as_slice().to_vec(),
                 references: record.references,
@@ -997,18 +999,30 @@ pub(crate) fn build_snapshot(
         meter.field(32, 32)?;
         meter.charge(208)?;
     }
-    for delivery in store.outbound.keys() {
+    let mut outbound = BTreeMap::new();
+    for (delivery, out) in store.outbound.iter() {
         meter.field(32, 32)?;
         meter.charge(232)?;
         let record = store
             .obligations
-            .get(delivery)
+            .get(&delivery)
             .ok_or(ReadError::InvalidData)?;
-        delivery_claim(store, *delivery, record)?;
+        delivery_claim(store, delivery, record)?;
+        outbound.insert(delivery, *out);
     }
     for _ in store.inbound.values() {
         meter.field(32, 32)?;
         meter.charge(200)?;
+    }
+    let mut operations = BTreeMap::new();
+    for (op, record) in store.operations.iter_ordered() {
+        operations.insert(
+            op,
+            OperationRecord {
+                recipe: record.recipe.to_vec(),
+                decision: record.decision,
+            },
+        );
     }
     Ok(DurableState {
         ledger: store.ledger,
@@ -1021,7 +1035,7 @@ pub(crate) fn build_snapshot(
         route_revision: store.route_revision,
         sessions: store.sessions.clone(),
         routes: store.routes.clone(),
-        operations: store.operations.clone(),
+        operations,
         fences: store.fences.clone(),
         receipt_frontiers: store.receipt_frontiers.clone(),
         retained: store.retained.clone(),
@@ -1030,6 +1044,6 @@ pub(crate) fn build_snapshot(
         payloads,
         obligations: store.obligations.clone(),
         inbound: store.inbound.clone(),
-        outbound: store.outbound.clone(),
+        outbound,
     })
 }

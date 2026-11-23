@@ -69,6 +69,13 @@ for level in (4, 5):
         steps=[connect("a", "p-wild", level=level), publish("a", "wild/#", "x", level=level), until_close("a")],
     )
 
+    scenario(
+        f"publish/empty-topic-name-{v}",
+        doc="""A PUBLISH whose Topic Name is empty, with no Topic Alias: it names no topic
+        and the connection is closed.""",
+        steps=[connect("a", "p-empty", level=level), publish("a", "", "x", level=level), until_close("a")],
+    )
+
 scenario(
     "publish/qos-downgrade-v4",
     doc="""A subscription granted QoS 1 receives a QoS 0, a QoS 1 and a QoS 2 message:
@@ -115,7 +122,8 @@ scenario(
     "publish/burst-qos0-v4",
     doc="""One hundred QoS 0 messages written at once reach an online QoS 0 subscriber;
     the transcript keeps whether all came and whether those that came are in the order
-    sent, not how many.""",
+    sent, not how many. mqttiumd paces QoS 0 by connection (record 0063): a subscriber
+    that reads receives the burst whole, so the count is compared again.""",
     steps=[
         connect("sub", "p-burst-sub"), subscribe("sub", 1, [("burst/t", 0)]),
         connect("pub", "p-burst-pub"),

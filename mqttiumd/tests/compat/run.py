@@ -266,7 +266,7 @@ def markdown(matrix) -> str:
         "Written by `tests/compat/run.py`: regenerate it with the command in",
         "`tests/compat/README.md` and copy `matrix.md` here; do not edit it by hand.", "",
         f"- broker: `mqttiumd` built from commit `{matrix['broker']['commit']}`",
-        f"- reference: Mosquitto {version}, the version `preview/build-mosquitto-reference.sh` builds",
+        f"- reference: Mosquitto {version}, the version `tests/compat/build-reference.sh` builds",
         f"- scenarios played: {len(rows)}" + ("" if matrix["complete"] else " (a partial run)"), "",
         "`same` means equal normalized transcripts on the scenario played, nothing",
         "more. A difference is not a failure of mqttiumd by itself: Mosquitto is not",
@@ -333,7 +333,7 @@ def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--reference", type=Path,
                         help="the mosquitto executable, its build directory, or the output directory of "
-                             "preview/build-mosquitto-reference.sh")
+                             "tests/compat/build-reference.sh")
     parser.add_argument("--broker", type=Path, help="the mqttiumd executable")
     parser.add_argument("--out", type=Path, default=HERE.parents[1] / "target/compat",
                         help="directory for matrix.md, matrix.json and the transcripts")

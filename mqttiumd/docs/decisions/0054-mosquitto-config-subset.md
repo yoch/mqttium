@@ -62,6 +62,11 @@ security-weakening directives.
 3. **CLI surface**:
    - `mqttiumd check-config PATH` prints the JSON directive report and exits
      `0` if valid or `2` if any directive or cross-check is blocking.
+     The report names in `launch_requires` the options a launch with this
+     file alone still needs (`--db`, `--events`): a valid file may leave the
+     database and the event journal to the command line, and `-c PATH` alone
+     is then refused (added after the external audit of `47e1d12`, report
+     0034).
    - `mqttiumd -c PATH` / `--config PATH` loads the validated configuration
      before applying explicit CLI overrides.
 

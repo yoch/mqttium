@@ -83,6 +83,7 @@ fn with_runtime_clock_hooks(
             max_sessions: nz(128),
             max_routes: nz(128),
             max_exchanges: nz(max_exchanges),
+            session_qos2_exchanges: nz(crate::receiving::MAXIMUM as u32),
             account: AccountId::new(1),
             payload_bytes: PayloadBytes::new(4 * 1024 * 1024),
             resolution_delay: LogicalDuration::new(10000),
@@ -105,6 +106,8 @@ fn with_runtime_clock_hooks(
         message_expiry_scan: Instant::now(),
         message_expiry_input: None,
         message_last_time: None,
+        last_message_clock_sync: Instant::now(),
+        message_clock_needed: true,
         clock: boot.clock,
         clock_anchor: boot.clock_anchor,
         clock_checkpoint: None,
@@ -115,10 +118,15 @@ fn with_runtime_clock_hooks(
         last_expiry_inventory: None,
         owner,
         _authority: authority,
-        writer: &mut writer,
+        writer: StoreHandle::Threaded(&mut writer),
         events,
-        peers: BTreeMap::new(),
+        peers: FlatMap::new(),
+        ready_peers: net::ReadyQueue::new(),
+        ready_raw: Vec::new(),
+        pending_peers: FlatSet::new(),
+        capacity_waiters: 0,
         retiring: Vec::new(),
+        session_ids: boot.sessions.values().map(|s| s.id).collect(),
         sessions: boot.sessions,
         session_requests: BTreeMap::new(),
         will_connects: BTreeMap::new(),
@@ -127,28 +135,36 @@ fn with_runtime_clock_hooks(
         next_session_request: 0,
         generation: ConnectionGeneration::new(0),
         peer_cursor: 0,
+        peer_keys: Vec::new(),
+        last_peer_deadline_scan: Instant::now(),
         inputs: VecDeque::new(),
         control_inputs: VecDeque::new(),
         closing_inputs: VecDeque::new(),
         terminal_inputs: VecDeque::new(),
+        terminal_effects: ScopedFlatMap::new(),
         deferred_inputs: VecDeque::new(),
+        deferred_by_conn: FlatMap::new(),
         effects_awaited: false,
         deferred_retries: 0,
         credit_progress: Instant::now(),
         timers: BTreeMap::new(),
-        inflight: BTreeMap::new(),
+        inflight: ScopedFlatMap::new(),
         lifecycle_inflight: BTreeMap::new(),
         last_session_change: None,
         session_cardinality_dirty: false,
         last_session_cardinality: None,
-        work_reads: BTreeMap::new(),
+        work_reads: ScopedFlatMap::new(),
         pending_work: VecDeque::new(),
         pending_work_set: BTreeSet::new(),
-        cached_bindings: BTreeMap::new(),
+        queued_work_sessions: FlatSet::new(),
+        cached_bindings: FlatMap::new(),
         bindings_dirty: true,
         stale_frames_dirty: false,
+        timers_dirty: false,
+        receipt_pressure_blocked: false,
         last_work_scan: Instant::now(),
         last_will_scan: Instant::now(),
+        last_maintenance_flush: Instant::now(),
         maintenance_needed: false,
         #[cfg(feature = "test-hooks")]
         work_cache: BTreeMap::new(),
@@ -167,8 +183,8 @@ fn with_runtime_clock_hooks(
         deferred_ack: None,
         #[cfg(feature = "test-hooks")]
         deferred_ack_used: false,
-        frames: BTreeMap::new(),
-        outgoing_bindings: BTreeMap::new(),
+        frames: ScopedFlatMap::new(),
+        outgoing_bindings: FlatMap::new(),
         puback_observation: 0,
         #[cfg(feature = "test-hooks")]
         copied_puback: None,
@@ -188,11 +204,13 @@ fn with_runtime_clock_hooks(
         loop {
             runtime
                 .writer
+                .threaded_mut()
                 .sender
                 .send(Request::Recovery(cursor))
                 .unwrap();
             let Response::Recovery(page) = runtime
                 .writer
+                .threaded_mut()
                 .receiver
                 .recv_timeout(Duration::from_secs(3))
                 .unwrap()
@@ -250,10 +268,13 @@ fn peer(runtime: &mut Runtime<'_>) -> (ConnectionGeneration, TcpStream) {
     let (socket, _) = listener.accept().unwrap();
     runtime.generation = runtime.generation.checked_next().unwrap();
     let generation = runtime.generation;
+    let ready = (runtime.ready_peers.clone(), generation.get());
+    runtime.pending_peers.insert(generation);
     runtime.peers.insert(
         generation,
         Peer {
-            io: net::spawn_with_clock(socket, runtime.clock.clone()).unwrap(),
+            io: net::spawn_with_ready(socket, runtime.clock.clone(), runtime.wake.clone(), ready)
+                .unwrap(),
             created: Instant::now(),
             last_packet: Instant::now(),
             connected: false,
@@ -275,6 +296,8 @@ fn peer(runtime: &mut Runtime<'_>) -> (ConnectionGeneration, TcpStream) {
             receiving: crate::receiving::Window::default(),
             closing: None,
             deferred_publish: None,
+            behind: VecDeque::new(),
+            behind_bytes: 0,
             blocked_output: None,
             retire_code: None,
         },
@@ -308,6 +331,7 @@ fn next_control_reply(runtime: &mut Runtime<'_>) -> ControlResponse {
             .expect("control reply budget");
         let response = runtime
             .writer
+            .threaded_mut()
             .control_receiver
             .recv_timeout(remaining)
             .unwrap();
@@ -414,7 +438,7 @@ fn closing_qos0_without_collecting_written_retires_the_exact_attempt() {
                 break;
             }
         }
-        let effect = *runtime
+        let effect = runtime
             .frames
             .iter()
             .find(|(_, f)| f.kind == "PUBLISH0")
@@ -430,6 +454,152 @@ fn closing_qos0_without_collecting_written_retires_the_exact_attempt() {
         assert!(runtime.terminal_inputs.iter().any(|i|matches!(i,Input::Qos0EmitRefused{effect:e,connection,reason:Qos0DropReason::ConnectionClosed} if *e==effect && connection.generation==generation)),"the owner must receive exact terminal loss, not lose an accepted effect silently");
         runtime.drain_inputs().unwrap();
     });
+}
+
+/// The QoS 0 drops the broker recorded, read from complete event lines.
+fn qos0_drops(directory: &Path) -> usize {
+    let events = std::fs::read_to_string(directory.join("events.jsonl")).unwrap();
+    let complete = events.rfind('\n').map_or("", |end| &events[..end]);
+    complete
+        .lines()
+        .filter(|line| line.contains("\"qos0_dropped\""))
+        .count()
+}
+
+/// A subscriber at QoS 0 whose output the test holds: nothing drains it
+/// until the test takes a frame and reports it written. The messages, more
+/// than the output queue holds, are published by `publish`, which returns
+/// once the broker has taken each one. No message may be dropped for the
+/// queue of the subscriber, and they leave in the order of their
+/// publication. The broker leaves `RESERVE` places of the queue to
+/// acknowledgements and to QoS 1 and 2 publications.
+fn burst_reaches_a_subscriber_whose_output_is_held(
+    client: &'static [u8],
+    publish: impl Fn(&mut Runtime<'_>, ConnectionGeneration, &mut TcpStream, u16),
+) {
+    const MESSAGES: u16 = 300;
+    const RESERVE: usize = 32;
+    const _: () = assert!(MESSAGES as usize > net::OUTPUT_SLOTS);
+    // A table wide enough for the hundred to wait: deliveries that wait for
+    // a window may hold half of the volatile queue, which has its size.
+    with_runtime(4096, |runtime, directory| {
+        let (subscriber, mut reader) = peer(runtime);
+        runtime.connect(subscriber, connect_packet(client)).unwrap();
+        until(runtime, |r| r.session_requests.is_empty());
+        assert_eq!(read_frame(&mut reader).0, 0x20);
+        runtime
+            .packet(subscriber, 0x82, vec![0, 1, 0, 0, 1, b't', 0])
+            .unwrap();
+        assert_eq!(served_frame(runtime, &mut reader).0, 0x90);
+        let (publisher, mut writer) = peer(runtime);
+        runtime
+            .connect(publisher, connect_packet(b"burst-publisher"))
+            .unwrap();
+        until(runtime, |r| r.session_requests.is_empty());
+        assert_eq!(read_frame(&mut writer).0, 0x20);
+        until(runtime, |r| {
+            r.inflight.is_empty() && r.inputs.is_empty() && r.frames.is_empty()
+        });
+
+        let (lane, held) = std::sync::mpsc::sync_channel(net::OUTPUT_SLOTS);
+        let original = std::mem::replace(
+            &mut runtime.peers.get_mut(&subscriber).unwrap().io.outgoing,
+            lane.into(),
+        );
+        for index in 0..MESSAGES {
+            publish(runtime, publisher, &mut writer, index);
+        }
+        let settle = |runtime: &mut Runtime<'_>| {
+            for _ in 0..40 {
+                pump(runtime);
+                thread::sleep(Duration::from_millis(1));
+            }
+        };
+        settle(runtime);
+        assert_eq!(
+            qos0_drops(directory),
+            0,
+            "a message was dropped for the output queue of a connected subscriber"
+        );
+        assert!(
+            runtime.peers[&subscriber].closing.is_none(),
+            "the subscriber was closed for its output queue"
+        );
+
+        // Each frame the test takes is reported written; the next ones follow.
+        let mut delivered = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while delivered.len() < usize::from(MESSAGES) && Instant::now() < deadline {
+            let frames: Vec<net::Write> = held.try_iter().collect();
+            assert!(
+                frames.len() <= net::OUTPUT_SLOTS - RESERVE,
+                "{} QoS 0 frames at once leave no room for acknowledgements",
+                frames.len()
+            );
+            for frame in frames {
+                let (effect, connection) = frame.correlation.expect("a correlated PUBLISH");
+                // The payload is the rank of the message, on two bytes.
+                let mut bytes = frame.bytes.as_slice().to_vec();
+                if let Some(payload) = &frame.payload {
+                    bytes.extend_from_slice(payload.as_slice());
+                }
+                let rank = &bytes[bytes.len() - 2..];
+                delivered.push(u16::from_be_bytes([rank[0], rank[1]]));
+                runtime
+                    .written_complete(effect, connection, frame.total_len())
+                    .unwrap();
+            }
+            settle(runtime);
+        }
+        assert_eq!(delivered, (0..MESSAGES).collect::<Vec<_>>());
+        assert_eq!(qos0_drops(directory), 0);
+        runtime.peers.get_mut(&subscriber).unwrap().io.outgoing = original;
+        runtime.packet(subscriber, 0xc0, vec![]).unwrap();
+        assert_eq!(served_frame(runtime, &mut reader), (0xd0, vec![]));
+    });
+}
+
+/// Record 0063. A QoS 0 publication waits for the output of its subscriber
+/// as an acknowledgement does: the core emits a window of frames and the
+/// next ones when a write completes. The broker used to emit the burst at
+/// once and drop what found the queue full, although the subscriber was
+/// connected and its queue the broker's own.
+#[test]
+fn a_qos0_burst_waits_for_the_output_of_its_subscriber_and_keeps_its_order() {
+    burst_reaches_a_subscriber_whose_output_is_held(
+        b"burst-volatile",
+        |runtime, publisher, _, index| {
+            let [high, low] = index.to_be_bytes();
+            runtime
+                .packet(publisher, 0x30, vec![0, 1, b't', 0, high, low])
+                .unwrap();
+            // The broker takes each publication as it is read.
+            runtime.drain_inputs().unwrap();
+        },
+    );
+}
+
+/// The same for durable publications delivered to a QoS 0 subscription:
+/// each is consumed in the store before its frame is emitted, so a frame
+/// dropped for a full queue is a message the store no longer owes.
+#[test]
+fn durable_publications_to_a_qos0_subscription_wait_for_its_output() {
+    burst_reaches_a_subscriber_whose_output_is_held(
+        b"burst-consumed",
+        |runtime, publisher, writer, index| {
+            let [high, low] = (index + 1).to_be_bytes();
+            let [first, second] = index.to_be_bytes();
+            runtime
+                .packet(
+                    publisher,
+                    0x32,
+                    vec![0, 1, b't', high, low, 0, first, second],
+                )
+                .unwrap();
+            until(runtime, |r| r.inputs.is_empty() && r.inflight.is_empty());
+            assert_eq!(served_frame(runtime, writer).0, 0x40);
+        },
+    );
 }
 
 fn event_turn_without_scan(runtime: &mut Runtime<'_>) {
@@ -452,8 +622,11 @@ fn until_without_scan(runtime: &mut Runtime<'_>, condition: impl Fn(&Runtime<'_>
 }
 
 fn queued_publications(directory: &Path, generation: ConnectionGeneration) -> usize {
-    std::fs::read_to_string(directory.join("events.jsonl"))
-        .unwrap()
+    // The file is read while the broker writes it: a last line without its
+    // end is an event still being written, not an event.
+    let events = std::fs::read_to_string(directory.join("events.jsonl")).unwrap();
+    let complete = events.rfind('\n').map_or("", |end| &events[..end]);
+    complete
         .lines()
         .filter(|line| {
             let event: serde_json::Value = serde_json::from_str(line).unwrap();
@@ -1203,7 +1376,7 @@ fn a_connection_keeps_at_most_its_window_of_business_packets_waiting() {
             business_packets(&r.inputs, waiting) == WINDOW - 1
         });
         while let Some(deferred) = runtime.inputs.pop_front() {
-            runtime.deferred_inputs.push_back(deferred);
+            runtime.push_deferred_back(deferred);
         }
         // The last publication of the window and the control packet behind
         // it are both taken.
@@ -1218,7 +1391,7 @@ fn a_connection_keeps_at_most_its_window_of_business_packets_waiting() {
             .position(|input| business_connection(input) == Some(waiting))
             .unwrap();
         let deferred = runtime.inputs.remove(last).unwrap();
-        runtime.deferred_inputs.push_back(deferred);
+        runtime.push_deferred_back(deferred);
         first.write_all(&[0x30, 4, 0, 1, b'w', 0, 0xc0, 0]).unwrap();
         second.write_all(&[0x30, 4, 0, 1, b'v', 0]).unwrap();
         read_until(runtime, |r| business_packets(&r.inputs, other) == 1);
@@ -1239,7 +1412,7 @@ fn a_connection_keeps_at_most_its_window_of_business_packets_waiting() {
         assert!(runtime.peers[&waiting].closing.is_none());
 
         // One waiting publication is taken up again: the held one follows.
-        let resumed = runtime.deferred_inputs.pop_front().unwrap();
+        let resumed = runtime.pop_deferred_front().unwrap();
         runtime.inputs.push_front(resumed);
         read_until(runtime, |r| pings(r, waiting) == 2);
         assert_eq!(business_packets(&runtime.inputs, waiting), 2);
@@ -2350,7 +2523,7 @@ fn a_peer_reuses_qos1_identifier_before_the_old_internal_written_receipt() {
         // This read proves the client can legally reuse PI 1. Deliberately do
         // not poll the socket's internal Written channel before the new input.
         assert_eq!(read_frame(&mut client), (0x40, unmatched(1)));
-        let old = *runtime
+        let old = runtime
             .frames
             .iter()
             .find(|(_, f)| f.kind == "PUBACK")
@@ -2428,7 +2601,9 @@ fn finish_retained_durable_publish(close_before_enqueue: bool) {
                 .try_send(net::Write {
                     expiry: None,
                     correlation: None,
-                    bytes: vec![0xd0, 0],
+                    bytes: net::FrameBytes::from_slice(&[0xd0, 0]),
+                    payload: None,
+                    report: net::WriteReport::Complete,
                 })
                 .unwrap();
         }
@@ -2636,7 +2811,9 @@ fn a_slow_transport_holds_its_acks_while_an_independent_exchange_progresses() {
                     .try_send(net::Write {
                         expiry: None,
                         correlation: None,
-                        bytes: vec![0xd0, 0],
+                        bytes: net::FrameBytes::from_slice(&[0xd0, 0]),
+                        payload: None,
+                        report: net::WriteReport::Complete,
                     })
                     .unwrap();
             }
@@ -2680,7 +2857,7 @@ fn a_slow_transport_holds_its_acks_while_an_independent_exchange_progresses() {
             incoming
                 .try_send(net::Incoming::Packet {
                     first: 0xc0,
-                    body: vec![],
+                    body: net::FrameBytes::empty(),
                     observed: Ok(runtime.message_now().unwrap()),
                 })
                 .unwrap();
@@ -2887,7 +3064,7 @@ fn a_full_input_lane_leaves_the_next_socket_packet_in_its_bounded_channel() {
         producer
             .try_send(net::Incoming::Packet {
                 first: 0xc0,
-                body: vec![],
+                body: net::FrameBytes::empty(),
                 observed: Ok(runtime.message_now().unwrap()),
             })
             .unwrap();
@@ -2931,6 +3108,7 @@ fn a_full_ordinary_lane_still_collects_an_authentic_writer_reply() {
         runtime.drain_inputs().unwrap();
         let response = runtime
             .writer
+            .threaded_mut()
             .receiver
             .recv_timeout(Duration::from_secs(1))
             .unwrap();
@@ -2945,10 +3123,10 @@ fn a_full_ordinary_lane_still_collects_an_authentic_writer_reply() {
         ));
         let (producer, consumer) = std::sync::mpsc::sync_channel(1);
         producer.try_send(response).unwrap();
-        let original = std::mem::replace(&mut runtime.writer.receiver, consumer);
+        let original = std::mem::replace(&mut runtime.writer.threaded_mut().receiver, consumer);
         fill_ordinary_inputs(runtime, generation);
         runtime.writer_results().unwrap();
-        runtime.writer.receiver = original;
+        runtime.writer.threaded_mut().receiver = original;
         assert!(
             runtime.inflight.is_empty(),
             "full_ordinary_input_delayed_already_committed_writer_reply"
@@ -2978,7 +3156,9 @@ fn a_saturated_four_slot_output_retains_the_committed_puback_until_terminal_fail
                 .try_send(net::Write {
                     expiry: None,
                     correlation: None,
-                    bytes: vec![0xd0, 0],
+                    bytes: net::FrameBytes::from_slice(&[0xd0, 0]),
+                    payload: None,
+                    report: net::WriteReport::Complete,
                 })
                 .unwrap();
         }
@@ -3435,7 +3615,8 @@ fn cancelled_startup_never_announces_ready_and_releases_its_opened_epoch() {
         Hooks::default(),
         &events,
         cancel,
-        &mut writer,
+        StoreHandle::Threaded(&mut writer),
+        None,
         None,
         Limits::BOUNDED,
     );
@@ -3489,7 +3670,8 @@ fn established_typed_startup_failure_takes_precedence_over_cancellation() {
         Hooks::default(),
         &events,
         cancel,
-        &mut writer,
+        StoreHandle::Threaded(&mut writer),
+        None,
         None,
         Limits::BOUNDED,
     );
@@ -3553,7 +3735,8 @@ fn cancellation_during_unacknowledged_registration_never_announces_ready() {
             hooks,
             &events,
             cancel.clone(),
-            &mut writer,
+            StoreHandle::Threaded(&mut writer),
+            None,
             None,
             Limits::BOUNDED,
         );
@@ -3776,11 +3959,20 @@ fn a_full_maintenance_input_lane_leaves_the_real_reply_in_reserved_transport() {
         // before publishing that marker's ordinary response. No elapsed-time
         // assumption establishes that the collector reached its reply channel.
         for _ in 0..2 {
-            runtime.writer.sender.send(Request::Recovery(None)).unwrap();
+            runtime
+                .writer
+                .threaded_mut()
+                .sender
+                .send(Request::Recovery(None))
+                .unwrap();
         }
         for _ in 0..2 {
             assert!(matches!(
-                runtime.writer.receiver.recv_timeout(Duration::from_secs(2)),
+                runtime
+                    .writer
+                    .threaded_mut()
+                    .receiver
+                    .recv_timeout(Duration::from_secs(2)),
                 Ok(Response::Recovery(Ok(_)))
             ));
         }
@@ -4104,7 +4296,8 @@ fn stale_puback_during_takeover_with_a_blocked_close_cannot_stop_other_connectio
         // replies. This distinguishes takeover/control progress from global
         // quiescence while preserving the adapter's original correlations.
         let (released, receiver) = std::sync::mpsc::sync_channel(IN_FLIGHT * 2);
-        let worker_receiver = std::mem::replace(&mut runtime.writer.receiver, receiver);
+        let worker_receiver =
+            std::mem::replace(&mut runtime.writer.threaded_mut().receiver, receiver);
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             until_phase(
                 runtime,
@@ -4216,11 +4409,11 @@ fn stale_puback_during_takeover_with_a_blocked_close_cannot_stop_other_connectio
         // Restore the real adapter even if an assertion panics. Afterwards,
         // require every held effect's own correlated reply to be collected;
         // each wait measures one operation's progress, not total quiescence.
-        runtime.writer.receiver = worker_receiver;
+        runtime.writer.threaded_mut().receiver = worker_receiver;
         if let Err(payload) = outcome {
             std::panic::resume_unwind(payload);
         }
-        let pending = runtime.inflight.keys().copied().collect::<Vec<_>>();
+        let pending = runtime.inflight.keys().collect::<Vec<_>>();
         for effect in pending {
             until_phase(runtime, path, "collect held correlated admission", |r| {
                 !r.inflight.contains_key(&effect)
@@ -4517,10 +4710,13 @@ fn zero_expiry_reconnect_first_resumes_then_ends_the_existing_incarnation() {
 
 fn relay_control_reply(runtime: &mut Runtime<'_>, response: ControlResponse) {
     let (sender, receiver) = std::sync::mpsc::sync_channel(crate::writer::CONTROL_QUEUE);
-    let original = std::mem::replace(&mut runtime.writer.control_receiver, receiver);
+    let original = std::mem::replace(
+        &mut runtime.writer.threaded_mut().control_receiver,
+        receiver,
+    );
     sender.send(response).unwrap();
     let result = runtime.writer_results();
-    runtime.writer.control_receiver = original;
+    runtime.writer.threaded_mut().control_receiver = original;
     result.unwrap();
 }
 
@@ -5699,6 +5895,7 @@ fn certain_detach_failure_is_observable_instead_of_losing_offline_expiration() {
         // Its durable fence proves no effect; no fabricated store result.
         runtime
             .writer
+            .threaded_mut()
             .control_sender
             .send(ControlRequest::Lifecycle(OwnedEffect::new(
                 effect,
@@ -5988,6 +6185,210 @@ fn disconnect_four_before_real_open_reply_survives_source_cleanup_and_admits_onc
     });
 }
 
+/// Serves the runtime for a bounded while and says whether the client stayed
+/// without a frame. A closed socket is silent too.
+fn stays_silent(runtime: &mut Runtime<'_>, client: &mut TcpStream) -> bool {
+    let deadline = Instant::now() + Duration::from_millis(100);
+    let mut first = [0u8; 1];
+    client
+        .set_read_timeout(Some(Duration::from_millis(2)))
+        .unwrap();
+    let mut silent = true;
+    while silent && Instant::now() < deadline {
+        pump(runtime);
+        silent = !client.peek(&mut first).is_ok_and(|read| read > 0);
+    }
+    client
+        .set_read_timeout(Some(Duration::from_secs(1)))
+        .unwrap();
+    silent
+}
+
+/// MQTT 5 §3.14.2.2.2, §3.1.2.11.2 and §4.1: the Session Expiry Interval of a
+/// DISCONNECT replaces the CONNECT value whatever legal reason code carries
+/// it, and zero ends the session with the network connection. §3.1.2.5
+/// [MQTT-3.1.2-8, -10]: only reason 0x00 discards the Will. Each fact is
+/// checked on its own: the durable session, the reply to the client, the
+/// Will, Session Present at the next CONNECT, and the former subscription.
+fn disconnect_with_zero_expiry_ends_the_session(reason: u8, expected_wills: usize) {
+    with_runtime(128, |runtime, directory| {
+        const STATUS: &[u8] = b"atelier/sensor/status";
+        const COMMAND: &[u8] = b"atelier/sensor/command";
+        let subscribe = |filter: &[u8]| {
+            let mut body = vec![0, 1, 0, 0, filter.len() as u8];
+            body.extend_from_slice(filter);
+            body.push(1);
+            body
+        };
+        let inspect = |directory: &Path| {
+            mqttiumd_store_sqlite::SqliteStore::inspect(&directory.join("store.sqlite")).unwrap()
+        };
+        let (monitor, mut monitor_client) = peer(runtime);
+        runtime
+            .connect(monitor, connect_packet(b"will-monitor"))
+            .unwrap();
+        until(runtime, |r| r.session_requests.is_empty());
+        assert_eq!(read_frame(&mut monitor_client).0, 0x20);
+        runtime.packet(monitor, 0x82, subscribe(STATUS)).unwrap();
+        until(runtime, |r| r.inflight.is_empty() && r.inputs.is_empty());
+        assert_eq!(read_frame(&mut monitor_client).0, 0x90);
+
+        let name = b"expiring-sensor";
+        let (generation, mut client) = peer(runtime);
+        runtime
+            .connect(generation, will_connect(name, SessionExpiry::After(600)))
+            .unwrap();
+        until(runtime, |r| r.session_requests.is_empty());
+        assert_eq!(read_frame(&mut client).0, 0x20);
+        let original = runtime.peers[&generation].session.unwrap();
+        runtime
+            .packet(generation, 0x82, subscribe(COMMAND))
+            .unwrap();
+        until(runtime, |r| r.inflight.is_empty() && r.inputs.is_empty());
+        assert_eq!(read_frame(&mut client).0, 0x90);
+        let before = inspect(directory);
+        assert!(before.sessions.contains_key(&original));
+        assert_eq!(before.routes.len(), 2);
+
+        runtime
+            .packet(generation, 0xe0, vec![reason, 5, 0x11, 0, 0, 0, 0])
+            .unwrap();
+        until(runtime, |r| {
+            !r.peers.contains_key(&generation)
+                && !r.owner.session_status().lifecycle_pending
+                && r.lifecycle_inflight.is_empty()
+                && r.closing_inputs.is_empty()
+        });
+        let after = inspect(directory);
+        assert!(
+            !after.sessions.contains_key(&original),
+            "disconnect_{reason:#04x}_expiry_zero_kept_the_session"
+        );
+        assert_eq!(
+            after.routes.len(),
+            1,
+            "disconnect_{reason:#04x}_expiry_zero_kept_the_subscription"
+        );
+        // A DISCONNECT is the last packet of its sender and has no answer.
+        let mut byte = [0u8; 1];
+        assert_eq!(
+            client.read(&mut byte).unwrap(),
+            0,
+            "disconnect_{reason:#04x}_was_answered_with_{:#04x}",
+            byte[0]
+        );
+
+        runtime.queue(Input::DiscoverWills).unwrap();
+        runtime.drain_inputs().unwrap();
+        until(runtime, |r| {
+            !r.owner.will_status().reading
+                && !r.owner.will_status().admission_pending
+                && r.will_reads.is_none()
+        });
+        let settled = inspect(directory);
+        assert!(settled.wills.is_empty(), "will_left_armed_after_disconnect");
+        let published = settled
+            .operations
+            .values()
+            .filter(|row| {
+                matches!(
+                    row.decision,
+                    mqttiumd_store_api::Decision::Committed(CommitFacts::WillPublished { .. })
+                )
+            })
+            .count();
+        assert_eq!(
+            published, expected_wills,
+            "disconnect_{reason:#04x}_will_admissions"
+        );
+        if expected_wills == 1 {
+            let (header, body) = served_frame(runtime, &mut monitor_client);
+            assert_eq!(header & 0xf0, 0x30);
+            assert_eq!(&body[2..2 + STATUS.len()], STATUS);
+            assert!(body.ends_with(b"offline-private"));
+        }
+        assert!(
+            stays_silent(runtime, &mut monitor_client),
+            "disconnect_{reason:#04x}_extra_will_delivery"
+        );
+
+        let (next, mut next_client) = peer(runtime);
+        runtime.connect(next, connect_packet(name)).unwrap();
+        until(runtime, |r| r.session_requests.is_empty());
+        let (kind, body) = read_frame(&mut next_client);
+        assert_eq!(kind, 0x20);
+        assert_eq!(
+            &body[..2],
+            &[0, 0],
+            "disconnect_{reason:#04x}_expiry_zero_session_present"
+        );
+        let mut command = vec![0, COMMAND.len() as u8];
+        command.extend_from_slice(COMMAND);
+        command.extend_from_slice(&[0, 9, 0, b'v']);
+        runtime.packet(monitor, 0x32, command).unwrap();
+        let (header, body) = served_frame(runtime, &mut monitor_client);
+        assert_eq!((header, &body[..2]), (0x40, &[0, 9][..]));
+        assert!(
+            stays_silent(runtime, &mut next_client),
+            "disconnect_{reason:#04x}_former_subscription_delivered"
+        );
+    });
+}
+
+/// MQTT 5 §3.14.2.2.2: a session opened with Session Expiry Interval 0
+/// cannot be given a non-zero one at DISCONNECT, whatever the reason code.
+#[test]
+fn a_disconnect_cannot_raise_a_zero_session_expiry_whatever_its_reason() {
+    for reason in [0x00u8, 0x04, 0x80, 0x83] {
+        with_runtime(128, |runtime, directory| {
+            let (generation, mut client) = peer(runtime);
+            let mut connect = connect_packet(b"zero-then-seven");
+            connect.expiry = SessionExpiry::OnDisconnect;
+            runtime.connect(generation, connect).unwrap();
+            until(runtime, |r| r.session_requests.is_empty());
+            assert_eq!(read_frame(&mut client).0, 0x20);
+            runtime
+                .packet(generation, 0xe0, vec![reason, 5, 0x11, 0, 0, 0, 7])
+                .unwrap();
+            assert_eq!(
+                served_frame(runtime, &mut client),
+                (0xe0, vec![0x82, 0]),
+                "reason {reason:#04x}"
+            );
+            until(runtime, |r| {
+                !r.peers.contains_key(&generation)
+                    && !r.owner.session_status().lifecycle_pending
+                    && r.lifecycle_inflight.is_empty()
+                    && r.closing_inputs.is_empty()
+            });
+            let durable =
+                mqttiumd_store_sqlite::SqliteStore::inspect(&directory.join("store.sqlite"))
+                    .unwrap();
+            assert!(durable.sessions.is_empty(), "reason {reason:#04x}");
+        });
+    }
+}
+
+#[test]
+fn normal_disconnect_with_zero_expiry_ends_the_session_and_discards_the_will() {
+    disconnect_with_zero_expiry_ends_the_session(0x00, 0);
+}
+
+#[test]
+fn disconnect_with_will_message_and_zero_expiry_ends_the_session_and_publishes_the_will_once() {
+    disconnect_with_zero_expiry_ends_the_session(0x04, 1);
+}
+
+#[test]
+fn unspecified_error_disconnect_with_zero_expiry_ends_the_session_and_publishes_the_will_once() {
+    disconnect_with_zero_expiry_ends_the_session(0x80, 1);
+}
+
+#[test]
+fn implementation_error_disconnect_with_zero_expiry_ends_the_session_and_publishes_the_will_once() {
+    disconnect_with_zero_expiry_ends_the_session(0x83, 1);
+}
+
 #[test]
 fn takeover_waits_for_old_will_admission_and_old_close_cannot_publish_new_will() {
     with_runtime(128, |runtime, directory| {
@@ -6057,11 +6458,13 @@ fn overlapping_same_client_will_connects_leave_the_replacement_connected() {
         // Both authentic SQLite barrier reads precede either Open submission.
         let one = runtime
             .writer
+            .threaded_mut()
             .control_receiver
             .recv_timeout(Duration::from_secs(2))
             .unwrap();
         let two = runtime
             .writer
+            .threaded_mut()
             .control_receiver
             .recv_timeout(Duration::from_secs(2))
             .unwrap();
@@ -6165,18 +6568,19 @@ fn tls_test_peer(
         .set_read_timeout(Some(Duration::from_secs(2)))
         .unwrap();
     let (server, _) = listener.accept().unwrap();
+    let (generation, previous_client) = peer(runtime);
+    drop(previous_client);
     let io = net::spawn_tls(
         server,
         security.tls,
         security.policy,
         runtime.clock.clone(),
         runtime.wake.clone(),
+        Some((runtime.ready_peers.clone(), generation.get())),
         #[cfg(feature = "test-hooks")]
         (runtime.hooks.clone(), runtime.events.clone()),
     )
     .unwrap();
-    let (generation, previous_client) = peer(runtime);
-    drop(previous_client);
     let previous = std::mem::replace(&mut runtime.peers.get_mut(&generation).unwrap().io, io);
     previous.close();
     runtime.retiring.push(previous);
@@ -6270,6 +6674,150 @@ fn tls_terminal_writer_cannot_discard_an_already_decoded_normal_disconnect() {
     });
 }
 
+/// The frames a client still reads, then how its stream ends: `Ok(0)` for a
+/// close_notify alert, the error kind of a transport that ended without one.
+type TlsEnd = (Vec<(u8, Vec<u8>)>, Result<usize, std::io::ErrorKind>);
+
+/// What a TLS client reads once the broker has ended the connection.
+fn tls_end_of_stream(
+    runtime: &mut Runtime<'_>,
+    generation: ConnectionGeneration,
+    client: &mut rustls::StreamOwned<rustls::ClientConnection, TcpStream>,
+) -> TlsEnd {
+    until(runtime, |r| {
+        !r.peers.contains_key(&generation)
+            && r.closing_inputs.is_empty()
+            && !r.owner.session_status().lifecycle_pending
+            && r.lifecycle_inflight.is_empty()
+    });
+    let mut frames = Vec::new();
+    let mut byte = [0u8; 1];
+    loop {
+        match client.read(&mut byte) {
+            Ok(1) => {
+                let mut rest = [0u8; 1];
+                client.read_exact(&mut rest).unwrap();
+                let mut body = vec![0; usize::from(rest[0])];
+                client.read_exact(&mut body).unwrap();
+                frames.push((byte[0], body));
+            }
+            other => return (frames, other.map_err(|error| error.kind())),
+        }
+    }
+}
+
+fn published_wills(directory: &Path) -> usize {
+    mqttiumd_store_sqlite::SqliteStore::inspect(&directory.join("store.sqlite"))
+        .unwrap()
+        .operations
+        .values()
+        .filter(|row| {
+            matches!(
+                row.decision,
+                mqttiumd_store_api::Decision::Committed(CommitFacts::WillPublished { .. })
+            )
+        })
+        .count()
+}
+
+/// RFC 8446 §6.1: each party sends a close_notify alert before it closes its
+/// write side, unless it has already sent an error alert. A client that
+/// said DISCONNECT must be able to tell the end of the stream from a
+/// truncation. The disconnection keeps its MQTT meaning: reason 0x00
+/// discards the Will, reason 0x04 publishes it once.
+#[test]
+fn a_tls_client_reads_close_notify_after_its_disconnect() {
+    for (disconnect, wills) in [(&[0xe0, 0][..], 0), (&[0xe0, 2, 4, 0][..], 1)] {
+        with_runtime(128, |runtime, directory| {
+            let (generation, mut client) = tls_test_peer(runtime, directory);
+            runtime
+                .connect(
+                    generation,
+                    will_connect(b"tls-clean-close", SessionExpiry::Never),
+                )
+                .unwrap();
+            until(runtime, |r| {
+                r.session_requests.is_empty() && r.frames.is_empty()
+            });
+            assert_eq!(read_frame(&mut client).0, 0x20);
+            client.write_all(disconnect).unwrap();
+            client.flush().unwrap();
+            assert_eq!(
+                tls_end_of_stream(runtime, generation, &mut client),
+                (vec![], Ok(0)),
+                "tls_closed_without_close_notify"
+            );
+            runtime.queue(Input::DiscoverWills).unwrap();
+            runtime.drain_inputs().unwrap();
+            until(runtime, |r| {
+                !r.owner.will_status().reading
+                    && !r.owner.will_status().admission_pending
+                    && r.will_reads.is_none()
+            });
+            assert_eq!(published_wills(directory), wills);
+        });
+    }
+}
+
+/// The broker's own DISCONNECT is followed by close_notify too: the client
+/// reads the reason, then the end of the stream.
+#[test]
+fn a_tls_client_reads_the_broker_disconnect_and_then_close_notify() {
+    with_runtime(128, |runtime, directory| {
+        let (generation, mut client) = tls_test_peer(runtime, directory);
+        runtime
+            .connect(generation, connect_packet(b"tls-refused"))
+            .unwrap();
+        until(runtime, |r| {
+            r.session_requests.is_empty() && r.frames.is_empty()
+        });
+        assert_eq!(read_frame(&mut client).0, 0x20);
+        // A QoS 0 PUBLISH with the DUP flag is a Malformed Packet.
+        client.write_all(&[0x38, 4, 0, 1, b't', 0]).unwrap();
+        client.flush().unwrap();
+        assert_eq!(
+            tls_end_of_stream(runtime, generation, &mut client),
+            (vec![(0xe0, vec![0x81, 0])], Ok(0)),
+            "tls_closed_without_close_notify"
+        );
+    });
+}
+
+/// A client that closes TLS first, without an MQTT DISCONNECT, is answered
+/// with close_notify, and its Will is published: the transport ended
+/// without a normal disconnection.
+#[test]
+fn a_tls_client_that_sends_close_notify_first_is_answered_with_close_notify() {
+    with_runtime(128, |runtime, directory| {
+        let (generation, mut client) = tls_test_peer(runtime, directory);
+        runtime
+            .connect(
+                generation,
+                will_connect(b"tls-closes-first", SessionExpiry::Never),
+            )
+            .unwrap();
+        until(runtime, |r| {
+            r.session_requests.is_empty() && r.frames.is_empty()
+        });
+        assert_eq!(read_frame(&mut client).0, 0x20);
+        client.conn.send_close_notify();
+        client.conn.complete_io(&mut client.sock).unwrap();
+        assert_eq!(
+            tls_end_of_stream(runtime, generation, &mut client),
+            (vec![], Ok(0)),
+            "tls_close_notify_not_answered"
+        );
+        runtime.queue(Input::DiscoverWills).unwrap();
+        runtime.drain_inputs().unwrap();
+        until(runtime, |r| {
+            !r.owner.will_status().reading
+                && !r.owner.will_status().admission_pending
+                && r.will_reads.is_none()
+        });
+        assert_eq!(published_wills(directory), 1);
+    });
+}
+
 #[test]
 fn blocked_output_and_full_input_preserve_independent_work_and_reconnect_credit() {
     for reverse in [false, true] {
@@ -6358,7 +6906,9 @@ fn blocked_output_and_full_input_preserve_independent_work_and_reconnect_credit(
                     .try_send(net::Write {
                         expiry: None,
                         correlation: None,
-                        bytes: vec![0xd0, 0],
+                        bytes: net::FrameBytes::from_slice(&[0xd0, 0]),
+                        payload: None,
+                        report: net::WriteReport::Complete,
                     })
                     .unwrap();
             }
@@ -6406,6 +6956,7 @@ fn blocked_output_and_full_input_preserve_independent_work_and_reconnect_credit(
             runtime.drain_inputs().unwrap();
             let reply = runtime
                 .writer
+                .threaded_mut()
                 .receiver
                 .recv_timeout(Duration::from_secs(1))
                 .unwrap();
@@ -6424,13 +6975,13 @@ fn blocked_output_and_full_input_preserve_independent_work_and_reconnect_credit(
             assert!(runtime.inflight.contains_key(&committed_effect));
             let (replay, ready) = std::sync::mpsc::sync_channel(1);
             replay.try_send(reply).unwrap();
-            let writer = std::mem::replace(&mut runtime.writer.receiver, ready);
+            let writer = std::mem::replace(&mut runtime.writer.threaded_mut().receiver, ready);
             fill_ordinary_inputs(runtime, publisher);
             assert_eq!(runtime.ordinary_room(), 0);
             assert_eq!(runtime.inputs.len(), ORDINARY_INPUTS);
             let progress_started = Instant::now();
             runtime.writer_results().unwrap();
-            runtime.writer.receiver = writer;
+            runtime.writer.threaded_mut().receiver = writer;
             assert!(!runtime.inflight.contains_key(&committed_effect));
             assert_eq!(runtime.ordinary_room(), 0);
             assert_eq!(runtime.writer_input_count(), 1);
@@ -6572,4 +7123,431 @@ fn blocked_output_and_full_input_preserve_independent_work_and_reconnect_credit(
             );
         });
     }
+}
+
+#[test]
+fn direct_volatile_store_commits_inline_and_saves_snapshot() {
+    let directory = Directory::new();
+    let db_path = directory.0.join("direct.sqlite");
+    let events =
+        Events::open_at(&directory.0.join("events.jsonl"), crate::events::Level::Ops).unwrap();
+    let cancel = Arc::new(AtomicBool::new(false));
+    let (mut direct, boot) = DirectWriter::open(
+        db_path.clone(),
+        events.clone(),
+        Hooks::default(),
+        cancel.clone(),
+        None,
+        false,
+        crate::writer::StorageMode::Volatile {
+            snapshot_interval: Some(Duration::from_secs(60)),
+        },
+    )
+    .unwrap();
+    let mut authority = OwnerAuthority::from_grant(boot.grant, NonZeroU32::MIN).unwrap();
+    let outbox = authority
+        .create_outbox(
+            LogicalOwnerId::new(0),
+            NonZeroUsize::new(128).unwrap(),
+            nz(65536),
+        )
+        .unwrap();
+    let mut owner = Owner::new(
+        OwnerConfig {
+            max_sessions: nz(128),
+            max_routes: nz(128),
+            max_exchanges: nz(128),
+            session_qos2_exchanges: nz(crate::receiving::MAXIMUM as u32),
+            account: AccountId::new(1),
+            payload_bytes: PayloadBytes::new(4 * 1024 * 1024),
+            resolution_delay: LogicalDuration::new(10000),
+            retained_operations: nz(128),
+            remembered_connections: nz(8),
+        },
+        outbox,
+    )
+    .unwrap();
+    owner.enable_inline_claims();
+    let mut runtime = Runtime {
+        progress: 0,
+        wake: crate::wake::Wake::new(),
+        limits: Limits::BOUNDED,
+        security: None,
+        message_expiry_request: None,
+        message_expiry_retry: false,
+        message_expiry_retry_attempts: 0,
+        message_expiry_observation: None,
+        message_expiry_after: None,
+        message_expiry_scan: Instant::now(),
+        message_expiry_input: None,
+        message_last_time: None,
+        last_message_clock_sync: Instant::now(),
+        message_clock_needed: true,
+        clock: boot.clock,
+        clock_anchor: boot.clock_anchor,
+        clock_checkpoint: None,
+        last_clock_checkpoint: Instant::now(),
+        checkpoint_degraded: false,
+        expiry_timers: BTreeMap::new(),
+        expiry_inputs: VecDeque::new(),
+        last_expiry_inventory: None,
+        owner,
+        _authority: authority,
+        writer: StoreHandle::Direct(&mut direct),
+        events,
+        peers: FlatMap::new(),
+        ready_peers: net::ReadyQueue::new(),
+        ready_raw: Vec::new(),
+        pending_peers: FlatSet::new(),
+        capacity_waiters: 0,
+        retiring: Vec::new(),
+        session_ids: boot.sessions.values().map(|s| s.id).collect(),
+        sessions: boot.sessions,
+        session_requests: BTreeMap::new(),
+        will_connects: BTreeMap::new(),
+        will_reads: None,
+        last_will_deferred: None,
+        next_session_request: 0,
+        generation: ConnectionGeneration::new(0),
+        peer_cursor: 0,
+        peer_keys: Vec::new(),
+        last_peer_deadline_scan: Instant::now(),
+        inputs: VecDeque::new(),
+        control_inputs: VecDeque::new(),
+        closing_inputs: VecDeque::new(),
+        terminal_inputs: VecDeque::new(),
+        terminal_effects: ScopedFlatMap::new(),
+        deferred_inputs: VecDeque::new(),
+        deferred_by_conn: FlatMap::new(),
+        effects_awaited: false,
+        deferred_retries: 0,
+        credit_progress: Instant::now(),
+        timers: BTreeMap::new(),
+        inflight: ScopedFlatMap::new(),
+        lifecycle_inflight: BTreeMap::new(),
+        last_session_change: None,
+        session_cardinality_dirty: false,
+        last_session_cardinality: None,
+        work_reads: ScopedFlatMap::new(),
+        pending_work: VecDeque::new(),
+        pending_work_set: BTreeSet::new(),
+        queued_work_sessions: FlatSet::new(),
+        cached_bindings: FlatMap::new(),
+        bindings_dirty: true,
+        stale_frames_dirty: false,
+        timers_dirty: false,
+        receipt_pressure_blocked: false,
+        last_work_scan: Instant::now(),
+        last_will_scan: Instant::now(),
+        last_maintenance_flush: Instant::now(),
+        maintenance_needed: false,
+        #[cfg(feature = "test-hooks")]
+        work_cache: BTreeMap::new(),
+        #[cfg(feature = "test-hooks")]
+        deferred_work: VecDeque::new(),
+        #[cfg(feature = "test-hooks")]
+        emission_barriers: VecDeque::new(),
+        #[cfg(feature = "test-hooks")]
+        last_consume_result: None,
+        started: Instant::now(),
+        #[cfg(feature = "test-hooks")]
+        captured: None,
+        #[cfg(feature = "test-hooks")]
+        hooks: Hooks::default(),
+        #[cfg(feature = "test-hooks")]
+        deferred_ack: None,
+        #[cfg(feature = "test-hooks")]
+        deferred_ack_used: false,
+        frames: ScopedFlatMap::new(),
+        outgoing_bindings: FlatMap::new(),
+        puback_observation: 0,
+        #[cfg(feature = "test-hooks")]
+        copied_puback: None,
+        #[cfg(feature = "test-hooks")]
+        deferred_outgoing_written: None,
+        #[cfg(feature = "test-hooks")]
+        copied_outgoing_frame: None,
+        #[cfg(feature = "test-hooks")]
+        last_finish_result: None,
+        #[cfg(feature = "test-hooks")]
+        copied_session_change: None,
+        #[cfg(feature = "test-hooks")]
+        copied_session_close: None,
+    };
+    let mut cursor = None;
+    loop {
+        let Some(Response::Recovery(page)) = runtime.writer.exec_recovery(cursor).unwrap() else {
+            panic!("direct recovery response");
+        };
+        let page = page.unwrap();
+        cursor = page.next;
+        runtime
+            .queue(Input::Recovery {
+                facts: page.facts,
+                last: cursor.is_none(),
+            })
+            .unwrap();
+        runtime.drain_inputs().unwrap();
+        if cursor.is_none() {
+            break;
+        }
+    }
+    assert!(!runtime.owner.is_recovering());
+
+    // Connect persistent subscriber & publisher, subscribe, publish QoS 1 inline.
+    let (sub_gen, mut sub_sock) = peer(&mut runtime);
+    let mut sub_conn = connect_packet(b"direct-sub");
+    sub_conn.clean_start = false;
+    sub_conn.expiry = SessionExpiry::Never;
+    runtime.connect(sub_gen, sub_conn).unwrap();
+    until(&mut runtime, |r| r.session_requests.is_empty());
+    assert_eq!(read_frame(&mut sub_sock).0, 0x20);
+    // Subscribe to topic "t" at QoS 1.
+    runtime
+        .packet(sub_gen, 0x82, vec![0, 1, 0, 0, 1, b't', 1])
+        .unwrap();
+    until(&mut runtime, |r| r.frames.is_empty() && r.inputs.is_empty());
+    assert_eq!(read_frame(&mut sub_sock).0, 0x90);
+
+    let (pub_gen, mut pub_sock) = peer(&mut runtime);
+    runtime
+        .connect(pub_gen, connect_packet(b"direct-pub"))
+        .unwrap();
+    until(&mut runtime, |r| r.session_requests.is_empty());
+    assert_eq!(read_frame(&mut pub_sock).0, 0x20);
+
+    // Publish QoS 1 on "t" with retained=true so snapshot verification observes it.
+    runtime
+        .packet(pub_gen, 0x33, vec![0, 1, b't', 0, 7, 0, b'o', b'k'])
+        .unwrap();
+    runtime.drain_inputs().unwrap();
+    // Synchronous DirectWriter resolves Persist + emits PUBACK + EmitPublish in one pass,
+    // with zero inflight commands and zero armed timers for the resolved admission!
+    assert!(runtime.inflight.is_empty());
+    assert!(runtime.timers.is_empty());
+    assert_eq!(read_frame(&mut pub_sock), (0x40, vec![0, 7]));
+    let (first, body) = read_frame(&mut sub_sock);
+    assert_eq!(first & 0xf6, 0x32);
+    assert!(body.ends_with(b"ok"));
+
+    // Cleanly close peers and persist atomic SQLite snapshot on finish().
+    runtime.shutdown_sessions(Duration::from_secs(2)).unwrap();
+    for (_, p) in std::mem::take(&mut runtime.peers) {
+        p.io.close();
+        runtime.retiring.push(p.io);
+    }
+    let deadline = Instant::now() + Duration::from_secs(2);
+    for mut p in std::mem::take(&mut runtime.retiring) {
+        while !p.is_finished() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(p.join_finished());
+    }
+    drop(runtime);
+    direct.finish().unwrap();
+
+    let saved = mqttiumd_store_sqlite::SqliteStore::inspect(&db_path).unwrap();
+    assert!(
+        saved.retained.contains_key(b"t".as_slice()),
+        "shutdown snapshot must preserve retained message committed via DirectWriter"
+    );
+    assert!(
+        saved
+            .sessions
+            .values()
+            .any(|s| s.client_id == b"direct-sub"),
+        "shutdown snapshot must preserve persistent subscriber session"
+    );
+}
+
+/// What may go ahead of a publication that waits for a slot of the window:
+/// only the PUBREL of another exchange. A PUBREL whose identifier is the
+/// one of a waiting PUBLISH keeps its place, as does every other packet.
+#[test]
+fn only_the_pubrel_of_another_exchange_goes_ahead_of_a_waiting_publication() {
+    with_runtime(128, |runtime, _| {
+        let (generation, _client) = peer(runtime);
+        let Ok(Packet::Core(waiting)) =
+            codec::decode_for(codec::Version::V311, 0x34, b"\0\x01t\0\x09payload", BOUNDS)
+        else {
+            panic!("QoS 2 PUBLISH")
+        };
+        let peer = runtime.peers.get_mut(&generation).unwrap();
+        peer.deferred_publish = Some(DeferredPublish {
+            packet: waiting,
+            ingress_order: 9,
+            since: Instant::now(),
+            wire: false,
+        });
+        let raw = |first: u8, body: &[u8]| {
+            (
+                first,
+                net::FrameBytes::from_slice(body),
+                Err(crate::session_time::TimeError::ClockUnavailable),
+            )
+        };
+        assert!(peer.overtakes_deferred(0x62, &[0, 1]));
+        assert!(
+            !peer.overtakes_deferred(0x62, &[0, 9]),
+            "its own PUBLISH waits"
+        );
+        for (first, body) in [
+            (0x40, &[0, 1][..]),
+            (0x50, &[0, 1][..]),
+            (0x70, &[0, 1][..]),
+            (0xc0, &[][..]),
+            (0xe0, &[][..]),
+            (0x30, b"\0\x01tpayload"),
+            (0x82, b"\0\x02\0\x01t\x01"),
+            (0x62, &[0][..]),
+        ] {
+            assert!(!peer.overtakes_deferred(first, body), "{first:#04x}");
+        }
+        peer.keep_behind(raw(0x34, b"\0\x01t\0\x05payload"))
+            .unwrap();
+        assert!(
+            !peer.overtakes_deferred(0x62, &[0, 5]),
+            "a PUBLISH kept behind"
+        );
+        assert!(peer.overtakes_deferred(0x62, &[0, 6]));
+        assert_eq!(raw_publish_id(0x34, b"\0\x01t\0\x05payload"), Some(5));
+        assert_eq!(raw_publish_id(0x32, b"\0\x01t\x01\x02"), Some(0x0102));
+        assert_eq!(raw_publish_id(0x30, b"\0\x01t\0\x05payload"), None);
+        assert_eq!(raw_publish_id(0x34, b"\0\x01t\0"), None);
+        assert_eq!(raw_publish_id(0x62, &[0, 5]), None);
+
+        // The bound: one lane of packets, and the bytes of one largest packet.
+        for _ in 1..BEHIND_PACKETS {
+            peer.keep_behind(raw(0xc0, &[])).unwrap();
+        }
+        assert!(
+            peer.keep_behind(raw(0xc0, &[])).is_err(),
+            "one lane of packets"
+        );
+        peer.behind.clear();
+        peer.behind_bytes = 0;
+        let large = vec![0u8; BEHIND_BYTES];
+        peer.keep_behind(raw(0x30, &large)).unwrap();
+        assert!(
+            peer.keep_behind(raw(0x30, &[0])).is_err(),
+            "bytes of one packet"
+        );
+        assert_eq!(peer.behind_bytes, BEHIND_BYTES);
+    });
+}
+
+/// Upstream ticket 3542 on this broker: an UNSUBACK the client's output has
+/// no room for. The effect of the UNSUBSCRIBE is committed, the
+/// acknowledgement stays owed while the output is full, the connection is
+/// not closed, and the client reads it with the identifier of its request
+/// once room returns: for a filter it had, for a filter it never had
+/// (MQTT-3.10.4-5), and for a request of more filters than one unit
+/// request, which the runtime acknowledges once (MQTT-3.10.4-4, -6).
+#[test]
+fn an_unsuback_owed_while_the_output_is_full_is_delivered_when_room_returns() {
+    with_runtime(128, |runtime, directory| {
+        let routes = |directory: &Path| {
+            mqttiumd_store_sqlite::SqliteStore::inspect(&directory.join("store.sqlite"))
+                .unwrap()
+                .routes
+                .len()
+        };
+        let (generation, mut client) = peer(runtime);
+        runtime
+            .connect(generation, connect_packet(b"unsuback-output-full"))
+            .unwrap();
+        until(runtime, |r| r.session_requests.is_empty());
+        assert_eq!(read_frame(&mut client).0, 0x20);
+        // One filter, then nine more in one request.
+        let many: Vec<[u8; 2]> = (0..9).map(|index| [b'f', b'0' + index]).collect();
+        let mut subscribe = vec![0, 2, 0];
+        for filter in &many {
+            subscribe.extend_from_slice(&[0, 2, filter[0], filter[1], 1]);
+        }
+        for (body, granted) in [(vec![0, 1, 0, 0, 1, b't', 1], 1), (subscribe, 9)] {
+            runtime.packet(generation, 0x82, body).unwrap();
+            let (first, suback) = served_frame(runtime, &mut client);
+            assert_eq!((first, suback.len()), (0x90, 3 + granted));
+        }
+        until(runtime, |r| {
+            r.inflight.is_empty() && r.inputs.is_empty() && r.frames.is_empty()
+        });
+        assert_eq!(routes(directory), 10);
+
+        let mut unsubscribe_many = vec![0, 9, 0];
+        for filter in &many {
+            unsubscribe_many.extend_from_slice(&[0, 2, filter[0], filter[1]]);
+        }
+        for (name, body, routes_after, unsuback) in [
+            (
+                "a filter it had",
+                vec![0, 7, 0, 0, 1, b't'],
+                9,
+                vec![0, 7, 0, 0x00],
+            ),
+            (
+                "a filter it never had",
+                vec![0, 8, 0, 0, 1, b'u'],
+                9,
+                vec![0, 8, 0, 0x11],
+            ),
+            (
+                "nine filters in one request",
+                unsubscribe_many,
+                0,
+                [&[0, 9, 0][..], &[0x00; 9][..]].concat(),
+            ),
+        ] {
+            // The output lane of the client has no room: a full substitute.
+            let (full, _queued) = std::sync::mpsc::sync_channel(net::OUTPUT_SLOTS);
+            for _ in 0..net::OUTPUT_SLOTS {
+                full.try_send(net::Write {
+                    expiry: None,
+                    correlation: None,
+                    bytes: net::FrameBytes::from_slice(&[0xd0, 0]),
+                    payload: None,
+                    report: net::WriteReport::Complete,
+                })
+                .unwrap();
+            }
+            let original = std::mem::replace(
+                &mut runtime.peers.get_mut(&generation).unwrap().io.outgoing,
+                full.into(),
+            );
+            runtime.packet(generation, 0xa2, body).unwrap();
+            until(runtime, |r| {
+                routes(directory) == routes_after
+                    && r.inflight.is_empty()
+                    && r.inputs.is_empty()
+                    && r.peers
+                        .get(&generation)
+                        .is_none_or(|peer| peer.blocked_output.is_some() || peer.requests.is_some())
+            });
+            let peer = runtime.peers.get(&generation).expect(name);
+            assert!(peer.closing.is_none(), "{name}: closed for a full output");
+            assert!(
+                stays_silent(runtime, &mut client),
+                "{name}: a frame left a full output"
+            );
+            assert!(
+                runtime.peers.contains_key(&generation),
+                "{name}: repeated pressure closed the connection"
+            );
+
+            runtime.peers.get_mut(&generation).unwrap().io.outgoing = original;
+            assert_eq!(
+                served_frame(runtime, &mut client),
+                (0xb0, unsuback),
+                "{name}"
+            );
+            until(runtime, |r| {
+                r.peers
+                    .get(&generation)
+                    .is_some_and(|peer| peer.blocked_output.is_none() && peer.requests.is_none())
+            });
+        }
+        // The connection goes on.
+        runtime.packet(generation, 0xc0, vec![]).unwrap();
+        assert_eq!(served_frame(runtime, &mut client), (0xd0, vec![]));
+    });
 }

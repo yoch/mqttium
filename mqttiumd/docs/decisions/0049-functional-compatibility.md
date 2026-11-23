@@ -5,6 +5,11 @@ one variant to a public type of the contract tier (`PubackReason`). It
 changes no schema and no durable encoding; the contract digest that
 `validate` prints moves because the register lists the accepted records.
 
+Amended by 0062 (proposed): the reference of the bench is Mosquitto 2.1.4.
+Of the two cases of `reference-nonconformant` below, the second no longer
+stands: Mosquitto 2.1.3 refuses a packet over its announced Maximum Packet
+Size.
+
 ## Context
 
 The product is meant to replace Mosquitto 2.0.21 for the clients that use

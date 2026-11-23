@@ -22,8 +22,8 @@ use mqttiumd_contract::capacity::{
 };
 use mqttiumd_contract::command::{
     AdmitPublication, ChangeSubscriptions, ClaimDelivery, Command, ConsumeDelivery, EpochLedger,
-    EpochPhase, FinishDelivery, LedgerOpening, OpenEpoch, Recipe, RecipeError, ReleaseInbound,
-    UpdateSubscriptions,
+    EpochPhase, FinishDelivery, InlineClaim, LedgerOpening, OpenEpoch, Recipe, RecipeError,
+    ReleaseInbound, UpdateSubscriptions,
 };
 use mqttiumd_contract::effects::{InboundPhase, RecoveredFact};
 use mqttiumd_contract::ids::{
@@ -701,6 +701,13 @@ trait Staging {
         retained_mask: Option<&mqttiumd_contract::retained::RetainMask>,
         payload: Option<&SharedBytes>,
     ) -> Guard<CommitFacts>;
+    fn stage_publication_with_claim(
+        &mut self,
+        admit: Admission<'_>,
+        retained_mask: Option<&mqttiumd_contract::retained::RetainMask>,
+        payload: Option<&SharedBytes>,
+        inline_claim: Option<InlineClaim>,
+    ) -> Guard<CommitFacts>;
     fn stage_release(&mut self, release: &ReleaseInbound) -> Guard<CommitFacts>;
     fn stage_subscriptions(&mut self, command: &ChangeSubscriptions) -> Guard<CommitFacts>;
     fn stage_updates(&mut self, command: &UpdateSubscriptions) -> Guard<CommitFacts>;
@@ -820,6 +827,15 @@ impl Staging for DurableState {
         admit: Admission<'_>,
         retained_mask: Option<&mqttiumd_contract::retained::RetainMask>,
         payload: Option<&SharedBytes>,
+    ) -> Guard<CommitFacts> {
+        self.stage_publication_with_claim(admit, retained_mask, payload, None)
+    }
+    fn stage_publication_with_claim(
+        &mut self,
+        admit: Admission<'_>,
+        retained_mask: Option<&mqttiumd_contract::retained::RetainMask>,
+        payload: Option<&SharedBytes>,
+        inline_claim: Option<InlineClaim>,
     ) -> Guard<CommitFacts> {
         let failed = RejectReason::PreconditionFailed;
         let operation = admit.operation;
@@ -959,6 +975,34 @@ impl Staging for DurableState {
                 return Err(failed);
             }
         }
+        let claimed_target = if let Some(claim) = inline_claim {
+            if expired {
+                return Err(failed);
+            }
+            let target = targets.get(usize::from(claim.target_index)).ok_or(failed)?;
+            if target.effective_qos == Qos::AtMostOnce
+                || self.outbound.contains_key(&target.delivery)
+                || self
+                    .outbound
+                    .values()
+                    .any(|slot| slot.target == target.session && slot.packet_id == claim.packet_id)
+            {
+                return Err(failed);
+            }
+            self.outbound.insert(
+                target.delivery,
+                OutboundRecord {
+                    started: false,
+                    target: target.session,
+                    target_revision: target.session_revision,
+                    packet_id: claim.packet_id,
+                    claim: operation,
+                },
+            );
+            true
+        } else {
+            false
+        };
         if exactly_once {
             let (packet_id, exchange) = admit.inbound.ok_or(failed)?;
             let slot = (admit.source_session, packet_id);
@@ -973,6 +1017,14 @@ impl Staging for DurableState {
                 return Err(failed);
             }
         }
+        let exchange_slots = ExchangeSlots::new(
+            admit
+                .costs
+                .exchange_slots
+                .get()
+                .checked_add(u64::from(claimed_target))
+                .ok_or(failed)?,
+        );
         self.charge(Accounts {
             payload_bytes: if expired {
                 PayloadBytes::new(0)
@@ -980,7 +1032,7 @@ impl Staging for DurableState {
                 admit.costs.payload_bytes
             },
             references: References::new(reference_count),
-            exchange_slots: admit.costs.exchange_slots,
+            exchange_slots,
             receipt_slots: admit.costs.receipt_slots,
         })?;
         if reference_count == 0 && !expired {
@@ -2262,6 +2314,16 @@ impl DurableStore for MemoryStore {
                         a.properties = props;
                         staged.stage_publication(a, None, command.payload.as_ref())
                     }
+                    Recipe::ClaimedPublication(claimed) => {
+                        let mut a = Admission::from(&claimed.admission);
+                        a.properties = props;
+                        staged.stage_publication_with_claim(
+                            a,
+                            None,
+                            command.payload.as_ref(),
+                            Some(claimed.claim),
+                        )
+                    }
                     Recipe::RetainedPublication(value) => {
                         let mut a = Admission::from(&value.admission);
                         a.properties = props;
@@ -2303,6 +2365,12 @@ impl DurableStore for MemoryStore {
             Recipe::AdmitPublication(admit) => {
                 staged.stage_admission(admit, command.payload.as_ref())
             }
+            Recipe::ClaimedPublication(claimed) => staged.stage_publication_with_claim(
+                Admission::from(&claimed.admission),
+                None,
+                command.payload.as_ref(),
+                Some(claimed.claim),
+            ),
             Recipe::RetainedPublication(value) => staged.stage_publication(
                 Admission::from(&value.admission),
                 Some(&value.retain_targets),

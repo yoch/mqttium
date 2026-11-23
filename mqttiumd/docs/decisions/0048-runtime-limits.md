@@ -3,6 +3,17 @@
 Status: **Accepted** (21 November 2026, decided under the repository
 owner's delegation on the advice of the independent audit of `8e4303d`).
 
+Note (23 November 2026): the code has since moved past the numbers of this
+record, under records that are still proposed. Record 0051 raised the
+limits this record calls independent of the connection limit (4,096
+sessions, 1,024 targets per publication, 1,024 writer requests, commands
+in flight scaled up to 512) and the range of the connection limit (1 to
+4,096). Record 0061 sized the exchange table for the sessions, and record
+0063 the output queue of a connection: 256 places, so 265 frame
+registrations per connection. The derivation rule of this record is unchanged;
+`docs/product-tcp.md` has the current values beside those of the frozen
+profile.
+
 ## Context
 
 Eight records (0022, 0025, 0026, 0029, 0033, 0034, 0035 and 0043) state

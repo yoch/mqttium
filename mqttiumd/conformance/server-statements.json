@@ -342,9 +342,17 @@
           {
             "file": "mqttiumd/crates/mqttiumd-store-sqlite/tests/will.rs",
             "test": "both_stores_publish_after_restart_and_cancel_normal_disconnect"
+          },
+          {
+            "file": "mqttiumd/crates/mqttiumd/src/runtime_tests.rs",
+            "test": "unspecified_error_disconnect_with_zero_expiry_ends_the_session_and_publishes_the_will_once"
+          },
+          {
+            "file": "mqttiumd/crates/mqttiumd/src/runtime_tests.rs",
+            "test": "implementation_error_disconnect_with_zero_expiry_ends_the_session_and_publishes_the_will_once"
           }
         ],
-        "note": "The Will is admitted once after DISCONNECT 0x04, after a take-over and after a restart, and not after DISCONNECT 0x00. A non-zero Will Delay Interval is refused, so that branch does not exist; no test reads the Will PUBLISH on a subscriber's socket."
+        "note": "The Will is admitted once after a DISCONNECT whose reason code is not 0x00 (0x04, 0x80 and 0x83 are asserted, and the Will PUBLISH is read on a subscriber's socket), after a take-over and after a restart, and not after DISCONNECT 0x00. A non-zero Will Delay Interval is refused, so that branch does not exist."
       },
       {
         "id": "MQTT-3.1.2-9",
@@ -399,7 +407,7 @@
         "code": [
           "mqttiumd/crates/mqttiumd/src/codec.rs:client_connect"
         ],
-        "note": "Only Will QoS 1 is accepted: a CONNECT with Will QoS 0 or 2 is answered with CONNACK 0x83 and closed. Will QoS 3 is a Protocol Error closed without a CONNACK."
+        "note": "Only Will QoS 1 is accepted: a CONNECT with Will QoS 0 or 2 is answered with CONNACK 0x83 and closed. Will QoS 3 is a Malformed Packet (`ReservedWillQos`, 0x81 in the event); it supplies no response limit and is closed without a CONNACK."
       },
       {
         "id": "MQTT-3.1.2-13",
@@ -601,7 +609,7 @@
           "mqttiumd/crates/mqttiumd-core/src/owner/pubsub.rs:plan_delivery_emit",
           "mqttiumd/crates/mqttiumd-core/src/owner/pubsub.rs:qos0_fits"
         ],
-        "note": "A QoS 1 or 2 delivery whose PUBLISH would exceed the client's Maximum Packet Size is not sent and ends through the FinishDelivery guarded by its claim; the connection stays open and the next delivery is sent (record 0025 as amended). The core tests cover QoS 1 and 2, with and without Message Expiry, at the exact size and across the Remaining Length step; the runtime test covers QoS 1 on the wire and the resumed session. The test of `tests/packet_limit.rs` drives the product executable over TCP at QoS 1 and QoS 2: nothing is written for the discarded delivery, the event `delivery_discarded` carries `packet_too_large`, the store keeps no obligation and no claim, the next delivery fits the limit, and the session resumed under a larger limit reads a new message first; it is the active successor of the frozen reception F-packet-limit. The compatibility scenarios `publish/over-maximum-packet-size-qos1-v5` and `-qos2-v5` carry the same story as expectations on the transcript, and Mosquitto 2.0.21 answers alike. A QoS 0 copy is dropped (`qos0_fits`). Not covered: a kill of the real process between the claim and its discard (shown on the core with a recovered claim and on both stores with a reopen)."
+        "note": "A QoS 1 or 2 delivery whose PUBLISH would exceed the client's Maximum Packet Size is not sent and ends through the FinishDelivery guarded by its claim; the connection stays open and the next delivery is sent (record 0025 as amended). The core tests cover QoS 1 and 2, with and without Message Expiry, at the exact size and across the Remaining Length step; the runtime test covers QoS 1 on the wire and the resumed session. The test of `tests/packet_limit.rs` drives the product executable over TCP at QoS 1 and QoS 2: nothing is written for the discarded delivery, the event `delivery_discarded` carries `packet_too_large`, the store keeps no obligation and no claim, the next delivery fits the limit, and the session resumed under a larger limit reads a new message first; it is the active successor of the frozen reception F-packet-limit. The compatibility scenarios `publish/over-maximum-packet-size-qos1-v5` and `-qos2-v5` carry the same story as expectations on the transcript, and Mosquitto 2.1.4 answers alike. A QoS 0 copy is dropped (`qos0_fits`). Not covered: a kill of the real process between the claim and its discard (shown on the core with a recovered claim and on both stores with a reopen)."
       },
       {
         "id": "MQTT-3.1.2-26",
@@ -1139,7 +1147,7 @@
         "applies_to_server": false,
         "status": "not-applicable",
         "evidence": [],
-        "note": "Binds the client only. The CONNACK announces 32,776 bytes, the size within which no PUBLISH exceeds the payload limit, and the announcement is a limit: a packet of exactly that size is served and one a byte larger, of any kind, is answered DISCONNECT 0x95 and closed (`a_packet_over_the_announced_maximum_packet_size_is_refused`, and the bench expectation `errors/packet-at-announced-maximum-v5#limit`)."
+        "note": "Binds the client only. The CONNACK announces 1,048,584 bytes, the size within which no PUBLISH exceeds the payload limit, and the announcement is a limit: a packet of exactly that size is served and one a byte larger, of any kind, is answered DISCONNECT 0x95 and closed (`a_packet_over_the_announced_maximum_packet_size_is_refused`, and the bench expectation `errors/packet-at-announced-maximum-v5#limit`)."
       },
       {
         "id": "MQTT-3.2.2-16",
@@ -2537,12 +2545,17 @@
         "id": "MQTT-3.14.1-1",
         "feature": "disconnect",
         "applies_to_server": true,
-        "status": "implemented-untested",
-        "evidence": [],
+        "status": "covered",
+        "evidence": [
+          {
+            "file": "mqttiumd/crates/mqttiumd/tests/wire_classes.rs",
+            "test": "reserved_fixed_header_flags_are_a_malformed_packet_on_every_packet_type"
+          }
+        ],
         "code": [
           "mqttiumd/crates/mqttiumd/src/codec.rs:flags"
         ],
-        "note": "Non-zero flag bits are `InvalidFixedFlags`, but the reader closes the connection without sending the DISCONNECT 0x81; no test sends a DISCONNECT with reserved bits."
+        "note": "Non-zero flag bits are `InvalidFixedFlags`, a Malformed Packet: the client reads DISCONNECT 0x81 and the connection is closed, asserted on the executable for a DISCONNECT with reserved bits and eight other packet types."
       },
       {
         "id": "MQTT-3.14.2-1",
@@ -2655,6 +2668,10 @@
           {
             "file": "mqttiumd/crates/mqttiumd-store-sqlite/tests/will.rs",
             "test": "both_stores_publish_after_restart_and_cancel_normal_disconnect"
+          },
+          {
+            "file": "mqttiumd/crates/mqttiumd/src/runtime_tests.rs",
+            "test": "normal_disconnect_with_zero_expiry_ends_the_session_and_discards_the_will"
           }
         ],
         "note": "DISCONNECT 0x00 cancels the stored Will; no publication is admitted for it."
@@ -2733,9 +2750,13 @@
           {
             "file": "mqttiumd/crates/mqttiumd/src/runtime_tests.rs",
             "test": "ephemeral_sessions_return_owner_cache_and_durable_capacity"
+          },
+          {
+            "file": "mqttiumd/crates/mqttiumd/src/runtime_tests.rs",
+            "test": "unspecified_error_disconnect_with_zero_expiry_ends_the_session_and_publishes_the_will_once"
           }
         ],
-        "note": "A detached session is removed from the store at its deadline, and at once when the interval is 0."
+        "note": "A detached session is removed from the store at its deadline, and at once when the interval is 0, whether the CONNECT or a DISCONNECT of any legal reason code set it."
       },
       {
         "id": "MQTT-4.2-1",
@@ -3240,11 +3261,15 @@
             "test": "will_malformed_and_duplicate_properties_keep_their_protocol_causes"
           },
           {
+            "file": "mqttiumd/crates/mqttiumd/src/codec.rs",
+            "test": "an_empty_publish_topic_without_an_alias_is_a_protocol_error"
+          },
+          {
             "file": "mqttiumd/crates/mqttiumd-contract/src/topic.rs",
             "test": "independent_filter_grammar"
           }
         ],
-        "note": "An empty Will Topic is refused and an empty PUBLISH topic takes the same check. An empty filter is refused by `codec::filter` (not asserted) and by the core's grammar (asserted)."
+        "note": "An empty Will Topic is refused as Topic Name Invalid (0x90). An empty PUBLISH topic designates nothing without a Topic Alias, and none is accepted: it is a Protocol Error (0x82), asserted on the wire. An empty filter is refused by `codec::filter` (not asserted) and by the core's grammar (asserted)."
       },
       {
         "id": "MQTT-4.7.3-2",
@@ -5026,12 +5051,17 @@
         "id": "MQTT-3.14.1-1",
         "feature": "disconnect",
         "applies_to_server": true,
-        "status": "implemented-untested",
-        "evidence": [],
+        "status": "covered",
+        "evidence": [
+          {
+            "file": "mqttiumd/crates/mqttiumd/tests/wire_classes.rs",
+            "test": "reserved_fixed_header_flags_are_a_malformed_packet_on_every_packet_type"
+          }
+        ],
         "code": [
           "mqttiumd/crates/mqttiumd/src/codec.rs:flags"
         ],
-        "note": "Non-zero flag bits are `InvalidFixedFlags` and the reader closes the connection; no test sends a DISCONNECT with reserved bits. A 3.1.1 DISCONNECT with a body is refused (asserted)."
+        "note": "Non-zero flag bits are `InvalidFixedFlags` and the connection is closed without an answer, asserted on the executable for a DISCONNECT with reserved bits and eight other packet types. A 3.1.1 DISCONNECT with a body is refused (asserted in the codec)."
       },
       {
         "id": "MQTT-3.14.4-1",
@@ -5438,11 +5468,15 @@
             "test": "will_malformed_and_duplicate_properties_keep_their_protocol_causes"
           },
           {
+            "file": "mqttiumd/crates/mqttiumd/src/codec.rs",
+            "test": "an_empty_publish_topic_without_an_alias_is_a_protocol_error"
+          },
+          {
             "file": "mqttiumd/crates/mqttiumd-contract/src/topic.rs",
             "test": "independent_filter_grammar"
           }
         ],
-        "note": "An empty Will Topic is refused and an empty PUBLISH topic takes the same check. An empty filter is refused by `codec::filter` (not asserted) and by the core's grammar (asserted)."
+        "note": "An empty Will Topic and an empty PUBLISH topic are refused; MQTT 3.1.1 has no reason code and the connection is closed. An empty filter is refused by `codec::filter` (not asserted) and by the core's grammar (asserted)."
       },
       {
         "id": "MQTT-4.7.3-2",

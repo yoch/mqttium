@@ -4,8 +4,12 @@ The optional mTLS listener uses TLS 1.3, explicit client certificate pins,
 ClientID ownership and static topic grants. The legacy plaintext listener
 accepts loopback addresses only. For setup, see the [secure preview guide](../preview/SECURE.md)
 and [record 0035](decisions/0035-private-mtls-profile.md). The secure
-SQLite profile uses schema 13 and a separate database from schema 12.
+SQLite profile uses schema 15 and a separate database from schema 14.
 The sections below describe the shared MQTT behavior and historical loopback profile.
+Limits are those of the executable today; its readiness event lists the
+effective ones. [Bounds and transport](#bounds-and-transport) sets them beside
+the bounded profile of the earlier receptions, which
+`contracts/v1/product-profile.json` freezes.
 
 The same listener accepts MQTT 3.1.1 and MQTT 5. The
 [interoperability preview](../preview/MQTT311.md) shows ordinary Mosquitto clients
@@ -54,12 +58,12 @@ QoS and outgoing QoS 1. No Local is applied separately to each contribution.
 UNSUBSCRIBE removes a literal stored filter only. The destination set is frozen
 at admission; later replacement or removal never reroutes an old obligation.
 
-The 16-destination limit applies to distinct sessions after aggregation, not
-matching filters. Exactly 16 is allowed. A seventeenth refuses the complete
+The destination limit, 1,024, applies to distinct sessions after aggregation,
+not matching filters. Exactly 1,024 is allowed. One more refuses the complete
 durable admission or explicitly drops the whole volatile occurrence before any
-output. Existing per-literal route limit 16 and total subscription limit 128
-remain in force. [ADR 0031](decisions/0031-hierarchical-subscriptions.md) records
-the decision and versioned canonical options; current schema12 (loopback) and schema13 (mTLS) refuse older formats
+output. The per-literal route limit, 1,024, and the total subscription limit,
+16,384, remain in force. [ADR 0031](decisions/0031-hierarchical-subscriptions.md) records
+the decision and versioned canonical options; current schema 14 (loopback) and schema 15 (mTLS) refuse older formats
 without modification or implicit migration.
 
 ## Launch and external clients
@@ -77,7 +81,7 @@ Two options size and observe the executable (records 0044 and 0046):
 
 | Option | Values | Default |
 | - | - | - |
-| `--max-connections N` | 1 to 128, the number of durable sessions | 128; 16 in a build with `test-hooks`, the profile of the earlier receptions |
+| `--max-connections N` | 1 to 4,096, the number of durable sessions; another value is refused | 4,096; 16 in a build with `test-hooks`, the profile of the earlier receptions |
 | `--event-level LEVEL` | `ops` writes lifecycle, refusal and fault records and counts every per-message observation in one `counters` record per second; `audit` writes every record | `ops`; `audit` in a build with `test-hooks` |
 
 The distributed executable is built with
@@ -185,12 +189,33 @@ and transport generation guard later closes independently of reusable ClientID.
 A takeover closes the old transport first. An old zero-retention session ends
 before Clean Start handling, so Clean Start 0 then creates a new session/SP0.
 
+A DISCONNECT of any reason code a client may send ends the connection and is
+never answered ([ADR 0058](decisions/0058-client-disconnect-reasons-and-tls-close-notify.md)):
+its Session Expiry Interval applies whatever the reason, and only reason 0x00
+discards the Will. A server-only or undefined reason is Protocol Error 0x82.
 DISCONNECT without the property preserves the CONNECT policy; explicit infinity
 is supported only when CONNECT was nonzero. CONNECT zero followed by any
 nonzero DISCONNECT expiry is Protocol Error 0x82. Duplicate properties and
 malformed encodings remain protocol/malformed errors. Finite overrides are
 supported; they do not reset a deadline when a command result is delayed. DISCONNECT has no MQTT ACK:
 local client completion alone does not establish durable termination.
+
+The broker closes the transport before it commits the end of the session
+([ADR 0059](decisions/0059-disconnect-durability-boundary.md)). The end of
+the client's stream, or close_notify, is therefore not an acknowledgement.
+The end is durable when the lifecycle command commits:
+
+| `--storage-mode` | The end of a session is durable when |
+| - | - |
+| `durable` | the SQLite `COMMIT` returns |
+| `log` | the `fdatasync` of the record returns |
+| `volatile` | the next snapshot is written, or never without snapshots |
+
+If the process is lost before that commit, a session opened with a non-zero
+interval and ended with interval 0 is resumed (Session Present 1), and a
+Will that a normal DISCONNECT cancelled is published by the restart. The
+`session_changed` event (`Closed` or `Detached`) is written once the store
+has answered.
 
 [ADR 0029](decisions/0029-explicit-session-lifecycle.md) defines the
 atomic target-only cancellation and lifecycle authority. Ending a session
@@ -200,7 +225,7 @@ Cancelled obligations are not counted as successful deliveries. No terminal
 session row is retained per historical ClientID; SessionIds never repeat.
 Actual broker-epoch opening ends previous zero-retention sessions before owner
 recovery/readiness. Persistent sessions remain until explicitly ended; there is
-no automatic eviction and the active quota remains 128.
+no automatic eviction and the active quota remains 4,096.
 
 For a short lifecycle demonstration against the running broker:
 
@@ -245,12 +270,12 @@ every output. Peer Receive Maximum constrains QoS 1 and QoS 2 output in addition
 local limit; QoS 0 neither consumes nor returns receive-window credit in either
 direction. Topic Alias Maximum and Request Problem Information are checked;
 no alias or diagnostic string is emitted. CONNACK advertises Receive Maximum 8,
-Maximum Packet Size 32,776, wildcard and retained availability, and no subscription-identifier, shared
+Maximum Packet Size 1,048,584, wildcard and retained availability, and no subscription-identifier, shared
 or topic-alias support. The announced size follows the payload limit: no
-PUBLISH within it carries more than 32,768 bytes of payload, so none is refused
+PUBLISH within it carries more than 1,048,576 bytes of payload, so none is refused
 for its size. The announcement is also a limit: an MQTT 5 packet larger than
 it, of any kind, is answered DISCONNECT 0x95 and the connection is closed.
-The transport itself reads frames up to 65,536 bytes, which a CONNECT with a
+The transport itself reads frames up to 1,114,112 bytes, which a CONNECT with a
 large Will needs before any announcement, and which bounds an MQTT 3.1.1
 packet, to whose client nothing is announced. Maximum QoS is omitted: that property can
 only encode 0 or 1, while this profile accepts incoming QoS 2.
@@ -282,33 +307,56 @@ its neighbours are served.
 
 ## Bounds and transport
 
-`contracts/v1/product-profile.json` identifies `tcp-qos0-exact-pubsub-v1`.
-Limits are `--max-connections` connections (16 in the receptions this guide
-cites), 128 sessions, 128 exact subscriptions, eight filters
-per request and 16 targets per publication/topic. Packets are at most 65,536
-bytes, ClientID/topic/filter 1,024 bytes and payload 32,768 bytes. Per-connection
-input/output queues hold four items; writer queue 32, commands in flight 16,
-timers 512 and physical receipts 8,192. Timers, ordinary inputs, the effect
-box and the outgoing identifier bindings are multiplied for every further
-sixteen connections of the limit. A full input queue slows its peer through
+The executable reports its profile, `tcp-will-pubsub-v1` or
+`mtls-will-pubsub-v1`, and its effective limits in the readiness event.
+`contracts/v1/product-profile.json` freezes the bounded profile of the earlier
+receptions under the same identifier; the receptions this guide cites ran
+with it, at sixteen connections.
+
+| Limit | Frozen reception profile | Executable today |
+| - | -: | -: |
+| Connections (`--max-connections`) | 16 | 1 to 4,096, default 4,096 |
+| Durable sessions | 128 | 4,096 |
+| Subscriptions | 128 | 16,384 |
+| Filters per core request | 8 | 8; a larger SUBSCRIBE is split |
+| Targets per publication | 16 | 1,024 |
+| Packet read from the transport, bytes | 65,536 | 1,114,112 |
+| Maximum Packet Size announced, bytes | 32,776 | 1,048,584 |
+| ClientID, topic and filter, bytes | 1,024 | 1,024 |
+| Payload, bytes | 32,768 | 1,048,576 |
+| Input queue of a connection, items | 4 | 32 |
+| Output queue of a connection, items | 4 | 256 |
+| Writer queue | 32 | 1,024 |
+| Commands in flight | 16 | 16 per sixteen connections, at most 512 |
+| Timers | 512 | 512 per sixteen connections |
+| Physical receipts | 8,192 | 65,536 |
+| Closed generations remembered | 8 | 8 |
+
+Timers, ordinary inputs, the effect box and the outgoing identifier bindings
+are multiplied for every further sixteen connections of the limit; the effect
+box stops at 4,096 and the commands in flight at 512. A full input queue slows its peer through
 TCP and closes nothing; the store worker commits the commands waiting in
 its queue as one transaction (record 0045). Maintenance and the single lifecycle flight share reserved four-slot
 writer request/reply lanes. Maintenance has four owner control inputs; closure
-has a separate bounded two-facts-per-transport lane. The core remembers
-eight closed generations. Known terminal operation timers are removed only
-after their corresponding owner transition applies.
+has a separate bounded two-facts-per-transport lane. Known terminal operation
+timers are removed only after their corresponding owner transition applies.
 
-There are 128 volatile incoming entries and a separate 128-entry outgoing
-metadata table with 4 MiB of loaded payload. Initially QoS 0 fanout has a separate
-128-entry/reference and 4 MiB volatile budget, conservatively charged per
-recipient reference although immutable payload bytes are shared. A new fanout
-that does not fit is dropped as a batch with `capacity_exceeded`. The durable
-account has 4 MiB payload, 128 references and 128 exchange slots shared by
+There are 32,768 incoming exchange entries, eight for each session the
+broker can hold whatever `--max-connections`
+([ADR 0061](decisions/0061-session-exchange-bound.md)), and a separate
+outgoing delivery table of the same size with 64 MiB of loaded payload; the
+outgoing identifier bindings are 128 per sixteen connections. QoS 0 fanout has
+a volatile queue of 32,768 entries whose payload is charged per recipient
+reference, although immutable payload bytes are shared, against a limit of
+64 MiB. A new fanout that does not fit is dropped as a batch with
+`capacity_exceeded`. The frozen profile had 128 entries and 4 MiB for each. The durable
+account has 256 MiB payload, 65,536 references and 32,768 exchange slots shared by
 incoming QoS 2 and claimed outgoing QoS 1. Each connection has at most eight
 active outgoing QoS 1 slots, further bounded by the peer. QoS 0 uses no such slot.
 
 Packet bodies are reserved after canonical bounded Remaining Length. Socket
-send buffers request 4,096 bytes; the effective OS value is recorded. Separate
+send buffers keep the size the system gives them; the effective value is
+recorded. Separate
 reader/writer tasks serve each connection. SQLite runs on its exclusive worker,
 never in the owner reactor. Partial packets have a 5-second deadline, CONNECT
 3 seconds, and each entire write an absolute 250 ms budget even if partial
@@ -317,7 +365,14 @@ completes or its transport closes.
 
 The bounded Outbox retains effects with the same identity until acceptance or
 a correlated outcome. QoS 0 output saturation returns a typed refusal to the
-owner for an explicit drop; it does not silently erase an effect. Durable
+owner for an explicit drop; it does not silently erase an effect. The owner
+paces QoS 0 per connection
+([ADR 0063](decisions/0063-qos0-paced-per-connection.md)): at most 224 QoS 0
+frames are in the output queue of a connection, which has 256 places, and the
+next ones leave as writes complete. Up to 1,024 deliveries wait for a connection,
+in order; past that the newest is dropped with `output_saturated`. A
+subscriber that reads receives a burst whole; one that does not is closed by
+the write deadline. Durable
 results remain correlated after socket closure. Generations do not repeat,
 and the runtime checks its live map before core delivery even after the core's
 bounded closed-generation memory evicts an old entry. Late store results may
@@ -416,6 +471,23 @@ remain. The write-to-progress publication gap can retain one decoded PUBLISH
 for at most 500 ms while a matching accepted terminal ACK is pending. Submission
 alone returns no credit. A genuine ninth unfinished exchange remains refused.
 
+MQTT 3.1.1 announces no window: a ninth exchange is pressure, and its PUBLISH
+waits for a slot. The broker goes on reading behind it
+([ADR 0060](decisions/0060-reading-behind-a-waiting-publication.md)): the
+PUBREL of another exchange goes ahead and frees a slot, every other packet
+waits behind in order, up to 32 packets and the bytes of one largest packet.
+A 3.1.1 client can have 41 QoS 2 exchanges in flight; beyond that it stalls
+until Keep Alive.
+
+The window is also the bound of a session
+([ADR 0061](decisions/0061-session-exchange-bound.md)): a session holds at
+most eight inbound QoS 2 exchanges across its connections. A session that
+owes eight PUBREL and publishes a new QoS 2 message is not acknowledged
+and its connection is closed with `capacity_exceeded`; an MQTT 5 client is
+sent DISCONNECT 0x97 first. Sending the owed PUBREL again, as a client
+must when it reconnects, makes room. An exchange that awaits its PUBREL holds an entry and
+none of the 64 MiB of payload lent to the publications being admitted.
+
 Outgoing QoS 1 progresses Queued → ClaimPending → AwaitPuback → FinishPending
 → Terminal. Known ClaimDelivery commit associates DeliveryId, target/revision,
 PI and claim operation before PUBLISH eligibility. Claim identity also guards
@@ -472,7 +544,7 @@ SQLite schema **6** stores compact receipt guards, retention/attachment, durable
 detachment/deadline and one temporal anchor. Schemas 1/2/3/4/5 and other
 incompatible versions are refused with typed InvalidData before write-affecting
 pragmas. There is no implicit migration, checkpoint, reset or empty replacement.
-Current schema12 loopback and schema13 mTLS files are supported; older-format files remain
+Current schema 14 loopback and schema 15 mTLS files are supported; older-format files remain
 historical inputs until a separate migration is supplied. Invalid/over-budget current files also refuse
 readiness without resetting partial recovery.
 
@@ -499,10 +571,10 @@ the pure owner can close its sequence position. Unknown outcomes, disconnection,
 timeouts and history eviction cannot. An offline obligation, an active claim
 or an incoming QoS 2 marker can outlast the full admission/claim receipt.
 
-Each origin has at most 1024 issued but not durably confirmed positions. New
-business stops at span 512, leaving 512 positions for inbound, outgoing and
-session-termination continuations (128 each). Ordinary
-business cannot spend the final 512 of the unchanged 8192 physical receipt
+Each origin has at most 4,096 issued but not durably confirmed positions. New
+business stops at span 3,584, leaving 512 positions for inbound, outgoing and
+session-termination continuations. Ordinary
+business cannot spend the final 512 of the 65,536 physical receipt
 slots. Resolution uses its original operation identity. Maintenance itself
 creates neither an OperationId nor another receipt. Its reserved paths can
 progress when ordinary result/input queues or network output are blocked.
@@ -629,7 +701,7 @@ See [report 0012](reports/0012-outgoing-pi-reuse.md). This is system reception,
 not an extension of the fixture oracle's qualifying scope. The existing
 receipt, QoS 0/1/2 and pub/sub receptions remain separate regression gates.
 
-The simultaneous session limit remains128. Explicit termination and finite
+The simultaneous session limit remains 4,096. Explicit termination and finite
 expiry recover eligible capacity; valid offline infinite sessions are preserved.
 No automatic eviction or unlimited-service claim follows from these mechanisms.
 
@@ -689,10 +761,10 @@ Will variants outside the received profile and general migration remain separate
 
 ## Durable retained values (record 0032)
 
-The normal preview now stores up to32 exact retained topics and1MiB of current
-retained payload. Each topic owns one reference independently of subscribers
+The normal preview stores up to 4,096 exact retained topics and 64 MiB of
+current retained payload (32 topics and 1 MiB in the frozen profile). Each topic owns one reference independently of subscribers
 and producer session lifetime. It records the original producer ClientID for
-No Local. The existing4MiB payload and128 reference quotas also apply; old
+No Local. The durable payload and reference quotas also apply; old
 versions still owed to recipients remain charged. Replacing or clearing a value
 releases only the retained-owned reference. Empty RETAIN1 clears and remains a
 normal live publication; RETAIN0 does not mutate the stored value.
@@ -701,14 +773,15 @@ QoS1/2 retained changes, complete live fanout, reference/account updates and
 receipt are one admission transaction. QoS2 changes at admission before PUBREC;
 PUBREL only releases its inbound marker. Retained QoS0 uses its own durable
 operation without a Packet Identifier, acknowledgement, inbound slot or Receive
-Maximum credit. At most one such owner flight retains at most32768payload bytes
-and16target descriptors while uncertain; further retained QoS0 inputs wait. Ordinary QoS0 remains volatile. Client QoS0 completion alone is
+Maximum credit. At most one such owner flight retains its payload and its
+target descriptors, within the payload and destination limits, while uncertain;
+further retained QoS0 inputs wait. Ordinary QoS0 remains volatile. Client QoS0 completion alone is
 not evidence of broker commit; observe the value at another client or after
 restart. Unknown commands keep their exact operation and recipe; historical
 lookup precedes execution and collection preserves non-execution frontiers.
 
-A subscription update transaction considers up to8ordered filter occurrences
-against32retained entries. RH0 always requests replay; RH1 only when that literal
+A subscription update transaction considers up to 8 ordered filter occurrences
+against the retained entries, at most 4,096. RH0 always requests replay; RH1 only when that literal
 filter is absent at that step; RH2 never. Repeated filters are evaluated in order,
 including intermediate effects. The final route keeps the last options. Each
 eligible occurrence/topic creates a distinct replay: overlapping requested
@@ -718,12 +791,12 @@ Replay always carries RETAIN1; live delivery uses the OR of RAP on eligible
 contributions and the incoming RETAIN flag.
 
 Replay materialization freezes the publication version, topic, shared immutable
-payload, effective QoS, flag and a fresh causal delivery identity. Up to256
-publication identities are reserved before submission; unused identities are
+payload, effective QoS, flag and a fresh causal delivery identity. Up to 32,768
+publication identities (8 filters times 4,096 topics) are reserved before submission; unused identities are
 burned and covered by receipt closure. Existing reference capacity can refuse a
 whole update with negative SUBACKs; it cannot announce success and truncate the
-replay. Thirty-two topics to one subscriber are supported:16 is the per-live-
-publication destination bound, not a retained inventory bound. Existing paged
+replay. Every retained topic can replay to one subscriber: the per-live-
+publication destination bound, 1,024, is not a retained inventory bound. Existing paged
 work discovery and claim/Finish or consume-before-QoS0-emission drain the work;
 notifications remain an optimization. A later replace/clear does not rewrite it.
 
@@ -751,7 +824,7 @@ is unlimited, zero expires at reception and every positive value including
 The original domain/tick/interval is frozen at TCP frame completion before the
 reader channel, pending CONNECT or core input deferral and copied
 unchanged through retained replay and old owed versions. Tags13..16 preserve
-all historical tags1..12. Current SQLite schema12/13 refuses older formats before modification.
+all historical tags1..12. Current SQLite schema 14/15 refuses older formats before modification.
 
 Known same-origin time can establish expiry across process restarts. Unknown
 continuity quarantines expiring state, with bounded references and no fresh
@@ -777,10 +850,12 @@ quarantined with its PI/reference, not treated as certainly unsent or fresh.
 A receiptless maintenance lane scans four publications per request with a live
 key cursor and one outstanding request. It preserves unknown outcomes and
 potentially started claims; conditional claimed-copy expiry requires an exact
-certain-never-started fact. The existing128references/4MiB,32retained topics/1MiB,
-16destinations,8filters,256replay candidates and8192receipts remain. Start and
-terminal frame facts have544 reserved runtime inputs;208frame registrations
-remain. Correlated lifecycle/receipt controls retain independent lanes.
+certain-never-started fact. The limits of references, retained topics,
+destinations, filters, replay candidates and receipts given under
+[Bounds and transport](#bounds-and-transport) and above remain. A connection
+has 265 frame registrations (its 256 output places and nine more); start and
+terminal frame facts have twice as many reserved runtime inputs, plus the
+effect box. Correlated lifecycle/receipt controls retain independent lanes.
 
 Run `tools/run_message_expiry_reception.sh /tmp/message-expiry-reception` from
 this directory. Its new tests are system evidence, not extension of historical
@@ -797,7 +872,8 @@ observe retained `online`, a real sensor-process SIGKILL and non-retained
 localhost by default. The authenticated listener has a separate configuration and storage profile.
 
 OpenWillAt installs the exact attachment's immutable Will before known Open
-allows CONNACK. Normal DISCONNECT0 cancels it durably; DISCONNECT4 requests it.
+allows CONNACK. Normal DISCONNECT0 cancels it durably; DISCONNECT4 and every other reason
+code a client may send request it.
 EOF/RST, transport error, Keep Alive expiry and a protocol close after accepted
 Open make it Pending. Takeover closes the old transport and admits its zero-delay
 Will before opening the replacement, including Clean Start0. Peer.session and
@@ -812,11 +888,11 @@ the saved producer ClientID; normal output QoS0/1 and durable Finish apply to it
 targets. Offline recipients remain responsible references after source expiry.
 Existing receipt retirement protects kind17 publication/payload identities.
 
-There are at most256 intentions/8MiB of Will payload,32768 payload bytes and1024
-topic bytes each. Large canonical Open receipts have a separate8MiB ceiling;
+There are at most 1,024 intentions and 32 MiB of Will payload, 32,768 payload
+bytes and 1,024 topic bytes each. Large canonical Open receipts have a separate 8 MiB ceiling;
 pressure returns Unknown without writes, so reserved Resolve/fence capacity can
-establish nonexecution. Existing128 sessions,128 message references/4MiB and8192
-receipts remain unchanged. Full intention storage refuses a new Will CONNECT.
+establish nonexecution. The session, message reference and receipt limits
+remain unchanged. Full intention storage refuses a new Will CONNECT.
 Fanout or message-capacity pressure retains Pending state and emits a bounded
 `will_deferred` cause; it never truncates the target set. A bounded one-row
 continuation and100ms recovery scan run independently of ordinary notifications.
@@ -851,6 +927,6 @@ live obligations, intent consumption and receipt have one commit boundary.
 Same-ClientID CONNECT waits on the durable Will barrier, including while the
 retained inventory or fanout is at capacity. The event `will_connect_deferred`
 identifies a waiting transport. A reconnect timeout can require another attempt.
-Existing and unrelated connections keep progressing. SQLite schemas 12 and
-13 reject older formats before modification. The [decision](decisions/0037-retained-will.md)
+Existing and unrelated connections keep progressing. SQLite schemas 14 and
+15 reject older formats before modification. The [decision](decisions/0037-retained-will.md)
 describes the ordering and the bounded deferral.

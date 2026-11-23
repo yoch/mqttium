@@ -74,6 +74,26 @@ scenario(
     ],
 )
 
+for reason, name in ((0x00, "normal"), (0x04, "with-will"), (0x80, "unspecified-error"),
+                     (0x83, "implementation-error")):
+    scenario(
+        f"will/disconnect-{name}-expiry-zero-v5",
+        doc=f"""A client with a Will and a session of sixty seconds sends DISCONNECT with
+        Reason Code {reason:#04x} and Session Expiry Interval 0. What is recorded: whether
+        the Will is published, and whether the session is still there when the same
+        ClientID comes back with Clean Start 0.""",
+        steps=[
+            connect("sub", f"w-dr{reason:02x}-sub", level=5),
+            subscribe("sub", 1, [(f"willr{reason:02x}/t", 0)], level=5),
+            connect("w", f"w-dr{reason:02x}", level=5, props={"session_expiry_interval": 60},
+                    will={"topic": f"willr{reason:02x}/t", "payload": "gone", "qos": 1}),
+            send("w", wire.disconnect(level=5, reason=reason, props={"session_expiry_interval": 0})),
+            close("w", wait_peer=1.0),
+            collect("sub"),
+            connect("w", f"w-dr{reason:02x}", level=5, clean=False, props={"session_expiry_interval": 60}),
+        ],
+    )
+
 scenario(
     "will/delay-interval-v5",
     doc="""A Will with Will Delay Interval 1 on a session that outlives the connection is
@@ -99,4 +119,4 @@ scenario(
     ],
 )
 
-del level, v
+del level, v, reason, name

@@ -204,5 +204,5 @@ The table states implementation obligations, not completed Rust trace replays.
 | `FinishTarget` | Only that destination's durable Finish returns its reference. | Existing QoS1 Finish gates and Will offline-destination completion. |
 | `ReleasePressure` | Independent completion restores capacity; maintenance cannot silently discard a pending Will. | Bounded saturation/capacity-recovery tests; `CapacityBounded`. |
 | `OldClose` | An already attributed old attachment fact cannot be looked up against the current ClientID binding. | Actual old-generation runtime input tests; `mut-rebind-old-close`. |
-| `Crash`, `Recover` | Lose volatile transports, rediscover exact pending intentions and preserve admitted obligations on the same file. | Separate process/signal witnesses; `mut-forget-on-crash`, `reach-recovery`. |
+| `Crash`, `Recover` | Lose volatile transports, rediscover exact pending intentions and preserve admitted obligations on the same file. | Separate process/signal witnesses; `mut-forget-on-crash`, `reach-recovery`. On the executable: `a_kill_before_the_commit_publishes_the_will_a_normal_disconnect_cancelled` and `a_kill_after_the_commit_keeps_the_will_cancelled` (`crates/mqttiumd/tests/disconnect_durability.rs`). |
 | `Idle` | Safety does not assume a fair scheduler or a bounded publication delay. | All configurations; no liveness declaration. |

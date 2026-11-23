@@ -57,6 +57,8 @@ const OPS_KINDS: &[&str] = &[
     "counters",
     "expiry_inventory",
     "input_capacity_refused",
+    "log_checkpoint_failed",
+    "log_checkpoint_saved",
     "log_rotated",
     "message_expiry_clock",
     "message_expiry_retry_exhausted",
@@ -155,15 +157,32 @@ impl Events {
     #[inline]
     #[must_use]
     pub fn records(&self, kind: &str) -> bool {
-        self.level == Level::Audit || OPS_KINDS.binary_search(&kind).is_ok()
+        if self.level == Level::Audit {
+            return true;
+        }
+        if kind == "session_cardinality" || fast_tally_index(kind).is_some() {
+            return false;
+        }
+        OPS_KINDS.binary_search(&kind).is_ok()
     }
 
     /// Counts one observation that the current level does not write.
     #[inline]
     pub fn tally(&self, kind: &str) {
+        if self.level == Level::Ops
+            && let Some(index) = fast_tally_index(kind)
+        {
+            self.fast_tallies[index].fetch_add(1, Ordering::Relaxed);
+            return;
+        }
         if self.records(kind) {
             return;
         }
+        self.tally_slow(kind);
+    }
+
+    #[cold]
+    fn tally_slow(&self, kind: &str) {
         if let Some(index) = fast_tally_index(kind) {
             self.fast_tallies[index].fetch_add(1, Ordering::Relaxed);
             return;
@@ -270,19 +289,32 @@ impl Events {
             level,
         })
     }
+    #[inline]
     pub fn emit(&self, kind: &str, fields: Value) -> io::Result<()> {
-        if !self.records(kind) {
-            self.tally(kind);
-            return Ok(());
+        if self.level == Level::Ops {
+            if let Some(index) = fast_tally_index(kind) {
+                self.fast_tallies[index].fetch_add(1, Ordering::Relaxed);
+                return Ok(());
+            }
+            if OPS_KINDS.binary_search(&kind).is_err() {
+                self.tally_slow(kind);
+                return Ok(());
+            }
         }
         self.write(kind, fields)
     }
     /// Lazily builds the JSON fields only when `kind` is actually recorded.
     #[inline]
     pub fn emit_with(&self, kind: &str, fields: impl FnOnce() -> Value) -> io::Result<()> {
-        if !self.records(kind) {
-            self.tally(kind);
-            return Ok(());
+        if self.level == Level::Ops {
+            if let Some(index) = fast_tally_index(kind) {
+                self.fast_tallies[index].fetch_add(1, Ordering::Relaxed);
+                return Ok(());
+            }
+            if OPS_KINDS.binary_search(&kind).is_err() {
+                self.tally_slow(kind);
+                return Ok(());
+            }
         }
         self.write(kind, fields())
     }
@@ -391,6 +423,19 @@ mod tests {
             .lines()
             .map(|line| serde_json::from_str(line).unwrap())
             .collect()
+    }
+
+    #[test]
+    fn fast_tallies_and_session_cardinality_are_disjoint_from_ops_kinds() {
+        assert!(OPS_KINDS.windows(2).all(|w| w[0] < w[1]));
+        assert!(OPS_KINDS.binary_search(&"session_cardinality").is_err());
+        for kind in FAST_TALLIES {
+            assert!(
+                OPS_KINDS.binary_search(&kind).is_err(),
+                "{kind} must not appear in OPS_KINDS"
+            );
+            assert!(fast_tally_index(kind).is_some());
+        }
     }
     fn sequence(value: &Value) -> u64 {
         value["seq"].as_str().unwrap().parse().unwrap()

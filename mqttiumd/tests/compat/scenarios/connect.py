@@ -119,8 +119,10 @@ scenario(
 
 scenario(
     "connect/keepalive-timeout-v4",
-    doc="Keep Alive 1 and then silence: the broker closes the connection (observed within 5 s, not timed).",
-    steps=[connect("a", "c-idle", keepalive=1), until_close("a", timeout=5.0)],
+    doc="""Keep Alive 1 and then silence: the broker closes the connection (observed within
+    10 s, not timed: Mosquitto 2.1.4 checks Keep Alive on a coarse period and closes after
+    about six seconds).""",
+    steps=[connect("a", "c-idle", keepalive=1), until_close("a", timeout=10.0)],
 )
 
 scenario(

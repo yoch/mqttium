@@ -152,7 +152,7 @@
     {
       "decision": "0026",
       "path": "docs/decisions/0026-qos0-volatile-and-consumed.md",
-      "sha256": "ff41182e0f5c5f9592f2f0c6f0972324d31326ec1348450fe5b6c53e2e5a7275"
+      "sha256": "b74a7f7f4bd6fc3746dd704a45fdb2d9a635db22341085ef72e796f037459f72"
     },
     {
       "decision": "0027",
@@ -167,7 +167,7 @@
     {
       "decision": "0029",
       "path": "docs/decisions/0029-explicit-session-lifecycle.md",
-      "sha256": "84e58357ca50ef13e7e5d519a7e9eed74b28f855865d4486e3dabd5589e64d56"
+      "sha256": "aa5ee58f341278595e86274b489f695e1b186a304b742d273cd6d8679ca0dc9f"
     },
     {
       "decision": "0030",
@@ -192,12 +192,12 @@
     {
       "decision": "0034",
       "path": "docs/decisions/0034-durable-will.md",
-      "sha256": "da07e9b28e79abac0bd0840defc593cd9ac610f18d366baef977a9a91880f377"
+      "sha256": "4a3b9b0fadba4dfeb1d0356129a7c17c7a13cfb77c9ab7971a15bdaf9f922ce6"
     },
     {
       "decision": "0035",
       "path": "docs/decisions/0035-private-mtls-profile.md",
-      "sha256": "657ab09220b08a4c599803045097973102cfb221fd1773dfa097280fa6de4ef1"
+      "sha256": "8d70c14edcc6dbdf60e5cded181e206cdffb525f7eca5d4b549fb536355b11d0"
     },
     {
       "decision": "0036",
@@ -252,7 +252,7 @@
     {
       "decision": "0046",
       "path": "docs/decisions/0046-input-backpressure.md",
-      "sha256": "d2a77b383674b952d14c0079e19a72227df986efe39b89dae442def2a23a8c3f"
+      "sha256": "c989153843398d98306ad174dca7d8ecc3b206711b064d1bbda88ca50acdcab0"
     },
     {
       "decision": "0047",
@@ -262,12 +262,12 @@
     {
       "decision": "0048",
       "path": "docs/decisions/0048-runtime-limits.md",
-      "sha256": "8d11753aea3d61ecd0ecd75cba2e3500398675a02896cfc2ff08db0edb73501b"
+      "sha256": "d4a5fe67e7ae3723a6d2962c97ffebda450172e6e7180032ab10745b65156af2"
     },
     {
       "decision": "0049",
       "path": "docs/decisions/0049-functional-compatibility.md",
-      "sha256": "ddcd8456870c4de36e2dda5ab9e534e239175a344e8040a595c2d7714453326f"
+      "sha256": "4a4e51113617b864829e699b74bdc14e648f9a9a8d95731f8d198b7b6af9e4b8"
     },
     {
       "decision": "0050",

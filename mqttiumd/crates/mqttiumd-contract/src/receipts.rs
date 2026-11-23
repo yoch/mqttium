@@ -15,7 +15,7 @@ pub const RECEIPT_WINDOW: usize = 4_096;
 pub const RECEIPT_DATA_WINDOW: usize = 3_584;
 pub const RECEIPT_CONTROL_RESERVE: u64 = 512;
 pub const MAX_RECEIPT_ORIGINS: usize = 64;
-pub const MAX_COLLECTION_ROWS: u16 = 256;
+pub const MAX_COLLECTION_ROWS: u16 = 512;
 pub const RECEIPT_COLLECTION_TRIGGER: usize = 64;
 
 /// One producer's never-reused sequence spaces.
@@ -140,6 +140,7 @@ impl ReceiptClass {
             | Recipe::RetainedQos0(_)
             | Recipe::ReplaySubscriptions(_)
             | Recipe::AdmitPublication(_)
+            | Recipe::ClaimedPublication(_)
             | Recipe::ChangeSubscriptions(_)
             | Recipe::UpdateSubscriptions(_) => Self::Business,
             Recipe::WillPublication(_)

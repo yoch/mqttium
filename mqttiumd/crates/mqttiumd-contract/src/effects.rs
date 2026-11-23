@@ -711,12 +711,52 @@ struct ReservationRecord {
 }
 
 /// What one dispatch pass did.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
 pub struct DispatchReport {
     /// Effects whose ownership moved to the adapter, in order.
     pub accepted: usize,
     /// The first refusal. An independent effect may have passed a blocked wire queue.
     pub blocked: Option<SubmitBlock>,
+}
+
+/// Exact O(1) counters for priority control effects currently held in an [`Outbox`].
+#[derive(Clone, Copy, Default, Debug)]
+struct ControlCounts {
+    receipt: u32,
+    session: u32,
+    will: u32,
+}
+
+impl ControlCounts {
+    fn classify(effect: &Effect) -> (bool, bool, bool) {
+        match effect {
+            Effect::CollectReceipts { .. } => (true, false, false),
+            Effect::CloseConnection { .. }
+            | Effect::SessionChanged { .. }
+            | Effect::SessionRefused { .. } => (false, true, false),
+            Effect::LoadWills { .. } => (false, false, true),
+            Effect::Persist { command } => match command.recipe.get() {
+                crate::command::Recipe::SessionLifecycle(_) => (false, true, false),
+                crate::command::Recipe::WillPublication(_) => (false, false, true),
+                _ => (false, false, false),
+            },
+            _ => (false, false, false),
+        }
+    }
+
+    fn add(&mut self, effect: &Effect) {
+        let (r, s, w) = Self::classify(effect);
+        self.receipt += u32::from(r);
+        self.session += u32::from(s);
+        self.will += u32::from(w);
+    }
+
+    fn sub(&mut self, effect: &Effect) {
+        let (r, s, w) = Self::classify(effect);
+        self.receipt -= u32::from(r);
+        self.session -= u32::from(s);
+        self.will -= u32::from(w);
+    }
 }
 
 /// The bounded effect box of one owner.
@@ -734,6 +774,7 @@ pub struct Outbox {
     queue: BoundedQueue<OwnedEffect>,
     records: BoundedVec<ReservationRecord>,
     reserved: usize,
+    controls: ControlCounts,
 }
 
 impl Outbox {
@@ -762,7 +803,58 @@ impl Outbox {
             queue: BoundedQueue::with_capacity(capacity)?,
             records,
             reserved: 0,
+            controls: ControlCounts::default(),
         })
+    }
+
+    /// Whether the box currently holds any `CollectReceipts` effect.
+    #[must_use]
+    pub fn has_receipt_control(&self) -> bool {
+        self.controls.receipt != 0
+    }
+
+    /// Whether the box currently holds any session lifecycle/close/change/refusal control effect.
+    #[must_use]
+    pub fn has_session_control(&self) -> bool {
+        self.controls.session != 0
+    }
+
+    /// Whether the box currently holds any Will publication/load control effect.
+    #[must_use]
+    pub fn has_will_control(&self) -> bool {
+        self.controls.will != 0
+    }
+
+    fn pop_front_tracked(&mut self) -> Option<OwnedEffect> {
+        let effect = self.queue.pop_front()?;
+        self.controls.sub(effect.effect());
+        Some(effect)
+    }
+
+    #[expect(
+        clippy::result_large_err,
+        reason = "returns the unpushed OwnedEffect by value without heap allocation"
+    )]
+    fn push_back_tracked(&mut self, effect: OwnedEffect) -> Result<(), OwnedEffect> {
+        self.controls.add(effect.effect());
+        if let Err(effect) = self.queue.try_push_back(effect) {
+            self.controls.sub(effect.effect());
+            return Err(effect);
+        }
+        Ok(())
+    }
+
+    #[expect(
+        clippy::result_large_err,
+        reason = "returns the unpushed OwnedEffect by value without heap allocation"
+    )]
+    fn push_front_tracked(&mut self, effect: OwnedEffect) -> Result<(), OwnedEffect> {
+        self.controls.add(effect.effect());
+        if let Err(effect) = self.queue.try_push_front(effect) {
+            self.controls.sub(effect.effect());
+            return Err(effect);
+        }
+        Ok(())
     }
 
     /// The identity of this box.
@@ -930,7 +1022,7 @@ impl Outbox {
             Ok(index) => index,
             Err(reason) => return Err(PublishRefused { effect, reason }),
         };
-        if let Err(effect) = self.queue.try_push_back(effect) {
+        if let Err(effect) = self.push_back_tracked(effect) {
             return Err(PublishRefused {
                 effect,
                 reason: ReservationError::Inconsistent,
@@ -965,12 +1057,16 @@ impl Outbox {
         collection: EffectId,
         deadline: DeadlineToken,
     ) -> DispatchReport {
-        let mut waiting = self.queue.iter().any(|effect| effect.id() == collection);
+        if self.queue.is_empty() {
+            return DispatchReport::default();
+        }
+        let mut waiting =
+            self.controls.receipt != 0 && self.queue.iter().any(|effect| effect.id() == collection);
         let mut accepted = 0;
         let mut blocked = None;
         let count = self.queue.len();
         for _ in 0..count {
-            let Some(effect) = self.queue.pop_front() else {
+            let Some(effect) = self.pop_front_tracked() else {
                 break;
             };
             let is_collection = effect.id() == collection
@@ -995,7 +1091,7 @@ impl Outbox {
                 Some(effect)
             };
             if let Some(effect) = restore {
-                let restored = self.queue.try_push_back(effect);
+                let restored = self.push_back_tracked(effect);
                 debug_assert!(restored.is_ok(), "the scanned slot was taken");
             }
         }
@@ -1012,14 +1108,20 @@ impl Outbox {
         sink: &mut dyn EffectSink,
         flight: Option<(OperationId, DeadlineToken)>,
     ) -> DispatchReport {
-        let mut waiting = flight.is_some_and(|(operation, _)| self.queue.iter().any(|e| {
-            matches!(e.effect(), Effect::Persist {command} if command.recipe.operation() == operation)
-        }));
+        if self.queue.is_empty() || (flight.is_none() && self.controls.session == 0) {
+            return DispatchReport::default();
+        }
+        let mut waiting = self.controls.session != 0
+            && flight.is_some_and(|(operation, _)| {
+                self.queue.iter().any(|e| {
+                    matches!(e.effect(), Effect::Persist {command} if command.recipe.operation() == operation)
+                })
+            });
         let mut accepted = 0;
         let mut blocked = None;
         let count = self.queue.len();
         for _ in 0..count {
-            let Some(effect) = self.queue.pop_front() else {
+            let Some(effect) = self.pop_front_tracked() else {
                 break;
             };
             let lifecycle_persist = matches!(effect.effect(), Effect::Persist {command} if matches!(command.recipe.get(), crate::command::Recipe::SessionLifecycle(_)));
@@ -1054,7 +1156,7 @@ impl Outbox {
                 Some(effect)
             };
             if let Some(effect) = restore {
-                let restored = self.queue.try_push_back(effect);
+                let restored = self.push_back_tracked(effect);
                 debug_assert!(restored.is_ok(), "the scanned slot was taken");
             }
         }
@@ -1067,14 +1169,20 @@ impl Outbox {
         sink: &mut dyn EffectSink,
         flight: Option<(OperationId, DeadlineToken)>,
     ) -> DispatchReport {
-        let mut waiting = flight.is_some_and(|(operation, _)| self.queue.iter().any(|e| {
-            matches!(e.effect(), Effect::Persist {command} if command.recipe.operation() == operation)
-        }));
+        if self.queue.is_empty() || (flight.is_none() && self.controls.will == 0) {
+            return DispatchReport::default();
+        }
+        let mut waiting = self.controls.will != 0
+            && flight.is_some_and(|(operation, _)| {
+                self.queue.iter().any(|e| {
+                    matches!(e.effect(), Effect::Persist {command} if command.recipe.operation() == operation)
+                })
+            });
         let mut accepted = 0;
         let mut blocked = None;
         let count = self.queue.len();
         for _ in 0..count {
-            let Some(effect) = self.queue.pop_front() else {
+            let Some(effect) = self.pop_front_tracked() else {
                 break;
             };
             let lifecycle_persist = matches!(effect.effect(), Effect::Persist {command} if matches!(command.recipe.get(), crate::command::Recipe::WillPublication(_)));
@@ -1104,7 +1212,7 @@ impl Outbox {
                 Some(effect)
             };
             if let Some(effect) = restore {
-                let restored = self.queue.try_push_back(effect);
+                let restored = self.push_back_tracked(effect);
                 debug_assert!(restored.is_ok(), "the scanned slot was taken");
             }
         }
@@ -1118,7 +1226,7 @@ impl Outbox {
         let mut held = 0;
         let mut blocked = None;
         for remaining in (0..self.queue.len()).rev() {
-            let effect = self.queue.pop_front().expect("unvisited effect");
+            let effect = self.pop_front_tracked().expect("unvisited effect");
             let wire = effect.effect().wire_generation();
             if let Some(key) = wire
                 && held != 0
@@ -1128,7 +1236,7 @@ impl Outbox {
                     .skip(remaining)
                     .any(|older| older.effect().wire_generation() == Some(key))
             {
-                let restored = self.queue.try_push_back(effect);
+                let restored = self.push_back_tracked(effect);
                 debug_assert!(restored.is_ok(), "the popped slot was taken");
                 held += 1;
                 continue;
@@ -1140,17 +1248,17 @@ impl Outbox {
                     let transport_only =
                         reason == SubmitBlock::TransportBackpressure && wire.is_some();
                     if !transport_only && held == 0 {
-                        let restored = self.queue.try_push_front(effect);
+                        let restored = self.push_front_tracked(effect);
                         debug_assert!(restored.is_ok(), "the popped slot was taken");
                         break;
                     }
-                    let restored = self.queue.try_push_back(effect);
+                    let restored = self.push_back_tracked(effect);
                     debug_assert!(restored.is_ok(), "the popped slot was taken");
                     if !transport_only {
                         // Put the already visited refusals before the unvisited tail.
                         for _ in 0..remaining {
-                            let effect = self.queue.pop_front().expect("unvisited effect");
-                            let restored = self.queue.try_push_back(effect);
+                            let effect = self.pop_front_tracked().expect("unvisited effect");
+                            let restored = self.push_back_tracked(effect);
                             debug_assert!(restored.is_ok(), "the popped slot was taken");
                         }
                         break;
@@ -1460,6 +1568,10 @@ impl OwnerAuthority {
     /// An empty box does not mean that its owner is at rest: replies to
     /// effects already accepted still belong to the owner, and retiring
     /// the box does not end its life cycle.
+    #[expect(
+        clippy::result_large_err,
+        reason = "a refusal returns the box by value without heap allocation"
+    )]
     pub fn retire(&mut self, outbox: Outbox) -> Result<(), RetireRefused> {
         let index = match self.retirable(&outbox) {
             Ok(index) => index,

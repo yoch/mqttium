@@ -1,10 +1,18 @@
 [
   {
+    "id": "connect/bad-protocol-level-v4",
+    "class": "unspecified",
+    "difference": "For a CONNECT with protocol level 6, Mosquitto answers a CONNACK in the MQTT 5 layout with Reason Code 0x84 (Unsupported Protocol Version) and closes; mqttiumd answers the MQTT 3.1.1 CONNACK with return code 1 (unacceptable protocol version) and closes.",
+    "statement": "MQTT-3.1.2-2 asks for return code 0x01 and a close; MQTT 5.0 section 3.1.2.2 allows CONNACK 0x84 before the close. A level that is neither 4 nor 5 names neither layout",
+    "decision": "0062",
+    "fingerprint": "7e0c2c0e6104fba1"
+  },
+  {
     "id": "connect/connack-capabilities-v5",
     "class": "profile-refused",
-    "difference": "Mosquitto announces Receive Maximum 20 and Topic Alias Maximum 10 and leaves every other capability at its default; mqttiumd announces Receive Maximum 8, Maximum Packet Size 1 048 584, Topic Alias Maximum 0, and shared subscriptions and Subscription Identifiers not available.",
+    "difference": "Mosquitto announces Receive Maximum 20, Topic Alias Maximum 10 and Maximum Packet Size 2 000 000 and leaves every other capability at its default; mqttiumd announces Receive Maximum 8, Maximum Packet Size 1 048 584, Topic Alias Maximum 0, and shared subscriptions and Subscription Identifiers not available.",
     "lot": "The capabilities of the v0.1 profile: Topic Alias from client to server (Topic Alias Maximum above 0); Shared subscriptions (CMP-002); Subscription Identifiers; Receive Maximum and Maximum Packet Size of the runtime profile",
-    "fingerprint": "b52c6f8738fb9477"
+    "fingerprint": "d80423b8f9620e5c"
   },
   {
     "id": "connect/empty-clientid-v4",
@@ -52,21 +60,20 @@
     "fingerprint": "e65f6932e92f4b99"
   },
   {
-    "id": "errors/packet-at-announced-maximum-v5",
-    "class": "reference-nonconformant",
-    "difference": "Both acknowledge a PUBLISH of exactly the announced 1 048 584 bytes with Reason Code 0x10 (No matching subscribers). Mosquitto also acknowledges the next one, of 1 048 585 bytes, and keeps the connection; mqttiumd answers DISCONNECT 0x95 (Packet too large) and closes.",
-    "statement": "MQTT-4.13.1-1, with section 3.2.2.3.6: the size is the whole packet, and a larger one is a Protocol Error with 0x95",
-    "mqttiumd": "Measures the whole packet, fixed header included: acknowledges 1 048 584 bytes, answers 1 048 585 with DISCONNECT 0x95 (Packet too large) and closes the network connection.",
-    "decision": "0049",
-    "fingerprint": "b11195bc5d8f4afa"
-  },
-  {
     "id": "properties/topic-alias-v5",
     "class": "profile-refused",
     "difference": "Mosquitto (Topic Alias Maximum 10) resolves the alias and delivers both messages; mqttiumd (Topic Alias Maximum 0) answers the first PUBLISH with DISCONNECT 0x94 (Topic Alias invalid) and closes.",
     "statement": "MQTT-3.2.2-18: with Topic Alias Maximum 0 the client is the one at fault",
     "lot": "Topic Alias from client to server (Topic Alias Maximum above 0)",
     "fingerprint": "36e59be75d5309a5"
+  },
+  {
+    "id": "publish/empty-topic-name-v5",
+    "class": "unspecified",
+    "difference": "Both close the connection on a PUBLISH with an empty Topic Name and no Topic Alias; Mosquitto after DISCONNECT 0x81 (Malformed Packet), mqttiumd after DISCONNECT 0x82 (Protocol Error).",
+    "statement": "MQTT-4.13.1-1: both close; section 3.3.2.1 calls an empty Topic Name without a Topic Alias a Protocol Error",
+    "decision": "0058",
+    "fingerprint": "da8d3d90732c886d"
   },
   {
     "id": "publish/pubrel-retransmit-v5",
@@ -94,6 +101,33 @@
     "fingerprint": "3d5fe5d94ba4a6cf"
   },
   {
+    "id": "session/ninth-exchange-after-reconnection-v4",
+    "class": "reference-nonconformant",
+    "difference": "A 3.1.1 session owes the PUBREL of eight exchanges and publishes a ninth QoS 2 message. Mosquitto answers PUBREC, later answers its PUBREL with PUBCOMP, and the subscriber never receives the message (upstream ticket 3809); mqttiumd does not acknowledge the PUBLISH and closes the connection. On both the subscriber ends with the first eight messages.",
+    "statement": "MQTT-4.3.3-2: a PUBREC says the receiver accepted ownership of the message, and MQTT-4.5.0-1 that a message it owns is added to the matching sessions",
+    "mqttiumd": "Does not acknowledge the ninth PUBLISH and closes the network connection: the message stays the client's. A PUBREL for its identifier is answered with PUBCOMP, as 3.1.1 answers any PUBREL.",
+    "decision": "0061",
+    "fingerprint": "7537924e76ce1ecd"
+  },
+  {
+    "id": "session/ninth-exchange-after-reconnection-v5",
+    "class": "reference-nonconformant",
+    "difference": "An MQTT 5 session owes the PUBREL of eight exchanges, the Receive Maximum, and publishes a ninth QoS 2 message. Mosquitto answers PUBREC 0x97 (Quota exceeded), keeps the connection, and later answers the PUBREL of that identifier with PUBCOMP 0x00; mqttiumd sends DISCONNECT 0x97 (Quota exceeded) and closes, and answers that PUBREL with PUBCOMP 0x92 (Packet Identifier not found).",
+    "statement": "MQTT-4.13.1-1, with section 3.3.4: a client that exceeds Receive Maximum (MQTT-3.3.4-7) makes a Protocol Error, so the server must close the connection",
+    "mqttiumd": "Sends DISCONNECT 0x97 (Quota exceeded) and closes the network connection; the bound is the session's, whatever the connection.",
+    "decision": "0061",
+    "fingerprint": "22887b0faacf88f1"
+  },
+  {
+    "id": "session/redelivery-pubrel-after-expiry-v5",
+    "class": "reference-nonconformant",
+    "difference": "A QoS 2 delivery with Message Expiry Interval 1 reached PUBREL and lost its connection before PUBCOMP. When the session comes back after the interval, Mosquitto sends nothing after CONNACK (upstream ticket 3744); mqttiumd sends the PUBREL again and completes on PUBCOMP.",
+    "statement": "MQTT-4.4.0-1: the PUBREL of an exchange in progress is resent on reconnection; the Message Expiry Interval of section 3.3.2.3.3 ends the delivery of a message that has not started, not an exchange that has",
+    "mqttiumd": "Sends the PUBREL again with its Packet Identifier after CONNACK and ends the exchange on PUBCOMP.",
+    "decision": "0062",
+    "fingerprint": "6a35aa4e4020a164"
+  },
+  {
     "id": "subscribe/invalid-empty-filter-v5",
     "class": "unspecified",
     "difference": "Both close the connection on the invalid Topic Filter; Mosquitto with DISCONNECT 0x81 (Malformed Packet), mqttiumd with DISCONNECT 0x82 (Protocol Error).",
@@ -108,6 +142,14 @@
     "statement": "MQTT-4.13.1-1: both close; the Reason Code is not prescribed",
     "decision": "0049",
     "fingerprint": "6a79447df4524ecc"
+  },
+  {
+    "id": "subscribe/overlapping-subscriptions-v4",
+    "class": "unspecified",
+    "difference": "For one message matching two subscriptions of a MQTT 3.1.1 client, Mosquitto sends one copy per subscription (QoS 0 and QoS 1); mqttiumd sends one copy at the highest granted QoS.",
+    "statement": "MQTT-3.3.5-1 requires the copy at the highest QoS; section 3.3.5 allows a copy per subscription",
+    "decision": "0049",
+    "fingerprint": "3e0b0a3c257fc4cf"
   },
   {
     "id": "subscribe/overlapping-subscriptions-v5",
@@ -147,7 +189,7 @@
     "class": "profile-refused",
     "difference": "Mosquitto sends its retained `$SYS/broker/version` message; mqttiumd grants the subscription and publishes nothing under `$SYS`.",
     "lot": "Operations: metrics published under `$SYS` (chapter 1, section 3, row Exploitation)",
-    "fingerprint": "b026513ceb42f74a"
+    "fingerprint": "7953345e71ed7efe"
   },
   {
     "id": "will/abrupt-close-qos0-v4",
@@ -176,5 +218,23 @@
     "difference": "Mosquitto accepts Will Delay Interval 1 and publishes the Will after the delay; mqttiumd refuses the CONNECT with CONNACK 0x83 (Implementation specific error).",
     "lot": "Will messages beyond QoS 1 without delay: Will QoS 0 and 2, Will Delay Interval",
     "fingerprint": "d099e2268f9c64c9"
+  },
+  {
+    "id": "will/disconnect-implementation-error-expiry-zero-v5",
+    "class": "reference-nonconformant",
+    "difference": "On DISCONNECT with Reason Code 0x83 (Implementation specific error) and Session Expiry Interval 0 from a client with a Will, Mosquitto ends the session and publishes no Will; mqttiumd ends the session and publishes the Will.",
+    "statement": "MQTT-3.1.2-8, with MQTT-3.14.4-3: the Will is published when the connection closes unless a DISCONNECT with Reason Code 0x00 discarded it",
+    "mqttiumd": "Publishes the Will and ends the session.",
+    "decision": "0058",
+    "fingerprint": "142cde83aa657126"
+  },
+  {
+    "id": "will/disconnect-unspecified-error-expiry-zero-v5",
+    "class": "reference-nonconformant",
+    "difference": "On DISCONNECT with Reason Code 0x80 (Unspecified error) and Session Expiry Interval 0 from a client with a Will, Mosquitto ends the session and publishes no Will; mqttiumd ends the session and publishes the Will.",
+    "statement": "MQTT-3.1.2-8, with MQTT-3.14.4-3: the Will is published when the connection closes unless a DISCONNECT with Reason Code 0x00 discarded it",
+    "mqttiumd": "Publishes the Will and ends the session.",
+    "decision": "0058",
+    "fingerprint": "e33c6b8e975f49d8"
   }
 ]

@@ -375,6 +375,9 @@ impl Owner {
                 self.wills.after = flight.next;
                 self.wills.deferred =
                     deferred.then_some((flight.will, WillDeferredReason::StoreRefusal));
+                if !deferred && self.inline_claim_enabled {
+                    self.mark_all_sessions_dirty(true);
+                }
                 remember(&mut self.finished, finished)?;
             }
         }
@@ -442,6 +445,7 @@ mod tests {
                 max_sessions: nz(24),
                 max_routes: nz(24),
                 max_exchanges: nz(8),
+                session_qos2_exchanges: NonZeroU32::MAX,
                 account: AccountId::new(1),
                 payload_bytes: PayloadBytes::new(1024),
                 resolution_delay: LogicalDuration::new(1),

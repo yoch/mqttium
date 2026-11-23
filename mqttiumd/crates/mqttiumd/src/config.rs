@@ -70,6 +70,10 @@ pub struct ConfigReport {
     pub ok: bool,
     pub reports: Vec<DirectiveReport>,
     pub errors: Vec<String>,
+    /// What a launch with this file alone still lacks, as the options of
+    /// the command line that give it. A valid file can leave the event
+    /// journal or the database to the command line.
+    pub launch_requires: Vec<&'static str>,
 }
 
 impl ConfigReport {
@@ -92,6 +96,7 @@ impl ConfigReport {
             "ok": self.ok,
             "directives": directives,
             "errors": self.errors,
+            "launch_requires": self.launch_requires,
         })
     }
 }
@@ -112,17 +117,38 @@ pub struct ParsedConfig {
 }
 
 impl ParsedConfig {
+    /// Disk storage or snapshotting needs a database path.
+    fn needs_db(&self) -> bool {
+        matches!(
+            self.storage_mode,
+            StorageMode::Durable
+                | StorageMode::Log
+                | StorageMode::Volatile {
+                    snapshot_interval: Some(_),
+                }
+        ) || self.require_existing_db
+    }
+
+    /// The options a launch must still be given, because this file names
+    /// neither the path they give. The same conditions as
+    /// [`ParsedConfig::into_runtime_config`], which refuses without them.
+    #[must_use]
+    pub fn launch_requires(&self) -> Vec<&'static str> {
+        let mut missing = Vec::new();
+        if self.needs_db() && self.db.is_none() {
+            missing.push("--db");
+        }
+        if self.events.is_none() {
+            missing.push("--events");
+        }
+        missing
+    }
+
     /// Finalizes into a runnable [`Config`], requiring `--db` when disk
     /// storage or snapshotting is active and `--events` either from the
     /// configuration file or CLI overrides.
     pub fn into_runtime_config(self, hooks: Hooks) -> Result<Config, String> {
-        let needs_db = matches!(
-            self.storage_mode,
-            StorageMode::Durable
-                | StorageMode::Volatile {
-                    snapshot_interval: Some(_),
-                }
-        ) || self.require_existing_db;
+        let needs_db = self.needs_db();
         let db = if needs_db {
             self.db.ok_or_else(|| {
                 "database path missing (set persistence_location/mqttiumd_db or --db)".to_owned()
@@ -966,7 +992,7 @@ fn parse_file(acc: &mut Accumulator, path: &Path, depth: usize) -> Result<(), St
                 ),
             },
             "mqttiumd_storage_mode" => match rest {
-                "durable" | "volatile" => {
+                "durable" | "log" | "volatile" => {
                     acc.explicit_storage_mode = Some(rest.to_owned());
                     acc.record(
                         path,
@@ -981,7 +1007,7 @@ fn parse_file(acc: &mut Accumulator, path: &Path, depth: usize) -> Result<(), St
                     line_no,
                     directive,
                     DirectiveStatus::Blocking,
-                    "mqttiumd_storage_mode expects `durable` or `volatile`",
+                    "mqttiumd_storage_mode expects `durable`, `log`, or `volatile`",
                 ),
             },
             "mqttiumd_snapshot_interval" => match rest.parse::<u64>() {
@@ -1199,6 +1225,22 @@ pub fn check_file(path: &Path) -> Result<(ConfigReport, Option<ParsedConfig>), S
             );
             StorageMode::Durable
         }
+        (Some("log"), Some(false)) => {
+            acc.errors.push(
+                "CFG-006: `persistence false` conflicts with `mqttiumd_storage_mode log`"
+                    .to_owned(),
+            );
+            StorageMode::Log
+        }
+        (Some("log"), _) => {
+            if acc.explicit_snapshot_interval.is_some() {
+                acc.errors.push(
+                    "mqttiumd_snapshot_interval requires `mqttiumd_storage_mode volatile`"
+                        .to_owned(),
+                );
+            }
+            StorageMode::Log
+        }
         (Some("durable"), _) | (None, None | Some(true)) => {
             if acc.explicit_snapshot_interval.is_some() {
                 acc.errors.push(
@@ -1247,10 +1289,11 @@ pub fn check_file(path: &Path) -> Result<(ConfigReport, Option<ParsedConfig>), S
     };
 
     let ok = !acc.has_blocking();
-    let report = ConfigReport {
+    let mut report = ConfigReport {
         ok,
         reports: acc.reports.clone(),
         errors: acc.errors.clone(),
+        launch_requires: Vec::new(),
     };
     let parsed = if ok {
         let default_limits = if cfg!(feature = "test-hooks") {
@@ -1282,6 +1325,9 @@ pub fn check_file(path: &Path) -> Result<(ConfigReport, Option<ParsedConfig>), S
     } else {
         None
     };
+    if let Some(parsed) = &parsed {
+        report.launch_requires = parsed.launch_requires();
+    }
     Ok((report, parsed))
 }
 

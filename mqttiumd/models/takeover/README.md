@@ -18,7 +18,7 @@ python ../tools/formal/run_tlc.py --models-dir models/takeover --list
 python ../tools/formal/run_tlc.py --models-dir models/takeover
 ```
 
-14 configurations, the whole directory in about thirty-five seconds; the
+20 configurations, the whole directory in about forty-five seconds; the
 largest explores 208,572 states in about ten.
 
 ## What is modelled
@@ -35,6 +35,11 @@ generation it was submitted on; its receipt and its result carry that
 - A close is `Control::stop` on the core thread, in its three steps:
   `cancelled` is set, the socket is shut down, and only then the terminal
   reason is recorded. The task may run between any two of them.
+- With `Deferred` the connection is a TLS one. Its task owns the state
+  that seals the close_notify alert, so `Connection::close` only sets
+  `cancelled`: the task shuts the socket and records the reason when it
+  ends (`tls::Task::finish`), and `Runtime::close` leaves the peer in the
+  table until `is_finished`. The alert is not a frame and is not modelled.
 - The task checks `cancelled`, then writes; a write on a socket that was
   shut down fails and ends the task. A task that ends runs
   `Control::stop` on its own thread and `Lanes::finish`.
@@ -73,6 +78,7 @@ generation it was submitted on; its receipt and its result carry that
 | `OldClosedBeforeNewBound` | The session is bound to the new generation only after the old peer was removed and its socket shut down. |
 | `OldSilentOnceNewBound` | Nothing is written to the old socket once the session is bound to the new generation. |
 | `ClosedIsShut` | A closed peer has `cancelled` set, its socket shut down and its reason recorded before the core does anything else. |
+| `ClosedIsCancelled`, `RemovedIsShut` | With `Deferred`, in place of `ClosedIsShut`: a closed peer is cancelled before the core does anything else, and a peer that left the table has its socket shut down and its reason recorded. |
 | `RecordedIsShut`, `NoWriteAfterRecord` | Once the terminal reason of a connection can be read its socket is shut down, and no byte leaves on it after that. |
 | `EveryFrameResolved`, `TakeoverCompletes` | Under weak fairness of the core, the owner and the tasks: every accepted frame gets its result at the owner, and a takeover ends bound to the new generation unless the new connection was closed first. |
 
@@ -107,6 +113,7 @@ no code, only whether one is recorded.
 | `mut-open-without-waiting`, `mut-open-without-waiting-write` | The open of the new generation does not wait for the old peer to leave the table. | `OldClosedBeforeNewBound`; `OldSilentOnceNewBound` |
 | `mut-cancel-without-shutdown` | A close sets `cancelled` and leaves the socket open. | `OldSilentOnceNewBound`: the task had checked the flag before it was set |
 | `mut-record-before-shutdown` | `Control::stop` records the reason, then sets the flag, then shuts the socket. | `NoWriteAfterRecord`: a write that passed its check leaves after the reason |
+| `mut-deferred-without-waiting`, `mut-deferred-without-waiting-write` | With `Deferred`, `finish_close` removes the peer without waiting for its task. | `OldClosedBeforeNewBound`; `OldSilentOnceNewBound`: the socket is still open when the new generation is bound |
 
 The `reach-` configurations show a Failed result of the old
 generation applied while the session is bound to the new one and
@@ -122,7 +129,7 @@ while another failed.
 | `NewConnect` | `connect`, `start_takeover` | `takeover_waits_for_old_will_admission_and_old_close_cannot_publish_new_will` (`runtime_tests.rs`) |
 | `CoreCloseDue`, `CoreCloseOther` | `Runtime::close`, up to the call of `Connection::close` | `stale_puback_during_takeover_with_a_blocked_close_cannot_stop_other_connections` (`runtime_tests.rs`) |
 | `CoreStopCancel`, `CoreStopShut`, `CoreStopRecord` | `cancelled.store(true)`, `stream.shutdown` and `record` in `Control::stop` | `cancellation_ends_idle_and_partial_socket_tasks` (`net.rs`); no test places a write between the steps |
-| `CoreFinishClose` | `finish_close` | `closing_qos0_without_collecting_written_retires_the_exact_attempt` (`runtime_tests.rs`) |
+| `CoreFinishClose` | `finish_close`; with `Deferred`, after the `is_tls() && !is_finished()` return of `Runtime::close` and the retiring pass of `connections` | `closing_qos0_without_collecting_written_retires_the_exact_attempt` (`runtime_tests.rs`) |
 | `CoreOpenNew` | `pump_will_connects`: a pending connect is ready only when its `previous` peer is no longer in `peers` | `takeover_waits_for_old_will_admission_and_old_close_cannot_publish_new_will` |
 | `OwnerFrameResult` | `plan_frame_result` (`owner.rs`) | `a_failed_frame_ends_the_connection_of_its_session`: a Failed of another generation or session is absorbed; `qos1_complete_write_releases_once_partial_or_wrong_receipt_never_does` |
 | `OwnerClosed` | `Input::ConnectionClosed`; `pop_closing_input` | `copied_lifecycle_effect_and_actual_old_close_cannot_rebind_a_replaced_client_id` (`runtime_tests.rs`, feature `test-hooks`) |
@@ -131,13 +138,13 @@ while another failed.
 | `TaskCheck`, `TaskWrite` | `control.is_cancelled()` then `stream.write` in `write_attempt` | No deterministic replay of the window of `mut-record-before-shutdown` |
 | `TaskCancelled` | `control.is_cancelled()` at the start of `turn` | `cancellation_reports_every_accepted_output_frame` (`net.rs`) |
 | `TaskError` | Any `Err` of `turn` | `noncanonical_header_is_a_malformed_packet_not_clean_eof` (`net.rs`) |
-| `TaskFinish` | `Driven::finish`: `Control::stop`, `Lanes::finish`; `retire` | `cancellation_reports_every_accepted_output_frame`; `a_terminal_turn_publishes_its_facts_before_the_link_reads_finished` (`net/reactor.rs`) |
+| `TaskFinish` | `Driven::finish`: `Control::stop`, `Lanes::finish`; `retire`. A TLS task attempts close_notify first: `a_tls_client_reads_close_notify_after_its_disconnect` (`runtime_tests.rs`) | `cancellation_reports_every_accepted_output_frame`; `a_terminal_turn_publishes_its_facts_before_the_link_reads_finished` (`net/reactor.rs`) |
 | `Quiescent` | The end of a run of the model | Not an action of the code |
 
 The sidecar lists under `replays` the tests that drive the code through
 the counterexample of a mutant or a trace of the model: the generation
 check of the owner, the close that retires frames whose receipts were not
 collected, and the takeover that waits for the old peer. No test replays
-`mut-record-before-shutdown`, `mut-cancel-without-shutdown` or
-`mut-open-without-waiting` with a frame in flight: they need a chosen
-schedule of the core and reactor threads.
+`mut-record-before-shutdown`, `mut-cancel-without-shutdown`,
+`mut-open-without-waiting` or `mut-deferred-without-waiting` with a frame
+in flight: they need a chosen schedule of the core and reactor threads.

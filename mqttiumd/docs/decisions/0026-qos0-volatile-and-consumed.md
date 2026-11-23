@@ -5,6 +5,11 @@ repository owner's delegation on the advice of the independent audit of
 `8e4303d`). This bounded product increment preserves ARC-025 and does not
 qualify all MQTT/P1/P2 semantics or accept historical proposals.
 
+Amended by 0063 (proposed): the owner emits QoS 0 by a window per
+connection and the next frames as their writes complete, so a burst alone
+no longer meets the output saturation this record names; past what a
+connection may keep waiting, the drop is the owner's.
+
 Amendment of acceptance (21 November 2026).
 Keep the bounded 100 ms durable-work rescan until a replacement preserves or
 rediscovers every outstanding obligation across a full input queue and

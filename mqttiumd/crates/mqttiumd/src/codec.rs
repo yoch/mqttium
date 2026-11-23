@@ -109,7 +109,6 @@ pub struct Error {
     pub code: &'static str,
     pub reason: u8,
     peer_maximum: Option<u32>,
-    disconnect_expiry: Option<u32>,
 }
 
 impl Error {
@@ -125,18 +124,6 @@ impl Error {
     /// Peer response limit established by a fully validated CONNECT.
     pub const fn peer_maximum(self) -> Option<u32> {
         self.peer_maximum
-    }
-    /// The packet was structurally validated before profile refusal. MQTT's
-    /// CONNECT0→DISCONNECTnonzero context rule also applies to an otherwise
-    /// unsupported DISCONNECT feature.
-    pub fn in_session(self, connect_expiry: SessionExpiry) -> Self {
-        if connect_expiry == SessionExpiry::OnDisconnect
-            && self.disconnect_expiry.is_some_and(|value| value != 0)
-        {
-            protocol("SessionExpiryIncreaseForbidden")
-        } else {
-            self
-        }
     }
 }
 
@@ -154,7 +141,6 @@ const fn malformed(code: &'static str) -> Error {
         code,
         reason: 0x81,
         peer_maximum: None,
-        disconnect_expiry: None,
     }
 }
 
@@ -164,7 +150,6 @@ const fn protocol(code: &'static str) -> Error {
         code,
         reason: 0x82,
         peer_maximum: None,
-        disconnect_expiry: None,
     }
 }
 
@@ -174,7 +159,6 @@ const fn unsupported(code: &'static str) -> Error {
         code,
         reason: 0x83,
         peer_maximum: None,
-        disconnect_expiry: None,
     }
 }
 
@@ -184,7 +168,6 @@ const fn oversized(code: &'static str) -> Error {
         code,
         reason: 0x95,
         peer_maximum: None,
-        disconnect_expiry: None,
     }
 }
 
@@ -596,7 +579,12 @@ fn client_connect(body: &[u8], bounds: Bounds) -> Result<Packet, Error> {
         return Err(malformed("PasswordWithoutUsername"));
     }
     let will = flags & 4 != 0;
-    if (!will && flags & 0x38 != 0) || (will && (flags >> 3) & 3 == 3) {
+    // Will QoS 3 is a Malformed Packet (MQTT-3.1.2-12). The other forbidden
+    // combinations parse and are Protocol Errors.
+    if (flags >> 3) & 3 == 3 {
+        return Err(malformed("ReservedWillQos"));
+    }
+    if !will && flags & 0x38 != 0 {
         return Err(protocol("InvalidWillFlags"));
     }
     let keep_alive = input.u16()?;
@@ -747,6 +735,12 @@ fn publish(version: Version, first: u8, body: &[u8], bounds: Bounds) -> Result<P
         Some(identifier(&mut input)?)
     };
     let props = versioned_properties(version, &mut input, Context::Publish)?;
+    // No Topic Alias reaches this point: Topic Alias Maximum 0 was announced
+    // and the properties refused any. An empty name therefore designates
+    // nothing, a Protocol Error and not an invalid name (MQTT 5 §3.3.2.1).
+    if topic_bytes.is_empty() {
+        return Err(protocol("EmptyTopicName"));
+    }
     topic(topic_bytes)?;
     let payload = input.take(body.len() - input.at)?;
     if props.unsupported {
@@ -758,7 +752,6 @@ fn publish(version: Version, first: u8, body: &[u8], bounds: Bounds) -> Result<P
             code: "PayloadFormatInvalid",
             reason: 0x99,
             peer_maximum: None,
-            disconnect_expiry: None,
         });
     }
     let has_props = props.payload_format_indicator.is_some()
@@ -881,20 +874,12 @@ fn disconnect(body: &[u8]) -> Result<Packet, Error> {
         properties(&mut input, Context::Disconnect)?
     };
     input.end()?;
-    if !matches!(reason, 0 | 4)
-        || props.unsupported
-        || props
-            .expiry
-            .is_some_and(|n| SessionExpiry::from_wire(n).is_none())
-    {
-        return Err(Error {
-            disconnect_expiry: props.expiry,
-            ..unsupported("DisconnectOutsideProfile")
-        });
-    }
+    // Every reason admitted above ends the connection and is served: the
+    // Session Expiry Interval applies whatever the reason (§3.14.2.2.2), and
+    // only a normal disconnection discards the Will (§3.1.2.5).
     Ok(Packet::Disconnect {
         expiry: props.expiry.and_then(SessionExpiry::from_wire),
-        publish_will: reason == 4,
+        publish_will: reason != 0,
     })
 }
 
@@ -1280,69 +1265,131 @@ pub fn encode(frame: OutboundFrame) -> Result<Vec<u8>, Error> {
 }
 
 pub fn encode_for(version: Version, frame: OutboundFrame) -> Result<Vec<u8>, Error> {
+    encode_frame_bytes(version, frame).map(|bytes| bytes.as_slice().to_vec())
+}
+
+/// Encodes a core-authorized control frame directly into an inline
+/// [`crate::net::FrameBytes`] buffer with zero heap allocation.
+pub fn encode_frame_bytes(
+    version: Version,
+    frame: OutboundFrame,
+) -> Result<crate::net::FrameBytes, Error> {
+    use crate::net::FrameBytes;
+    let ack = |first: u8, packet_id: InboundPacketId, reason: AckReason| {
+        let reason = match reason {
+            AckReason::Success => 0,
+            AckReason::PacketIdentifierNotFound => 0x92,
+            AckReason::QuotaExceeded => 0x97,
+            AckReason::ImplementationSpecificError => 0x83,
+        };
+        if (first == 0x70 && !matches!(reason, 0 | 0x92)) || (first == 0x50 && reason == 0x92) {
+            return Err(protocol("InvalidOutboundAckReason"));
+        }
+        let id = packet_id.get().to_be_bytes();
+        Ok(if reason == 0 {
+            FrameBytes::from_slice(&[first, 2, id[0], id[1]])
+        } else {
+            FrameBytes::from_slice(&[first, 3, id[0], id[1], reason])
+        })
+    };
     if version == Version::V5 {
-        return encode(frame);
+        return match frame {
+            OutboundFrame::Puback { packet_id, reason } => {
+                let [high, low] = packet_id.get().to_be_bytes();
+                let code = reason.to_wire();
+                if code == 0 {
+                    Ok(FrameBytes::from_slice(&[0x40, 2, high, low]))
+                } else {
+                    Ok(FrameBytes::from_slice(&[0x40, 3, high, low, code]))
+                }
+            }
+            OutboundFrame::Pubrec { packet_id, reason } => ack(0x50, packet_id, reason),
+            OutboundFrame::Pubcomp { packet_id, reason } => ack(0x70, packet_id, reason),
+            OutboundFrame::Pubrel { packet_id } => {
+                let [high, low] = packet_id.get().to_be_bytes();
+                Ok(FrameBytes::from_slice(&[0x62, 2, high, low]))
+            }
+            OutboundFrame::Pingresp => Ok(FrameBytes::from_slice(&[0xd0, 0])),
+            OutboundFrame::Connack { session_present } => Ok(FrameBytes::from_slice(&[
+                0x20,
+                22,
+                u8::from(session_present),
+                0,
+                19,
+                0x21,
+                0,
+                8,
+                0x27,
+                ANNOUNCED[0],
+                ANNOUNCED[1],
+                ANNOUNCED[2],
+                ANNOUNCED[3],
+                0x25,
+                1,
+                0x22,
+                0,
+                0,
+                0x28,
+                1,
+                0x29,
+                0,
+                0x2a,
+                0,
+            ])),
+            OutboundFrame::Suback { .. } | OutboundFrame::Unsuback { .. } => {
+                encode(frame).map(FrameBytes::from)
+            }
+        };
     }
     match frame {
-        OutboundFrame::Connack { session_present } => {
-            Ok(vec![0x20, 2, u8::from(session_present), 0])
-        }
-        OutboundFrame::Puback {
-            reason: PubackReason::Success,
-            ..
-        }
-        | OutboundFrame::Pubrec {
-            reason: AckReason::Success,
-            ..
-        }
-        | OutboundFrame::Pubcomp {
-            reason: AckReason::Success,
-            ..
-        }
-        | OutboundFrame::Pubrel { .. }
-        | OutboundFrame::Pingresp => encode(frame),
-        // MQTT 3.1.1 has no reason code: a publication accepted without a
-        // matching subscription is acknowledged like any other (record
-        // 0049).
+        OutboundFrame::Connack { session_present } => Ok(FrameBytes::from_slice(&[
+            0x20,
+            2,
+            u8::from(session_present),
+            0,
+        ])),
         OutboundFrame::Puback {
             packet_id,
-            reason: PubackReason::NoMatchingSubscribers,
-        } => encode(OutboundFrame::Puback {
+            reason: PubackReason::Success | PubackReason::NoMatchingSubscribers,
+        } => {
+            let [high, low] = packet_id.get().to_be_bytes();
+            Ok(FrameBytes::from_slice(&[0x40, 2, high, low]))
+        }
+        OutboundFrame::Pubrec {
             packet_id,
-            reason: PubackReason::Success,
-        }),
+            reason: AckReason::Success,
+        } => ack(0x50, packet_id, AckReason::Success),
         OutboundFrame::Pubcomp {
             packet_id,
-            reason: AckReason::PacketIdentifierNotFound,
+            reason: AckReason::Success | AckReason::PacketIdentifierNotFound,
         } => {
-            // MQTT 3.1.1 ends a replayed PUBREL with the same identifier.
             let [high, low] = packet_id.get().to_be_bytes();
-            Ok(vec![0x70, 2, high, low])
+            Ok(FrameBytes::from_slice(&[0x70, 2, high, low]))
         }
+        OutboundFrame::Pubrel { packet_id } => {
+            let [high, low] = packet_id.get().to_be_bytes();
+            Ok(FrameBytes::from_slice(&[0x62, 2, high, low]))
+        }
+        OutboundFrame::Pingresp => Ok(FrameBytes::from_slice(&[0xd0, 0])),
         OutboundFrame::Suback { packet_id, results } => {
             let codes = results
                 .as_slice()
                 .filter(|codes| !codes.is_empty())
                 .ok_or_else(|| protocol("InvalidFilterResults"))?;
             let [high, low] = packet_id.get().to_be_bytes();
-            let mut bytes = vec![0x90, (2 + codes.len()) as u8, high, low];
-            bytes.extend(
-                codes
-                    .iter()
-                    .map(|&code| if code <= 2 { code } else { 0x80 }),
-            );
+            let mut bytes = FrameBytes::from_slice(&[0x90, (2 + codes.len()) as u8, high, low]);
+            for &code in codes {
+                bytes.push(if code <= 2 { code } else { 0x80 });
+            }
             Ok(bytes)
         }
-        // 3.1.1 acknowledges the request, also where nothing is removed.
-        // A filter the broker refuses as invalid holds no subscription;
-        // any other failure could leave one and is not acknowledged.
         OutboundFrame::Unsuback { packet_id, results }
             if results.as_slice().is_some_and(|codes| {
                 !codes.is_empty() && codes.iter().all(|code| matches!(code, 0 | 0x11 | 0x8f))
             }) =>
         {
             let [high, low] = packet_id.get().to_be_bytes();
-            Ok(vec![0xb0, 2, high, low])
+            Ok(FrameBytes::from_slice(&[0xb0, 2, high, low]))
         }
         _ => Err(unsupported("AckNotEncodableInMqtt311")),
     }
@@ -1458,6 +1505,16 @@ pub struct EncodedPublish {
     pub expiry_value_offset: Option<usize>,
 }
 
+/// Segmented MQTT publication keeping the immutable payload shared across
+/// fan-out recipients without copying it into each subscriber's frame buffer.
+#[derive(Debug, PartialEq, Eq)]
+pub struct EncodedSegments {
+    pub header: crate::net::FrameBytes,
+    pub payload: Option<SharedBytes>,
+    pub total_len: usize,
+    pub expiry_value_offset: Option<usize>,
+}
+
 pub fn encode_qos0_expiring(
     topic: &SharedBytes,
     payload: &SharedBytes,
@@ -1488,6 +1545,19 @@ pub fn encode_qos0_with_properties(
     properties: Option<&PublishProperties>,
 ) -> Result<EncodedPublish, Error> {
     encode_publication(
+        version, None, topic, payload, false, retain, remaining, properties,
+    )
+}
+
+pub fn encode_qos0_segments(
+    version: Version,
+    topic: &SharedBytes,
+    payload: &SharedBytes,
+    retain: bool,
+    remaining: Option<u32>,
+    properties: Option<&PublishProperties>,
+) -> Result<EncodedSegments, Error> {
+    encode_publication_segments(
         version, None, topic, payload, false, retain, remaining, properties,
     )
 }
@@ -1573,7 +1643,7 @@ pub(crate) fn encode_delivery_for(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn encode_delivery_with_properties(
+pub(crate) fn encode_delivery_segments(
     version: Version,
     packet: (OutboundPacketId, Qos),
     topic_name: &SharedBytes,
@@ -1582,8 +1652,8 @@ pub(crate) fn encode_delivery_with_properties(
     retain: bool,
     remaining: Option<u32>,
     properties: Option<&PublishProperties>,
-) -> Result<EncodedPublish, Error> {
-    encode_publication(
+) -> Result<EncodedSegments, Error> {
+    encode_publication_segments(
         version,
         Some(packet),
         topic_name,
@@ -1595,7 +1665,7 @@ pub(crate) fn encode_delivery_with_properties(
     )
 }
 
-fn push_varint(bytes: &mut Vec<u8>, mut value: usize) {
+fn push_varint_frame(bytes: &mut crate::net::FrameBytes, mut value: usize) {
     for _ in 0..4 {
         let mut part = (value % 128) as u8;
         value /= 128;
@@ -1610,7 +1680,7 @@ fn push_varint(bytes: &mut Vec<u8>, mut value: usize) {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn encode_publication(
+fn encode_publication_segments(
     version: Version,
     packet: Option<(OutboundPacketId, Qos)>,
     topic_name: &SharedBytes,
@@ -1619,7 +1689,7 @@ fn encode_publication(
     retain: bool,
     remaining: Option<u32>,
     properties: Option<&PublishProperties>,
-) -> Result<EncodedPublish, Error> {
+) -> Result<EncodedSegments, Error> {
     topic(topic_name.as_slice())?;
     if topic_name.len() > crate::writer::MAX_TOPIC || payload.len() > crate::writer::MAX_PAYLOAD {
         return Err(oversized("OutgoingFieldTooLarge"));
@@ -1659,70 +1729,99 @@ fn encode_publication(
         .checked_add(1 + length_bytes)
         .filter(|n| *n <= crate::net::MAX_PACKET_BYTES)
         .ok_or_else(|| oversized("PacketTooLarge"))?;
-    let mut bytes = Vec::new();
-    bytes
-        .try_reserve_exact(total)
+    let header_len = total - payload.len();
+    let mut header = crate::net::FrameBytes::try_with_capacity(header_len)
         .map_err(|_| protocol("OutgoingAllocationFailed"))?;
-    bytes.push(
+    header.push(
         (if let Some((_, qos)) = packet {
             0x30 | (qos.to_wire() << 1) | if dup { 8 } else { 0 }
         } else {
             0x30
         }) | u8::from(retain),
     );
-    push_varint(&mut bytes, body);
-    bytes.extend_from_slice(&(topic_name.len() as u16).to_be_bytes());
-    bytes.extend_from_slice(topic_name.as_slice());
+    push_varint_frame(&mut header, body);
+    header.extend_from_slice(&(topic_name.len() as u16).to_be_bytes());
+    header.extend_from_slice(topic_name.as_slice());
     if let Some((packet_id, _)) = packet {
-        bytes.extend_from_slice(&packet_id.get().to_be_bytes());
+        header.extend_from_slice(&packet_id.get().to_be_bytes());
     }
     let expiry_value_offset = if version == Version::V5 {
-        push_varint(&mut bytes, prop_bytes);
+        push_varint_frame(&mut header, prop_bytes);
         let offset = if let Some(remaining) = remaining {
-            bytes.push(0x02);
-            let at = bytes.len();
-            bytes.extend_from_slice(&remaining.to_be_bytes());
+            header.push(0x02);
+            let at = header.len();
+            header.extend_from_slice(&remaining.to_be_bytes());
             Some(at)
         } else {
             None
         };
         if let Some(p) = props {
             if let Some(pfi) = p.payload_format_indicator {
-                bytes.push(0x01);
-                bytes.push(pfi);
+                header.push(0x01);
+                header.push(pfi);
             }
             if let Some(ct) = &p.content_type {
-                bytes.push(0x03);
-                bytes.extend_from_slice(&(ct.len() as u16).to_be_bytes());
-                bytes.extend_from_slice(ct.as_slice());
+                header.push(0x03);
+                header.extend_from_slice(&(ct.len() as u16).to_be_bytes());
+                header.extend_from_slice(ct.as_slice());
             }
             if let Some(rt) = &p.response_topic {
-                bytes.push(0x08);
-                bytes.extend_from_slice(&(rt.len() as u16).to_be_bytes());
-                bytes.extend_from_slice(rt.as_slice());
+                header.push(0x08);
+                header.extend_from_slice(&(rt.len() as u16).to_be_bytes());
+                header.extend_from_slice(rt.as_slice());
             }
             if let Some(cd) = &p.correlation_data {
-                bytes.push(0x09);
-                bytes.extend_from_slice(&(cd.len() as u16).to_be_bytes());
-                bytes.extend_from_slice(cd.as_slice());
+                header.push(0x09);
+                header.extend_from_slice(&(cd.len() as u16).to_be_bytes());
+                header.extend_from_slice(cd.as_slice());
             }
             for (k, v) in p.user_properties.iter() {
-                bytes.push(0x26);
-                bytes.extend_from_slice(&(k.len() as u16).to_be_bytes());
-                bytes.extend_from_slice(k.as_slice());
-                bytes.extend_from_slice(&(v.len() as u16).to_be_bytes());
-                bytes.extend_from_slice(v.as_slice());
+                header.push(0x26);
+                header.extend_from_slice(&(k.len() as u16).to_be_bytes());
+                header.extend_from_slice(k.as_slice());
+                header.extend_from_slice(&(v.len() as u16).to_be_bytes());
+                header.extend_from_slice(v.as_slice());
             }
         }
         offset
     } else {
         None
     };
-    bytes.extend_from_slice(payload.as_slice());
-    debug_assert_eq!(bytes.len(), total);
+    debug_assert_eq!(header.len(), header_len);
+    Ok(EncodedSegments {
+        header,
+        payload: (!payload.is_empty()).then(|| payload.clone()),
+        total_len: total,
+        expiry_value_offset,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn encode_publication(
+    version: Version,
+    packet: Option<(OutboundPacketId, Qos)>,
+    topic_name: &SharedBytes,
+    payload: &SharedBytes,
+    dup: bool,
+    retain: bool,
+    remaining: Option<u32>,
+    properties: Option<&PublishProperties>,
+) -> Result<EncodedPublish, Error> {
+    let seg = encode_publication_segments(
+        version, packet, topic_name, payload, dup, retain, remaining, properties,
+    )?;
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(seg.total_len)
+        .map_err(|_| protocol("OutgoingAllocationFailed"))?;
+    bytes.extend_from_slice(&seg.header);
+    if let Some(p) = seg.payload {
+        bytes.extend_from_slice(p.as_slice());
+    }
+    debug_assert_eq!(bytes.len(), seg.total_len);
     Ok(EncodedPublish {
         bytes,
-        expiry_value_offset,
+        expiry_value_offset: seg.expiry_value_offset,
     })
 }
 
@@ -2255,18 +2354,87 @@ mod tests {
                 "InvalidTopicName"
             );
         }
-        for flags in [0x10, 0x20, 0x1c] {
+        for flags in [0x08, 0x10, 0x20] {
+            let error = decode(
+                0x10,
+                &will_connect(EXPIRY, &[], flags, b"a/b", b"offline"),
+                BOUNDS,
+            )
+            .unwrap_err();
             assert_eq!(
-                decode(
-                    0x10,
-                    &will_connect(EXPIRY, &[], flags, b"a/b", b"offline"),
-                    BOUNDS
-                )
-                .unwrap_err()
-                .code(),
-                "InvalidWillFlags"
+                (error.kind(), error.code(), error.reason_code()),
+                (ErrorKind::Protocol, "InvalidWillFlags", 0x82),
+                "flags {flags:#04x}"
             );
         }
+    }
+
+    /// MQTT 5 §3.1.2.6 [MQTT-3.1.2-12]: Will QoS 3 is a Malformed Packet,
+    /// with or without the Will Flag. A Will QoS or Will Retain bit without
+    /// the Will Flag parses and is forbidden data: a Protocol Error. Neither
+    /// supplies a response limit, so both are closed without a CONNACK.
+    #[test]
+    fn reserved_will_qos_is_a_malformed_packet() {
+        for flags in [0x18, 0x1c, 0x38, 0x3c] {
+            let error = decode(
+                0x10,
+                &will_connect(EXPIRY, &[], flags, b"a/b", b"offline"),
+                BOUNDS,
+            )
+            .unwrap_err();
+            assert_eq!(
+                (error.kind(), error.code(), error.reason_code()),
+                (ErrorKind::Malformed, "ReservedWillQos", 0x81),
+                "flags {flags:#04x}"
+            );
+            assert_eq!(error.peer_maximum(), None, "flags {flags:#04x}");
+        }
+    }
+
+    /// MQTT 5 §3.3.2.1 and §3.3.4: a zero-length Topic Name without a Topic
+    /// Alias is a Protocol Error (0x82). Topic Name Invalid (0x90) stays the
+    /// reason of a name that is present and not acceptable.
+    #[test]
+    fn an_empty_publish_topic_without_an_alias_is_a_protocol_error() {
+        for (first, body) in [
+            (0x30, &b"\0\0\0payload"[..]),
+            (0x32, &b"\0\0\0\x07\0payload"[..]),
+            (0x34, &b"\0\0\0\x07\0payload"[..]),
+        ] {
+            let error = decode(first, body, BOUNDS).unwrap_err();
+            assert_eq!(
+                (error.kind(), error.code(), error.reason_code()),
+                (ErrorKind::Protocol, "EmptyTopicName", 0x82),
+                "first byte {first:#04x}"
+            );
+        }
+        kind(
+            decode_for(Version::V311, 0x30, b"\0\0payload", BOUNDS),
+            ErrorKind::Protocol,
+        );
+        // Topic Alias Maximum 0 was announced: the alias is refused first.
+        let alias = decode(0x30, b"\0\0\x03\x23\0\x01payload", BOUNDS).unwrap_err();
+        assert_eq!(alias.reason_code(), 0x94);
+        let wildcard = decode(0x30, b"\0\x03a/+\0payload", BOUNDS).unwrap_err();
+        assert_eq!(
+            (wildcard.code(), wildcard.reason_code()),
+            ("InvalidTopicName", 0x90)
+        );
+        let will = decode(
+            0x10,
+            &will_connect(EXPIRY, &[], 0x0c, b"", b"offline"),
+            BOUNDS,
+        )
+        .unwrap_err();
+        assert_eq!(
+            (will.code(), will.reason_code()),
+            ("InvalidTopicName", 0x90)
+        );
+        let response = decode(0x30, b"\0\x03a/b\x03\x08\0\0payload", BOUNDS).unwrap_err();
+        assert_eq!(
+            (response.code(), response.reason_code()),
+            ("InvalidTopicName", 0x90)
+        );
     }
 
     #[test]
@@ -2320,6 +2488,34 @@ mod tests {
                 publish_will: false
             }
         );
+    }
+
+    /// MQTT 5 §3.14.2.1: every reason code a client may send is a
+    /// disconnection, not a refused packet. §3.14.2.2.2: its Session Expiry
+    /// Interval is carried whatever the reason. §3.1.2.5: only 0x00 discards
+    /// the Will.
+    #[test]
+    fn every_legal_client_disconnect_reason_carries_its_expiry_and_publishes_the_will() {
+        for reason in [
+            4u8, 0x80, 0x81, 0x82, 0x83, 0x90, 0x93, 0x94, 0x95, 0x96, 0x97, 0x98, 0x99,
+        ] {
+            assert_eq!(
+                decode(0xe0, &[reason], BOUNDS),
+                Ok(Packet::Disconnect {
+                    expiry: None,
+                    publish_will: true
+                }),
+                "reason {reason:#04x}"
+            );
+            assert_eq!(
+                decode(0xe0, &[reason, 5, 0x11, 0, 0, 0, 0], BOUNDS),
+                Ok(Packet::Disconnect {
+                    expiry: Some(SessionExpiry::OnDisconnect),
+                    publish_will: true
+                }),
+                "reason {reason:#04x} with Session Expiry Interval 0"
+            );
+        }
     }
 
     #[test]
@@ -2397,24 +2593,19 @@ mod tests {
     }
 
     #[test]
-    fn zero_connect_context_rejects_any_nonzero_disconnect_before_profile_refusal() {
-        let error = decode(0xe0, &[0x80, 5, 0x11, 0, 0, 0, 7], BOUNDS).unwrap_err();
+    fn a_nonzero_disconnect_expiry_is_decoded_for_the_runtime_context_rule() {
+        // The CONNECT0→DISCONNECTnonzero rule needs the CONNECT value: the
+        // codec hands the override to the runtime whatever the reason.
         assert_eq!(
-            error.in_session(SessionExpiry::OnDisconnect).code(),
-            "SessionExpiryIncreaseForbidden"
+            decode(0xe0, &[0x80, 5, 0x11, 0, 0, 0, 7], BOUNDS),
+            Ok(Packet::Disconnect {
+                expiry: Some(SessionExpiry::After(7)),
+                publish_will: true
+            })
         );
-        assert_eq!(
-            error.in_session(SessionExpiry::OnDisconnect).reason_code(),
-            0x82
-        );
-        assert_eq!(
-            error.in_session(SessionExpiry::Never).kind(),
-            ErrorKind::Unsupported
-        );
-        let malformed = decode(0xe0, &[0, 5, 0x11, 0], BOUNDS).unwrap_err();
-        assert_eq!(
-            malformed.in_session(SessionExpiry::OnDisconnect).kind(),
-            ErrorKind::Malformed
+        kind(
+            decode(0xe0, &[0x80, 5, 0x11, 0], BOUNDS),
+            ErrorKind::Malformed,
         );
     }
 
@@ -2922,7 +3113,6 @@ mod tests {
             code: "UnsupportedProtocolVersion",
             reason: 0x84,
             peer_maximum: None,
-            disconnect_expiry: None,
         };
         assert_eq!(refusal(version, true), [0x20, 3, 0, 0x84, 0]);
         assert_eq!(refusal(version, false), [0xe0, 2, 0x83, 0]);

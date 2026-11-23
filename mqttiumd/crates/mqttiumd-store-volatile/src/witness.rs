@@ -7,7 +7,7 @@ use mqttiumd_contract::ids::{OperationId, PayloadId, PublicationId, PublicationS
 use mqttiumd_contract::outcome::CommitFacts;
 use mqttiumd_contract::receipts::ReceiptOrigin;
 use mqttiumd_contract::retained::MAX_REPLAYS;
-use mqttiumd_store_api::{Decision, Limits, OperationRecord, ReadError};
+use mqttiumd_store_api::{Decision, Limits, ReadError};
 
 /// Bounded identity span reserved by a receipted command.
 #[derive(Clone, Copy, Debug)]
@@ -196,15 +196,14 @@ pub(crate) fn bounds(recipe: &Recipe) -> Result<Option<IdentityBounds>, ReadErro
 pub(crate) fn receipt_bounds(
     limits: &Limits,
     operation: OperationId,
-    record: &OperationRecord,
+    recipe_bytes: &[u8],
+    decision: Decision,
 ) -> Result<Option<IdentityBounds>, ReadError> {
-    if matches!(record.decision, Decision::Rejected(_))
-        && !matches!(record.recipe.get(6), Some(12 | 14))
-    {
+    if matches!(decision, Decision::Rejected(_)) && !matches!(recipe_bytes.get(6), Some(12 | 14)) {
         return Ok(None);
     }
     let recipe = Recipe::decode_canonical(
-        &record.recipe,
+        recipe_bytes,
         limits.max_targets_per_admission,
         limits.max_topic_bytes,
     )
@@ -221,7 +220,7 @@ pub(crate) fn receipt_bounds(
     let Some(bounds) = bounds(&recipe)? else {
         return Ok(None);
     };
-    let valid = match record.decision {
+    let valid = match decision {
         Decision::Rejected(_) => recipe.replay_subscriptions().is_some(),
         Decision::Committed(CommitFacts::WillPublished { will, publication }) => {
             matches!(&recipe, Recipe::WillPublication(a) if a.will == will && a.publication == publication)
