@@ -1,0 +1,106 @@
+# Architectural debt that `deslop-please --allow .deslop-please.allow` still
+# tolerates, run from `mqttiumd/` (deslop-please 0.1.3). Recorded on 23
+# November 2026 at 290db2b, 87 entries; each lot of branch
+# `refactor/deslop-layers` removes the entries it fixes. An entry still here is
+# not fixed.
+#
+# Kept on purpose, with their reason:
+# - long-file, wide-directory: splitting the long files re-points about 125
+#   citations of conformance/server-statements.json and the replays of the
+#   models, which CI checks; the structural lots change which files are long.
+#   Decided after them.
+# - shallow-module mqttiumd_store_api: `DurableStore` is the port every store
+#   implements (eleven implementations); a trait that is the interface shows
+#   its methods. Removing one method does not make it deep.
+# - shallow-module mqttiumd_contract: a contract crate shows its types. Moving
+#   the generic maps out (a crate of their own) reverses record 0057 and is a
+#   separate proposal.
+#
+# The other entries are fixed lot by lot.
+module-cycle mqttiumd::codec,mqttiumd::net,mqttiumd::security
+module-cycle mqttiumd_contract::command,mqttiumd_contract::message_expiry,mqttiumd_contract::outcome,mqttiumd_contract::packet,mqttiumd_contract::properties,mqttiumd_contract::pubsub,mqttiumd_contract::retained,mqttiumd_contract::session,mqttiumd_contract::will
+module-cycle mqttiumd_core::owner::pubsub,mqttiumd_core::owner::receipts,mqttiumd_core::owner::routing,mqttiumd_core::owner::sessions,mqttiumd_core::owner::will
+module-cycle mqttiumd_lab::bench::broker,mqttiumd_lab::bench::campaign,mqttiumd_lab::bench::child,mqttiumd_lab::bench::runner
+module-cycle mqttiumd_lab::semantic,mqttiumd_lab::workspace
+module-cycle mqttiumd_store_sqlite::message_expiry,mqttiumd_store_sqlite::pubsub,mqttiumd_store_sqlite::receipts,mqttiumd_store_sqlite::retained
+module-cycle mqttiumd_store_sqlite::reader,mqttiumd_store_sqlite::sessions,mqttiumd_store_sqlite::will
+tangle mqttiumd_contract::command::AnnotatedPublication,mqttiumd_contract::command::Recipe,mqttiumd_contract::message_expiry::ExpiringPublication,mqttiumd_contract::message_expiry::TimedReplaySubscriptions,mqttiumd_contract::retained::check,mqttiumd_contract::retained::decode,mqttiumd_contract::retained::encode
+tangle mqttiumd_lab::semantic::check,mqttiumd_lab::semantic::fixture,mqttiumd_lab::semantic::registry,mqttiumd_lab::semantic::requirements_known,mqttiumd_lab::semantic::run_result,mqttiumd_lab::semantic::scenario,mqttiumd_lab::workspace::Workspace
+tangle mqttiumd_lab::store::durable::<DurableState as Staging>::stage_session,mqttiumd_lab::store::durable::will_memory::end,mqttiumd_lab::store::durable::will_memory::open
+tangle mqttiumd_store_sqlite::sessions::stage,mqttiumd_store_sqlite::will::end,mqttiumd_store_sqlite::will::open
+tangle mqttiumd_store_volatile::VolatileStore,mqttiumd_store_volatile::read::FactRef,mqttiumd_store_volatile::read::build_snapshot,mqttiumd_store_volatile::read::check_delivery_metadata,mqttiumd_store_volatile::read::check_inventory_bound,mqttiumd_store_volatile::read::check_message_candidate,mqttiumd_store_volatile::read::check_message_observation,mqttiumd_store_volatile::read::delivery_claim,mqttiumd_store_volatile::read::inventory,mqttiumd_store_volatile::read::recover_page,mqttiumd_store_volatile::read::validate_retained,mqttiumd_store_volatile::read::validate_wills,mqttiumd_store_volatile::read::will_page,mqttiumd_store_volatile::read::work_page
+field-leak mqttiumd::net::reactor::Shared::dead
+field-leak mqttiumd::net::reactor::Shared::held
+field-leak mqttiumd::net::reactor::Shared::queue
+field-leak mqttiumd::net::reactor::Shared::sleeping
+field-leak mqttiumd::net::reactor::Shared::waker
+field-leak mqttiumd::policy_transition::Plan::body
+field-leak mqttiumd::runtime::Acceptor::accepted
+field-leak mqttiumd::security::Policy::storage
+field-leak mqttiumd::writer::DirectWriter::control_responses
+field-leak mqttiumd::writer::DirectWriter::responses
+field-leak mqttiumd::writer::Writer::boot
+field-leak mqttiumd::writer::Writer::control_receiver
+field-leak mqttiumd::writer::Writer::control_sender
+field-leak mqttiumd::writer::Writer::receiver
+field-leak mqttiumd::writer::Writer::sender
+field-leak mqttiumd_core::leases::LeaseTable::account
+field-leak mqttiumd_core::owner::Owner::outbox
+field-leak mqttiumd_core::owner::pubsub::State::conn_by_loading_effect
+field-leak mqttiumd_core::owner::pubsub::State::connections
+field-leak mqttiumd_core::owner::pubsub::State::continuation
+field-leak mqttiumd_core::owner::pubsub::State::continuations_started
+field-leak mqttiumd_core::owner::pubsub::State::control
+field-leak mqttiumd_core::owner::pubsub::State::control_candidates
+field-leak mqttiumd_core::owner::pubsub::State::deliveries
+field-leak mqttiumd_core::owner::pubsub::State::deliveries_by_session
+field-leak mqttiumd_core::owner::pubsub::State::delivery_by_claim_op
+field-leak mqttiumd_core::owner::pubsub::State::delivery_by_deadline
+field-leak mqttiumd_core::owner::pubsub::State::delivery_by_frame
+field-leak mqttiumd_core::owner::pubsub::State::delivery_by_op
+field-leak mqttiumd_core::owner::pubsub::State::delivery_by_target_pi
+field-leak mqttiumd_core::owner::pubsub::State::expiring_deliveries
+field-leak mqttiumd_core::owner::pubsub::State::next_pubrec_rank
+field-leak mqttiumd_core::owner::pubsub::State::non_inline_by_session
+field-leak mqttiumd_core::owner::pubsub::State::retained
+field-leak mqttiumd_core::owner::pubsub::State::volatile
+field-leak mqttiumd_core::owner::receipts::State::entries
+field-leak mqttiumd_core::owner::receipts::State::pending
+field-leak mqttiumd_lab::bench::collector::Collector::lines
+field-leak mqttiumd_lab::bench::scenario::Scenario::assertions
+field-leak mqttiumd_lab::bench::scenario::Scenario::faults
+field-leak mqttiumd_lab::bench::scenario::Scenario::steps
+field-leak mqttiumd_lab::store::adapter::SimStore::events
+field-leak mqttiumd_lab::store::adapter::SimStore::grouped
+field-leak mqttiumd_lab::store::adapter::SimStore::store
+field-leak mqttiumd_store_sqlite::SqliteStore::settings
+field-leak mqttiumd_store_sqlite::StoreCaches::open_receipts
+field-leak mqttiumd_store_sqlite::StoreCaches::witnesses
+field-leak mqttiumd_store_sqlite::StoreCaches::work_verified
+field-leak mqttiumd_store_volatile::VolatileStore::durability
+field-leak mqttiumd_store_volatile::VolatileStore::ledger
+field-leak mqttiumd_store_volatile::VolatileStore::session_clock
+field-leak mqttiumd_store_volatile::log::LogStore::sqlite_settings
+field-leak mqttiumd_store_volatile::snapshot::VolatileHandle::sqlite_settings
+shallow-module mqttiumd_contract
+shallow-module mqttiumd_store_api
+wide-directory crates/mqttiumd-contract/src/
+wide-directory crates/mqttiumd-lab/src/bench/
+wide-directory crates/mqttiumd-lab/tests/
+wide-directory crates/mqttiumd-store-sqlite/tests/
+long-file crates/mqttiumd-contract/src/command.rs
+long-file crates/mqttiumd-contract/src/effects.rs
+long-file crates/mqttiumd-contract/src/opening.rs
+long-file crates/mqttiumd-core/src/owner.rs
+long-file crates/mqttiumd-core/src/owner/pubsub.rs
+long-file crates/mqttiumd-core/src/owner/sessions.rs
+long-file crates/mqttiumd-lab/src/semantic.rs
+long-file crates/mqttiumd-lab/src/store/conformance.rs
+long-file crates/mqttiumd-lab/src/store/durable.rs
+long-file crates/mqttiumd-store-sqlite/src/lib.rs
+long-file crates/mqttiumd-store-volatile/src/lib.rs
+long-file crates/mqttiumd/src/codec.rs
+long-file crates/mqttiumd/src/net.rs
+long-file crates/mqttiumd/src/runtime.rs
+long-file crates/mqttiumd/src/runtime_tests.rs
+long-file crates/mqttiumd/src/writer.rs
