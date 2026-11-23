@@ -167,7 +167,7 @@
     {
       "decision": "0029",
       "path": "docs/decisions/0029-explicit-session-lifecycle.md",
-      "sha256": "84e58357ca50ef13e7e5d519a7e9eed74b28f855865d4486e3dabd5589e64d56"
+      "sha256": "aa5ee58f341278595e86274b489f695e1b186a304b742d273cd6d8679ca0dc9f"
     },
     {
       "decision": "0030",
@@ -192,12 +192,12 @@
     {
       "decision": "0034",
       "path": "docs/decisions/0034-durable-will.md",
-      "sha256": "da07e9b28e79abac0bd0840defc593cd9ac610f18d366baef977a9a91880f377"
+      "sha256": "4a3b9b0fadba4dfeb1d0356129a7c17c7a13cfb77c9ab7971a15bdaf9f922ce6"
     },
     {
       "decision": "0035",
       "path": "docs/decisions/0035-private-mtls-profile.md",
-      "sha256": "657ab09220b08a4c599803045097973102cfb221fd1773dfa097280fa6de4ef1"
+      "sha256": "8d70c14edcc6dbdf60e5cded181e206cdffb525f7eca5d4b549fb536355b11d0"
     },
     {
       "decision": "0036",

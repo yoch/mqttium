@@ -5,6 +5,8 @@ repository owner's delegation on the advice of the independent audit of
 `8e4303d`).
 
 Amendment of acceptance (21 November 2026).
+Amended by 0058 (proposed): every client DISCONNECT whose reason code is not
+0x00 leads to Pending publication, not only DISCONNECT4.
 Amended by 0037. The zero-delay QoS 1 Will supports both Retain values. Size
 durable intentions and their payloads independently of the number of
 connected transports. Record 0048 states the capacities of the runtime and

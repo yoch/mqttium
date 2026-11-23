@@ -185,6 +185,10 @@ and transport generation guard later closes independently of reusable ClientID.
 A takeover closes the old transport first. An old zero-retention session ends
 before Clean Start handling, so Clean Start 0 then creates a new session/SP0.
 
+A DISCONNECT of any reason code a client may send ends the connection and is
+never answered ([ADR 0058](decisions/0058-client-disconnect-reasons-and-tls-close-notify.md)):
+its Session Expiry Interval applies whatever the reason, and only reason 0x00
+discards the Will. A server-only or undefined reason is Protocol Error 0x82.
 DISCONNECT without the property preserves the CONNECT policy; explicit infinity
 is supported only when CONNECT was nonzero. CONNECT zero followed by any
 nonzero DISCONNECT expiry is Protocol Error 0x82. Duplicate properties and
@@ -797,7 +801,8 @@ observe retained `online`, a real sensor-process SIGKILL and non-retained
 localhost by default. The authenticated listener has a separate configuration and storage profile.
 
 OpenWillAt installs the exact attachment's immutable Will before known Open
-allows CONNACK. Normal DISCONNECT0 cancels it durably; DISCONNECT4 requests it.
+allows CONNACK. Normal DISCONNECT0 cancels it durably; DISCONNECT4 and every other reason
+code a client may send request it.
 EOF/RST, transport error, Keep Alive expiry and a protocol close after accepted
 Open make it Pending. Takeover closes the old transport and admits its zero-delay
 Will before opening the replacement, including Clean Start0. Peer.session and
