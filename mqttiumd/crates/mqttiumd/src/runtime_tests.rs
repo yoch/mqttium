@@ -119,6 +119,7 @@ fn with_runtime_clock_hooks(
         events,
         peers: BTreeMap::new(),
         retiring: Vec::new(),
+        session_ids: boot.sessions.values().map(|s| s.id).collect(),
         sessions: boot.sessions,
         session_requests: BTreeMap::new(),
         will_connects: BTreeMap::new(),

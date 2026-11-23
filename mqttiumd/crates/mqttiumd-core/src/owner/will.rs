@@ -375,6 +375,9 @@ impl Owner {
                 self.wills.after = flight.next;
                 self.wills.deferred =
                     deferred.then_some((flight.will, WillDeferredReason::StoreRefusal));
+                if !deferred && self.inline_claim_enabled {
+                    self.mark_all_sessions_dirty(true);
+                }
                 remember(&mut self.finished, finished)?;
             }
         }

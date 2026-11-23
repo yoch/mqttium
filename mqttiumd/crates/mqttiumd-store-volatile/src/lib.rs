@@ -22,8 +22,8 @@ use mqttiumd_contract::capacity::{
 };
 use mqttiumd_contract::command::{
     AdmitPublication, ChangeSubscriptions, ClaimDelivery, Command, ConsumeDelivery, DeliveryCause,
-    EpochLedger, EpochPhase, FinishDelivery, LedgerOpening, OpenEpoch, Recipe, ReleaseInbound,
-    UpdateSubscriptions,
+    EpochLedger, EpochPhase, FinishDelivery, InlineClaim, LedgerOpening, OpenEpoch, Recipe,
+    ReleaseInbound, UpdateSubscriptions,
 };
 use mqttiumd_contract::effects::InboundPhase;
 use mqttiumd_contract::ids::{
@@ -47,6 +47,7 @@ use mqttiumd_contract::receipts::{
 use mqttiumd_contract::retained::{
     MAX_REPLAYS, MAX_RETAINED_BYTES, MAX_RETAINED_TOPICS, ReplaySubscriptions, RetainMask,
 };
+use mqttiumd_contract::scoped_map::{ScopedKey, ScopedMap};
 use mqttiumd_contract::session::{
     SessionAction, SessionCancellations, SessionChange, SessionDetachment, SessionEndReason,
     SessionExpiry, SessionGuard, SessionLifecycle,
@@ -59,9 +60,9 @@ use mqttiumd_store_api::{
     DurableStore, ExpiredDelivery, InboundRecord, Limits, MAX_CLIENT_ID_BYTES,
     MAX_RECOVERY_INVENTORY_ROWS, MESSAGE_EXPIRY_SWEEP_DELIVERIES,
     MESSAGE_EXPIRY_SWEEP_PUBLICATIONS, MessageExpirySweep, ObligationPhase, ObligationRecord,
-    OperationRecord, OutboundRecord, ReadBudget, ReadError, RecoveryCursor, RecoveryPage,
-    RecoveryRefused, Resolved, RetainedRecord, RouteTarget, SessionClockAnchor,
-    SessionClockReading, SessionRecord, SessionState, WillPage, WorkPage,
+    OutboundRecord, ReadBudget, ReadError, RecoveryCursor, RecoveryPage, RecoveryRefused, Resolved,
+    RetainedRecord, RouteTarget, SessionClockAnchor, SessionClockReading, SessionRecord,
+    SessionState, WillPage, WorkPage,
 };
 
 pub use log::{LOG_MAX_GROUP, LogStore};
@@ -93,6 +94,16 @@ pub(crate) struct VPublication {
 pub(crate) struct VPayload {
     pub bytes: SharedBytes,
     pub references: u64,
+}
+
+/// Zero-copy receipt stored in `VolatileStore::operations` (`Arc<[u8]>` shared
+/// directly with `FrozenRecipe`) with optional precomputed `IdentityBounds`
+/// so `collect_receipts` skips canonical decoding on locally committed rows.
+#[derive(Clone, Debug)]
+pub(crate) struct VOperation {
+    pub recipe: std::sync::Arc<[u8]>,
+    pub decision: Decision,
+    pub cached_bounds: Option<Option<IdentityBounds>>,
 }
 
 #[derive(Clone, Copy)]
@@ -163,7 +174,7 @@ impl<'a> From<&'a mqttiumd_contract::retained::RetainedQos0> for Admission<'a> {
 
 enum Established {
     Outcome(StoreOutcome),
-    Absent(EpochPhase),
+    Absent,
 }
 
 #[derive(Clone, Copy)]
@@ -216,7 +227,7 @@ pub struct VolatileStore {
     pub(crate) route_revision: Revision,
     pub(crate) sessions: BTreeMap<SessionId, SessionRecord>,
     pub(crate) routes: BTreeMap<Vec<u8>, Vec<RouteTarget>>,
-    pub(crate) operations: BTreeMap<OperationId, OperationRecord>,
+    pub(crate) operations: ScopedMap<OperationId, VOperation>,
     pub(crate) fences: BTreeSet<OperationId>,
     pub(crate) receipt_frontiers: BTreeMap<ReceiptOrigin, ReceiptClosure>,
     pub(crate) retained: BTreeMap<Vec<u8>, RetainedRecord>,
@@ -234,7 +245,6 @@ pub struct VolatileStore {
     pub(crate) obligations_by_target: BTreeSet<(SessionId, DeliveryId)>,
     pub(crate) obligations_by_pub: BTreeMap<PublicationId, u32>,
     pub(crate) inbound_by_pub: BTreeMap<PublicationId, u32>,
-    pub(crate) inbound_by_session: BTreeSet<(SessionId, InboundPacketId)>,
     pub(crate) outbound_by_target_pi: BTreeSet<(SessionId, OutboundPacketId)>,
     pub(crate) publications_by_payload: BTreeMap<PayloadId, u32>,
     pub(crate) retained_bytes: u64,
@@ -262,7 +272,7 @@ impl VolatileStore {
             route_revision: Revision::new(0),
             sessions: BTreeMap::new(),
             routes: BTreeMap::new(),
-            operations: BTreeMap::new(),
+            operations: ScopedMap::new(),
             fences: BTreeSet::new(),
             receipt_frontiers: BTreeMap::new(),
             retained: BTreeMap::new(),
@@ -279,7 +289,6 @@ impl VolatileStore {
             obligations_by_target: BTreeSet::new(),
             obligations_by_pub: BTreeMap::new(),
             inbound_by_pub: BTreeMap::new(),
-            inbound_by_session: BTreeSet::new(),
             outbound_by_target_pi: BTreeSet::new(),
             publications_by_payload: BTreeMap::new(),
             retained_bytes: 0,
@@ -358,10 +367,8 @@ impl VolatileStore {
             *obligations_by_pub.entry(delivery.publication).or_insert(0) += 1;
         }
         let mut inbound_by_pub: BTreeMap<PublicationId, u32> = BTreeMap::new();
-        let mut inbound_by_session = BTreeSet::new();
-        for (&(session, pi), row) in &state.inbound {
+        for row in state.inbound.values() {
             *inbound_by_pub.entry(row.publication).or_insert(0) += 1;
-            inbound_by_session.insert((session, pi));
         }
         let mut outbound_by_target_pi = BTreeSet::new();
         for row in state.outbound.values() {
@@ -394,23 +401,36 @@ impl VolatileStore {
         let mut witnesses: BTreeMap<ReceiptOrigin, OriginWitness> = BTreeMap::new();
         let mut open_will_receipt_bytes = 0usize;
         let mut all_receipts_valid = true;
-        for (&op, record) in &state.operations {
+        let mut operations = ScopedMap::new();
+        for (op, record) in state.operations {
             if witness::is_open_will_recipe(&record.recipe) {
                 open_will_receipt_bytes =
                     open_will_receipt_bytes.saturating_add(record.recipe.len());
             }
-            match witness::receipt_bounds(&state.limits, op, record) {
-                Ok(Some(bounds)) => {
-                    witnesses
-                        .entry(ReceiptOrigin::of(op))
-                        .or_default()
-                        .record(bounds);
-                }
-                Ok(None) => {}
-                Err(_) => {
-                    all_receipts_valid = false;
-                }
-            }
+            let cached_bounds =
+                match witness::receipt_bounds(&state.limits, op, &record.recipe, record.decision) {
+                    Ok(bounds) => {
+                        if let Some(b) = bounds {
+                            witnesses
+                                .entry(ReceiptOrigin::of(op))
+                                .or_default()
+                                .record(b);
+                        }
+                        Some(bounds)
+                    }
+                    Err(_) => {
+                        all_receipts_valid = false;
+                        None
+                    }
+                };
+            operations.insert(
+                op,
+                VOperation {
+                    recipe: std::sync::Arc::from(record.recipe),
+                    decision: record.decision,
+                    cached_bounds,
+                },
+            );
         }
         let mut store = Self {
             ledger: state.ledger,
@@ -423,7 +443,7 @@ impl VolatileStore {
             route_revision: state.route_revision,
             sessions: state.sessions,
             routes: state.routes,
-            operations: state.operations,
+            operations,
             fences: state.fences,
             receipt_frontiers: state.receipt_frontiers,
             retained: state.retained,
@@ -440,7 +460,6 @@ impl VolatileStore {
             obligations_by_target,
             obligations_by_pub,
             inbound_by_pub,
-            inbound_by_session,
             outbound_by_target_pi,
             publications_by_payload,
             retained_bytes,
@@ -539,7 +558,7 @@ impl VolatileStore {
             EpochPhase::Closed => {
                 Established::Outcome(StoreOutcome::RejectedCertain(RejectReason::EpochClosed))
             }
-            phase => Established::Absent(phase),
+            _ => Established::Absent,
         }
     }
 
@@ -548,7 +567,7 @@ impl VolatileStore {
         let operation = recipe.operation();
         match self.established_inner(operation) {
             Established::Outcome(_) => true,
-            Established::Absent(_) => {
+            Established::Absent => {
                 !self.receipt_capacity(operation, Some(ReceiptClass::of(recipe)))
                     || !matches!(
                         self.will_receipt_capacity(command.recipe.canonical_bytes()),
@@ -559,7 +578,7 @@ impl VolatileStore {
     }
 
     pub(crate) fn can_fence(&self, operation: OperationId) -> bool {
-        matches!(self.established_inner(operation), Established::Absent(_))
+        matches!(self.established_inner(operation), Established::Absent)
             && self.receipt_capacity(operation, None)
             && check_charge(self.accounts, self.limits, Accounts::RECEIPT).is_ok()
             && self.revision.checked_add(1).is_some()
@@ -639,30 +658,42 @@ impl VolatileStore {
         }
         if !self.validated {
             // Re-scan operations in origin when reopened from unvalidated state.
-            let id = |seq| {
-                OperationId::new(
-                    operation.incarnation(),
-                    operation.epoch(),
-                    operation.owner(),
-                    OperationSeq::new(seq),
-                )
-            };
+            let scope = operation.scope();
             let mut meter = read::ReadMeter::new(ReadBudget::SNAPSHOT);
-            for (op, record) in self.operations.range(id(0)..=id(u64::MAX)) {
-                meter.field(record.recipe.len(), ReadBudget::SNAPSHOT.max_field_bytes)?;
-                meter.charge(
-                    256usize
-                        .checked_add(record.recipe.len())
-                        .ok_or(ReadError::LimitExceeded)?,
-                )?;
-                if let Some(old) = witness::receipt_bounds(&self.limits, *op, record)?
-                    && (incoming.first <= old.last && old.first <= incoming.last
-                        || incoming.payload.is_some() && incoming.payload == old.payload)
-                {
-                    return Ok(true);
-                }
-            }
-            return Ok(false);
+            let mut found = false;
+            self.operations.for_each_in_scope_range(
+                scope,
+                OperationSeq::new(0),
+                OperationSeq::new(u64::MAX),
+                |op, record| {
+                    if found {
+                        return Ok(());
+                    }
+                    meter.field(record.recipe.len(), ReadBudget::SNAPSHOT.max_field_bytes)?;
+                    meter.charge(
+                        256usize
+                            .checked_add(record.recipe.len())
+                            .ok_or(ReadError::LimitExceeded)?,
+                    )?;
+                    let bounds = match record.cached_bounds {
+                        Some(cached) => cached,
+                        None => witness::receipt_bounds(
+                            &self.limits,
+                            op,
+                            &record.recipe,
+                            record.decision,
+                        )?,
+                    };
+                    if let Some(old) = bounds
+                        && (incoming.first <= old.last && old.first <= incoming.last
+                            || incoming.payload.is_some() && incoming.payload == old.payload)
+                    {
+                        found = true;
+                    }
+                    Ok(())
+                },
+            )?;
+            return Ok(found);
         }
         Ok(self
             .witnesses
@@ -673,7 +704,7 @@ impl VolatileStore {
     fn record_operation(
         &mut self,
         operation: OperationId,
-        canonical: Vec<u8>,
+        canonical: std::sync::Arc<[u8]>,
         decision: Decision,
         witness_bounds: Option<IdentityBounds>,
     ) {
@@ -689,9 +720,10 @@ impl VolatileStore {
         }
         self.operations.insert(
             operation,
-            OperationRecord {
+            VOperation {
                 recipe: canonical,
                 decision,
+                cached_bounds: Some(witness_bounds),
             },
         );
     }
@@ -710,7 +742,7 @@ impl VolatileStore {
         &mut self,
         recipe: &Recipe,
         operation: OperationId,
-        canonical: Vec<u8>,
+        canonical: std::sync::Arc<[u8]>,
         reason: RejectReason,
     ) -> (StoreOutcome, bool) {
         let Ok(next_rev) = self.next_revision() else {
@@ -887,12 +919,12 @@ impl VolatileStore {
             .checked_next()
             .map_err(|_| AdminRefused::Exhausted)?;
         let marker_keys: Vec<_> = self
-            .inbound_by_session
+            .inbound
             .range(
                 (session, InboundPacketId::new(1).unwrap())
                     ..=(session, InboundPacketId::new(u16::MAX).unwrap()),
             )
-            .copied()
+            .map(|(k, _)| *k)
             .collect();
         let delivery_keys: Vec<_> = self
             .obligations_by_target
@@ -999,7 +1031,6 @@ impl VolatileStore {
         let deliveries = delivery_keys.len() as u32;
         for key in marker_keys {
             let marker = self.inbound.remove(&key).expect("preflighted inbound");
-            self.inbound_by_session.remove(&key);
             self.dec_inbound_pub(marker.publication);
             self.accounts.exchange_slots =
                 ExchangeSlots::new(self.accounts.exchange_slots.get() - 1);
@@ -1048,6 +1079,17 @@ impl VolatileStore {
         retained_mask: Option<&RetainMask>,
         payload: Option<&SharedBytes>,
         remove_will: Option<OperationId>,
+    ) -> Step<CommitFacts> {
+        self.exec_publication_with_claim(admit, retained_mask, payload, remove_will, None)
+    }
+
+    fn exec_publication_with_claim(
+        &mut self,
+        admit: Admission<'_>,
+        retained_mask: Option<&RetainMask>,
+        payload: Option<&SharedBytes>,
+        remove_will: Option<OperationId>,
+        inline_claim: Option<InlineClaim>,
     ) -> Step<CommitFacts> {
         let failed = CommitErr::Refused(RejectReason::PreconditionFailed);
         let operation = admit.operation;
@@ -1198,6 +1240,23 @@ impl VolatileStore {
                 }
             }
         }
+        let claimed_target = if let Some(claim) = inline_claim {
+            if expired {
+                return Err(failed);
+            }
+            let target = targets.get(usize::from(claim.target_index)).ok_or(failed)?;
+            if target.effective_qos == Qos::AtMostOnce
+                || self.outbound.contains_key(&target.delivery)
+                || self
+                    .outbound_by_target_pi
+                    .contains(&(target.session, claim.packet_id))
+            {
+                return Err(failed);
+            }
+            Some((*target, claim.packet_id))
+        } else {
+            None
+        };
         let inbound_slot = if exactly_once {
             let (packet_id, exchange) = admit.inbound.ok_or(failed)?;
             let slot = (admit.source_session, packet_id);
@@ -1209,6 +1268,14 @@ impl VolatileStore {
             None
         };
         let reference_count = if expired { 0 } else { raw_ref_count };
+        let exchange_slots = ExchangeSlots::new(
+            admit
+                .costs
+                .exchange_slots
+                .get()
+                .checked_add(u64::from(claimed_target.is_some()))
+                .ok_or(failed)?,
+        );
         let charged = check_charge(
             accounts_after_release,
             self.limits,
@@ -1219,7 +1286,7 @@ impl VolatileStore {
                     admit.costs.payload_bytes
                 },
                 references: References::new(reference_count),
-                exchange_slots: admit.costs.exchange_slots,
+                exchange_slots,
                 receipt_slots: admit.costs.receipt_slots,
             },
         )
@@ -1311,6 +1378,20 @@ impl VolatileStore {
                     .or_insert(0) += 1;
             }
         }
+        if let Some((target, packet_id)) = claimed_target {
+            self.outbound.insert(
+                target.delivery,
+                OutboundRecord {
+                    started: false,
+                    target: target.session,
+                    target_revision: target.session_revision,
+                    packet_id,
+                    claim: operation,
+                },
+            );
+            self.outbound_by_target_pi
+                .insert((target.session, packet_id));
+        }
         if let Some((slot, exchange)) = inbound_slot {
             self.inbound.insert(
                 slot,
@@ -1320,7 +1401,6 @@ impl VolatileStore {
                     phase: InboundPhase::AwaitPubrel,
                 },
             );
-            self.inbound_by_session.insert(slot);
             *self.inbound_by_pub.entry(admit.publication).or_insert(0) += 1;
         }
         self.accounts = final_accounts;
@@ -1914,7 +1994,6 @@ impl VolatileStore {
         let _next_rev = self.next_revision()?;
 
         self.inbound.remove(&slot);
-        self.inbound_by_session.remove(&slot);
         self.dec_inbound_pub(publication);
         self.accounts = next_accounts;
         self.discard_completed_publication(publication);
@@ -2331,21 +2410,41 @@ impl VolatileStore {
             return Ok(false);
         }
         let mut meter = read::ReadMeter::new(ReadBudget::SNAPSHOT);
-        for (operation, record) in self.operations.range(id(0)..=id(u64::MAX)) {
-            meter.field(record.recipe.len(), ReadBudget::SNAPSHOT.max_field_bytes)?;
-            meter.charge(
-                128usize
-                    .checked_add(record.recipe.len())
-                    .ok_or(ReadError::LimitExceeded)?,
-            )?;
-            if let Some(admit) = witness::receipt_bounds(&self.limits, *operation, record)?
-                && (admit.first.sequence().get() == 0
-                    || admit.payload.is_some_and(|p| p.sequence().get() == 0))
-            {
-                return Ok(false);
-            }
-        }
-        Ok(true)
+        let scope = (origin.incarnation, origin.epoch, origin.owner);
+        let mut compatible = true;
+        self.operations.for_each_in_scope_range(
+            scope,
+            OperationSeq::new(0),
+            OperationSeq::new(u64::MAX),
+            |operation, record| {
+                if !compatible {
+                    return Ok(());
+                }
+                meter.field(record.recipe.len(), ReadBudget::SNAPSHOT.max_field_bytes)?;
+                meter.charge(
+                    128usize
+                        .checked_add(record.recipe.len())
+                        .ok_or(ReadError::LimitExceeded)?,
+                )?;
+                let admit = match record.cached_bounds {
+                    Some(cached) => cached,
+                    None => witness::receipt_bounds(
+                        &self.limits,
+                        operation,
+                        &record.recipe,
+                        record.decision,
+                    )?,
+                };
+                if let Some(admit) = admit
+                    && (admit.first.sequence().get() == 0
+                        || admit.payload.is_some_and(|p| p.sequence().get() == 0))
+                {
+                    compatible = false;
+                }
+                Ok(())
+            },
+        )?;
+        Ok(compatible)
     }
 }
 
@@ -2559,7 +2658,16 @@ impl DurableStore for VolatileStore {
                         .checked_add(record.recipe.len())
                         .ok_or(ReadError::LimitExceeded)?,
                 )?;
-                if let Some(admit) = witness::receipt_bounds(&self.limits, operation, record)?
+                let admit = match record.cached_bounds {
+                    Some(cached) => cached,
+                    None => witness::receipt_bounds(
+                        &self.limits,
+                        operation,
+                        &record.recipe,
+                        record.decision,
+                    )?,
+                };
+                if let Some(admit) = admit
                     && (admit.last.sequence() > request.publication_through
                         || admit
                             .payload
@@ -2586,11 +2694,17 @@ impl DurableStore for VolatileStore {
         let ceiling = usize::from(collection.limit) + 1;
         keys.try_reserve_exact(ceiling * 2)
             .map_err(|_| ReadError::AllocationFailed)?;
-        keys.extend(
-            self.operations
-                .range(first..=last)
-                .take(ceiling)
-                .map(|(id, _)| (*id, false)),
+        let scope = (origin.incarnation, origin.epoch, origin.owner);
+        let _ = self.operations.for_each_in_scope_range(
+            scope,
+            OperationSeq::new(0),
+            closure.through,
+            |id, _| -> Result<(), ()> {
+                if keys.len() < ceiling {
+                    keys.push((id, false));
+                }
+                Ok(())
+            },
         );
         keys.extend(
             self.fences
@@ -2687,9 +2801,11 @@ impl DurableStore for VolatileStore {
             .map_err(|_| ReadError::AllocationFailed)?;
         keys.extend(
             self.operations
-                .range(start..=end)
+                .iter_ordered()
+                .skip_while(|(id, _)| *id < start)
+                .take_while(|(id, _)| *id <= end)
                 .take(ceiling)
-                .map(|(id, _)| (*id, false)),
+                .map(|(id, _)| (id, false)),
         );
         keys.extend(
             self.fences
@@ -2859,13 +2975,21 @@ impl DurableStore for VolatileStore {
         };
         let recipe = command.recipe.get();
         let operation = recipe.operation();
-        if matches!(
-            self.established_inner(operation),
-            Established::Outcome(StoreOutcome::RetiredOutcomeUnavailable)
-        ) {
+        let canonical = command.recipe.canonical_bytes();
+        // Single-pass recognition (replaces 3 separate map lookups in the prior path).
+        if operation.incarnation() != self.ledger.incarnation() {
+            return settled(StoreOutcome::RejectedCertain(
+                RejectReason::PreconditionFailed,
+            ));
+        }
+        if (operation.epoch() <= self.collected_through && operation.epoch().get() != 0)
+            || self
+                .receipt_frontiers
+                .get(&ReceiptOrigin::of(operation))
+                .is_some_and(|closure| operation.sequence() <= closure.through)
+        {
             return settled(StoreOutcome::RetiredOutcomeUnavailable);
         }
-        let canonical = command.recipe.canonical_bytes();
         if let Some(record) = self.operations.get(&operation) {
             let same_payload = match (recipe, &command.payload, record.decision) {
                 (recipe, Some(bytes), Decision::Committed(_))
@@ -2885,17 +3009,26 @@ impl DurableStore for VolatileStore {
                 }
                 _ => true,
             };
-            if record.recipe.as_slice() != canonical || !same_payload {
+            if record.recipe.as_ref() != canonical || !same_payload {
                 return Applied {
                     reply: StoreReply::Violation(StoreViolation::RecipeMismatch),
                     committed_now: false,
                     wrote: false,
                 };
             }
+            return settled(match record.decision {
+                Decision::Committed(facts) => StoreOutcome::Committed(facts),
+                Decision::Rejected(reason) => StoreOutcome::RejectedCertain(reason),
+            });
         }
-        let phase = match self.established_inner(operation) {
-            Established::Outcome(outcome) => return settled(outcome),
-            Established::Absent(phase) => phase,
+        if self.fences.contains(&operation) {
+            return settled(StoreOutcome::RejectedCertain(RejectReason::Fenced));
+        }
+        let phase = match self.ledger.phase_of(operation.epoch()) {
+            EpochPhase::Closed => {
+                return settled(StoreOutcome::RejectedCertain(RejectReason::EpochClosed));
+            }
+            phase => phase,
         };
         if !self.receipt_capacity(operation, Some(ReceiptClass::of(recipe))) {
             return settled(StoreOutcome::PendingOrUnknown);
@@ -2907,7 +3040,7 @@ impl DurableStore for VolatileStore {
             return rejected(self.commit_rejection(
                 recipe,
                 operation,
-                canonical.to_vec(),
+                command.recipe.canonical_arc(),
                 RejectReason::PreconditionFailed,
             ));
         }
@@ -2917,7 +3050,7 @@ impl DurableStore for VolatileStore {
                 return rejected(self.commit_rejection(
                     recipe,
                     operation,
-                    canonical.to_vec(),
+                    command.recipe.canonical_arc(),
                     RejectReason::PreconditionFailed,
                 ));
             }
@@ -2932,6 +3065,17 @@ impl DurableStore for VolatileStore {
                         let mut a = Admission::from(admit);
                         a.properties = props;
                         self.exec_publication(a, None, command.payload.as_ref(), None)
+                    }
+                    Recipe::ClaimedPublication(claimed) => {
+                        let mut a = Admission::from(&claimed.admission);
+                        a.properties = props;
+                        self.exec_publication_with_claim(
+                            a,
+                            None,
+                            command.payload.as_ref(),
+                            None,
+                            Some(claimed.claim),
+                        )
                     }
                     Recipe::RetainedPublication(value) => {
                         let mut a = Admission::from(&value.admission);
@@ -2976,6 +3120,13 @@ impl DurableStore for VolatileStore {
             Recipe::AdmitPublication(admit) => {
                 self.exec_publication(Admission::from(admit), None, command.payload.as_ref(), None)
             }
+            Recipe::ClaimedPublication(claimed) => self.exec_publication_with_claim(
+                Admission::from(&claimed.admission),
+                None,
+                command.payload.as_ref(),
+                None,
+                Some(claimed.claim),
+            ),
             Recipe::RetainedPublication(value) => self.exec_publication(
                 Admission::from(&value.admission),
                 Some(&value.retain_targets),
@@ -3085,7 +3236,7 @@ impl DurableStore for VolatileStore {
                 let witness_bounds = witness::bounds(recipe).ok().flatten();
                 self.record_operation(
                     operation,
-                    canonical.to_vec(),
+                    command.recipe.canonical_arc(),
                     Decision::Committed(facts),
                     witness_bounds,
                 );
@@ -3096,9 +3247,12 @@ impl DurableStore for VolatileStore {
                     wrote: true,
                 }
             }
-            Err(CommitErr::Refused(reason)) => {
-                rejected(self.commit_rejection(recipe, operation, canonical.to_vec(), reason))
-            }
+            Err(CommitErr::Refused(reason)) => rejected(self.commit_rejection(
+                recipe,
+                operation,
+                command.recipe.canonical_arc(),
+                reason,
+            )),
             Err(CommitErr::NotWritten) => settled(StoreOutcome::PendingOrUnknown),
         }
     }
@@ -3106,7 +3260,7 @@ impl DurableStore for VolatileStore {
     fn established(&self, operation: OperationId) -> Result<Option<StoreOutcome>, ReadError> {
         Ok(match self.established_inner(operation) {
             Established::Outcome(outcome) => Some(outcome),
-            Established::Absent(_) => None,
+            Established::Absent => None,
         })
     }
 
@@ -3117,7 +3271,7 @@ impl DurableStore for VolatileStore {
         };
         match self.established_inner(operation) {
             Established::Outcome(outcome) => settled(outcome),
-            Established::Absent(_) => {
+            Established::Absent => {
                 if !self.receipt_capacity(operation, None) {
                     return settled(StoreOutcome::PendingOrUnknown);
                 }
@@ -3243,8 +3397,8 @@ impl DurableStore for VolatileStore {
                     operation.epoch() <= collected && operation.epoch().get() != 0
                 };
                 let mut freed = 0u64;
-                for operation in self.operations.keys().chain(self.fences.iter()) {
-                    if retired(operation) {
+                for operation in self.operations.keys().chain(self.fences.iter().copied()) {
+                    if retired(&operation) {
                         freed = freed.checked_add(1).ok_or(AdminRefused::Exhausted)?;
                     }
                 }
@@ -3258,12 +3412,8 @@ impl DurableStore for VolatileStore {
                     .map_err(|_| AdminRefused::WriteFailed)?;
                 self.collected_through = collected;
                 self.accounts.receipt_slots = next_receipts;
-                let retired_ops: Vec<OperationId> = self
-                    .operations
-                    .keys()
-                    .filter(|op| retired(op))
-                    .copied()
-                    .collect();
+                let retired_ops: Vec<OperationId> =
+                    self.operations.keys().filter(|op| retired(op)).collect();
                 for op in retired_ops {
                     self.remove_operation(&op);
                 }

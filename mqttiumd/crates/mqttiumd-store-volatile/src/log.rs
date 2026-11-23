@@ -89,9 +89,9 @@ const ADMIN_COLLECT_CLOSED_EPOCHS: u8 = 4;
 
 static ROTATE_SEQ: AtomicU64 = AtomicU64::new(0);
 
-/// Pure-Rust Castagnoli CRC-32C (`0x82F63B78` reflected polynomial).
-const CRC32C_TABLE: [u32; 256] = {
-    let mut table = [0u32; 256];
+/// Pure-Rust Slice-by-8 Castagnoli CRC-32C (`0x82F63B78` reflected polynomial).
+const CRC32C_TABLES: [[u32; 256]; 8] = {
+    let mut tables = [[0u32; 256]; 8];
     let mut i = 0usize;
     while i < 256 {
         let mut crc = i as u32;
@@ -104,17 +104,40 @@ const CRC32C_TABLE: [u32; 256] = {
             }
             bit += 1;
         }
-        table[i] = crc;
+        tables[0][i] = crc;
         i += 1;
     }
-    table
+    let mut t = 1usize;
+    while t < 8 {
+        let mut i = 0usize;
+        while i < 256 {
+            let prev = tables[t - 1][i];
+            tables[t][i] = tables[0][(prev & 0xff) as usize] ^ (prev >> 8);
+            i += 1;
+        }
+        t += 1;
+    }
+    tables
 };
 
 #[must_use]
 pub(crate) fn crc32c(bytes: &[u8]) -> u32 {
     let mut crc = !0u32;
-    for &b in bytes {
-        crc = CRC32C_TABLE[((crc ^ u32::from(b)) & 0xff) as usize] ^ (crc >> 8);
+    let mut chunks = bytes.chunks_exact(8);
+    for chunk in &mut chunks {
+        let lo = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]) ^ crc;
+        let hi = u32::from_le_bytes([chunk[4], chunk[5], chunk[6], chunk[7]]);
+        crc = CRC32C_TABLES[7][(lo & 0xff) as usize]
+            ^ CRC32C_TABLES[6][((lo >> 8) & 0xff) as usize]
+            ^ CRC32C_TABLES[5][((lo >> 16) & 0xff) as usize]
+            ^ CRC32C_TABLES[4][(lo >> 24) as usize]
+            ^ CRC32C_TABLES[3][(hi & 0xff) as usize]
+            ^ CRC32C_TABLES[2][((hi >> 8) & 0xff) as usize]
+            ^ CRC32C_TABLES[1][((hi >> 16) & 0xff) as usize]
+            ^ CRC32C_TABLES[0][(hi >> 24) as usize];
+    }
+    for &b in chunks.remainder() {
+        crc = CRC32C_TABLES[0][((crc ^ u32::from(b)) & 0xff) as usize] ^ (crc >> 8);
     }
     !crc
 }

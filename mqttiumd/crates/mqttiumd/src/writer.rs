@@ -479,7 +479,9 @@ pub fn recipe_kind(recipe: &Recipe) -> &'static str {
         Recipe::MarkDeliveryStarted(_) => "DeliveryStarted",
         Recipe::PreparePubrel(_) => "DeliveryPubrelReady",
         Recipe::ExpireDelivery(_) => "MessageExpire",
-        Recipe::RetainedPublication(_) | Recipe::AdmitPublication(_) => "Admission",
+        Recipe::RetainedPublication(_)
+        | Recipe::AdmitPublication(_)
+        | Recipe::ClaimedPublication(_) => "Admission",
         Recipe::RetainedQos0(_) => "RetainedQoS0",
         Recipe::ReplaySubscriptions(_) => "Subscriptions",
         Recipe::ReleaseInbound(_) => "Release",
@@ -821,6 +823,8 @@ impl Writer {
                 let mut stopping = false;
                 let mut stop_result: Result<(), Failure> = Ok(());
                 let mut state = BusinessState::default();
+                let mut members: Vec<Member> = Vec::with_capacity(group);
+                let mut deferred_reads: Vec<(EffectId, Effect)> = Vec::new();
                 #[cfg(feature="test-hooks")]
                 let mut duplicate_control: Option<ControlResponse> = None;
                 loop {
@@ -907,8 +911,8 @@ impl Writer {
                         // one group. Interleaved read-only LoadWork requests do
                         // not shatter the write group: they run immediately
                         // after the group commit so they see the committed rows.
-                        let mut members: Vec<Member> = Vec::new();
-                        let mut deferred_reads: Vec<(EffectId, Effect)> = Vec::new();
+                        members.clear();
+                        deferred_reads.clear();
                         let mut other = None;
                         let mut closed = false;
                         while members.len() < group && deferred_reads.len() < group {
@@ -939,9 +943,10 @@ impl Writer {
                         let idle_turn =
                             members.is_empty() && deferred_reads.is_empty() && other.is_none();
                         if !members.is_empty() {
-                            pending.extend(group_responses(&mut store, members, &events, &cancel));
+                            group_responses_into(&mut store, &members, &events, &cancel, &mut pending);
+                            members.clear();
                         }
-                        for (effect, work) in deferred_reads {
+                        for (effect, work) in deferred_reads.drain(..) {
                             pending.push_back(effect_response(
                                 &mut store, effect, work, &events, &hooks, &cancel, &mut state,
                             ));
@@ -1052,6 +1057,21 @@ fn business_response(
 
 /// The sessions a committed command may have given work to.
 fn targets_of(recipe: &Recipe) -> Vec<SessionId> {
+    if let Recipe::ClaimedPublication(claimed) = recipe.inner_publication() {
+        let claimed_idx = usize::from(claimed.claim.target_index);
+        if claimed.admission.targets.len() <= 1 {
+            return Vec::new();
+        }
+        return claimed
+            .admission
+            .targets
+            .as_slice()
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != claimed_idx)
+            .map(|(_, t)| t.session)
+            .collect();
+    }
     if let Recipe::WillPublication(a) = recipe {
         a.targets.as_slice().iter().map(|t| t.session).collect()
     } else if let Some(a) = recipe.admission() {
@@ -1151,14 +1171,15 @@ struct Member {
     command: mqttiumd_contract::command::Command,
 }
 
-/// Applies the commands in one transaction (record 0045) and answers each
-/// in order. No answer exists before the commit of the group returned.
-fn group_responses(
+/// Applies the commands in one transaction (record 0045) and appends each
+/// answer in order into `out`. No answer exists before the commit returned.
+fn group_responses_into(
     store: &mut StoreBackend,
-    members: Vec<Member>,
+    members: &[Member],
     events: &Events,
     cancel: &AtomicBool,
-) -> Vec<Response> {
+    out: &mut VecDeque<Response>,
+) {
     let commands: Vec<_> = members.iter().map(|member| &member.command).collect();
     let count = commands.len();
     if events
@@ -1174,21 +1195,18 @@ fn group_responses(
             .map(|command| store.apply(command))
             .collect()
     });
-    members
-        .iter()
-        .zip(applied)
-        .map(|(member, applied)| {
-            let recipe = member.command.recipe.get();
-            record_applied(recipe, &applied, events, cancel);
-            record_result(recipe, &applied, events, cancel);
-            Response::Store {
-                effect: member.effect,
-                operation: recipe.operation(),
-                reply: applied.reply,
-                targets: targets_of(recipe),
-            }
-        })
-        .collect()
+    out.reserve(members.len());
+    for (member, applied) in members.iter().zip(applied) {
+        let recipe = member.command.recipe.get();
+        record_applied(recipe, &applied, events, cancel);
+        record_result(recipe, &applied, events, cancel);
+        out.push_back(Response::Store {
+            effect: member.effect,
+            operation: recipe.operation(),
+            reply: applied.reply,
+            targets: targets_of(recipe),
+        });
+    }
 }
 
 fn effect_response(
@@ -1548,6 +1566,7 @@ fn replay_controls(
                 .map_err(|_| Failure::plain("receipt_replay_recipe"))?;
         let admission = match &mut recipe {
             Recipe::AdmitPublication(a) => a,
+            Recipe::ClaimedPublication(a) => &mut a.admission,
             Recipe::RetainedPublication(a) => &mut a.admission,
             _ => return Err(Failure::plain("receipt_replay_kind")),
         };

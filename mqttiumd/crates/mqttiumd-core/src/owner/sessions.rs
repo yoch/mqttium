@@ -1183,7 +1183,7 @@ mod tests {
     fn answer(owner: &mut Owner, reply: StoreOutcome) -> Vec<(EffectId, Effect)> {
         let flight = owner.lifecycle.as_ref().unwrap();
         let input = Input::StoreResult {
-            effect: flight.in_flight.answers.persist,
+            effect: flight.in_flight.answers.persist_id(),
             operation: flight.command.operation,
             reply: StoreReply::Outcome(reply),
         };
@@ -1307,7 +1307,7 @@ mod tests {
         let effects = apply(
             &mut owner,
             Input::StoreResult {
-                effect: original.in_flight.answers.persist,
+                effect: original.in_flight.answers.persist_id(),
                 operation,
                 reply: StoreReply::Outcome(StoreOutcome::Committed(CommitFacts::SessionLifecycle(
                     opened(1, SessionExpiry::OnDisconnect),
@@ -1444,7 +1444,7 @@ mod tests {
             apply(
                 &mut owner,
                 Input::StoreResult {
-                    effect: original.in_flight.answers.persist,
+                    effect: original.in_flight.answers.persist_id(),
                     operation,
                     reply: StoreReply::Outcome(StoreOutcome::Committed(
                         CommitFacts::SessionLifecycle(closed(1))
@@ -1515,14 +1515,14 @@ mod tests {
                 connection: ConnectionGeneration::new(1),
             },
             Input::StoreResult {
-                effect: original.in_flight.answers.persist,
+                effect: original.in_flight.answers.persist_id(),
                 operation: old_token,
                 reply: StoreReply::Outcome(StoreOutcome::Committed(CommitFacts::SessionLifecycle(
                     opened(1, SessionExpiry::OnDisconnect),
                 ))),
             },
             Input::StoreResult {
-                effect: old_close.in_flight.answers.persist,
+                effect: old_close.in_flight.answers.persist_id(),
                 operation: old_close.command.operation,
                 reply: StoreReply::Outcome(StoreOutcome::Committed(CommitFacts::SessionLifecycle(
                     closed(1),
@@ -1555,7 +1555,7 @@ mod tests {
         let effects = apply(
             &mut owner,
             Input::StoreResult {
-                effect: flight.in_flight.answers.persist,
+                effect: flight.in_flight.answers.persist_id(),
                 operation: flight.command.operation,
                 reply: StoreReply::Outcome(StoreOutcome::RejectedCertain(RejectReason::Fenced)),
             },
@@ -1572,7 +1572,7 @@ mod tests {
         let flight = owner.lifecycle.clone().unwrap();
         let previous = owner.sessions.as_slice().to_vec();
         let input = Input::StoreResult {
-            effect: flight.in_flight.answers.persist,
+            effect: flight.in_flight.answers.persist_id(),
             operation: flight.command.operation,
             reply: StoreReply::Outcome(StoreOutcome::Committed(CommitFacts::SessionLifecycle(
                 opened(2, SessionExpiry::Never),
@@ -2105,7 +2105,7 @@ mod tests {
         let flight = owner.lifecycle.as_ref().unwrap().clone();
         let outcome = owner.step(
             Input::StoreResult {
-                effect: flight.in_flight.answers.persist,
+                effect: flight.in_flight.answers.persist_id(),
                 operation: flight.command.operation,
                 reply: StoreReply::Outcome(StoreOutcome::Committed(CommitFacts::SessionLifecycle(
                     SessionChange::Detached {
@@ -2230,7 +2230,7 @@ mod tests {
         }
         let outcome = owner.step(
             Input::StoreResult {
-                effect: flight.in_flight.answers.persist,
+                effect: flight.in_flight.answers.persist_id(),
                 operation: flight.command.operation,
                 reply: StoreReply::Outcome(StoreOutcome::Committed(CommitFacts::SessionLifecycle(
                     wrong,

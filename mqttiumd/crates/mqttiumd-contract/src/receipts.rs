@@ -140,6 +140,7 @@ impl ReceiptClass {
             | Recipe::RetainedQos0(_)
             | Recipe::ReplaySubscriptions(_)
             | Recipe::AdmitPublication(_)
+            | Recipe::ClaimedPublication(_)
             | Recipe::ChangeSubscriptions(_)
             | Recipe::UpdateSubscriptions(_) => Self::Business,
             Recipe::WillPublication(_)

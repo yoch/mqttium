@@ -158,6 +158,7 @@ pub enum WorkKind {
     RetainedQos0,
     ReplaySubscriptions,
     AdmitPublication,
+    ClaimedPublication,
     ReleaseInbound,
     ChangeSubscriptions,
     ClaimDelivery,
@@ -185,6 +186,7 @@ impl WorkKind {
             Self::RetainedQos0 => "RetainedQos0",
             Self::ReplaySubscriptions => "ReplaySubscriptions",
             Self::AdmitPublication => "AdmitPublication",
+            Self::ClaimedPublication => "ClaimedPublication",
             Self::ReleaseInbound => "ReleaseInbound",
             Self::ChangeSubscriptions => "ChangeSubscriptions",
             Self::ClaimDelivery => "ClaimDelivery",
@@ -597,6 +599,14 @@ fn describe(work: &Work) -> (WorkKind, Option<OperationId>, Source) {
                 WorkKind::AdmitPublication,
                 Some(admit.operation),
                 Some((admit.source.session, admit.source.packet_id)),
+            ),
+            Recipe::ClaimedPublication(claimed) => (
+                WorkKind::ClaimedPublication,
+                Some(claimed.admission.operation),
+                Some((
+                    claimed.admission.source.session,
+                    claimed.admission.source.packet_id,
+                )),
             ),
             Recipe::ReleaseInbound(release) => (
                 WorkKind::ReleaseInbound,

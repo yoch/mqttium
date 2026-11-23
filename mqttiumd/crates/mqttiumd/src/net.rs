@@ -9,11 +9,13 @@ use std::collections::VecDeque;
 use std::io::{self, IoSlice, Read, Write as _};
 use std::net::{Shutdown, TcpStream};
 use std::os::fd::{AsRawFd, RawFd};
+#[cfg(test)]
+use std::sync::Condvar;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 #[cfg(test)]
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SendError, SyncSender};
 use std::sync::mpsc::{TryRecvError, TrySendError};
-use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use mqttiumd_contract::ids::{ConnectionKey, EffectId};
@@ -158,22 +160,58 @@ pub struct WireProgress {
     pub connection: ConnectionKey,
 }
 
-/// Lazy bounded single-producer/single-consumer queue.
+/// Lazy bounded single-producer/single-consumer queue with a Redis-style
+/// inline single-item slot.
 ///
-/// Unlike `std::sync::mpsc::sync_channel(N)`, this allocates zero ring-buffer
-/// memory when created and shrinks back to zero when drained after bursts,
-/// cutting idle per-connection lane RAM from ~30 KiB to ~288 bytes while
-/// preserving exact bounded backpressure and disconnect semantics.
+/// Unlike `std::sync::mpsc::sync_channel(N)`, idle and low-rate connections
+/// (CONNECT/CONNACK/keep-alive) transfer single items through `inline` with
+/// zero heap allocation; `overflow` allocates lazily only when a second item
+/// arrives before the first is consumed and shrinks back to zero after bursts.
 struct LaneState<T> {
-    queue: VecDeque<T>,
+    inline: Option<T>,
+    overflow: VecDeque<T>,
     sender_alive: bool,
     receiver_alive: bool,
+}
+
+impl<T> LaneState<T> {
+    #[inline]
+    fn len(&self) -> usize {
+        usize::from(self.inline.is_some()) + self.overflow.len()
+    }
+
+    #[inline]
+    fn is_empty(&self) -> bool {
+        self.inline.is_none() && self.overflow.is_empty()
+    }
+
+    #[inline]
+    fn push_back(&mut self, value: T) {
+        if self.inline.is_none() && self.overflow.is_empty() {
+            self.inline = Some(value);
+        } else {
+            self.overflow.push_back(value);
+        }
+    }
+
+    #[inline]
+    fn pop_front(&mut self) -> Option<T> {
+        let value = self.inline.take()?;
+        if !self.overflow.is_empty() {
+            self.inline = self.overflow.pop_front();
+            if self.overflow.is_empty() && self.overflow.capacity() > LANE_SHRINK_THRESHOLD {
+                self.overflow = VecDeque::new();
+            }
+        }
+        Some(value)
+    }
 }
 
 struct LaneInner<T> {
     cap: usize,
     pending: AtomicBool,
     state: Mutex<LaneState<T>>,
+    #[cfg(test)]
     changed: Condvar,
 }
 
@@ -191,12 +229,13 @@ impl<T> LaneTx<T> {
         if !state.receiver_alive {
             return Err(TrySendError::Disconnected(value));
         }
-        if state.queue.len() >= self.inner.cap {
+        if state.len() >= self.inner.cap {
             return Err(TrySendError::Full(value));
         }
-        state.queue.push_back(value);
+        state.push_back(value);
         self.inner.pending.store(true, Ordering::Release);
         drop(state);
+        #[cfg(test)]
         self.inner.changed.notify_one();
         if let Some(control) = &self.control {
             control.mark_active();
@@ -210,7 +249,7 @@ impl<T> LaneTx<T> {
             Ok(guard) => guard,
             Err(_) => return Err(SendError(value)),
         };
-        while state.receiver_alive && state.queue.len() >= self.inner.cap {
+        while state.receiver_alive && state.len() >= self.inner.cap {
             state = match self.inner.changed.wait(state) {
                 Ok(guard) => guard,
                 Err(_) => return Err(SendError(value)),
@@ -219,7 +258,7 @@ impl<T> LaneTx<T> {
         if !state.receiver_alive {
             return Err(SendError(value));
         }
-        state.queue.push_back(value);
+        state.push_back(value);
         self.inner.pending.store(true, Ordering::Release);
         drop(state);
         self.inner.changed.notify_one();
@@ -236,6 +275,7 @@ impl<T> Drop for LaneTx<T> {
             state.sender_alive = false;
             self.inner.pending.store(true, Ordering::Release);
         }
+        #[cfg(test)]
         self.inner.changed.notify_all();
         if let Some(control) = &self.control {
             control.mark_active();
@@ -258,15 +298,12 @@ impl<T> LaneRx<T> {
             Ok(guard) => guard,
             Err(_) => return Err(TryRecvError::Disconnected),
         };
-        if let Some(value) = state.queue.pop_front() {
-            if state.queue.is_empty() && state.queue.capacity() > LANE_SHRINK_THRESHOLD {
-                state.queue = VecDeque::new();
-            }
-            self.inner.pending.store(
-                !state.queue.is_empty() || !state.sender_alive,
-                Ordering::Release,
-            );
+        if let Some(value) = state.pop_front() {
+            self.inner
+                .pending
+                .store(!state.is_empty() || !state.sender_alive, Ordering::Release);
             drop(state);
+            #[cfg(test)]
             self.inner.changed.notify_one();
             return Ok(value);
         }
@@ -287,14 +324,10 @@ impl<T> LaneRx<T> {
             Err(_) => return Err(RecvTimeoutError::Disconnected),
         };
         loop {
-            if let Some(value) = state.queue.pop_front() {
-                if state.queue.is_empty() && state.queue.capacity() > LANE_SHRINK_THRESHOLD {
-                    state.queue = VecDeque::new();
-                }
-                self.inner.pending.store(
-                    !state.queue.is_empty() || !state.sender_alive,
-                    Ordering::Release,
-                );
+            if let Some(value) = state.pop_front() {
+                self.inner
+                    .pending
+                    .store(!state.is_empty() || !state.sender_alive, Ordering::Release);
                 drop(state);
                 self.inner.changed.notify_one();
                 return Ok(value);
@@ -328,6 +361,7 @@ impl<T> Drop for LaneRx<T> {
         if let Ok(mut state) = self.inner.state.lock() {
             state.receiver_alive = false;
         }
+        #[cfg(test)]
         self.inner.changed.notify_all();
     }
 }
@@ -337,10 +371,12 @@ fn lazy_lane<T>(cap: usize, control: Option<Control>) -> (LaneTx<T>, LaneRx<T>) 
         cap,
         pending: AtomicBool::new(false),
         state: Mutex::new(LaneState {
-            queue: VecDeque::new(),
+            inline: None,
+            overflow: VecDeque::new(),
             sender_alive: true,
             receiver_alive: true,
         }),
+        #[cfg(test)]
         changed: Condvar::new(),
     });
     (

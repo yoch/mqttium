@@ -615,7 +615,7 @@ enum FactRef<'a> {
     Route(&'a [u8], &'a RouteTarget),
     Session(SessionId, &'a SessionRecord),
     Inbound(mqttiumd_contract::ids::InboundPacketId, &'a InboundRecord),
-    Operation(OperationId, &'a OperationRecord),
+    Operation(OperationId, &'a crate::VOperation),
     Fence(OperationId),
     Outbound(DeliveryId, &'a ObligationRecord),
     ReceiptFrontier(ReceiptClosure),
@@ -756,9 +756,9 @@ fn inventory(store: &VolatileStore) -> impl Iterator<Item = FactRef<'_>> {
         .map(|((_, packet), marker)| FactRef::Inbound(*packet, marker));
     let operations = store
         .operations
-        .iter()
+        .iter_ordered()
         .filter(move |(operation, _)| older(operation))
-        .map(|(operation, record)| FactRef::Operation(*operation, record));
+        .map(|(operation, record)| FactRef::Operation(operation, record));
     let fences = store
         .fences
         .iter()
@@ -1010,6 +1010,16 @@ pub(crate) fn build_snapshot(
         meter.field(32, 32)?;
         meter.charge(200)?;
     }
+    let mut operations = BTreeMap::new();
+    for (op, record) in store.operations.iter_ordered() {
+        operations.insert(
+            op,
+            OperationRecord {
+                recipe: record.recipe.to_vec(),
+                decision: record.decision,
+            },
+        );
+    }
     Ok(DurableState {
         ledger: store.ledger,
         collected_through: store.collected_through,
@@ -1021,7 +1031,7 @@ pub(crate) fn build_snapshot(
         route_revision: store.route_revision,
         sessions: store.sessions.clone(),
         routes: store.routes.clone(),
-        operations: store.operations.clone(),
+        operations,
         fences: store.fences.clone(),
         receipt_frontiers: store.receipt_frontiers.clone(),
         retained: store.retained.clone(),

@@ -34,10 +34,6 @@ pub(super) struct State {
     sweep: bool,
 }
 
-#[expect(
-    clippy::large_enum_variant,
-    reason = "an allocation-free plan carries the bounded retry history by value"
-)]
 #[derive(Debug)]
 pub(super) enum Change {
     Submit { flight: Flight, activate: bool },

@@ -35,3 +35,4 @@ pub mod will;
 pub mod topic;
 
 pub mod retained;
+pub mod scoped_map;

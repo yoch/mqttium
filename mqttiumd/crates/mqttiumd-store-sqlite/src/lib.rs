@@ -78,8 +78,8 @@ use mqttiumd_contract::capacity::{
     BoundedVec, ExchangeSlots, PayloadBytes, ReceiptSlots, References, Resource,
 };
 use mqttiumd_contract::command::{
-    AdmitPublication, Command, EpochLedger, EpochPhase, LedgerOpening, OpenEpoch, Recipe,
-    RecipeError, ReleaseInbound,
+    AdmitPublication, Command, EpochLedger, EpochPhase, InlineClaim, LedgerOpening, OpenEpoch,
+    Recipe, RecipeError, ReleaseInbound,
 };
 use mqttiumd_contract::effects::{InboundPhase, RecoveredFact};
 use mqttiumd_contract::ids::{
@@ -946,6 +946,31 @@ fn stage_publication(
     retained_mask: Option<&mqttiumd_contract::retained::RetainMask>,
     payload: Option<&SharedBytes>,
 ) -> Guard<CommitFacts> {
+    stage_publication_with_claim(
+        conn,
+        meta,
+        caches,
+        delta,
+        admit,
+        retained_mask,
+        payload,
+        None,
+    )
+}
+#[expect(
+    clippy::too_many_arguments,
+    reason = "internal SQLite staging helper carries transaction context and optional inline claim"
+)]
+fn stage_publication_with_claim(
+    conn: &Connection,
+    meta: &mut Meta,
+    caches: &mut StoreCaches,
+    delta: &TxDelta,
+    admit: Admission<'_>,
+    retained_mask: Option<&mqttiumd_contract::retained::RetainMask>,
+    payload: Option<&SharedBytes>,
+    inline_claim: Option<InlineClaim>,
+) -> Guard<CommitFacts> {
     let failed = RejectReason::PreconditionFailed;
     let operation = admit.operation;
     let same_scope = |incarnation, epoch, owner| {
@@ -1129,6 +1154,52 @@ fn stage_publication(
             i64::from(retained_mask.is_some_and(|mask| mask.is_set(target_index))),
         ])?;
     }
+    let claimed_target = if let Some(claim) = inline_claim {
+        if expired {
+            return refused(failed);
+        }
+        let Some(target) = targets.get(usize::from(claim.target_index)) else {
+            return refused(failed);
+        };
+        if target.effective_qos == Qos::AtMostOnce {
+            return refused(failed);
+        }
+        let delivery_pub = target.delivery.publication.to_be_bytes();
+        let delivery_idx = i64::from(target.delivery.index);
+        let target_bytes = target.session.to_be_bytes();
+        let taken = conn
+            .prepare_cached(
+                "SELECT 1 FROM outbound WHERE (publication=?1 AND idx=?2) OR (target=?3 AND packet_id=?4) LIMIT 1",
+            )?
+            .query_row(
+                params![
+                    delivery_pub.as_slice(),
+                    delivery_idx,
+                    target_bytes.as_slice(),
+                    i64::from(claim.packet_id.get()),
+                ],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if taken {
+            return refused(failed);
+        }
+        conn.prepare_cached(
+            "INSERT INTO outbound(publication,idx,target,target_revision,packet_id,claim) VALUES(?1,?2,?3,?4,?5,?6)",
+        )?
+        .execute(params![
+            delivery_pub.as_slice(),
+            delivery_idx,
+            target_bytes.as_slice(),
+            target.session_revision.to_be_bytes().as_slice(),
+            i64::from(claim.packet_id.get()),
+            operation.to_be_bytes().as_slice(),
+        ])?;
+        true
+    } else {
+        false
+    };
     if exactly_once {
         // One admission per inbound exchange: an occupied slot is never
         // taken over, whatever generation the newcomer claims.
@@ -1155,6 +1226,14 @@ fn stage_publication(
             inbound_phase_code(InboundPhase::AwaitPubrel),
         ])?;
     }
+    let exchange_slots = ExchangeSlots::new(
+        admit
+            .costs
+            .exchange_slots
+            .get()
+            .checked_add(u64::from(claimed_target))
+            .ok_or(Abort::Refused(failed))?,
+    );
     charge(
         meta,
         Accounts {
@@ -1164,7 +1243,7 @@ fn stage_publication(
                 admit.costs.payload_bytes
             },
             references: References::new(reference_count),
-            exchange_slots: admit.costs.exchange_slots,
+            exchange_slots,
             receipt_slots: admit.costs.receipt_slots,
         },
     )?;
@@ -1630,6 +1709,20 @@ fn stage_command(
                     a.properties = props;
                     stage_publication(conn, meta, caches, group_delta, a, None, payload)?
                 }
+                Recipe::ClaimedPublication(claimed) => {
+                    let mut a = Admission::from(&claimed.admission);
+                    a.properties = props;
+                    stage_publication_with_claim(
+                        conn,
+                        meta,
+                        caches,
+                        group_delta,
+                        a,
+                        None,
+                        payload,
+                        Some(claimed.claim),
+                    )?
+                }
                 Recipe::RetainedPublication(value) => {
                     let mut a = Admission::from(&value.admission);
                     a.properties = props;
@@ -1677,6 +1770,16 @@ fn stage_command(
         Recipe::AdmitPublication(admit) => {
             stage_admission(conn, meta, caches, group_delta, admit, payload)?
         }
+        Recipe::ClaimedPublication(claimed) => stage_publication_with_claim(
+            conn,
+            meta,
+            caches,
+            group_delta,
+            Admission::from(&claimed.admission),
+            None,
+            payload,
+            Some(claimed.claim),
+        )?,
         Recipe::RetainedPublication(value) => stage_publication(
             conn,
             meta,

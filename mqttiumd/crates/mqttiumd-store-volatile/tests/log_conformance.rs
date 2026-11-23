@@ -469,3 +469,138 @@ fn log_compacts_automatically_and_handles_stale_wal_and_schema15_policy() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn claimed_publication_matches_sqlite_and_recovers_after_crash() {
+    use mqttiumd_contract::command::{ClaimedPublication, FinishDelivery, InlineClaim};
+
+    let dir = temp_dir("claimed-pub");
+    let log_path = dir.join("log.sqlite");
+    let sql_path = dir.join("sql.sqlite");
+    let limits = fixture_limits();
+
+    let mut log_world = World::with_limits(
+        &|incarnation, lim| {
+            let mut s = LogStore::open_or_create(&log_path, incarnation, lim, None, false)
+                .expect("log store");
+            s.set_checkpoint_bytes(64 * 1024 * 1024);
+            s
+        },
+        limits,
+    );
+    let mut sql_world = World::with_limits(
+        &|incarnation, lim| SqliteStore::create(&sql_path, incarnation, lim).expect("sqlite store"),
+        limits,
+    );
+
+    let make_claimed = |world: &World<LogStore>, seq: u64, in_pi: u16, out_pi: u16, body: &[u8]| {
+        let base = world.admission(seq, in_pi, body, &[world.b]);
+        let Recipe::AdmitPublication(admit) =
+            Recipe::decode_canonical(base.recipe.canonical_bytes(), 16, 64).unwrap()
+        else {
+            panic!("expected AdmitPublication");
+        };
+        Command {
+            recipe: FrozenRecipe::freeze(Recipe::ClaimedPublication(ClaimedPublication {
+                admission: admit,
+                claim: InlineClaim {
+                    target_index: 0,
+                    packet_id: OutboundPacketId::new(out_pi).unwrap(),
+                },
+            }))
+            .unwrap(),
+            payload: base.payload,
+        }
+    };
+
+    let c1 = make_claimed(&log_world, 1, 7, 11, b"inline-one");
+    let c_dup_pi = make_claimed(&log_world, 2, 8, 11, b"inline-dup-pi");
+    let c2 = make_claimed(&log_world, 3, 9, 12, b"inline-two");
+    let fin1 = Command {
+        recipe: FrozenRecipe::freeze(Recipe::FinishDelivery(FinishDelivery {
+            operation: operation_id(log_world.epoch, 4),
+            delivery: DeliveryId {
+                publication: publication_id(log_world.epoch, 1),
+                index: 0,
+            },
+            target: log_world.b,
+            target_revision: Revision::new(1),
+            packet_id: OutboundPacketId::new(11).unwrap(),
+            claim: operation_id(log_world.epoch, 1),
+        }))
+        .unwrap(),
+        payload: None,
+    };
+
+    let log_replies = log_world
+        .store
+        .apply_group(&[&c1, &c_dup_pi, &c2, &fin1])
+        .expect("log group");
+    let sql_replies = sql_world
+        .store
+        .apply_group(&[&c1, &c_dup_pi, &c2, &fin1])
+        .expect("sql group");
+    assert_eq!(log_replies, sql_replies);
+    assert!(log_replies[0].committed_now);
+    assert!(matches!(
+        log_replies[1].reply,
+        StoreReply::Outcome(StoreOutcome::RejectedCertain(
+            mqttiumd_contract::outcome::RejectReason::PreconditionFailed
+        ))
+    ));
+    assert!(log_replies[2].committed_now);
+    assert!(log_replies[3].committed_now);
+
+    let expected = sql_world.store.snapshot().expect("sql snapshot");
+    assert_eq!(log_world.store.snapshot().expect("log snapshot"), expected);
+    // Delivery 1 was finished; delivery 3 remains claimed with packet_id 12 and claim = op 3.
+    assert_eq!(expected.outbound.len(), 1);
+    let rec = expected
+        .outbound
+        .get(&DeliveryId {
+            publication: publication_id(log_world.epoch, 3),
+            index: 0,
+        })
+        .expect("inline claim row present");
+    assert_eq!(rec.packet_id, OutboundPacketId::new(12).unwrap());
+    assert_eq!(rec.claim, operation_id(log_world.epoch, 3));
+
+    // Uncompacted .mlog crash recovery must reconstruct exact outbound & account state!
+    let target_b = log_world.b;
+    let epoch = log_world.epoch;
+    drop(log_world);
+    let mut reopened =
+        LogStore::open_or_create(&log_path, StoreIncarnation::new(999), limits, None, true)
+            .expect("reopen after crash");
+    assert_eq!(reopened.snapshot().unwrap(), expected);
+
+    // Finishing the recovered inline-claimed delivery after crash releases all slots cleanly.
+    let fin2 = Command {
+        recipe: FrozenRecipe::freeze(Recipe::FinishDelivery(FinishDelivery {
+            operation: operation_id(epoch, 5),
+            delivery: DeliveryId {
+                publication: publication_id(epoch, 3),
+                index: 0,
+            },
+            target: target_b,
+            target_revision: Revision::new(1),
+            packet_id: OutboundPacketId::new(12).unwrap(),
+            claim: operation_id(epoch, 3),
+        }))
+        .unwrap(),
+        payload: None,
+    };
+    let r_log = reopened.apply(&fin2);
+    let r_sql = sql_world.store.apply(&fin2);
+    assert_eq!(r_log, r_sql);
+    assert!(r_log.committed_now);
+    assert_eq!(
+        reopened.snapshot().unwrap(),
+        sql_world.store.snapshot().unwrap()
+    );
+    assert!(reopened.snapshot().unwrap().outbound.is_empty());
+
+    drop(reopened);
+    drop(sql_world);
+    let _ = std::fs::remove_dir_all(&dir);
+}

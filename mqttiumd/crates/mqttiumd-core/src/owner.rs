@@ -30,8 +30,8 @@ use crate::contract::capacity::{
     ReceiptSlots, References, Resource, WakeCondition, WorkUnits,
 };
 use crate::contract::command::{
-    AdmitPublication, Command, Costs, DeliveryCause, FrozenRecipe, PayloadRef, Recipe, RecipeError,
-    ReleaseInbound, Source, Target,
+    AdmitPublication, ClaimedPublication, Command, Costs, DeliveryCause, FrozenRecipe, InlineClaim,
+    PayloadRef, Recipe, RecipeError, ReleaseInbound, Source, Target,
 };
 use crate::contract::effects::{
     CloseReason, CreateRefused, DispatchReport, Effect, EffectReservation, EffectSink, FactRank,
@@ -42,8 +42,8 @@ use crate::contract::ids::{
     AccountId, ConnectionGeneration, ConnectionKey, ContinuationId, DeadlineToken, DeliveryId,
     EffectId, EffectSeq, ExchangeGeneration, ExchangeId, Exhausted, InboundPacketId,
     LeaseGeneration, LeaseKey, LogicalDuration, LogicalOwnerId, OperationId, OperationSeq,
-    PayloadId, PayloadSeq, PublicationId, PublicationSeq, RequestId, RequestSeq, Revision,
-    RunEpoch, SessionId, StoreIncarnation,
+    OutboundPacketId, PayloadId, PayloadSeq, PublicationId, PublicationSeq, RequestId, RequestSeq,
+    Revision, RunEpoch, SessionId, StoreIncarnation,
 };
 use crate::contract::outcome::{
     CommitFacts, RejectReason, StoreOutcome, StoreReply, StoreViolation,
@@ -51,6 +51,7 @@ use crate::contract::outcome::{
 use crate::contract::packet::{
     AckReason, InboundPacket, OutboundFrame, PubackReason, Qos, SharedBytes,
 };
+use crate::contract::scoped_map::ScopedMap;
 use crate::contract::step::{CoreFault, Exhaustion, PlanStamp, Progress, StepOutcome, TurnGrant};
 use crate::credits::{Credits, ReleaseOutcome};
 use crate::leases::{LeaseRefused, LeaseTable};
@@ -300,48 +301,90 @@ struct Limits {
 ///   is absorbed (`OwnerConfig::retained_operations`).
 /// - I5, consumed. A terminated operation never goes through the
 ///   application path again; its late results only meet the check of I4.
+///
+/// Prefix-stripped answer set (bbtree-inspired): all retained effects for an
+/// operation belong to one `(epoch, owner)` scope, so only 8-byte `EffectSeq`
+/// values plus a presence bitmask are stored inline (88 B vs 280 B).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 struct Answers {
-    persist: EffectId,
-    recent: [Option<EffectId>; RECENT_RESOLUTIONS],
-    landmarks: [Option<EffectId>; LANDMARK_RESOLUTIONS],
+    epoch: RunEpoch,
+    owner: LogicalOwnerId,
+    persist: EffectSeq,
+    recent: [EffectSeq; RECENT_RESOLUTIONS],
+    landmarks: [EffectSeq; LANDMARK_RESOLUTIONS],
     /// Resolutions emitted for the operation so far.
     emitted: u64,
+    /// Bit `0..RECENT_RESOLUTIONS` = populated `recent`, next bits = `landmarks`.
+    present: u8,
 }
 
 impl Answers {
     fn new(persist: EffectId) -> Self {
         Self {
-            persist,
-            recent: [None; RECENT_RESOLUTIONS],
-            landmarks: [None; LANDMARK_RESOLUTIONS],
+            epoch: persist.epoch,
+            owner: persist.owner,
+            persist: persist.sequence,
+            recent: [EffectSeq::new(0); RECENT_RESOLUTIONS],
+            landmarks: [EffectSeq::new(0); LANDMARK_RESOLUTIONS],
             emitted: 0,
+            present: 0,
+        }
+    }
+
+    #[allow(dead_code)]
+    fn persist_id(&self) -> EffectId {
+        EffectId {
+            epoch: self.epoch,
+            owner: self.owner,
+            sequence: self.persist,
         }
     }
 
     fn names(&self, effect: EffectId) -> bool {
-        self.persist == effect
-            || self.recent.contains(&Some(effect))
-            || self.landmarks.contains(&Some(effect))
+        if effect.epoch != self.epoch || effect.owner != self.owner {
+            return false;
+        }
+        let seq = effect.sequence;
+        if self.persist == seq {
+            return true;
+        }
+        if self.emitted == 0 {
+            return false;
+        }
+        for i in 0..RECENT_RESOLUTIONS {
+            if (self.present & (1u8 << i)) != 0 && self.recent[i] == seq {
+                return true;
+            }
+        }
+        for i in 0..LANDMARK_RESOLUTIONS {
+            if (self.present & (1u8 << (RECENT_RESOLUTIONS + i))) != 0 && self.landmarks[i] == seq {
+                return true;
+            }
+        }
+        false
     }
 
     /// Retains the next resolution of the operation.
     fn with(mut self, resolution: EffectId) -> Self {
+        if resolution.epoch != self.epoch || resolution.owner != self.owner {
+            return self;
+        }
         self.emitted = self.emitted.saturating_add(1);
         let rank = self.emitted;
         let place = |rank: u64, len: usize| {
             usize::try_from(rank % u64::try_from(len).unwrap_or(1)).unwrap_or(0)
         };
-        if let Some(slot) = self.recent.get_mut(place(rank, RECENT_RESOLUTIONS)) {
-            *slot = Some(resolution);
+        let recent_idx = place(rank, RECENT_RESOLUTIONS);
+        if let Some(slot) = self.recent.get_mut(recent_idx) {
+            *slot = resolution.sequence;
+            self.present |= 1u8 << recent_idx;
         }
         if rank.is_power_of_two() {
             let landmark = u64::from(rank.trailing_zeros());
-            if let Some(slot) = self
-                .landmarks
-                .get_mut(place(landmark, LANDMARK_RESOLUTIONS))
-            {
-                *slot = Some(resolution);
+            let landmark_idx = place(landmark, LANDMARK_RESOLUTIONS);
+            if let Some(slot) = self.landmarks.get_mut(landmark_idx) {
+                *slot = resolution.sequence;
+                self.present |= 1u8 << (RECENT_RESOLUTIONS + landmark_idx);
             }
         }
         self
@@ -504,6 +547,28 @@ struct Refusal {
     work_used: WorkUnits,
 }
 
+#[derive(Debug)]
+struct InlineClaimPlan {
+    delivery: DeliveryId,
+    target: SessionId,
+    target_revision: Revision,
+    qos: Qos,
+    packet_id: OutboundPacketId,
+    generation: ConnectionGeneration,
+    topic: SharedBytes,
+    payload: SharedBytes,
+    properties: Option<alloc::sync::Arc<crate::contract::properties::PublishProperties>>,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum InlineOutcome {
+    Committed {
+        slot: usize,
+        emission: Option<(EffectId, ConnectionKey)>,
+    },
+    Remove(usize),
+}
+
 /// The change of state of a transition. Indices name entries of the
 /// tables at the revision the plan was computed against.
 #[derive(Debug)]
@@ -546,6 +611,8 @@ enum Change {
         unmatched: bool,
         cost: Credits,
         in_flight: InFlight,
+        inline_claim: Option<alloc::boxed::Box<InlineClaimPlan>>,
+        dirty_targets: alloc::vec::Vec<SessionId>,
     },
     /// The admission of the exchange is known committed.
     Committed {
@@ -637,6 +704,10 @@ struct Plan {
     receipt_consumed: Option<OperationId>,
     /// The held answer the transition releases beside its change.
     released: Option<Released>,
+    /// Inline-claimed delivery transition resolved beside an admission result.
+    inline_outcome: Option<InlineOutcome>,
+    /// Non-inline admission resolved `(operation, committed)` for dirty tracking.
+    non_inline_resolved: Option<(OperationId, bool)>,
 }
 
 /// What a plan draws and publishes while it is computed.
@@ -650,6 +721,8 @@ struct Draft {
     receipt_issued: Option<receipts::Entry>,
     receipt_consumed: Option<OperationId>,
     released: Option<Released>,
+    inline_outcome: Option<InlineOutcome>,
+    non_inline_resolved: Option<(OperationId, bool)>,
 }
 
 impl Draft {
@@ -797,6 +870,59 @@ impl Draft {
 /// let owner = Owner::new(config, outbox).unwrap();
 /// let twin = Owner::new(config, outbox).unwrap();
 /// ```
+/// Redis `listpack`-inspired compact sorted index set for per-session /
+/// per-window tables (typically 1..8 entries, contiguous in one cache line).
+#[derive(Clone, Default, PartialEq, Eq, Debug)]
+pub(super) struct SmallIndexSet(alloc::vec::Vec<usize>);
+
+impl SmallIndexSet {
+    pub(super) fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub(super) fn insert(&mut self, value: usize) -> bool {
+        match self.0.binary_search(&value) {
+            Ok(_) => false,
+            Err(pos) => {
+                self.0.insert(pos, value);
+                true
+            }
+        }
+    }
+
+    pub(super) fn remove(&mut self, value: &usize) -> bool {
+        match self.0.binary_search(value) {
+            Ok(pos) => {
+                self.0.remove(pos);
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
+    pub(super) fn iter(&self) -> core::slice::Iter<'_, usize> {
+        self.0.iter()
+    }
+}
+
+impl IntoIterator for SmallIndexSet {
+    type Item = usize;
+    type IntoIter = alloc::vec::IntoIter<usize>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.into_iter()
+    }
+}
+
+impl<'a> IntoIterator for &'a SmallIndexSet {
+    type Item = &'a usize;
+    type IntoIter = core::slice::Iter<'a, usize>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.iter()
+    }
+}
+
 #[derive(Debug)]
 pub struct Owner {
     id: LogicalOwnerId,
@@ -819,15 +945,15 @@ pub struct Owner {
     session_by_conn: BTreeMap<ConnectionGeneration, usize>,
     slots: BoundedVec<Slot>,
     slot_by_key: BTreeMap<(SessionId, InboundPacketId), usize>,
-    slot_by_op: BTreeMap<OperationId, usize>,
+    slot_by_op: ScopedMap<OperationId, usize>,
     slot_by_deadline: BTreeMap<DeadlineToken, usize>,
-    slot_by_effect: BTreeMap<EffectId, usize>,
-    slots_by_session: BTreeMap<SessionId, BTreeSet<usize>>,
+    slot_by_effect: ScopedMap<EffectId, usize>,
+    slots_by_session: BTreeMap<SessionId, SmallIndexSet>,
     release_retry_slots: BTreeSet<usize>,
     leases: LeaseTable,
     /// The latest operations that ended; see `OwnerConfig`.
     finished: BoundedQueue<Finished>,
-    finished_by_op: BTreeMap<OperationId, (Finished, u32)>,
+    finished_by_op: ScopedMap<OperationId, (Finished, u32)>,
     /// The latest connections that were closed; see `OwnerConfig`.
     closed: BoundedQueue<ConnectionGeneration>,
     closed_set: BTreeSet<ConnectionGeneration>,
@@ -837,9 +963,16 @@ pub struct Owner {
     wills: will::State,
     lifecycle: Option<sessions::Flight>,
     lifecycle_enabled: bool,
+    inline_claim_enabled: bool,
+    non_inline_targets_by_op: ScopedMap<OperationId, alloc::vec::Vec<SessionId>>,
     message_now: Option<MessageTime>,
     release_continuation: Option<ContinuationId>,
     release_continuations_started: bool,
+    /// Last priority control attempts confirmed absent from `outbox` so
+    /// steady-state `Owner::dispatch` avoids rotating the entire outbox.
+    receipt_priority_dispatched: Option<(EffectId, DeadlineToken)>,
+    lifecycle_flight_dispatched: Option<(OperationId, DeadlineToken)>,
+    will_flight_dispatched: Option<(OperationId, DeadlineToken)>,
     /// The one box of this owner. A renewal replaces it in place.
     outbox: Outbox,
 }
@@ -952,14 +1085,14 @@ impl Owner {
             session_by_conn: BTreeMap::new(),
             slots,
             slot_by_key: BTreeMap::new(),
-            slot_by_op: BTreeMap::new(),
+            slot_by_op: ScopedMap::with_scope((id.incarnation(), id.epoch(), id.owner())),
             slot_by_deadline: BTreeMap::new(),
-            slot_by_effect: BTreeMap::new(),
+            slot_by_effect: ScopedMap::with_scope((id.epoch(), id.owner())),
             slots_by_session: BTreeMap::new(),
             release_retry_slots: BTreeSet::new(),
             leases,
             finished,
-            finished_by_op: BTreeMap::new(),
+            finished_by_op: ScopedMap::with_scope((id.incarnation(), id.epoch(), id.owner())),
             closed,
             closed_set: BTreeSet::new(),
             resolution_delay: config.resolution_delay,
@@ -968,9 +1101,18 @@ impl Owner {
             wills: will::State::new(),
             lifecycle: None,
             lifecycle_enabled: false,
+            inline_claim_enabled: false,
+            non_inline_targets_by_op: ScopedMap::with_scope((
+                id.incarnation(),
+                id.epoch(),
+                id.owner(),
+            )),
             message_now: None,
             release_continuation: None,
             release_continuations_started: false,
+            receipt_priority_dispatched: None,
+            lifecycle_flight_dispatched: None,
+            will_flight_dispatched: None,
             outbox,
         })
     }
@@ -980,6 +1122,12 @@ impl Owner {
     /// via `Input::OpenSession`.
     pub fn enable_session_lifecycle(&mut self) {
         self.lifecycle_enabled = true;
+    }
+
+    /// Enables atomic online admission + claim (`Recipe::ClaimedPublication`)
+    /// when a live publication targets a single caught-up online subscriber.
+    pub fn enable_inline_claims(&mut self) {
+        self.inline_claim_enabled = true;
     }
 
     /// The box of the owner. It is always present: a renewal replaces it
@@ -994,13 +1142,32 @@ impl Owner {
     /// Hands effects to `sink` with the receipt and lifecycle control lanes.
     /// A transport refusal preserves write order on its generation.
     pub fn dispatch(&mut self, sink: &mut dyn EffectSink) -> DispatchReport {
-        let priority = self.receipts.priority().map(|(effect, deadline)| {
-            self.outbox
-                .dispatch_receipt_controls(sink, effect, deadline)
+        if self.outbox.is_empty() {
+            return DispatchReport::default();
+        }
+        let priority = self.receipts.priority().and_then(|key| {
+            if !self.outbox.has_receipt_control() && self.receipt_priority_dispatched == Some(key) {
+                return None;
+            }
+            let report = self.outbox.dispatch_receipt_controls(sink, key.0, key.1);
+            if report.blocked.is_none() {
+                self.receipt_priority_dispatched = Some(key);
+            }
+            Some(report)
         });
         let lifecycle = if self.lifecycle_enabled {
             let flight = self.lifecycle_dispatch();
-            Some(self.outbox.dispatch_session_controls(sink, flight))
+            if !self.outbox.has_session_control()
+                && (flight.is_none() || self.lifecycle_flight_dispatched == flight)
+            {
+                None
+            } else {
+                let report = self.outbox.dispatch_session_controls(sink, flight);
+                if report.blocked.is_none() {
+                    self.lifecycle_flight_dispatched = flight;
+                }
+                Some(report)
+            }
         } else {
             None
         };
@@ -1010,7 +1177,17 @@ impl Owner {
                 .is_none_or(|control| control.blocked.is_none())
             {
                 let flight = self.will_dispatch();
-                Some(self.outbox.dispatch_will_controls(sink, flight))
+                if !self.outbox.has_will_control()
+                    && (flight.is_none() || self.will_flight_dispatched == flight)
+                {
+                    None
+                } else {
+                    let report = self.outbox.dispatch_will_controls(sink, flight);
+                    if report.blocked.is_none() {
+                        self.will_flight_dispatched = flight;
+                    }
+                    Some(report)
+                }
             } else {
                 None
             }
@@ -1068,7 +1245,11 @@ impl Owner {
             .map_err(|refusal| match refusal {
                 ReplaceRefusal::Retire(reason) => RenewRefused::Retire(reason),
                 ReplaceRefusal::Create(reason) => RenewRefused::Create(reason),
-            })
+            })?;
+        self.receipt_priority_dispatched = None;
+        self.lifecycle_flight_dispatched = None;
+        self.will_flight_dispatched = None;
+        Ok(())
     }
 
     /// The owner.
@@ -1530,6 +1711,8 @@ impl Owner {
             receipt_issued: None,
             receipt_consumed: None,
             released: None,
+            inline_outcome: None,
+            non_inline_resolved: None,
         };
         let planned = self
             .revision
@@ -1579,6 +1762,8 @@ impl Owner {
                     receipt_issued: draft.receipt_issued,
                     receipt_consumed: draft.receipt_consumed,
                     released: draft.released,
+                    inline_outcome: draft.inline_outcome,
+                    non_inline_resolved: draft.non_inline_resolved,
                 })
             }
             Err(stop) => Err(Refusal {
@@ -2318,6 +2503,8 @@ impl Owner {
             },
             targets: list,
         };
+        let mut inline_claim_plan: Option<alloc::boxed::Box<InlineClaimPlan>> = None;
+        let mut dirty_targets = alloc::vec::Vec::new();
         let recipe = if *retain || expiry.is_some() {
             let retain_targets = if *retain {
                 let mut iter = selected.iter();
@@ -2340,9 +2527,40 @@ impl Owner {
             } else {
                 Recipe::RetainedPublication(retained)
             }
+        } else if selected.len() == 1
+            && let Some(only) = selected.iter().next().copied()
+            && let Some((target_gen, out_packet_id)) = self.plan_inline_claim(only, length)
+        {
+            inline_claim_plan = Some(alloc::boxed::Box::new(InlineClaimPlan {
+                delivery: DeliveryId {
+                    publication,
+                    index: 0,
+                },
+                target: only.session,
+                target_revision: only.revision,
+                qos: only.qos,
+                packet_id: out_packet_id,
+                generation: target_gen,
+                topic: topic.clone(),
+                payload: payload.clone(),
+                properties: properties.clone(),
+            }));
+            Recipe::ClaimedPublication(ClaimedPublication {
+                admission,
+                claim: InlineClaim {
+                    target_index: 0,
+                    packet_id: out_packet_id,
+                },
+            })
         } else {
             Recipe::AdmitPublication(admission)
         };
+        if self.inline_claim_enabled && inline_claim_plan.is_none() && targets > 0 {
+            dirty_targets.reserve(targets);
+            for target in selected.iter() {
+                dirty_targets.push(target.session);
+            }
+        }
         let recipe = if let Some(props) = properties {
             Recipe::AnnotatedPublication(crate::contract::command::AnnotatedPublication {
                 inner: alloc::boxed::Box::new(recipe),
@@ -2362,6 +2580,8 @@ impl Owner {
             unmatched: targets == 0,
             cost,
             in_flight,
+            inline_claim: inline_claim_plan,
+            dirty_targets,
         })
     }
 
@@ -2717,39 +2937,47 @@ impl Owner {
                 // The owner publishes what depends on the commit in this
                 // transition: the command is consumed.
                 let finished = finished(CommandPhase::Consumed, Some(facts));
-                if slot.retired {
-                    return Ok(Change::End {
+                let change = if slot.retired {
+                    Change::End {
                         slot: index,
                         finished,
-                    });
-                }
-                if admission {
+                    }
+                } else if admission {
                     if slot.qos == Qos::AtLeastOnce {
-                        return self.plan_puback(index, finished, slot.puback_reason(), draft);
+                        self.plan_puback(index, finished, slot.puback_reason(), draft)?
+                    } else {
+                        // PUBREC becomes eligible here and nowhere earlier.
+                        let frame = OutboundFrame::Pubrec { packet_id, reason };
+                        if self.must_wait(slot) {
+                            Change::Hold {
+                                slot: index,
+                                admission: Some(finished),
+                                frame,
+                                resent: false,
+                                publish_origin: None,
+                            }
+                        } else {
+                            self.plan_answer(slot, frame, draft)?;
+                            Change::Committed {
+                                slot: index,
+                                admission: finished,
+                            }
+                        }
                     }
-                    // PUBREC becomes eligible here and nowhere earlier.
-                    let frame = OutboundFrame::Pubrec { packet_id, reason };
-                    if self.must_wait(slot) {
-                        return Ok(Change::Hold {
-                            slot: index,
-                            admission: Some(finished),
-                            frame,
-                            resent: false,
-                            publish_origin: None,
-                        });
-                    }
-                    self.plan_answer(slot, frame, draft)?;
-                    Ok(Change::Committed {
-                        slot: index,
-                        admission: finished,
-                    })
                 } else {
                     self.plan_answer(slot, OutboundFrame::Pubcomp { packet_id, reason }, draft)?;
-                    Ok(Change::End {
+                    Change::End {
                         slot: index,
                         finished,
-                    })
+                    }
+                };
+                if admission {
+                    draft.inline_outcome = self.plan_inline_claim_result(operation, true, draft)?;
+                    if !self.non_inline_targets_by_op.is_empty() {
+                        draft.non_inline_resolved = Some((operation, true));
+                    }
                 }
+                Ok(change)
             }
             (
                 Verdict::Transition(CommandPhase::RejectedCertain),
@@ -2757,6 +2985,13 @@ impl Owner {
             ) => {
                 draft.receipt_consumed = Some(operation);
                 let finished = finished(CommandPhase::RejectedCertain, None);
+                if admission {
+                    draft.inline_outcome =
+                        self.plan_inline_claim_result(operation, false, draft)?;
+                    if !self.non_inline_targets_by_op.is_empty() {
+                        draft.non_inline_resolved = Some((operation, false));
+                    }
+                }
                 if slot.retired {
                     return Ok(Change::End {
                         slot: index,
@@ -3163,6 +3398,8 @@ impl Owner {
             receipt_issued,
             receipt_consumed,
             released,
+            inline_outcome,
+            non_inline_resolved,
             ..
         } = plan;
         let reserved = match reservation {
@@ -3205,6 +3442,24 @@ impl Owner {
             self.apply_release(released)?;
         }
         self.apply_change(change, input)?;
+        if let Some(outcome) = inline_outcome {
+            self.apply_inline_claim_outcome(outcome)?;
+        }
+        if let Some((operation, committed)) = non_inline_resolved
+            && let Some(targets) = self.non_inline_targets_by_op.remove(&operation)
+        {
+            for target in targets {
+                if let Some(count) = self.pubsub.non_inline_by_session.get_mut(&target) {
+                    *count = count.saturating_sub(1);
+                    if *count == 0 {
+                        self.pubsub.non_inline_by_session.remove(&target);
+                    }
+                }
+                if committed {
+                    self.mark_session_dirty(target, true);
+                }
+            }
+        }
         if after && let Some(released) = released {
             self.apply_release(released)?;
         }
@@ -3284,9 +3539,12 @@ impl Owner {
                 unmatched,
                 cost,
                 in_flight,
+                inline_claim,
+                dirty_targets,
             } => {
                 // The plan checked the account and the table.
                 let lease = self.leases.reserve(cost).map_err(|_| STALE)?;
+                let op = in_flight.operation;
                 let slot = Slot {
                     session,
                     packet_id,
@@ -3302,6 +3560,15 @@ impl Owner {
                     retired: false,
                 };
                 self.push_slot(slot)?;
+                if let Some(plan) = inline_claim {
+                    self.apply_inline_claim_insert(op, *plan)?;
+                } else if !dirty_targets.is_empty() {
+                    for &target in &dirty_targets {
+                        *self.pubsub.non_inline_by_session.entry(target).or_insert(0) += 1;
+                        self.mark_session_dirty(target, false);
+                    }
+                    self.non_inline_targets_by_op.insert(op, dirty_targets);
+                }
             }
             Change::Committed { slot, admission } => {
                 if !matches!(
@@ -4143,6 +4410,13 @@ mod tests {
                     CommitFacts::PublicationAdmitted {
                         publication: admit.publication,
                         exchange: admit.source.exchange,
+                    }
+                }
+                Recipe::ClaimedPublication(claimed) => {
+                    assert!(command.payload.is_some());
+                    CommitFacts::PublicationAdmitted {
+                        publication: claimed.admission.publication,
+                        exchange: claimed.admission.source.exchange,
                     }
                 }
                 Recipe::ReleaseInbound(release) => {

@@ -361,6 +361,7 @@ struct Runtime<'a> {
     peers: BTreeMap<ConnectionGeneration, Peer>,
     retiring: Vec<net::Connection>,
     sessions: BTreeMap<Vec<u8>, Session>,
+    session_ids: BTreeSet<SessionId>,
     session_requests: BTreeMap<u64, PendingSession>,
     will_connects: BTreeMap<ConnectionGeneration, PendingWillConnect>,
     will_reads: Option<EffectId>,
@@ -1340,7 +1341,7 @@ impl Runtime<'_> {
                 {
                     return Err(Failure::plain("session_cache_budget"));
                 }
-                self.sessions.insert(
+                if let Some(replaced) = self.sessions.insert(
                     client_id.as_slice().to_vec(),
                     Session {
                         id: session,
@@ -1351,7 +1352,10 @@ impl Runtime<'_> {
                         opened_by: Some(changed_by),
                         detached: None,
                     },
-                );
+                ) {
+                    self.session_ids.remove(&replaced.id);
+                }
+                self.session_ids.insert(session);
                 if let Some(generation) = connection {
                     let close_intent = self
                         .session_requests
@@ -1573,6 +1577,7 @@ impl Runtime<'_> {
             .retain(|i| !matches!(i, Input::ExpireSession {guard,..} if guard.session == retired));
         self.session_cardinality_dirty = true;
         self.sessions.retain(|_, cached| cached.id != retired);
+        self.session_ids.remove(&retired);
         if self.pending_work_set.remove(&retired) {
             self.pending_work.retain(|s| *s != retired);
         }
@@ -1630,6 +1635,8 @@ impl Runtime<'_> {
             + self.deferred_retries)
             .min(self.limits.drain_steps);
         let mut steps_taken = 0usize;
+        let mut outbox_len_at_dispatch = self.owner.outbox().map_or(0, |b| b.len());
+        let mut dispatch_blocked = false;
         while steps_taken < step_budget {
             steps_taken += 1;
             // A wake serves the oldest packet that waits, ahead of
@@ -2250,16 +2257,22 @@ impl Runtime<'_> {
                     self.timers_dirty = true;
                 }
             }
+            if applied && (returns_credit || wakes_business) {
+                dispatch_blocked = false;
+            }
             let inputs_before_dispatch = self.inputs.len();
             let must_dispatch = !applied
                 || !fast_batch_step
                 || cfg!(feature = "test-hooks")
-                || self
-                    .owner
-                    .outbox()
-                    .is_some_and(|box_| box_.len() >= 32 || box_.free_slots() < 16);
+                || self.owner.outbox().is_some_and(|box_| {
+                    box_.free_slots() < 16
+                        || (!dispatch_blocked
+                            && box_.len().saturating_sub(outbox_len_at_dispatch) >= 32)
+                });
             if must_dispatch {
-                self.dispatch()?;
+                let accepted = self.dispatch_returning_accepted()?;
+                outbox_len_at_dispatch = self.owner.outbox().map_or(0, |b| b.len());
+                dispatch_blocked = accepted == 0 && outbox_len_at_dispatch > 0;
             }
             if applied
                 && let Some(operation) = lifecycle_result
@@ -2405,9 +2418,14 @@ impl Runtime<'_> {
     }
 
     fn dispatch(&mut self) -> Result<(), Failure> {
+        let _ = self.dispatch_returning_accepted()?;
+        Ok(())
+    }
+
+    fn dispatch_returning_accepted(&mut self) -> Result<usize, Failure> {
         #[cfg(not(feature = "test-hooks"))]
         if self.owner.outbox().is_some_and(|box_| box_.is_empty()) {
-            return Ok(());
+            return Ok(0);
         }
         if self.timers_dirty && self.timers.len() >= self.limits.timers.saturating_sub(16) {
             self.timers_dirty = false;
@@ -2494,7 +2512,7 @@ impl Runtime<'_> {
         }
         self.session_cardinality_dirty = true;
         self.emit_session_cardinality()?;
-        Ok(())
+        Ok(report.accepted)
     }
     fn apply_control_response(&mut self, response: ControlResponse) -> Result<(), Failure> {
         match response {
@@ -2793,7 +2811,7 @@ impl Runtime<'_> {
                     }
                     let page = result.map_err(|e| Failure::read(e, ReadPhase::Work))?;
                     self.session_cardinality_dirty = true;
-                    if !self.sessions.values().any(|cached| cached.id == session) {
+                    if !self.session_ids.contains(&session) {
                         self.events.emit("work_page_ignored", json!({"details":{"session":session.get().to_string(),"effect":effect_text(effect),"code":"retired_session"}})).map_err(event_failure)?;
                         continue;
                     }
@@ -2868,6 +2886,18 @@ impl Runtime<'_> {
                     )),
                 ..
             } => Some((*target, false)),
+            Input::StoreResult {
+                operation,
+                reply:
+                    StoreReply::Outcome(
+                        StoreOutcome::Committed(CommitFacts::PublicationAdmitted { .. })
+                        | StoreOutcome::RejectedCertain(_),
+                    ),
+                ..
+            } => self
+                .owner
+                .inline_claim_target(*operation)
+                .map(|target| (target, false)),
             Input::StoreResult {
                 reply:
                     StoreReply::Outcome(StoreOutcome::Committed(CommitFacts::SubscriptionsChanged {
@@ -4391,7 +4421,7 @@ impl Runtime<'_> {
                 }
                 let page = result.map_err(|e| Failure::read(e, ReadPhase::Work))?;
                 self.session_cardinality_dirty = true;
-                if !self.sessions.values().any(|cached| cached.id == session) {
+                if !self.session_ids.contains(&session) {
                     self.events.emit("work_page_ignored", json!({"details":{"session":session.get().to_string(),"effect":effect_text(effect),"code":"retired_session"}})).map_err(event_failure)?;
                     continue;
                 }
@@ -6050,7 +6080,7 @@ fn run_inner(
         )
         .map_err(|_| Failure::plain("outbox_creation"))?;
     let max_exchanges = (limits.connections * crate::receiving::MAXIMUM).max(128);
-    let owner = Owner::new(
+    let mut owner = Owner::new(
         OwnerConfig {
             max_sessions: nz(crate::writer::SESSIONS as u32),
             max_routes: nz(mqttiumd_contract::pubsub::MAX_SUBSCRIPTIONS as u32),
@@ -6064,6 +6094,13 @@ fn run_inner(
         outbox,
     )
     .map_err(|_| Failure::plain("owner_creation"))?;
+    #[cfg(feature = "test-hooks")]
+    let enable_inline_claims = hooks.directory.is_none();
+    #[cfg(not(feature = "test-hooks"))]
+    let enable_inline_claims = true;
+    if enable_inline_claims {
+        owner.enable_inline_claims();
+    }
     // The worker handle stays in outer run for cleanup even if recovery fails.
     let expiry_timers = boot
         .sessions
@@ -6111,6 +6148,7 @@ fn run_inner(
         events: events.clone(),
         peers: BTreeMap::new(),
         retiring: Vec::new(),
+        session_ids: boot.sessions.values().map(|s| s.id).collect(),
         sessions: boot.sessions,
         session_requests: BTreeMap::new(),
         will_connects: BTreeMap::new(),
