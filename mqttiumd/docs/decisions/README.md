@@ -69,6 +69,8 @@ its source; a test fails when the register and the records drift apart.
 | [0052](0052-volatile-store-and-periodic-snapshot.md) | Proposed | Indexed zero-clone `VolatileStore` (`mqttiumd-store-volatile`) with optional periodic atomic Schema-14/15 SQLite snapshots and explicit `DUR-001`/`DUR-002` readiness reporting | `mqttiumd-store-volatile`, `mqttiumd-store-sqlite`, `mqttiumd` |
 | [0053](0053-publish-properties.md) | Proposed | End-to-end MQTT 5 PUBLISH application properties (`0x01`, `0x03`, `0x08`, `0x09`, ordered `0x26`), canonical recipe kind 23, SQLite/Volatile persistence, and MQTT 3.1.1 stripping | Contract, core, stores, runtime |
 | [0054](0054-mosquitto-config-subset.md) | Proposed | Native `mosquitto.conf` subset reader (`-c`/`--config`) and static checker (`check-config`) with per-directive CFG-001/002/006/SEC-005 classification | `mqttiumd` |
+| [0055](0055-logstore-append-only-wal.md) | Proposed | Append-only sequential `.mlog` durable WAL store (`LogStore`, `--storage-mode log`) with Slice-by-8 CRC32C, torn-tail truncation, fail-closed corruption detection, and automatic Schema-14/15 compaction | `mqttiumd-store-volatile`, `mqttiumd-store-sqlite`, `mqttiumd` |
+| [0056](0056-claimed-publication-and-core-optimizations.md) | Proposed | Atomic online admission+claim (`Recipe::ClaimedPublication`, kind 24), `ScopedMap` prefix stripping, Redis-compact runtime/core tables, O(1) `Outbox` control counters, and hash-indexed exact `RouteIndex` | Contract, core, stores, runtime |
 
 What each record leaves open is tracked in
 [`../reception/open-conditions.md`](../reception/open-conditions.md).
