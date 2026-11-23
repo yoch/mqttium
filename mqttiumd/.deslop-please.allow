@@ -24,13 +24,12 @@
 #   of the backend reads the durable state beside the adapter, unrecorded and
 #   unfaulted, by design. Every other use goes through the adapter.
 #
-# The other entries are fixed lot by lot. After lot 1 (lab): 78 entries.
+# The other entries are fixed lot by lot. After lot 1 (lab): 78 entries;
+# after lot 2 (contract): 75.
 module-cycle mqttiumd::codec,mqttiumd::net,mqttiumd::security
-module-cycle mqttiumd_contract::command,mqttiumd_contract::message_expiry,mqttiumd_contract::outcome,mqttiumd_contract::packet,mqttiumd_contract::properties,mqttiumd_contract::pubsub,mqttiumd_contract::retained,mqttiumd_contract::session,mqttiumd_contract::will
 module-cycle mqttiumd_core::owner::pubsub,mqttiumd_core::owner::receipts,mqttiumd_core::owner::routing,mqttiumd_core::owner::sessions,mqttiumd_core::owner::will
 module-cycle mqttiumd_store_sqlite::message_expiry,mqttiumd_store_sqlite::pubsub,mqttiumd_store_sqlite::receipts,mqttiumd_store_sqlite::retained
 module-cycle mqttiumd_store_sqlite::reader,mqttiumd_store_sqlite::sessions,mqttiumd_store_sqlite::will
-tangle mqttiumd_contract::command::AnnotatedPublication,mqttiumd_contract::command::Recipe,mqttiumd_contract::message_expiry::ExpiringPublication,mqttiumd_contract::message_expiry::TimedReplaySubscriptions,mqttiumd_contract::retained::check,mqttiumd_contract::retained::decode,mqttiumd_contract::retained::encode
 tangle mqttiumd_store_sqlite::sessions::stage,mqttiumd_store_sqlite::will::end,mqttiumd_store_sqlite::will::open
 tangle mqttiumd_store_volatile::VolatileStore,mqttiumd_store_volatile::read::FactRef,mqttiumd_store_volatile::read::build_snapshot,mqttiumd_store_volatile::read::check_delivery_metadata,mqttiumd_store_volatile::read::check_inventory_bound,mqttiumd_store_volatile::read::check_message_candidate,mqttiumd_store_volatile::read::check_message_observation,mqttiumd_store_volatile::read::delivery_claim,mqttiumd_store_volatile::read::inventory,mqttiumd_store_volatile::read::recover_page,mqttiumd_store_volatile::read::validate_retained,mqttiumd_store_volatile::read::validate_wills,mqttiumd_store_volatile::read::will_page,mqttiumd_store_volatile::read::work_page
 field-leak mqttiumd::net::reactor::Shared::dead
@@ -87,7 +86,6 @@ wide-directory crates/mqttiumd-contract/src/
 wide-directory crates/mqttiumd-lab/src/bench/
 wide-directory crates/mqttiumd-lab/tests/
 wide-directory crates/mqttiumd-store-sqlite/tests/
-long-file crates/mqttiumd-contract/src/command.rs
 long-file crates/mqttiumd-contract/src/effects.rs
 long-file crates/mqttiumd-contract/src/opening.rs
 long-file crates/mqttiumd-core/src/owner.rs

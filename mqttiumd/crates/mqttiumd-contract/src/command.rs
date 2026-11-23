@@ -52,132 +52,29 @@ use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
-use crate::capacity::{BoundedVec, ExchangeSlots, PayloadBytes, ReceiptSlots, References};
+use crate::canonical::{
+    KIND_ADMIT_PUBLICATION, KIND_ANNOTATED_PUBLICATION, KIND_CHANGE_SUBSCRIPTIONS,
+    KIND_CLAIM_DELIVERY, KIND_CLAIMED_PUBLICATION, KIND_CONSUME_DELIVERY, KIND_FINISH_DELIVERY,
+    KIND_RELEASE_INBOUND, KIND_SUBSCRIPTION_OPTIONS, KIND_UPDATE_SUBSCRIPTIONS, MAGIC, Reader,
+    put_exchange_generation,
+};
+pub use crate::canonical::{RECIPE_FORMAT, RecipeError};
+use crate::capacity::BoundedVec;
 use crate::ids::{
     DeliveryId, ExchangeGeneration, ExchangeId, InboundPacketId, OperationId, OutboundPacketId,
-    PayloadId, PublicationId, RequestId, Revision, SessionId,
+    PublicationId, Revision, SessionId,
 };
+use crate::message::{Qos, SharedBytes};
 pub use crate::message_expiry::{
     ExpireDelivery, ExpiringAdmission, ExpiringPublication, MarkDeliveryStarted,
     TimedReplaySubscriptions,
 };
-use crate::packet::{Qos, SharedBytes};
+pub use crate::publication::{AdmitPublication, Costs, PayloadRef, Source, Target};
+pub use crate::pubsub::{
+    ChangeSubscriptions, ClaimDelivery, ConsumeDelivery, DeliveryCause, FinishDelivery,
+    UpdateSubscriptions,
+};
 use crate::pubsub::{GrantedSubscriptionChange, MAX_FILTERS, SubscriptionChange};
-
-const MAGIC: &[u8; 4] = b"MQDR";
-
-/// The only recipe format of contract revision 1.
-pub const RECIPE_FORMAT: u16 = 1;
-
-const KIND_ADMIT_PUBLICATION: u8 = 1;
-const KIND_RELEASE_INBOUND: u8 = 2;
-const KIND_CHANGE_SUBSCRIPTIONS: u8 = 3;
-const KIND_CLAIM_DELIVERY: u8 = 4;
-const KIND_FINISH_DELIVERY: u8 = 5;
-const KIND_CONSUME_DELIVERY: u8 = 6;
-const KIND_UPDATE_SUBSCRIPTIONS: u8 = 7;
-const KIND_SUBSCRIPTION_OPTIONS: u8 = 9;
-const KIND_ANNOTATED_PUBLICATION: u8 = 23;
-const KIND_CLAIMED_PUBLICATION: u8 = 24;
-
-/// Why an obligation exists. The cause stays inspectable by the oracle.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum DeliveryCause {
-    /// A live publication selected the committed routing cut. The historical
-    /// name and byte value also cover aggregated hierarchical subscriptions.
-    LiveExact = 1,
-    RetainedReplay = 2,
-}
-
-/// The inbound exchange a publication came from.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct Source {
-    pub session: SessionId,
-    pub session_revision: Revision,
-    pub packet_id: InboundPacketId,
-    pub exchange: ExchangeId,
-}
-
-/// A durable immutable payload object and its length.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct PayloadRef {
-    pub id: PayloadId,
-    pub length: PayloadBytes,
-}
-
-/// One destination of an admission. The target is a `SessionId`, never a
-/// ClientID: a recreated session is a different target.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct Target {
-    pub session: SessionId,
-    pub session_revision: Revision,
-    pub delivery: DeliveryId,
-    pub effective_qos: Qos,
-    pub cause: DeliveryCause,
-}
-
-/// Durable costs charged by an admission, checked and committed with it.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct Costs {
-    pub payload_bytes: PayloadBytes,
-    pub references: References,
-    pub exchange_slots: ExchangeSlots,
-    pub receipt_slots: ReceiptSlots,
-}
-
-/// Commits publication, payload, obligations, inbound QoS 2 state, accounts
-/// and receipt together, or nothing.
-///
-/// Equality is the equality of recipes, not of their storage: two
-/// admissions are equal exactly when their canonical bytes are equal. The
-/// bound of the container that holds the targets is not part of the
-/// recipe and takes no part in the comparison.
-#[derive(Debug)]
-pub struct AdmitPublication {
-    pub operation: OperationId,
-    pub request: RequestId,
-    pub publication: PublicationId,
-    pub source: Source,
-    pub route_revision: Revision,
-    pub qos: Qos,
-    pub retain: bool,
-    pub topic: SharedBytes,
-    pub payload: PayloadRef,
-    pub costs: Costs,
-    pub targets: BoundedVec<Target>,
-}
-
-impl PartialEq for AdmitPublication {
-    fn eq(&self, other: &Self) -> bool {
-        // Destructured so that a new field cannot be left out silently.
-        let Self {
-            operation,
-            request,
-            publication,
-            source,
-            route_revision,
-            qos,
-            retain,
-            topic,
-            payload,
-            costs,
-            targets,
-        } = self;
-        *operation == other.operation
-            && *request == other.request
-            && *publication == other.publication
-            && *source == other.source
-            && *route_revision == other.route_revision
-            && *qos == other.qos
-            && *retain == other.retain
-            && *topic == other.topic
-            && *payload == other.payload
-            && *costs == other.costs
-            && targets.as_slice() == other.targets.as_slice()
-    }
-}
-
-impl Eq for AdmitPublication {}
 
 /// Durably terminates an inbound QoS 2 exchange after PUBREL, before PUBCOMP
 /// becomes eligible. It never creates a distribution.
@@ -188,83 +85,6 @@ pub struct ReleaseInbound {
     pub packet_id: InboundPacketId,
     pub exchange: ExchangeId,
 }
-
-#[derive(Debug)]
-pub struct ChangeSubscriptions {
-    pub operation: OperationId,
-    pub session: SessionId,
-    pub session_revision: Revision,
-    pub route_revision: Revision,
-    pub changes: BoundedVec<SubscriptionChange>,
-}
-impl PartialEq for ChangeSubscriptions {
-    fn eq(&self, other: &Self) -> bool {
-        let Self {
-            operation,
-            session,
-            session_revision,
-            route_revision,
-            changes,
-        } = self;
-        *operation == other.operation
-            && *session == other.session
-            && *session_revision == other.session_revision
-            && *route_revision == other.route_revision
-            && changes.as_slice() == other.changes.as_slice()
-    }
-}
-impl Eq for ChangeSubscriptions {}
-
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct ClaimDelivery {
-    pub operation: OperationId,
-    pub delivery: DeliveryId,
-    pub target: SessionId,
-    pub target_revision: Revision,
-    pub packet_id: OutboundPacketId,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct FinishDelivery {
-    pub operation: OperationId,
-    pub delivery: DeliveryId,
-    pub target: SessionId,
-    pub target_revision: Revision,
-    pub packet_id: OutboundPacketId,
-    pub claim: OperationId,
-}
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct ConsumeDelivery {
-    pub operation: OperationId,
-    pub delivery: DeliveryId,
-    pub target: SessionId,
-    pub target_revision: Revision,
-}
-#[derive(Debug)]
-pub struct UpdateSubscriptions {
-    pub operation: OperationId,
-    pub session: SessionId,
-    pub session_revision: Revision,
-    pub route_revision: Revision,
-    pub changes: BoundedVec<GrantedSubscriptionChange>,
-}
-impl PartialEq for UpdateSubscriptions {
-    fn eq(&self, other: &Self) -> bool {
-        let Self {
-            operation,
-            session,
-            session_revision,
-            route_revision,
-            changes,
-        } = self;
-        *operation == other.operation
-            && *session == other.session
-            && *session_revision == other.session_revision
-            && *route_revision == other.route_revision
-            && changes.as_slice() == other.changes.as_slice()
-    }
-}
-impl Eq for UpdateSubscriptions {}
 
 /// Inline claim of one QoS 1/2 target created atomically by an admission.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -404,37 +224,6 @@ pub enum Recipe {
     UpdateSubscriptions(UpdateSubscriptions),
 }
 
-/// A recipe is not well formed, or cannot be decoded.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum RecipeError {
-    /// The bytes end before the layout does.
-    Truncated,
-    /// Bytes remain after the layout ends.
-    TrailingBytes,
-    /// The first four bytes are not the recipe magic.
-    BadMagic,
-    /// The format number is not one this revision reads.
-    UnknownFormat(u16),
-    /// The kind tag is not in the closed set.
-    UnknownKind(u8),
-    /// A field holds a value outside its closed domain.
-    InvalidField(&'static str),
-    /// More targets than the profile admits.
-    TooManyTargets { count: usize, max: usize },
-    /// The topic does not fit its two-byte length.
-    TopicTooLong(usize),
-    /// A delivery does not belong to the recipe's publication.
-    ForeignDelivery,
-    /// The source exchange does not belong to the source session.
-    ForeignExchange,
-    /// Storage for the decoded recipe could not be allocated.
-    AllocationFailed,
-}
-
-fn put_exchange_generation(out: &mut Vec<u8>, exchange: ExchangeId) {
-    out.extend_from_slice(&exchange.generation.to_be_bytes());
-}
-
 fn encode_delivery(
     out: &mut Vec<u8>,
     operation: OperationId,
@@ -543,9 +332,9 @@ impl Recipe {
             Self::TimedReplaySubscriptions(value) => value.check(),
             Self::MarkDeliveryStarted(_) => Ok(()),
             Self::ExpireDelivery(value) => value.check(),
-            Self::RetainedPublication(_) | Self::RetainedQos0(_) | Self::ReplaySubscriptions(_) => {
-                crate::retained::check(self)
-            }
+            Self::RetainedPublication(value) => value.check_retained(),
+            Self::RetainedQos0(value) => value.check_retained(),
+            Self::ReplaySubscriptions(value) => value.check_retained(),
             Self::SessionLifecycle(change) => change.check(),
             Self::UpdateSubscriptions(change) => change.check_retained(),
             Self::ChangeSubscriptions(change) => {
@@ -621,9 +410,9 @@ impl Recipe {
                 value.expiry.encode(out);
                 value.observed.encode(out);
             }
-            Self::RetainedPublication(_) | Self::RetainedQos0(_) | Self::ReplaySubscriptions(_) => {
-                crate::retained::encode(self, out)?
-            }
+            Self::RetainedPublication(value) => value.encode_retained(out)?,
+            Self::ReplaySubscriptions(value) => value.encode_retained(out)?,
+            Self::RetainedQos0(value) => value.encode_retained(out)?,
             Self::SessionLifecycle(change) => {
                 out.push(8);
                 change.encode(out);
@@ -702,6 +491,111 @@ impl Recipe {
         Ok(())
     }
 
+    /// Kind 13: a publication (kind 1, 10, 11, 20 or 21, nested) with its
+    /// message expiry.
+    fn decode_expiring(
+        reader: &mut Reader<'_>,
+        max_targets: usize,
+        max_topic: usize,
+    ) -> Result<ExpiringPublication, RecipeError> {
+        let nested = crate::message_expiry::read_nested(reader, &[1, 10, 11, 20, 21])?;
+        // No temporal extension can appear within a temporal wrapper. Existing
+        // tag 10 retains its single legacy tag-1 envelope.
+        let admission = match Recipe::decode_canonical(nested, max_targets, max_topic)? {
+            Recipe::AdmitPublication(admission) if !admission.retain => {
+                ExpiringAdmission::Qos12(crate::retained::RetainedPublication {
+                    admission,
+                    retain_targets: crate::retained::RetainMask::EMPTY,
+                })
+            }
+            Recipe::RetainedPublication(value) => ExpiringAdmission::Qos12(value),
+            Recipe::RetainedQos0(value) => ExpiringAdmission::Qos0(value),
+            _ => return Err(RecipeError::InvalidField("message_expiry_nested_kind")),
+        };
+        let value = ExpiringPublication {
+            admission,
+            expiry: crate::message_time::MessageExpiry::decode(reader)?,
+        };
+        value.check()?;
+        Ok(value)
+    }
+
+    /// Kinds 10, 12 and 20: a legacy recipe (kind 1, 7 or 9), nested once,
+    /// with what makes it retained.
+    fn decode_retained_nested(
+        kind: u8,
+        bytes: &mut &[u8],
+        max_targets: usize,
+        max_topic: usize,
+    ) -> Result<Self, RecipeError> {
+        use crate::retained::{
+            LEGACY_MAX_TARGETS, ReplaySubscriptions, RetainMask, RetainedPublication,
+        };
+        let mut r = Reader { bytes };
+        let recipe = {
+            let len = r.u32()? as usize;
+            let nested = r.take(len)?;
+            // Reject nested extensions before decoding: depth is exactly one.
+            if nested.len() < 7
+                || (matches!(kind, 10 | 20) && nested[6] != 1)
+                || (kind == 12 && !matches!(nested[6], 7 | 9))
+            {
+                return Err(RecipeError::InvalidField("retained_nested_kind"));
+            }
+            match Recipe::decode_canonical(nested, max_targets, max_topic)? {
+                Recipe::AdmitPublication(admission) if kind == 10 => {
+                    if admission.targets.len() > LEGACY_MAX_TARGETS {
+                        return Err(RecipeError::InvalidField("retain_targets"));
+                    }
+                    Recipe::RetainedPublication(RetainedPublication {
+                        admission,
+                        retain_targets: RetainMask::from_u16(r.u16()?),
+                    })
+                }
+                Recipe::AdmitPublication(admission) if kind == 20 => {
+                    if admission.targets.len() <= LEGACY_MAX_TARGETS {
+                        return Err(RecipeError::InvalidField("noncanonical_wide_targets"));
+                    }
+                    let retain_targets =
+                        RetainMask::decode_wide(&mut r, admission.targets.len(), "retain_targets")?;
+                    Recipe::RetainedPublication(RetainedPublication {
+                        admission,
+                        retain_targets,
+                    })
+                }
+                Recipe::UpdateSubscriptions(update) if kind == 12 => {
+                    Recipe::ReplaySubscriptions(ReplaySubscriptions {
+                        update,
+                        first_publication: PublicationId::from_be_slice(r.take(32)?)
+                            .map_err(|_| RecipeError::Truncated)?,
+                    })
+                }
+                _ => return Err(RecipeError::InvalidField("retained_nested_kind")),
+            }
+        };
+        *bytes = r.bytes;
+        Ok(recipe)
+    }
+
+    /// Kind 14: a replay of retained messages (kind 12, nested) with the
+    /// time it was observed.
+    fn decode_timed_replay(
+        reader: &mut Reader<'_>,
+        max_targets: usize,
+        max_topic: usize,
+    ) -> Result<TimedReplaySubscriptions, RecipeError> {
+        let nested = crate::message_expiry::read_nested(reader, &[12])?;
+        let Recipe::ReplaySubscriptions(replay) =
+            Recipe::decode_canonical(nested, max_targets, max_topic)?
+        else {
+            return Err(RecipeError::InvalidField("message_expiry_nested_kind"));
+        };
+        Ok(TimedReplaySubscriptions {
+            replay,
+            observed: crate::message_time::MessageTime::decode(reader)?,
+        })
+    }
+
     /// Decodes a canonical representation, refusing anything that is not the
     /// unique encoding of a well-formed recipe with at most `max_targets`
     /// targets and a topic of at most `max_topic_len` bytes.
@@ -730,12 +624,12 @@ impl Recipe {
                 max_topic_len,
                 tag,
             )?),
-            13 => Self::ExpiringPublication(ExpiringPublication::decode(
+            13 => Self::ExpiringPublication(Self::decode_expiring(
                 &mut reader,
                 max_targets,
                 max_topic_len,
             )?),
-            14 => Self::TimedReplaySubscriptions(TimedReplaySubscriptions::decode(
+            14 => Self::TimedReplaySubscriptions(Self::decode_timed_replay(
                 &mut reader,
                 max_targets,
                 max_topic_len,
@@ -765,13 +659,19 @@ impl Recipe {
                 };
                 Self::ExpireDelivery(ExpireDelivery {
                     finish,
-                    expiry: crate::message_expiry::MessageExpiry::decode(&mut reader)?,
-                    observed: crate::message_expiry::MessageTime::decode(&mut reader)?,
+                    expiry: crate::message_time::MessageExpiry::decode(&mut reader)?,
+                    observed: crate::message_time::MessageTime::decode(&mut reader)?,
                 })
             }
-            kind @ (10..=12 | 20 | 21) => {
-                crate::retained::decode(kind, &mut reader.bytes, max_targets, max_topic_len)?
+            kind @ (10 | 12 | 20) => {
+                Self::decode_retained_nested(kind, &mut reader.bytes, max_targets, max_topic_len)?
             }
+            kind @ (11 | 21) => Self::RetainedQos0(crate::retained::RetainedQos0::decode(
+                kind,
+                &mut reader.bytes,
+                max_targets,
+                max_topic_len,
+            )?),
             8 => {
                 Self::SessionLifecycle(crate::session::SessionLifecycle::decode(&mut reader.bytes)?)
             }
@@ -950,88 +850,6 @@ impl Recipe {
         }
         recipe.check()?;
         Ok(recipe)
-    }
-}
-
-pub(crate) struct Reader<'a> {
-    pub(crate) bytes: &'a [u8],
-}
-
-impl<'a> Reader<'a> {
-    pub(crate) fn delivery(
-        &mut self,
-    ) -> Result<
-        (
-            OperationId,
-            DeliveryId,
-            SessionId,
-            Revision,
-            OutboundPacketId,
-        ),
-        RecipeError,
-    > {
-        let operation = self.operation()?;
-        let publication =
-            PublicationId::from_be_slice(self.take(32)?).map_err(|_| RecipeError::Truncated)?;
-        let delivery = DeliveryId {
-            publication,
-            index: self.u32()?,
-        };
-        let target = SessionId::new(self.u64()?);
-        let revision = Revision::new(self.u64()?);
-        let packet = OutboundPacketId::new(self.u16()?)
-            .ok_or(RecipeError::InvalidField("outbound_packet_id"))?;
-        Ok((operation, delivery, target, revision, packet))
-    }
-    pub(crate) fn take(&mut self, len: usize) -> Result<&'a [u8], RecipeError> {
-        if self.bytes.len() < len {
-            return Err(RecipeError::Truncated);
-        }
-        let (head, tail) = self.bytes.split_at(len);
-        self.bytes = tail;
-        Ok(head)
-    }
-
-    pub(crate) fn u8(&mut self) -> Result<u8, RecipeError> {
-        Ok(self.take(1)?[0])
-    }
-
-    pub(crate) fn u16(&mut self) -> Result<u16, RecipeError> {
-        let mut array = [0u8; 2];
-        array.copy_from_slice(self.take(2)?);
-        Ok(u16::from_be_bytes(array))
-    }
-
-    pub(crate) fn u32(&mut self) -> Result<u32, RecipeError> {
-        let mut array = [0u8; 4];
-        array.copy_from_slice(self.take(4)?);
-        Ok(u32::from_be_bytes(array))
-    }
-
-    pub(crate) fn u64(&mut self) -> Result<u64, RecipeError> {
-        let mut array = [0u8; 8];
-        array.copy_from_slice(self.take(8)?);
-        Ok(u64::from_be_bytes(array))
-    }
-
-    pub(crate) fn operation(&mut self) -> Result<OperationId, RecipeError> {
-        OperationId::from_be_slice(self.take(32)?).map_err(|_| RecipeError::Truncated)
-    }
-
-    pub(crate) fn packet_id(&mut self) -> Result<InboundPacketId, RecipeError> {
-        InboundPacketId::new(self.u16()?).ok_or(RecipeError::InvalidField("packet_id"))
-    }
-
-    pub(crate) fn qos(&mut self) -> Result<Qos, RecipeError> {
-        Qos::from_wire(self.u8()?).ok_or(RecipeError::InvalidField("qos"))
-    }
-
-    pub(crate) fn boolean(&mut self, field: &'static str) -> Result<bool, RecipeError> {
-        match self.u8()? {
-            0 => Ok(false),
-            1 => Ok(true),
-            _ => Err(RecipeError::InvalidField(field)),
-        }
     }
 }
 
@@ -1282,222 +1100,15 @@ pub use crate::opening::{
     OpeningRejection, OpeningTicket, StartupNonce,
 };
 
-impl AdmitPublication {
-    pub(crate) fn check_retained(&self) -> Result<(), RecipeError> {
-        if self
-            .targets
-            .as_slice()
-            .iter()
-            .any(|target| target.cause != DeliveryCause::LiveExact)
-        {
-            return Err(RecipeError::InvalidField("admission_cause"));
-        }
-        if self.source.exchange.session != self.source.session {
-            return Err(RecipeError::ForeignExchange);
-        }
-        if self.topic.len() > usize::from(u16::MAX) {
-            return Err(RecipeError::TopicTooLong(self.topic.len()));
-        }
-        if self.targets.len() > usize::from(u16::MAX) {
-            return Err(RecipeError::TooManyTargets {
-                count: self.targets.len(),
-                max: usize::from(u16::MAX),
-            });
-        }
-        if self
-            .targets
-            .as_slice()
-            .iter()
-            .any(|target| target.delivery.publication != self.publication)
-        {
-            return Err(RecipeError::ForeignDelivery);
-        }
-        Ok(())
-    }
-}
-impl AdmitPublication {
-    pub(crate) fn encode_body(&self, out: &mut Vec<u8>) {
-        out.extend_from_slice(&self.operation.to_be_bytes());
-        out.extend_from_slice(&self.request.to_be_bytes());
-        out.extend_from_slice(&self.publication.to_be_bytes());
-        out.extend_from_slice(&self.source.session.to_be_bytes());
-        out.extend_from_slice(&self.source.session_revision.to_be_bytes());
-        out.extend_from_slice(&self.source.packet_id.get().to_be_bytes());
-        put_exchange_generation(out, self.source.exchange);
-        out.extend_from_slice(&self.route_revision.to_be_bytes());
-        out.push(self.qos.to_wire());
-        out.push(u8::from(self.retain));
-        // Both lengths were bounded by `check` above.
-        out.extend_from_slice(&(self.topic.len() as u16).to_be_bytes());
-        out.extend_from_slice(self.topic.as_slice());
-        out.extend_from_slice(&self.payload.id.to_be_bytes());
-        out.extend_from_slice(&self.payload.length.get().to_be_bytes());
-        out.extend_from_slice(&self.costs.payload_bytes.get().to_be_bytes());
-        out.extend_from_slice(&self.costs.references.get().to_be_bytes());
-        out.extend_from_slice(&self.costs.exchange_slots.get().to_be_bytes());
-        out.extend_from_slice(&self.costs.receipt_slots.get().to_be_bytes());
-        out.extend_from_slice(&(self.targets.len() as u16).to_be_bytes());
-        for target in self.targets.as_slice() {
-            out.extend_from_slice(&target.session.to_be_bytes());
-            out.extend_from_slice(&target.session_revision.to_be_bytes());
-            out.extend_from_slice(&target.delivery.index.to_be_bytes());
-            out.push(target.effective_qos.to_wire());
-            out.push(target.cause as u8);
-        }
-    }
-
-    pub(crate) fn encode_retained(&self, out: &mut Vec<u8>) -> Result<(), RecipeError> {
-        out.extend_from_slice(MAGIC);
-        out.extend_from_slice(&RECIPE_FORMAT.to_be_bytes());
-        out.push(KIND_ADMIT_PUBLICATION);
-        self.encode_body(out);
-        Ok(())
-    }
-
-    fn decode_body(
-        reader: &mut Reader<'_>,
-        max_targets: usize,
-        max_topic_len: usize,
-    ) -> Result<Self, RecipeError> {
-        let operation = reader.operation()?;
-        let request =
-            RequestId::from_be_slice(reader.take(32)?).map_err(|_| RecipeError::Truncated)?;
-        let publication =
-            PublicationId::from_be_slice(reader.take(32)?).map_err(|_| RecipeError::Truncated)?;
-        let session = SessionId::new(reader.u64()?);
-        let session_revision = Revision::new(reader.u64()?);
-        let packet_id = reader.packet_id()?;
-        let exchange = ExchangeId {
-            session,
-            generation: ExchangeGeneration::new(reader.u64()?),
-        };
-        let route_revision = Revision::new(reader.u64()?);
-        let qos = reader.qos()?;
-        let retain = reader.boolean("retain")?;
-        let topic_len = usize::from(reader.u16()?);
-        if topic_len > max_topic_len {
-            return Err(RecipeError::TopicTooLong(topic_len));
-        }
-        let topic = SharedBytes::copy_from(reader.take(topic_len)?, max_topic_len)
-            .map_err(|error| RecipeError::TopicTooLong(error.len))?;
-        let payload = PayloadRef {
-            id: PayloadId::from_be_slice(reader.take(32)?).map_err(|_| RecipeError::Truncated)?,
-            length: PayloadBytes::new(reader.u64()?),
-        };
-        let costs = Costs {
-            payload_bytes: PayloadBytes::new(reader.u64()?),
-            references: References::new(reader.u64()?),
-            exchange_slots: ExchangeSlots::new(reader.u64()?),
-            receipt_slots: ReceiptSlots::new(reader.u64()?),
-        };
-        let count = usize::from(reader.u16()?);
-        if count > max_targets {
-            return Err(RecipeError::TooManyTargets {
-                count,
-                max: max_targets,
-            });
-        }
-        let mut targets =
-            BoundedVec::with_capacity(count).map_err(|_| RecipeError::AllocationFailed)?;
-        for _ in 0..count {
-            let target = Target {
-                session: SessionId::new(reader.u64()?),
-                session_revision: Revision::new(reader.u64()?),
-                delivery: DeliveryId {
-                    publication,
-                    index: reader.u32()?,
-                },
-                effective_qos: reader.qos()?,
-                cause: match reader.u8()? {
-                    1 => DeliveryCause::LiveExact,
-                    _ => return Err(RecipeError::InvalidField("cause")),
-                },
-            };
-            targets
-                .try_push(target)
-                .map_err(|_| RecipeError::AllocationFailed)?;
-        }
-        Ok(Self {
-            operation,
-            request,
-            publication,
-            source: Source {
-                session,
-                session_revision,
-                packet_id,
-                exchange,
-            },
-            route_revision,
-            qos,
-            retain,
-            topic,
-            payload,
-            costs,
-            targets,
-        })
-    }
-}
-impl UpdateSubscriptions {
-    pub(crate) fn check_retained(&self) -> Result<(), RecipeError> {
-        if self.changes.is_empty() || self.changes.len() > MAX_FILTERS {
-            return Err(RecipeError::InvalidField("subscription_count"));
-        }
-        for entry in self.changes.as_slice() {
-            if !crate::topic::valid_filter(entry.topic.as_slice()) {
-                return Err(RecipeError::InvalidField("topic_filter"));
-            }
-            if entry.granted.is_none()
-                && entry.options != crate::pubsub::SubscriptionOptions::DEFAULT
-            {
-                return Err(RecipeError::InvalidField("unsubscribe_options"));
-            }
-        }
-        Ok(())
-    }
-}
-impl UpdateSubscriptions {
-    pub(crate) fn encode_retained(&self, out: &mut Vec<u8>) -> Result<(), RecipeError> {
-        out.extend_from_slice(MAGIC);
-        out.extend_from_slice(&RECIPE_FORMAT.to_be_bytes());
-        let with_options = self
-            .changes
-            .as_slice()
-            .iter()
-            .any(|c| c.options != crate::pubsub::SubscriptionOptions::DEFAULT);
-        out.push(if with_options {
-            KIND_SUBSCRIPTION_OPTIONS
-        } else {
-            KIND_UPDATE_SUBSCRIPTIONS
-        });
-        out.extend_from_slice(&self.operation.to_be_bytes());
-        out.extend_from_slice(&self.session.to_be_bytes());
-        out.extend_from_slice(&self.session_revision.to_be_bytes());
-        out.extend_from_slice(&self.route_revision.to_be_bytes());
-        out.push(self.changes.len() as u8);
-        for entry in self.changes.as_slice() {
-            out.push(match entry.granted {
-                None => 0,
-                Some(Qos::AtMostOnce) => 1,
-                Some(Qos::AtLeastOnce) => 2,
-                Some(Qos::ExactlyOnce) => 3,
-            });
-            if with_options {
-                out.push(entry.options.bits());
-            }
-            out.extend_from_slice(&(entry.topic.len() as u16).to_be_bytes());
-            out.extend_from_slice(entry.topic.as_slice());
-        }
-        Ok(())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::capacity::{ExchangeSlots, PayloadBytes, ReceiptSlots, References};
     use crate::ids::{
         LogicalOwnerId, OperationSeq, PayloadSeq, PublicationSeq, RequestSeq, RunEpoch,
         StoreIncarnation,
     };
+    use crate::ids::{PayloadId, RequestId};
 
     fn scope() -> (StoreIncarnation, RunEpoch, LogicalOwnerId) {
         (

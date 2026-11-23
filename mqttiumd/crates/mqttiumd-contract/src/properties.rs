@@ -4,7 +4,7 @@
 //! packets: Payload Format Indicator (`0x01`), Content Type (`0x03`),
 //! Response Topic (`0x08`), Correlation Data (`0x09`), and ordered User
 //! Properties (`0x26`). Message Expiry Interval (`0x02`) remains owned by
-//! [`crate::message_expiry::MessageExpiry`] because its remaining wire value
+//! [`crate::message_time::MessageExpiry`] because its remaining wire value
 //! ages with the monotonic clock.
 //!
 //! This module lives in `mqttiumd-contract` (`no_std + alloc`, no unsafe) so
@@ -14,8 +14,8 @@
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
-use crate::command::{Reader, RecipeError};
-use crate::packet::SharedBytes;
+use crate::canonical::{Reader, RecipeError};
+use crate::message::SharedBytes;
 
 /// Maximum number of ordered User Property pairs carried by one PUBLISH.
 pub const MAX_USER_PROPERTIES: usize = 64;

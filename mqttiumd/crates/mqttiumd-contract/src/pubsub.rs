@@ -1,10 +1,14 @@
 //! Bounded subscription and outgoing QoS 1 data (ADR 0025).
-use crate::command::DeliveryCause;
+use crate::canonical::{
+    KIND_SUBSCRIPTION_OPTIONS, KIND_UPDATE_SUBSCRIPTIONS, MAGIC, RECIPE_FORMAT, RecipeError,
+};
+use crate::capacity::BoundedVec;
 use crate::ids::{
     ConnectionKey, DeliveryId, EffectId, OperationId, OutboundPacketId, Revision, SessionId,
 };
-use crate::packet::{Qos, SharedBytes, TooLarge};
+use crate::message::{Qos, SharedBytes, TooLarge};
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 
 pub const MAX_FILTERS: usize = 8;
 pub const MAX_SUBSCRIPTIONS: usize = 16_384;
@@ -193,7 +197,7 @@ pub struct WorkItem {
     pub qos: Qos,
     pub cause: DeliveryCause,
     pub retain: bool,
-    pub expiry: Option<crate::message_expiry::MessageExpiry>,
+    pub expiry: Option<crate::message_time::MessageExpiry>,
     pub properties: Option<Arc<crate::properties::PublishProperties>>,
     pub topic: SharedBytes,
     pub payload: SharedBytes,
@@ -228,5 +232,147 @@ impl SubscriptionOptions {
     #[must_use]
     pub const fn no_local(self) -> bool {
         self.0 & 4 != 0
+    }
+}
+
+/// Why an obligation exists. The cause stays inspectable by the oracle.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum DeliveryCause {
+    /// A live publication selected the committed routing cut. The historical
+    /// name and byte value also cover aggregated hierarchical subscriptions.
+    LiveExact = 1,
+    RetainedReplay = 2,
+}
+
+// The recipes of subscriptions (kinds 3, 7 and 9) and of outgoing
+// deliveries (kinds 4 to 6); `command` frames them.
+#[derive(Debug)]
+pub struct ChangeSubscriptions {
+    pub operation: OperationId,
+    pub session: SessionId,
+    pub session_revision: Revision,
+    pub route_revision: Revision,
+    pub changes: BoundedVec<SubscriptionChange>,
+}
+impl PartialEq for ChangeSubscriptions {
+    fn eq(&self, other: &Self) -> bool {
+        let Self {
+            operation,
+            session,
+            session_revision,
+            route_revision,
+            changes,
+        } = self;
+        *operation == other.operation
+            && *session == other.session
+            && *session_revision == other.session_revision
+            && *route_revision == other.route_revision
+            && changes.as_slice() == other.changes.as_slice()
+    }
+}
+impl Eq for ChangeSubscriptions {}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct ClaimDelivery {
+    pub operation: OperationId,
+    pub delivery: DeliveryId,
+    pub target: SessionId,
+    pub target_revision: Revision,
+    pub packet_id: OutboundPacketId,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct FinishDelivery {
+    pub operation: OperationId,
+    pub delivery: DeliveryId,
+    pub target: SessionId,
+    pub target_revision: Revision,
+    pub packet_id: OutboundPacketId,
+    pub claim: OperationId,
+}
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct ConsumeDelivery {
+    pub operation: OperationId,
+    pub delivery: DeliveryId,
+    pub target: SessionId,
+    pub target_revision: Revision,
+}
+#[derive(Debug)]
+pub struct UpdateSubscriptions {
+    pub operation: OperationId,
+    pub session: SessionId,
+    pub session_revision: Revision,
+    pub route_revision: Revision,
+    pub changes: BoundedVec<GrantedSubscriptionChange>,
+}
+impl PartialEq for UpdateSubscriptions {
+    fn eq(&self, other: &Self) -> bool {
+        let Self {
+            operation,
+            session,
+            session_revision,
+            route_revision,
+            changes,
+        } = self;
+        *operation == other.operation
+            && *session == other.session
+            && *session_revision == other.session_revision
+            && *route_revision == other.route_revision
+            && changes.as_slice() == other.changes.as_slice()
+    }
+}
+impl Eq for UpdateSubscriptions {}
+
+impl UpdateSubscriptions {
+    pub(crate) fn check_retained(&self) -> Result<(), RecipeError> {
+        if self.changes.is_empty() || self.changes.len() > MAX_FILTERS {
+            return Err(RecipeError::InvalidField("subscription_count"));
+        }
+        for entry in self.changes.as_slice() {
+            if !crate::topic::valid_filter(entry.topic.as_slice()) {
+                return Err(RecipeError::InvalidField("topic_filter"));
+            }
+            if entry.granted.is_none()
+                && entry.options != crate::pubsub::SubscriptionOptions::DEFAULT
+            {
+                return Err(RecipeError::InvalidField("unsubscribe_options"));
+            }
+        }
+        Ok(())
+    }
+}
+impl UpdateSubscriptions {
+    pub(crate) fn encode_retained(&self, out: &mut Vec<u8>) -> Result<(), RecipeError> {
+        out.extend_from_slice(MAGIC);
+        out.extend_from_slice(&RECIPE_FORMAT.to_be_bytes());
+        let with_options = self
+            .changes
+            .as_slice()
+            .iter()
+            .any(|c| c.options != crate::pubsub::SubscriptionOptions::DEFAULT);
+        out.push(if with_options {
+            KIND_SUBSCRIPTION_OPTIONS
+        } else {
+            KIND_UPDATE_SUBSCRIPTIONS
+        });
+        out.extend_from_slice(&self.operation.to_be_bytes());
+        out.extend_from_slice(&self.session.to_be_bytes());
+        out.extend_from_slice(&self.session_revision.to_be_bytes());
+        out.extend_from_slice(&self.route_revision.to_be_bytes());
+        out.push(self.changes.len() as u8);
+        for entry in self.changes.as_slice() {
+            out.push(match entry.granted {
+                None => 0,
+                Some(Qos::AtMostOnce) => 1,
+                Some(Qos::AtLeastOnce) => 2,
+                Some(Qos::ExactlyOnce) => 3,
+            });
+            if with_options {
+                out.push(entry.options.bits());
+            }
+            out.extend_from_slice(&(entry.topic.len() as u16).to_be_bytes());
+            out.extend_from_slice(entry.topic.as_slice());
+        }
+        Ok(())
     }
 }

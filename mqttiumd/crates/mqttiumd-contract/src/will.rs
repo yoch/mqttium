@@ -1,9 +1,11 @@
 //! Durable zero-delay QoS1 Will intentions, independent of their source session.
 //! The installing Open OperationId is the never-reused occurrence identity.
+use crate::canonical::{Reader, RecipeError};
 use crate::capacity::BoundedVec;
-use crate::command::{Costs, DeliveryCause, PayloadRef, Reader, RecipeError, Target};
 use crate::ids::{DeliveryId, OperationId, PayloadId, PublicationId, Revision, SessionId};
-use crate::packet::{Qos, SharedBytes};
+use crate::message::{Qos, SharedBytes};
+use crate::publication::{Costs, PayloadRef, Target};
+use crate::pubsub::DeliveryCause;
 use crate::retained::{LEGACY_MAX_TARGETS, MAX_RETAIN_MASK_TARGETS, RetainMask};
 use alloc::vec::Vec;
 use core::fmt;

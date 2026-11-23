@@ -6,9 +6,9 @@
 
 use alloc::vec::Vec;
 
-use crate::command::RecipeError;
+use crate::canonical::RecipeError;
 use crate::ids::{OperationId, Revision, SessionId};
-use crate::packet::SharedBytes;
+use crate::message::SharedBytes;
 
 pub const MAX_SESSION_CLIENT_BYTES: usize = 1024;
 
@@ -381,7 +381,7 @@ impl SessionLifecycle {
                     .map_err(|_| RecipeError::AllocationFailed)?;
                 let now = read_u64(bytes)?;
                 let will = if read_bool(bytes)? {
-                    let mut reader = crate::command::Reader { bytes };
+                    let mut reader = crate::canonical::Reader { bytes };
                     let value = crate::will::WillSpec::decode(&mut reader, tag == 7)?;
                     *bytes = reader.bytes;
                     Some(value)
