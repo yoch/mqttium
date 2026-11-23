@@ -883,3 +883,84 @@ fn clients_that_fill_their_announced_window_together_all_complete() {
         }
     }
 }
+
+/// MQTT 3.1.1 has no Receive Maximum: a client may have more QoS 2
+/// exchanges in flight than the broker's window of eight. The broker holds
+/// the PUBLISH it has no slot for. A slot is freed by a PUBCOMP, which
+/// needs the PUBREL of an earlier exchange, and that PUBREL is behind the
+/// held PUBLISH in the client's stream: the broker must go on reading it.
+/// Every exchange completes, and the subscriber receives each message once
+/// and in the order of publication on their one topic (MQTT 3.1.1 §4.3.3,
+/// [MQTT-4.5.0-1], [MQTT-4.6.0-5]).
+#[test]
+fn a_3_1_1_client_with_more_qos2_exchanges_than_the_window_completes_them_all() {
+    const EXCHANGES: u16 = 12;
+    let broker = Broker::start("qos2-pipeline-311");
+    let mut subscriber = Peer::connect(broker.address, "pipeline-subscriber", false);
+    let mut body = subscriber.head(1);
+    text("pipeline/#", &mut body);
+    body.push(2);
+    subscriber.stream.write_all(&packet(0x82, &body)).unwrap();
+    assert_eq!(subscriber.acknowledged(0x90, 1), [2], "QoS 2 granted");
+
+    let mut publisher = Peer::connect(broker.address, "pipeline-publisher", false);
+    let mut burst = Vec::new();
+    for id in 1..=EXCHANGES {
+        let mut body = Vec::new();
+        text("pipeline/t", &mut body);
+        body.extend_from_slice(&id.to_be_bytes());
+        body.extend_from_slice(format!("message-{id}").as_bytes());
+        burst.extend_from_slice(&packet(0x34, &body));
+    }
+    publisher.stream.write_all(&burst).unwrap();
+    let mut completed = Vec::new();
+    while completed.len() < usize::from(EXCHANGES) {
+        let mut first = [0u8; 2];
+        publisher
+            .stream
+            .read_exact(&mut first)
+            .unwrap_or_else(|error| {
+                panic!(
+                    "after {} PUBCOMP of {EXCHANGES}: {error}\n{}",
+                    completed.len(),
+                    broker.refusals()
+                )
+            });
+        let mut body = vec![0; usize::from(first[1])];
+        publisher.stream.read_exact(&mut body).unwrap();
+        match first[0] {
+            0x50 => publisher
+                .stream
+                .write_all(&[0x62, 2, body[0], body[1]])
+                .unwrap(),
+            0x70 => completed.push(u16::from_be_bytes([body[0], body[1]])),
+            other => panic!("packet {other:#x} {body:?}\n{}", broker.refusals()),
+        }
+    }
+    completed.sort_unstable();
+    assert_eq!(completed, (1..=EXCHANGES).collect::<Vec<_>>());
+
+    let mut delivered = Vec::new();
+    while delivered.len() < usize::from(EXCHANGES) {
+        let (first, body) = read_packet(&mut subscriber.stream);
+        match first & 0xf0 {
+            0x30 => {
+                assert_eq!(first & 0x06, 0x04, "delivered at QoS 2");
+                let length = usize::from(u16::from_be_bytes([body[0], body[1]]));
+                delivered.push(String::from_utf8(body[4 + length..].to_vec()).unwrap());
+                let id = [body[2 + length], body[3 + length]];
+                subscriber
+                    .stream
+                    .write_all(&[0x50, 2, id[0], id[1]])
+                    .unwrap();
+            }
+            0x60 => subscriber
+                .stream
+                .write_all(&[0x70, 2, body[0], body[1]])
+                .unwrap(),
+            other => panic!("packet {other:#x} {body:?}"),
+        }
+    }
+    let expected: Vec<_> = (1..=EXCHANGES).map(|id| format!("message-{id}")).collect();
+    assert_eq!(delivered, expected, "each message once, in order");
+}
