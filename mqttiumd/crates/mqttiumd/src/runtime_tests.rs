@@ -6522,6 +6522,148 @@ fn tls_terminal_writer_cannot_discard_an_already_decoded_normal_disconnect() {
     });
 }
 
+/// What a TLS client reads once the broker has ended the connection: the
+/// frames still in its stream, then `Ok(0)` for a close_notify alert or the
+/// error kind of a transport that ended without one.
+fn tls_end_of_stream(
+    runtime: &mut Runtime<'_>,
+    generation: ConnectionGeneration,
+    client: &mut rustls::StreamOwned<rustls::ClientConnection, TcpStream>,
+) -> (Vec<(u8, Vec<u8>)>, Result<usize, std::io::ErrorKind>) {
+    until(runtime, |r| {
+        !r.peers.contains_key(&generation)
+            && r.closing_inputs.is_empty()
+            && !r.owner.session_status().lifecycle_pending
+            && r.lifecycle_inflight.is_empty()
+    });
+    let mut frames = Vec::new();
+    let mut byte = [0u8; 1];
+    loop {
+        match client.read(&mut byte) {
+            Ok(1) => {
+                let mut rest = [0u8; 1];
+                client.read_exact(&mut rest).unwrap();
+                let mut body = vec![0; usize::from(rest[0])];
+                client.read_exact(&mut body).unwrap();
+                frames.push((byte[0], body));
+            }
+            other => return (frames, other.map_err(|error| error.kind())),
+        }
+    }
+}
+
+fn published_wills(directory: &Path) -> usize {
+    mqttiumd_store_sqlite::SqliteStore::inspect(&directory.join("store.sqlite"))
+        .unwrap()
+        .operations
+        .values()
+        .filter(|row| {
+            matches!(
+                row.decision,
+                mqttiumd_store_api::Decision::Committed(CommitFacts::WillPublished { .. })
+            )
+        })
+        .count()
+}
+
+/// RFC 8446 §6.1: each party sends a close_notify alert before it closes its
+/// write side, unless it has already sent an error alert. A client that
+/// said DISCONNECT must be able to tell the end of the stream from a
+/// truncation. The disconnection keeps its MQTT meaning: reason 0x00
+/// discards the Will, reason 0x04 publishes it once.
+#[test]
+fn a_tls_client_reads_close_notify_after_its_disconnect() {
+    for (disconnect, wills) in [(&[0xe0, 0][..], 0), (&[0xe0, 2, 4, 0][..], 1)] {
+        with_runtime(128, |runtime, directory| {
+            let (generation, mut client) = tls_test_peer(runtime, directory);
+            runtime
+                .connect(
+                    generation,
+                    will_connect(b"tls-clean-close", SessionExpiry::Never),
+                )
+                .unwrap();
+            until(runtime, |r| {
+                r.session_requests.is_empty() && r.frames.is_empty()
+            });
+            assert_eq!(read_frame(&mut client).0, 0x20);
+            client.write_all(disconnect).unwrap();
+            client.flush().unwrap();
+            assert_eq!(
+                tls_end_of_stream(runtime, generation, &mut client),
+                (vec![], Ok(0)),
+                "tls_closed_without_close_notify"
+            );
+            runtime.queue(Input::DiscoverWills).unwrap();
+            runtime.drain_inputs().unwrap();
+            until(runtime, |r| {
+                !r.owner.will_status().reading
+                    && !r.owner.will_status().admission_pending
+                    && r.will_reads.is_none()
+            });
+            assert_eq!(published_wills(directory), wills);
+        });
+    }
+}
+
+/// The broker's own DISCONNECT is followed by close_notify too: the client
+/// reads the reason, then the end of the stream.
+#[test]
+fn a_tls_client_reads_the_broker_disconnect_and_then_close_notify() {
+    with_runtime(128, |runtime, directory| {
+        let (generation, mut client) = tls_test_peer(runtime, directory);
+        runtime
+            .connect(generation, connect_packet(b"tls-refused"))
+            .unwrap();
+        until(runtime, |r| {
+            r.session_requests.is_empty() && r.frames.is_empty()
+        });
+        assert_eq!(read_frame(&mut client).0, 0x20);
+        // A QoS 0 PUBLISH with the DUP flag is a Malformed Packet.
+        client.write_all(&[0x38, 4, 0, 1, b't', 0]).unwrap();
+        client.flush().unwrap();
+        assert_eq!(
+            tls_end_of_stream(runtime, generation, &mut client),
+            (vec![(0xe0, vec![0x81, 0])], Ok(0)),
+            "tls_closed_without_close_notify"
+        );
+    });
+}
+
+/// A client that closes TLS first, without an MQTT DISCONNECT, is answered
+/// with close_notify, and its Will is published: the transport ended
+/// without a normal disconnection.
+#[test]
+fn a_tls_client_that_sends_close_notify_first_is_answered_with_close_notify() {
+    with_runtime(128, |runtime, directory| {
+        let (generation, mut client) = tls_test_peer(runtime, directory);
+        runtime
+            .connect(
+                generation,
+                will_connect(b"tls-closes-first", SessionExpiry::Never),
+            )
+            .unwrap();
+        until(runtime, |r| {
+            r.session_requests.is_empty() && r.frames.is_empty()
+        });
+        assert_eq!(read_frame(&mut client).0, 0x20);
+        client.conn.send_close_notify();
+        client.conn.complete_io(&mut client.sock).unwrap();
+        assert_eq!(
+            tls_end_of_stream(runtime, generation, &mut client),
+            (vec![], Ok(0)),
+            "tls_close_notify_not_answered"
+        );
+        runtime.queue(Input::DiscoverWills).unwrap();
+        runtime.drain_inputs().unwrap();
+        until(runtime, |r| {
+            !r.owner.will_status().reading
+                && !r.owner.will_status().admission_pending
+                && r.will_reads.is_none()
+        });
+        assert_eq!(published_wills(directory), 1);
+    });
+}
+
 #[test]
 fn blocked_output_and_full_input_preserve_independent_work_and_reconnect_credit() {
     for reverse in [false, true] {
