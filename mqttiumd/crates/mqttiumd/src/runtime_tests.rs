@@ -7284,3 +7284,119 @@ fn only_the_pubrel_of_another_exchange_goes_ahead_of_a_waiting_publication() {
         assert_eq!(peer.behind_bytes, BEHIND_BYTES);
     });
 }
+
+/// Upstream ticket 3542 on this broker: an UNSUBACK the client's output has
+/// no room for. The effect of the UNSUBSCRIBE is committed, the
+/// acknowledgement stays owed while the output is full, the connection is
+/// not closed, and the client reads it with the identifier of its request
+/// once room returns: for a filter it had, for a filter it never had
+/// (MQTT-3.10.4-5), and for a request of more filters than one unit
+/// request, which the runtime acknowledges once (MQTT-3.10.4-4, -6).
+#[test]
+fn an_unsuback_owed_while_the_output_is_full_is_delivered_when_room_returns() {
+    with_runtime(128, |runtime, directory| {
+        let routes = |directory: &Path| {
+            mqttiumd_store_sqlite::SqliteStore::inspect(&directory.join("store.sqlite"))
+                .unwrap()
+                .routes
+                .len()
+        };
+        let (generation, mut client) = peer(runtime);
+        runtime
+            .connect(generation, connect_packet(b"unsuback-output-full"))
+            .unwrap();
+        until(runtime, |r| r.session_requests.is_empty());
+        assert_eq!(read_frame(&mut client).0, 0x20);
+        // One filter, then nine more in one request.
+        let many: Vec<[u8; 2]> = (0..9).map(|index| [b'f', b'0' + index]).collect();
+        let mut subscribe = vec![0, 2, 0];
+        for filter in &many {
+            subscribe.extend_from_slice(&[0, 2, filter[0], filter[1], 1]);
+        }
+        for (body, granted) in [(vec![0, 1, 0, 0, 1, b't', 1], 1), (subscribe, 9)] {
+            runtime.packet(generation, 0x82, body).unwrap();
+            let (first, suback) = served_frame(runtime, &mut client);
+            assert_eq!((first, suback.len()), (0x90, 3 + granted));
+        }
+        until(runtime, |r| {
+            r.inflight.is_empty() && r.inputs.is_empty() && r.frames.is_empty()
+        });
+        assert_eq!(routes(directory), 10);
+
+        let mut unsubscribe_many = vec![0, 9, 0];
+        for filter in &many {
+            unsubscribe_many.extend_from_slice(&[0, 2, filter[0], filter[1]]);
+        }
+        for (name, body, routes_after, unsuback) in [
+            (
+                "a filter it had",
+                vec![0, 7, 0, 0, 1, b't'],
+                9,
+                vec![0, 7, 0, 0x00],
+            ),
+            (
+                "a filter it never had",
+                vec![0, 8, 0, 0, 1, b'u'],
+                9,
+                vec![0, 8, 0, 0x11],
+            ),
+            (
+                "nine filters in one request",
+                unsubscribe_many,
+                0,
+                [&[0, 9, 0][..], &[0x00; 9][..]].concat(),
+            ),
+        ] {
+            // The output lane of the client has no room: a full substitute.
+            let (full, _queued) = std::sync::mpsc::sync_channel(net::OUTPUT_SLOTS);
+            for _ in 0..net::OUTPUT_SLOTS {
+                full.try_send(net::Write {
+                    expiry: None,
+                    correlation: None,
+                    bytes: net::FrameBytes::from_slice(&[0xd0, 0]),
+                    payload: None,
+                    report: net::WriteReport::Complete,
+                })
+                .unwrap();
+            }
+            let original = std::mem::replace(
+                &mut runtime.peers.get_mut(&generation).unwrap().io.outgoing,
+                full.into(),
+            );
+            runtime.packet(generation, 0xa2, body).unwrap();
+            until(runtime, |r| {
+                routes(directory) == routes_after
+                    && r.inflight.is_empty()
+                    && r.inputs.is_empty()
+                    && r.peers
+                        .get(&generation)
+                        .is_none_or(|peer| peer.blocked_output.is_some() || peer.requests.is_some())
+            });
+            let peer = runtime.peers.get(&generation).expect(name);
+            assert!(peer.closing.is_none(), "{name}: closed for a full output");
+            assert!(
+                stays_silent(runtime, &mut client),
+                "{name}: a frame left a full output"
+            );
+            assert!(
+                runtime.peers.contains_key(&generation),
+                "{name}: repeated pressure closed the connection"
+            );
+
+            runtime.peers.get_mut(&generation).unwrap().io.outgoing = original;
+            assert_eq!(
+                served_frame(runtime, &mut client),
+                (0xb0, unsuback),
+                "{name}"
+            );
+            until(runtime, |r| {
+                r.peers
+                    .get(&generation)
+                    .is_some_and(|peer| peer.blocked_output.is_none() && peer.requests.is_none())
+            });
+        }
+        // The connection goes on.
+        runtime.packet(generation, 0xc0, vec![]).unwrap();
+        assert_eq!(served_frame(runtime, &mut client), (0xd0, vec![]));
+    });
+}

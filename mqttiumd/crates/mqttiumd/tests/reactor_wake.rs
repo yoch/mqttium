@@ -903,8 +903,6 @@ fn a_3_1_1_client_with_more_qos2_exchanges_than_the_window_completes_them_all() 
 }
 
 fn qos2_pipeline_completes(exchanges: u16) {
-    #[allow(non_snake_case)]
-    let EXCHANGES = exchanges;
     let broker = Broker::start("qos2-pipeline-311");
     let mut subscriber = Peer::connect(broker.address, "pipeline-subscriber", false);
     let mut body = subscriber.head(1);
@@ -915,7 +913,7 @@ fn qos2_pipeline_completes(exchanges: u16) {
 
     let mut publisher = Peer::connect(broker.address, "pipeline-publisher", false);
     let mut burst = Vec::new();
-    for id in 1..=EXCHANGES {
+    for id in 1..=exchanges {
         let mut body = Vec::new();
         text("pipeline/t", &mut body);
         body.extend_from_slice(&id.to_be_bytes());
@@ -924,14 +922,14 @@ fn qos2_pipeline_completes(exchanges: u16) {
     }
     publisher.stream.write_all(&burst).unwrap();
     let mut completed = Vec::new();
-    while completed.len() < usize::from(EXCHANGES) {
+    while completed.len() < usize::from(exchanges) {
         let mut first = [0u8; 2];
         publisher
             .stream
             .read_exact(&mut first)
             .unwrap_or_else(|error| {
                 panic!(
-                    "after {} PUBCOMP of {EXCHANGES}: {error}\n{}",
+                    "after {} PUBCOMP of {exchanges}: {error}\n{}",
                     completed.len(),
                     broker.refusals()
                 )
@@ -948,10 +946,10 @@ fn qos2_pipeline_completes(exchanges: u16) {
         }
     }
     completed.sort_unstable();
-    assert_eq!(completed, (1..=EXCHANGES).collect::<Vec<_>>());
+    assert_eq!(completed, (1..=exchanges).collect::<Vec<_>>());
 
-    let delivered = receive_qos2(&mut subscriber, usize::from(EXCHANGES));
-    let expected: Vec<_> = (1..=EXCHANGES).map(|id| format!("message-{id}")).collect();
+    let delivered = receive_qos2(&mut subscriber, usize::from(exchanges));
+    let expected: Vec<_> = (1..=exchanges).map(|id| format!("message-{id}")).collect();
     assert_eq!(delivered, expected, "each message once, in order");
 }
 
@@ -1100,4 +1098,138 @@ fn stale_qos2_exchanges_of_a_3_1_1_session_do_not_stop_or_lose_a_publication() {
         matches!(&more, Err(error) if matches!(error.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut)),
         "a second delivery: {more:?} {byte:?}"
     );
+}
+
+/// An MQTT 5 client that keeps its session for an hour (Clean Start 0), and
+/// the Session Present flag of its CONNACK.
+fn session_v5(address: SocketAddr, client_id: &str) -> (TcpStream, bool) {
+    let mut stream = TcpStream::connect(address).unwrap();
+    stream.set_nodelay(true).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    let mut body = Vec::new();
+    text("MQTT", &mut body);
+    body.extend_from_slice(&[5, 0x00, 0, 60, 5, 0x11]);
+    body.extend_from_slice(&3600u32.to_be_bytes());
+    text(client_id, &mut body);
+    stream.write_all(&packet(0x10, &body)).unwrap();
+    let (first, connack) = read_packet(&mut stream);
+    assert_eq!((first, connack[1]), (0x20, 0), "CONNACK");
+    (stream, connack[0] & 1 == 1)
+}
+
+fn subscribe_qos1_v5(stream: &mut TcpStream, filter: &str) {
+    let mut body = vec![0, 1, 0];
+    text(filter, &mut body);
+    body.push(1);
+    stream.write_all(&packet(0x82, &body)).unwrap();
+    assert_eq!(read_packet(stream), (0x90, vec![0, 1, 0, 1]), "SUBACK");
+}
+
+/// Reads QoS 1 deliveries of an MQTT 5 subscriber and acknowledges each,
+/// until `count` different payloads were read. A redelivery (DUP) of one
+/// already read is acknowledged and not counted again.
+fn receive_qos1_v5(stream: &mut TcpStream, count: usize) -> Vec<String> {
+    let mut payloads = Vec::new();
+    while payloads.len() < count {
+        let (first, body) = read_packet(stream);
+        assert_eq!(first & 0xf6, 0x32, "QoS 1 PUBLISH, got {first:#x} {body:?}");
+        let length = usize::from(u16::from_be_bytes([body[0], body[1]]));
+        let id = [body[2 + length], body[3 + length]];
+        let properties = usize::from(body[4 + length]);
+        let payload = String::from_utf8(body[5 + length + properties..].to_vec()).unwrap();
+        stream.write_all(&[0x40, 2, id[0], id[1]]).unwrap();
+        if !payloads.contains(&payload) {
+            payloads.push(payload);
+        }
+    }
+    payloads
+}
+
+/// Upstream ticket 3687 on this broker: a positive PUBACK and what becomes
+/// of the message for each subscriber. Three subscribers at QoS 1: one
+/// reads, one is connected and reads nothing, one is offline. A PUBACK
+/// 0x00 follows the commit that writes one obligation per subscriber, so
+/// every acknowledged message is owed to each of them: the one that reads
+/// has it at once, the store owes the two others every message, and each
+/// receives all of them when it comes back. Nothing is dropped for one
+/// subscriber because another is slow (MQTT 5 [MQTT-4.3.2-4],
+/// [MQTT-4.5.0-1]).
+#[test]
+fn every_acknowledged_qos1_message_is_owed_to_and_reaches_each_subscriber() {
+    const MESSAGES: usize = 40;
+    let broker = Broker::start("owed-to-each");
+    let (mut offline, _) = session_v5(broker.address, "owed-offline");
+    subscribe_qos1_v5(&mut offline, "owed/#");
+    offline.write_all(&[0xe0, 0]).unwrap();
+    assert_eq!(read_until_close(&mut offline), [0u8; 0]);
+    let (mut silent, _) = session_v5(broker.address, "owed-silent");
+    subscribe_qos1_v5(&mut silent, "owed/#");
+    let mut reader = connect(broker.address, "owed-reader");
+    subscribe_qos1_v5(&mut reader, "owed/#");
+
+    let mut publisher = connect(broker.address, "owed-publisher");
+    let expected: Vec<String> = (1..=MESSAGES).map(|n| format!("message-{n}")).collect();
+    for (index, payload) in expected.iter().enumerate() {
+        let id = u16::try_from(index + 1).unwrap().to_be_bytes();
+        let mut body = Vec::new();
+        text("owed/t", &mut body);
+        body.extend_from_slice(&id);
+        body.push(0);
+        body.extend_from_slice(payload.as_bytes());
+        publisher.write_all(&packet(0x32, &body)).unwrap();
+        let (first, puback) = read_packet(&mut publisher);
+        assert_eq!(first, 0x40, "{}", broker.refusals());
+        assert_eq!(&puback[..2], &id);
+        assert!(
+            puback.len() == 2 || puback[2] == 0x00,
+            "{payload} was not accepted: {puback:?}"
+        );
+        // The subscriber that reads has each acknowledged message at once.
+        assert_eq!(
+            receive_qos1_v5(&mut reader, 1),
+            std::slice::from_ref(payload)
+        );
+    }
+
+    // What the store owes: every message to the two that did not read.
+    let store = broker.directory.join("store.sqlite");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let owed = mqttiumd_store_sqlite::SqliteStore::inspect(&store)
+            .unwrap()
+            .obligations
+            .len();
+        if owed == 2 * MESSAGES {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{owed} obligations, {} expected",
+            2 * MESSAGES
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    // The silent subscriber leaves without having read; both come back.
+    drop(silent);
+    for client_id in ["owed-silent", "owed-offline"] {
+        let (mut resumed, present) = session_v5(broker.address, client_id);
+        assert!(present, "{client_id}");
+        assert_eq!(
+            receive_qos1_v5(&mut resumed, MESSAGES),
+            expected,
+            "{client_id}"
+        );
+    }
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !mqttiumd_store_sqlite::SqliteStore::inspect(&store)
+        .unwrap()
+        .obligations
+        .is_empty()
+    {
+        assert!(Instant::now() < deadline, "obligations left after delivery");
+        std::thread::sleep(Duration::from_millis(10));
+    }
 }
