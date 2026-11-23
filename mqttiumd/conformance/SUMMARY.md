@@ -103,7 +103,7 @@ The broker deliberately rejects or does not offer the feature today. The note sa
 
 | MQTT | Statement | Code | Note |
 | - | - | - | - |
-| 5.0 | `MQTT-3.1.2-12` | `mqttiumd/crates/mqttiumd/src/codec.rs:client_connect` | Only Will QoS 1 is accepted: a CONNECT with Will QoS 0 or 2 is answered with CONNACK 0x83 and closed. Will QoS 3 is a Protocol Error closed without a CONNACK. |
+| 5.0 | `MQTT-3.1.2-12` | `mqttiumd/crates/mqttiumd/src/codec.rs:client_connect` | Only Will QoS 1 is accepted: a CONNECT with Will QoS 0 or 2 is answered with CONNACK 0x83 and closed. Will QoS 3 is a Malformed Packet (`ReservedWillQos`, 0x81 in the event); it supplies no response limit and is closed without a CONNACK. |
 | 5.0 | `MQTT-3.1.3-9` | `mqttiumd/crates/mqttiumd/src/codec.rs:client_connect` | A non-zero Will Delay Interval is refused with CONNACK 0x83 (`will_profile_refusals_do_not_accept_ignored_properties`), so no delayed Will exists to withhold. |
 | 5.0 | `MQTT-3.1.3-10` | `mqttiumd/crates/mqttiumd/src/codec.rs:client_connect` | A Will carrying a User Property, or any property other than a zero Will Delay Interval, is refused with CONNACK 0x83. |
 | 3.1.1 | `MQTT-3.1.2-14` | `mqttiumd/crates/mqttiumd/src/codec.rs:client_connect` | Only Will QoS 1 is accepted: a CONNECT with Will QoS 0 or 2 is answered with return code 0x03 and closed. Will QoS 3 is closed without a CONNACK. |

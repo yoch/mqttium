@@ -342,9 +342,17 @@
           {
             "file": "mqttiumd/crates/mqttiumd-store-sqlite/tests/will.rs",
             "test": "both_stores_publish_after_restart_and_cancel_normal_disconnect"
+          },
+          {
+            "file": "mqttiumd/crates/mqttiumd/src/runtime_tests.rs",
+            "test": "unspecified_error_disconnect_with_zero_expiry_ends_the_session_and_publishes_the_will_once"
+          },
+          {
+            "file": "mqttiumd/crates/mqttiumd/src/runtime_tests.rs",
+            "test": "implementation_error_disconnect_with_zero_expiry_ends_the_session_and_publishes_the_will_once"
           }
         ],
-        "note": "The Will is admitted once after DISCONNECT 0x04, after a take-over and after a restart, and not after DISCONNECT 0x00. A non-zero Will Delay Interval is refused, so that branch does not exist; no test reads the Will PUBLISH on a subscriber's socket."
+        "note": "The Will is admitted once after a DISCONNECT whose reason code is not 0x00 (0x04, 0x80 and 0x83 are asserted, and the Will PUBLISH is read on a subscriber's socket), after a take-over and after a restart, and not after DISCONNECT 0x00. A non-zero Will Delay Interval is refused, so that branch does not exist."
       },
       {
         "id": "MQTT-3.1.2-9",
@@ -399,7 +407,7 @@
         "code": [
           "mqttiumd/crates/mqttiumd/src/codec.rs:client_connect"
         ],
-        "note": "Only Will QoS 1 is accepted: a CONNECT with Will QoS 0 or 2 is answered with CONNACK 0x83 and closed. Will QoS 3 is a Protocol Error closed without a CONNACK."
+        "note": "Only Will QoS 1 is accepted: a CONNECT with Will QoS 0 or 2 is answered with CONNACK 0x83 and closed. Will QoS 3 is a Malformed Packet (`ReservedWillQos`, 0x81 in the event); it supplies no response limit and is closed without a CONNACK."
       },
       {
         "id": "MQTT-3.1.2-13",
@@ -2655,6 +2663,10 @@
           {
             "file": "mqttiumd/crates/mqttiumd-store-sqlite/tests/will.rs",
             "test": "both_stores_publish_after_restart_and_cancel_normal_disconnect"
+          },
+          {
+            "file": "mqttiumd/crates/mqttiumd/src/runtime_tests.rs",
+            "test": "normal_disconnect_with_zero_expiry_ends_the_session_and_discards_the_will"
           }
         ],
         "note": "DISCONNECT 0x00 cancels the stored Will; no publication is admitted for it."
@@ -2733,9 +2745,13 @@
           {
             "file": "mqttiumd/crates/mqttiumd/src/runtime_tests.rs",
             "test": "ephemeral_sessions_return_owner_cache_and_durable_capacity"
+          },
+          {
+            "file": "mqttiumd/crates/mqttiumd/src/runtime_tests.rs",
+            "test": "unspecified_error_disconnect_with_zero_expiry_ends_the_session_and_publishes_the_will_once"
           }
         ],
-        "note": "A detached session is removed from the store at its deadline, and at once when the interval is 0."
+        "note": "A detached session is removed from the store at its deadline, and at once when the interval is 0, whether the CONNECT or a DISCONNECT of any legal reason code set it."
       },
       {
         "id": "MQTT-4.2-1",
@@ -3240,11 +3256,15 @@
             "test": "will_malformed_and_duplicate_properties_keep_their_protocol_causes"
           },
           {
+            "file": "mqttiumd/crates/mqttiumd/src/codec.rs",
+            "test": "an_empty_publish_topic_without_an_alias_is_a_protocol_error"
+          },
+          {
             "file": "mqttiumd/crates/mqttiumd-contract/src/topic.rs",
             "test": "independent_filter_grammar"
           }
         ],
-        "note": "An empty Will Topic is refused and an empty PUBLISH topic takes the same check. An empty filter is refused by `codec::filter` (not asserted) and by the core's grammar (asserted)."
+        "note": "An empty Will Topic is refused as Topic Name Invalid (0x90). An empty PUBLISH topic designates nothing without a Topic Alias, and none is accepted: it is a Protocol Error (0x82), asserted on the wire. An empty filter is refused by `codec::filter` (not asserted) and by the core's grammar (asserted)."
       },
       {
         "id": "MQTT-4.7.3-2",
@@ -5438,11 +5458,15 @@
             "test": "will_malformed_and_duplicate_properties_keep_their_protocol_causes"
           },
           {
+            "file": "mqttiumd/crates/mqttiumd/src/codec.rs",
+            "test": "an_empty_publish_topic_without_an_alias_is_a_protocol_error"
+          },
+          {
             "file": "mqttiumd/crates/mqttiumd-contract/src/topic.rs",
             "test": "independent_filter_grammar"
           }
         ],
-        "note": "An empty Will Topic is refused and an empty PUBLISH topic takes the same check. An empty filter is refused by `codec::filter` (not asserted) and by the core's grammar (asserted)."
+        "note": "An empty Will Topic and an empty PUBLISH topic are refused; MQTT 3.1.1 has no reason code and the connection is closed. An empty filter is refused by `codec::filter` (not asserted) and by the core's grammar (asserted)."
       },
       {
         "id": "MQTT-4.7.3-2",

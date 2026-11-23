@@ -579,7 +579,12 @@ fn client_connect(body: &[u8], bounds: Bounds) -> Result<Packet, Error> {
         return Err(malformed("PasswordWithoutUsername"));
     }
     let will = flags & 4 != 0;
-    if (!will && flags & 0x38 != 0) || (will && (flags >> 3) & 3 == 3) {
+    // Will QoS 3 is a Malformed Packet (MQTT-3.1.2-12). The other forbidden
+    // combinations parse and are Protocol Errors.
+    if (flags >> 3) & 3 == 3 {
+        return Err(malformed("ReservedWillQos"));
+    }
+    if !will && flags & 0x38 != 0 {
         return Err(protocol("InvalidWillFlags"));
     }
     let keep_alive = input.u16()?;
@@ -730,6 +735,12 @@ fn publish(version: Version, first: u8, body: &[u8], bounds: Bounds) -> Result<P
         Some(identifier(&mut input)?)
     };
     let props = versioned_properties(version, &mut input, Context::Publish)?;
+    // No Topic Alias reaches this point: Topic Alias Maximum 0 was announced
+    // and the properties refused any. An empty name therefore designates
+    // nothing, a Protocol Error and not an invalid name (MQTT 5 §3.3.2.1).
+    if topic_bytes.is_empty() {
+        return Err(protocol("EmptyTopicName"));
+    }
     topic(topic_bytes)?;
     let payload = input.take(body.len() - input.at)?;
     if props.unsupported {
