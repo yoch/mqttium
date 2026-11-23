@@ -319,12 +319,14 @@ has a separate bounded two-facts-per-transport lane. The core remembers
 eight closed generations. Known terminal operation timers are removed only
 after their corresponding owner transition applies.
 
-There are 128 volatile incoming entries and a separate 128-entry outgoing
+There are 32,768 incoming exchange entries, eight for each session the
+broker can hold whatever `--max-connections`
+([ADR 0061](decisions/0061-session-exchange-bound.md)), and a separate 128-entry outgoing
 metadata table with 4 MiB of loaded payload. Initially QoS 0 fanout has a separate
 128-entry/reference and 4 MiB volatile budget, conservatively charged per
 recipient reference although immutable payload bytes are shared. A new fanout
 that does not fit is dropped as a batch with `capacity_exceeded`. The durable
-account has 4 MiB payload, 128 references and 128 exchange slots shared by
+account has 256 MiB payload, 65,536 references and 32,768 exchange slots shared by
 incoming QoS 2 and claimed outgoing QoS 1. Each connection has at most eight
 active outgoing QoS 1 slots, further bounded by the peer. QoS 0 uses no such slot.
 
@@ -444,6 +446,15 @@ PUBREL of another exchange goes ahead and frees a slot, every other packet
 waits behind in order, up to 32 packets and the bytes of one largest packet.
 A 3.1.1 client can have 41 QoS 2 exchanges in flight; beyond that it stalls
 until Keep Alive.
+
+The window is also the bound of a session
+([ADR 0061](decisions/0061-session-exchange-bound.md)): a session holds at
+most eight inbound QoS 2 exchanges across its connections. A session that
+owes eight PUBREL and publishes a new QoS 2 message is not acknowledged
+and its connection is closed with `capacity_exceeded`; an MQTT 5 client is
+sent DISCONNECT 0x97 first. Sending the owed PUBREL again, as a client
+must when it reconnects, makes room. An exchange that awaits its PUBREL holds an entry and
+none of the 64 MiB of payload lent to the publications being admitted.
 
 Outgoing QoS 1 progresses Queued → ClaimPending → AwaitPuback → FinishPending
 → Terminal. Known ClaimDelivery commit associates DeliveryId, target/revision,

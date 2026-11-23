@@ -44,7 +44,7 @@ on another deployment.
 | Shared subscriptions | Announced unavailable; `$share/…` is DISCONNECT 0x9E | Consumers that share a load | A delivery policy among members and its durable state |
 | Subscription identifiers | Announced unavailable; DISCONNECT 0xA1 | Clients that route on the identifier | Store and return the identifier per subscription |
 | Topic aliases | Topic Alias Maximum 0; an alias is DISCONNECT 0x94 | Clients that send aliases without reading the CONNACK | Accept inbound aliases. The audit saw Mosquitto announce 10 |
-| Receive Maximum | 8, fixed; the audit saw Mosquitto announce 20 | A 3.1.1 client with many QoS 2 exchanges in flight: 41 complete, more stall until Keep Alive (record 0060) | Raise the window, make it configurable, or keep it. It sizes the exchange table (record 0048) |
+| Receive Maximum | 8, fixed; the audit saw Mosquitto announce 20 | A 3.1.1 client with many QoS 2 exchanges in flight: 41 complete, more stall until Keep Alive (record 0060) | Raise the window, make it configurable, or keep it. It sizes the exchange table and bounds a session (record 0061) |
 | Maximum Packet Size | 1,048,584 bytes; the audit saw Mosquitto announce 2,000,000 | Publishers of payloads over 1 MiB | Raise `MAX_PAYLOAD` and what is sized from it |
 | Empty ClientID | Refused (CONNACK 2 in 3.1.1, 0x85 in 5); the Mosquitto command-line clients need `-i` | Clients that let the broker name them | Assign an identifier, as MQTT 5 allows |
 
@@ -62,7 +62,7 @@ on another deployment.
 | - | - | - | - |
 | SIGHUP | Ends the process with status 0. Mosquitto reloads its configuration and goes on | A supervisor or a log rotation that sends SIGHUP | Ignore the signal, or reload. Ending on it surprises an operator; ignoring it is the smallest change |
 | Durability of a DISCONNECT | Durable at the commit of the end of the session; the end of the stream is not an acknowledgement (record 0059) | Clients that rely on a Will not being published after a normal disconnection | Decided: keep. Record 0059 says what closing after the commit would cost |
-| One session can hold every inbound exchange | Open (record 0060, open conditions) | Any listener an untrusted client can reach | A bound per session in the core |
+| A session holds at most eight inbound QoS 2 exchanges | Decided (record 0061). A session that owes eight PUBREL and publishes a new QoS 2 message is closed with `capacity_exceeded`, MQTT 5 after DISCONNECT 0x97; the publication is not acknowledged. QoS 0 and 1 are served | A device that loses its state, keeps its session and never sends the PUBREL it owes: it publishes nothing at QoS 2 until the session ends | Keep. The bound is what stops one session from holding the exchanges of every client; a client that sends its PUBREL again on reconnection never meets it |
 
 ## Policy differences a client can see
 

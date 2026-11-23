@@ -8,6 +8,10 @@ found the defect this record fixes.
 holds the evidence. No public type of the core tier, durable encoding,
 injection point or schema changes.
 
+Amended by 0061 (proposed), which decides the point this record left
+open: a session holds at most eight inbound QoS 2 exchanges and the table
+is sized for the sessions.
+
 ## Context
 
 A connection has a window of eight inbound exchanges (`receiving::MAXIMUM`).
@@ -66,6 +70,8 @@ announced no window, up to the bound above.
 - MQTT 5 is unchanged: a ninth exchange is still DISCONNECT 0x93.
 
 ## Open: one session can hold every exchange
+
+Closed by record 0061. What follows is the state this record left.
 
 Found by the same tests, not fixed here. An inbound QoS 2 exchange at
 PUBREC keeps its lease of the core's exchange table until its PUBREL. The
