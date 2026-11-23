@@ -104,10 +104,20 @@ pub struct OwnerConfig {
     /// the owner can hold at a time, across both QoS levels. The product
     /// outgoing-delivery table has this same bound independently.
     pub max_exchanges: NonZeroU32,
+    /// Inbound QoS 2 exchanges one session can hold at a time, across its
+    /// connections: the exchanges a client can keep open, between PUBREC
+    /// and its PUBREL. A QoS 2 publication that would be one more waits
+    /// while the owner itself is admitting or releasing one of them, and
+    /// closes its connection when every one of them awaits a PUBREL of the
+    /// client (record 0061). A table of `max_sessions` times this bound
+    /// cannot be filled by exchanges only clients can end.
+    pub session_qos2_exchanges: NonZeroU32,
     /// The account charged for the exchanges this owner holds.
     pub account: AccountId,
-    /// Payload bytes the exchanges of this owner may have brought in and
-    /// not yet finished with. Loaded outgoing payloads have this same
+    /// Payload bytes of the publications this owner is admitting or
+    /// acknowledging: an exchange holds its payload until its QoS 1
+    /// acknowledgement ends it or until it awaits its PUBREL, which holds
+    /// an exchange and no byte. Loaded outgoing payloads have this same
     /// bound independently of the incoming leases.
     pub payload_bytes: PayloadBytes,
     /// The delay after which an unanswered operation is resolved (ADR
@@ -818,6 +828,7 @@ impl Draft {
 /// #     max_sessions: one,
 /// #     max_routes: one,
 /// #     max_exchanges: one,
+/// #     session_qos2_exchanges: NonZeroU32::MAX,
 /// #     account: AccountId::new(1),
 /// #     payload_bytes: PayloadBytes::new(16),
 /// #     resolution_delay: LogicalDuration::new(5),
@@ -858,6 +869,7 @@ impl Draft {
 /// #     max_sessions: one,
 /// #     max_routes: one,
 /// #     max_exchanges: one,
+/// #     session_qos2_exchanges: NonZeroU32::MAX,
 /// #     account: AccountId::new(1),
 /// #     payload_bytes: PayloadBytes::new(16),
 /// #     resolution_delay: LogicalDuration::new(5),
@@ -960,6 +972,8 @@ pub struct Owner {
     slot_by_deadline: FlatMap<DeadlineToken, usize>,
     slot_by_effect: ScopedFlatMap<EffectId, usize>,
     slots_by_session: FlatMap<SessionId, SmallIndexSet>,
+    /// See `OwnerConfig::session_qos2_exchanges`.
+    session_qos2_exchanges: usize,
     release_retry_slots: BTreeSet<usize>,
     leases: LeaseTable,
     /// The latest operations that ended; see `OwnerConfig`.
@@ -1100,6 +1114,8 @@ impl Owner {
             slot_by_deadline: FlatMap::new(),
             slot_by_effect: ScopedFlatMap::with_scope((id.epoch(), id.owner())),
             slots_by_session: FlatMap::new(),
+            session_qos2_exchanges: usize::try_from(config.session_qos2_exchanges.get())
+                .unwrap_or(usize::MAX),
             release_retry_slots: BTreeSet::new(),
             leases,
             finished,
@@ -2450,6 +2466,36 @@ impl Owner {
                 wake: WakeCondition::ResourceReleased,
             })
         };
+        // One session holds a bounded number of QoS 2 exchanges, whatever
+        // the number of its connections (record 0061): between PUBREC and
+        // PUBREL only the client ends an exchange. A QoS 1 exchange ends
+        // by the owner's own acknowledgement and is not counted. While the
+        // owner is admitting or releasing one of the session's QoS 2
+        // exchanges the publication waits for it. When every one awaits a
+        // PUBREL a wait would be the client's to end: its connection is
+        // closed.
+        if qos == Qos::ExactlyOnce
+            && let Some(held) = self.slots_by_session.get(&source.id)
+        {
+            let slots = self.slots.as_slice();
+            let exchanges = || {
+                held.iter()
+                    .map(|index| &slots[*index])
+                    .filter(|slot| slot.qos == Qos::ExactlyOnce)
+            };
+            if exchanges().count() >= self.session_qos2_exchanges {
+                let owed = |slot: &Slot| {
+                    matches!(
+                        slot.state,
+                        SlotState::AwaitPubrel | SlotState::AnswerHeld { resent: true, .. }
+                    )
+                };
+                if exchanges().all(owed) {
+                    return never(draft);
+                }
+                return Err(lacking(Resource::ExchangeSlots, 1));
+            }
+        }
         // The lease table has one slot per entry of the exchange table and
         // every exchange holds a lease: an account that grants the lease
         // leaves room for the exchange.
@@ -3614,11 +3660,8 @@ impl Owner {
                 ) {
                     return Err(STALE);
                 }
-                self.unindex_slot(slot);
-                let held = &mut self.slots.as_mut_slice()[slot];
-                held.admission = Some(admission);
-                held.state = SlotState::AwaitPubrel;
-                self.index_slot(slot);
+                self.slots.as_mut_slice()[slot].admission = Some(admission);
+                self.await_pubrel(slot)?;
             }
             Change::Replay {
                 slot,
@@ -3772,13 +3815,29 @@ impl Owner {
                     SlotState::AckPending { effect, connection };
                 self.index_slot(released.slot);
             }
-            Next::AwaitPubrel => {
-                self.unindex_slot(released.slot);
-                self.slots.as_mut_slice()[released.slot].state = SlotState::AwaitPubrel;
-                self.index_slot(released.slot);
-            }
+            Next::AwaitPubrel => self.await_pubrel(released.slot)?,
             Next::End => self.end_held(released.slot)?,
         }
+        Ok(())
+    }
+
+    /// The exchange at `index` now awaits the PUBREL of its client. Its
+    /// publication is committed and no longer in this process: the lease
+    /// keeps the exchange and returns the bytes of the payload, as the
+    /// lease of an exchange recovered from the store holds none (record
+    /// 0061).
+    fn await_pubrel(&mut self, index: usize) -> Result<(), CoreFault> {
+        let lease = self.slots.as_slice()[index].lease;
+        let kept = Credits::new(PayloadBytes::ZERO, ExchangeSlots::new(1));
+        let lease = self
+            .leases
+            .lighten(lease, kept)
+            .ok_or(CoreFault::StalePlan)?;
+        self.unindex_slot(index);
+        let held = &mut self.slots.as_mut_slice()[index];
+        held.lease = lease;
+        held.state = SlotState::AwaitPubrel;
+        self.index_slot(index);
         Ok(())
     }
 
@@ -3826,9 +3885,7 @@ impl Owner {
                             ..
                         }
                     ) {
-                        self.unindex_slot(index);
-                        self.slots.as_mut_slice()[index].state = SlotState::AwaitPubrel;
-                        self.index_slot(index);
+                        self.await_pubrel(index)?;
                     } else {
                         self.end_held(index)?;
                     }
@@ -4120,6 +4177,7 @@ mod tests {
             max_sessions: bound(3),
             max_routes: bound(2),
             max_exchanges: bound(2),
+            session_qos2_exchanges: NonZeroU32::MAX,
             account: AccountId::new(9),
             payload_bytes: PayloadBytes::new(16),
             resolution_delay: LogicalDuration::new(5),
@@ -6051,7 +6109,8 @@ mod tests {
         assert_eq!(world.sent(committed(&second)), ["EmitPubrec"]);
         absorbed(&mut world, written(&old_ack));
         assert_eq!(world.phase(7), AWAIT);
-        assert_eq!(used(&world), (7, 1));
+        // Committed and acknowledged: the exchange holds no payload.
+        assert_eq!(used(&world), (0, 1));
 
         let mut world = World::release_pending();
         let release = world.flights[1];
@@ -6336,8 +6395,11 @@ mod tests {
         assert_eq!(kinds(&effects), ["EmitPubrec"]);
         assert_eq!(effects[0].1, frame_to(CONN, pubrec(AckReason::Success)));
         assert_eq!(world.phase(7), AWAIT);
-        // The lease of the exchange stays: its charge is now durable.
-        assert_eq!(used(&world), (7, 1));
+        // The exchange keeps a lease: its place until the PUBREL. The
+        // payload is committed and left this process: its bytes return
+        // (record 0061).
+        assert_eq!(used(&world), (0, 1));
+        assert_eq!(world.owner.leases.held(), 1);
     }
 
     #[test]
@@ -6714,7 +6776,7 @@ mod tests {
         assert_eq!(again.facts, refused.facts);
         assert_eq!(world.phase(7), RELEASING);
         assert_eq!(world.in_flight(7).operation, again.operation);
-        assert_eq!(used(&world), (7, 1));
+        assert_eq!(used(&world), (0, 1));
         assert_eq!(world.sent(committed(&again)), ["EmitPubcomp"]);
     }
 
@@ -7140,6 +7202,7 @@ mod tests {
             // Three exchanges at once: one more than the fixture allows.
             let roomy = OwnerConfig {
                 max_exchanges: bound(3),
+                session_qos2_exchanges: NonZeroU32::MAX,
                 payload_bytes: PayloadBytes::new(32),
                 ..config()
             };
@@ -7213,6 +7276,162 @@ mod tests {
         world.applied(transport_closed(CONN));
         assert!(answered(&world.drain()).is_empty());
         assert_eq!(world.owner.slots.len(), before - 1, "the held PUBACK ended");
+    }
+
+    /// Record 0061: one session holds a bounded number of exchanges,
+    /// across its connections. At the bound, a new publication waits while
+    /// the owner itself is ending one of them; when every one awaits a
+    /// PUBREL, only the client can end one and its connection is closed.
+    /// A PUBLISH received again, another session and a PUBREL are served.
+    #[test]
+    fn a_session_holds_a_bounded_number_of_exchanges_across_its_connections() {
+        let pubrel_on = |connection: u64, raw: u16| Input::Packet {
+            connection: ConnectionGeneration::new(connection),
+            ingress_order: 9,
+            packet: InboundPacket::Pubrel {
+                packet_id: packet_id(raw),
+            },
+        };
+        let bounded = OwnerConfig {
+            max_exchanges: bound(8),
+            session_qos2_exchanges: bound(2),
+            payload_bytes: PayloadBytes::new(64),
+            ..config()
+        };
+        let mut world = World::with(bounded, EPOCH, CAPACITY);
+        world.applied(page(&fixture(EPOCH), true));
+        assert_eq!(world.sent(connect(CONN, b"p1-producer")), ["EmitConnack"]);
+
+        // A first connection leaves one exchange at PUBREC.
+        let first = world.submit(ordered(CONN, 1, Qos::ExactlyOnce, 1));
+        assert_eq!(world.sent(committed(&first)), ["EmitPubrec"]);
+        assert!(world.sent(transport_closed(CONN)).is_empty());
+        assert_eq!(world.sent(connect(11, b"p1-producer")), ["EmitConnack"]);
+
+        // The second exchange is being admitted: a third waits for it and
+        // is handed back intact.
+        let second = world.submit(ordered(11, 2, Qos::ExactlyOnce, 1));
+        let before = world.snapshot();
+        let outcome = world.step(ordered(11, 3, Qos::ExactlyOnce, 2));
+        let StepOutcome::NeedCapacity { input, need, .. } = outcome else {
+            panic!("{outcome:?}")
+        };
+        assert_eq!(input, ordered(11, 3, Qos::ExactlyOnce, 2));
+        assert_eq!(
+            need,
+            CapacityNeed {
+                resource: Resource::ExchangeSlots,
+                amount: 1,
+                wake: WakeCondition::ResourceReleased,
+            }
+        );
+        assert_eq!(world.snapshot(), before);
+        assert_eq!(world.sent(committed(&second)), ["EmitPubrec"]);
+        assert_eq!(used(&world), (0, 2));
+
+        // A QoS 1 exchange ends by the owner's own PUBACK: it is not
+        // counted, and is admitted while the session holds its bound.
+        let at_least_once = world.submit(ordered(11, 4, Qos::AtLeastOnce, 2));
+        world.applied(committed(&at_least_once));
+        let puback = world.drain();
+        assert_eq!(kinds(&puback), ["EmitPuback"]);
+        assert_eq!(world.owner.leases.held(), 3);
+        world.applied(written(&puback[0]));
+        assert_eq!(world.owner.leases.held(), 2, "the QoS 1 exchange ended");
+
+        // Both await their PUBREL. A PUBLISH received again is answered;
+        // another session is admitted: the table has room.
+        assert_eq!(
+            world.sent(ordered(11, 1, Qos::ExactlyOnce, 3)),
+            ["EmitPubrec"]
+        );
+        assert_eq!(world.sent(connect(12, b"p1-b")), ["EmitConnack"]);
+        let other = world.submit(ordered(12, 1, Qos::ExactlyOnce, 1));
+        assert_eq!(world.sent(committed(&other)), ["EmitPubrec"]);
+
+        // A new publication of the session that holds its bound: only the
+        // client can make room, and the connection is closed. Nothing of
+        // the session is lost.
+        let effects = {
+            world.applied(ordered(11, 3, Qos::ExactlyOnce, 4));
+            world.drain()
+        };
+        assert_eq!(kinds(&effects), ["CloseConnection"]);
+        assert_eq!(
+            effects[0].1,
+            Effect::CloseConnection {
+                connection: ConnectionGeneration::new(11),
+                reason: CloseReason::CapacityExceeded,
+            }
+        );
+        assert_eq!(world.owner.connection_of(SessionId::new(PRODUCER)), None);
+        assert_eq!(world.owner.leases.held(), 3);
+        assert_eq!(world.phase(3), None);
+
+        // The client comes back and completes one exchange: it publishes
+        // again.
+        assert_eq!(world.sent(connect(13, b"p1-producer")), ["EmitConnack"]);
+        let release = world.submit(pubrel_on(13, 1));
+        // While the release is in flight the publication waits.
+        assert!(matches!(
+            world.step(ordered(13, 3, Qos::ExactlyOnce, 10)),
+            StepOutcome::NeedCapacity { .. }
+        ));
+        assert_eq!(world.sent(committed(&release)), ["EmitPubcomp"]);
+        let again = world.submit(ordered(13, 3, Qos::ExactlyOnce, 10));
+        assert_eq!(world.sent(committed(&again)), ["EmitPubrec"]);
+        assert_eq!(used(&world), (0, 3));
+    }
+
+    /// Record 0061: an exchange holds the bytes of its payload until it
+    /// awaits its PUBREL, by each way it gets there; an answer sent again
+    /// changes nothing of its lease.
+    #[test]
+    fn an_exchange_that_awaits_its_pubrel_holds_no_payload() {
+        // Its answer was held behind an earlier one, then left.
+        let mut world = World::connected();
+        let earlier = world.submit(ordered(CONN, 7, Qos::ExactlyOnce, 1));
+        let later = world.submit(ordered(CONN, 8, Qos::ExactlyOnce, 2));
+        assert_eq!(used(&world), (14, 2));
+        assert!(world.sent(committed(&later)).is_empty());
+        assert_eq!(used(&world), (14, 2), "a held answer keeps its payload");
+        world.applied(committed(&earlier));
+        assert_eq!(
+            answered(&world.drain()),
+            [("PUBREC", 7, CONN), ("PUBREC", 8, CONN)]
+        );
+        assert_eq!(used(&world), (0, 2));
+        let leases: Vec<LeaseKey> = world
+            .owner
+            .slots
+            .as_slice()
+            .iter()
+            .map(|s| s.lease)
+            .collect();
+        // The PUBREC sent again: the same leases.
+        assert_eq!(
+            world.sent(ordered(CONN, 7, Qos::ExactlyOnce, 3)),
+            ["EmitPubrec"]
+        );
+        let after: Vec<LeaseKey> = world
+            .owner
+            .slots
+            .as_slice()
+            .iter()
+            .map(|s| s.lease)
+            .collect();
+        assert_eq!(after, leases);
+        assert!(leases.iter().all(|lease| world.owner.leases.holds(*lease)));
+
+        // Its held answer ended with its connection.
+        let mut world = World::connected();
+        let _earlier = world.submit(ordered(CONN, 7, Qos::ExactlyOnce, 1));
+        let later = world.submit(ordered(CONN, 8, Qos::ExactlyOnce, 2));
+        assert!(world.sent(committed(&later)).is_empty());
+        world.applied(transport_closed(CONN));
+        assert_eq!(world.phase(8), AWAIT);
+        // The admission still pending keeps its seven bytes.
+        assert_eq!(used(&world), (7, 2));
     }
 
     /// Only publications of the same connection precede one another: an

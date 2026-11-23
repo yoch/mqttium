@@ -819,16 +819,20 @@ fn a_request_with_many_filters_is_served_like_its_unit_requests() {
 /// The Receive Maximum of the CONNACK is a promise to every client at
 /// once. A hundred clients each open the eight QoS 2 exchanges it allows, all
 /// together, and answer every PUBREC with its PUBREL as it arrives: they
-/// respect the window and give the broker what it needs to finish. The
-/// broker holds fewer exchange credits than the windows add up to, so
-/// some publications wait; none of these clients may be closed for it,
-/// and every exchange completes (counter-audit of bbe1453: a peer that
-/// had already sent the PUBREL its own progress needed was closed).
+/// respect the window and give the broker what it needs to finish. None
+/// of these clients may be closed, and every exchange completes
+/// (counter-audit of bbe1453: a peer that had already sent the PUBREL its
+/// own progress needed was closed).
+///
+/// When this test was written the broker held 128 exchange credits for
+/// all its clients and most of these publications waited for one. The
+/// table is now sized for the sessions (record 0061), so the eight
+/// hundred exchanges each find theirs; the wait for a credit is covered by
+/// the tests of the loop that give the broker a table of one or eight.
 #[test]
 fn clients_that_fill_their_announced_window_together_all_complete() {
-    // Far more exchanges than the broker has credits (128): the first
-    // packets read take them all, and every client that holds one has
-    // later publications waiting and its PUBRELs behind them in its stream.
+    // Every client has its publications and, behind them in its stream,
+    // the PUBRELs of the first ones acknowledged.
     const CLIENTS: usize = 100;
     const WINDOW: u16 = 8;
     // The instrumented build defaults to the sixteen connections of the
@@ -1013,16 +1017,18 @@ fn qos2_publish(stream: &mut TcpStream, duplicate: bool, id: u16, payload: &str)
 }
 
 /// The case of upstream ticket 3809: QoS 2 exchanges a 3.1.1 session left
-/// at PUBREC on earlier connections, more of them than the window of one
-/// connection. A PUBREC follows the commit that routes the publication, so
-/// a publication that is acknowledged is delivered: the old ones were
-/// delivered when they were acknowledged, a new one is acknowledged and
-/// delivered once, a duplicate of an old one is acknowledged again and not
-/// delivered again, and every old exchange can still be completed
-/// (MQTT 3.1.1 §4.3.3, §4.4, [MQTT-4.5.0-1]).
+/// at PUBREC on an earlier connection. A PUBREC follows the commit that
+/// routes the publication, so what is acknowledged is delivered, once: a
+/// duplicate of an old PUBLISH is acknowledged again and not delivered
+/// again (MQTT 3.1.1 §4.3.3, §4.4).
+///
+/// A session holds eight such exchanges and no more (record 0061). A new
+/// QoS 2 publication of a session that owes eight PUBREL is not
+/// acknowledged and its connection is closed: only the client can make room, by the PUBREL
+/// it must send again when it reconnects ([MQTT-4.4.0-1]). Once it did,
+/// the publication is accepted and delivered once: nothing was lost.
 #[test]
-fn stale_qos2_exchanges_of_a_3_1_1_session_do_not_stop_or_lose_a_publication() {
-    const ROUNDS: u16 = 3;
+fn stale_qos2_exchanges_of_a_3_1_1_session_are_bounded_and_lose_no_publication() {
     const WINDOW: u16 = 8;
     let broker = Broker::start("stale-qos2-311");
     let mut subscriber = Peer::connect(broker.address, "stale-subscriber", false);
@@ -1032,35 +1038,75 @@ fn stale_qos2_exchanges_of_a_3_1_1_session_do_not_stop_or_lose_a_publication() {
     subscriber.stream.write_all(&packet(0x82, &body)).unwrap();
     assert_eq!(subscriber.acknowledged(0x90, 1), [2], "QoS 2 granted");
 
-    // Each connection leaves a full window of exchanges at PUBREC.
-    for round in 0..ROUNDS {
-        let (mut publisher, present) = resume_311(broker.address, "stale-publisher");
-        assert_eq!(present, round > 0, "round {round}");
-        for id in round * WINDOW + 1..=(round + 1) * WINDOW {
-            qos2_publish(&mut publisher, false, id, &format!("old-{id}"));
-        }
-        let mut acknowledged = Vec::new();
-        for _ in 0..WINDOW {
-            let (first, body) = read_packet(&mut publisher);
-            assert_eq!(first, 0x50, "PUBREC, got {body:?}\n{}", broker.refusals());
-            acknowledged.push(u16::from_be_bytes([body[0], body[1]]));
-        }
+    // A connection leaves a full window of exchanges at PUBREC.
+    let (mut publisher, present) = resume_311(broker.address, "stale-publisher");
+    assert!(!present);
+    for id in 1..=WINDOW {
+        qos2_publish(&mut publisher, false, id, &format!("old-{id}"));
+    }
+    for id in 1..=WINDOW {
         assert_eq!(
-            acknowledged,
-            (round * WINDOW + 1..=(round + 1) * WINDOW).collect::<Vec<_>>()
+            read_packet(&mut publisher),
+            (0x50, id.to_be_bytes().to_vec()),
+            "{}",
+            broker.refusals()
         );
     }
-    let stale = ROUNDS * WINDOW;
     assert_eq!(
-        receive_qos2(&mut subscriber, usize::from(stale)),
-        (1..=stale)
+        receive_qos2(&mut subscriber, usize::from(WINDOW)),
+        (1..=WINDOW)
             .map(|id| format!("old-{id}"))
             .collect::<Vec<_>>(),
         "what was acknowledged was delivered"
     );
+    drop(publisher);
 
+    // The session comes back without its PUBREL. A duplicate of an old
+    // PUBLISH is acknowledged, not delivered again; a new publication is
+    // not acknowledged and the connection is closed.
     let (mut publisher, present) = resume_311(broker.address, "stale-publisher");
     assert!(present);
+    qos2_publish(&mut publisher, true, 1, "old-1");
+    assert_eq!(read_packet(&mut publisher), (0x50, vec![0, 1]));
+    qos2_publish(&mut publisher, false, 1000, "new");
+    assert_eq!(
+        packet_or_end(&mut publisher),
+        None,
+        "a ninth exchange of the session was answered"
+    );
+    // The event is written by the broker after the stream ended.
+    let recorded = || {
+        std::fs::read_to_string(broker.directory.join("events.jsonl"))
+            .unwrap_or_default()
+            .lines()
+            .any(|line| {
+                line.contains("\"connection_closed\"") && line.contains("capacity_exceeded")
+            })
+    };
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !recorded() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        recorded(),
+        "the close is recorded with its reason:\n{}",
+        broker.refusals()
+    );
+
+    // It reconnects and sends its PUBREL again, as it must: every old
+    // exchange completes and the publication is accepted.
+    let (mut publisher, present) = resume_311(broker.address, "stale-publisher");
+    assert!(present);
+    for id in 1..=WINDOW {
+        let [high, low] = id.to_be_bytes();
+        publisher.write_all(&[0x62, 2, high, low]).unwrap();
+        assert_eq!(
+            read_packet(&mut publisher),
+            (0x70, vec![high, low]),
+            "{}",
+            broker.refusals()
+        );
+    }
     qos2_publish(&mut publisher, false, 1000, "new");
     assert_eq!(
         read_packet(&mut publisher),
@@ -1072,19 +1118,6 @@ fn stale_qos2_exchanges_of_a_3_1_1_session_do_not_stop_or_lose_a_publication() {
     publisher.write_all(&[0x62, 2, 3, 232]).unwrap();
     assert_eq!(read_packet(&mut publisher), (0x70, vec![3, 232]));
 
-    // A duplicate of an old PUBLISH is acknowledged, not delivered again.
-    qos2_publish(&mut publisher, true, 1, "old-1");
-    assert_eq!(read_packet(&mut publisher), (0x50, vec![0, 1]));
-    for id in 1..=stale {
-        let [high, low] = id.to_be_bytes();
-        publisher.write_all(&[0x62, 2, high, low]).unwrap();
-        assert_eq!(
-            read_packet(&mut publisher),
-            (0x70, vec![high, low]),
-            "{}",
-            broker.refusals()
-        );
-    }
     // The connection goes on, and the subscriber was sent nothing more.
     publisher.write_all(&[0xc0, 0]).unwrap();
     assert_eq!(read_packet(&mut publisher).0, 0xd0);
@@ -1097,6 +1130,51 @@ fn stale_qos2_exchanges_of_a_3_1_1_session_do_not_stop_or_lose_a_publication() {
     assert!(
         matches!(&more, Err(error) if matches!(error.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut)),
         "a second delivery: {more:?} {byte:?}"
+    );
+}
+
+/// The same bound for an MQTT 5 session: a session that owes eight PUBREL
+/// and opens a ninth QoS 2 exchange is told Quota exceeded (0x97) before
+/// its connection is closed. A QoS 1 publication is not such an exchange:
+/// the broker's own PUBACK ends it, and it is served.
+#[test]
+fn an_mqtt5_session_that_owes_its_window_of_pubrel_is_told_quota_exceeded() {
+    const WINDOW: u16 = 8;
+    let publish = |stream: &mut TcpStream, first: u8, id: u16| {
+        let mut body = Vec::new();
+        text("stale/v5", &mut body);
+        body.extend_from_slice(&id.to_be_bytes());
+        body.extend_from_slice(&[0, b'x']);
+        stream.write_all(&packet(first, &body)).unwrap();
+    };
+    let broker = Broker::start("stale-qos2-v5");
+    let (mut publisher, present) = session_v5(broker.address, "stale-v5");
+    assert!(!present);
+    for id in 1..=WINDOW {
+        publish(&mut publisher, 0x34, id);
+    }
+    for id in 1..=WINDOW {
+        let (first, body) = read_packet(&mut publisher);
+        assert_eq!((first, &body[..2]), (0x50, &id.to_be_bytes()[..]));
+    }
+    drop(publisher);
+
+    let (mut publisher, present) = session_v5(broker.address, "stale-v5");
+    assert!(present);
+    publish(&mut publisher, 0x32, 100);
+    let (first, body) = read_packet(&mut publisher);
+    assert_eq!(
+        (first, &body[..2]),
+        (0x40, &[0, 100][..]),
+        "{}",
+        broker.refusals()
+    );
+    publish(&mut publisher, 0x34, 101);
+    assert_eq!(
+        read_until_close(&mut publisher),
+        [0xe0, 2, 0x97, 0],
+        "{}",
+        broker.refusals()
     );
 }
 

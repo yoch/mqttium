@@ -809,6 +809,7 @@ mod tests {
                 max_sessions: bound(128),
                 max_routes: bound(128),
                 max_exchanges: bound(128),
+                session_qos2_exchanges: NonZeroU32::MAX,
                 account: AccountId::new(1),
                 payload_bytes: PayloadBytes::new(4 * 1024 * 1024),
                 resolution_delay: LogicalDuration::new(10000),

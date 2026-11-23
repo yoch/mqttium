@@ -5789,13 +5789,20 @@ impl EffectSink for Sink<'_, '_> {
                     CloseReason::CapacityExceeded => "capacity_exceeded",
                 };
                 let mut flushing = false;
-                if *reason == CloseReason::SessionTakenOver
+                // An MQTT 5 client is told why: its session was taken over,
+                // or a limit of the broker was exceeded (Quota exceeded).
+                let notice = match reason {
+                    CloseReason::SessionTakenOver => Some(0x8e),
+                    CloseReason::CapacityExceeded => Some(0x97),
+                    CloseReason::ProtocolError | CloseReason::OutcomeUnknown => None,
+                };
+                if let Some(notice) = notice
                     && let Some(peer) = self.peers.get_mut(connection)
                 {
                     if peer.closing.is_some() {
                         flushing = true;
                     } else if peer.version != Some(Version::V311) {
-                        let bytes = codec::disconnect_reason(0x8e);
+                        let bytes = codec::disconnect_reason(notice);
                         if bytes.len() <= peer.max_packet
                             && peer
                                 .io
@@ -6573,12 +6580,16 @@ fn run_inner(
             nz(65536),
         )
         .map_err(|_| Failure::plain("outbox_creation"))?;
-    let max_exchanges = (limits.connections * crate::receiving::MAXIMUM).max(128);
+    // Every session can hold a window of exchanges only its client ends:
+    // the table is sized for the sessions, not for the connections (record
+    // 0061).
+    let max_exchanges = crate::writer::SESSIONS * crate::receiving::MAXIMUM;
     let mut owner = Owner::new(
         OwnerConfig {
             max_sessions: nz(crate::writer::SESSIONS as u32),
             max_routes: nz(mqttiumd_contract::pubsub::MAX_SUBSCRIPTIONS as u32),
             max_exchanges: nz(max_exchanges as u32),
+            session_qos2_exchanges: nz(crate::receiving::MAXIMUM as u32),
             account: AccountId::new(1),
             payload_bytes: PayloadBytes::new(64 * 1024 * 1024),
             resolution_delay: LogicalDuration::new(10000),

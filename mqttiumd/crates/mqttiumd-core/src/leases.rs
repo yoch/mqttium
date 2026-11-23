@@ -257,6 +257,38 @@ impl LeaseTable {
         Ok(outcome)
     }
 
+    /// Replaces the lease `key` names with a lease of `cost` held in the
+    /// same slot under the next generation of that slot, and returns the
+    /// key of the lease the slot then holds. The old lease leaves through
+    /// [`LeaseTable::release`] and the new one is charged as a restored
+    /// lease is: the one release path and the one charge path (record
+    /// 0010).
+    ///
+    /// A lease only gets lighter. A `cost` equal to what the lease holds,
+    /// or larger in a dimension, changes nothing and returns `key`; so does
+    /// a slot whose generations are spent, whose lease stays as it is
+    /// rather than leave the table. `None` when `key` names no lease this
+    /// table holds: nothing changed.
+    pub fn lighten(&mut self, key: LeaseKey, cost: Credits) -> Option<LeaseKey> {
+        let index = self.locate(key)?;
+        let entry = &self.slots.as_slice()[index];
+        let held = entry.record.as_ref()?.cost();
+        if cost == held || cost.bytes > held.bytes || cost.slots > held.slots {
+            return Some(key);
+        }
+        let Some(generation) = entry.next_generation else {
+            return Some(key);
+        };
+        if self.release(key) != Ok(ReleaseOutcome::Released) {
+            return None;
+        }
+        // The slot is free at `generation`, and the account was just
+        // released of more than it is charged now.
+        let lighter = LeaseKey { generation, ..key };
+        self.restore(lighter, cost).ok()?;
+        Some(lighter)
+    }
+
     /// Restores a held lease read from durable data, once per durable row.
     /// It refuses a slot that already holds one, and charges the account
     /// through `Account::reserve`, under the generation of the row.
@@ -732,5 +764,67 @@ mod tests {
             Err(LeaseRefused::TableExhausted)
         );
         assert_eq!(table.account().used(), Credits::ZERO);
+    }
+
+    #[test]
+    fn a_lightened_lease_returns_its_bytes_and_keeps_its_slot() {
+        let mut table = table(10, 2, 2);
+        let heavy = table.reserve(credits(10, 1)).expect("room");
+        assert_eq!(
+            table.check(credits(1, 1)),
+            Err(LeaseRefused::Limit {
+                resource: Resource::PayloadBytes,
+                missing: 1
+            })
+        );
+        let light = table.lighten(heavy, credits(0, 1)).expect("held");
+        assert_eq!(light, key(heavy.slot, 1), "the next generation of the slot");
+        assert!(table.holds(light) && !table.holds(heavy));
+        assert_eq!(table.held(), 1);
+        assert_eq!(table.account().used(), credits(0, 1));
+        assert_invariant(&table);
+        // The old key is a late release; the bytes serve another lease.
+        assert_eq!(table.release(heavy), Ok(ReleaseOutcome::Stale));
+        let other = table.reserve(credits(10, 1)).expect("the bytes are back");
+        assert_ne!(other.slot, light.slot);
+        assert_eq!(table.release(light), Ok(ReleaseOutcome::Released));
+        assert_eq!(table.account().used(), credits(10, 1));
+        assert_invariant(&table);
+    }
+
+    #[test]
+    fn lightening_never_grows_a_lease_and_changes_nothing_it_cannot_do() {
+        let mut table = table(10, 4, 2);
+        let lease = table.reserve(credits(4, 1)).expect("room");
+        let before = table.snapshot();
+        // The same cost, more bytes, more slots: the lease stays.
+        for cost in [credits(4, 1), credits(5, 1), credits(0, 2)] {
+            assert_eq!(table.lighten(lease, cost), Some(lease), "{cost:?}");
+            assert_eq!(table.snapshot(), before);
+        }
+        // A key that names no held lease.
+        assert_eq!(table.lighten(key(1, 0), credits(0, 1)), None);
+        assert_eq!(table.lighten(key(0, 1), credits(0, 1)), None);
+        assert_eq!(table.snapshot(), before);
+
+        // A slot at its last generation keeps the lease it holds.
+        let mut table = table_at_last_generation(1);
+        let last = table.reserve(credits(4, 1)).expect("a generation is left");
+        let before = table.snapshot();
+        assert_eq!(table.lighten(last, credits(0, 1)), Some(last));
+        assert_eq!(table.snapshot(), before);
+
+        // The generation before the last: the lighter lease spends the slot.
+        let mut table = table_at_last_generation(1);
+        table.slots.as_mut_slice()[0].next_generation = Some(LeaseGeneration::new(u64::MAX - 1));
+        let lease = table.reserve(credits(4, 1)).expect("a generation is left");
+        let light = table.lighten(lease, credits(0, 1)).expect("held");
+        assert_eq!(light.generation, LeaseGeneration::new(u64::MAX));
+        assert_invariant(&table);
+        assert_eq!(table.release(light), Ok(ReleaseOutcome::Released));
+        assert_eq!(
+            table.reserve(credits(1, 1)),
+            Err(LeaseRefused::TableExhausted)
+        );
     }
 }

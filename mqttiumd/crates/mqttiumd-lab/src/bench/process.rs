@@ -102,6 +102,8 @@ pub fn owner_config(
         max_sessions: bound(max_sessions, "session")?,
         max_routes: bound(max_routes, "route target")?,
         max_exchanges: bound(max_exchanges, "exchange slot")?,
+        // No bound of its own: the table of the fixture bounds a scenario.
+        session_qos2_exchanges: NonZeroU32::MAX,
         account: AccountId::new(1),
         payload_bytes: PayloadBytes::new(payload_bytes),
         resolution_delay: LogicalDuration::new(resolution_delay),
