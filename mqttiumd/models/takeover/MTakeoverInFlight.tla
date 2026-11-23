@@ -17,6 +17,10 @@
 (*   - `Connection::close` is `Control::stop` on the core thread, three    *)
 (*     steps the task may interleave: `cancelled` is set, the socket is    *)
 (*     shut down, and only then the terminal reason is recorded.           *)
+(*   - With Deferred (a TLS connection) `Connection::close` only sets      *)
+(*     `cancelled`: the task owns the state that seals close_notify, so    *)
+(*     it shuts the socket and records the reason when it ends, and        *)
+(*     `Runtime::close` leaves the peer in the table until `is_finished`.  *)
 (*   - The task checks `cancelled` and then writes; a write on a socket    *)
 (*     that is shut down fails. A task that ends runs `Lanes::finish`.     *)
 (*   - `finish_close` gives Failed to every frame the old generation       *)
@@ -41,15 +45,19 @@ CONSTANTS
     OutSlots,   \* capacity of a frame lane
     WrittenCap, \* capacity of a receipt lane
     Preserve,   \* the core waits for the task's facts before it closes
+    Deferred,   \* the task shuts its own socket: a TLS connection
     Mutation    \* "none" or the name of a model mutation
 
 Mutations == {"none", "NoGenerationCheck", "LeaveFramesAtClose",
-              "OpenWithoutWaiting", "CancelWithoutShutdown", "RecordBeforeShutdown"}
+              "OpenWithoutWaiting", "CancelWithoutShutdown", "RecordBeforeShutdown",
+              "DeferredWithoutWaiting"}
 
 ASSUME /\ NumOld \in Nat /\ NumNew \in Nat
        /\ OutSlots \in Nat \ {0} /\ WrittenCap \in Nat \ {0}
-       /\ Preserve \in BOOLEAN
+       /\ Preserve \in BOOLEAN /\ Deferred \in BOOLEAN
        /\ Mutation \in Mutations
+       /\ Mutation = "DeferredWithoutWaiting" => Deferred
+       /\ Deferred => Mutation \notin {"CancelWithoutShutdown", "RecordBeforeShutdown"}
 
 Old == 1
 New == 2
@@ -100,13 +108,15 @@ histVars == <<hForeignEnd, hWriteAfterBound, hWriteAfterRecord>>
 vars == <<coreVars, ownerVars, stopVars, ctlVars, out, written, taskVars, histVars>>
 
 \* The three steps of Control::stop, in order. RecordBeforeShutdown is
-\* the order the function had before the socket was shut first.
+\* the order the function had before the socket was shut first. With
+\* Deferred the core takes the first step only: the flag.
 StopOrder ==
-    IF Mutation = "RecordBeforeShutdown"
+    IF Deferred THEN <<"cancel">>
+    ELSE IF Mutation = "RecordBeforeShutdown"
     THEN <<"record", "cancel", "shut">>
     ELSE <<"cancel", "shut", "record">>
 Stopping(step) == stopPc > 0 /\ StopOrder[stopPc] = step
-StopNext == stopPc' = IF stopPc = 3 THEN 0 ELSE stopPc + 1
+StopNext == stopPc' = IF stopPc = Len(StopOrder) THEN 0 ELSE stopPc + 1
 Idle == stopPc = 0
 
 Room(g) == Len(written[g]) < WrittenCap
@@ -221,10 +231,12 @@ CoreStopRecord ==
 \* table, ConnectionClosed, and the peer leaves the table. With Preserve
 \* the core first waits for `is_finished` and reads the lane up to its
 \* first Failed. LeaveFramesAtClose removes the peer and leaves its
-\* frames.
+\* frames. With Deferred the core waits for `is_finished` in every case:
+\* only then is the socket shut. DeferredWithoutWaiting does not wait.
 CoreFinishClose(g) ==
     /\ Idle /\ g \in peers /\ retire[g]
     /\ Preserve => finished[g] /\ FactsRead(g)
+    /\ (Deferred /\ Mutation # "DeferredWithoutWaiting") => finished[g]
     /\ peers' = peers \ {g}
     /\ LET left == pendingF \cap Of(g) IN
           IF Mutation = "LeaveFramesAtClose"
@@ -292,7 +304,8 @@ OwnerOpen ==
 \* The task ends: `Driven::finish` runs Control::stop on its own thread,
 \* where no write of this task can interleave, then Lanes::finish. The
 \* reason the task records is the one kept if the core has not recorded
-\* its own yet.
+\* its own yet. A TLS task first attempts close_notify, which is not a
+\* frame and is not modelled.
 End(g) ==
     /\ tpc' = [tpc EXCEPT ![g] = "fin"]
     /\ recorded' = [recorded EXCEPT ![g] = TRUE]
@@ -482,6 +495,16 @@ OldSilentOnceNewBound == ~hWriteAfterBound
 \* recorded before the core does anything else.
 ClosedIsShut ==
     \A g \in Gens : (retire[g] /\ Idle) => shut[g] /\ cancelled[g] /\ recorded[g]
+
+\* With Deferred a closed peer is cancelled before the core does anything
+\* else; the shutdown is its task's.
+ClosedIsCancelled ==
+    \A g \in Gens : (retire[g] /\ Idle) => cancelled[g]
+
+\* A peer that left the table has its socket shut down and its reason
+\* recorded, whoever shut it.
+RemovedIsShut ==
+    \A g \in Gens : (retire[g] /\ g \notin peers) => shut[g] /\ recorded[g]
 
 \* Once the terminal reason of a connection can be read, its socket is
 \* shut down, and no byte leaves on it any more.

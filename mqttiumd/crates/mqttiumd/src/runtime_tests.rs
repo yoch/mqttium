@@ -6522,14 +6522,16 @@ fn tls_terminal_writer_cannot_discard_an_already_decoded_normal_disconnect() {
     });
 }
 
-/// What a TLS client reads once the broker has ended the connection: the
-/// frames still in its stream, then `Ok(0)` for a close_notify alert or the
-/// error kind of a transport that ended without one.
+/// The frames a client still reads, then how its stream ends: `Ok(0)` for a
+/// close_notify alert, the error kind of a transport that ended without one.
+type TlsEnd = (Vec<(u8, Vec<u8>)>, Result<usize, std::io::ErrorKind>);
+
+/// What a TLS client reads once the broker has ended the connection.
 fn tls_end_of_stream(
     runtime: &mut Runtime<'_>,
     generation: ConnectionGeneration,
     client: &mut rustls::StreamOwned<rustls::ClientConnection, TcpStream>,
-) -> (Vec<(u8, Vec<u8>)>, Result<usize, std::io::ErrorKind>) {
+) -> TlsEnd {
     until(runtime, |r| {
         !r.peers.contains_key(&generation)
             && r.closing_inputs.is_empty()

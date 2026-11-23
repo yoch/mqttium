@@ -1065,8 +1065,18 @@ impl Connection {
         }
     }
 
+    /// Ends the connection. A plain task is stopped here: its socket is
+    /// shut on this thread. A TLS task owns the state that seals the
+    /// close_notify alert (RFC 8446 §6.1), so it is only cancelled here: it
+    /// sends the alert, shuts the socket and records the reason on its own
+    /// thread when it ends. The owner of a TLS connection waits for
+    /// `is_finished` before it treats the socket as shut.
     pub fn close(&self) {
-        self.control.stop(&self.stream, "cancelled");
+        if self.is_tls() {
+            self.control.0.cancelled.store(true, Ordering::Release);
+        } else {
+            self.control.stop(&self.stream, "cancelled");
+        }
         self.link.notify();
     }
 

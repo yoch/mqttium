@@ -1195,6 +1195,13 @@ impl Runtime<'_> {
                 return Ok(());
             }
         }
+        // A TLS task ends its own transport: close_notify, then the
+        // shutdown. Its peer keeps its place until the task has finished,
+        // so nothing is bound to another generation while the old socket
+        // can still write. The retiring pass of `connections` finishes it.
+        if self.peers[&generation].io.is_tls() && !self.peers[&generation].io.is_finished() {
+            return Ok(());
+        }
         self.finish_close(generation, code)
     }
 

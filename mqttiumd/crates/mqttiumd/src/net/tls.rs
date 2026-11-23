@@ -301,6 +301,28 @@ impl Task {
         }
     }
 
+    /// RFC 8446 §6.1: close_notify precedes the end of the write side unless
+    /// an error alert was sent. Only an orderly end says it: the close the
+    /// core decided, and the answer to the peer's own close_notify. A sealed
+    /// frame that did not leave whole would make the alert undecryptable,
+    /// and the stream is then truncated in fact. The attempt never waits: a
+    /// peer that does not read gets the end of the transport alone.
+    fn close_notify(&mut self, code: &'static str) {
+        if !matches!(self.machine.phase, Phase::Active)
+            || !matches!(code, "cancelled" | "tls_close_notify")
+            || self.machine.output.is_some()
+        {
+            return;
+        }
+        self.state.send_close_notify();
+        while self.state.wants_write() {
+            let mut writer = &*self.stream;
+            if !matches!(self.state.write_tls(&mut writer), Ok(count) if count != 0) {
+                break;
+            }
+        }
+    }
+
     fn handshake_turn(
         &mut self,
         start: Instant,
@@ -669,7 +691,8 @@ impl Driven for Task {
     }
 
     fn finish(self: Box<Self>, code: &'static str) {
-        let task = *self;
+        let mut task = *self;
+        task.close_notify(code);
         task.control.stop(&task.stream, code);
         let active = task
             .machine
