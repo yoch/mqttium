@@ -63,7 +63,7 @@ use crate::{UNKNOWN, VolatileStore};
 pub const LOG_MAX_GROUP: usize = 256;
 
 /// Default `.mlog` size threshold before automatic SQLite checkpoint compaction.
-pub const DEFAULT_CHECKPOINT_BYTES: u64 = 32 * 1024 * 1024;
+pub const DEFAULT_CHECKPOINT_BYTES: u64 = 128 * 1024 * 1024;
 
 const WAL_MAGIC: &[u8; 4] = b"MQLG";
 const WAL_VERSION: u16 = 1;

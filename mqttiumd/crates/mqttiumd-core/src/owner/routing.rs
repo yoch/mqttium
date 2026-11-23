@@ -208,7 +208,7 @@ impl ExactBucket {
 /// `Owner::routes`.
 #[derive(Debug, Default)]
 pub(super) struct RouteIndex {
-    exact: BTreeMap<u64, ExactBucket>,
+    exact: FlatMap<u64, ExactBucket>,
     wildcard: TrieNode,
     wildcard_count: usize,
     total: usize,
@@ -237,13 +237,13 @@ impl RouteIndex {
             self.wildcard_count += 1;
         } else {
             let hash = topic_hash64(bytes);
-            match self.exact.entry(hash) {
-                alloc::collections::btree_map::Entry::Vacant(slot) => {
-                    slot.insert(ExactBucket::Single(route.topic.clone(), alloc::vec![index]));
-                }
-                alloc::collections::btree_map::Entry::Occupied(mut slot) => {
-                    slot.get_mut().insert(route.topic.clone(), index);
-                }
+            if let Some(bucket) = self.exact.get_mut(&hash) {
+                bucket.insert(route.topic.clone(), index);
+            } else {
+                self.exact.insert(
+                    hash,
+                    ExactBucket::Single(route.topic.clone(), alloc::vec![index]),
+                );
             }
         }
         self.total += 1;
@@ -264,7 +264,7 @@ impl RouteIndex {
         &self,
         routes: &[Route],
         sessions: &[Session],
-        session_by_id: &BTreeMap<SessionId, usize>,
+        session_by_id: &FlatMap<SessionId, usize>,
         source: SessionId,
         topic: &[u8],
         qos: Qos,
@@ -285,7 +285,7 @@ impl RouteIndex {
         &self,
         routes: &[Route],
         sessions: &[Session],
-        session_by_id: &BTreeMap<SessionId, usize>,
+        session_by_id: &FlatMap<SessionId, usize>,
         source: Option<&[u8]>,
         topic: &[u8],
         qos: Qos,
@@ -1371,7 +1371,7 @@ mod tests {
             b"A",
         ];
         let mut sessions = Vec::new();
-        let mut session_by_id = BTreeMap::new();
+        let mut session_by_id = FlatMap::new();
         for id in 1..=20u64 {
             session_by_id.insert(SessionId::new(id), sessions.len());
             sessions.push(session(id));
@@ -1434,7 +1434,7 @@ mod tests {
     fn wide_fanout_1024_targets_selects_in_canonical_order() {
         let count = MAX_TARGETS;
         let mut sessions = Vec::with_capacity(count);
-        let mut session_by_id = BTreeMap::new();
+        let mut session_by_id = FlatMap::new();
         let mut routes = Vec::with_capacity(count);
         for i in (1..=count as u64).rev() {
             session_by_id.insert(SessionId::new(i), sessions.len());

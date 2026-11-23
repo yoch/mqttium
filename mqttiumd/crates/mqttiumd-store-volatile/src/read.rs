@@ -330,12 +330,12 @@ pub(crate) fn check_inventory_bound(store: &VolatileStore) -> Result<(), ReadErr
     if rows > MAX_RECOVERY_INVENTORY_ROWS {
         return Err(ReadError::LimitExceeded);
     }
-    for delivery in store.outbound.keys() {
+    for (delivery, _) in store.outbound.iter() {
         let record = store
             .obligations
-            .get(delivery)
+            .get(&delivery)
             .ok_or(ReadError::InvalidData)?;
-        delivery_claim(store, *delivery, record)?;
+        delivery_claim(store, delivery, record)?;
     }
     Ok(())
 }
@@ -387,9 +387,11 @@ pub(crate) fn check_message_candidate(
         check_delivery_metadata(store, *delivery, record)?;
         delivery_claim(store, *delivery, record)?;
     }
-    for (delivery, _) in store.outbound.range(range) {
-        if !store.obligations.contains_key(delivery) {
-            return Err(ReadError::InvalidData);
+    if !store.validated {
+        for (delivery, _) in store.outbound.iter() {
+            if delivery.publication == id && !store.obligations.contains_key(&delivery) {
+                return Err(ReadError::InvalidData);
+            }
         }
     }
     if store.retained.len() > MAX_RETAINED_TOPICS {
@@ -976,7 +978,7 @@ pub(crate) fn build_snapshot(
         );
     }
     let mut payloads = BTreeMap::new();
-    for (id, record) in &store.payloads {
+    for (id, record) in store.payloads.iter() {
         meter.field(32, 32)?;
         meter.field(record.bytes.len(), store.limits.max_payload_bytes)?;
         meter.charge(
@@ -985,7 +987,7 @@ pub(crate) fn build_snapshot(
                 .ok_or(ReadError::LimitExceeded)?,
         )?;
         payloads.insert(
-            *id,
+            id,
             PayloadRecord {
                 bytes: record.bytes.as_slice().to_vec(),
                 references: record.references,
@@ -997,14 +999,16 @@ pub(crate) fn build_snapshot(
         meter.field(32, 32)?;
         meter.charge(208)?;
     }
-    for delivery in store.outbound.keys() {
+    let mut outbound = BTreeMap::new();
+    for (delivery, out) in store.outbound.iter() {
         meter.field(32, 32)?;
         meter.charge(232)?;
         let record = store
             .obligations
-            .get(delivery)
+            .get(&delivery)
             .ok_or(ReadError::InvalidData)?;
-        delivery_claim(store, *delivery, record)?;
+        delivery_claim(store, delivery, record)?;
+        outbound.insert(delivery, *out);
     }
     for _ in store.inbound.values() {
         meter.field(32, 32)?;
@@ -1040,6 +1044,6 @@ pub(crate) fn build_snapshot(
         payloads,
         obligations: store.obligations.clone(),
         inbound: store.inbound.clone(),
-        outbound: store.outbound.clone(),
+        outbound,
     })
 }

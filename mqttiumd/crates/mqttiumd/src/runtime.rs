@@ -6,7 +6,10 @@ use crate::{
     net,
     receiving::Terminal,
     security::{self, Security, TlsFiles},
-    writer::{ControlRequest, ControlResponse, Failure, Hooks, Request, Response, Session, Writer},
+    writer::{
+        Boot, ControlRequest, ControlResponse, DirectWriter, Failure, Hooks, Request, Response,
+        Session, StoreHandle, Writer,
+    },
 };
 use mqttiumd_contract::capacity::{BoundedVec, PayloadBytes, Resource, WakeCondition, WorkUnits};
 use mqttiumd_contract::command::{DeliveryCause, Recipe};
@@ -14,6 +17,7 @@ use mqttiumd_contract::effects::{
     CloseReason, Effect, EffectSink, FrameProgress, Input, OwnedEffect, OwnerAuthority,
     RecoveredFact, SubmitBlock, SubmitResult,
 };
+use mqttiumd_contract::flat_map::{FlatMap, FlatSet, ScopedFlatMap};
 use mqttiumd_contract::ids::{
     AccountId, ConnectionGeneration, ConnectionKey, DeadlineToken, EffectId, LogicalDuration,
     LogicalOwnerId, LogicalTime, OperationId, OutboundPacketId, PublicationId, SessionId,
@@ -236,7 +240,7 @@ struct Peer {
     /// yet given to the core: a packet behind a CONNECT that is still
     /// being opened, or a business packet the lane has no place for. The
     /// packets behind it stay with the transport, in order.
-    held_packet: Option<(u8, Vec<u8>, net::FrameObservation)>,
+    held_packet: Option<(u8, net::FrameBytes, net::FrameObservation)>,
     /// Since when a packet of this connection waits for a credit that
     /// other work holds. The results of the store return such credits; a
     /// wait during which the broker returned none for [`CAPACITY_WAIT`] is
@@ -261,6 +265,19 @@ impl Peer {
         } else {
             false
         }
+    }
+
+    #[inline]
+    fn needs_poll(&self) -> bool {
+        self.retire_code.is_some()
+            || self.held_packet.is_some()
+            || self.deferred_publish.is_some()
+            || self.requests.is_some()
+            || self.blocked_output.is_some()
+            || self.closing.is_some()
+            || self.pending
+            || !self.connected
+            || self.capacity_wait.is_some()
     }
 }
 /// A SUBSCRIBE or UNSUBSCRIBE served as several requests of the core, in
@@ -346,6 +363,8 @@ struct Runtime<'a> {
     message_expiry_scan: Instant,
     message_expiry_input: Option<Input>,
     message_last_time: Option<MessageTime>,
+    last_message_clock_sync: Instant,
+    message_clock_needed: bool,
     clock: Arc<dyn SessionClock>,
     clock_anchor: SessionClockAnchor,
     clock_checkpoint: Option<(SessionClockReading, Instant)>,
@@ -356,9 +375,13 @@ struct Runtime<'a> {
     last_expiry_inventory: Option<(usize, bool)>,
     owner: Owner,
     _authority: OwnerAuthority,
-    writer: &'a mut Writer,
+    writer: StoreHandle<'a>,
     events: Events,
-    peers: BTreeMap<ConnectionGeneration, Peer>,
+    peers: FlatMap<ConnectionGeneration, Peer>,
+    ready_peers: Arc<net::ReadyQueue>,
+    ready_raw: Vec<u64>,
+    pending_peers: FlatSet<ConnectionGeneration>,
+    capacity_waiters: usize,
     retiring: Vec<net::Connection>,
     sessions: BTreeMap<Vec<u8>, Session>,
     session_ids: BTreeSet<SessionId>,
@@ -375,8 +398,9 @@ struct Runtime<'a> {
     control_inputs: VecDeque<Input>,
     closing_inputs: VecDeque<Input>,
     terminal_inputs: VecDeque<Input>,
-    terminal_effects: BTreeMap<EffectId, u32>,
+    terminal_effects: ScopedFlatMap<EffectId, u32>,
     deferred_inputs: VecDeque<Input>,
+    deferred_by_conn: FlatMap<ConnectionGeneration, usize>,
     /// A packet waits in `deferred_inputs` for room in the effect box.
     effects_awaited: bool,
     /// How many deferred packets may be tried again, from the oldest,
@@ -394,16 +418,16 @@ struct Runtime<'a> {
     /// other work that progresses is pressure, however long it lasts.
     credit_progress: Instant,
     timers: BTreeMap<DeadlineToken, Instant>,
-    inflight: BTreeMap<EffectId, OperationId>,
+    inflight: ScopedFlatMap<EffectId, OperationId>,
     lifecycle_inflight: BTreeMap<EffectId, OperationId>,
     last_session_change: Option<OperationId>,
     session_cardinality_dirty: bool,
     last_session_cardinality: Option<[usize; 13]>,
-    work_reads: BTreeMap<EffectId, SessionId>,
+    work_reads: ScopedFlatMap<EffectId, SessionId>,
     pending_work: VecDeque<SessionId>,
     pending_work_set: BTreeSet<SessionId>,
-    queued_work_sessions: BTreeSet<SessionId>,
-    cached_bindings: BTreeMap<SessionId, ConnectionGeneration>,
+    queued_work_sessions: FlatSet<SessionId>,
+    cached_bindings: FlatMap<SessionId, ConnectionGeneration>,
     bindings_dirty: bool,
     stale_frames_dirty: bool,
     timers_dirty: bool,
@@ -429,8 +453,8 @@ struct Runtime<'a> {
     deferred_ack: Option<(EffectId, ConnectionKey, usize, Instant)>,
     #[cfg(feature = "test-hooks")]
     deferred_ack_used: bool,
-    frames: BTreeMap<EffectId, PendingFrame>,
-    outgoing_bindings: BTreeMap<(ConnectionKey, OutboundPacketId), PubackTarget>,
+    frames: ScopedFlatMap<EffectId, PendingFrame>,
+    outgoing_bindings: FlatMap<(ConnectionKey, OutboundPacketId), PubackTarget>,
     puback_observation: u64,
     #[cfg(feature = "test-hooks")]
     copied_puback: Option<CopiedPuback>,
@@ -477,9 +501,14 @@ impl Runtime<'_> {
         Ok(now)
     }
 
+    #[cfg(test)]
+    fn expire_messages(&mut self) -> Result<(), Failure> {
+        self.expire_messages_at(Instant::now())
+    }
+
     /// One bounded scan request; a completed page rearms the next page without
     /// allocating a historical timer or an operation receipt.
-    fn expire_messages(&mut self) -> Result<(), Failure> {
+    fn expire_messages_at(&mut self, now_instant: Instant) -> Result<(), Failure> {
         if let Some((now, after)) = self.message_expiry_request {
             if self.message_expiry_retry {
                 if self.message_expiry_retry_attempts >= MESSAGE_EXPIRY_RETRIES {
@@ -491,14 +520,11 @@ impl Runtime<'_> {
                         .map_err(event_failure)?;
                     return Err(Failure::plain("message_expiry_retry_exhausted"));
                 }
-                match self
-                    .writer
-                    .control_sender
-                    .try_send(ControlRequest::MessageExpiry {
-                        now,
-                        after,
-                        limit: 4,
-                    }) {
+                match self.writer.try_send_control(ControlRequest::MessageExpiry {
+                    now,
+                    after,
+                    limit: 4,
+                }) {
                     Ok(()) => {
                         self.message_expiry_retry = false;
                         self.message_expiry_retry_attempts = self
@@ -521,7 +547,8 @@ impl Runtime<'_> {
         }
         if self.message_expiry_input.is_some()
             || (self.message_expiry_after.is_none()
-                && self.message_expiry_scan.elapsed() < Duration::from_millis(100))
+                && now_instant.saturating_duration_since(self.message_expiry_scan)
+                    < Duration::from_millis(100))
         {
             return Ok(());
         }
@@ -534,19 +561,16 @@ impl Runtime<'_> {
             if self.message_expiry_observation == Some(now) {
                 // Reusing a completed header could give an old duplicated page
                 // authority over a later scan while the provider is stopped.
-                self.message_expiry_scan = Instant::now();
+                self.message_expiry_scan = now_instant;
                 return Ok(());
             }
             now
         };
-        match self
-            .writer
-            .control_sender
-            .try_send(ControlRequest::MessageExpiry {
-                now,
-                after,
-                limit: 4,
-            }) {
+        match self.writer.try_send_control(ControlRequest::MessageExpiry {
+            now,
+            after,
+            limit: 4,
+        }) {
             Ok(()) => {
                 self.message_expiry_request = Some((now, after));
                 self.message_expiry_observation = Some(now);
@@ -664,8 +688,7 @@ impl Runtime<'_> {
                 let reading = self.clock.read().map_err(|e| Failure::plain(e.code()))?;
                 match self
                     .writer
-                    .control_sender
-                    .try_send(ControlRequest::ClockCheckpoint {
+                    .try_send_control(ControlRequest::ClockCheckpoint {
                         expected: self.clock_anchor,
                         reading,
                     }) {
@@ -696,18 +719,21 @@ impl Runtime<'_> {
         // However many lanes the turn serves, each reactor thread is woken
         // once, when the turn ends.
         let _wakes = net::hold_wakes();
+        let now = Instant::now();
         self.writer_results()?;
-        self.connections()?;
-        self.discover_work();
+        self.connections_at(now)?;
+        self.discover_work_at(now);
         self.drain_pending_work();
-        self.expire_messages()?;
+        self.expire_messages_at(now)?;
         self.expire_sessions()?;
-        self.due_deadlines()?;
+        self.due_deadlines_at(now)?;
         #[cfg(feature = "test-hooks")]
         self.controls()?;
         self.drain_inputs()?;
         self.drain_pending_work();
-        self.dispatch()
+        self.dispatch()?;
+        self.writer.maybe_periodic_snapshot(now);
+        Ok(())
     }
 
     /// How long an idle reactor may wait for a signal. A due core deadline
@@ -781,6 +807,7 @@ impl Runtime<'_> {
             .generation
             .checked_next()
             .map_err(|_| Failure::plain("generation_exhausted"))?;
+        let ready = (self.ready_peers.clone(), self.generation.get());
         let io = match &self.security {
             Some(security) => net::spawn_tls(
                 stream,
@@ -788,13 +815,15 @@ impl Runtime<'_> {
                 security.policy.clone(),
                 self.clock.clone(),
                 self.wake.clone(),
+                Some(ready),
                 #[cfg(feature = "test-hooks")]
                 (self.hooks.clone(), self.events.clone()),
             ),
-            None => net::spawn_with_wake(stream, self.clock.clone(), self.wake.clone()),
+            None => net::spawn_with_ready(stream, self.clock.clone(), self.wake.clone(), ready),
         }
         .map_err(|_| Failure::plain("socket_spawn"))?;
         let sendbuf = io.send_buffer_bytes();
+        self.pending_peers.insert(self.generation);
         self.peers.insert(
             self.generation,
             Peer {
@@ -828,6 +857,18 @@ impl Runtime<'_> {
         Ok(true)
     }
     fn queue(&mut self, input: Input) -> Result<(), Failure> {
+        if matches!(
+            input,
+            Input::WorkPage { .. }
+                | Input::MessagesExpired { .. }
+                | Input::Recovery { .. }
+                | Input::Packet {
+                    packet: InboundPacket::Subscribe { .. },
+                    ..
+                }
+        ) {
+            self.message_clock_needed = true;
+        }
         if matches!(input, Input::ExpireSession { .. }) {
             if !self.expiry_inputs.iter().any(|old| old == &input) {
                 if self.expiry_inputs.len() >= crate::writer::SESSIONS {
@@ -848,7 +889,7 @@ impl Runtime<'_> {
                 return Err(Failure::plain("terminal_input_budget"));
             }
             if let Some(id) = eid {
-                *self.terminal_effects.entry(id).or_insert(0) += 1;
+                *self.terminal_effects.get_or_insert_default(id) += 1;
             }
             self.terminal_inputs.push_back(input);
             self.session_cardinality_dirty = true;
@@ -901,12 +942,58 @@ impl Runtime<'_> {
     /// behind one of them.
     fn business_waits(&self, generation: ConnectionGeneration) -> bool {
         self.ordinary_room() < self.limits.control_reserve()
-            || self
-                .deferred_inputs
-                .iter()
-                .filter(|input| business_connection(input) == Some(generation))
-                .count()
+            || self.deferred_by_conn.get(&generation).copied().unwrap_or(0)
                 >= crate::receiving::MAXIMUM
+    }
+
+    fn note_deferred_push(&mut self, input: &Input) {
+        if let Some(conn) = business_connection(input) {
+            *self.deferred_by_conn.get_or_insert_default(conn) += 1;
+        }
+    }
+
+    fn note_deferred_pop(&mut self, input: &Input) {
+        if let Some(conn) = business_connection(input)
+            && let Some(count) = self.deferred_by_conn.get_mut(&conn)
+        {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                self.deferred_by_conn.remove(&conn);
+            }
+        }
+    }
+
+    fn push_deferred_back(&mut self, input: Input) {
+        self.note_deferred_push(&input);
+        self.deferred_inputs.push_back(input);
+    }
+
+    fn push_deferred_front(&mut self, input: Input) {
+        self.note_deferred_push(&input);
+        self.deferred_inputs.push_front(input);
+    }
+
+    fn pop_deferred_front(&mut self) -> Option<Input> {
+        let popped = self.deferred_inputs.pop_front()?;
+        self.note_deferred_pop(&popped);
+        Some(popped)
+    }
+
+    fn retain_deferred(&mut self, mut keep: impl FnMut(&Input) -> bool) {
+        let counts = &mut self.deferred_by_conn;
+        self.deferred_inputs.retain(|input| {
+            let kept = keep(input);
+            if !kept
+                && let Some(conn) = business_connection(input)
+                && let Some(count) = counts.get_mut(&conn)
+            {
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    counts.remove(&conn);
+                }
+            }
+            kept
+        });
     }
     /// Advances a SUBSCRIBE or UNSUBSCRIBE served as several requests of
     /// the core: gives the core the next unit request once the previous one
@@ -968,8 +1055,9 @@ impl Runtime<'_> {
             .try_send(net::Write {
                 expiry: None,
                 correlation: None,
-                bytes,
+                bytes: net::FrameBytes::from(bytes),
                 payload: None,
+                report: net::WriteReport::None,
             })
             .is_ok()
         {
@@ -985,9 +1073,9 @@ impl Runtime<'_> {
     fn defer(&mut self, packet: Input, retried: bool) {
         if retried {
             self.deferred_retries = 0;
-            self.deferred_inputs.push_front(packet);
+            self.push_deferred_front(packet);
         } else {
-            self.deferred_inputs.push_back(packet);
+            self.push_deferred_back(packet);
         }
     }
     fn ordinary_room(&self) -> usize {
@@ -1071,7 +1159,8 @@ impl Runtime<'_> {
         }
         peer.retire_code = Some(code);
         peer.closing.get_or_insert((code, Instant::now()));
-        if peer.close_observed_at.is_none() {
+        self.pending_peers.insert(generation);
+        if self.peers[&generation].close_observed_at.is_none() {
             let observed = self.session_now()?;
             self.peers
                 .get_mut(&generation)
@@ -1115,6 +1204,10 @@ impl Runtime<'_> {
         code: &'static str,
     ) -> Result<(), Failure> {
         if let Some(peer) = self.peers.remove(&generation) {
+            self.pending_peers.remove(&generation);
+            if peer.capacity_wait.is_some() {
+                self.capacity_waiters = self.capacity_waiters.saturating_sub(1);
+            }
             self.bindings_dirty = true;
             self.stale_frames_dirty = true;
             let observed_monotonic_ns = peer
@@ -1180,7 +1273,7 @@ impl Runtime<'_> {
                 .frames
                 .iter()
                 .filter(|(_, frame)| frame.connection.generation == generation)
-                .map(|(id, _)| *id)
+                .map(|(id, _)| id)
                 .collect();
             for id in pending {
                 let frame = self
@@ -1202,8 +1295,7 @@ impl Runtime<'_> {
                     })?;
                 }
             }
-            self.deferred_inputs
-                .retain(|input| input_connection(input) != Some(generation));
+            self.retain_deferred(|input| input_connection(input) != Some(generation));
             self.outgoing_bindings
                 .retain(|(connection, _), _| connection.generation != generation);
             peer.io.close();
@@ -1233,7 +1325,8 @@ impl Runtime<'_> {
         let deadline = Instant::now()
             .checked_add(budget)
             .ok_or_else(|| Failure::plain("shutdown_deadline_overflow"))?;
-        let generations: Vec<_> = self.peers.keys().copied().collect();
+        let mut generations: Vec<_> = self.peers.keys().copied().collect();
+        generations.sort_unstable();
         for generation in generations {
             self.close(generation, "shutdown")?;
         }
@@ -1587,7 +1680,7 @@ impl Runtime<'_> {
             |input| !matches!(input, Input::WorkAvailable { session } if *session == retired),
         );
         self.queued_work_sessions.remove(&retired);
-        self.deferred_inputs.retain(
+        self.retain_deferred(
             |input| !matches!(input, Input::WorkAvailable { session } if *session == retired),
         );
         #[cfg(feature = "test-hooks")]
@@ -1607,17 +1700,26 @@ impl Runtime<'_> {
             && self.expiry_inputs.is_empty()
             && self.message_expiry_input.is_none())
         {
-            let now = self.message_now()?;
-            if !matches!(
-                self.owner.step(
-                    Input::MessageClock { now },
-                    TurnGrant {
-                        work_limit: WorkUnits::new(65536)
-                    }
-                ),
-                StepOutcome::Applied { .. }
-            ) {
-                return Err(Failure::plain("message_clock_not_applied"));
+            let needs_clock = cfg!(any(test, feature = "test-hooks"))
+                || self.message_clock_needed
+                || self.message_last_time.is_none()
+                || self.owner.has_expiring_messages()
+                || self.last_message_clock_sync.elapsed() >= IDLE_TICK;
+            if needs_clock {
+                let now = self.message_now()?;
+                self.message_clock_needed = false;
+                self.last_message_clock_sync = Instant::now();
+                if !matches!(
+                    self.owner.step(
+                        Input::MessageClock { now },
+                        TurnGrant {
+                            work_limit: WorkUnits::new(65536)
+                        }
+                    ),
+                    StepOutcome::Applied { .. }
+                ) {
+                    return Err(Failure::plain("message_clock_not_applied"));
+                }
             }
         }
         let mut control_budget = crate::writer::CONTROL_QUEUE;
@@ -1637,169 +1739,157 @@ impl Runtime<'_> {
         let mut steps_taken = 0usize;
         let mut outbox_len_at_dispatch = self.owner.outbox().map_or(0, |b| b.len());
         let mut dispatch_blocked = false;
-        while steps_taken < step_budget {
-            steps_taken += 1;
-            // A wake serves the oldest packet that waits, ahead of
-            // everything else and without moving the others.
-            let retried = if self.deferred_retries > 0 {
-                self.deferred_retries -= 1;
-                self.deferred_inputs.pop_front()
-            } else {
-                None
-            };
-            let from_retry = retried.is_some();
-            let control = if !from_retry && control_budget > 0 {
-                self.control_inputs.pop_front()
-            } else {
-                None
-            };
-            let Some(input) = retried
-                .or(control.inspect(|_| control_budget -= 1))
-                .or_else(|| {
-                    if closing_budget > 0 {
-                        closing_budget -= 1;
-                        self.pop_closing_input()
-                    } else {
-                        None
-                    }
-                })
-                .or_else(|| {
-                    if terminal_budget > 0 {
-                        terminal_budget -= 1;
-                        self.pop_terminal_input()
-                    } else {
-                        None
-                    }
-                })
-                .or_else(|| {
-                    if expiry_budget > 0 {
-                        expiry_budget -= 1;
-                        self.expiry_inputs.pop_front()
-                    } else {
-                        None
-                    }
-                })
-                .or_else(|| self.message_expiry_input.take())
-                .or_else(|| {
-                    let popped = self.inputs.pop_front()?;
-                    if let Input::WorkAvailable { session } = &popped {
-                        self.queued_work_sessions.remove(session);
-                    }
-                    Some(popped)
-                })
-            else {
-                break;
-            };
-            if !from_retry
-                && let Some(connection) = business_connection(&input)
-                && self
-                    .deferred_inputs
-                    .iter()
-                    .any(|older| business_connection(older) == Some(connection))
-            {
-                self.deferred_inputs.push_back(input);
-                continue;
-            }
-            let input = match input {
-                Input::ObservedPuback {
-                    connection,
-                    packet_id,
-                    reason,
-                    target,
-                } => {
-                    if !self.queued_generation_is_current(connection.generation)? {
-                        self.events
-                            .emit(
-                                "puback_ignored",
-                                puback_fields(
-                                    connection,
-                                    packet_id,
-                                    reason,
-                                    target,
-                                    None,
-                                    "connection_closed",
-                                ),
-                            )
-                            .map_err(event_failure)?;
-                        continue;
-                    }
-                    #[cfg(feature = "test-hooks")]
-                    let target = if MUTANT_REBIND_OBSERVED_PUBACK {
-                        self.owner.puback_target(connection, packet_id)
-                    } else {
-                        target
-                    };
-                    if target.is_none() || self.owner.puback_target(connection, packet_id) != target
-                    {
-                        self.events
-                            .emit(
-                                "puback_ignored",
-                                puback_fields(
-                                    connection,
-                                    packet_id,
-                                    reason,
-                                    target,
-                                    None,
-                                    "no_current_matching_occurrence",
-                                ),
-                            )
-                            .map_err(event_failure)?;
-                    }
+        loop {
+            let progress_before_pass = self.progress;
+            while steps_taken < step_budget {
+                steps_taken += 1;
+                // A wake serves the oldest packet that waits, ahead of
+                // everything else and without moving the others.
+                let retried = if self.deferred_retries > 0 {
+                    self.deferred_retries -= 1;
+                    self.pop_deferred_front()
+                } else {
+                    None
+                };
+                let from_retry = retried.is_some();
+                let control = if !from_retry && control_budget > 0 {
+                    self.control_inputs.pop_front()
+                } else {
+                    None
+                };
+                let Some(input) = retried
+                    .or(control.inspect(|_| control_budget -= 1))
+                    .or_else(|| {
+                        if closing_budget > 0 {
+                            closing_budget -= 1;
+                            self.pop_closing_input()
+                        } else {
+                            None
+                        }
+                    })
+                    .or_else(|| {
+                        if terminal_budget > 0 {
+                            terminal_budget -= 1;
+                            self.pop_terminal_input()
+                        } else {
+                            None
+                        }
+                    })
+                    .or_else(|| {
+                        if expiry_budget > 0 {
+                            expiry_budget -= 1;
+                            self.expiry_inputs.pop_front()
+                        } else {
+                            None
+                        }
+                    })
+                    .or_else(|| self.message_expiry_input.take())
+                    .or_else(|| {
+                        let popped = self.inputs.pop_front()?;
+                        if let Input::WorkAvailable { session } = &popped {
+                            self.queued_work_sessions.remove(session);
+                        }
+                        Some(popped)
+                    })
+                else {
+                    break;
+                };
+                if !from_retry
+                    && !self.deferred_by_conn.is_empty()
+                    && let Some(connection) = business_connection(&input)
+                    && self.deferred_by_conn.contains_key(&connection)
+                {
+                    self.push_deferred_back(input);
+                    continue;
+                }
+                let input = match input {
                     Input::ObservedPuback {
                         connection,
                         packet_id,
                         reason,
                         target,
+                    } => {
+                        if !self.queued_generation_is_current(connection.generation)? {
+                            self.events
+                                .emit(
+                                    "puback_ignored",
+                                    puback_fields(
+                                        connection,
+                                        packet_id,
+                                        reason,
+                                        target,
+                                        None,
+                                        "connection_closed",
+                                    ),
+                                )
+                                .map_err(event_failure)?;
+                            continue;
+                        }
+                        #[cfg(feature = "test-hooks")]
+                        let target = if MUTANT_REBIND_OBSERVED_PUBACK {
+                            self.owner.puback_target(connection, packet_id)
+                        } else {
+                            target
+                        };
+                        if target.is_none()
+                            || self.owner.puback_target(connection, packet_id) != target
+                        {
+                            self.events
+                                .emit(
+                                    "puback_ignored",
+                                    puback_fields(
+                                        connection,
+                                        packet_id,
+                                        reason,
+                                        target,
+                                        None,
+                                        "no_current_matching_occurrence",
+                                    ),
+                                )
+                                .map_err(event_failure)?;
+                        }
+                        Input::ObservedPuback {
+                            connection,
+                            packet_id,
+                            reason,
+                            target,
+                        }
                     }
-                }
-                Input::Packet {
-                    packet: InboundPacket::Puback { .. } | InboundPacket::Qos2Ack { .. },
-                    ..
-                } => return Err(Failure::plain("uncorrelated_puback_input")),
-                Input::Packet {
-                    connection,
-                    ingress_order,
-                    packet,
-                } => {
-                    if !self.queued_generation_is_current(connection)? {
-                        continue;
-                    }
+                    Input::Packet {
+                        packet: InboundPacket::Puback { .. } | InboundPacket::Qos2Ack { .. },
+                        ..
+                    } => return Err(Failure::plain("uncorrelated_puback_input")),
                     Input::Packet {
                         connection,
                         ingress_order,
                         packet,
-                    }
-                }
-                Input::OpenSession {
-                    connection,
-                    client_id,
-                    clean_start,
-                    expiry,
-                } => {
-                    if !self.peers.contains_key(&connection) {
-                        self.session_requests
-                            .retain(|_, pending| pending.connection != connection);
-                        continue;
+                    } => {
+                        if !self.queued_generation_is_current(connection)? {
+                            continue;
+                        }
+                        Input::Packet {
+                            connection,
+                            ingress_order,
+                            packet,
+                        }
                     }
                     Input::OpenSession {
                         connection,
                         client_id,
                         clean_start,
                         expiry,
-                    }
-                }
-                Input::OpenSessionWillAt {
-                    connection,
-                    client_id,
-                    clean_start,
-                    expiry,
-                    will,
-                    now: _,
-                } => {
-                    if !self.peers.contains_key(&connection) {
-                        self.session_requests
-                            .retain(|_, pending| pending.connection != connection);
-                        continue;
+                    } => {
+                        if !self.peers.contains_key(&connection) {
+                            self.session_requests
+                                .retain(|_, pending| pending.connection != connection);
+                            continue;
+                        }
+                        Input::OpenSession {
+                            connection,
+                            client_id,
+                            clean_start,
+                            expiry,
+                        }
                     }
                     Input::OpenSessionWillAt {
                         connection,
@@ -1807,511 +1897,556 @@ impl Runtime<'_> {
                         clean_start,
                         expiry,
                         will,
-                        now: self.session_now()?,
+                        now: _,
+                    } => {
+                        if !self.peers.contains_key(&connection) {
+                            self.session_requests
+                                .retain(|_, pending| pending.connection != connection);
+                            continue;
+                        }
+                        Input::OpenSessionWillAt {
+                            connection,
+                            client_id,
+                            clean_start,
+                            expiry,
+                            will,
+                            now: self.session_now()?,
+                        }
                     }
-                }
-                Input::OpenSessionAt {
-                    connection,
-                    client_id,
-                    clean_start,
-                    expiry,
-                    now: _,
-                } => {
-                    if !self.peers.contains_key(&connection) {
-                        self.session_requests
-                            .retain(|_, pending| pending.connection != connection);
-                        continue;
-                    }
-                    let now = self.session_now()?;
                     Input::OpenSessionAt {
                         connection,
                         client_id,
                         clean_start,
                         expiry,
-                        now,
+                        now: _,
+                    } => {
+                        if !self.peers.contains_key(&connection) {
+                            self.session_requests
+                                .retain(|_, pending| pending.connection != connection);
+                            continue;
+                        }
+                        let now = self.session_now()?;
+                        Input::OpenSessionAt {
+                            connection,
+                            client_id,
+                            clean_start,
+                            expiry,
+                            now,
+                        }
                     }
-                }
-                Input::SessionEstablished {
-                    connection,
-                    session,
-                    client_id,
-                    revision,
-                    session_present,
-                } => Input::SessionEstablished {
-                    connection: connection.filter(|g| self.peers.contains_key(g)),
-                    session,
-                    client_id,
-                    revision,
-                    session_present,
-                },
-                other => other,
-            };
-            let finish = match &input {
-                Input::StoreResult {
-                    operation,
-                    reply:
-                        StoreReply::Outcome(StoreOutcome::Committed(CommitFacts::DeliveryFinished {
-                            delivery,
-                            ..
-                        })),
-                    ..
-                } => Some((*operation, *delivery)),
-                _ => None,
-            };
-            let wakes_business = matches!(
-                input,
-                Input::StoreResult { .. } | Input::ReceiptsCollected { .. }
-            );
-            let collected = match &input {
-                Input::ReceiptsCollected {
-                    effect,
-                    collection,
-                    reply:
-                        ReceiptCollectionReply::Applied {
-                            closure,
-                            removed,
-                            retained,
-                            more,
-                        },
-                } if self.owner.collection_reply_is_live(*effect, *collection) => {
-                    Some((*collection, *closure, *removed, *retained, *more))
-                }
-                _ => None,
-            };
-            let ready_work = self.work_progress_hint(&input);
-            let will_progress = matches!(
-                &input,
-                Input::StoreResult {
-                    reply: StoreReply::Outcome(StoreOutcome::Committed(
-                        CommitFacts::WillPublished { .. }
-                    )),
-                    ..
-                }
-            ) || matches!(&input, Input::WillPage { next: Some(_), .. })
-                || (matches!(
+                    Input::SessionEstablished {
+                        connection,
+                        session,
+                        client_id,
+                        revision,
+                        session_present,
+                    } => Input::SessionEstablished {
+                        connection: connection.filter(|g| self.peers.contains_key(g)),
+                        session,
+                        client_id,
+                        revision,
+                        session_present,
+                    },
+                    other => other,
+                };
+                let finish = match &input {
+                    Input::StoreResult {
+                        operation,
+                        reply:
+                            StoreReply::Outcome(StoreOutcome::Committed(
+                                CommitFacts::DeliveryFinished { delivery, .. },
+                            )),
+                        ..
+                    } => Some((*operation, *delivery)),
+                    _ => None,
+                };
+                let wakes_business = matches!(
+                    input,
+                    Input::StoreResult { .. } | Input::ReceiptsCollected { .. }
+                );
+                let collected = match &input {
+                    Input::ReceiptsCollected {
+                        effect,
+                        collection,
+                        reply:
+                            ReceiptCollectionReply::Applied {
+                                closure,
+                                removed,
+                                retained,
+                                more,
+                            },
+                    } if self.owner.collection_reply_is_live(*effect, *collection) => {
+                        Some((*collection, *closure, *removed, *retained, *more))
+                    }
+                    _ => None,
+                };
+                let ready_work = self.work_progress_hint(&input);
+                let will_progress = matches!(
                     &input,
                     Input::StoreResult {
                         reply: StoreReply::Outcome(StoreOutcome::Committed(
-                            CommitFacts::SessionLifecycle(_)
+                            CommitFacts::WillPublished { .. }
                         )),
                         ..
                     }
-                ) && matches!(
-                    self.owner.lifecycle_action(),
-                    Some(SessionAction::EndWill { .. })
-                ));
-
-            let opening = match &input {
-                Input::OpenSessionWillAt { connection, .. }
-                | Input::OpenSession { connection, .. }
-                | Input::OpenSessionAt { connection, .. } => Some(*connection),
-                _ => None,
-            };
-            let lifecycle_result = match &input {
-                Input::StoreResult {
-                    operation,
-                    reply: StoreReply::Outcome(StoreOutcome::RejectedCertain(_)),
-                    ..
-                } if self.owner.lifecycle_operation_is_live(*operation) => Some(*operation),
-                _ => None,
-            };
-            let control_refusal =
-                lifecycle_result.and_then(|_| match self.owner.lifecycle_action() {
-                    Some(SessionAction::Detach { .. }) => Some("session_detach_rejected"),
-                    Some(SessionAction::Expire { .. }) => Some("session_expire_rejected"),
-                    _ => None,
-                });
-            let previous_lifecycle = self.owner.lifecycle_dispatch().map(|(op, _)| op);
-            let mut applied = false;
-            let business = business_connection(&input);
-            // What can end an inbound exchange without an answer of the
-            // store: the terminal receipt of a frame, a closed connection.
-            let closes = Self::closing_input(&input);
-            let returns_credit = closes
-                || matches!(&input, Input::FrameResult { progress, .. }
-                    if !matches!(progress, FrameProgress::Started));
-            let is_recovery = matches!(&input, Input::Recovery { .. });
-            let may_change_bindings = is_recovery
-                || closes
-                || matches!(
-                    &input,
-                    Input::SessionEstablished { .. }
-                        | Input::OpenSession { .. }
-                        | Input::OpenSessionAt { .. }
-                        | Input::OpenSessionWillAt { .. }
-                        | Input::ExpireSession { .. }
-                        | Input::Packet {
-                            packet: InboundPacket::ConnectResume { .. },
-                            ..
-                        }
-                        | Input::StoreResult {
+                ) || matches!(&input, Input::WillPage { next: Some(_), .. })
+                    || (matches!(
+                        &input,
+                        Input::StoreResult {
                             reply: StoreReply::Outcome(StoreOutcome::Committed(
                                 CommitFacts::SessionLifecycle(_)
                             )),
                             ..
                         }
-                );
-            let outgoing_binding_prune = if self.outgoing_bindings.is_empty() {
-                OutgoingPrune::None
-            } else {
-                match &input {
-                    Input::ObservedPuback {
-                        connection,
-                        packet_id,
-                        ..
-                    }
-                    | Input::ObservedQos2Ack {
-                        connection,
-                        packet_id,
-                        ..
-                    } => OutgoingPrune::Key((*connection, *packet_id)),
+                    ) && matches!(
+                        self.owner.lifecycle_action(),
+                        Some(SessionAction::EndWill { .. })
+                    ));
+
+                let opening = match &input {
+                    Input::OpenSessionWillAt { connection, .. }
+                    | Input::OpenSession { connection, .. }
+                    | Input::OpenSessionAt { connection, .. } => Some(*connection),
+                    _ => None,
+                };
+                let lifecycle_result = match &input {
                     Input::StoreResult {
-                        reply:
-                            StoreReply::Outcome(StoreOutcome::Committed(
-                                CommitFacts::DeliveryFinished {
-                                    target, packet_id, ..
-                                }
-                                | CommitFacts::DeliveryStarted {
-                                    target, packet_id, ..
-                                }
-                                | CommitFacts::DeliveryPubrelReady {
-                                    target, packet_id, ..
-                                }
-                                | CommitFacts::DeliveryExpired {
-                                    target, packet_id, ..
+                        operation,
+                        reply: StoreReply::Outcome(StoreOutcome::RejectedCertain(_)),
+                        ..
+                    } if self.owner.lifecycle_operation_is_live(*operation) => Some(*operation),
+                    _ => None,
+                };
+                let control_refusal =
+                    lifecycle_result.and_then(|_| match self.owner.lifecycle_action() {
+                        Some(SessionAction::Detach { .. }) => Some("session_detach_rejected"),
+                        Some(SessionAction::Expire { .. }) => Some("session_expire_rejected"),
+                        _ => None,
+                    });
+                let previous_lifecycle = self.owner.lifecycle_dispatch().map(|(op, _)| op);
+                let mut applied = false;
+                let business = business_connection(&input);
+                // What can end an inbound exchange without an answer of the
+                // store: the terminal receipt of a frame, a closed connection.
+                let closes = Self::closing_input(&input);
+                let returns_credit = closes
+                    || matches!(&input, Input::FrameResult { progress, .. }
+                    if !matches!(progress, FrameProgress::Started));
+                let is_recovery = matches!(&input, Input::Recovery { .. });
+                let may_change_bindings = is_recovery
+                    || closes
+                    || matches!(
+                        &input,
+                        Input::SessionEstablished { .. }
+                            | Input::OpenSession { .. }
+                            | Input::OpenSessionAt { .. }
+                            | Input::OpenSessionWillAt { .. }
+                            | Input::ExpireSession { .. }
+                            | Input::Packet {
+                                packet: InboundPacket::ConnectResume { .. },
+                                ..
+                            }
+                            | Input::StoreResult {
+                                reply: StoreReply::Outcome(StoreOutcome::Committed(
+                                    CommitFacts::SessionLifecycle(_)
+                                )),
+                                ..
+                            }
+                    );
+                let outgoing_binding_prune = if self.outgoing_bindings.is_empty() {
+                    OutgoingPrune::None
+                } else {
+                    match &input {
+                        Input::ObservedPuback {
+                            connection,
+                            packet_id,
+                            ..
+                        }
+                        | Input::ObservedQos2Ack {
+                            connection,
+                            packet_id,
+                            ..
+                        } => OutgoingPrune::Key((*connection, *packet_id)),
+                        Input::StoreResult {
+                            reply:
+                                StoreReply::Outcome(StoreOutcome::Committed(
+                                    CommitFacts::DeliveryFinished {
+                                        target, packet_id, ..
+                                    }
+                                    | CommitFacts::DeliveryStarted {
+                                        target, packet_id, ..
+                                    }
+                                    | CommitFacts::DeliveryPubrelReady {
+                                        target, packet_id, ..
+                                    }
+                                    | CommitFacts::DeliveryExpired {
+                                        target, packet_id, ..
+                                    },
+                                )),
+                            ..
+                        } => match self.owner.connection_of(*target) {
+                            Some(generation) => OutgoingPrune::Key((
+                                ConnectionKey {
+                                    session: *target,
+                                    generation,
                                 },
+                                *packet_id,
                             )),
-                        ..
-                    } => match self.owner.connection_of(*target) {
-                        Some(generation) => OutgoingPrune::Key((
-                            ConnectionKey {
-                                session: *target,
-                                generation,
-                            },
-                            *packet_id,
-                        )),
-                        None => OutgoingPrune::Full,
-                    },
-                    Input::StoreResult {
-                        reply:
-                            StoreReply::Outcome(StoreOutcome::Committed(
-                                CommitFacts::PublicationAdmitted { .. }
-                                | CommitFacts::RetainedQos0Stored { .. }
-                                | CommitFacts::InboundReleased { .. }
-                                | CommitFacts::SubscriptionsChanged { .. }
-                                | CommitFacts::DeliveryClaimed { .. }
-                                | CommitFacts::DeliveryConsumed { .. }
-                                | CommitFacts::WillPublished { .. },
-                            )),
-                        ..
-                    }
-                    | Input::FrameResult {
-                        progress: FrameProgress::Written { .. } | FrameProgress::Started,
-                        ..
-                    }
-                    | Input::Packet {
-                        packet:
-                            InboundPacket::Publish { .. }
-                            | InboundPacket::Subscribe { .. }
-                            | InboundPacket::Unsubscribe { .. }
-                            | InboundPacket::Pingreq,
-                        ..
-                    }
-                    | Input::Continue { .. }
-                    | Input::WorkAvailable { .. }
-                    | Input::WorkPage { .. }
-                    | Input::MessageClock { .. }
-                    | Input::MaintainReceipts
-                    | Input::ReceiptsCollected { .. }
-                    | Input::DiscoverWills
-                    | Input::WillPage { .. }
-                    | Input::Qos0EmitRefused { .. } => OutgoingPrune::None,
-                    _ => OutgoingPrune::Full,
-                }
-            };
-            let is_receipt_collected = matches!(&input, Input::ReceiptsCollected { .. });
-            let may_change_timers = !self.timers.is_empty()
-                && !matches!(
-                    &input,
-                    Input::Packet {
-                        packet: InboundPacket::Publish { .. }
-                            | InboundPacket::Subscribe { .. }
-                            | InboundPacket::Unsubscribe { .. }
-                            | InboundPacket::Pingreq
-                            | InboundPacket::Puback { .. }
-                            | InboundPacket::Qos2Ack { .. },
-                        ..
-                    } | Input::ObservedPuback { .. }
-                        | Input::ObservedQos2Ack { .. }
-                        | Input::FrameResult { .. }
+                            None => OutgoingPrune::Full,
+                        },
+                        Input::StoreResult {
+                            reply:
+                                StoreReply::Outcome(StoreOutcome::Committed(
+                                    CommitFacts::PublicationAdmitted { .. }
+                                    | CommitFacts::RetainedQos0Stored { .. }
+                                    | CommitFacts::InboundReleased { .. }
+                                    | CommitFacts::SubscriptionsChanged { .. }
+                                    | CommitFacts::DeliveryClaimed { .. }
+                                    | CommitFacts::DeliveryConsumed { .. }
+                                    | CommitFacts::WillPublished { .. },
+                                )),
+                            ..
+                        }
+                        | Input::FrameResult {
+                            progress: FrameProgress::Written { .. } | FrameProgress::Started,
+                            ..
+                        }
+                        | Input::Packet {
+                            packet:
+                                InboundPacket::Publish { .. }
+                                | InboundPacket::Subscribe { .. }
+                                | InboundPacket::Unsubscribe { .. }
+                                | InboundPacket::Pingreq,
+                            ..
+                        }
                         | Input::Continue { .. }
                         | Input::WorkAvailable { .. }
                         | Input::WorkPage { .. }
                         | Input::MessageClock { .. }
-                        | Input::Qos0EmitRefused { .. }
-                );
-            let fast_batch_step = matches!(
-                &input,
-                Input::StoreResult {
-                    reply: StoreReply::Outcome(StoreOutcome::Committed(
-                        CommitFacts::PublicationAdmitted { .. }
-                            | CommitFacts::DeliveryClaimed { .. }
-                            | CommitFacts::DeliveryFinished { .. }
-                            | CommitFacts::DeliveryStarted { .. }
-                            | CommitFacts::DeliveryPubrelReady { .. }
-                            | CommitFacts::InboundReleased { .. },
-                    )),
-                    ..
-                } | Input::WorkAvailable { .. }
-                    | Input::WorkPage { .. }
-                    | Input::ObservedPuback { .. }
-                    | Input::ObservedQos2Ack { .. }
-                    | Input::FrameResult {
-                        progress: FrameProgress::Written { .. } | FrameProgress::Started,
-                        ..
+                        | Input::MaintainReceipts
+                        | Input::ReceiptsCollected { .. }
+                        | Input::DiscoverWills
+                        | Input::WillPage { .. }
+                        | Input::Qos0EmitRefused { .. } => OutgoingPrune::None,
+                        _ => OutgoingPrune::Full,
                     }
-                    | Input::Packet {
-                        packet: InboundPacket::Publish {
-                            qos: mqttiumd_contract::packet::Qos::AtLeastOnce
-                                | mqttiumd_contract::packet::Qos::ExactlyOnce,
+                };
+                let is_receipt_collected = matches!(&input, Input::ReceiptsCollected { .. });
+                let may_change_timers = !self.timers.is_empty()
+                    && !matches!(
+                        &input,
+                        Input::Packet {
+                            packet: InboundPacket::Publish { .. }
+                                | InboundPacket::Subscribe { .. }
+                                | InboundPacket::Unsubscribe { .. }
+                                | InboundPacket::Pingreq
+                                | InboundPacket::Puback { .. }
+                                | InboundPacket::Qos2Ack { .. },
                             ..
-                        } | InboundPacket::Pubrel { .. },
+                        } | Input::ObservedPuback { .. }
+                            | Input::ObservedQos2Ack { .. }
+                            | Input::FrameResult { .. }
+                            | Input::Continue { .. }
+                            | Input::WorkAvailable { .. }
+                            | Input::WorkPage { .. }
+                            | Input::MessageClock { .. }
+                            | Input::Qos0EmitRefused { .. }
+                    );
+                let fast_batch_step = matches!(
+                    &input,
+                    Input::StoreResult {
+                        reply: StoreReply::Outcome(StoreOutcome::Committed(
+                            CommitFacts::PublicationAdmitted { .. }
+                                | CommitFacts::DeliveryClaimed { .. }
+                                | CommitFacts::DeliveryFinished { .. }
+                                | CommitFacts::DeliveryStarted { .. }
+                                | CommitFacts::DeliveryPubrelReady { .. }
+                                | CommitFacts::InboundReleased { .. },
+                        )),
                         ..
-                    }
-            );
-            let work_limit = if is_recovery {
-                WorkUnits::new(u64::MAX)
-            } else {
-                WorkUnits::new(65536)
-            };
-            match self.owner.step(input, TurnGrant { work_limit }) {
-                StepOutcome::Applied { .. } => {
-                    applied = true;
-                    self.progress = self.progress.wrapping_add(1);
-                    if is_receipt_collected {
-                        self.receipt_pressure_blocked = false;
-                    }
-                    if let Some(peer) = business.and_then(|key| self.peers.get_mut(&key)) {
-                        peer.capacity_wait = None;
-                    }
-                    if let Some(connection) = opening
-                        && let Some((operation, _)) = self.owner.lifecycle_dispatch()
-                        && previous_lifecycle != Some(operation)
-                        && let Some(pending) = self
-                            .session_requests
-                            .values_mut()
-                            .find(|pending| pending.connection == connection)
-                    {
-                        pending.operation = Some(operation);
-                    }
-                    if wakes_business && self.owner.collection_ready() {
-                        self.maintenance_needed = true;
-                    }
-                    if let Some((collection, closure, removed, retained, more)) = collected {
-                        if more
-                            || self.owner.receipt_status().is_some_and(|(_, span, holes)| {
-                                span >= mqttiumd_contract::receipts::RECEIPT_COLLECTION_TRIGGER
-                                    && span > holes
-                            })
+                    } | Input::WorkAvailable { .. }
+                        | Input::WorkPage { .. }
+                        | Input::ObservedPuback { .. }
+                        | Input::ObservedQos2Ack { .. }
+                        | Input::FrameResult {
+                            progress: FrameProgress::Written { .. } | FrameProgress::Started,
+                            ..
+                        }
+                        | Input::Packet {
+                            packet: InboundPacket::Publish {
+                                qos: mqttiumd_contract::packet::Qos::AtLeastOnce
+                                    | mqttiumd_contract::packet::Qos::ExactlyOnce,
+                                ..
+                            } | InboundPacket::Pubrel { .. },
+                            ..
+                        }
+                );
+                let work_limit = if is_recovery {
+                    WorkUnits::new(u64::MAX)
+                } else {
+                    WorkUnits::new(65536)
+                };
+                match self.owner.step(input, TurnGrant { work_limit }) {
+                    StepOutcome::Applied { .. } => {
+                        applied = true;
+                        self.progress = self.progress.wrapping_add(1);
+                        if is_receipt_collected {
+                            self.receipt_pressure_blocked = false;
+                        }
+                        if let Some(peer) = business.and_then(|key| self.peers.get_mut(&key))
+                            && peer.capacity_wait.take().is_some()
                         {
+                            self.capacity_waiters = self.capacity_waiters.saturating_sub(1);
+                        }
+                        if let Some(connection) = opening
+                            && let Some((operation, _)) = self.owner.lifecycle_dispatch()
+                            && previous_lifecycle != Some(operation)
+                            && let Some(pending) = self
+                                .session_requests
+                                .values_mut()
+                                .find(|pending| pending.connection == connection)
+                        {
+                            pending.operation = Some(operation);
+                        }
+                        if wakes_business && self.owner.collection_ready() {
                             self.maintenance_needed = true;
                         }
-                        self.events
-                            .emit_with("receipt_collection_applied", || {
-                                let mut details = crate::writer::collection_details(collection);
-                                crate::writer::returned_closure_details(&mut details, closure);
-                                details["removed"] = json!(removed);
-                                details["retained"] = json!(retained.to_string());
-                                details["more"] = json!(more);
-                                json!({"command_kind":"ReceiptCollection","details":details})
-                            })
-                            .map_err(event_failure)?;
-                    }
-                    if let Some((id, delivery)) = finish {
-                        self.events.emit_with("core_finish_observed",||json!({"operation":operation(id),"details":{"delivery":delivery_text(delivery)}})).map_err(event_failure)?;
-                    }
-                    if wakes_business || returns_credit {
-                        self.credit_progress = Instant::now();
-                        if is_receipt_collected || !self.receipt_pressure_blocked {
-                            // What the deferred packets wait for may be there
-                            // now. They are tried again from the oldest, each
-                            // ahead of later bytes of its connection, until one
-                            // still cannot be served. Control packets can still
-                            // pass while a durable routing mutation remains
-                            // unresolved.
-                            self.deferred_retries = self.deferred_inputs.len();
-                        }
-                    }
-                }
-                StepOutcome::NeedCapacity { input, need, .. } => {
-                    match input {
-                        expiry @ Input::MessagesExpired { .. } => {
-                            self.message_expiry_input = Some(expiry);
-                        }
-                        packet @ Input::Packet { .. }
-                            if matches!(
-                                need.resource,
-                                Resource::ResultSlots | Resource::ReceiptSlots
-                            ) && need.wake == WakeCondition::ResultDelivered =>
-                        {
-                            if need.resource == Resource::ReceiptSlots {
-                                let was_blocked = self.receipt_pressure_blocked;
-                                self.receipt_pressure_blocked = true;
+                        if let Some((collection, closure, removed, retained, more)) = collected {
+                            if more
+                                || self.owner.receipt_status().is_some_and(|(_, span, holes)| {
+                                    span >= mqttiumd_contract::receipts::RECEIPT_COLLECTION_TRIGGER
+                                        && span > holes
+                                })
+                            {
                                 self.maintenance_needed = true;
-                                if !was_blocked && !from_retry {
-                                    let (span, holes) = self
-                                        .owner
-                                        .receipt_status()
-                                        .map(|(_, s, h)| (s, h))
-                                        .unwrap_or((0, 0));
-                                    self.events.emit("receipt_window_pressure",json!({"details":{"resource":"ReceiptSlots","code":"receipt_window_business_full","span":span,"unconsumed_holes":holes}})).map_err(event_failure)?;
-                                }
                             }
-                            self.defer(packet, from_retry)
+                            self.events
+                                .emit_with("receipt_collection_applied", || {
+                                    let mut details = crate::writer::collection_details(collection);
+                                    crate::writer::returned_closure_details(&mut details, closure);
+                                    details["removed"] = json!(removed);
+                                    details["retained"] = json!(retained.to_string());
+                                    details["more"] = json!(more);
+                                    json!({"command_kind":"ReceiptCollection","details":details})
+                                })
+                                .map_err(event_failure)?;
                         }
-                        // The effect box is emptied by the dispatch that
-                        // follows this pass. The packet waits for it in
-                        // order, behind nothing of its own connection.
-                        //
-                        // A deferred packet keeps its place in the lane, and
-                        // the lane admits a business packet only above its
-                        // control reserve: the packets that wait can never
-                        // take the places of those that release what the
-                        // box waits for. No count of them closes a
-                        // connection (record 0046).
-                        packet @ Input::Packet { .. }
-                            if need.resource == Resource::EffectSlots
-                                && need.wake == WakeCondition::EffectAccepted =>
-                        {
-                            self.effects_awaited = true;
-                            self.defer(packet, from_retry)
+                        if let Some((id, delivery)) = finish {
+                            self.events.emit_with("core_finish_observed",||json!({"operation":operation(id),"details":{"delivery":delivery_text(delivery)}})).map_err(event_failure)?;
                         }
-                        // A credit that an admission or an exchange in
-                        // flight holds: the result of the store that ends
-                        // it returns the credit and takes the deferred
-                        // packets up again. The wait is bounded per
-                        // connection (`CAPACITY_WAIT`). Only a business
-                        // packet waits: nothing of its connection passes
-                        // it, so no order changes.
-                        packet @ Input::Packet { .. }
-                            if need.wake == WakeCondition::ResourceReleased
-                                && business.is_some() =>
-                        {
-                            if let Some(peer) = business.and_then(|key| self.peers.get_mut(&key)) {
-                                peer.capacity_wait.get_or_insert_with(Instant::now);
+                        if wakes_business || returns_credit {
+                            if self.capacity_waiters != 0 {
+                                self.credit_progress = Instant::now();
                             }
-                            self.defer(packet, from_retry)
-                        }
-                        Input::Packet { connection, .. } => {
-                            // No transition applied and no effect was submitted for this packet.
-                            // Close its transport rather than reorder its positive acknowledgements.
-                            self.events.emit("input_capacity_refused",json!({"connection":connection.get().to_string(),"details":{"accepted_command_rejected":false,"resource":format!("{:?}",need.resource),"wake":format!("{:?}",need.wake)}})).map_err(event_failure)?;
-                            self.close(connection, "input_capacity")?;
-                        }
-                        other if Self::terminal_input(&other) => {
-                            if let Some(id) = Self::terminal_effect(&other) {
-                                *self.terminal_effects.entry(id).or_insert(0) += 1;
+                            if is_receipt_collected || !self.receipt_pressure_blocked {
+                                // What the deferred packets wait for may be there
+                                // now. They are tried again from the oldest, each
+                                // ahead of later bytes of its connection, until one
+                                // still cannot be served. Control packets can still
+                                // pass while a durable routing mutation remains
+                                // unresolved.
+                                self.deferred_retries = self.deferred_inputs.len();
                             }
-                            self.terminal_inputs.push_back(other);
-                        }
-                        other if Self::closing_input(&other) => {
-                            self.closing_inputs.push_back(other)
-                        }
-                        other @ Input::ExpireSession { .. } => self.expiry_inputs.push_back(other),
-                        other if self.maintenance_input(&other) => {
-                            self.control_inputs.push_back(other)
-                        }
-                        other => {
-                            if let Input::WorkAvailable { session } = &other {
-                                self.queued_work_sessions.insert(*session);
-                            }
-                            self.inputs.push_back(other);
                         }
                     }
+                    StepOutcome::NeedCapacity { input, need, .. } => {
+                        match input {
+                            expiry @ Input::MessagesExpired { .. } => {
+                                self.message_expiry_input = Some(expiry);
+                            }
+                            packet @ Input::Packet { .. }
+                                if matches!(
+                                    need.resource,
+                                    Resource::ResultSlots | Resource::ReceiptSlots
+                                ) && need.wake == WakeCondition::ResultDelivered =>
+                            {
+                                if need.resource == Resource::ReceiptSlots {
+                                    let was_blocked = self.receipt_pressure_blocked;
+                                    self.receipt_pressure_blocked = true;
+                                    self.maintenance_needed = true;
+                                    if !was_blocked && !from_retry {
+                                        let (span, holes) = self
+                                            .owner
+                                            .receipt_status()
+                                            .map(|(_, s, h)| (s, h))
+                                            .unwrap_or((0, 0));
+                                        self.events.emit("receipt_window_pressure",json!({"details":{"resource":"ReceiptSlots","code":"receipt_window_business_full","span":span,"unconsumed_holes":holes}})).map_err(event_failure)?;
+                                    }
+                                }
+                                self.defer(packet, from_retry)
+                            }
+                            // The effect box is emptied by the dispatch that
+                            // follows this pass. The packet waits for it in
+                            // order, behind nothing of its own connection.
+                            //
+                            // A deferred packet keeps its place in the lane, and
+                            // the lane admits a business packet only above its
+                            // control reserve: the packets that wait can never
+                            // take the places of those that release what the
+                            // box waits for. No count of them closes a
+                            // connection (record 0046).
+                            packet @ Input::Packet { .. }
+                                if need.resource == Resource::EffectSlots
+                                    && need.wake == WakeCondition::EffectAccepted =>
+                            {
+                                self.effects_awaited = true;
+                                self.defer(packet, from_retry)
+                            }
+                            // A credit that an admission or an exchange in
+                            // flight holds: the result of the store that ends
+                            // it returns the credit and takes the deferred
+                            // packets up again. The wait is bounded per
+                            // connection (`CAPACITY_WAIT`). Only a business
+                            // packet waits: nothing of its connection passes
+                            // it, so no order changes.
+                            packet @ Input::Packet { .. }
+                                if need.wake == WakeCondition::ResourceReleased
+                                    && business.is_some() =>
+                            {
+                                if let Some(key) = business
+                                    && let Some(peer) = self.peers.get_mut(&key)
+                                {
+                                    if peer.capacity_wait.is_none() {
+                                        peer.capacity_wait = Some(Instant::now());
+                                        self.capacity_waiters += 1;
+                                    }
+                                    self.pending_peers.insert(key);
+                                }
+                                self.defer(packet, from_retry)
+                            }
+                            Input::Packet { connection, .. } => {
+                                // No transition applied and no effect was submitted for this packet.
+                                // Close its transport rather than reorder its positive acknowledgements.
+                                self.events.emit("input_capacity_refused",json!({"connection":connection.get().to_string(),"details":{"accepted_command_rejected":false,"resource":format!("{:?}",need.resource),"wake":format!("{:?}",need.wake)}})).map_err(event_failure)?;
+                                self.close(connection, "input_capacity")?;
+                            }
+                            other if Self::terminal_input(&other) => {
+                                if let Some(id) = Self::terminal_effect(&other) {
+                                    *self.terminal_effects.get_or_insert_default(id) += 1;
+                                }
+                                self.terminal_inputs.push_back(other);
+                            }
+                            other if Self::closing_input(&other) => {
+                                self.closing_inputs.push_back(other)
+                            }
+                            other @ Input::ExpireSession { .. } => {
+                                self.expiry_inputs.push_back(other)
+                            }
+                            other if self.maintenance_input(&other) => {
+                                self.control_inputs.push_back(other)
+                            }
+                            other => {
+                                if let Input::WorkAvailable { session } = &other {
+                                    self.queued_work_sessions.insert(*session);
+                                }
+                                self.inputs.push_back(other);
+                            }
+                        }
+                    }
+                    StepOutcome::Exhausted { .. } => return Err(Failure::plain("core_exhausted")),
+                    StepOutcome::Fatal(fault) => {
+                        self.events
+                            .emit(
+                                "core_fault",
+                                json!({"details":{"code":format!("{fault:?}")}}),
+                            )
+                            .map_err(event_failure)?;
+                        return Err(Failure::plain("core_fault"));
+                    }
                 }
-                StepOutcome::Exhausted { .. } => return Err(Failure::plain("core_exhausted")),
-                StepOutcome::Fatal(fault) => {
-                    self.events
-                        .emit(
-                            "core_fault",
-                            json!({"details":{"code":format!("{fault:?}")}}),
-                        )
-                        .map_err(event_failure)?;
-                    return Err(Failure::plain("core_fault"));
+                if applied {
+                    self.session_cardinality_dirty = true;
+                    if may_change_bindings {
+                        self.bindings_dirty = true;
+                    }
+                    match outgoing_binding_prune {
+                        OutgoingPrune::None => {}
+                        OutgoingPrune::Key(key) => self.prune_outgoing_binding_key(key),
+                        OutgoingPrune::Full => self.prune_outgoing_bindings(),
+                    }
+                    // A terminal result is consumed only after the exact input was
+                    // applied. Defer the full timer sweep to the end of the pass
+                    // (or when `ArmDeadline` nears its cap) to avoid O(N) scans per step.
+                    if may_change_timers {
+                        self.timers_dirty = true;
+                    }
+                }
+                if applied && (returns_credit || wakes_business) {
+                    dispatch_blocked = false;
+                }
+                let inputs_before_dispatch = self.inputs.len();
+                let must_dispatch = !applied
+                    || !fast_batch_step
+                    || cfg!(feature = "test-hooks")
+                    || self.owner.outbox().is_some_and(|box_| {
+                        box_.free_slots() < 16
+                            || (!dispatch_blocked
+                                && box_.len().saturating_sub(outbox_len_at_dispatch) >= 32)
+                    });
+                if must_dispatch {
+                    let accepted = self.dispatch_returning_accepted()?;
+                    outbox_len_at_dispatch = self.owner.outbox().map_or(0, |b| b.len());
+                    dispatch_blocked = accepted == 0 && outbox_len_at_dispatch > 0;
+                }
+                if applied
+                    && let Some(operation) = lifecycle_result
+                    && !self.owner.lifecycle_operation_is_live(operation)
+                {
+                    self.session_requests
+                        .retain(|_, pending| pending.operation != Some(operation));
+                    // A known no-effect result is not a completed detach/expiry.
+                    // Stop observably rather than silently losing the continuation
+                    // or manufacturing a second command while its outcome is unknown.
+                    if let Some(code) = control_refusal {
+                        return Err(Failure::plain(code));
+                    }
+                }
+                if applied
+                    && will_progress
+                    && !self.owner.will_status().admission_pending
+                    && !self
+                        .control_inputs
+                        .iter()
+                        .any(|input| matches!(input, Input::DiscoverWills))
+                {
+                    self.queue(Input::DiscoverWills)?;
+                }
+                if applied && let Some((session, initial)) = ready_work {
+                    self.rearm_ready_work(session, initial);
+                }
+                if applied && self.inputs.len() > inputs_before_dispatch {
+                    step_budget = step_budget
+                        .saturating_add(self.inputs.len() - inputs_before_dispatch)
+                        .min(self.limits.drain_steps);
                 }
             }
-            if applied {
-                self.session_cardinality_dirty = true;
-                if may_change_bindings {
-                    self.bindings_dirty = true;
-                }
-                match outgoing_binding_prune {
-                    OutgoingPrune::None => {}
-                    OutgoingPrune::Key(key) => self.prune_outgoing_binding_key(key),
-                    OutgoingPrune::Full => self.prune_outgoing_bindings(),
-                }
-                // A terminal result is consumed only after the exact input was
-                // applied. Defer the full timer sweep to the end of the pass
-                // (or when `ArmDeadline` nears its cap) to avoid O(N) scans per step.
-                if may_change_timers {
-                    self.timers_dirty = true;
-                }
+            if self.timers_dirty {
+                self.timers_dirty = false;
+                self.timers
+                    .retain(|token, _| self.owner.deadline_is_live(*token));
             }
-            if applied && (returns_credit || wakes_business) {
-                dispatch_blocked = false;
+            self.dispatch()?;
+            if !self.writer.is_direct() || self.progress == progress_before_pass {
+                break;
             }
-            let inputs_before_dispatch = self.inputs.len();
-            let must_dispatch = !applied
-                || !fast_batch_step
-                || cfg!(feature = "test-hooks")
-                || self.owner.outbox().is_some_and(|box_| {
-                    box_.free_slots() < 16
-                        || (!dispatch_blocked
-                            && box_.len().saturating_sub(outbox_len_at_dispatch) >= 32)
-                });
-            if must_dispatch {
-                let accepted = self.dispatch_returning_accepted()?;
-                outbox_len_at_dispatch = self.owner.outbox().map_or(0, |b| b.len());
-                dispatch_blocked = accepted == 0 && outbox_len_at_dispatch > 0;
+            self.writer_results()?;
+            let extra = self.inputs.len()
+                + self.control_inputs.len()
+                + self.closing_inputs.len().min(self.limits.pass_facts)
+                + self.terminal_inputs.len().min(self.limits.pass_facts)
+                + self.deferred_retries;
+            if extra == 0 || steps_taken >= self.limits.drain_steps {
+                break;
             }
-            if applied
-                && let Some(operation) = lifecycle_result
-                && !self.owner.lifecycle_operation_is_live(operation)
-            {
-                self.session_requests
-                    .retain(|_, pending| pending.operation != Some(operation));
-                // A known no-effect result is not a completed detach/expiry.
-                // Stop observably rather than silently losing the continuation
-                // or manufacturing a second command while its outcome is unknown.
-                if let Some(code) = control_refusal {
-                    return Err(Failure::plain(code));
-                }
-            }
-            if applied
-                && will_progress
-                && !self.owner.will_status().admission_pending
-                && !self
-                    .control_inputs
-                    .iter()
-                    .any(|input| matches!(input, Input::DiscoverWills))
-            {
-                self.queue(Input::DiscoverWills)?;
-            }
-            if applied && let Some((session, initial)) = ready_work {
-                self.rearm_ready_work(session, initial);
-            }
-            if applied && self.inputs.len() > inputs_before_dispatch {
-                step_budget = step_budget
-                    .saturating_add(self.inputs.len() - inputs_before_dispatch)
-                    .min(self.limits.drain_steps);
-            }
+            control_budget = crate::writer::CONTROL_QUEUE;
+            closing_budget = self.closing_inputs.len().min(self.limits.pass_facts);
+            terminal_budget = self.terminal_inputs.len().min(self.limits.pass_facts);
+            step_budget = steps_taken
+                .saturating_add(extra)
+                .min(self.limits.drain_steps);
+            outbox_len_at_dispatch = self.owner.outbox().map_or(0, |b| b.len());
+            dispatch_blocked = false;
         }
-        if self.timers_dirty {
-            self.timers_dirty = false;
-            self.timers
-                .retain(|token, _| self.owner.deadline_is_live(*token));
-        }
-        self.dispatch()?;
         self.schedule_maintenance();
         let deferred = self.owner.will_status().deferred;
         if deferred != self.last_will_deferred {
@@ -2375,7 +2510,12 @@ impl Runtime<'_> {
         }
     }
     fn due_deadlines(&mut self) -> Result<(), Failure> {
-        let now = Instant::now();
+        self.due_deadlines_at(Instant::now())
+    }
+    fn due_deadlines_at(&mut self, now: Instant) -> Result<(), Failure> {
+        if self.timers.is_empty() {
+            return Ok(());
+        }
         let due: Vec<_> = self
             .timers
             .iter()
@@ -2408,13 +2548,14 @@ impl Runtime<'_> {
     }
     /// The connection of every cached session the owner has attached. One
     /// pass over each side, where a lookup per session was quadratic.
-    fn bindings(&self) -> BTreeMap<SessionId, ConnectionGeneration> {
-        let cached: BTreeSet<SessionId> =
-            self.sessions.values().map(|session| session.id).collect();
-        self.owner
-            .connections()
-            .filter(|(session, _)| cached.contains(session))
-            .collect()
+    fn bindings(&self) -> FlatMap<SessionId, ConnectionGeneration> {
+        let mut out = FlatMap::new();
+        for (session, generation) in self.owner.connections() {
+            if self.session_ids.contains(&session) {
+                out.insert(session, generation);
+            }
+        }
+        out
     }
 
     fn dispatch(&mut self) -> Result<(), Failure> {
@@ -2437,7 +2578,7 @@ impl Runtime<'_> {
             self.bindings_dirty = false;
         }
         let mut sink = Sink {
-            writer: self.writer,
+            writer: &mut self.writer,
             limits: self.limits,
             peers: &mut self.peers,
             events: &self.events,
@@ -2466,6 +2607,9 @@ impl Runtime<'_> {
             frames: &mut self.frames,
             outgoing_bindings: &mut self.outgoing_bindings,
             close: Vec::new(),
+            mark_pending_peers: Vec::new(),
+            pending_work_targets: Vec::new(),
+            direct_skip_next_deadline: false,
             session_change: None,
             error: None,
         };
@@ -2473,9 +2617,17 @@ impl Runtime<'_> {
         sink.release_qos0();
         let report = self.owner.dispatch(&mut sink);
         let close = std::mem::take(&mut sink.close);
+        let mark_pending = std::mem::take(&mut sink.mark_pending_peers);
+        let work_targets = std::mem::take(&mut sink.pending_work_targets);
         let changed = sink.session_change.take();
         let error = sink.error.take();
         drop(sink);
+        for generation in mark_pending {
+            self.pending_peers.insert(generation);
+        }
+        for target in work_targets {
+            self.notify_work(target)?;
+        }
         if report.accepted != 0 {
             self.progress = self.progress.wrapping_add(1);
             if std::mem::take(&mut self.effects_awaited) {
@@ -2689,7 +2841,7 @@ impl Runtime<'_> {
         // Replies have their own reserved capacity. The owner retains bounded
         // attempt correlation; no adapter history or second retry loop exists.
         for _ in 0..crate::writer::CONTROL_QUEUE.saturating_sub(self.control_inputs.len()) {
-            let response = match self.writer.control_receiver.try_recv() {
+            let response = match self.writer.try_recv_control() {
                 Ok(reply) => {
                     self.progress = self.progress.wrapping_add(1);
                     reply
@@ -2707,7 +2859,7 @@ impl Runtime<'_> {
             WRITER_INPUTS.saturating_sub(self.writer_input_count())
         };
         for _ in 0..writer_budget {
-            let response = match self.writer.receiver.try_recv() {
+            let response = match self.writer.try_recv() {
                 Ok(r) => {
                     self.progress = self.progress.wrapping_add(1);
                     r
@@ -2930,6 +3082,9 @@ impl Runtime<'_> {
         }
     }
     fn rearm_ready_work(&mut self, session: SessionId, initial: bool) {
+        if self.queued_work_sessions.contains(&session) {
+            return;
+        }
         let usable = self.owner.connection_of(session).is_some_and(|generation| {
             self.peers
                 .get(&generation)
@@ -2972,8 +3127,12 @@ impl Runtime<'_> {
             }
         }
     }
+    #[cfg(test)]
     fn discover_work(&mut self) {
-        if self.last_will_scan.elapsed() >= Duration::from_millis(100)
+        self.discover_work_at(Instant::now());
+    }
+    fn discover_work_at(&mut self, now: Instant) {
+        if now.saturating_duration_since(self.last_will_scan) >= Duration::from_millis(100)
             && self.control_inputs.len() < crate::writer::CONTROL_QUEUE
             && !self
                 .control_inputs
@@ -2981,17 +3140,17 @@ impl Runtime<'_> {
                 .chain(self.inputs.iter())
                 .any(|input| matches!(input, Input::DiscoverWills))
         {
-            self.last_will_scan = Instant::now();
+            self.last_will_scan = now;
             self.control_inputs.push_back(Input::DiscoverWills);
         }
         #[cfg(feature = "test-hooks")]
         if MUTANT_NOTIFICATIONS_ONLY {
             return;
         }
-        if self.last_work_scan.elapsed() < Duration::from_millis(100) {
+        if now.saturating_duration_since(self.last_work_scan) < Duration::from_millis(100) {
             return;
         }
-        self.last_work_scan = Instant::now();
+        self.last_work_scan = now;
         let sessions: Vec<_> = self
             .sessions
             .values()
@@ -3119,12 +3278,14 @@ impl Runtime<'_> {
                 .try_send(net::Write {
                     expiry: None,
                     correlation: None,
-                    bytes,
+                    bytes: net::FrameBytes::from(bytes),
                     payload: None,
+                    report: net::WriteReport::Complete,
                 })
                 .is_ok()
             {
                 peer.closing = Some(("session_taken_over", Instant::now()));
+                self.pending_peers.insert(old);
             } else {
                 self.close(old, "session_taken_over")?;
             }
@@ -3185,7 +3346,7 @@ impl Runtime<'_> {
                 connection,
                 client: pending.connect.client_id.clone(),
             };
-            match self.writer.control_sender.try_send(request) {
+            match self.writer.try_send_control(request) {
                 Ok(()) => pending.awaiting = true,
                 Err(TrySendError::Full(_)) => break,
                 Err(TrySendError::Disconnected(_)) => {
@@ -3200,13 +3361,13 @@ impl Runtime<'_> {
         &mut self,
         generation: ConnectionGeneration,
         first: u8,
-        body: Vec<u8>,
+        body: impl Into<net::FrameBytes>,
     ) -> Result<(), Failure> {
         let observed = self.clock.read().map(|reading| MessageTime {
             domain: reading.domain,
             tick: reading.tick,
         });
-        self.packet_at(generation, first, body, observed)
+        self.packet_at(generation, first, body.into(), observed)
     }
 
     fn authorization_refusal(
@@ -3241,13 +3402,15 @@ impl Runtime<'_> {
                     .outgoing
                     .try_send(net::Write {
                         correlation: None,
-                        bytes,
+                        bytes: net::FrameBytes::from(bytes),
                         payload: None,
                         expiry: None,
+                        report: net::WriteReport::Complete,
                     })
                     .is_ok()
             {
                 peer.closing = Some(("not_authorized", Instant::now()));
+                self.pending_peers.insert(generation);
                 return Ok(());
             }
         }
@@ -3287,12 +3450,14 @@ impl Runtime<'_> {
                     .try_send(net::Write {
                         expiry: None,
                         correlation: None,
-                        bytes,
+                        bytes: net::FrameBytes::from(bytes),
                         payload: None,
+                        report: net::WriteReport::Complete,
                     })
                     .is_ok()
             {
                 p.closing = Some((code, Instant::now()));
+                self.pending_peers.insert(generation);
                 return Ok(());
             }
         }
@@ -3303,13 +3468,20 @@ impl Runtime<'_> {
         &mut self,
         generation: ConnectionGeneration,
         first: u8,
-        body: Vec<u8>,
+        body: impl Into<net::FrameBytes>,
         observed: net::FrameObservation,
     ) -> Result<(), Failure> {
+        let body = body.into();
         if !self.admit_generation(generation)? {
             return Ok(());
         }
-        self.wire_progress(generation)?;
+        if self
+            .peers
+            .get(&generation)
+            .is_some_and(|peer| peer.io.wire_progress.has_pending())
+        {
+            self.wire_progress(generation)?;
+        }
         let version = self.peers.get(&generation).and_then(|peer| peer.version);
         if first >> 4 == 1 && version.is_some() {
             return self.close(generation, "second_connect");
@@ -3354,12 +3526,14 @@ impl Runtime<'_> {
                             .try_send(net::Write {
                                 expiry: None,
                                 correlation: None,
-                                bytes,
+                                bytes: net::FrameBytes::from(bytes),
                                 payload: None,
+                                report: net::WriteReport::Complete,
                             })
                             .is_ok()
                     {
                         p.closing = Some(("packet_refused", Instant::now()));
+                        self.pending_peers.insert(generation);
                         return Ok(());
                     }
                 }
@@ -3455,6 +3629,7 @@ impl Runtime<'_> {
                     "authority":"reader_frame_completion",
                     "domain":hex_domain(observed.domain),"tick":observed.tick.to_string()
                 }})).map_err(event_failure)?;
+                self.message_clock_needed = true;
                 Packet::Core(packet)
             }
             other => other,
@@ -3463,7 +3638,9 @@ impl Runtime<'_> {
             .peers
             .get_mut(&generation)
             .ok_or_else(|| Failure::plain("generation_missing"))?;
-        p.last_packet = Instant::now();
+        if p.keep_alive != 0 && p.io.last_heard().is_none() {
+            p.last_packet = Instant::now();
+        }
         match decoded {
             Packet::TimedPublish { .. } => Err(Failure::plain("timed_publish_not_anchored")),
             Packet::Connect(connect) => self.connect(generation, connect),
@@ -3487,6 +3664,7 @@ impl Runtime<'_> {
                     served: Vec::new(),
                     awaiting: false,
                 });
+                self.pending_peers.insert(generation);
                 self.serve_requests(generation)
             }
             Packet::Disconnect {
@@ -3504,12 +3682,14 @@ impl Runtime<'_> {
                             .try_send(net::Write {
                                 expiry: None,
                                 correlation: None,
-                                bytes,
+                                bytes: net::FrameBytes::from(bytes),
                                 payload: None,
+                                report: net::WriteReport::Complete,
                             })
                             .is_ok()
                     {
                         p.closing = Some(("packet_refused", Instant::now()));
+                        self.pending_peers.insert(generation);
                         return Ok(());
                     }
                     return self.close(generation, "packet_refused");
@@ -3590,6 +3770,27 @@ impl Runtime<'_> {
                         .publish_qos(id.get(), ingress_order, *qos)
                         .is_err()
                 {
+                    let id_raw = id.get();
+                    let qos_val = *qos;
+                    if p.io.written.has_pending() {
+                        if let Some(code) = self.collect_written(generation)? {
+                            return self.close(generation, code);
+                        }
+                        if self.peers.get_mut(&generation).is_some_and(|peer| {
+                            peer.receiving
+                                .publish_qos(id_raw, ingress_order, qos_val)
+                                .is_ok()
+                        }) {
+                            return self.queue(Input::Packet {
+                                connection: generation,
+                                ingress_order,
+                                packet,
+                            });
+                        }
+                    }
+                    let Some(p) = self.peers.get_mut(&generation) else {
+                        return Ok(());
+                    };
                     let pending_terminal = self.frames.values().any(|frame| {
                         frame.connection.generation == generation
                             && frame
@@ -3620,10 +3821,11 @@ impl Runtime<'_> {
                             since: Instant::now(),
                             wire: pending_terminal,
                         });
+                        self.pending_peers.insert(generation);
                         self.events.emit("publish_waiting_wire",json!({"connection":generation.get().to_string(),"details":{"publish_order":ingress_order.to_string()}})).map_err(event_failure)?;
                         return Ok(());
                     }
-                    let bytes = vec![0xe0, 2, 0x93, 0];
+                    let bytes = net::FrameBytes::from_slice(&[0xe0, 2, 0x93, 0]);
                     if p.version != Some(codec::Version::V311)
                         && bytes.len() <= p.max_packet
                         && p.io
@@ -3633,10 +3835,12 @@ impl Runtime<'_> {
                                 correlation: None,
                                 bytes,
                                 payload: None,
+                                report: net::WriteReport::Complete,
                             })
                             .is_ok()
                     {
                         p.closing = Some(("receive_maximum", Instant::now()));
+                        self.pending_peers.insert(generation);
                         return Ok(());
                     }
                     return self.close(generation, "receive_maximum");
@@ -3761,20 +3965,40 @@ impl Runtime<'_> {
         Ok(false)
     }
     fn connections(&mut self) -> Result<(), Failure> {
+        self.connections_at(Instant::now())
+    }
+    fn connections_at(&mut self, now: Instant) -> Result<(), Failure> {
         self.pump_will_connects()?;
         let mut keys = std::mem::take(&mut self.peer_keys);
         keys.clear();
-        keys.extend(self.peers.keys().copied());
+        let deadline_sweep = now.saturating_duration_since(self.last_peer_deadline_scan)
+            >= Duration::from_millis(100);
+        self.ready_peers.drain_into(&mut self.ready_raw);
+        if deadline_sweep {
+            self.last_peer_deadline_scan = now;
+            self.ready_raw.clear();
+            keys.extend(self.peers.keys().copied());
+            if keys.len() > 1 {
+                keys.sort_unstable();
+            }
+        } else {
+            keys.extend(self.pending_peers.iter().copied());
+            keys.extend(self.ready_raw.drain(..).map(ConnectionGeneration::new));
+            #[cfg(test)]
+            for (&generation, peer) in self.peers.iter() {
+                if peer.io.uses_std_channel() {
+                    keys.push(generation);
+                }
+            }
+            if keys.len() > 1 {
+                keys.sort_unstable();
+                keys.dedup();
+            }
+        }
         if !keys.is_empty() {
             let start = self.peer_cursor % keys.len();
             keys.rotate_left(start);
             self.peer_cursor = start + 1;
-        }
-        let now = Instant::now();
-        let deadline_sweep = now.saturating_duration_since(self.last_peer_deadline_scan)
-            >= Duration::from_millis(100);
-        if deadline_sweep {
-            self.last_peer_deadline_scan = now;
         }
         let result = (|| -> Result<(), Failure> {
             for &generation in &keys {
@@ -3796,9 +4020,17 @@ impl Runtime<'_> {
                             || peer.capacity_wait.is_some();
                         (state_active, needs_deadline, peer.retire_code)
                     }
-                    None => continue,
+                    None => {
+                        if !self.pending_peers.is_empty() {
+                            self.pending_peers.remove(&generation);
+                        }
+                        continue;
+                    }
                 };
                 if !active && !needs_deadline_check {
+                    if !self.pending_peers.is_empty() {
+                        self.pending_peers.remove(&generation);
+                    }
                     continue;
                 }
                 if let Some(code) = is_retiring {
@@ -3825,14 +4057,25 @@ impl Runtime<'_> {
                     self.finish_close(generation, code)?;
                     continue;
                 }
+                let mut drained_incoming = true;
                 if active {
-                    let tls = self
-                        .peers
-                        .get(&generation)
-                        .is_some_and(|peer| peer.io.is_tls());
+                    let (tls, has_wire_progress, has_written) = match self.peers.get(&generation) {
+                        Some(peer) => (
+                            peer.io.is_tls(),
+                            peer.io.wire_progress.has_pending(),
+                            peer.io.written.has_pending(),
+                        ),
+                        None => continue,
+                    };
                     let mut tls_close = None;
+                    let mut write_close = None;
                     let mut input_ended = false;
-                    self.wire_progress(generation)?;
+                    if has_wire_progress {
+                        self.wire_progress(generation)?;
+                    }
+                    if has_written && let Some(code) = self.collect_written(generation)? {
+                        write_close = Some(code);
+                    }
                     let backpressured = self.peers.get_mut(&generation).is_some_and(|peer| {
                         if let Some(effect) = peer.blocked_output
                             && self.owner.outbox().is_some_and(|outbox| {
@@ -3849,7 +4092,7 @@ impl Runtime<'_> {
                         self.retry_deferred_publish(generation)?;
                     }
                     self.serve_requests(generation)?;
-                    let mut drained_incoming = false;
+                    drained_incoming = false;
                     for _ in 0..32 {
                         // A CONNECT can use one slot now and reserve one for Open.
                         // Leave the bytes with their socket reader until both fit.
@@ -3880,6 +4123,10 @@ impl Runtime<'_> {
                                     body,
                                     observed,
                                 }),
+                                None if !p.io.incoming.has_pending() => {
+                                    drained_incoming = true;
+                                    break;
+                                }
                                 None => p.io.incoming.try_recv(),
                             },
                             None => break,
@@ -3954,10 +4201,15 @@ impl Runtime<'_> {
                             }
                         }
                     }
-                    if !drained_incoming && let Some(peer) = self.peers.get(&generation) {
-                        peer.io.mark_activity();
+                    if self
+                        .peers
+                        .get(&generation)
+                        .is_some_and(|peer| peer.io.written.has_pending())
+                        && let Some(code) = self.collect_written(generation)?
+                    {
+                        write_close.get_or_insert(code);
                     }
-                    if let Some(code) = self.collect_written(generation)? {
+                    if let Some(code) = write_close {
                         if tls {
                             tls_close.get_or_insert(code);
                         } else {
@@ -3985,6 +4237,7 @@ impl Runtime<'_> {
                         {
                             let (_, since) = peer.closing.get_or_insert((code, now));
                             if now.saturating_duration_since(*since) < Duration::from_millis(300) {
+                                self.pending_peers.insert(generation);
                                 continue;
                             }
                         }
@@ -4024,6 +4277,18 @@ impl Runtime<'_> {
                         self.close(generation, code)?;
                     }
                 }
+                match self.peers.get(&generation) {
+                    Some(peer)
+                        if peer.needs_poll() || !drained_incoming || peer.io.has_pending() =>
+                    {
+                        self.pending_peers.insert(generation);
+                    }
+                    _ => {
+                        if !self.pending_peers.is_empty() {
+                            self.pending_peers.remove(&generation);
+                        }
+                    }
+                }
             }
             Ok(())
         })();
@@ -4036,7 +4301,7 @@ impl Runtime<'_> {
                 .frames
                 .iter()
                 .filter(|(_, v)| !self.peers.contains_key(&v.connection.generation))
-                .map(|(id, v)| (*id, v.connection))
+                .map(|(id, v)| (id, v.connection))
                 .collect();
             for (effect, connection) in stale {
                 self.frames.remove(&effect);
@@ -4615,17 +4880,17 @@ enum OutgoingPrune {
     Full,
 }
 
-struct Sink<'a> {
-    writer: &'a Writer,
-    peers: &'a mut BTreeMap<ConnectionGeneration, Peer>,
+struct Sink<'a, 'b> {
+    writer: &'a mut StoreHandle<'b>,
+    peers: &'a mut FlatMap<ConnectionGeneration, Peer>,
     events: &'a Events,
-    inflight: &'a mut BTreeMap<EffectId, OperationId>,
+    inflight: &'a mut ScopedFlatMap<EffectId, OperationId>,
     lifecycle_inflight: &'a mut BTreeMap<EffectId, OperationId>,
     lifecycle_operation: Option<OperationId>,
     will_operation: Option<OperationId>,
     will_reads: &'a mut Option<EffectId>,
-    work_reads: &'a mut BTreeMap<EffectId, SessionId>,
-    bindings: &'a BTreeMap<SessionId, ConnectionGeneration>,
+    work_reads: &'a mut ScopedFlatMap<EffectId, SessionId>,
+    bindings: &'a FlatMap<SessionId, ConnectionGeneration>,
     #[cfg(feature = "test-hooks")]
     work_cache: &'a BTreeMap<DeliveryId, WorkItem>,
     #[cfg(feature = "test-hooks")]
@@ -4636,22 +4901,25 @@ struct Sink<'a> {
     releasing_qos0: bool,
     timers: &'a mut BTreeMap<DeadlineToken, Instant>,
     inputs: &'a mut VecDeque<Input>,
-    queued_work_sessions: &'a mut BTreeSet<SessionId>,
+    queued_work_sessions: &'a mut FlatSet<SessionId>,
     terminal_inputs: &'a mut VecDeque<Input>,
-    terminal_effects: &'a mut BTreeMap<EffectId, u32>,
+    terminal_effects: &'a mut ScopedFlatMap<EffectId, u32>,
     ordinary_reserved: usize,
     queued_writer_replies: Option<usize>,
-    frames: &'a mut BTreeMap<EffectId, PendingFrame>,
-    outgoing_bindings: &'a mut BTreeMap<(ConnectionKey, OutboundPacketId), PubackTarget>,
+    frames: &'a mut ScopedFlatMap<EffectId, PendingFrame>,
+    outgoing_bindings: &'a mut FlatMap<(ConnectionKey, OutboundPacketId), PubackTarget>,
     limits: Limits,
     close: Vec<(ConnectionGeneration, &'static str)>,
+    mark_pending_peers: Vec<ConnectionGeneration>,
+    pending_work_targets: Vec<SessionId>,
+    direct_skip_next_deadline: bool,
     session_change: Option<AppliedSessionChange>,
     error: Option<Failure>,
 }
-impl Sink<'_> {
+impl Sink<'_, '_> {
     fn push_terminal(&mut self, input: Input) {
         if let Some(id) = Runtime::terminal_effect(&input) {
-            *self.terminal_effects.entry(id).or_insert(0) += 1;
+            *self.terminal_effects.get_or_insert_default(id) += 1;
         }
         self.terminal_inputs.push_back(input);
     }
@@ -4671,7 +4939,7 @@ impl Sink<'_> {
         queued + pending < WRITER_INPUTS
     }
 }
-impl Sink<'_> {
+impl Sink<'_, '_> {
     fn submit_lifecycle(&mut self, effect: OwnedEffect) -> SubmitResult {
         if self.lifecycle_inflight.len() >= LIFECYCLE_IN_FLIGHT {
             return SubmitResult::NotSubmitted {
@@ -4691,8 +4959,7 @@ impl Sink<'_> {
         };
         match self
             .writer
-            .control_sender
-            .try_send(ControlRequest::Lifecycle(effect))
+            .try_send_control(ControlRequest::Lifecycle(effect))
         {
             Ok(()) => {
                 self.lifecycle_inflight.insert(id, operation_id);
@@ -4719,7 +4986,7 @@ impl Sink<'_> {
     }
 }
 #[cfg(feature = "test-hooks")]
-impl Sink<'_> {
+impl Sink<'_, '_> {
     fn release_qos0(&mut self) {
         let Some(front) = self.emission_barriers.front_mut() else {
             return;
@@ -4760,7 +5027,7 @@ impl Sink<'_> {
         }
     }
 }
-impl EffectSink for Sink<'_> {
+impl EffectSink for Sink<'_, '_> {
     fn try_submit(&mut self, effect: OwnedEffect) -> SubmitResult {
         let id = effect.id();
         let refused = |effect, reason| SubmitResult::NotSubmitted { effect, reason };
@@ -4771,6 +5038,9 @@ impl EffectSink for Sink<'_> {
         // effects: a later Persist/CONNACK must not race this dispatch tail.
         if self.session_change.is_some() || !self.close.is_empty() {
             return refused(effect, SubmitBlock::QueueFull);
+        }
+        if !matches!(effect.effect(), Effect::ArmDeadline { .. }) {
+            self.direct_skip_next_deadline = false;
         }
         match effect.effect() {
             Effect::SessionChanged {
@@ -4809,12 +5079,14 @@ impl EffectSink for Sink<'_> {
                             .try_send(net::Write {
                                 expiry: None,
                                 correlation: None,
-                                bytes,
+                                bytes: net::FrameBytes::from(bytes),
                                 payload: None,
+                                report: net::WriteReport::Complete,
                             })
                             .is_ok()
                     {
                         peer.closing = Some(("session_refused", Instant::now()));
+                        self.mark_pending_peers.push(generation);
                     } else {
                         self.close.push((generation, "session_refused"));
                     }
@@ -4935,6 +5207,7 @@ impl EffectSink for Sink<'_> {
                                 correlation: Some((id, connection)),
                                 bytes: encoded.header,
                                 payload: encoded.payload,
+                                report: net::WriteReport::Complete,
                             });
                             #[cfg(feature = "test-hooks")]
                             if result.is_ok()
@@ -4945,6 +5218,7 @@ impl EffectSink for Sink<'_> {
                                     correlation: None,
                                     bytes,
                                     payload,
+                                    report: net::WriteReport::None,
                                 });
                             }
                             match result {
@@ -5034,8 +5308,9 @@ impl EffectSink for Sink<'_> {
                     let _ = peer.io.outgoing.try_send(net::Write {
                         expiry: None,
                         correlation: None,
-                        bytes,
+                        bytes: net::FrameBytes::from(bytes),
                         payload: None,
+                        report: net::WriteReport::Complete,
                     });
                 }
                 #[cfg(feature = "test-hooks")]
@@ -5069,8 +5344,9 @@ impl EffectSink for Sink<'_> {
                     let _ = peer.io.outgoing.try_send(net::Write {
                         expiry: None,
                         correlation: None,
-                        bytes,
+                        bytes: net::FrameBytes::from(bytes),
                         payload: None,
+                        report: net::WriteReport::Complete,
                     });
                 }
                 #[cfg(feature = "test-hooks")]
@@ -5087,12 +5363,15 @@ impl EffectSink for Sink<'_> {
                     let _ = p.io.outgoing.try_send(net::Write {
                         expiry: None,
                         correlation: None,
-                        bytes: codec::encode(OutboundFrame::Pubrec {
-                            packet_id: admission.source.packet_id,
-                            reason: mqttiumd_contract::packet::AckReason::Success,
-                        })
-                        .unwrap_or_default(),
+                        bytes: net::FrameBytes::from(
+                            codec::encode(OutboundFrame::Pubrec {
+                                packet_id: admission.source.packet_id,
+                                reason: mqttiumd_contract::packet::AckReason::Success,
+                            })
+                            .unwrap_or_default(),
+                        ),
                         payload: None,
+                        report: net::WriteReport::Complete,
                     });
                 }
                 #[cfg(feature = "test-hooks")]
@@ -5109,15 +5388,48 @@ impl EffectSink for Sink<'_> {
                     let _ = p.io.outgoing.try_send(net::Write {
                         expiry: None,
                         correlation: None,
-                        bytes: codec::encode(OutboundFrame::Puback {
-                            packet_id: admission.source.packet_id,
-                            reason: mqttiumd_contract::packet::PubackReason::Success,
-                        })
-                        .unwrap_or_default(),
+                        bytes: net::FrameBytes::from(
+                            codec::encode(OutboundFrame::Puback {
+                                packet_id: admission.source.packet_id,
+                                reason: mqttiumd_contract::packet::PubackReason::Success,
+                            })
+                            .unwrap_or_default(),
+                        ),
                         payload: None,
+                        report: net::WriteReport::Complete,
                     });
                 }
-                match self.writer.sender.try_send(Request::Effect(effect)) {
+                if let Some((reply, targets)) = self.writer.apply_persist_direct(command) {
+                    self.inputs.push_back(Input::StoreResult {
+                        effect: id,
+                        operation: operation_id,
+                        reply,
+                    });
+                    if let Some(count) = self.queued_writer_replies.as_mut() {
+                        *count += 1;
+                    }
+                    if !targets.is_empty() {
+                        self.pending_work_targets.extend(targets);
+                    }
+                    self.direct_skip_next_deadline = matches!(
+                        reply,
+                        StoreReply::Outcome(
+                            StoreOutcome::Committed(_) | StoreOutcome::RejectedCertain(_)
+                        )
+                    );
+                    if self
+                        .events
+                        .emit_with("command_submitted", || {
+                            json!({"operation":operation(operation_id),"command_kind":command_kind,"details":details.unwrap_or_else(|| json!({}))})
+                        })
+                        .is_err()
+                    {
+                        self.error = Some(Failure::plain("events_unavailable"));
+                    }
+                    let _ = effect.into_parts();
+                    return SubmitResult::Accepted;
+                }
+                match self.writer.try_send(Request::Effect(effect)) {
                     Ok(()) => {
                         self.inflight.insert(id, operation_id);
                         #[cfg(feature = "test-hooks")]
@@ -5159,7 +5471,7 @@ impl EffectSink for Sink<'_> {
                     return refused(effect, SubmitBlock::InFlightLimit);
                 }
                 let op = *operation;
-                match self.writer.sender.try_send(Request::Effect(effect)) {
+                match self.writer.try_send(Request::Effect(effect)) {
                     Ok(()) => {
                         self.inflight.insert(id, op);
                         SubmitResult::Accepted
@@ -5274,7 +5586,8 @@ impl EffectSink for Sink<'_> {
                     });
                     return SubmitResult::Accepted;
                 }
-                let bytes = match codec::encode_for(peer.version.unwrap_or_default(), frame) {
+                let bytes = match codec::encode_frame_bytes(peer.version.unwrap_or_default(), frame)
+                {
                     Ok(bytes) if bytes.len() <= peer.max_packet => bytes,
                     Err(error) if error.code() == "AckNotEncodableInMqtt311" => {
                         let code = if matches!(
@@ -5299,11 +5612,17 @@ impl EffectSink for Sink<'_> {
                         return refused(effect, SubmitBlock::Closed);
                     }
                 };
+                let report = if cfg!(any(test, feature = "test-hooks")) && terminal.is_some() {
+                    net::WriteReport::CompleteAndWireProgress
+                } else {
+                    net::WriteReport::Complete
+                };
                 match peer.io.outgoing.try_send(net::Write {
                     expiry: None,
                     correlation: Some((id, connection)),
                     bytes,
                     payload: None,
+                    report,
                 }) {
                     Ok(()) => {
                         if let Some((key, target)) = binding {
@@ -5313,6 +5632,7 @@ impl EffectSink for Sink<'_> {
                             // Pipeline processing starts only after the core's
                             // CONNACK occupies the ordered socket output queue.
                             peer.pending = false;
+                            self.mark_pending_peers.push(generation);
                             // Readiness is effective only after the ordered
                             // CONNACK enters the bounded writer queue. The
                             // earlier cache-install fence deliberately kept
@@ -5340,6 +5660,7 @@ impl EffectSink for Sink<'_> {
                         SubmitResult::Accepted
                     }
                     Err(TrySendError::Full(_)) => {
+                        self.mark_pending_peers.push(generation);
                         if peer.blocked_output.replace(id) != Some(id)
                             && self.events.emit_with("effect_retained",||json!({"connection":generation.get().to_string(),"details":{"code":"output_queue_full","effect":effect_text(id),"packet_kind":kind}})).is_err(){self.error=Some(Failure::plain("events_unavailable"));}
                         refused(effect, SubmitBlock::TransportBackpressure)
@@ -5372,12 +5693,14 @@ impl EffectSink for Sink<'_> {
                                 .try_send(net::Write {
                                     expiry: None,
                                     correlation: None,
-                                    bytes,
+                                    bytes: net::FrameBytes::from(bytes),
                                     payload: None,
+                                    report: net::WriteReport::Complete,
                                 })
                                 .is_ok()
                         {
                             peer.closing = Some((code, Instant::now()));
+                            self.mark_pending_peers.push(*connection);
                             flushing = true;
                         }
                     }
@@ -5390,13 +5713,10 @@ impl EffectSink for Sink<'_> {
             }
             Effect::CollectReceipts { collection } => {
                 let collection = *collection;
-                match self
-                    .writer
-                    .control_sender
-                    .try_send(ControlRequest::Collect {
-                        effect: id,
-                        collection,
-                    }) {
+                match self.writer.try_send_control(ControlRequest::Collect {
+                    effect: id,
+                    collection,
+                }) {
                     Ok(()) => {
                         let mut details = crate::writer::collection_details(collection);
                         details["effect"] = json!(effect_text(id));
@@ -5421,6 +5741,10 @@ impl EffectSink for Sink<'_> {
                 }
             }
             Effect::ArmDeadline { token, after } => {
+                if std::mem::take(&mut self.direct_skip_next_deadline) {
+                    let _ = effect.into_parts();
+                    return SubmitResult::Accepted;
+                }
                 if self.timers.len() >= self.limits.timers {
                     return refused(effect, SubmitBlock::QueueFull);
                 }
@@ -5453,7 +5777,7 @@ impl EffectSink for Sink<'_> {
                 if self.will_reads.is_some() || !self.writer_reply_room() {
                     return refused(effect, SubmitBlock::InFlightLimit);
                 }
-                match self.writer.sender.try_send(Request::Effect(effect)) {
+                match self.writer.try_send(Request::Effect(effect)) {
                     Ok(()) => {
                         *self.will_reads = Some(id);
                         SubmitResult::Accepted
@@ -5472,7 +5796,7 @@ impl EffectSink for Sink<'_> {
                     return refused(effect, SubmitBlock::InFlightLimit);
                 }
                 let session = *session;
-                match self.writer.sender.try_send(Request::Effect(effect)) {
+                match self.writer.try_send(Request::Effect(effect)) {
                     Ok(()) => {
                         self.work_reads.insert(id, session);
                         SubmitResult::Accepted
@@ -5602,31 +5926,44 @@ impl EffectSink for Sink<'_> {
                 // Register before the network task can observe this frame.
                 // A rejected queue submission rolls this precise entry back.
                 self.outgoing_bindings.insert(binding_key, binding);
+                let track_written = write_expiry.is_some()
+                    || peer.blocked_output == Some(id)
+                    || self.events.records("frame_written")
+                    || cfg!(any(test, feature = "test-hooks"));
                 match peer.io.outgoing.try_send(net::Write {
                     expiry: write_expiry,
-                    correlation: Some((id, connection)),
+                    correlation: track_written.then_some((id, connection)),
                     bytes: encoded.header,
                     payload: encoded.payload,
+                    report: if track_written {
+                        net::WriteReport::Complete
+                    } else {
+                        net::WriteReport::None
+                    },
                 }) {
                     Ok(()) => {
-                        self.frames.insert(
-                            id,
-                            PendingFrame {
-                                connection,
-                                kind: "PUBLISH",
-                                packet_id: Some(packet_id.get()),
-                                receive_serial: None,
-                                terminal: None,
-                                wire_released: false,
-                                was_retained: peer.submitted_output(id),
-                            },
-                        );
+                        let was_retained = peer.submitted_output(id);
+                        if track_written {
+                            self.frames.insert(
+                                id,
+                                PendingFrame {
+                                    connection,
+                                    kind: "PUBLISH",
+                                    packet_id: Some(packet_id.get()),
+                                    receive_serial: None,
+                                    terminal: None,
+                                    wire_released: false,
+                                    was_retained,
+                                },
+                            );
+                        }
                         let _ = effect.into_parts();
                         if self.events.emit_with("frame_queued",||json!({"connection":generation.get().to_string(),"details":{"packet_kind":"PUBLISH","effect":effect_text(id),"delivery":delivery_text(delivery),"target":connection.session.get().to_string(),"packet_id":packet_id.get(),"claim":operation_text(claim),"dup":dup,"retain":retain}})).is_err(){self.error=Some(Failure::plain("events_unavailable"));}
                         SubmitResult::Accepted
                     }
                     Err(TrySendError::Full(_)) => {
                         self.outgoing_bindings.remove(&binding_key);
+                        self.mark_pending_peers.push(generation);
                         if peer.blocked_output.replace(id) != Some(id)
                             && self.events.emit_with("effect_retained",||json!({"connection":generation.get().to_string(),"details":{"code":"output_queue_full","effect":effect_text(id),"packet_kind":"PUBLISH"}})).is_err(){self.error=Some(Failure::plain("events_unavailable"));}
                         refused(effect, SubmitBlock::TransportBackpressure)
@@ -5898,14 +6235,51 @@ pub fn run(config: Config) -> Result<(), Failure> {
     ctrlc::set_handler(move || signal.store(true, Ordering::Relaxed))
         .map_err(|_| Failure::plain("signal_handler"))?;
     events.emit("starting",json!({"details":{"test_hooks":cfg!(feature="test-hooks"),"sqlite_kill_points":mqttiumd_store_sqlite::KILL_POINTS_ENABLED}})).map_err(event_failure)?;
+    let policy = security
+        .as_ref()
+        .map(|security| security.policy.storage().clone());
+    let use_direct = matches!(
+        config.storage_mode,
+        crate::writer::StorageMode::Volatile { .. }
+    ) && config.hooks.directory.is_none();
+    if use_direct {
+        let (mut direct, boot) = DirectWriter::open(
+            config.db,
+            events.clone(),
+            config.hooks.clone(),
+            cancel.clone(),
+            policy,
+            config.require_existing_db,
+            config.storage_mode,
+        )?;
+        let result = run_inner(
+            &config.listen,
+            config.hooks,
+            &events,
+            cancel.clone(),
+            StoreHandle::Direct(&mut direct),
+            Some(boot),
+            security,
+            config.limits,
+        );
+        if let Err(failure) = &result {
+            let _ = events.emit("startup_or_runtime_refused", failure.fields());
+        }
+        cancel.store(true, Ordering::Relaxed);
+        let writer_result = direct.finish();
+        if let Err(failure) = &writer_result {
+            let _ = events.emit("startup_or_runtime_refused", failure.fields());
+        } else {
+            events.emit("stopped",json!({"details":{"writer_released":true,"accepted_commands_certainly_rejected":false}})).map_err(event_failure)?;
+        }
+        return result.and(writer_result);
+    }
     let mut writer = Writer::spawn_configured(
         config.db,
         events.clone(),
         config.hooks.clone(),
         cancel.clone(),
-        security
-            .as_ref()
-            .map(|security| security.policy.storage().clone()),
+        policy,
         config.require_existing_db,
         config.storage_mode,
     )?;
@@ -5914,7 +6288,8 @@ pub fn run(config: Config) -> Result<(), Failure> {
         config.hooks,
         &events,
         cancel.clone(),
-        &mut writer,
+        StoreHandle::Threaded(&mut writer),
+        None,
         security,
         config.limits,
     );
@@ -6051,20 +6426,29 @@ fn startup_reply<T>(
         }
     }
 }
+#[allow(clippy::too_many_arguments)]
 fn run_inner(
     listen: &SocketAddr,
     hooks: Hooks,
     events: &Events,
     cancel: Arc<AtomicBool>,
-    writer: &mut Writer,
+    mut writer: StoreHandle<'_>,
+    direct_boot: Option<Boot>,
     security: Option<Security>,
     limits: Limits,
 ) -> Result<(), Failure> {
     let _ = &hooks;
-    let boot = writer
-        .boot
-        .recv_timeout(Duration::from_secs(10))
-        .map_err(|_| Failure::plain("startup_deadline"))??;
+    let (boot, wake) = match (&mut writer, direct_boot) {
+        (StoreHandle::Direct(_), Some(boot)) => (boot, crate::wake::Wake::new()),
+        (StoreHandle::Threaded(w), None) => {
+            let boot = w
+                .boot
+                .recv_timeout(Duration::from_secs(10))
+                .map_err(|_| Failure::plain("startup_deadline"))??;
+            (boot, w.wake.clone())
+        }
+        _ => return Err(Failure::plain("startup_protocol")),
+    };
     let epoch = boot.grant.epoch();
     let incarnation = boot.grant.incarnation();
     let collect_closed = boot.collect_closed;
@@ -6123,7 +6507,7 @@ fn run_inner(
         .collect();
     let mut runtime = Runtime {
         progress: 0,
-        wake: writer.wake.clone(),
+        wake,
         limits,
         security,
         message_expiry_request: None,
@@ -6134,6 +6518,8 @@ fn run_inner(
         message_expiry_scan: Instant::now(),
         message_expiry_input: None,
         message_last_time: None,
+        last_message_clock_sync: Instant::now(),
+        message_clock_needed: true,
         clock: boot.clock,
         clock_anchor: boot.clock_anchor,
         clock_checkpoint: None,
@@ -6146,7 +6532,11 @@ fn run_inner(
         _authority: authority,
         writer,
         events: events.clone(),
-        peers: BTreeMap::new(),
+        peers: FlatMap::new(),
+        ready_peers: net::ReadyQueue::new(),
+        ready_raw: Vec::new(),
+        pending_peers: FlatSet::new(),
+        capacity_waiters: 0,
         retiring: Vec::new(),
         session_ids: boot.sessions.values().map(|s| s.id).collect(),
         sessions: boot.sessions,
@@ -6163,22 +6553,23 @@ fn run_inner(
         control_inputs: VecDeque::new(),
         closing_inputs: VecDeque::new(),
         terminal_inputs: VecDeque::new(),
-        terminal_effects: BTreeMap::new(),
+        terminal_effects: ScopedFlatMap::new(),
         deferred_inputs: VecDeque::new(),
+        deferred_by_conn: FlatMap::new(),
         effects_awaited: false,
         deferred_retries: 0,
         credit_progress: Instant::now(),
         timers: BTreeMap::new(),
-        inflight: BTreeMap::new(),
+        inflight: ScopedFlatMap::new(),
         lifecycle_inflight: BTreeMap::new(),
         last_session_change: None,
         session_cardinality_dirty: false,
         last_session_cardinality: None,
-        work_reads: BTreeMap::new(),
+        work_reads: ScopedFlatMap::new(),
         pending_work: VecDeque::new(),
         pending_work_set: BTreeSet::new(),
-        queued_work_sessions: BTreeSet::new(),
-        cached_bindings: BTreeMap::new(),
+        queued_work_sessions: FlatSet::new(),
+        cached_bindings: FlatMap::new(),
         bindings_dirty: true,
         stale_frames_dirty: false,
         timers_dirty: false,
@@ -6204,8 +6595,8 @@ fn run_inner(
         deferred_ack: None,
         #[cfg(feature = "test-hooks")]
         deferred_ack_used: false,
-        frames: BTreeMap::new(),
-        outgoing_bindings: BTreeMap::new(),
+        frames: ScopedFlatMap::new(),
+        outgoing_bindings: FlatMap::new(),
         puback_observation: 0,
         #[cfg(feature = "test-hooks")]
         copied_puback: None,
@@ -6226,17 +6617,20 @@ fn run_inner(
         let mut saw_epoch = false;
         loop {
             check_startup_cancel(&cancel)?;
-            runtime
-                .writer
-                .sender
-                .send(Request::Recovery(cursor))
-                .map_err(|_| Failure::plain("writer_closed"))?;
-            let response = startup_reply(
-                &runtime.writer.receiver,
-                &cancel,
-                Instant::now() + Duration::from_secs(10),
-                "recovery_deadline",
-            )?;
+            let response = match runtime.writer.exec_recovery(cursor)? {
+                Some(reply) => reply,
+                None => {
+                    let StoreHandle::Threaded(w) = &runtime.writer else {
+                        return Err(Failure::plain("recovery_protocol"));
+                    };
+                    startup_reply(
+                        &w.receiver,
+                        &cancel,
+                        Instant::now() + Duration::from_secs(10),
+                        "recovery_deadline",
+                    )?
+                }
+            };
             let Response::Recovery(page) = response else {
                 return Err(Failure::plain("recovery_protocol"));
             };
@@ -6297,20 +6691,24 @@ fn run_inner(
                 if Instant::now() >= deadline {
                     return Err(Failure::plain("startup_collection_deadline"));
                 }
-                runtime
-                    .writer
-                    .control_sender
-                    .send(ControlRequest::Closed(collection))
-                    .map_err(|_| Failure::plain("writer_control_disconnected"))?;
+                let reply = match runtime.writer.exec_closed_collection(collection)? {
+                    Some(reply) => reply,
+                    None => {
+                        let StoreHandle::Threaded(w) = &runtime.writer else {
+                            return Err(Failure::plain("startup_collection_protocol"));
+                        };
+                        startup_reply(
+                            &w.control_receiver,
+                            &cancel,
+                            deadline,
+                            "startup_collection_deadline",
+                        )?
+                    }
+                };
                 let ControlResponse::Closed {
                     collection: found,
                     result,
-                } = startup_reply(
-                    &runtime.writer.control_receiver,
-                    &cancel,
-                    deadline,
-                    "startup_collection_deadline",
-                )?
+                } = reply
                 else {
                     return Err(Failure::plain("startup_collection_protocol"));
                 };

@@ -1007,6 +1007,243 @@ impl Writer {
         }
     }
 }
+
+/// Single-threaded synchronous store engine for `--storage-mode volatile`
+/// (when test-hooks are inactive), eliminating cross-thread channels, mutex
+/// handoffs, Condvar wakeups, and `Arc` cache-line bouncing on every durable
+/// command while preserving the exact `VolatileStore`, `DurableStore`, and
+/// atomic SQLite snapshot semantics.
+pub(crate) struct DirectWriter {
+    store: StoreBackend,
+    events: Events,
+    hooks: Hooks,
+    cancel: Arc<AtomicBool>,
+    state: BusinessState,
+    responses: VecDeque<Response>,
+    control_responses: VecDeque<ControlResponse>,
+    last_snapshot_check: Instant,
+}
+
+impl DirectWriter {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn open(
+        path: PathBuf,
+        events: Events,
+        hooks: Hooks,
+        cancel: Arc<AtomicBool>,
+        policy: Option<mqttiumd_store_sqlite::StoragePolicy>,
+        require_existing: bool,
+        storage_mode: StorageMode,
+    ) -> Result<(Self, Boot), Failure> {
+        if hooks.directory.is_some() {
+            return Err(Failure::plain("volatile_test_hooks_unsupported"));
+        }
+        let clock = Arc::new(SystemClock::new().map_err(|error| Failure::plain(error.code()))?);
+        let (store, boot) = bootstrap_bound(&path, clock, policy, require_existing, storage_mode)?;
+        Ok((
+            Self {
+                store,
+                events,
+                hooks,
+                cancel,
+                state: BusinessState::default(),
+                responses: VecDeque::new(),
+                control_responses: VecDeque::new(),
+                last_snapshot_check: Instant::now(),
+            },
+            boot,
+        ))
+    }
+
+    pub(crate) fn apply_persist_inline(
+        &mut self,
+        command: &mqttiumd_contract::command::Command,
+    ) -> (StoreReply, Vec<SessionId>) {
+        use mqttiumd_contract::outcome::{CommitFacts, StoreOutcome};
+        let recipe = command.recipe.get();
+        let applied = self.store.apply(command);
+        record_applied(recipe, &applied, &self.events, &self.cancel);
+        record_result(recipe, &applied, &self.events, &self.cancel);
+        let targets = if matches!(
+            applied.reply,
+            StoreReply::Outcome(StoreOutcome::Committed(
+                CommitFacts::PublicationAdmitted { .. }
+                    | CommitFacts::RetainedQos0Stored { .. }
+                    | CommitFacts::SubscriptionsChanged { .. }
+            ))
+        ) {
+            targets_of(recipe)
+        } else {
+            Vec::new()
+        };
+        (applied.reply, targets)
+    }
+
+    pub(crate) fn exec_request(&mut self, request: Request) {
+        let reply = business_response(
+            &mut self.store,
+            request,
+            &self.events,
+            &self.hooks,
+            &self.cancel,
+            &mut self.state,
+        );
+        self.responses.push_back(reply);
+    }
+
+    pub(crate) fn exec_control(&mut self, request: ControlRequest) {
+        let reply = control_response(
+            &mut self.store,
+            request,
+            &self.events,
+            &self.hooks,
+            &self.cancel,
+            &mut self.state,
+        );
+        self.control_responses.push_back(reply);
+    }
+
+    pub(crate) fn try_recv(&mut self) -> Result<Response, TryRecvError> {
+        self.responses.pop_front().ok_or(TryRecvError::Empty)
+    }
+
+    pub(crate) fn try_recv_control(&mut self) -> Result<ControlResponse, TryRecvError> {
+        self.control_responses
+            .pop_front()
+            .ok_or(TryRecvError::Empty)
+    }
+
+    pub(crate) fn maybe_periodic_snapshot(&mut self, now: Instant) {
+        if now.saturating_duration_since(self.last_snapshot_check) >= Duration::from_millis(100) {
+            self.last_snapshot_check = now;
+            let _ = self.store.maybe_snapshot(&self.events, false);
+        }
+    }
+
+    pub(crate) fn finish(mut self) -> Result<(), Failure> {
+        self.store.maybe_snapshot(&self.events, true)
+    }
+}
+
+/// Abstracts the exclusive store worker between the threaded writer (SQLite
+/// durable, `.mlog` log-first, and test-hook runs) and the zero-hop in-thread
+/// `DirectWriter` used for `--storage-mode volatile`.
+pub(crate) enum StoreHandle<'a> {
+    Threaded(&'a mut Writer),
+    Direct(&'a mut DirectWriter),
+}
+
+#[expect(
+    clippy::result_large_err,
+    reason = "the refused request is handed back by value"
+)]
+impl StoreHandle<'_> {
+    #[cfg(test)]
+    pub(crate) fn threaded_mut(&mut self) -> &mut Writer {
+        match self {
+            Self::Threaded(writer) => writer,
+            Self::Direct(_) => panic!("expected threaded writer"),
+        }
+    }
+
+    #[inline]
+    pub(crate) fn is_direct(&self) -> bool {
+        matches!(self, Self::Direct(_))
+    }
+
+    pub(crate) fn try_send(&mut self, request: Request) -> Result<(), TrySendError<Request>> {
+        match self {
+            Self::Threaded(writer) => writer.sender.try_send(request),
+            Self::Direct(direct) => {
+                direct.exec_request(request);
+                Ok(())
+            }
+        }
+    }
+
+    pub(crate) fn try_recv(&mut self) -> Result<Response, TryRecvError> {
+        match self {
+            Self::Threaded(writer) => writer.receiver.try_recv(),
+            Self::Direct(direct) => direct.try_recv(),
+        }
+    }
+
+    pub(crate) fn try_send_control(
+        &mut self,
+        request: ControlRequest,
+    ) -> Result<(), TrySendError<ControlRequest>> {
+        match self {
+            Self::Threaded(writer) => writer.control_sender.try_send(request),
+            Self::Direct(direct) => {
+                direct.exec_control(request);
+                Ok(())
+            }
+        }
+    }
+
+    pub(crate) fn try_recv_control(&mut self) -> Result<ControlResponse, TryRecvError> {
+        match self {
+            Self::Threaded(writer) => writer.control_receiver.try_recv(),
+            Self::Direct(direct) => direct.try_recv_control(),
+        }
+    }
+
+    #[inline]
+    pub(crate) fn apply_persist_direct(
+        &mut self,
+        command: &mqttiumd_contract::command::Command,
+    ) -> Option<(StoreReply, Vec<SessionId>)> {
+        match self {
+            Self::Threaded(_) => None,
+            Self::Direct(direct) => Some(direct.apply_persist_inline(command)),
+        }
+    }
+
+    #[inline]
+    pub(crate) fn maybe_periodic_snapshot(&mut self, now: Instant) {
+        if let Self::Direct(direct) = self {
+            direct.maybe_periodic_snapshot(now);
+        }
+    }
+
+    pub(crate) fn exec_recovery(
+        &mut self,
+        cursor: Option<RecoveryCursor>,
+    ) -> Result<Option<Response>, Failure> {
+        match self {
+            Self::Threaded(writer) => {
+                writer
+                    .sender
+                    .send(Request::Recovery(cursor))
+                    .map_err(|_| Failure::plain("writer_closed"))?;
+                Ok(None)
+            }
+            Self::Direct(direct) => {
+                direct.exec_request(Request::Recovery(cursor));
+                Ok(direct.responses.pop_front())
+            }
+        }
+    }
+
+    pub(crate) fn exec_closed_collection(
+        &mut self,
+        collection: ClosedReceiptCollection,
+    ) -> Result<Option<ControlResponse>, Failure> {
+        match self {
+            Self::Threaded(writer) => {
+                writer
+                    .control_sender
+                    .send(ControlRequest::Closed(collection))
+                    .map_err(|_| Failure::plain("writer_control_disconnected"))?;
+                Ok(None)
+            }
+            Self::Direct(direct) => {
+                direct.exec_control(ControlRequest::Closed(collection));
+                Ok(direct.control_responses.pop_front())
+            }
+        }
+    }
+}
 #[derive(Default)]
 struct BusinessState {
     #[cfg(feature = "test-hooks")]

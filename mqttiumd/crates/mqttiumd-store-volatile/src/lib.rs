@@ -26,6 +26,7 @@ use mqttiumd_contract::command::{
     ReleaseInbound, UpdateSubscriptions,
 };
 use mqttiumd_contract::effects::InboundPhase;
+use mqttiumd_contract::flat_map::{FlatSet, ScopedFlatMap};
 use mqttiumd_contract::ids::{
     DeliveryId, InboundPacketId, LogicalOwnerId, OperationId, OperationSeq, OutboundPacketId,
     PayloadId, PayloadSeq, PublicationId, PublicationSeq, Revision, RunEpoch, SessionId,
@@ -233,22 +234,22 @@ pub struct VolatileStore {
     pub(crate) retained: BTreeMap<Vec<u8>, RetainedRecord>,
     pub(crate) wills: BTreeMap<OperationId, WillIntent>,
     pub(crate) publications: BTreeMap<PublicationId, VPublication>,
-    pub(crate) payloads: BTreeMap<PayloadId, VPayload>,
+    pub(crate) payloads: ScopedFlatMap<PayloadId, VPayload>,
     pub(crate) obligations: BTreeMap<DeliveryId, ObligationRecord>,
     pub(crate) inbound: BTreeMap<(SessionId, InboundPacketId), InboundRecord>,
-    pub(crate) outbound: BTreeMap<DeliveryId, OutboundRecord>,
+    pub(crate) outbound: ScopedFlatMap<DeliveryId, OutboundRecord>,
     // Maintained secondary indices for O(1)/O(log N) operations:
     pub(crate) active_sessions: usize,
     pub(crate) active_by_client: BTreeMap<Vec<u8>, SessionId>,
     pub(crate) total_routes: usize,
     pub(crate) routes_by_session: BTreeMap<SessionId, BTreeSet<Vec<u8>>>,
     pub(crate) obligations_by_target: BTreeSet<(SessionId, DeliveryId)>,
-    pub(crate) obligations_by_pub: BTreeMap<PublicationId, u32>,
-    pub(crate) inbound_by_pub: BTreeMap<PublicationId, u32>,
-    pub(crate) outbound_by_target_pi: BTreeSet<(SessionId, OutboundPacketId)>,
-    pub(crate) publications_by_payload: BTreeMap<PayloadId, u32>,
+    pub(crate) obligations_by_pub: ScopedFlatMap<PublicationId, u32>,
+    pub(crate) inbound_by_pub: ScopedFlatMap<PublicationId, u32>,
+    pub(crate) outbound_by_target_pi: FlatSet<(SessionId, OutboundPacketId)>,
+    pub(crate) publications_by_payload: ScopedFlatMap<PayloadId, u32>,
     pub(crate) retained_bytes: u64,
-    pub(crate) retained_by_pub: BTreeMap<PublicationId, Vec<u8>>,
+    pub(crate) retained_by_pub: ScopedFlatMap<PublicationId, Vec<u8>>,
     pub(crate) wills_bytes: u64,
     pub(crate) wills_by_client: BTreeMap<Vec<u8>, usize>,
     pub(crate) witnesses: BTreeMap<ReceiptOrigin, OriginWitness>,
@@ -278,21 +279,21 @@ impl VolatileStore {
             retained: BTreeMap::new(),
             wills: BTreeMap::new(),
             publications: BTreeMap::new(),
-            payloads: BTreeMap::new(),
+            payloads: ScopedFlatMap::new(),
             obligations: BTreeMap::new(),
             inbound: BTreeMap::new(),
-            outbound: BTreeMap::new(),
+            outbound: ScopedFlatMap::new(),
             active_sessions: 0,
             active_by_client: BTreeMap::new(),
             total_routes: 0,
             routes_by_session: BTreeMap::new(),
             obligations_by_target: BTreeSet::new(),
-            obligations_by_pub: BTreeMap::new(),
-            inbound_by_pub: BTreeMap::new(),
-            outbound_by_target_pi: BTreeSet::new(),
-            publications_by_payload: BTreeMap::new(),
+            obligations_by_pub: ScopedFlatMap::new(),
+            inbound_by_pub: ScopedFlatMap::new(),
+            outbound_by_target_pi: FlatSet::new(),
+            publications_by_payload: ScopedFlatMap::new(),
             retained_bytes: 0,
-            retained_by_pub: BTreeMap::new(),
+            retained_by_pub: ScopedFlatMap::new(),
             wills_bytes: 0,
             wills_by_client: BTreeMap::new(),
             witnesses: BTreeMap::new(),
@@ -328,11 +329,11 @@ impl VolatileStore {
             }
         }
         let mut publications = BTreeMap::new();
-        let mut publications_by_payload: BTreeMap<PayloadId, u32> = BTreeMap::new();
+        let mut publications_by_payload: ScopedFlatMap<PayloadId, u32> = ScopedFlatMap::new();
         for (id, row) in state.publications {
             let topic = SharedBytes::copy_from(&row.topic, row.topic.len())
                 .expect("in-memory topic fits its own length");
-            *publications_by_payload.entry(row.payload).or_insert(0) += 1;
+            *publications_by_payload.get_or_insert_default(row.payload) += 1;
             publications.insert(
                 id,
                 VPublication {
@@ -348,7 +349,7 @@ impl VolatileStore {
                 },
             );
         }
-        let mut payloads = BTreeMap::new();
+        let mut payloads = ScopedFlatMap::new();
         for (id, row) in state.payloads {
             let bytes = SharedBytes::copy_from(&row.bytes, row.bytes.len())
                 .expect("in-memory payload fits its own length");
@@ -361,21 +362,23 @@ impl VolatileStore {
             );
         }
         let mut obligations_by_target = BTreeSet::new();
-        let mut obligations_by_pub: BTreeMap<PublicationId, u32> = BTreeMap::new();
+        let mut obligations_by_pub: ScopedFlatMap<PublicationId, u32> = ScopedFlatMap::new();
         for (&delivery, row) in &state.obligations {
             obligations_by_target.insert((row.target, delivery));
-            *obligations_by_pub.entry(delivery.publication).or_insert(0) += 1;
+            *obligations_by_pub.get_or_insert_default(delivery.publication) += 1;
         }
-        let mut inbound_by_pub: BTreeMap<PublicationId, u32> = BTreeMap::new();
+        let mut inbound_by_pub: ScopedFlatMap<PublicationId, u32> = ScopedFlatMap::new();
         for row in state.inbound.values() {
-            *inbound_by_pub.entry(row.publication).or_insert(0) += 1;
+            *inbound_by_pub.get_or_insert_default(row.publication) += 1;
         }
-        let mut outbound_by_target_pi = BTreeSet::new();
-        for row in state.outbound.values() {
+        let mut outbound_by_target_pi = FlatSet::new();
+        let mut outbound = ScopedFlatMap::new();
+        for (delivery, row) in state.outbound {
             outbound_by_target_pi.insert((row.target, row.packet_id));
+            outbound.insert(delivery, row);
         }
         let mut retained_bytes = 0u64;
-        let mut retained_by_pub = BTreeMap::new();
+        let mut retained_by_pub = ScopedFlatMap::new();
         let mut dup_retained_pub = false;
         for (topic, row) in &state.retained {
             if retained_by_pub
@@ -452,7 +455,7 @@ impl VolatileStore {
             payloads,
             obligations: state.obligations,
             inbound: state.inbound,
-            outbound: state.outbound,
+            outbound,
             active_sessions,
             active_by_client,
             total_routes,
@@ -1348,8 +1351,7 @@ impl VolatileStore {
         );
         *self
             .publications_by_payload
-            .entry(admit.payload.id)
-            .or_insert(0) += 1;
+            .get_or_insert_default(admit.payload.id) += 1;
         if reference_count > 0 {
             self.payloads.insert(
                 admit.payload.id,
@@ -1374,8 +1376,7 @@ impl VolatileStore {
                     .insert((target.session, target.delivery));
                 *self
                     .obligations_by_pub
-                    .entry(target.delivery.publication)
-                    .or_insert(0) += 1;
+                    .get_or_insert_default(target.delivery.publication) += 1;
             }
         }
         if let Some((target, packet_id)) = claimed_target {
@@ -1401,7 +1402,7 @@ impl VolatileStore {
                     phase: InboundPhase::AwaitPubrel,
                 },
             );
-            *self.inbound_by_pub.entry(admit.publication).or_insert(0) += 1;
+            *self.inbound_by_pub.get_or_insert_default(admit.publication) += 1;
         }
         self.accounts = final_accounts;
         if let Some(producer_client_id) = retained_producer {
@@ -1711,7 +1712,9 @@ impl VolatileStore {
                     .get_mut(&payload_id)
                     .expect("preflighted payload")
                     .references += 1;
-                *self.publications_by_payload.entry(payload_id).or_insert(0) += 1;
+                *self
+                    .publications_by_payload
+                    .get_or_insert_default(payload_id) += 1;
                 self.publications.insert(pub_id, source);
                 let delivery = DeliveryId {
                     publication: pub_id,
@@ -1729,7 +1732,7 @@ impl VolatileStore {
                     },
                 );
                 self.obligations_by_target.insert((session, delivery));
-                *self.obligations_by_pub.entry(pub_id).or_insert(0) += 1;
+                *self.obligations_by_pub.get_or_insert_default(pub_id) += 1;
             }
         }
         Ok(CommitFacts::SubscriptionsChanged {
@@ -2524,8 +2527,8 @@ impl DurableStore for VolatileStore {
                     };
                     let uncertain = self
                         .outbound
-                        .range(range.clone())
-                        .filter(|(_, record)| !record.started)
+                        .iter()
+                        .filter(|(delivery, record)| delivery.publication == id && !record.started)
                         .count();
                     result.quarantined = result
                         .quarantined

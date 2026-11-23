@@ -1059,15 +1059,85 @@ impl PartialEq for FrozenRecipe {
 
 impl Eq for FrozenRecipe {}
 
+struct StackBuf<const N: usize> {
+    buf: [u8; N],
+    len: usize,
+}
+
+impl<const N: usize> StackBuf<N> {
+    fn new() -> Self {
+        Self {
+            buf: [0u8; N],
+            len: 0,
+        }
+    }
+
+    fn push(&mut self, byte: u8) {
+        self.buf[self.len] = byte;
+        self.len += 1;
+    }
+
+    fn extend(&mut self, slice: &[u8]) {
+        let end = self.len + slice.len();
+        self.buf[self.len..end].copy_from_slice(slice);
+        self.len = end;
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        &self.buf[..self.len]
+    }
+}
+
+fn encode_delivery_stack<const N: usize>(
+    out: &mut StackBuf<N>,
+    operation: OperationId,
+    delivery: DeliveryId,
+    target: SessionId,
+    revision: Revision,
+    packet_id: OutboundPacketId,
+) {
+    out.extend(&operation.to_be_bytes());
+    out.extend(&delivery.publication.to_be_bytes());
+    out.extend(&delivery.index.to_be_bytes());
+    out.extend(&target.to_be_bytes());
+    out.extend(&revision.to_be_bytes());
+    out.extend(&packet_id.get().to_be_bytes());
+}
+
+fn encode_admit_body_stack<const N: usize>(out: &mut StackBuf<N>, admit: &AdmitPublication) {
+    out.extend(&admit.operation.to_be_bytes());
+    out.extend(&admit.request.to_be_bytes());
+    out.extend(&admit.publication.to_be_bytes());
+    out.extend(&admit.source.session.to_be_bytes());
+    out.extend(&admit.source.session_revision.to_be_bytes());
+    out.extend(&admit.source.packet_id.get().to_be_bytes());
+    out.extend(&admit.source.exchange.generation.to_be_bytes());
+    out.extend(&admit.route_revision.to_be_bytes());
+    out.push(admit.qos.to_wire());
+    out.push(u8::from(admit.retain));
+    out.extend(&(admit.topic.len() as u16).to_be_bytes());
+    out.extend(admit.topic.as_slice());
+    out.extend(&admit.payload.id.to_be_bytes());
+    out.extend(&admit.payload.length.get().to_be_bytes());
+    out.extend(&admit.costs.payload_bytes.get().to_be_bytes());
+    out.extend(&admit.costs.references.get().to_be_bytes());
+    out.extend(&admit.costs.exchange_slots.get().to_be_bytes());
+    out.extend(&admit.costs.receipt_slots.get().to_be_bytes());
+    out.extend(&(admit.targets.len() as u16).to_be_bytes());
+    for target in admit.targets.as_slice() {
+        out.extend(&target.session.to_be_bytes());
+        out.extend(&target.session_revision.to_be_bytes());
+        out.extend(&target.delivery.index.to_be_bytes());
+        out.push(target.effective_qos.to_wire());
+        out.push(target.cause as u8);
+    }
+}
+
 impl FrozenRecipe {
     /// Freezes a well-formed recipe together with its canonical encoding.
     pub fn freeze(recipe: Recipe) -> Result<Self, RecipeError> {
-        let mut canonical = Vec::with_capacity(192);
-        recipe.encode_canonical(&mut canonical)?;
-        Ok(Self(Arc::new(FrozenInner {
-            recipe,
-            canonical: Arc::from(canonical),
-        })))
+        let canonical = encode_canonical_arc(&recipe)?;
+        Ok(Self(Arc::new(FrozenInner { recipe, canonical })))
     }
 
     /// The frozen recipe.
@@ -1093,6 +1163,110 @@ impl FrozenRecipe {
     pub fn operation(&self) -> OperationId {
         self.0.recipe.operation()
     }
+}
+
+fn encode_canonical_arc(recipe: &Recipe) -> Result<Arc<[u8]>, RecipeError> {
+    const STACK_CAP: usize = 384;
+    // Fixed bytes of AdmitPublication header + body excluding topic and targets.
+    const ADMIT_FIXED: usize = 215;
+    const TARGET_BYTES: usize = 22;
+
+    match recipe {
+        Recipe::FinishDelivery(finish) | Recipe::PreparePubrel(finish) => {
+            let mut out = StackBuf::<128>::new();
+            out.extend(MAGIC);
+            out.extend(&RECIPE_FORMAT.to_be_bytes());
+            out.push(if matches!(recipe, Recipe::PreparePubrel(_)) {
+                19
+            } else {
+                KIND_FINISH_DELIVERY
+            });
+            encode_delivery_stack(
+                &mut out,
+                finish.operation,
+                finish.delivery,
+                finish.target,
+                finish.target_revision,
+                finish.packet_id,
+            );
+            out.extend(&finish.claim.to_be_bytes());
+            return Ok(Arc::from(out.as_slice()));
+        }
+        Recipe::ClaimDelivery(claim) => {
+            let mut out = StackBuf::<96>::new();
+            out.extend(MAGIC);
+            out.extend(&RECIPE_FORMAT.to_be_bytes());
+            out.push(KIND_CLAIM_DELIVERY);
+            encode_delivery_stack(
+                &mut out,
+                claim.operation,
+                claim.delivery,
+                claim.target,
+                claim.target_revision,
+                claim.packet_id,
+            );
+            return Ok(Arc::from(out.as_slice()));
+        }
+        Recipe::ConsumeDelivery(consume) => {
+            let mut out = StackBuf::<96>::new();
+            out.extend(MAGIC);
+            out.extend(&RECIPE_FORMAT.to_be_bytes());
+            out.push(KIND_CONSUME_DELIVERY);
+            out.extend(&consume.operation.to_be_bytes());
+            out.extend(&consume.delivery.publication.to_be_bytes());
+            out.extend(&consume.delivery.index.to_be_bytes());
+            out.extend(&consume.target.to_be_bytes());
+            out.extend(&consume.target_revision.to_be_bytes());
+            return Ok(Arc::from(out.as_slice()));
+        }
+        Recipe::ReleaseInbound(release) => {
+            recipe.check()?;
+            let mut out = StackBuf::<64>::new();
+            out.extend(MAGIC);
+            out.extend(&RECIPE_FORMAT.to_be_bytes());
+            out.push(KIND_RELEASE_INBOUND);
+            out.extend(&release.operation.to_be_bytes());
+            out.extend(&release.source_session.to_be_bytes());
+            out.extend(&release.packet_id.get().to_be_bytes());
+            out.extend(&release.exchange.generation.to_be_bytes());
+            return Ok(Arc::from(out.as_slice()));
+        }
+        Recipe::AdmitPublication(admit) => {
+            let needed = ADMIT_FIXED
+                .saturating_add(admit.topic.len())
+                .saturating_add(admit.targets.len().saturating_mul(TARGET_BYTES));
+            if needed <= STACK_CAP {
+                admit.check_retained()?;
+                let mut out = StackBuf::<STACK_CAP>::new();
+                out.extend(MAGIC);
+                out.extend(&RECIPE_FORMAT.to_be_bytes());
+                out.push(KIND_ADMIT_PUBLICATION);
+                encode_admit_body_stack(&mut out, admit);
+                return Ok(Arc::from(out.as_slice()));
+            }
+        }
+        Recipe::ClaimedPublication(claimed) => {
+            let needed = ADMIT_FIXED
+                .saturating_add(4)
+                .saturating_add(claimed.admission.topic.len())
+                .saturating_add(claimed.admission.targets.len().saturating_mul(TARGET_BYTES));
+            if needed <= STACK_CAP {
+                claimed.check()?;
+                let mut out = StackBuf::<STACK_CAP>::new();
+                out.extend(MAGIC);
+                out.extend(&RECIPE_FORMAT.to_be_bytes());
+                out.push(KIND_CLAIMED_PUBLICATION);
+                encode_admit_body_stack(&mut out, &claimed.admission);
+                out.extend(&claimed.claim.target_index.to_be_bytes());
+                out.extend(&claimed.claim.packet_id.get().to_be_bytes());
+                return Ok(Arc::from(out.as_slice()));
+            }
+        }
+        _ => {}
+    }
+    let mut canonical = Vec::with_capacity(256);
+    recipe.encode_canonical(&mut canonical)?;
+    Ok(Arc::from(canonical))
 }
 
 /// A frozen command proposed to the store. The payload bytes travel with an
@@ -2042,5 +2216,75 @@ mod tests {
             })),
             Err(RecipeError::InvalidField("inline_claim_retain"))
         );
+    }
+
+    #[test]
+    fn stack_fast_path_matches_encode_canonical_byte_for_byte() {
+        let (incarnation, epoch, owner) = scope();
+        let op = |seq: u64| OperationId::new(incarnation, epoch, owner, OperationSeq::new(seq));
+        let assert_parity = |recipe: Recipe| {
+            let mut expected = Vec::new();
+            recipe.encode_canonical(&mut expected).unwrap();
+            let frozen = FrozenRecipe::freeze(recipe).unwrap();
+            assert_eq!(frozen.canonical_bytes(), expected.as_slice());
+        };
+
+        let claim = ClaimDelivery {
+            operation: op(10),
+            delivery: DeliveryId {
+                publication: publication(),
+                index: 2,
+            },
+            target: SessionId::new(9),
+            target_revision: Revision::new(3),
+            packet_id: OutboundPacketId::new(42).unwrap(),
+        };
+        assert_parity(Recipe::ClaimDelivery(claim));
+
+        let finish = FinishDelivery {
+            operation: op(11),
+            delivery: DeliveryId {
+                publication: publication(),
+                index: 2,
+            },
+            target: SessionId::new(9),
+            target_revision: Revision::new(3),
+            packet_id: OutboundPacketId::new(42).unwrap(),
+            claim: op(10),
+        };
+        assert_parity(Recipe::FinishDelivery(finish));
+        assert_parity(Recipe::PreparePubrel(finish));
+
+        assert_parity(Recipe::ConsumeDelivery(ConsumeDelivery {
+            operation: op(12),
+            delivery: DeliveryId {
+                publication: publication(),
+                index: 0,
+            },
+            target: SessionId::new(9),
+            target_revision: Revision::new(3),
+        }));
+
+        assert_parity(Recipe::ReleaseInbound(ReleaseInbound {
+            operation: op(13),
+            source_session: SessionId::new(7),
+            packet_id: InboundPacketId::new(17).unwrap(),
+            exchange: ExchangeId {
+                session: SessionId::new(7),
+                generation: ExchangeGeneration::new(99),
+            },
+        }));
+
+        assert_parity(admission(&[target(11, 0)]));
+        let Recipe::AdmitPublication(admit) = admission(&[target(11, 0), target(12, 1)]) else {
+            panic!("expected AdmitPublication");
+        };
+        assert_parity(Recipe::ClaimedPublication(ClaimedPublication {
+            admission: admit,
+            claim: InlineClaim {
+                target_index: 1,
+                packet_id: OutboundPacketId::new(77).unwrap(),
+            },
+        }));
     }
 }

@@ -38,6 +38,7 @@ use crate::contract::effects::{
     FrameProgress, Input, Outbox, OwnedEffect, OwnerAuthority, RecoveredFact, RecoveryOrder,
     ReplaceRefusal, RetireRefusal,
 };
+use crate::contract::flat_map::{FlatMap, ScopedFlatMap};
 use crate::contract::ids::{
     AccountId, ConnectionGeneration, ConnectionKey, ContinuationId, DeadlineToken, DeliveryId,
     EffectId, EffectSeq, ExchangeGeneration, ExchangeId, Exhausted, InboundPacketId,
@@ -51,7 +52,6 @@ use crate::contract::outcome::{
 use crate::contract::packet::{
     AckReason, InboundPacket, OutboundFrame, PubackReason, Qos, SharedBytes,
 };
-use crate::contract::scoped_map::ScopedMap;
 use crate::contract::step::{CoreFault, Exhaustion, PlanStamp, Progress, StepOutcome, TurnGrant};
 use crate::credits::{Credits, ReleaseOutcome};
 use crate::leases::{LeaseRefused, LeaseTable};
@@ -876,6 +876,10 @@ impl Draft {
 pub(super) struct SmallIndexSet(alloc::vec::Vec<usize>);
 
 impl SmallIndexSet {
+    pub(super) fn len(&self) -> usize {
+        self.0.len()
+    }
+
     pub(super) fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
@@ -898,6 +902,13 @@ impl SmallIndexSet {
             }
             Err(_) => false,
         }
+    }
+
+    pub(super) fn replace(&mut self, from: usize, to: usize) {
+        if let Ok(pos) = self.0.binary_search(&from) {
+            self.0.remove(pos);
+        }
+        let _ = self.insert(to);
     }
 
     pub(super) fn iter(&self) -> core::slice::Iter<'_, usize> {
@@ -940,20 +951,20 @@ pub struct Owner {
     route_index: routing::RouteIndex,
     route_by_key: BTreeMap<(SessionId, SharedBytes), usize>,
     sessions: BoundedVec<Session>,
-    session_by_id: BTreeMap<SessionId, usize>,
+    session_by_id: FlatMap<SessionId, usize>,
     session_by_client: BTreeMap<SharedBytes, usize>,
-    session_by_conn: BTreeMap<ConnectionGeneration, usize>,
+    session_by_conn: FlatMap<ConnectionGeneration, usize>,
     slots: BoundedVec<Slot>,
-    slot_by_key: BTreeMap<(SessionId, InboundPacketId), usize>,
-    slot_by_op: ScopedMap<OperationId, usize>,
-    slot_by_deadline: BTreeMap<DeadlineToken, usize>,
-    slot_by_effect: ScopedMap<EffectId, usize>,
-    slots_by_session: BTreeMap<SessionId, SmallIndexSet>,
+    slot_by_key: FlatMap<(SessionId, InboundPacketId), usize>,
+    slot_by_op: ScopedFlatMap<OperationId, usize>,
+    slot_by_deadline: FlatMap<DeadlineToken, usize>,
+    slot_by_effect: ScopedFlatMap<EffectId, usize>,
+    slots_by_session: FlatMap<SessionId, SmallIndexSet>,
     release_retry_slots: BTreeSet<usize>,
     leases: LeaseTable,
     /// The latest operations that ended; see `OwnerConfig`.
     finished: BoundedQueue<Finished>,
-    finished_by_op: ScopedMap<OperationId, (Finished, u32)>,
+    finished_by_op: ScopedFlatMap<OperationId, (Finished, u32)>,
     /// The latest connections that were closed; see `OwnerConfig`.
     closed: BoundedQueue<ConnectionGeneration>,
     closed_set: BTreeSet<ConnectionGeneration>,
@@ -964,7 +975,7 @@ pub struct Owner {
     lifecycle: Option<sessions::Flight>,
     lifecycle_enabled: bool,
     inline_claim_enabled: bool,
-    non_inline_targets_by_op: ScopedMap<OperationId, alloc::vec::Vec<SessionId>>,
+    non_inline_targets_by_op: ScopedFlatMap<OperationId, alloc::vec::Vec<SessionId>>,
     message_now: Option<MessageTime>,
     release_continuation: Option<ContinuationId>,
     release_continuations_started: bool,
@@ -1080,19 +1091,19 @@ impl Owner {
             route_index: routing::RouteIndex::default(),
             route_by_key: BTreeMap::new(),
             sessions,
-            session_by_id: BTreeMap::new(),
+            session_by_id: FlatMap::new(),
             session_by_client: BTreeMap::new(),
-            session_by_conn: BTreeMap::new(),
+            session_by_conn: FlatMap::new(),
             slots,
-            slot_by_key: BTreeMap::new(),
-            slot_by_op: ScopedMap::with_scope((id.incarnation(), id.epoch(), id.owner())),
-            slot_by_deadline: BTreeMap::new(),
-            slot_by_effect: ScopedMap::with_scope((id.epoch(), id.owner())),
-            slots_by_session: BTreeMap::new(),
+            slot_by_key: FlatMap::new(),
+            slot_by_op: ScopedFlatMap::with_scope((id.incarnation(), id.epoch(), id.owner())),
+            slot_by_deadline: FlatMap::new(),
+            slot_by_effect: ScopedFlatMap::with_scope((id.epoch(), id.owner())),
+            slots_by_session: FlatMap::new(),
             release_retry_slots: BTreeSet::new(),
             leases,
             finished,
-            finished_by_op: ScopedMap::with_scope((id.incarnation(), id.epoch(), id.owner())),
+            finished_by_op: ScopedFlatMap::with_scope((id.incarnation(), id.epoch(), id.owner())),
             closed,
             closed_set: BTreeSet::new(),
             resolution_delay: config.resolution_delay,
@@ -1102,7 +1113,7 @@ impl Owner {
             lifecycle: None,
             lifecycle_enabled: false,
             inline_claim_enabled: false,
-            non_inline_targets_by_op: ScopedMap::with_scope((
+            non_inline_targets_by_op: ScopedFlatMap::with_scope((
                 id.incarnation(),
                 id.epoch(),
                 id.owner(),
@@ -1454,8 +1465,7 @@ impl Owner {
     fn index_slot(&mut self, index: usize) {
         let slot = self.slots.as_slice()[index];
         self.slots_by_session
-            .entry(slot.session)
-            .or_default()
+            .get_or_insert_default(slot.session)
             .insert(index);
         match slot.state {
             SlotState::AckPending { effect, .. } => {
@@ -1506,6 +1516,31 @@ impl Owner {
         }
     }
 
+    fn reindex_moved_slot(&mut self, from: usize, to: usize) {
+        let slot = self.slots.as_slice()[to];
+        if let Some(set) = self.slots_by_session.get_mut(&slot.session) {
+            set.replace(from, to);
+        }
+        match slot.state {
+            SlotState::AckPending { effect, .. } => {
+                self.slot_by_effect.insert(effect, to);
+            }
+            SlotState::AdmissionPending(f) | SlotState::ReleasePending(f) => {
+                self.slot_by_key.insert((slot.session, slot.packet_id), to);
+                self.slot_by_op.insert(f.operation, to);
+                self.slot_by_deadline.insert(f.deadline, to);
+            }
+            SlotState::ReleaseRetry(_) => {
+                self.slot_by_key.insert((slot.session, slot.packet_id), to);
+                self.release_retry_slots.remove(&from);
+                self.release_retry_slots.insert(to);
+            }
+            SlotState::AwaitPubrel | SlotState::AnswerHeld { .. } => {
+                self.slot_by_key.insert((slot.session, slot.packet_id), to);
+            }
+        }
+    }
+
     fn push_slot(&mut self, slot: Slot) -> Result<(), CoreFault> {
         let index = self.slots.len();
         self.slots
@@ -1526,12 +1561,11 @@ impl Owner {
         }
         self.unindex_slot(index);
         if index != last {
-            self.unindex_slot(last);
             self.slots.as_mut_slice().swap(index, last);
         }
         let removed = self.slots.pop().ok_or(CoreFault::StalePlan)?;
         if index != last {
-            self.index_slot(index);
+            self.reindex_moved_slot(last, index);
         }
         Ok(removed)
     }
@@ -3564,7 +3598,10 @@ impl Owner {
                     self.apply_inline_claim_insert(op, *plan)?;
                 } else if !dirty_targets.is_empty() {
                     for &target in &dirty_targets {
-                        *self.pubsub.non_inline_by_session.entry(target).or_insert(0) += 1;
+                        *self
+                            .pubsub
+                            .non_inline_by_session
+                            .get_or_insert_default(target) += 1;
                         self.mark_session_dirty(target, false);
                     }
                     self.non_inline_targets_by_op.insert(op, dirty_targets);

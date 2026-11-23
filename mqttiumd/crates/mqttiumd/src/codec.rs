@@ -1280,69 +1280,131 @@ pub fn encode(frame: OutboundFrame) -> Result<Vec<u8>, Error> {
 }
 
 pub fn encode_for(version: Version, frame: OutboundFrame) -> Result<Vec<u8>, Error> {
+    encode_frame_bytes(version, frame).map(|bytes| bytes.as_slice().to_vec())
+}
+
+/// Encodes a core-authorized control frame directly into an inline
+/// [`crate::net::FrameBytes`] buffer with zero heap allocation.
+pub fn encode_frame_bytes(
+    version: Version,
+    frame: OutboundFrame,
+) -> Result<crate::net::FrameBytes, Error> {
+    use crate::net::FrameBytes;
+    let ack = |first: u8, packet_id: InboundPacketId, reason: AckReason| {
+        let reason = match reason {
+            AckReason::Success => 0,
+            AckReason::PacketIdentifierNotFound => 0x92,
+            AckReason::QuotaExceeded => 0x97,
+            AckReason::ImplementationSpecificError => 0x83,
+        };
+        if (first == 0x70 && !matches!(reason, 0 | 0x92)) || (first == 0x50 && reason == 0x92) {
+            return Err(protocol("InvalidOutboundAckReason"));
+        }
+        let id = packet_id.get().to_be_bytes();
+        Ok(if reason == 0 {
+            FrameBytes::from_slice(&[first, 2, id[0], id[1]])
+        } else {
+            FrameBytes::from_slice(&[first, 3, id[0], id[1], reason])
+        })
+    };
     if version == Version::V5 {
-        return encode(frame);
+        return match frame {
+            OutboundFrame::Puback { packet_id, reason } => {
+                let [high, low] = packet_id.get().to_be_bytes();
+                let code = reason.to_wire();
+                if code == 0 {
+                    Ok(FrameBytes::from_slice(&[0x40, 2, high, low]))
+                } else {
+                    Ok(FrameBytes::from_slice(&[0x40, 3, high, low, code]))
+                }
+            }
+            OutboundFrame::Pubrec { packet_id, reason } => ack(0x50, packet_id, reason),
+            OutboundFrame::Pubcomp { packet_id, reason } => ack(0x70, packet_id, reason),
+            OutboundFrame::Pubrel { packet_id } => {
+                let [high, low] = packet_id.get().to_be_bytes();
+                Ok(FrameBytes::from_slice(&[0x62, 2, high, low]))
+            }
+            OutboundFrame::Pingresp => Ok(FrameBytes::from_slice(&[0xd0, 0])),
+            OutboundFrame::Connack { session_present } => Ok(FrameBytes::from_slice(&[
+                0x20,
+                22,
+                u8::from(session_present),
+                0,
+                19,
+                0x21,
+                0,
+                8,
+                0x27,
+                ANNOUNCED[0],
+                ANNOUNCED[1],
+                ANNOUNCED[2],
+                ANNOUNCED[3],
+                0x25,
+                1,
+                0x22,
+                0,
+                0,
+                0x28,
+                1,
+                0x29,
+                0,
+                0x2a,
+                0,
+            ])),
+            OutboundFrame::Suback { .. } | OutboundFrame::Unsuback { .. } => {
+                encode(frame).map(FrameBytes::from)
+            }
+        };
     }
     match frame {
-        OutboundFrame::Connack { session_present } => {
-            Ok(vec![0x20, 2, u8::from(session_present), 0])
-        }
-        OutboundFrame::Puback {
-            reason: PubackReason::Success,
-            ..
-        }
-        | OutboundFrame::Pubrec {
-            reason: AckReason::Success,
-            ..
-        }
-        | OutboundFrame::Pubcomp {
-            reason: AckReason::Success,
-            ..
-        }
-        | OutboundFrame::Pubrel { .. }
-        | OutboundFrame::Pingresp => encode(frame),
-        // MQTT 3.1.1 has no reason code: a publication accepted without a
-        // matching subscription is acknowledged like any other (record
-        // 0049).
+        OutboundFrame::Connack { session_present } => Ok(FrameBytes::from_slice(&[
+            0x20,
+            2,
+            u8::from(session_present),
+            0,
+        ])),
         OutboundFrame::Puback {
             packet_id,
-            reason: PubackReason::NoMatchingSubscribers,
-        } => encode(OutboundFrame::Puback {
+            reason: PubackReason::Success | PubackReason::NoMatchingSubscribers,
+        } => {
+            let [high, low] = packet_id.get().to_be_bytes();
+            Ok(FrameBytes::from_slice(&[0x40, 2, high, low]))
+        }
+        OutboundFrame::Pubrec {
             packet_id,
-            reason: PubackReason::Success,
-        }),
+            reason: AckReason::Success,
+        } => ack(0x50, packet_id, AckReason::Success),
         OutboundFrame::Pubcomp {
             packet_id,
-            reason: AckReason::PacketIdentifierNotFound,
+            reason: AckReason::Success | AckReason::PacketIdentifierNotFound,
         } => {
-            // MQTT 3.1.1 ends a replayed PUBREL with the same identifier.
             let [high, low] = packet_id.get().to_be_bytes();
-            Ok(vec![0x70, 2, high, low])
+            Ok(FrameBytes::from_slice(&[0x70, 2, high, low]))
         }
+        OutboundFrame::Pubrel { packet_id } => {
+            let [high, low] = packet_id.get().to_be_bytes();
+            Ok(FrameBytes::from_slice(&[0x62, 2, high, low]))
+        }
+        OutboundFrame::Pingresp => Ok(FrameBytes::from_slice(&[0xd0, 0])),
         OutboundFrame::Suback { packet_id, results } => {
             let codes = results
                 .as_slice()
                 .filter(|codes| !codes.is_empty())
                 .ok_or_else(|| protocol("InvalidFilterResults"))?;
             let [high, low] = packet_id.get().to_be_bytes();
-            let mut bytes = vec![0x90, (2 + codes.len()) as u8, high, low];
-            bytes.extend(
-                codes
-                    .iter()
-                    .map(|&code| if code <= 2 { code } else { 0x80 }),
-            );
+            let mut bytes = FrameBytes::from_slice(&[0x90, (2 + codes.len()) as u8, high, low]);
+            for &code in codes {
+                bytes.push(if code <= 2 { code } else { 0x80 });
+            }
             Ok(bytes)
         }
-        // 3.1.1 acknowledges the request, also where nothing is removed.
-        // A filter the broker refuses as invalid holds no subscription;
-        // any other failure could leave one and is not acknowledged.
         OutboundFrame::Unsuback { packet_id, results }
             if results.as_slice().is_some_and(|codes| {
                 !codes.is_empty() && codes.iter().all(|code| matches!(code, 0 | 0x11 | 0x8f))
             }) =>
         {
             let [high, low] = packet_id.get().to_be_bytes();
-            Ok(vec![0xb0, 2, high, low])
+            Ok(FrameBytes::from_slice(&[0xb0, 2, high, low]))
         }
         _ => Err(unsupported("AckNotEncodableInMqtt311")),
     }
@@ -1462,7 +1524,7 @@ pub struct EncodedPublish {
 /// fan-out recipients without copying it into each subscriber's frame buffer.
 #[derive(Debug, PartialEq, Eq)]
 pub struct EncodedSegments {
-    pub header: Vec<u8>,
+    pub header: crate::net::FrameBytes,
     pub payload: Option<SharedBytes>,
     pub total_len: usize,
     pub expiry_value_offset: Option<usize>,
@@ -1618,7 +1680,7 @@ pub(crate) fn encode_delivery_segments(
     )
 }
 
-fn push_varint(bytes: &mut Vec<u8>, mut value: usize) {
+fn push_varint_frame(bytes: &mut crate::net::FrameBytes, mut value: usize) {
     for _ in 0..4 {
         let mut part = (value % 128) as u8;
         value /= 128;
@@ -1683,9 +1745,7 @@ fn encode_publication_segments(
         .filter(|n| *n <= crate::net::MAX_PACKET_BYTES)
         .ok_or_else(|| oversized("PacketTooLarge"))?;
     let header_len = total - payload.len();
-    let mut header = Vec::new();
-    header
-        .try_reserve_exact(header_len)
+    let mut header = crate::net::FrameBytes::try_with_capacity(header_len)
         .map_err(|_| protocol("OutgoingAllocationFailed"))?;
     header.push(
         (if let Some((_, qos)) = packet {
@@ -1694,14 +1754,14 @@ fn encode_publication_segments(
             0x30
         }) | u8::from(retain),
     );
-    push_varint(&mut header, body);
+    push_varint_frame(&mut header, body);
     header.extend_from_slice(&(topic_name.len() as u16).to_be_bytes());
     header.extend_from_slice(topic_name.as_slice());
     if let Some((packet_id, _)) = packet {
         header.extend_from_slice(&packet_id.get().to_be_bytes());
     }
     let expiry_value_offset = if version == Version::V5 {
-        push_varint(&mut header, prop_bytes);
+        push_varint_frame(&mut header, prop_bytes);
         let offset = if let Some(remaining) = remaining {
             header.push(0x02);
             let at = header.len();

@@ -157,7 +157,13 @@ impl Events {
     #[inline]
     #[must_use]
     pub fn records(&self, kind: &str) -> bool {
-        self.level == Level::Audit || OPS_KINDS.binary_search(&kind).is_ok()
+        if self.level == Level::Audit {
+            return true;
+        }
+        if kind == "session_cardinality" || fast_tally_index(kind).is_some() {
+            return false;
+        }
+        OPS_KINDS.binary_search(&kind).is_ok()
     }
 
     /// Counts one observation that the current level does not write.
@@ -417,6 +423,19 @@ mod tests {
             .lines()
             .map(|line| serde_json::from_str(line).unwrap())
             .collect()
+    }
+
+    #[test]
+    fn fast_tallies_and_session_cardinality_are_disjoint_from_ops_kinds() {
+        assert!(OPS_KINDS.windows(2).all(|w| w[0] < w[1]));
+        assert!(OPS_KINDS.binary_search(&"session_cardinality").is_err());
+        for kind in FAST_TALLIES {
+            assert!(
+                OPS_KINDS.binary_search(&kind).is_err(),
+                "{kind} must not appear in OPS_KINDS"
+            );
+            assert!(fast_tally_index(kind).is_some());
+        }
     }
     fn sequence(value: &Value) -> u64 {
         value["seq"].as_str().unwrap().parse().unwrap()

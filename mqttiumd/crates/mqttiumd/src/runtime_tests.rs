@@ -105,6 +105,8 @@ fn with_runtime_clock_hooks(
         message_expiry_scan: Instant::now(),
         message_expiry_input: None,
         message_last_time: None,
+        last_message_clock_sync: Instant::now(),
+        message_clock_needed: true,
         clock: boot.clock,
         clock_anchor: boot.clock_anchor,
         clock_checkpoint: None,
@@ -115,9 +117,13 @@ fn with_runtime_clock_hooks(
         last_expiry_inventory: None,
         owner,
         _authority: authority,
-        writer: &mut writer,
+        writer: StoreHandle::Threaded(&mut writer),
         events,
-        peers: BTreeMap::new(),
+        peers: FlatMap::new(),
+        ready_peers: net::ReadyQueue::new(),
+        ready_raw: Vec::new(),
+        pending_peers: FlatSet::new(),
+        capacity_waiters: 0,
         retiring: Vec::new(),
         session_ids: boot.sessions.values().map(|s| s.id).collect(),
         sessions: boot.sessions,
@@ -134,22 +140,23 @@ fn with_runtime_clock_hooks(
         control_inputs: VecDeque::new(),
         closing_inputs: VecDeque::new(),
         terminal_inputs: VecDeque::new(),
-        terminal_effects: BTreeMap::new(),
+        terminal_effects: ScopedFlatMap::new(),
         deferred_inputs: VecDeque::new(),
+        deferred_by_conn: FlatMap::new(),
         effects_awaited: false,
         deferred_retries: 0,
         credit_progress: Instant::now(),
         timers: BTreeMap::new(),
-        inflight: BTreeMap::new(),
+        inflight: ScopedFlatMap::new(),
         lifecycle_inflight: BTreeMap::new(),
         last_session_change: None,
         session_cardinality_dirty: false,
         last_session_cardinality: None,
-        work_reads: BTreeMap::new(),
+        work_reads: ScopedFlatMap::new(),
         pending_work: VecDeque::new(),
         pending_work_set: BTreeSet::new(),
-        queued_work_sessions: BTreeSet::new(),
-        cached_bindings: BTreeMap::new(),
+        queued_work_sessions: FlatSet::new(),
+        cached_bindings: FlatMap::new(),
         bindings_dirty: true,
         stale_frames_dirty: false,
         timers_dirty: false,
@@ -175,8 +182,8 @@ fn with_runtime_clock_hooks(
         deferred_ack: None,
         #[cfg(feature = "test-hooks")]
         deferred_ack_used: false,
-        frames: BTreeMap::new(),
-        outgoing_bindings: BTreeMap::new(),
+        frames: ScopedFlatMap::new(),
+        outgoing_bindings: FlatMap::new(),
         puback_observation: 0,
         #[cfg(feature = "test-hooks")]
         copied_puback: None,
@@ -196,11 +203,13 @@ fn with_runtime_clock_hooks(
         loop {
             runtime
                 .writer
+                .threaded_mut()
                 .sender
                 .send(Request::Recovery(cursor))
                 .unwrap();
             let Response::Recovery(page) = runtime
                 .writer
+                .threaded_mut()
                 .receiver
                 .recv_timeout(Duration::from_secs(3))
                 .unwrap()
@@ -258,10 +267,13 @@ fn peer(runtime: &mut Runtime<'_>) -> (ConnectionGeneration, TcpStream) {
     let (socket, _) = listener.accept().unwrap();
     runtime.generation = runtime.generation.checked_next().unwrap();
     let generation = runtime.generation;
+    let ready = (runtime.ready_peers.clone(), generation.get());
+    runtime.pending_peers.insert(generation);
     runtime.peers.insert(
         generation,
         Peer {
-            io: net::spawn_with_clock(socket, runtime.clock.clone()).unwrap(),
+            io: net::spawn_with_ready(socket, runtime.clock.clone(), runtime.wake.clone(), ready)
+                .unwrap(),
             created: Instant::now(),
             last_packet: Instant::now(),
             connected: false,
@@ -316,6 +328,7 @@ fn next_control_reply(runtime: &mut Runtime<'_>) -> ControlResponse {
             .expect("control reply budget");
         let response = runtime
             .writer
+            .threaded_mut()
             .control_receiver
             .recv_timeout(remaining)
             .unwrap();
@@ -422,7 +435,7 @@ fn closing_qos0_without_collecting_written_retires_the_exact_attempt() {
                 break;
             }
         }
-        let effect = *runtime
+        let effect = runtime
             .frames
             .iter()
             .find(|(_, f)| f.kind == "PUBLISH0")
@@ -1211,7 +1224,7 @@ fn a_connection_keeps_at_most_its_window_of_business_packets_waiting() {
             business_packets(&r.inputs, waiting) == WINDOW - 1
         });
         while let Some(deferred) = runtime.inputs.pop_front() {
-            runtime.deferred_inputs.push_back(deferred);
+            runtime.push_deferred_back(deferred);
         }
         // The last publication of the window and the control packet behind
         // it are both taken.
@@ -1226,7 +1239,7 @@ fn a_connection_keeps_at_most_its_window_of_business_packets_waiting() {
             .position(|input| business_connection(input) == Some(waiting))
             .unwrap();
         let deferred = runtime.inputs.remove(last).unwrap();
-        runtime.deferred_inputs.push_back(deferred);
+        runtime.push_deferred_back(deferred);
         first.write_all(&[0x30, 4, 0, 1, b'w', 0, 0xc0, 0]).unwrap();
         second.write_all(&[0x30, 4, 0, 1, b'v', 0]).unwrap();
         read_until(runtime, |r| business_packets(&r.inputs, other) == 1);
@@ -1247,7 +1260,7 @@ fn a_connection_keeps_at_most_its_window_of_business_packets_waiting() {
         assert!(runtime.peers[&waiting].closing.is_none());
 
         // One waiting publication is taken up again: the held one follows.
-        let resumed = runtime.deferred_inputs.pop_front().unwrap();
+        let resumed = runtime.pop_deferred_front().unwrap();
         runtime.inputs.push_front(resumed);
         read_until(runtime, |r| pings(r, waiting) == 2);
         assert_eq!(business_packets(&runtime.inputs, waiting), 2);
@@ -2358,7 +2371,7 @@ fn a_peer_reuses_qos1_identifier_before_the_old_internal_written_receipt() {
         // This read proves the client can legally reuse PI 1. Deliberately do
         // not poll the socket's internal Written channel before the new input.
         assert_eq!(read_frame(&mut client), (0x40, unmatched(1)));
-        let old = *runtime
+        let old = runtime
             .frames
             .iter()
             .find(|(_, f)| f.kind == "PUBACK")
@@ -2436,8 +2449,9 @@ fn finish_retained_durable_publish(close_before_enqueue: bool) {
                 .try_send(net::Write {
                     expiry: None,
                     correlation: None,
-                    bytes: vec![0xd0, 0],
+                    bytes: net::FrameBytes::from_slice(&[0xd0, 0]),
                     payload: None,
+                    report: net::WriteReport::Complete,
                 })
                 .unwrap();
         }
@@ -2645,8 +2659,9 @@ fn a_slow_transport_holds_its_acks_while_an_independent_exchange_progresses() {
                     .try_send(net::Write {
                         expiry: None,
                         correlation: None,
-                        bytes: vec![0xd0, 0],
+                        bytes: net::FrameBytes::from_slice(&[0xd0, 0]),
                         payload: None,
+                        report: net::WriteReport::Complete,
                     })
                     .unwrap();
             }
@@ -2690,7 +2705,7 @@ fn a_slow_transport_holds_its_acks_while_an_independent_exchange_progresses() {
             incoming
                 .try_send(net::Incoming::Packet {
                     first: 0xc0,
-                    body: vec![],
+                    body: net::FrameBytes::empty(),
                     observed: Ok(runtime.message_now().unwrap()),
                 })
                 .unwrap();
@@ -2897,7 +2912,7 @@ fn a_full_input_lane_leaves_the_next_socket_packet_in_its_bounded_channel() {
         producer
             .try_send(net::Incoming::Packet {
                 first: 0xc0,
-                body: vec![],
+                body: net::FrameBytes::empty(),
                 observed: Ok(runtime.message_now().unwrap()),
             })
             .unwrap();
@@ -2941,6 +2956,7 @@ fn a_full_ordinary_lane_still_collects_an_authentic_writer_reply() {
         runtime.drain_inputs().unwrap();
         let response = runtime
             .writer
+            .threaded_mut()
             .receiver
             .recv_timeout(Duration::from_secs(1))
             .unwrap();
@@ -2955,10 +2971,10 @@ fn a_full_ordinary_lane_still_collects_an_authentic_writer_reply() {
         ));
         let (producer, consumer) = std::sync::mpsc::sync_channel(1);
         producer.try_send(response).unwrap();
-        let original = std::mem::replace(&mut runtime.writer.receiver, consumer);
+        let original = std::mem::replace(&mut runtime.writer.threaded_mut().receiver, consumer);
         fill_ordinary_inputs(runtime, generation);
         runtime.writer_results().unwrap();
-        runtime.writer.receiver = original;
+        runtime.writer.threaded_mut().receiver = original;
         assert!(
             runtime.inflight.is_empty(),
             "full_ordinary_input_delayed_already_committed_writer_reply"
@@ -2988,8 +3004,9 @@ fn a_saturated_four_slot_output_retains_the_committed_puback_until_terminal_fail
                 .try_send(net::Write {
                     expiry: None,
                     correlation: None,
-                    bytes: vec![0xd0, 0],
+                    bytes: net::FrameBytes::from_slice(&[0xd0, 0]),
                     payload: None,
+                    report: net::WriteReport::Complete,
                 })
                 .unwrap();
         }
@@ -3446,7 +3463,8 @@ fn cancelled_startup_never_announces_ready_and_releases_its_opened_epoch() {
         Hooks::default(),
         &events,
         cancel,
-        &mut writer,
+        StoreHandle::Threaded(&mut writer),
+        None,
         None,
         Limits::BOUNDED,
     );
@@ -3500,7 +3518,8 @@ fn established_typed_startup_failure_takes_precedence_over_cancellation() {
         Hooks::default(),
         &events,
         cancel,
-        &mut writer,
+        StoreHandle::Threaded(&mut writer),
+        None,
         None,
         Limits::BOUNDED,
     );
@@ -3564,7 +3583,8 @@ fn cancellation_during_unacknowledged_registration_never_announces_ready() {
             hooks,
             &events,
             cancel.clone(),
-            &mut writer,
+            StoreHandle::Threaded(&mut writer),
+            None,
             None,
             Limits::BOUNDED,
         );
@@ -3787,11 +3807,20 @@ fn a_full_maintenance_input_lane_leaves_the_real_reply_in_reserved_transport() {
         // before publishing that marker's ordinary response. No elapsed-time
         // assumption establishes that the collector reached its reply channel.
         for _ in 0..2 {
-            runtime.writer.sender.send(Request::Recovery(None)).unwrap();
+            runtime
+                .writer
+                .threaded_mut()
+                .sender
+                .send(Request::Recovery(None))
+                .unwrap();
         }
         for _ in 0..2 {
             assert!(matches!(
-                runtime.writer.receiver.recv_timeout(Duration::from_secs(2)),
+                runtime
+                    .writer
+                    .threaded_mut()
+                    .receiver
+                    .recv_timeout(Duration::from_secs(2)),
                 Ok(Response::Recovery(Ok(_)))
             ));
         }
@@ -4115,7 +4144,8 @@ fn stale_puback_during_takeover_with_a_blocked_close_cannot_stop_other_connectio
         // replies. This distinguishes takeover/control progress from global
         // quiescence while preserving the adapter's original correlations.
         let (released, receiver) = std::sync::mpsc::sync_channel(IN_FLIGHT * 2);
-        let worker_receiver = std::mem::replace(&mut runtime.writer.receiver, receiver);
+        let worker_receiver =
+            std::mem::replace(&mut runtime.writer.threaded_mut().receiver, receiver);
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             until_phase(
                 runtime,
@@ -4227,11 +4257,11 @@ fn stale_puback_during_takeover_with_a_blocked_close_cannot_stop_other_connectio
         // Restore the real adapter even if an assertion panics. Afterwards,
         // require every held effect's own correlated reply to be collected;
         // each wait measures one operation's progress, not total quiescence.
-        runtime.writer.receiver = worker_receiver;
+        runtime.writer.threaded_mut().receiver = worker_receiver;
         if let Err(payload) = outcome {
             std::panic::resume_unwind(payload);
         }
-        let pending = runtime.inflight.keys().copied().collect::<Vec<_>>();
+        let pending = runtime.inflight.keys().collect::<Vec<_>>();
         for effect in pending {
             until_phase(runtime, path, "collect held correlated admission", |r| {
                 !r.inflight.contains_key(&effect)
@@ -4528,10 +4558,13 @@ fn zero_expiry_reconnect_first_resumes_then_ends_the_existing_incarnation() {
 
 fn relay_control_reply(runtime: &mut Runtime<'_>, response: ControlResponse) {
     let (sender, receiver) = std::sync::mpsc::sync_channel(crate::writer::CONTROL_QUEUE);
-    let original = std::mem::replace(&mut runtime.writer.control_receiver, receiver);
+    let original = std::mem::replace(
+        &mut runtime.writer.threaded_mut().control_receiver,
+        receiver,
+    );
     sender.send(response).unwrap();
     let result = runtime.writer_results();
-    runtime.writer.control_receiver = original;
+    runtime.writer.threaded_mut().control_receiver = original;
     result.unwrap();
 }
 
@@ -5710,6 +5743,7 @@ fn certain_detach_failure_is_observable_instead_of_losing_offline_expiration() {
         // Its durable fence proves no effect; no fabricated store result.
         runtime
             .writer
+            .threaded_mut()
             .control_sender
             .send(ControlRequest::Lifecycle(OwnedEffect::new(
                 effect,
@@ -6068,11 +6102,13 @@ fn overlapping_same_client_will_connects_leave_the_replacement_connected() {
         // Both authentic SQLite barrier reads precede either Open submission.
         let one = runtime
             .writer
+            .threaded_mut()
             .control_receiver
             .recv_timeout(Duration::from_secs(2))
             .unwrap();
         let two = runtime
             .writer
+            .threaded_mut()
             .control_receiver
             .recv_timeout(Duration::from_secs(2))
             .unwrap();
@@ -6176,18 +6212,19 @@ fn tls_test_peer(
         .set_read_timeout(Some(Duration::from_secs(2)))
         .unwrap();
     let (server, _) = listener.accept().unwrap();
+    let (generation, previous_client) = peer(runtime);
+    drop(previous_client);
     let io = net::spawn_tls(
         server,
         security.tls,
         security.policy,
         runtime.clock.clone(),
         runtime.wake.clone(),
+        Some((runtime.ready_peers.clone(), generation.get())),
         #[cfg(feature = "test-hooks")]
         (runtime.hooks.clone(), runtime.events.clone()),
     )
     .unwrap();
-    let (generation, previous_client) = peer(runtime);
-    drop(previous_client);
     let previous = std::mem::replace(&mut runtime.peers.get_mut(&generation).unwrap().io, io);
     previous.close();
     runtime.retiring.push(previous);
@@ -6369,8 +6406,9 @@ fn blocked_output_and_full_input_preserve_independent_work_and_reconnect_credit(
                     .try_send(net::Write {
                         expiry: None,
                         correlation: None,
-                        bytes: vec![0xd0, 0],
+                        bytes: net::FrameBytes::from_slice(&[0xd0, 0]),
                         payload: None,
+                        report: net::WriteReport::Complete,
                     })
                     .unwrap();
             }
@@ -6418,6 +6456,7 @@ fn blocked_output_and_full_input_preserve_independent_work_and_reconnect_credit(
             runtime.drain_inputs().unwrap();
             let reply = runtime
                 .writer
+                .threaded_mut()
                 .receiver
                 .recv_timeout(Duration::from_secs(1))
                 .unwrap();
@@ -6436,13 +6475,13 @@ fn blocked_output_and_full_input_preserve_independent_work_and_reconnect_credit(
             assert!(runtime.inflight.contains_key(&committed_effect));
             let (replay, ready) = std::sync::mpsc::sync_channel(1);
             replay.try_send(reply).unwrap();
-            let writer = std::mem::replace(&mut runtime.writer.receiver, ready);
+            let writer = std::mem::replace(&mut runtime.writer.threaded_mut().receiver, ready);
             fill_ordinary_inputs(runtime, publisher);
             assert_eq!(runtime.ordinary_room(), 0);
             assert_eq!(runtime.inputs.len(), ORDINARY_INPUTS);
             let progress_started = Instant::now();
             runtime.writer_results().unwrap();
-            runtime.writer.receiver = writer;
+            runtime.writer.threaded_mut().receiver = writer;
             assert!(!runtime.inflight.contains_key(&committed_effect));
             assert_eq!(runtime.ordinary_room(), 0);
             assert_eq!(runtime.writer_input_count(), 1);
@@ -6584,4 +6623,238 @@ fn blocked_output_and_full_input_preserve_independent_work_and_reconnect_credit(
             );
         });
     }
+}
+
+#[test]
+fn direct_volatile_store_commits_inline_and_saves_snapshot() {
+    let directory = Directory::new();
+    let db_path = directory.0.join("direct.sqlite");
+    let events =
+        Events::open_at(&directory.0.join("events.jsonl"), crate::events::Level::Ops).unwrap();
+    let cancel = Arc::new(AtomicBool::new(false));
+    let (mut direct, boot) = DirectWriter::open(
+        db_path.clone(),
+        events.clone(),
+        Hooks::default(),
+        cancel.clone(),
+        None,
+        false,
+        crate::writer::StorageMode::Volatile {
+            snapshot_interval: Some(Duration::from_secs(60)),
+        },
+    )
+    .unwrap();
+    let mut authority = OwnerAuthority::from_grant(boot.grant, NonZeroU32::MIN).unwrap();
+    let outbox = authority
+        .create_outbox(
+            LogicalOwnerId::new(0),
+            NonZeroUsize::new(128).unwrap(),
+            nz(65536),
+        )
+        .unwrap();
+    let mut owner = Owner::new(
+        OwnerConfig {
+            max_sessions: nz(128),
+            max_routes: nz(128),
+            max_exchanges: nz(128),
+            account: AccountId::new(1),
+            payload_bytes: PayloadBytes::new(4 * 1024 * 1024),
+            resolution_delay: LogicalDuration::new(10000),
+            retained_operations: nz(128),
+            remembered_connections: nz(8),
+        },
+        outbox,
+    )
+    .unwrap();
+    owner.enable_inline_claims();
+    let mut runtime = Runtime {
+        progress: 0,
+        wake: crate::wake::Wake::new(),
+        limits: Limits::BOUNDED,
+        security: None,
+        message_expiry_request: None,
+        message_expiry_retry: false,
+        message_expiry_retry_attempts: 0,
+        message_expiry_observation: None,
+        message_expiry_after: None,
+        message_expiry_scan: Instant::now(),
+        message_expiry_input: None,
+        message_last_time: None,
+        last_message_clock_sync: Instant::now(),
+        message_clock_needed: true,
+        clock: boot.clock,
+        clock_anchor: boot.clock_anchor,
+        clock_checkpoint: None,
+        last_clock_checkpoint: Instant::now(),
+        checkpoint_degraded: false,
+        expiry_timers: BTreeMap::new(),
+        expiry_inputs: VecDeque::new(),
+        last_expiry_inventory: None,
+        owner,
+        _authority: authority,
+        writer: StoreHandle::Direct(&mut direct),
+        events,
+        peers: FlatMap::new(),
+        ready_peers: net::ReadyQueue::new(),
+        ready_raw: Vec::new(),
+        pending_peers: FlatSet::new(),
+        capacity_waiters: 0,
+        retiring: Vec::new(),
+        session_ids: boot.sessions.values().map(|s| s.id).collect(),
+        sessions: boot.sessions,
+        session_requests: BTreeMap::new(),
+        will_connects: BTreeMap::new(),
+        will_reads: None,
+        last_will_deferred: None,
+        next_session_request: 0,
+        generation: ConnectionGeneration::new(0),
+        peer_cursor: 0,
+        peer_keys: Vec::new(),
+        last_peer_deadline_scan: Instant::now(),
+        inputs: VecDeque::new(),
+        control_inputs: VecDeque::new(),
+        closing_inputs: VecDeque::new(),
+        terminal_inputs: VecDeque::new(),
+        terminal_effects: ScopedFlatMap::new(),
+        deferred_inputs: VecDeque::new(),
+        deferred_by_conn: FlatMap::new(),
+        effects_awaited: false,
+        deferred_retries: 0,
+        credit_progress: Instant::now(),
+        timers: BTreeMap::new(),
+        inflight: ScopedFlatMap::new(),
+        lifecycle_inflight: BTreeMap::new(),
+        last_session_change: None,
+        session_cardinality_dirty: false,
+        last_session_cardinality: None,
+        work_reads: ScopedFlatMap::new(),
+        pending_work: VecDeque::new(),
+        pending_work_set: BTreeSet::new(),
+        queued_work_sessions: FlatSet::new(),
+        cached_bindings: FlatMap::new(),
+        bindings_dirty: true,
+        stale_frames_dirty: false,
+        timers_dirty: false,
+        receipt_pressure_blocked: false,
+        last_work_scan: Instant::now(),
+        last_will_scan: Instant::now(),
+        last_maintenance_flush: Instant::now(),
+        maintenance_needed: false,
+        #[cfg(feature = "test-hooks")]
+        work_cache: BTreeMap::new(),
+        #[cfg(feature = "test-hooks")]
+        deferred_work: VecDeque::new(),
+        #[cfg(feature = "test-hooks")]
+        emission_barriers: VecDeque::new(),
+        #[cfg(feature = "test-hooks")]
+        last_consume_result: None,
+        started: Instant::now(),
+        #[cfg(feature = "test-hooks")]
+        captured: None,
+        #[cfg(feature = "test-hooks")]
+        hooks: Hooks::default(),
+        #[cfg(feature = "test-hooks")]
+        deferred_ack: None,
+        #[cfg(feature = "test-hooks")]
+        deferred_ack_used: false,
+        frames: ScopedFlatMap::new(),
+        outgoing_bindings: FlatMap::new(),
+        puback_observation: 0,
+        #[cfg(feature = "test-hooks")]
+        copied_puback: None,
+        #[cfg(feature = "test-hooks")]
+        deferred_outgoing_written: None,
+        #[cfg(feature = "test-hooks")]
+        copied_outgoing_frame: None,
+        #[cfg(feature = "test-hooks")]
+        last_finish_result: None,
+        #[cfg(feature = "test-hooks")]
+        copied_session_change: None,
+        #[cfg(feature = "test-hooks")]
+        copied_session_close: None,
+    };
+    let mut cursor = None;
+    loop {
+        let Some(Response::Recovery(page)) = runtime.writer.exec_recovery(cursor).unwrap() else {
+            panic!("direct recovery response");
+        };
+        let page = page.unwrap();
+        cursor = page.next;
+        runtime
+            .queue(Input::Recovery {
+                facts: page.facts,
+                last: cursor.is_none(),
+            })
+            .unwrap();
+        runtime.drain_inputs().unwrap();
+        if cursor.is_none() {
+            break;
+        }
+    }
+    assert!(!runtime.owner.is_recovering());
+
+    // Connect persistent subscriber & publisher, subscribe, publish QoS 1 inline.
+    let (sub_gen, mut sub_sock) = peer(&mut runtime);
+    let mut sub_conn = connect_packet(b"direct-sub");
+    sub_conn.clean_start = false;
+    sub_conn.expiry = SessionExpiry::Never;
+    runtime.connect(sub_gen, sub_conn).unwrap();
+    until(&mut runtime, |r| r.session_requests.is_empty());
+    assert_eq!(read_frame(&mut sub_sock).0, 0x20);
+    // Subscribe to topic "t" at QoS 1.
+    runtime
+        .packet(sub_gen, 0x82, vec![0, 1, 0, 0, 1, b't', 1])
+        .unwrap();
+    until(&mut runtime, |r| r.frames.is_empty() && r.inputs.is_empty());
+    assert_eq!(read_frame(&mut sub_sock).0, 0x90);
+
+    let (pub_gen, mut pub_sock) = peer(&mut runtime);
+    runtime
+        .connect(pub_gen, connect_packet(b"direct-pub"))
+        .unwrap();
+    until(&mut runtime, |r| r.session_requests.is_empty());
+    assert_eq!(read_frame(&mut pub_sock).0, 0x20);
+
+    // Publish QoS 1 on "t" with retained=true so snapshot verification observes it.
+    runtime
+        .packet(pub_gen, 0x33, vec![0, 1, b't', 0, 7, 0, b'o', b'k'])
+        .unwrap();
+    runtime.drain_inputs().unwrap();
+    // Synchronous DirectWriter resolves Persist + emits PUBACK + EmitPublish in one pass,
+    // with zero inflight commands and zero armed timers for the resolved admission!
+    assert!(runtime.inflight.is_empty());
+    assert!(runtime.timers.is_empty());
+    assert_eq!(read_frame(&mut pub_sock), (0x40, vec![0, 7]));
+    let (first, body) = read_frame(&mut sub_sock);
+    assert_eq!(first & 0xf6, 0x32);
+    assert!(body.ends_with(b"ok"));
+
+    // Cleanly close peers and persist atomic SQLite snapshot on finish().
+    runtime.shutdown_sessions(Duration::from_secs(2)).unwrap();
+    for (_, p) in std::mem::take(&mut runtime.peers) {
+        p.io.close();
+        runtime.retiring.push(p.io);
+    }
+    let deadline = Instant::now() + Duration::from_secs(2);
+    for mut p in std::mem::take(&mut runtime.retiring) {
+        while !p.is_finished() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(p.join_finished());
+    }
+    drop(runtime);
+    direct.finish().unwrap();
+
+    let saved = mqttiumd_store_sqlite::SqliteStore::inspect(&db_path).unwrap();
+    assert!(
+        saved.retained.contains_key(b"t".as_slice()),
+        "shutdown snapshot must preserve retained message committed via DirectWriter"
+    );
+    assert!(
+        saved
+            .sessions
+            .values()
+            .any(|s| s.client_id == b"direct-sub"),
+        "shutdown snapshot must preserve persistent subscriber session"
+    );
 }

@@ -113,7 +113,7 @@ fn tls_failure(error: &Error) -> &'static str {
 
 struct Encoded {
     frame: Write,
-    batch: Vec<(Option<(EffectId, ConnectionKey)>, usize)>,
+    batch: Vec<CoalescedEntry>,
     ciphertext: Vec<u8>,
     offset: usize,
     deadline: Instant,
@@ -126,7 +126,7 @@ impl Encoded {
         if self.batch.is_empty() {
             vec![self.frame.correlation]
         } else {
-            self.batch.into_iter().map(|(c, _)| c).collect()
+            self.batch.into_iter().map(|(c, _, _)| c).collect()
         }
     }
 }
@@ -397,8 +397,8 @@ impl Task {
             {
                 let first_len = frame.total_len();
                 let next_len = next.total_len();
-                batch.push((frame.correlation, first_len));
-                batch.push((next.correlation, next_len));
+                batch.push((frame.correlation, frame.report, first_len));
+                batch.push((next.correlation, next.report, next_len));
                 frame.flatten_into_bytes();
                 next.append_to(&mut frame.bytes);
                 frame.correlation = None;
@@ -409,7 +409,7 @@ impl Task {
                     if more.can_coalesce(RECORD_BODY)
                         && frame.bytes.len() + more.total_len() <= RECORD_BODY
                     {
-                        batch.push((more.correlation, more.total_len()));
+                        batch.push((more.correlation, more.report, more.total_len()));
                         more.append_to(&mut frame.bytes);
                     } else {
                         self.lanes.peeked = Some(more);
@@ -432,7 +432,7 @@ impl Task {
                 } else {
                     self.machine
                         .unsealed
-                        .extend(batch.into_iter().map(|(c, _)| c));
+                        .extend(batch.into_iter().map(|(c, _, _)| c));
                 }
                 return Err(code);
             }
@@ -542,23 +542,32 @@ impl Task {
         }
         if encoded.offset == encoded.ciphertext.len() {
             if encoded.batch.is_empty() {
-                if let Some((effect, connection)) = encoded.frame.correlation {
+                let report = encoded.frame.report;
+                if report == WriteReport::CompleteAndWireProgress
+                    && let Some((effect, connection)) = encoded.frame.correlation
+                {
                     self.lanes
                         .wire_progress(WireProgress { effect, connection });
                 }
-                self.lanes.report(Written::Complete {
-                    correlation: encoded.frame.correlation,
-                    bytes: encoded.frame.total_len(),
-                });
+                if report != WriteReport::None {
+                    self.lanes.report(Written::Complete {
+                        correlation: encoded.frame.correlation,
+                        bytes: encoded.frame.total_len(),
+                    });
+                }
                 *output = None;
             } else {
                 let completed = output.take().expect("encoded batch");
-                for (correlation, bytes) in completed.batch {
-                    if let Some((effect, connection)) = correlation {
+                for (correlation, report, bytes) in completed.batch {
+                    if report == WriteReport::CompleteAndWireProgress
+                        && let Some((effect, connection)) = correlation
+                    {
                         self.lanes
                             .wire_progress(WireProgress { effect, connection });
                     }
-                    self.lanes.report(Written::Complete { correlation, bytes });
+                    if report != WriteReport::None {
+                        self.lanes.report(Written::Complete { correlation, bytes });
+                    }
                 }
             }
         }
