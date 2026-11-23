@@ -7,6 +7,10 @@ changes no public type of the core tier, no durable encoding and no
 contract. The contract digest that `validate` prints moves only because
 the register lists the accepted records.
 
+Amended by 0060 (proposed): the reader goes on behind a publication that
+waits for a slot of the window, so the PUBREL of a 3.1.1 client that was
+announced no window is read too, up to a bound.
+
 Amendment of acceptance (21 November 2026). The record is accepted with
 the rules of the text below, which differ from its first form on three
 points. Keep Alive runs from the last packet the transport heard; it is

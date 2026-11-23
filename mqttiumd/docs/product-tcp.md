@@ -437,6 +437,14 @@ remain. The write-to-progress publication gap can retain one decoded PUBLISH
 for at most 500 ms while a matching accepted terminal ACK is pending. Submission
 alone returns no credit. A genuine ninth unfinished exchange remains refused.
 
+MQTT 3.1.1 announces no window: a ninth exchange is pressure, and its PUBLISH
+waits for a slot. The broker goes on reading behind it
+([ADR 0060](decisions/0060-reading-behind-a-waiting-publication.md)): the
+PUBREL of another exchange goes ahead and frees a slot, every other packet
+waits behind in order, up to 32 packets and the bytes of one largest packet.
+A 3.1.1 client can have 41 QoS 2 exchanges in flight; beyond that it stalls
+until Keep Alive.
+
 Outgoing QoS 1 progresses Queued → ClaimPending → AwaitPuback → FinishPending
 → Terminal. Known ClaimDelivery commit associates DeliveryId, target/revision,
 PI and claim operation before PUBLISH eligibility. Claim identity also guards

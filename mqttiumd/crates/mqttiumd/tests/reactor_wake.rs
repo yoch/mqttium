@@ -1213,15 +1213,19 @@ fn every_acknowledged_qos1_message_is_owed_to_and_reaches_each_subscriber() {
     }
 
     // The silent subscriber leaves without having read; both come back.
+    // They stay connected until the store owes nothing: an acknowledgement
+    // written just before the end of a transport may not be applied.
     drop(silent);
+    let mut resumed = Vec::new();
     for client_id in ["owed-silent", "owed-offline"] {
-        let (mut resumed, present) = session_v5(broker.address, client_id);
+        let (mut stream, present) = session_v5(broker.address, client_id);
         assert!(present, "{client_id}");
         assert_eq!(
-            receive_qos1_v5(&mut resumed, MESSAGES),
+            receive_qos1_v5(&mut stream, MESSAGES),
             expected,
             "{client_id}"
         );
+        resumed.push(stream);
     }
     let deadline = Instant::now() + Duration::from_secs(10);
     while !mqttiumd_store_sqlite::SqliteStore::inspect(&store)
