@@ -71,6 +71,9 @@ pub enum Step {
     DriveUntil {
         event: Event,
         max_steps: u64,
+        /// While the event has not come and nothing else is eligible, fire
+        /// the armed deadline due first (decision 0018).
+        fire_deadlines: bool,
     },
     FireDeadline {
         max_steps: u64,
@@ -297,11 +300,11 @@ fn publish_properties(value: &Value, payload: &[u8]) -> Result<Option<PublishPro
 }
 
 /// Members of the scenario format the bench does not play yet: a fault
-/// repeated from an occurrence on (decision 0018) and a wait that fires
-/// the deadlines itself. A scenario that holds one is refused, never
-/// played by ignoring it.
+/// repeated from an occurrence on (decision 0018), which the injector of
+/// the store adapter cannot arm yet. A scenario that holds one is refused,
+/// never played by ignoring it.
 const UNPLAYED_FAULT_MEMBERS: [&str; 3] = ["from_occurrence", "expected_hits_at_least", "lag"];
-const UNPLAYED_STEP_MEMBERS: [&str; 1] = ["fire_deadlines"];
+const UNPLAYED_STEP_MEMBERS: [&str; 0] = [];
 
 /// Why the bench cannot play `document`, if it cannot: the first member it
 /// does not play, and where.
@@ -418,6 +421,10 @@ fn step(value: &Value) -> Result<Step, String> {
             Step::DriveUntil {
                 event,
                 max_steps: decimal(value, "max_steps")?,
+                fire_deadlines: match value.get("fire_deadlines") {
+                    None => false,
+                    Some(flag) => flag.as_bool().ok_or("fire_deadlines is not a boolean")?,
+                },
             }
         }
         "FireDeadline" => Step::FireDeadline {

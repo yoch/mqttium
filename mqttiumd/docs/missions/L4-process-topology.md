@@ -122,6 +122,17 @@ be read (`tests/bench_protocol.rs` plays 200 records through a window of
 
 Implemented in `crates/mqttiumd-lab/src/bench/child.rs`
 (`run --backend sqlite --process child`; the default stays in-process).
+
+An in-process SQLite run holds the writer lock of its store (`flock` on
+`<database>.writer-lock`) in the process that runs it. A process that
+process forks holds a copy of that descriptor until it executes its
+program; if the run restarts its store meanwhile, the reopen meets its
+own lock and the run stops with `WriterAlive`. The lab spawns nothing
+during an in-process run. The tests do, from other threads of the same
+test binary: `tests/bench_support.rs` keeps an in-process SQLite
+campaign apart from every spawn of its binary, and
+`tests/bench_fork_guard.rs` spawns without pause while such campaigns
+restart (it stopped with `WriterAlive` before the guard).
 The child relays each record its own collector wrote; the collector of
 the supervisor takes it with `accept`, checks the origin against the
 socket and the sequence against the origin, and numbers it in the

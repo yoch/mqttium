@@ -1,8 +1,9 @@
 //! What the bench does not play yet is refused, explicitly and before
 //! anything is written: the repeated faults of decision 0018
-//! (`from_occurrence`, `expected_hits_at_least`, `lag`) and the deadlines a
-//! `DriveUntil` fires itself (`fire_deadlines`). A scenario the contracts
-//! accept is never played by ignoring a member.
+//! (`from_occurrence`, `expected_hits_at_least`, `lag`). A scenario the
+//! contracts accept is never played by ignoring a member. The deadlines a
+//! `DriveUntil` fires itself (`fire_deadlines`) are played: see
+//! `bench_fire_deadlines.rs`.
 
 #[path = "bench_support.rs"]
 mod bench_support;
@@ -12,6 +13,10 @@ use std::path::PathBuf;
 use mqttiumd_lab::bench::campaign::{Request, execute};
 
 fn refused(scenario: &str, name: &str) -> String {
+    refused_on(scenario, name, "sim-store")
+}
+
+fn refused_on(scenario: &str, name: &str, backend: &str) -> String {
     let out = bench_support::fresh(name);
     let request = Request {
         root: bench_support::root(),
@@ -20,7 +25,7 @@ fn refused(scenario: &str, name: &str) -> String {
         out: out.clone(),
         seed: 1,
         run_id: Some("bench-test".to_owned()),
-        backend: "sim-store".to_owned(),
+        backend: backend.to_owned(),
         built_from: None,
         process: "in-process".to_owned(),
     };
@@ -39,30 +44,25 @@ fn a_repeated_fault_of_decision_0018_is_refused_before_anything_is_written() {
     assert!(why.contains("not played"), "{why}");
 }
 
+/// `tests/scenarios/audit/F3-permanent.json` (`F3-PERMANENT`) is the
+/// example of the contracts as it stands; it stays refused, on both
+/// stores, until the store adapter repeats a fault (lot L2).
 #[test]
-fn a_wait_that_fires_its_own_deadlines_is_refused_before_anything_is_written() {
-    let root = bench_support::root();
-    let mut scenario: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(root.join("tests/scenarios/p1/P1-02.json")).unwrap())
-            .unwrap();
-    let wait = scenario["steps"]
-        .as_array_mut()
-        .unwrap()
-        .iter_mut()
-        .find(|step| step["kind"] == "DriveUntil")
-        .unwrap();
-    wait["fire_deadlines"] = serde_json::json!(true);
-    let relative = format!(
-        "target/bench-scenarios/fire-deadlines-{}.json",
-        std::process::id()
+fn the_permanent_delay_of_the_audit_is_the_example_and_is_refused_until_faults_repeat() {
+    const AUDIT: &str = "tests/scenarios/audit/F3-permanent.json";
+    let read = |relative: &str| -> serde_json::Value {
+        serde_json::from_slice(&std::fs::read(bench_support::root().join(relative)).unwrap())
+            .unwrap()
+    };
+    let audit = read(AUDIT);
+    assert_eq!(
+        audit,
+        read("contracts/examples/v1/valid/scenario-permanent-delay.json")
     );
-    std::fs::create_dir_all(root.join("target/bench-scenarios")).unwrap();
-    std::fs::write(
-        root.join(&relative),
-        serde_json::to_vec_pretty(&scenario).unwrap(),
-    )
-    .unwrap();
-    let why = refused(&relative, "unplayed-fire");
-    let _ = std::fs::remove_file(root.join(&relative));
-    assert!(why.contains("fire_deadlines"), "{why}");
+    assert_eq!(audit["id"], "F3-PERMANENT");
+    for backend in ["sim-store", "sqlite"] {
+        let why = refused_on(AUDIT, &format!("unplayed-permanent-{backend}"), backend);
+        assert!(why.contains("from_occurrence"), "{backend}: {why}");
+        assert!(why.contains("not played"), "{backend}: {why}");
+    }
 }
