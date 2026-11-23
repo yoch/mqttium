@@ -3,7 +3,7 @@
 Written by `tests/compat/run.py`: regenerate it with the command in
 `tests/compat/README.md` and copy `matrix.md` here; do not edit it by hand.
 
-- broker: `mqttiumd` built from commit `476afc845877cc1eb2041c990618fc17490b115a`
+- broker: `mqttiumd` built from commit `d29b3564eb56930d18fe11472271ad066e208da8`
 - reference: Mosquitto 2.1.4, the version `tests/compat/build-reference.sh` builds
 - scenarios played: 135
 
@@ -123,7 +123,7 @@ this run and may differ in the next: where a broker may lawfully shed messages
 | `properties/response-topic-v5` | 5.0 | same | Response Topic and Correlation Data of a PUBLISH are forwarded unaltered to the subscriber. |
 | `properties/topic-alias-v5` | 5.0 | profile-refused | Mosquitto (Topic Alias Maximum 10) resolves the alias and delivers both messages; mqttiumd (Topic Alias Maximum 0) answers the first PUBLISH with DISCONNECT 0x94 (Topic Alias invalid) and closes. |
 | `properties/user-properties-v5` | 5.0 | same | User Properties of a PUBLISH are forwarded to the subscriber, repeated names included, in order. |
-| `publish/burst-qos0-v4` | 3.1.1 | same | One hundred QoS 0 messages written at once to an online QoS 0 subscriber. A broker may shed QoS 0 for a subscriber it does not write to fast enough, and whether it does depends on timing: mqttiumd drops what finds the subscriber's output queue of sixty-four frames full, and delivered sixty-four of the hundred in about one play in thirty. The count is measured, not compared; the transcript compares that each message that came is one of those sent, came once, and in the order sent. |
+| `publish/burst-qos0-v4` | 3.1.1 | same | One hundred QoS 0 messages written at once reach an online QoS 0 subscriber; the transcript keeps whether all came and whether those that came are in the order sent, not how many. mqttiumd paces QoS 0 by connection (record 0063): a subscriber that reads receives the burst whole, so the count is compared again. |
 | `publish/cross-version-v5-to-v4` | 3.1.1 + 5.0 | same | A MQTT 5 publisher sets Message Expiry Interval and a MQTT 3.1.1 subscriber receives the message, without any property. |
 | `publish/duplicate-qos1-publish-v4` | 3.1.1 | same | A QoS 1 PUBLISH is sent again with DUP 1 and the same Packet Identifier after its PUBACK: it is a new publication, acknowledged and delivered again, and DUP is not propagated to the subscriber. |
 | `publish/duplicate-qos2-publish-v4` | 3.1.1 | same | A QoS 2 PUBLISH is sent again with DUP 1 before PUBREL: it is acknowledged again and the subscriber still receives one message. |

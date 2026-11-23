@@ -1,7 +1,7 @@
 """PUBLISH in both directions: QoS 0/1/2, downgrade, duplicates, invalid topics, flow control."""
 import mqttwire as wire
-from dsl import (ack, collect, connect, disconnect, mark, measure, publish, publish_ack, publish_qos2, publish_sync,
-                 quiet, recv, scenario, send, subscribe, tally, until_close)
+from dsl import (ack, collect, connect, disconnect, mark, publish, publish_ack, publish_qos2, publish_sync, quiet, recv,
+                 scenario, send, subscribe, tally, until_close)
 from expectations import at, at_most, expectation
 
 for level in (4, 5):
@@ -120,19 +120,17 @@ scenario(
 
 scenario(
     "publish/burst-qos0-v4",
-    doc="""One hundred QoS 0 messages written at once to an online QoS 0 subscriber. A
-    broker may shed QoS 0 for a subscriber it does not write to fast enough, and whether
-    it does depends on timing: mqttiumd drops what finds the subscriber's output queue
-    of sixty-four frames full, and delivered sixty-four of the hundred in about one play
-    in thirty. The count is measured, not compared; the transcript compares that each
-    message that came is one of those sent, came once, and in the order sent.""",
+    doc="""One hundred QoS 0 messages written at once reach an online QoS 0 subscriber;
+    the transcript keeps whether all came and whether those that came are in the order
+    sent, not how many. mqttiumd paces QoS 0 by connection (record 0063): a subscriber
+    that reads receives the burst whole, so the count is compared again.""",
     steps=[
         connect("sub", "p-burst-sub"), subscribe("sub", 1, [("burst/t", 0)]),
         connect("pub", "p-burst-pub"),
         send("pub", b"".join(wire.publish("burst/t", f"m{index}") for index in range(100)),
              note="one hundred QoS 0 PUBLISH on burst/t in one write"),
         send("pub", wire.pingreq()), recv("pub"),
-        measure("sub", [f"m{index}" for index in range(100)]),
+        tally("sub", 100, sequence=[f"m{index}" for index in range(100)]),
     ],
 )
 
