@@ -48,8 +48,9 @@ executable with clients connected.
 
 The runtime writes `session_changed` (`action` `Closed` or `Detached`) once
 the store has answered: an operator who needs the fact reads that event.
-Record 0055 names the guarantee of the log mode `per_commit_fdatasync_wal`;
-the string the executable prints is the one of this table.
+Record 0055 named the guarantee of the log mode `per_commit_fdatasync_wal`
+until it was corrected; the string the executable prints is the one of this
+table.
 
 ### What a loss of the process before the commit does
 

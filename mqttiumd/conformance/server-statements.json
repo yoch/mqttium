@@ -1147,7 +1147,7 @@
         "applies_to_server": false,
         "status": "not-applicable",
         "evidence": [],
-        "note": "Binds the client only. The CONNACK announces 32,776 bytes, the size within which no PUBLISH exceeds the payload limit, and the announcement is a limit: a packet of exactly that size is served and one a byte larger, of any kind, is answered DISCONNECT 0x95 and closed (`a_packet_over_the_announced_maximum_packet_size_is_refused`, and the bench expectation `errors/packet-at-announced-maximum-v5#limit`)."
+        "note": "Binds the client only. The CONNACK announces 1,048,584 bytes, the size within which no PUBLISH exceeds the payload limit, and the announcement is a limit: a packet of exactly that size is served and one a byte larger, of any kind, is answered DISCONNECT 0x95 and closed (`a_packet_over_the_announced_maximum_packet_size_is_refused`, and the bench expectation `errors/packet-at-announced-maximum-v5#limit`)."
       },
       {
         "id": "MQTT-3.2.2-16",

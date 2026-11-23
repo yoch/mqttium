@@ -2,6 +2,8 @@
 
 Status: **Proposed** (22 November 2026). Applied to `mqttiumd-store-volatile`, `mqttiumd-store-sqlite`, and `mqttiumd`.
 
+Amended by 0055 (proposed): a third storage mode, `log`, with the guarantee `per_commit_fdatasync_append_log`; `--storage-mode` takes `durable|log|volatile`.
+
 ## Context
 
 In durable mode, every QoS 1/2 commit group pays a full SQLite WAL `synchronous=FULL` fsync before acknowledging the publisher. On single-disk and embedded ARM64 storage (microSD / eMMC / NVMe), this caps durable QoS 1 throughput at disk sync latency regardless of CPU headroom, whereas competing brokers such as Mosquitto default to in-memory state with optional periodic persistence (`autosave_interval`).

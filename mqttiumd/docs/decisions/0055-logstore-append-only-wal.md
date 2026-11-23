@@ -28,7 +28,7 @@ Because `mqttiumd-core` already freezes every irreversible state transition into
    - Read-only queries (`snapshot`, `work_page`, `recovery`, `inspect`) never wait on disk writes; under `Durability::Failing`, mutating groups leave both RAM state and `.mlog` length unchanged and answer `StoreOutcome::PendingOrUnknown`, while read-only groups still answer established receipts.
 3. **Explicit CLI & readiness reporting (`DUR-001`, `DUR-002`)**:
    - `--storage-mode durable|log|volatile` keeps `durable` (SQLite) as the default; `log` is strictly opt-in and never used as a silent fallback.
-   - The `ready` event and startup line explicitly declare `storage_mode: "log"` and `durability_guarantee: "per_commit_fdatasync_wal"`.
+   - The `ready` event and startup line explicitly declare `storage_mode: "log"` and `durability_guarantee: "per_commit_fdatasync_append_log"` (corrected on 23 November 2026: this line said `per_commit_fdatasync_wal`, a string the executable never printed; record 0059 noted it).
    - Any SQLite checkpoint produced by `LogStore` can be inspected live via `SqliteStore::inspect` and reopened seamlessly by `SqliteStore::open` / `open_secured`.
 
 ## Consequences

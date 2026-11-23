@@ -262,7 +262,7 @@
     {
       "decision": "0048",
       "path": "docs/decisions/0048-runtime-limits.md",
-      "sha256": "8d11753aea3d61ecd0ecd75cba2e3500398675a02896cfc2ff08db0edb73501b"
+      "sha256": "ff7f29a483a15889ed53bc55c087b271df50fcb995e40ceeda6aa29571a70e13"
     },
     {
       "decision": "0049",
