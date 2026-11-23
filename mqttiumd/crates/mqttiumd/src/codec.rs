@@ -109,7 +109,6 @@ pub struct Error {
     pub code: &'static str,
     pub reason: u8,
     peer_maximum: Option<u32>,
-    disconnect_expiry: Option<u32>,
 }
 
 impl Error {
@@ -125,18 +124,6 @@ impl Error {
     /// Peer response limit established by a fully validated CONNECT.
     pub const fn peer_maximum(self) -> Option<u32> {
         self.peer_maximum
-    }
-    /// The packet was structurally validated before profile refusal. MQTT's
-    /// CONNECT0→DISCONNECTnonzero context rule also applies to an otherwise
-    /// unsupported DISCONNECT feature.
-    pub fn in_session(self, connect_expiry: SessionExpiry) -> Self {
-        if connect_expiry == SessionExpiry::OnDisconnect
-            && self.disconnect_expiry.is_some_and(|value| value != 0)
-        {
-            protocol("SessionExpiryIncreaseForbidden")
-        } else {
-            self
-        }
     }
 }
 
@@ -154,7 +141,6 @@ const fn malformed(code: &'static str) -> Error {
         code,
         reason: 0x81,
         peer_maximum: None,
-        disconnect_expiry: None,
     }
 }
 
@@ -164,7 +150,6 @@ const fn protocol(code: &'static str) -> Error {
         code,
         reason: 0x82,
         peer_maximum: None,
-        disconnect_expiry: None,
     }
 }
 
@@ -174,7 +159,6 @@ const fn unsupported(code: &'static str) -> Error {
         code,
         reason: 0x83,
         peer_maximum: None,
-        disconnect_expiry: None,
     }
 }
 
@@ -184,7 +168,6 @@ const fn oversized(code: &'static str) -> Error {
         code,
         reason: 0x95,
         peer_maximum: None,
-        disconnect_expiry: None,
     }
 }
 
@@ -758,7 +741,6 @@ fn publish(version: Version, first: u8, body: &[u8], bounds: Bounds) -> Result<P
             code: "PayloadFormatInvalid",
             reason: 0x99,
             peer_maximum: None,
-            disconnect_expiry: None,
         });
     }
     let has_props = props.payload_format_indicator.is_some()
@@ -881,20 +863,12 @@ fn disconnect(body: &[u8]) -> Result<Packet, Error> {
         properties(&mut input, Context::Disconnect)?
     };
     input.end()?;
-    if !matches!(reason, 0 | 4)
-        || props.unsupported
-        || props
-            .expiry
-            .is_some_and(|n| SessionExpiry::from_wire(n).is_none())
-    {
-        return Err(Error {
-            disconnect_expiry: props.expiry,
-            ..unsupported("DisconnectOutsideProfile")
-        });
-    }
+    // Every reason admitted above ends the connection and is served: the
+    // Session Expiry Interval applies whatever the reason (§3.14.2.2.2), and
+    // only a normal disconnection discards the Will (§3.1.2.5).
     Ok(Packet::Disconnect {
         expiry: props.expiry.and_then(SessionExpiry::from_wire),
-        publish_will: reason == 4,
+        publish_will: reason != 0,
     })
 }
 
@@ -2539,24 +2513,19 @@ mod tests {
     }
 
     #[test]
-    fn zero_connect_context_rejects_any_nonzero_disconnect_before_profile_refusal() {
-        let error = decode(0xe0, &[0x80, 5, 0x11, 0, 0, 0, 7], BOUNDS).unwrap_err();
+    fn a_nonzero_disconnect_expiry_is_decoded_for_the_runtime_context_rule() {
+        // The CONNECT0→DISCONNECTnonzero rule needs the CONNECT value: the
+        // codec hands the override to the runtime whatever the reason.
         assert_eq!(
-            error.in_session(SessionExpiry::OnDisconnect).code(),
-            "SessionExpiryIncreaseForbidden"
+            decode(0xe0, &[0x80, 5, 0x11, 0, 0, 0, 7], BOUNDS),
+            Ok(Packet::Disconnect {
+                expiry: Some(SessionExpiry::After(7)),
+                publish_will: true
+            })
         );
-        assert_eq!(
-            error.in_session(SessionExpiry::OnDisconnect).reason_code(),
-            0x82
-        );
-        assert_eq!(
-            error.in_session(SessionExpiry::Never).kind(),
-            ErrorKind::Unsupported
-        );
-        let malformed = decode(0xe0, &[0, 5, 0x11, 0], BOUNDS).unwrap_err();
-        assert_eq!(
-            malformed.in_session(SessionExpiry::OnDisconnect).kind(),
-            ErrorKind::Malformed
+        kind(
+            decode(0xe0, &[0x80, 5, 0x11, 0], BOUNDS),
+            ErrorKind::Malformed,
         );
     }
 
@@ -3064,7 +3033,6 @@ mod tests {
             code: "UnsupportedProtocolVersion",
             reason: 0x84,
             peer_maximum: None,
-            disconnect_expiry: None,
         };
         assert_eq!(refusal(version, true), [0x20, 3, 0, 0x84, 0]);
         assert_eq!(refusal(version, false), [0xe0, 2, 0x83, 0]);

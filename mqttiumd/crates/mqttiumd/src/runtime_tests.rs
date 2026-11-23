@@ -6183,6 +6183,40 @@ fn disconnect_with_zero_expiry_ends_the_session(reason: u8, expected_wills: usiz
     });
 }
 
+/// MQTT 5 §3.14.2.2.2: a session opened with Session Expiry Interval 0
+/// cannot be given a non-zero one at DISCONNECT, whatever the reason code.
+#[test]
+fn a_disconnect_cannot_raise_a_zero_session_expiry_whatever_its_reason() {
+    for reason in [0x00u8, 0x04, 0x80, 0x83] {
+        with_runtime(128, |runtime, directory| {
+            let (generation, mut client) = peer(runtime);
+            let mut connect = connect_packet(b"zero-then-seven");
+            connect.expiry = SessionExpiry::OnDisconnect;
+            runtime.connect(generation, connect).unwrap();
+            until(runtime, |r| r.session_requests.is_empty());
+            assert_eq!(read_frame(&mut client).0, 0x20);
+            runtime
+                .packet(generation, 0xe0, vec![reason, 5, 0x11, 0, 0, 0, 7])
+                .unwrap();
+            assert_eq!(
+                served_frame(runtime, &mut client),
+                (0xe0, vec![0x82, 0]),
+                "reason {reason:#04x}"
+            );
+            until(runtime, |r| {
+                !r.peers.contains_key(&generation)
+                    && !r.owner.session_status().lifecycle_pending
+                    && r.lifecycle_inflight.is_empty()
+                    && r.closing_inputs.is_empty()
+            });
+            let durable =
+                mqttiumd_store_sqlite::SqliteStore::inspect(&directory.join("store.sqlite"))
+                    .unwrap();
+            assert!(durable.sessions.is_empty(), "reason {reason:#04x}");
+        });
+    }
+}
+
 #[test]
 fn normal_disconnect_with_zero_expiry_ends_the_session_and_discards_the_will() {
     disconnect_with_zero_expiry_ends_the_session(0x00, 0);

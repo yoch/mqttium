@@ -3498,10 +3498,6 @@ impl Runtime<'_> {
         {
             Ok(v) => v,
             Err(error) => {
-                let error = self
-                    .peers
-                    .get(&generation)
-                    .map_or(error, |peer| error.in_session(peer.connect_expiry));
                 self.events.emit("packet_refused",json!({"connection":generation.get().to_string(),"details":{"code":error.code(),"reason":error.reason_code()}})).map_err(event_failure)?;
                 // Refusal output has the same bounded absolute write path as business frames.
                 if let Some(p) = self.peers.get_mut(&generation) {
