@@ -425,7 +425,9 @@ class BlindSpots(unittest.TestCase):
                                        ["m0", "m9"], ["m1", "m0", "m0"])],
                          ["as-sent", "as-sent", "as-sent", "permuted", "other", "other", "other"])
         declared = {name: step for name in ("publish/pipelined-qos1-v4", "publish/burst-qos0-v4")
-                    for step in dsl.REGISTRY[name].steps if step["op"] == "tally"}
+                    for step in dsl.REGISTRY[name].steps if step["op"] in ("tally", "measure")}
+        self.assertEqual({name: step["op"] for name, step in declared.items()},
+                         {"publish/pipelined-qos1-v4": "tally", "publish/burst-qos0-v4": "measure"})
         self.assertEqual(declared["publish/pipelined-qos1-v4"]["sequence"], list(range(1, 21)))
         self.assertEqual(declared["publish/burst-qos0-v4"]["sequence"], [f"m{index}" for index in range(100)])
         burst = {"conn": "sub", "op": "tally", "kind": "PUBLISH", "expected": 3, "field": "payload",
