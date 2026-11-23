@@ -364,3 +364,78 @@ log_dest file ./events.jsonl
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// The checker reads a file; a launch needs an event journal, and a
+/// database where the storage has one, which the command line may give
+/// instead of the file. A valid file that names neither passes the check,
+/// and the report says what the command line must still give
+/// (`launch_requires`): the external audit of `47e1d12` found such a file
+/// accepted by the checker and refused at launch, with no word of it in
+/// the report.
+#[test]
+fn check_config_names_what_the_launch_still_needs_from_the_command_line() {
+    let dir = temp_dir("launch-requires");
+    let check = |name: &str, text: &str| -> serde_json::Value {
+        let path = dir.join(name);
+        std::fs::write(&path, text).unwrap();
+        let out = Command::new(env!("CARGO_BIN_EXE_mqttiumd"))
+            .args(["check-config", path.to_str().unwrap()])
+            .output()
+            .expect("run check-config");
+        assert!(out.status.success(), "{name}");
+        let report: serde_json::Value = serde_json::from_slice(&out.stdout).expect("json");
+        assert_eq!(report["ok"], true, "{name}");
+        report["launch_requires"].clone()
+    };
+    assert_eq!(
+        check(
+            "memory.conf",
+            "listener 0 127.0.0.1\nallow_anonymous true\npersistence false\n"
+        ),
+        serde_json::json!(["--events"])
+    );
+    assert_eq!(
+        check(
+            "disk.conf",
+            "listener 0 127.0.0.1\nallow_anonymous true\npersistence true\n"
+        ),
+        serde_json::json!(["--db", "--events"])
+    );
+    assert_eq!(
+        check(
+            "complete.conf",
+            "listener 0 127.0.0.1\nallow_anonymous true\npersistence false\nlog_dest file ./events.jsonl\n"
+        ),
+        serde_json::json!([])
+    );
+
+    // The launch agrees with the report: refused without the journal, and
+    // started once the command line gives it.
+    let conf = dir.join("memory.conf");
+    let refused = Command::new(env!("CARGO_BIN_EXE_mqttiumd"))
+        .args(["-c", conf.to_str().unwrap()])
+        .output()
+        .expect("launch without --events");
+    assert_eq!(refused.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("--events"),
+        "{}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+    let mut started = Command::new(env!("CARGO_BIN_EXE_mqttiumd"))
+        .args(["-c", conf.to_str().unwrap(), "--events"])
+        .arg(dir.join("journal.jsonl"))
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .expect("launch with --events");
+    let mut line = String::new();
+    std::io::BufRead::read_line(
+        &mut std::io::BufReader::new(started.stdout.take().unwrap()),
+        &mut line,
+    )
+    .unwrap();
+    let _ = started.kill();
+    let _ = started.wait();
+    assert!(line.starts_with("mqttiumd ready "), "{line:?}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
