@@ -2545,12 +2545,17 @@
         "id": "MQTT-3.14.1-1",
         "feature": "disconnect",
         "applies_to_server": true,
-        "status": "implemented-untested",
-        "evidence": [],
+        "status": "covered",
+        "evidence": [
+          {
+            "file": "mqttiumd/crates/mqttiumd/tests/wire_classes.rs",
+            "test": "reserved_fixed_header_flags_are_a_malformed_packet_on_every_packet_type"
+          }
+        ],
         "code": [
           "mqttiumd/crates/mqttiumd/src/codec.rs:flags"
         ],
-        "note": "Non-zero flag bits are `InvalidFixedFlags`, but the reader closes the connection without sending the DISCONNECT 0x81; no test sends a DISCONNECT with reserved bits."
+        "note": "Non-zero flag bits are `InvalidFixedFlags`, a Malformed Packet: the client reads DISCONNECT 0x81 and the connection is closed, asserted on the executable for a DISCONNECT with reserved bits and eight other packet types."
       },
       {
         "id": "MQTT-3.14.2-1",
@@ -5046,12 +5051,17 @@
         "id": "MQTT-3.14.1-1",
         "feature": "disconnect",
         "applies_to_server": true,
-        "status": "implemented-untested",
-        "evidence": [],
+        "status": "covered",
+        "evidence": [
+          {
+            "file": "mqttiumd/crates/mqttiumd/tests/wire_classes.rs",
+            "test": "reserved_fixed_header_flags_are_a_malformed_packet_on_every_packet_type"
+          }
+        ],
         "code": [
           "mqttiumd/crates/mqttiumd/src/codec.rs:flags"
         ],
-        "note": "Non-zero flag bits are `InvalidFixedFlags` and the reader closes the connection; no test sends a DISCONNECT with reserved bits. A 3.1.1 DISCONNECT with a body is refused (asserted)."
+        "note": "Non-zero flag bits are `InvalidFixedFlags` and the connection is closed without an answer, asserted on the executable for a DISCONNECT with reserved bits and eight other packet types. A 3.1.1 DISCONNECT with a body is refused (asserted in the codec)."
       },
       {
         "id": "MQTT-3.14.4-1",

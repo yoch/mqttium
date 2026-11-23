@@ -13,11 +13,11 @@ is inferred from. The others are not reviewed, which is not a third kind.
 
 | Status | MQTT 5.0 | MQTT 3.1.1 |
 | - | -: | -: |
-| `covered` | 148 | 83 |
+| `covered` | 149 | 84 |
 | of which `direct` | 14 | 6 |
 | of which `partial` | 8 | 15 |
-| not reviewed | 126 | 62 |
-| `implemented-untested` | 42 | 31 |
+| not reviewed | 127 | 63 |
+| `implemented-untested` | 41 | 30 |
 | `profile-refused` | 28 | 8 |
 | `open` | 0 | 0 |
 | `not-applicable` | 33 | 17 |
