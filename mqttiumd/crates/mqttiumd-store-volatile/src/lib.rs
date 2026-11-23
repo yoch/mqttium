@@ -477,8 +477,8 @@ impl VolatileStore {
         if !dup_active_client
             && !dup_retained_pub
             && all_receipts_valid
-            && read::check_inventory_bound(&store).is_ok()
-            && read::validate_retained(&store, ReadBudget::SNAPSHOT).is_ok()
+            && store.check_inventory_bound().is_ok()
+            && store.validate_retained(ReadBudget::SNAPSHOT).is_ok()
         {
             store.validated = true;
         }
@@ -490,10 +490,26 @@ impl VolatileStore {
         self.durability = durability;
     }
 
+    /// Runs `operation` as a dry run: every check runs, and the store
+    /// refuses to change while it does. The store then has the durability
+    /// it had before. A journal runs an operation so before it writes it.
+    pub(crate) fn dry_run<R>(&mut self, operation: impl FnOnce(&mut Self) -> R) -> R {
+        let durability = self.durability;
+        self.durability = Durability::Failing;
+        let result = operation(self);
+        self.durability = durability;
+        result
+    }
+
+    /// The anchor of the session clock, as committed.
+    pub(crate) fn session_clock(&self) -> Option<SessionClockAnchor> {
+        self.session_clock
+    }
+
     /// Bounded attachment barrier, O(log N) via `wills_by_client`.
     pub fn has_will_for_client(&self, client: &[u8]) -> Result<bool, ReadError> {
         if !self.validated {
-            read::validate_wills(self)?;
+            self.validate_wills()?;
         }
         Ok(self.wills_by_client.get(client).copied().unwrap_or(0) > 0)
     }
@@ -1115,7 +1131,8 @@ impl VolatileStore {
             return Err(failed);
         }
         let expired = if let Some(expiry) = admit.expiry {
-            read::check_message_observation(self, expiry.observed).map_err(|_| failed)?;
+            self.check_message_observation(expiry.observed)
+                .map_err(|_| failed)?;
             expiry.deadline().map_err(|_| failed)?;
             let anchor = self.session_clock.ok_or(failed)?.reading;
             expiry.interval == 0
@@ -1174,7 +1191,8 @@ impl VolatileStore {
         let mut release_old_retained = false;
         if retained_mask.is_some() {
             if !self.validated {
-                read::validate_retained(self, ReadBudget::SNAPSHOT).map_err(|_| failed)?;
+                self.validate_retained(ReadBudget::SNAPSHOT)
+                    .map_err(|_| failed)?;
             }
             let new_len = if expired { 0 } else { length };
             let existing = self.retained.get(admit.topic.as_slice());
@@ -1497,12 +1515,13 @@ impl VolatileStore {
     ) -> Step<CommitFacts> {
         let failed = CommitErr::Refused(RejectReason::PreconditionFailed);
         if let Some((_, _, Some(now))) = replay {
-            read::check_message_observation(self, now).map_err(|_| failed)?;
+            self.check_message_observation(now).map_err(|_| failed)?;
         }
         self.active_session(session, revision)
             .map_err(CommitErr::Refused)?;
         if replay.is_some() && !self.validated {
-            read::validate_retained(self, ReadBudget::SNAPSHOT).map_err(|_| failed)?;
+            self.validate_retained(ReadBudget::SNAPSHOT)
+                .map_err(|_| failed)?;
         }
         // Compute retained replay plans BEFORE checking route_revision?
         // Wait: MemoryStore computes plans first (checking observation, active_session,
@@ -1908,7 +1927,8 @@ impl VolatileStore {
 
     fn exec_expired(&mut self, command: &ExpireDelivery) -> Step<CommitFacts> {
         let failed = CommitErr::Refused(RejectReason::PreconditionFailed);
-        read::check_message_observation(self, command.observed).map_err(|_| failed)?;
+        self.check_message_observation(command.observed)
+            .map_err(|_| failed)?;
         let slot = self.outbound.get(&command.finish.delivery).ok_or(failed)?;
         let publication = self
             .publications
@@ -2458,7 +2478,7 @@ impl DurableStore for VolatileStore {
         limit: usize,
         budget: ReadBudget,
     ) -> Result<WillPage, ReadError> {
-        read::will_page(self, after, limit, budget)
+        self.will_page(after, limit, budget)
     }
 
     fn expire_messages(
@@ -2470,7 +2490,7 @@ impl DurableStore for VolatileStore {
         if limit == 0 || limit > MESSAGE_EXPIRY_SWEEP_PUBLICATIONS {
             return Err(ReadError::LimitExceeded);
         }
-        read::check_message_observation(self, now)?;
+        self.check_message_observation(now)?;
         let mut result = MessageExpirySweep {
             removed: BoundedVec::with_capacity(MESSAGE_EXPIRY_SWEEP_DELIVERIES)
                 .map_err(|_| ReadError::AllocationFailed)?,
@@ -2488,7 +2508,7 @@ impl DurableStore for VolatileStore {
             ))
             .take(limit as usize)
         {
-            read::check_message_candidate(self, id)?;
+            self.check_message_candidate(id)?;
             candidates.push((id, publication.expiry));
         }
         result.more = candidates.last().is_some_and(|(last, _)| {
@@ -2900,7 +2920,7 @@ impl DurableStore for VolatileStore {
     fn open_epoch(&mut self, command: &OpenEpoch) -> Result<OpeningOutcome, ReadError> {
         if let LedgerOpening::Opens { ledger } = self.ledger.open(command) {
             if !self.validated {
-                read::check_inventory_bound(self)?;
+                self.check_inventory_bound()?;
             }
             if self.sessions.len() > self.limits.max_sessions
                 || self.sessions.len() > MAX_RECOVERY_INVENTORY_ROWS
@@ -3435,7 +3455,7 @@ impl DurableStore for VolatileStore {
         limit: usize,
         budget: ReadBudget,
     ) -> Result<RecoveryPage, RecoveryRefused> {
-        read::recover_page(self, cursor, limit, budget)
+        self.recover_page(cursor, limit, budget)
     }
 
     fn read_work_with_budget(
@@ -3445,10 +3465,10 @@ impl DurableStore for VolatileStore {
         limit: usize,
         budget: ReadBudget,
     ) -> Result<WorkPage, ReadError> {
-        read::work_page(self, session, after, limit, budget)
+        self.work_page(session, after, limit, budget)
     }
 
     fn snapshot_with_budget(&self, budget: ReadBudget) -> Result<DurableState, ReadError> {
-        read::build_snapshot(self, budget)
+        self.build_snapshot(budget)
     }
 }

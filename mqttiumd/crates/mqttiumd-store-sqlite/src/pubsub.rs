@@ -565,7 +565,7 @@ pub(super) fn work(
     let meta = read_meta(&read)?;
     let counts_bounded = meta.accounts.references.get() <= MAX_RECOVERY_INVENTORY_ROWS as u64
         && meta.accounts.exchange_slots.get() <= MAX_RECOVERY_INVENTORY_ROWS as u64;
-    if !(counts_bounded && caches.work_verified.contains(&session)) {
+    if !(counts_bounded && caches.work_verified(session)) {
         sessions::validate_metadata(&read, &meta, Some(session))?;
         message_expiry::validate(&read, Some(session))?;
         // Check the target's finite metadata domain before either the QoS or
@@ -618,7 +618,7 @@ pub(super) fn work(
             return Err(Fault::Corrupt);
         }
         if counts_bounded {
-            caches.work_verified.insert(session);
+            caches.mark_work_verified(session);
         }
     }
     const SQL_FIRST: &str = "SELECT o.publication,o.idx,o.target_revision,p.topic,y.bytes,c.packet_id,c.claim,c.target,c.target_revision,s.revision,s.state,o.qos,o.retain,p.expiry_domain,p.expiry_tick,p.expiry_interval,c.started,o.cause,o.phase,p.properties FROM obligations o LEFT JOIN publications p ON p.id=o.publication LEFT JOIN payloads y ON y.id=p.payload LEFT JOIN outbound c ON c.publication=o.publication AND c.idx=o.idx LEFT JOIN sessions s ON s.id=o.target WHERE o.target=?1 ORDER BY o.publication,o.idx LIMIT ?2";

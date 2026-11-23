@@ -25,13 +25,13 @@
 #   unfaulted, by design. Every other use goes through the adapter.
 #
 # The other entries are fixed lot by lot. After lot 1 (lab): 78 entries;
-# after lot 2 (contract): 75.
+# after lot 2 (contract): 75; after lot 3 (stores): 65.
+# - field-leak of the effective settings (SqliteStore::settings,
+#   LogStore::sqlite_settings, VolatileHandle::sqlite_settings): a record of
+#   what the engine read back, which every reader only copies; its main
+#   reader is the writer of the runtime. Decided with the runtime lot.
 module-cycle mqttiumd::codec,mqttiumd::net,mqttiumd::security
 module-cycle mqttiumd_core::owner::pubsub,mqttiumd_core::owner::receipts,mqttiumd_core::owner::routing,mqttiumd_core::owner::sessions,mqttiumd_core::owner::will
-module-cycle mqttiumd_store_sqlite::message_expiry,mqttiumd_store_sqlite::pubsub,mqttiumd_store_sqlite::receipts,mqttiumd_store_sqlite::retained
-module-cycle mqttiumd_store_sqlite::reader,mqttiumd_store_sqlite::sessions,mqttiumd_store_sqlite::will
-tangle mqttiumd_store_sqlite::sessions::stage,mqttiumd_store_sqlite::will::end,mqttiumd_store_sqlite::will::open
-tangle mqttiumd_store_volatile::VolatileStore,mqttiumd_store_volatile::read::FactRef,mqttiumd_store_volatile::read::build_snapshot,mqttiumd_store_volatile::read::check_delivery_metadata,mqttiumd_store_volatile::read::check_inventory_bound,mqttiumd_store_volatile::read::check_message_candidate,mqttiumd_store_volatile::read::check_message_observation,mqttiumd_store_volatile::read::delivery_claim,mqttiumd_store_volatile::read::inventory,mqttiumd_store_volatile::read::recover_page,mqttiumd_store_volatile::read::validate_retained,mqttiumd_store_volatile::read::validate_wills,mqttiumd_store_volatile::read::will_page,mqttiumd_store_volatile::read::work_page
 field-leak mqttiumd::net::reactor::Shared::dead
 field-leak mqttiumd::net::reactor::Shared::held
 field-leak mqttiumd::net::reactor::Shared::queue
@@ -72,12 +72,6 @@ field-leak mqttiumd_core::owner::receipts::State::pending
 field-leak mqttiumd_lab::bench::collector::Collector::lines
 field-leak mqttiumd_lab::store::adapter::SimStore::store
 field-leak mqttiumd_store_sqlite::SqliteStore::settings
-field-leak mqttiumd_store_sqlite::StoreCaches::open_receipts
-field-leak mqttiumd_store_sqlite::StoreCaches::witnesses
-field-leak mqttiumd_store_sqlite::StoreCaches::work_verified
-field-leak mqttiumd_store_volatile::VolatileStore::durability
-field-leak mqttiumd_store_volatile::VolatileStore::ledger
-field-leak mqttiumd_store_volatile::VolatileStore::session_clock
 field-leak mqttiumd_store_volatile::log::LogStore::sqlite_settings
 field-leak mqttiumd_store_volatile::snapshot::VolatileHandle::sqlite_settings
 shallow-module mqttiumd_contract

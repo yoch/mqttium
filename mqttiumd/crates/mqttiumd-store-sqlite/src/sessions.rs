@@ -360,11 +360,17 @@ pub(super) fn stage(
     command: &SessionLifecycle,
 ) -> Guard<CommitFacts> {
     let failed = RejectReason::PreconditionFailed;
+    // A change with a will is a plain change between two steps of the
+    // will memory, in this order.
     if matches!(command.action, SessionAction::OpenWillAt { .. }) {
-        return will::open(conn, meta, command);
+        let opening = will::before_open(conn, meta, command)?;
+        let facts = stage(conn, meta, &opening)?;
+        will::arm(conn, command, facts)?;
+        return Ok(facts);
     }
     if matches!(command.action, SessionAction::EndWill { .. }) {
-        return will::end(conn, meta, command);
+        let detach = will::settle(conn, command)?;
+        return stage(conn, meta, &detach);
     }
     let change = match &command.action {
         SessionAction::OpenWillAt { .. } | SessionAction::EndWill { .. } => return refused(failed),

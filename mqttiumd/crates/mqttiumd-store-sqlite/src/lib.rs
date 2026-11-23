@@ -95,11 +95,12 @@ use mqttiumd_contract::outcome::{
 use mqttiumd_contract::packet::{Qos, SharedBytes};
 use mqttiumd_store_api::{
     Accounts, AdminCommand, AdminDone, AdminRefused, Applied, Decision, Durability, DurableState,
-    DurableStore, InboundRecord, Limits, MAX_CLIENT_ID_BYTES, MAX_RECOVERY_INVENTORY_ROWS,
-    MessageExpirySweep, ObligationPhase, ObligationRecord, OperationRecord, OutboundRecord,
-    PayloadRecord, PublicationRecord, ReadBudget, ReadError, RecoveryCursor, RecoveryPage,
-    RecoveryRefused, Resolved, RetainedRecord, RouteTarget, SessionClockAnchor,
-    SessionClockReading, SessionRecord, SessionState, WorkPage,
+    DurableStore, ExpiredDelivery, InboundRecord, Limits, MAX_CLIENT_ID_BYTES,
+    MAX_RECOVERY_INVENTORY_ROWS, MESSAGE_EXPIRY_SWEEP_DELIVERIES,
+    MESSAGE_EXPIRY_SWEEP_PUBLICATIONS, MessageExpirySweep, ObligationPhase, ObligationRecord,
+    OperationRecord, OutboundRecord, PayloadRecord, PublicationRecord, ReadBudget, ReadError,
+    RecoveryCursor, RecoveryPage, RecoveryRefused, Resolved, RetainedRecord, RouteTarget,
+    SessionClockAnchor, SessionClockReading, SessionRecord, SessionState, WorkPage,
 };
 
 use mqttiumd_contract::receipts::{
@@ -122,9 +123,9 @@ pub use group::{GroupRefused, MAX_GROUP};
 #[derive(Default)]
 pub(crate) struct StoreCaches {
     data_version: Option<i64>,
-    pub(crate) work_verified: BTreeSet<SessionId>,
-    pub(crate) witnesses: BTreeMap<ReceiptOrigin, retained::OriginWitness>,
-    pub(crate) open_receipts: Option<(usize, u64)>,
+    work_verified: BTreeSet<SessionId>,
+    witnesses: BTreeMap<ReceiptOrigin, receipts::OriginWitness>,
+    open_receipts: Option<(usize, u64)>,
 }
 
 impl StoreCaches {
@@ -149,13 +150,75 @@ impl StoreCaches {
         self.witnesses.clear();
         self.open_receipts = None;
     }
+
+    /// Whether the work metadata of `session` was verified since the data
+    /// last changed.
+    pub(crate) fn work_verified(&self, session: SessionId) -> bool {
+        self.work_verified.contains(&session)
+    }
+
+    pub(crate) fn mark_work_verified(&mut self, session: SessionId) {
+        self.work_verified.insert(session);
+    }
+
+    /// Forgets every verification of work: an opening changed the sessions.
+    pub(crate) fn forget_verified_work(&mut self) {
+        self.work_verified.clear();
+    }
+
+    /// Whether the committed receipts of `origin` witness a publication in
+    /// `first..=last` or `payload`. The witness of an origin is read once,
+    /// then kept until the data changes.
+    pub(crate) fn witnessed(
+        &mut self,
+        conn: &Connection,
+        meta: &Meta,
+        origin: ReceiptOrigin,
+        first: PublicationId,
+        last: PublicationId,
+        payload: Option<PayloadId>,
+    ) -> Result<bool, Fault> {
+        let witness = match self.witnesses.entry(origin) {
+            std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(receipts::OriginWitness::load(conn, meta, origin)?)
+            }
+        };
+        Ok(witness.matches(origin, first, last, payload))
+    }
+
+    /// The open receipts committed, rows and bytes, counted once until the
+    /// data changes.
+    pub(crate) fn open_receipts(&mut self, conn: &Connection) -> Result<(usize, u64), Fault> {
+        match self.open_receipts {
+            Some(pair) => Ok(pair),
+            None => {
+                let pair = will::receipt_capacity_scan(conn)?;
+                self.open_receipts = Some(pair);
+                Ok(pair)
+            }
+        }
+    }
+
+    /// Adds what a committed transaction staged.
+    fn absorb(&mut self, delta: TxDelta) {
+        for (origin, bounds) in delta.witnesses {
+            if let Some(witness) = self.witnesses.get_mut(&origin) {
+                witness.record(bounds);
+            }
+        }
+        if let Some((rows, bytes)) = &mut self.open_receipts {
+            *rows = rows.saturating_add(delta.open_rows);
+            *bytes = bytes.saturating_add(delta.open_bytes);
+        }
+    }
 }
 
 /// Uncommitted receipt-cache updates staged inside an open write transaction
 /// or savepoint; merged into `StoreCaches` only after `COMMIT` succeeds.
 #[derive(Default)]
 pub(crate) struct TxDelta {
-    pub(crate) witnesses: Vec<(ReceiptOrigin, retained::IdentityBounds)>,
+    pub(crate) witnesses: Vec<(ReceiptOrigin, receipts::IdentityBounds)>,
     pub(crate) open_rows: usize,
     pub(crate) open_bytes: u64,
 }
@@ -168,15 +231,40 @@ impl TxDelta {
     }
 
     pub(crate) fn commit_into(self, caches: &mut StoreCaches) {
-        for (origin, bounds) in self.witnesses {
-            if let Some(witness) = caches.witnesses.get_mut(&origin) {
-                witness.record(bounds);
-            }
+        caches.absorb(self);
+    }
+
+    /// Stages what a stored receipt adds to the caches: the identities it
+    /// reserved, and its bytes when it opens a will.
+    pub(crate) fn stage_receipt(
+        &mut self,
+        operation: OperationId,
+        bounds: Option<receipts::IdentityBounds>,
+        canonical: &[u8],
+    ) {
+        if let Some(bounds) = bounds {
+            self.witnesses.push((ReceiptOrigin::of(operation), bounds));
         }
-        if let Some((rows, bytes)) = &mut caches.open_receipts {
-            *rows = rows.saturating_add(self.open_rows);
-            *bytes = bytes.saturating_add(self.open_bytes);
+        if will::is_open_will_recipe(canonical) {
+            self.open_rows = self.open_rows.saturating_add(1);
+            self.open_bytes = self.open_bytes.saturating_add(canonical.len() as u64);
         }
+    }
+
+    /// Whether a receipt staged by this transaction for `origin` reserved a
+    /// publication in `first..=last` or `payload`.
+    pub(crate) fn witnessed(
+        &self,
+        origin: ReceiptOrigin,
+        first: PublicationId,
+        last: PublicationId,
+        payload: Option<PayloadId>,
+    ) -> bool {
+        self.witnesses.iter().any(|&(staged_origin, stored)| {
+            staged_origin == origin
+                && (first <= stored.last && stored.first <= last
+                    || payload.is_some() && payload == stored.payload)
+        })
     }
 }
 
@@ -1040,7 +1128,7 @@ fn stage_publication_with_claim(
         active_session(conn, admit.source_session, admit.source_revision)?;
     }
 
-    if retained::identity_was_used(
+    if receipts::identity_was_used(
         conn,
         meta,
         caches,
@@ -1618,12 +1706,12 @@ fn recognise_with_meta(
     if let Some(record) = record {
         let same_payload = match (recipe, &command.payload, record.decision) {
             (recipe, Some(bytes), Decision::Committed(_))
-                if retained::bounds(recipe)
+                if receipts::bounds(recipe)
                     .ok()
                     .flatten()
                     .is_some_and(|b| b.payload.is_some()) =>
             {
-                let payload_id = retained::bounds(recipe)
+                let payload_id = receipts::bounds(recipe)
                     .ok()
                     .flatten()
                     .and_then(|b| b.payload)
@@ -1833,17 +1921,7 @@ fn stage_command(
     };
     let operation = recipe.operation();
     insert_operation(conn, operation, canonical, Decision::Committed(facts))?;
-    if let Some(bounds) = retained::bounds(recipe)? {
-        member_delta
-            .witnesses
-            .push((ReceiptOrigin::of(operation), bounds));
-    }
-    if will::is_open_will_recipe(canonical) {
-        member_delta.open_rows = member_delta.open_rows.saturating_add(1);
-        member_delta.open_bytes = member_delta
-            .open_bytes
-            .saturating_add(canonical.len() as u64);
-    }
+    member_delta.stage_receipt(operation, receipts::bounds(recipe)?, canonical);
     Ok(facts)
 }
 
@@ -1860,19 +1938,10 @@ fn stage_rejection(
 ) -> Result<(), Abort<()>> {
     charge(meta, Accounts::RECEIPT).map_err(|_| Abort::Refused(()))?;
     insert_operation(conn, operation, canonical, Decision::Rejected(reason))?;
-    if recipe.replay_subscriptions().is_some()
-        && let Some(bounds) = retained::bounds(recipe).ok().flatten()
-    {
-        member_delta
-            .witnesses
-            .push((ReceiptOrigin::of(operation), bounds));
-    }
-    if will::is_open_will_recipe(canonical) {
-        member_delta.open_rows = member_delta.open_rows.saturating_add(1);
-        member_delta.open_bytes = member_delta
-            .open_bytes
-            .saturating_add(canonical.len() as u64);
-    }
+    let bounds = recipe
+        .replay_subscriptions()
+        .and_then(|_| receipts::bounds(recipe).ok().flatten());
+    member_delta.stage_receipt(operation, bounds, canonical);
     Ok(())
 }
 
@@ -2920,11 +2989,283 @@ impl SqliteStore {
     }
 }
 
+// The bounded maintenance that deletes expired messages, without a
+// receipt (record 0033): it reads the lifetime metadata of
+// `message_expiry` and releases retained values through `retained`.
+
+fn expiry_guard_failure(error: Abort<RejectReason>) -> Fault {
+    match error {
+        Abort::Read(error) => Fault::Read(error),
+        Abort::Fault | Abort::Refused(_) => Fault::Corrupt,
+    }
+}
+
+/// Inspect one selected publication and its bounded responsibilities before any
+/// freshness filter. The payload remains borrowed by SQLite; only topic keys
+/// needed for a conditional retained deletion are copied.
+fn expiry_candidate(
+    conn: &Connection,
+    meta: &Meta,
+    id: PublicationId,
+) -> Result<(Option<MessageExpiry>, Option<Vec<u8>>), Fault> {
+    let mut statement = conn.prepare_cached("SELECT qos,retain,retained_version,topic,payload,expiry_domain,expiry_tick,expiry_interval FROM publications WHERE id=?1")?;
+    let mut rows = statement.query([id.to_be_bytes().as_slice()])?;
+    let row = rows.next()?.ok_or(Fault::Corrupt)?;
+    code_qos(row.get(0)?)?;
+    let retain = match row.get::<_, i64>(1)? {
+        0 => false,
+        1 => true,
+        _ => return Err(Fault::Corrupt),
+    };
+    let version = reader::optional_blob(row, 2, 32)?
+        .as_deref()
+        .map(PublicationId::from_be_slice)
+        .transpose()
+        .map_err(|_| Fault::Corrupt)?;
+    let topic = reader::borrow_blob(row, 3, meta.limits.max_topic_bytes)?;
+    if topic.is_empty()
+        || topic.contains(&0)
+        || topic.iter().any(|b| matches!(b, b'+' | b'#'))
+        || std::str::from_utf8(topic).is_err()
+    {
+        return Err(Fault::Corrupt);
+    }
+    let payload =
+        PayloadId::from_be_slice(reader::borrow_blob(row, 4, 32)?).map_err(|_| Fault::Corrupt)?;
+    let expiry = message_expiry::decode(row, 5)?;
+    let mut retained_topic = None;
+    let mut retained = conn.prepare_cached(
+        "SELECT topic,producer_client_id FROM retained WHERE publication=?1 LIMIT 2",
+    )?;
+    let mut entries = retained.query([id.to_be_bytes().as_slice()])?;
+    if let Some(row) = entries.next()? {
+        let name = reader::borrow_blob(row, 0, meta.limits.max_topic_bytes)?;
+        let client = reader::borrow_blob(row, 1, MAX_CLIENT_ID_BYTES)?;
+        if name != topic
+            || !retain
+            || version.is_some()
+            || client.is_empty()
+            || client.contains(&0)
+            || std::str::from_utf8(client).is_err()
+        {
+            return Err(Fault::Corrupt);
+        }
+        retained_topic = Some(reader::copy_blob(row, 0, meta.limits.max_topic_bytes)?);
+        if entries.next()?.is_some() {
+            return Err(Fault::Corrupt);
+        }
+    }
+    let orphan: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM outbound c LEFT JOIN obligations o ON o.publication=c.publication AND o.idx=c.idx WHERE c.publication=?1 AND o.publication IS NULL LIMIT 1)", [id.to_be_bytes().as_slice()], |row| row.get(0))?;
+    if orphan {
+        return Err(Fault::Corrupt);
+    }
+    let mut obligations = conn.prepare_cached("SELECT o.idx,o.target,o.target_revision,o.qos,o.cause,o.phase,o.retain,c.target,c.target_revision,c.packet_id,c.claim,c.started,s.revision,s.state FROM obligations o LEFT JOIN outbound c ON c.publication=o.publication AND c.idx=o.idx LEFT JOIN sessions s ON s.id=o.target WHERE o.publication=?1 ORDER BY o.idx LIMIT ?2")?;
+    let mut obligations = obligations.query(params![
+        id.to_be_bytes().as_slice(),
+        MESSAGE_EXPIRY_SWEEP_DELIVERIES as i64 + 1
+    ])?;
+    let mut count = 0usize;
+    while let Some(row) = obligations.next()? {
+        count += 1;
+        if count > MESSAGE_EXPIRY_SWEEP_DELIVERIES {
+            return Err(ReadError::LimitExceeded.into());
+        }
+        u32::try_from(row.get::<_, i64>(0)?).map_err(|_| Fault::Corrupt)?;
+        let target = SessionId::from_be_slice(reader::borrow_blob(row, 1, 8)?)
+            .map_err(|_| Fault::Corrupt)?;
+        let revision = blob_u64(reader::borrow_blob(row, 2, 8)?)?;
+        let qos = code_qos(row.get(3)?)?;
+        let cause = code_cause(row.get(4)?)?;
+        let await_pubcomp = code_obligation_phase(row.get(5)?)? == ObligationPhase::AwaitPubcomp;
+        let kept_retain = match row.get::<_, i64>(6)? {
+            0 => false,
+            1 => true,
+            _ => return Err(Fault::Corrupt),
+        };
+        if (kept_retain && !retain)
+            || (cause == mqttiumd_contract::command::DeliveryCause::LiveExact && version.is_some())
+            || (cause == mqttiumd_contract::command::DeliveryCause::RetainedReplay
+                && (!kept_retain || version.is_none() || version == Some(id)))
+            || code_session_state(row.get(13)?)? != SessionState::Active
+            || blob_u64(reader::borrow_blob(row, 12, 8)?)? != revision
+        {
+            return Err(Fault::Corrupt);
+        }
+        if !matches!(row.get_ref(9)?, rusqlite::types::ValueRef::Null) {
+            let packet = u16::try_from(row.get::<_, i64>(9)?)
+                .ok()
+                .and_then(OutboundPacketId::new)
+                .ok_or(Fault::Corrupt)?;
+            let claim = OperationId::from_be_slice(reader::borrow_blob(row, 10, 32)?)
+                .map_err(|_| Fault::Corrupt)?;
+            if qos == Qos::AtMostOnce
+                || (await_pubcomp && qos != Qos::ExactlyOnce)
+                || claim.incarnation() != meta.ledger.incarnation()
+                || reader::borrow_blob(row, 7, 8)? != target.to_be_bytes()
+                || blob_u64(reader::borrow_blob(row, 8, 8)?)? != revision
+            {
+                return Err(Fault::Corrupt);
+            }
+            let _ = packet;
+            message_expiry::started(row, 11)?;
+        } else if await_pubcomp
+            || !matches!(row.get_ref(7)?, rusqlite::types::ValueRef::Null)
+            || !matches!(row.get_ref(8)?, rusqlite::types::ValueRef::Null)
+            || !matches!(row.get_ref(10)?, rusqlite::types::ValueRef::Null)
+            || !matches!(row.get_ref(11)?, rusqlite::types::ValueRef::Null)
+        {
+            return Err(Fault::Corrupt);
+        }
+    }
+    if count != 0 || retained_topic.is_some() {
+        let mut statement =
+            conn.prepare_cached("SELECT refs,length,length(bytes) FROM payloads WHERE id=?1")?;
+        let mut rows = statement.query([payload.to_be_bytes().as_slice()])?;
+        let row = rows.next()?.ok_or(Fault::Corrupt)?;
+        let refs = blob_u64(reader::borrow_blob(row, 0, 8)?)?;
+        let length = blob_u64(reader::borrow_blob(row, 1, 8)?)?;
+        if refs < count as u64 + u64::from(retained_topic.is_some())
+            || refs > meta.limits.references.get()
+            || length > meta.limits.max_payload_bytes as u64
+            || u64::try_from(row.get::<_, i64>(2)?).map_err(|_| Fault::Corrupt)? != length
+            || (retained_topic.is_some() && length == 0)
+        {
+            return Err(Fault::Corrupt);
+        }
+    }
+    Ok((expiry, retained_topic))
+}
+
+fn sweep_expired_messages(
+    conn: &Connection,
+    meta: &mut Meta,
+    now: MessageTime,
+    after: Option<PublicationId>,
+    limit: u32,
+) -> Result<MessageExpirySweep, Fault> {
+    if limit == 0 || limit > MESSAGE_EXPIRY_SWEEP_PUBLICATIONS {
+        return Err(ReadError::LimitExceeded.into());
+    }
+    message_expiry::check_observation(conn, now)?;
+    let mut candidates =
+        BoundedVec::with_capacity(limit as usize).map_err(|_| ReadError::AllocationFailed)?;
+    {
+        let mut statement = conn.prepare_cached(
+            "SELECT id FROM publications WHERE ?1 IS NULL OR id>?1 ORDER BY id LIMIT ?2",
+        )?;
+        let mut rows = statement.query(params![
+            after.map(|id| id.to_be_bytes().to_vec()),
+            i64::from(limit)
+        ])?;
+        while let Some(row) = rows.next()? {
+            let id = PublicationId::from_be_slice(reader::borrow_blob(row, 0, 32)?)
+                .map_err(|_| Fault::Corrupt)?;
+            let (expiry, retained_topic) = expiry_candidate(conn, meta, id)?;
+            candidates
+                .try_push((id, expiry, retained_topic))
+                .map_err(|_| ReadError::LimitExceeded)?;
+        }
+    }
+    let last = candidates.as_slice().last().map(|(id, _, _)| *id);
+    let more = if let Some(last) = last {
+        conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM publications WHERE id>?1 LIMIT 1)",
+            [last.to_be_bytes().as_slice()],
+            |row| row.get(0),
+        )?
+    } else {
+        false
+    };
+    let mut result = MessageExpirySweep {
+        removed: BoundedVec::with_capacity(MESSAGE_EXPIRY_SWEEP_DELIVERIES)
+            .map_err(|_| ReadError::AllocationFailed)?,
+        more,
+        next: if more { last } else { None },
+        ..MessageExpirySweep::default()
+    };
+    for (id, expiry, topic) in candidates.as_slice() {
+        let Some(expiry) = expiry else {
+            continue;
+        };
+        // This request may be a retry of an earlier frozen observation.
+        // Later admissions are outside its as-of range, not clock regressions.
+        if expiry.observed.domain == now.domain && expiry.observed.tick > now.tick {
+            continue;
+        }
+        match expiry.state(now).map_err(|_| Fault::Corrupt)? {
+            ExpiryState::Fresh { .. } => (),
+            ExpiryState::TemporalUncertain => {
+                result.quarantined += 1;
+            }
+            ExpiryState::Expired => {
+                let uncertain: i64 = conn.query_row("SELECT count(*) FROM (SELECT 1 FROM outbound WHERE publication=?1 AND started=0 LIMIT ?2)", params![id.to_be_bytes().as_slice(), MESSAGE_EXPIRY_SWEEP_DELIVERIES as i64 + 1], |row| row.get(0))?;
+                let uncertain = u32::try_from(uncertain).map_err(|_| Fault::Corrupt)?;
+                if uncertain as usize > MESSAGE_EXPIRY_SWEEP_DELIVERIES {
+                    return Err(ReadError::LimitExceeded.into());
+                }
+                result.quarantined = result
+                    .quarantined
+                    .checked_add(uncertain)
+                    .ok_or(ReadError::LimitExceeded)?;
+                if let Some(topic) = topic {
+                    // The topic and exact version are checked in this transaction.
+                    let removed = conn
+                        .prepare_cached("DELETE FROM retained WHERE topic=?1 AND publication=?2")?
+                        .execute(params![topic, id.to_be_bytes().as_slice()])?;
+                    if removed == 1 {
+                        retained::release(conn, meta, *id).map_err(expiry_guard_failure)?;
+                        result.retained_removed += 1;
+                    }
+                }
+                let mut deliveries = BoundedVec::with_capacity(MESSAGE_EXPIRY_SWEEP_DELIVERIES)
+                    .map_err(|_| ReadError::AllocationFailed)?;
+                {
+                    let mut statement = conn.prepare_cached("SELECT o.idx,o.target FROM obligations o WHERE o.publication=?1 AND NOT EXISTS(SELECT 1 FROM outbound c WHERE c.publication=o.publication AND c.idx=o.idx) ORDER BY o.idx LIMIT ?2")?;
+                    let mut rows = statement.query(params![
+                        id.to_be_bytes().as_slice(),
+                        MESSAGE_EXPIRY_SWEEP_DELIVERIES as i64 + 1
+                    ])?;
+                    while let Some(row) = rows.next()? {
+                        let delivery = DeliveryId {
+                            publication: *id,
+                            index: u32::try_from(row.get::<_, i64>(0)?)
+                                .map_err(|_| Fault::Corrupt)?,
+                        };
+                        let target = SessionId::from_be_slice(reader::borrow_blob(row, 1, 8)?)
+                            .map_err(|_| Fault::Corrupt)?;
+                        deliveries
+                            .try_push(ExpiredDelivery { delivery, target })
+                            .map_err(|_| ReadError::LimitExceeded)?;
+                    }
+                }
+                for item in deliveries.as_slice() {
+                    result
+                        .removed
+                        .try_push(*item)
+                        .map_err(|_| ReadError::LimitExceeded)?;
+                    end_obligation(
+                        conn,
+                        meta,
+                        &id.to_be_bytes(),
+                        i64::from(item.delivery.index),
+                    )
+                    .map_err(|error| match error {
+                        Abort::Read(error) => Fault::Read(error),
+                        Abort::Fault | Abort::Refused(_) => Fault::Corrupt,
+                    })?;
+                }
+            }
+        }
+    }
+    Ok(result)
+}
+
 /// Every table of the file, decoded, as one `DurableState`. The caller
 /// holds the read transaction.
 fn read_snapshot(conn: &Connection, budget: ReadBudget) -> Result<DurableState, Fault> {
     {
         let meta = read_meta(conn)?;
+        will::receipt_capacity(conn, &[])?;
         reader::snapshot(conn, &meta, budget)?;
         message_expiry::validate(conn, None)?;
         let mut sessions = BTreeMap::new();
@@ -3262,7 +3603,7 @@ impl DurableStore for SqliteStore {
         limit: u32,
     ) -> Result<MessageExpirySweep, ReadError> {
         match self.transact(|conn, meta| {
-            let result = message_expiry::sweep(conn, meta, now, after, limit)
+            let result = sweep_expired_messages(conn, meta, now, after, limit)
                 .map_err(|fault| Abort::Read(fault.read_error()))?;
             if result.removed.is_empty() && result.retained_removed == 0 {
                 Err(Abort::Refused(result))
@@ -3340,7 +3681,7 @@ impl DurableStore for SqliteStore {
                 Ok::<(), Abort<()>>(())
             }) {
                 Txn::ReadFailed(error) => return Err(error),
-                Txn::Committed(()) => self.caches.get_mut().work_verified.clear(),
+                Txn::Committed(()) => self.caches.get_mut().forget_verified_work(),
                 _ => {}
             }
         }

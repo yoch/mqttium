@@ -5,6 +5,7 @@ use mqttiumd_contract::receipts::{
     MAX_COLLECTION_ROWS, MAX_RECEIPT_ORIGINS, RECEIPT_CONTROL_RESERVE, RECEIPT_DATA_WINDOW,
     RECEIPT_WINDOW, ReceiptCollectionRefusal,
 };
+use mqttiumd_contract::retained::MAX_REPLAYS;
 
 // Compiled, narrow system-reception mutations. Ordinary builds keep all guards.
 pub(crate) const MUTANT_DELETE_WITHOUT_CLOSURE: bool = false;
@@ -173,7 +174,7 @@ fn initial_compatible(
             recipe: reader::copy_blob(row, 1, ReadBudget::SNAPSHOT.max_field_bytes)?,
             decision: decision_of(row, 2)?.decode()?,
         };
-        if let Some(admit) = retained::receipt_bounds(meta, operation, &record)?
+        if let Some(admit) = receipt_bounds(meta, operation, &record)?
             && (admit.first.sequence().get() == 0
                 || admit.payload.is_some_and(|p| p.sequence().get() == 0))
         {
@@ -322,7 +323,7 @@ pub(crate) fn prepare(
                 meter.charge(32)?;
                 continue;
             };
-            if let Some(admit) = retained::receipt_bounds(meta, operation, &record)?
+            if let Some(admit) = receipt_bounds(meta, operation, &record)?
                 && (admit.last.sequence() > request.publication_through
                     || admit
                         .payload
@@ -450,4 +451,328 @@ pub(crate) fn prepare_closed(
         },
         changed,
     ))
+}
+
+// The identities a receipt reserved: the publications and the payload of
+// its recipe, and whether an identity was used already.
+
+#[derive(Clone, Copy)]
+pub(super) struct IdentityBounds {
+    pub first: PublicationId,
+    pub last: PublicationId,
+    pub payload: Option<PayloadId>,
+}
+
+/// Disjoint, non-adjacent closed intervals `[start, end]`, keyed by `start`.
+/// Monotonic sequences collapse into a single `(1, N)` interval in O(1) space.
+#[derive(Default, Debug)]
+struct IntervalSet {
+    ranges: BTreeMap<u64, u64>,
+}
+
+impl IntervalSet {
+    fn insert(&mut self, mut start: u64, mut end: u64) {
+        if start > end {
+            return;
+        }
+        if let Some((&prev_start, &prev_end)) = self.ranges.range(..=start).next_back()
+            && prev_end.saturating_add(1) >= start
+        {
+            if prev_end >= end {
+                return;
+            }
+            start = prev_start;
+            let upper = end.saturating_add(1);
+            if self
+                .ranges
+                .range(start.saturating_add(1)..=upper)
+                .next()
+                .is_none()
+            {
+                if let Some(slot) = self.ranges.get_mut(&prev_start) {
+                    *slot = end;
+                }
+                return;
+            }
+        }
+        let upper = end.saturating_add(1);
+        let mut to_remove = Vec::new();
+        for (&s, &e) in self.ranges.range(start..=upper) {
+            if e > end {
+                end = e;
+            }
+            to_remove.push(s);
+        }
+        for s in to_remove {
+            self.ranges.remove(&s);
+        }
+        self.ranges.insert(start, end);
+    }
+
+    fn overlaps(&self, start: u64, end: u64) -> bool {
+        if start > end {
+            return false;
+        }
+        self.ranges
+            .range(..=end)
+            .next_back()
+            .is_some_and(|(_, &r_end)| r_end >= start)
+    }
+}
+
+/// Verified per-origin receipt witness intervals at the current `PRAGMA data_version`.
+#[derive(Default, Debug)]
+pub(super) struct OriginWitness {
+    publications: IntervalSet,
+    payloads: IntervalSet,
+}
+
+impl OriginWitness {
+    pub(super) fn record(&mut self, bounds: IdentityBounds) {
+        self.publications
+            .insert(bounds.first.sequence().get(), bounds.last.sequence().get());
+        if let Some(payload) = bounds.payload {
+            let seq = payload.sequence().get();
+            self.payloads.insert(seq, seq);
+        }
+    }
+
+    pub(super) fn matches(
+        &self,
+        origin: ReceiptOrigin,
+        first: PublicationId,
+        last: PublicationId,
+        payload: Option<PayloadId>,
+    ) -> bool {
+        let same_pub = (first.incarnation(), first.epoch(), first.owner())
+            == (origin.incarnation, origin.epoch, origin.owner)
+            && (last.incarnation(), last.epoch(), last.owner())
+                == (origin.incarnation, origin.epoch, origin.owner);
+        if same_pub
+            && self
+                .publications
+                .overlaps(first.sequence().get(), last.sequence().get())
+        {
+            return true;
+        }
+        if let Some(p) = payload
+            && (p.incarnation(), p.epoch(), p.owner())
+                == (origin.incarnation, origin.epoch, origin.owner)
+        {
+            let seq = p.sequence().get();
+            if self.payloads.overlaps(seq, seq) {
+                return true;
+            }
+        }
+        false
+    }
+
+    pub(super) fn load(
+        conn: &Connection,
+        meta: &Meta,
+        origin: ReceiptOrigin,
+    ) -> Result<Self, Fault> {
+        let op = |seq| {
+            OperationId::new(
+                origin.incarnation,
+                origin.epoch,
+                origin.owner,
+                OperationSeq::new(seq),
+            )
+            .to_be_bytes()
+        };
+        let mut statement = conn.prepare_cached(
+            "SELECT id,recipe,decision,publication,exchange,reason,resource,facts FROM operations WHERE id>=?1 AND id<=?2 ORDER BY id",
+        )?;
+        let mut rows = statement.query(params![op(0).as_slice(), op(u64::MAX).as_slice()])?;
+        let mut meter = reader::Meter::new(ReadBudget::SNAPSHOT);
+        let mut witness = Self::default();
+        while let Some(row) = rows.next()? {
+            let bytes = reader::borrow_blob(row, 1, ReadBudget::SNAPSHOT.max_field_bytes)?;
+            meter.charge(
+                256usize
+                    .checked_add(bytes.len())
+                    .ok_or(ReadError::LimitExceeded)?,
+            )?;
+            let id = OperationId::from_be_slice(reader::borrow_blob(row, 0, 32)?)
+                .map_err(|_| Fault::Corrupt)?;
+            let record = OperationRecord {
+                recipe: reader::copy_blob(row, 1, ReadBudget::SNAPSHOT.max_field_bytes)?,
+                decision: decision_of(row, 2)?.decode()?,
+            };
+            if let Some(stored) = receipt_bounds(meta, id, &record)? {
+                witness.record(stored);
+            }
+        }
+        Ok(witness)
+    }
+}
+
+pub(super) fn bounds(recipe: &Recipe) -> Result<Option<IdentityBounds>, Fault> {
+    let one = |p, payload| {
+        Some(IdentityBounds {
+            first: p,
+            last: p,
+            payload: Some(payload),
+        })
+    };
+    if let Recipe::WillPublication(a) = recipe {
+        return Ok(one(a.publication, a.payload.id));
+    }
+    if let Some(a) = recipe.admission() {
+        return Ok(one(a.publication, a.payload.id));
+    }
+    if let Some(a) = recipe.retained_qos0() {
+        return Ok(one(a.publication, a.payload.id));
+    }
+    Ok(if let Some(a) = recipe.replay_subscriptions() {
+        let first = a.first_publication;
+        Some(IdentityBounds {
+            first,
+            last: PublicationId::new(
+                first.incarnation(),
+                first.epoch(),
+                first.owner(),
+                PublicationSeq::new(
+                    first
+                        .sequence()
+                        .get()
+                        .checked_add(MAX_REPLAYS as u64 - 1)
+                        .ok_or(Fault::Corrupt)?,
+                ),
+            ),
+            payload: None,
+        })
+    } else {
+        None
+    })
+}
+
+pub(super) fn receipt_bounds(
+    meta: &Meta,
+    operation: OperationId,
+    record: &OperationRecord,
+) -> Result<Option<IdentityBounds>, Fault> {
+    // A subscription burns its entire reserved causal range even when the
+    // business decision is refused. Its receipt is the witness until the
+    // compact publication frontier covers the range before physical deletion.
+    if matches!(record.decision, Decision::Rejected(_))
+        && !matches!(record.recipe.get(6), Some(12 | 14))
+    {
+        return Ok(None);
+    }
+    let recipe = Recipe::decode_canonical(
+        &record.recipe,
+        meta.limits.max_targets_per_admission,
+        meta.limits.max_topic_bytes,
+    )
+    .map_err(|error| {
+        Fault::Read(match error {
+            RecipeError::AllocationFailed => ReadError::AllocationFailed,
+            RecipeError::TooManyTargets { .. } | RecipeError::TopicTooLong(_) => {
+                ReadError::LimitExceeded
+            }
+            _ => ReadError::InvalidData,
+        })
+    })?;
+    if recipe.operation() != operation {
+        return Err(Fault::Corrupt);
+    }
+    let Some(bounds) = bounds(&recipe)? else {
+        return Ok(None);
+    };
+    let valid = match record.decision {
+        Decision::Rejected(_) => recipe.replay_subscriptions().is_some(),
+        Decision::Committed(CommitFacts::WillPublished { will, publication }) => {
+            matches!(&recipe,Recipe::WillPublication(a) if a.will==will && a.publication==publication)
+        }
+        Decision::Committed(CommitFacts::PublicationAdmitted {
+            publication,
+            exchange,
+        }) => recipe
+            .admission()
+            .is_some_and(|a| a.publication == publication && a.source.exchange == exchange),
+        Decision::Committed(CommitFacts::RetainedQos0Stored { publication }) => recipe
+            .retained_qos0()
+            .is_some_and(|a| a.publication == publication),
+        Decision::Committed(CommitFacts::SubscriptionsChanged { session, .. }) => recipe
+            .replay_subscriptions()
+            .is_some_and(|a| a.update.session == session),
+        _ => false,
+    };
+    let scope = |p: PublicationId| {
+        (p.incarnation(), p.epoch(), p.owner())
+            == (
+                operation.incarnation(),
+                operation.epoch(),
+                operation.owner(),
+            )
+    };
+    if !valid
+        || !scope(bounds.first)
+        || !scope(bounds.last)
+        || bounds.payload.is_some_and(|p| {
+            (p.incarnation(), p.epoch(), p.owner())
+                != (
+                    operation.incarnation(),
+                    operation.epoch(),
+                    operation.owner(),
+                )
+        })
+    {
+        return Err(Fault::Corrupt);
+    }
+    Ok(Some(bounds))
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn identity_was_used(
+    conn: &Connection,
+    meta: &Meta,
+    caches: &mut StoreCaches,
+    delta: &TxDelta,
+    operation: OperationId,
+    first: PublicationId,
+    last: PublicationId,
+    payload: Option<PayloadId>,
+) -> Result<bool, Fault> {
+    let origin = ReceiptOrigin::of(operation);
+    if let Some(closure) = frontier(conn, meta, origin)?
+        && ((!MUTANT_ALLOW_OLD_PUBLICATION && first.sequence() <= closure.publication_through)
+            || (!MUTANT_ALLOW_OLD_PAYLOAD
+                && payload.is_some_and(|p| p.sequence() <= closure.payload_through)))
+    {
+        return Ok(true);
+    }
+    let live: bool = conn
+        .prepare_cached(
+            "SELECT EXISTS(SELECT 1 FROM publications WHERE id>=?1 AND id<=?2 LIMIT 1)",
+        )?
+        .query_row(
+            params![
+                first.to_be_bytes().as_slice(),
+                last.to_be_bytes().as_slice()
+            ],
+            |r| r.get(0),
+        )?;
+    if live {
+        return Ok(true);
+    }
+    if let Some(payload) = payload
+        && (exists(
+            conn,
+            "SELECT 1 FROM payloads WHERE id=?1",
+            &payload.to_be_bytes(),
+        )? || exists(
+            conn,
+            "SELECT 1 FROM publications WHERE payload=?1",
+            &payload.to_be_bytes(),
+        )?)
+    {
+        return Ok(true);
+    }
+    if caches.witnessed(conn, meta, origin, first, last, payload)? {
+        return Ok(true);
+    }
+    Ok(delta.witnessed(origin, first, last, payload))
 }
