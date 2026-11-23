@@ -325,7 +325,7 @@ with it, at sixteen connections.
 | ClientID, topic and filter, bytes | 1,024 | 1,024 |
 | Payload, bytes | 32,768 | 1,048,576 |
 | Input queue of a connection, items | 4 | 32 |
-| Output queue of a connection, items | 4 | 64 |
+| Output queue of a connection, items | 4 | 256 |
 | Writer queue | 32 | 1,024 |
 | Commands in flight | 16 | 16 per sixteen connections, at most 512 |
 | Timers | 512 | 512 per sixteen connections |
@@ -365,11 +365,14 @@ completes or its transport closes.
 
 The bounded Outbox retains effects with the same identity until acceptance or
 a correlated outcome. QoS 0 output saturation returns a typed refusal to the
-owner for an explicit drop; it does not silently erase an effect. The output
-queue of a connection has 64 places and the core does not wait for it: a
-subscriber that reads can still lose the end of a QoS 0 burst of more than 64
-messages (`qos0_dropped`, `output_saturated`;
-[open conditions](reception/open-conditions.md), report 0037). Durable
+owner for an explicit drop; it does not silently erase an effect. The owner
+paces QoS 0 per connection
+([ADR 0063](decisions/0063-qos0-paced-per-connection.md)): at most 224 QoS 0
+frames are in the output queue of a connection, which has 256 places, and the
+next ones leave as writes complete. Up to 1,024 deliveries wait for a connection,
+in order; past that the newest is dropped with `output_saturated`. A
+subscriber that reads receives a burst whole; one that does not is closed by
+the write deadline. Durable
 results remain correlated after socket closure. Generations do not repeat,
 and the runtime checks its live map before core delivery even after the core's
 bounded closed-generation memory evicts an old entry. Late store results may
@@ -850,7 +853,7 @@ potentially started claims; conditional claimed-copy expiry requires an exact
 certain-never-started fact. The limits of references, retained topics,
 destinations, filters, replay candidates and receipts given under
 [Bounds and transport](#bounds-and-transport) and above remain. A connection
-has 73 frame registrations (its 64 output places and nine more); start and
+has 265 frame registrations (its 256 output places and nine more); start and
 terminal frame facts have twice as many reserved runtime inputs, plus the
 effect box. Correlated lifecycle/receipt controls retain independent lanes.
 

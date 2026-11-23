@@ -77,6 +77,7 @@ its source; a test fails when the register and the records drift apart.
 | [0060](0060-reading-behind-a-waiting-publication.md) | Proposed | The reader goes on behind a publication that waits for a slot of the window: the PUBREL of another exchange goes ahead, every other packet waits behind in order, up to a bound. Open: one session can hold every exchange | Runtime |
 | [0061](0061-session-exchange-bound.md) | Proposed | A session holds at most eight inbound QoS 2 exchanges across its connections: at the bound a publication waits while the broker ends one, and the connection is closed when every one awaits a PUBREL. An exchange that awaits its PUBREL holds no payload. The exchange table is sized for the sessions. MQTT 5 is sent DISCONNECT 0x97 on a capacity close | Core, runtime |
 | [0062](0062-compatibility-reference-mosquitto-2-1-4.md) | Proposed | The compatibility bench is pinned to Mosquitto 2.1.4, built by `tests/compat/build-reference.sh`; the classification after the replay and nine new scenarios | Runtime (bench) |
+| [0063](0063-qos0-paced-per-connection.md) | Proposed | The owner emits QoS 0 by a window of 224 frames per connection, on an output queue of 256, and the next ones as their writes complete; up to 1,024 deliveries wait per connection, the newest is dropped past it; consumed QoS 0 deliveries are paced the same | Core |
 
 What each record leaves open is tracked in
 [`../reception/open-conditions.md`](../reception/open-conditions.md).

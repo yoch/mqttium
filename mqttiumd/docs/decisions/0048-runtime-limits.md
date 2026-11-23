@@ -8,9 +8,9 @@ record, under records that are still proposed. Record 0051 raised the
 limits this record calls independent of the connection limit (4,096
 sessions, 1,024 targets per publication, 1,024 writer requests, commands
 in flight scaled up to 512) and the range of the connection limit (1 to
-4,096; the output queue of a connection has 64 places, so 73 frame
-registrations per connection). Record 0061 sized the exchange table for
-the sessions. The derivation rule of this record is unchanged;
+4,096). Record 0061 sized the exchange table for the sessions, and record
+0063 the output queue of a connection: 256 places, so 265 frame
+registrations per connection. The derivation rule of this record is unchanged;
 `docs/product-tcp.md` has the current values beside those of the frozen
 profile.
 

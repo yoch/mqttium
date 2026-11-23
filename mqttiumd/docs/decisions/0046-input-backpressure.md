@@ -16,6 +16,10 @@ eight entries each, so the broker no longer holds 128 credits for all its
 clients; a session holds at most eight QoS 2 exchanges across its
 connections.
 
+Amended by 0063 (proposed): what this record says of output changes. A
+QoS 0 publication waits for the output of its subscriber, up to a bound,
+before it is dropped.
+
 Amendment of acceptance (21 November 2026). The record is accepted with
 the rules of the text below, which differ from its first form on three
 points. Keep Alive runs from the last packet the transport heard; it is

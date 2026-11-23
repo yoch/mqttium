@@ -152,7 +152,7 @@
     {
       "decision": "0026",
       "path": "docs/decisions/0026-qos0-volatile-and-consumed.md",
-      "sha256": "ff41182e0f5c5f9592f2f0c6f0972324d31326ec1348450fe5b6c53e2e5a7275"
+      "sha256": "b74a7f7f4bd6fc3746dd704a45fdb2d9a635db22341085ef72e796f037459f72"
     },
     {
       "decision": "0027",
@@ -252,7 +252,7 @@
     {
       "decision": "0046",
       "path": "docs/decisions/0046-input-backpressure.md",
-      "sha256": "93a5d24b500a7549f47af6457cd1c32671b59adbe72531f0d1553bb0cbe61615"
+      "sha256": "c989153843398d98306ad174dca7d8ecc3b206711b064d1bbda88ca50acdcab0"
     },
     {
       "decision": "0047",
@@ -262,7 +262,7 @@
     {
       "decision": "0048",
       "path": "docs/decisions/0048-runtime-limits.md",
-      "sha256": "ff7f29a483a15889ed53bc55c087b271df50fcb995e40ceeda6aa29571a70e13"
+      "sha256": "d4a5fe67e7ae3723a6d2962c97ffebda450172e6e7180032ab10745b65156af2"
     },
     {
       "decision": "0049",
