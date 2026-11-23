@@ -2343,18 +2343,87 @@ mod tests {
                 "InvalidTopicName"
             );
         }
-        for flags in [0x10, 0x20, 0x1c] {
+        for flags in [0x08, 0x10, 0x20] {
+            let error = decode(
+                0x10,
+                &will_connect(EXPIRY, &[], flags, b"a/b", b"offline"),
+                BOUNDS,
+            )
+            .unwrap_err();
             assert_eq!(
-                decode(
-                    0x10,
-                    &will_connect(EXPIRY, &[], flags, b"a/b", b"offline"),
-                    BOUNDS
-                )
-                .unwrap_err()
-                .code(),
-                "InvalidWillFlags"
+                (error.kind(), error.code(), error.reason_code()),
+                (ErrorKind::Protocol, "InvalidWillFlags", 0x82),
+                "flags {flags:#04x}"
             );
         }
+    }
+
+    /// MQTT 5 §3.1.2.6 [MQTT-3.1.2-12]: Will QoS 3 is a Malformed Packet,
+    /// with or without the Will Flag. A Will QoS or Will Retain bit without
+    /// the Will Flag parses and is forbidden data: a Protocol Error. Neither
+    /// supplies a response limit, so both are closed without a CONNACK.
+    #[test]
+    fn reserved_will_qos_is_a_malformed_packet() {
+        for flags in [0x18, 0x1c, 0x38, 0x3c] {
+            let error = decode(
+                0x10,
+                &will_connect(EXPIRY, &[], flags, b"a/b", b"offline"),
+                BOUNDS,
+            )
+            .unwrap_err();
+            assert_eq!(
+                (error.kind(), error.code(), error.reason_code()),
+                (ErrorKind::Malformed, "ReservedWillQos", 0x81),
+                "flags {flags:#04x}"
+            );
+            assert_eq!(error.peer_maximum(), None, "flags {flags:#04x}");
+        }
+    }
+
+    /// MQTT 5 §3.3.2.1 and §3.3.4: a zero-length Topic Name without a Topic
+    /// Alias is a Protocol Error (0x82). Topic Name Invalid (0x90) stays the
+    /// reason of a name that is present and not acceptable.
+    #[test]
+    fn an_empty_publish_topic_without_an_alias_is_a_protocol_error() {
+        for (first, body) in [
+            (0x30, &b"\0\0\0payload"[..]),
+            (0x32, &b"\0\0\0\x07\0payload"[..]),
+            (0x34, &b"\0\0\0\x07\0payload"[..]),
+        ] {
+            let error = decode(first, body, BOUNDS).unwrap_err();
+            assert_eq!(
+                (error.kind(), error.code(), error.reason_code()),
+                (ErrorKind::Protocol, "EmptyTopicName", 0x82),
+                "first byte {first:#04x}"
+            );
+        }
+        kind(
+            decode_for(Version::V311, 0x30, b"\0\0payload", BOUNDS),
+            ErrorKind::Protocol,
+        );
+        // Topic Alias Maximum 0 was announced: the alias is refused first.
+        let alias = decode(0x30, b"\0\0\x03\x23\0\x01payload", BOUNDS).unwrap_err();
+        assert_eq!(alias.reason_code(), 0x94);
+        let wildcard = decode(0x30, b"\0\x03a/+\0payload", BOUNDS).unwrap_err();
+        assert_eq!(
+            (wildcard.code(), wildcard.reason_code()),
+            ("InvalidTopicName", 0x90)
+        );
+        let will = decode(
+            0x10,
+            &will_connect(EXPIRY, &[], 0x0c, b"", b"offline"),
+            BOUNDS,
+        )
+        .unwrap_err();
+        assert_eq!(
+            (will.code(), will.reason_code()),
+            ("InvalidTopicName", 0x90)
+        );
+        let response = decode(0x30, b"\0\x03a/b\x03\x08\0\0payload", BOUNDS).unwrap_err();
+        assert_eq!(
+            (response.code(), response.reason_code()),
+            ("InvalidTopicName", 0x90)
+        );
     }
 
     #[test]

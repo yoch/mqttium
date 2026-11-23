@@ -478,6 +478,77 @@ fn a_refused_header_is_named_before_the_close() {
     );
 }
 
+/// MQTT 5 §3.3.2.1 and §3.3.4: a PUBLISH whose Topic Name is empty and that
+/// carries no Topic Alias is a Protocol Error, 0x82, at every QoS. A Topic
+/// Name that is present and holds a wildcard keeps Topic Name Invalid, 0x90.
+#[test]
+fn an_empty_topic_name_is_a_protocol_error_and_a_wildcard_an_invalid_topic_name() {
+    let broker = Broker::start("empty-topic");
+    for (first, identifier) in [(0x30, &[][..]), (0x32, &[0, 1][..]), (0x34, &[0, 1][..])] {
+        let mut publisher = connect(broker.address, &format!("empty-topic-{first:02x}"));
+        let mut body = Vec::new();
+        text("", &mut body);
+        body.extend_from_slice(identifier);
+        body.push(0);
+        body.extend_from_slice(b"payload");
+        publisher.write_all(&packet(first, &body)).unwrap();
+        assert_eq!(
+            read_until_close(&mut publisher),
+            [0xe0, 2, 0x82, 0],
+            "first byte {first:#04x}\n{}",
+            broker.refusals()
+        );
+    }
+    let mut publisher = connect(broker.address, "wildcard-topic");
+    let mut body = Vec::new();
+    text("wake/+", &mut body);
+    body.extend_from_slice(&[0, 1, 0]);
+    body.extend_from_slice(b"payload");
+    publisher.write_all(&packet(0x32, &body)).unwrap();
+    assert_eq!(
+        read_until_close(&mut publisher),
+        [0xe0, 2, 0x90, 0],
+        "{}",
+        broker.refusals()
+    );
+}
+
+/// MQTT 5 §3.1.2.6 [MQTT-3.1.2-12]: Will QoS 3 is a Malformed Packet. The
+/// CONNECT is not validated to its end, so it supplies no response limit:
+/// the broker closes without a CONNACK, and the event names the class.
+#[test]
+fn a_reserved_will_qos_is_closed_without_a_connack_and_recorded_as_malformed() {
+    let broker = Broker::start("reserved-will-qos");
+    let mut stream = TcpStream::connect(broker.address).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    let mut body = Vec::new();
+    text("MQTT", &mut body);
+    // Level 5; Clean Start, Will Flag, Will QoS 3; Keep Alive 60 s.
+    body.extend_from_slice(&[5, 0x1e, 0, 60, 0]);
+    text("reserved-will-qos", &mut body);
+    body.push(0);
+    text("wake/will", &mut body);
+    text("offline", &mut body);
+    stream.write_all(&packet(0x10, &body)).unwrap();
+    assert_eq!(read_until_close(&mut stream), [0u8; 0], "no CONNACK");
+    let refusals = broker.refusals();
+    let refused: serde_json::Value = refusals
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .find(|event| event["kind"] == "packet_refused")
+        .unwrap_or_else(|| panic!("no packet_refused event\n{refusals}"));
+    assert_eq!(
+        (
+            refused["details"]["code"].as_str(),
+            refused["details"]["reason"].as_u64()
+        ),
+        (Some("ReservedWillQos"), Some(0x81)),
+        "{refusals}"
+    );
+}
+
 /// The Maximum Packet Size of the CONNACK is a promise: a PUBLISH no
 /// larger than it is not refused for its size, whatever its shape. The
 /// two largest shapes are a QoS 0 and a QoS 1 PUBLISH with a one-byte
