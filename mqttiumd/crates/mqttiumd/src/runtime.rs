@@ -254,10 +254,73 @@ struct Peer {
     receiving: crate::receiving::Window,
     closing: Option<(&'static str, Instant)>,
     deferred_publish: Option<DeferredPublish>,
+    /// The packets read past `deferred_publish`, in their order, with their
+    /// bytes counted. The reader goes on behind a publication that waits
+    /// for a slot of the window, because the PUBREL that frees one is
+    /// behind it in the stream; what is not such a PUBREL waits here.
+    behind: VecDeque<(u8, net::FrameBytes, net::FrameObservation)>,
+    behind_bytes: usize,
     blocked_output: Option<EffectId>,
     retire_code: Option<&'static str>,
 }
+/// The packets kept behind a waiting publication: one more lane of them,
+/// and no more bytes than one packet of the largest size.
+const BEHIND_PACKETS: usize = net::INPUT_SLOTS;
+const BEHIND_BYTES: usize = net::MAX_PACKET_BYTES;
+
+/// The Packet Identifier of a raw PUBLISH above QoS 0. A packet too short
+/// to hold one has none: the codec refuses it when its turn comes.
+fn raw_publish_id(first: u8, body: &[u8]) -> Option<u16> {
+    if first >> 4 != 3 || first & 0x06 == 0 {
+        return None;
+    }
+    let topic = usize::from(u16::from_be_bytes([*body.first()?, *body.get(1)?]));
+    Some(u16::from_be_bytes([
+        *body.get(2 + topic)?,
+        *body.get(3 + topic)?,
+    ]))
+}
+
 impl Peer {
+    /// Whether this packet goes ahead of the publication that waits for a
+    /// slot: only a PUBREL, which completes another exchange and frees its
+    /// slot, and commutes with every packet but the PUBLISH of its own
+    /// identifier. Everything else keeps its place in the stream.
+    fn overtakes_deferred(&self, first: u8, body: &[u8]) -> bool {
+        if first >> 4 != 6 || body.len() < 2 {
+            return false;
+        }
+        let id = u16::from_be_bytes([body[0], body[1]]);
+        let waiting = self
+            .deferred_publish
+            .as_ref()
+            .and_then(|deferred| match &deferred.packet {
+                InboundPacket::Publish { packet_id, .. } => packet_id.map(|id| id.get()),
+                _ => None,
+            });
+        waiting != Some(id)
+            && self
+                .behind
+                .iter()
+                .all(|(first, body, _)| raw_publish_id(*first, body) != Some(id))
+    }
+
+    /// Keeps a packet behind the waiting publication, or hands it back
+    /// when the bound is reached: it then stays the held packet and the
+    /// rest stays with the transport.
+    fn keep_behind(
+        &mut self,
+        packet: (u8, net::FrameBytes, net::FrameObservation),
+    ) -> Result<(), (u8, net::FrameBytes, net::FrameObservation)> {
+        let bytes = packet.1.len();
+        if self.behind.len() >= BEHIND_PACKETS || self.behind_bytes + bytes > BEHIND_BYTES {
+            return Err(packet);
+        }
+        self.behind_bytes += bytes;
+        self.behind.push_back(packet);
+        Ok(())
+    }
+
     fn submitted_output(&mut self, effect: EffectId) -> bool {
         if self.blocked_output == Some(effect) {
             self.blocked_output = None;
@@ -272,6 +335,7 @@ impl Peer {
         self.retire_code.is_some()
             || self.held_packet.is_some()
             || self.deferred_publish.is_some()
+            || !self.behind.is_empty()
             || self.requests.is_some()
             || self.blocked_output.is_some()
             || self.closing.is_some()
@@ -849,6 +913,8 @@ impl Runtime<'_> {
                 receiving: crate::receiving::Window::default(),
                 closing: None,
                 deferred_publish: None,
+                behind: VecDeque::new(),
+                behind_bytes: 0,
                 blocked_output: None,
                 retire_code: None,
             },
@@ -4013,6 +4079,7 @@ impl Runtime<'_> {
                             || peer.retire_code.is_some()
                             || peer.held_packet.is_some()
                             || peer.deferred_publish.is_some()
+                            || !peer.behind.is_empty()
                             || peer.requests.is_some()
                             || peer.blocked_output.is_some()
                             || peer.closing.is_some();
@@ -4103,17 +4170,35 @@ impl Runtime<'_> {
                             break;
                         }
                         let business_waits = self.business_waits(generation);
+                        // A packet that was kept behind a publication is
+                        // older than the held packet and than the lane.
+                        let mut from_behind = false;
                         let incoming = match self.peers.get_mut(&generation) {
-                            Some(p)
-                                if p.closing.is_some()
-                                    || p.deferred_publish.is_some()
-                                    || p.requests.is_some() =>
-                            {
+                            Some(p) if p.closing.is_some() || p.requests.is_some() => {
                                 break;
                             }
                             Some(p) if p.pending && p.held_packet.is_some() => break,
+                            Some(p) if p.deferred_publish.is_none() && !p.behind.is_empty() => {
+                                if business_waits
+                                    && p.behind
+                                        .front()
+                                        .is_some_and(|(first, ..)| business_header(*first))
+                                {
+                                    break;
+                                }
+                                let (first, body, observed) =
+                                    p.behind.pop_front().expect("checked packet behind");
+                                p.behind_bytes -= body.len();
+                                from_behind = true;
+                                Ok(net::Incoming::Packet {
+                                    first,
+                                    body,
+                                    observed,
+                                })
+                            }
                             Some(p)
                                 if business_waits
+                                    && p.deferred_publish.is_none()
                                     && p.held_packet
                                         .as_ref()
                                         .is_some_and(|(first, ..)| business_header(*first)) =>
@@ -4157,13 +4242,35 @@ impl Runtime<'_> {
                                         .held_packet = Some((first, body, observed));
                                     break;
                                 }
+                                // A publication waits for a slot of the window.
+                                // The PUBREL of another exchange goes ahead: it
+                                // frees a slot. Every other packet waits behind
+                                // it, in order, up to a bound; past the bound
+                                // the reader stops as it did.
+                                if let Some(peer) = self.peers.get_mut(&generation)
+                                    && peer.deferred_publish.is_some()
+                                    && !peer.overtakes_deferred(first, &body)
+                                {
+                                    match peer.keep_behind((first, body, observed)) {
+                                        Ok(()) => continue,
+                                        Err(packet) => {
+                                            peer.held_packet = Some(packet);
+                                            break;
+                                        }
+                                    }
+                                }
                                 // It was taken from the lane to learn what it is;
                                 // it goes no further for now (record 0046).
                                 if business_waits
                                     && business_header(first)
                                     && let Some(peer) = self.peers.get_mut(&generation)
                                 {
-                                    peer.held_packet = Some((first, body, observed));
+                                    if from_behind {
+                                        peer.behind_bytes += body.len();
+                                        peer.behind.push_front((first, body, observed));
+                                    } else {
+                                        peer.held_packet = Some((first, body, observed));
+                                    }
                                     break;
                                 }
                                 self.packet_at(generation, first, body, observed)?

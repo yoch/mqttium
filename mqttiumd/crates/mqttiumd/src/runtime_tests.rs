@@ -295,6 +295,8 @@ fn peer(runtime: &mut Runtime<'_>) -> (ConnectionGeneration, TcpStream) {
             receiving: crate::receiving::Window::default(),
             closing: None,
             deferred_publish: None,
+            behind: VecDeque::new(),
+            behind_bytes: 0,
             blocked_output: None,
             retire_code: None,
         },
@@ -7205,4 +7207,80 @@ fn direct_volatile_store_commits_inline_and_saves_snapshot() {
             .any(|s| s.client_id == b"direct-sub"),
         "shutdown snapshot must preserve persistent subscriber session"
     );
+}
+
+/// What may go ahead of a publication that waits for a slot of the window:
+/// only the PUBREL of another exchange. A PUBREL whose identifier is the
+/// one of a waiting PUBLISH keeps its place, as does every other packet.
+#[test]
+fn only_the_pubrel_of_another_exchange_goes_ahead_of_a_waiting_publication() {
+    with_runtime(128, |runtime, _| {
+        let (generation, _client) = peer(runtime);
+        let Ok(Packet::Core(waiting)) =
+            codec::decode_for(codec::Version::V311, 0x34, b"\0\x01t\0\x09payload", BOUNDS)
+        else {
+            panic!("QoS 2 PUBLISH")
+        };
+        let peer = runtime.peers.get_mut(&generation).unwrap();
+        peer.deferred_publish = Some(DeferredPublish {
+            packet: waiting,
+            ingress_order: 9,
+            since: Instant::now(),
+            wire: false,
+        });
+        let raw = |first: u8, body: &[u8]| {
+            (
+                first,
+                net::FrameBytes::from_slice(body),
+                Err(crate::session_time::TimeError::ClockUnavailable),
+            )
+        };
+        assert!(peer.overtakes_deferred(0x62, &[0, 1]));
+        assert!(
+            !peer.overtakes_deferred(0x62, &[0, 9]),
+            "its own PUBLISH waits"
+        );
+        for (first, body) in [
+            (0x40, &[0, 1][..]),
+            (0x50, &[0, 1][..]),
+            (0x70, &[0, 1][..]),
+            (0xc0, &[][..]),
+            (0xe0, &[][..]),
+            (0x30, b"\0\x01tpayload"),
+            (0x82, b"\0\x02\0\x01t\x01"),
+            (0x62, &[0][..]),
+        ] {
+            assert!(!peer.overtakes_deferred(first, body), "{first:#04x}");
+        }
+        peer.keep_behind(raw(0x34, b"\0\x01t\0\x05payload"))
+            .unwrap();
+        assert!(
+            !peer.overtakes_deferred(0x62, &[0, 5]),
+            "a PUBLISH kept behind"
+        );
+        assert!(peer.overtakes_deferred(0x62, &[0, 6]));
+        assert_eq!(raw_publish_id(0x34, b"\0\x01t\0\x05payload"), Some(5));
+        assert_eq!(raw_publish_id(0x32, b"\0\x01t\x01\x02"), Some(0x0102));
+        assert_eq!(raw_publish_id(0x30, b"\0\x01t\0\x05payload"), None);
+        assert_eq!(raw_publish_id(0x34, b"\0\x01t\0"), None);
+        assert_eq!(raw_publish_id(0x62, &[0, 5]), None);
+
+        // The bound: one lane of packets, and the bytes of one largest packet.
+        for _ in 1..BEHIND_PACKETS {
+            peer.keep_behind(raw(0xc0, &[])).unwrap();
+        }
+        assert!(
+            peer.keep_behind(raw(0xc0, &[])).is_err(),
+            "one lane of packets"
+        );
+        peer.behind.clear();
+        peer.behind_bytes = 0;
+        let large = vec![0u8; BEHIND_BYTES];
+        peer.keep_behind(raw(0x30, &large)).unwrap();
+        assert!(
+            peer.keep_behind(raw(0x30, &[0])).is_err(),
+            "bytes of one packet"
+        );
+        assert_eq!(peer.behind_bytes, BEHIND_BYTES);
+    });
 }
