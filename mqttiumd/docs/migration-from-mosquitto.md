@@ -80,6 +80,10 @@ one can be surprised by the other.
 
 ## Not compared
 
-No differential run against Mosquitto 2.1.4 was made in this repository:
-the compatibility bench is pinned to 2.0.21. The "as the audit saw it"
-column is the audit's, on its host.
+The compatibility bench is pinned to Mosquitto 2.1.4 since record 0062
+and replays, among its 135 scenarios, the DISCONNECT with an error Reason
+Code, the empty Topic Name, the PUBREL of an expired message (upstream
+ticket 3744) and the ninth exchange of a session (upstream ticket 3809);
+`tests/compat/MATRIX.md` has the result. What is not in a scenario, TLS,
+ACL and everything across a restart among it, is still "as the audit saw
+it": the audit's observation, on its host.

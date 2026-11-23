@@ -8,7 +8,7 @@ the Runtime evidence tier of `mqttiumd/AGENTS.md`.
 Each scenario is a scripted exchange at packet level: named TCP
 connections, the exact packets sent, explicit waits for packets or for the
 closure of a connection, each with a deadline. A scenario is played against
-a fresh instance of the pinned Mosquitto 2.0.21 and against a fresh
+a fresh instance of the pinned Mosquitto 2.1.4 and against a fresh
 `mqttiumd`. The two transcripts are normalized and compared.
 
 **Mosquitto is not the oracle; the MQTT specification is.** Equal
@@ -27,7 +27,7 @@ Python 3.11 or later, standard library only.
 
 ```bash
 cd mqttiumd
-sh preview/build-mosquitto-reference.sh /tmp/mosquitto-reference    # once; needs a C toolchain and OpenSSL headers
+sh tests/compat/build-reference.sh /tmp/mosquitto-reference    # once; needs a C toolchain, OpenSSL and cJSON headers
 cargo build --release -p mqttiumd --locked
 python3 tests/compat/run.py \
     --reference /tmp/mosquitto-reference \
@@ -36,11 +36,13 @@ python3 tests/compat/run.py \
 ```
 
 `--reference` takes the output directory of the build script, the
-`mosquitto-2.0.21` build directory, or the `mosquitto` executable itself;
+`mosquitto-2.1.4` build directory, or the `mosquitto` executable itself;
 another version than the pinned one is refused. `--only GLOB ...` plays the
 scenarios whose id matches, `--list` prints them, `-v` prints each
 difference and the result of each expectation, `--jobs N` plays N
 scenarios at once (default 4). The whole bench takes about 40 seconds.
+The reference is the subject of record 0062; on Debian and Ubuntu the
+headers are in `libssl-dev` and `libcjson-dev`.
 
 The output directory receives:
 
@@ -187,12 +189,11 @@ mqttiumd is known to fail:
 ```
 
 sorted by `id`. Fixing the broker makes the entry stale, and the run fails
-until the entry is removed in the change that fixes it. Twelve
-expectations are declared: six on SUBSCRIBE and UNSUBSCRIBE, two on the
-content of the retained store, four on a delivery larger than the
-subscriber's Maximum Packet Size. One is open on the broker of
-`MATRIX.md`: `retained/forty-topics-qos1-v4#store`, because the bounded
-profile keeps thirty-two retained topics.
+until the entry is removed in the change that fixes it. Twenty-one
+expectations are declared: fourteen on SUBSCRIBE and UNSUBSCRIBE, two on
+the content of the retained store, four on a delivery larger than the
+subscriber's Maximum Packet Size, one on a packet larger than the
+announced Maximum Packet Size. None is open on the broker of `MATRIX.md`.
 
 An expectation states what conformance requires, not what Mosquitto does
 and not what mqttiumd does today; write it from the statement, give every
@@ -330,7 +331,7 @@ message. Its active evidence is:
 - `publish/over-maximum-packet-size-qos1-v5` and
   `publish/over-maximum-packet-size-qos2-v5`, each with the expectations
   `discarded` and `not-redelivered` on mqttiumd's transcript. Mosquitto
-  2.0.21 answers the same packets the same way: both scenarios are `same`;
+  2.1.4 answers the same packets the same way: both scenarios are `same`;
 - `crates/mqttiumd/tests/packet_limit.rs`, which plays the same story
   against the product executable at QoS 1 and QoS 2 and also reads what
   the wire does not show: the event `delivery_discarded` with the reason
@@ -340,7 +341,7 @@ message. Its active evidence is:
 ## What the bench does not show
 
 - **Conformance.** Only the points that carry an expectation are checked
-  against the specification: twelve today. Everywhere else, scenarios on which
+  against the specification: twenty-one today. Everywhere else, scenarios on which
   both brokers agree are not checked against it, and a classified
   difference rests on the reading of the person who classified it.
 - **The network below TCP's interface.** `eof` and `reset` are what the
@@ -349,7 +350,7 @@ message. Its active evidence is:
   connection or a few; no claim beyond them.
 - **Configuration.** Both brokers run with their defaults: anonymous
   access, no password file, no ACL, no TLS, no WebSocket, plain TCP on
-  loopback. Two scenarios set one limit of the reference
+  loopback. Five scenarios set one limit of the reference
   (`reference_config`).
 - **Durability.** The reference runs with `persistence false` and no
   broker is restarted or killed during a scenario. Crash recovery belongs

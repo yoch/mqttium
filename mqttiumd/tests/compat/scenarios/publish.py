@@ -69,6 +69,13 @@ for level in (4, 5):
         steps=[connect("a", "p-wild", level=level), publish("a", "wild/#", "x", level=level), until_close("a")],
     )
 
+    scenario(
+        f"publish/empty-topic-name-{v}",
+        doc="""A PUBLISH whose Topic Name is empty, with no Topic Alias: it names no topic
+        and the connection is closed.""",
+        steps=[connect("a", "p-empty", level=level), publish("a", "", "x", level=level), until_close("a")],
+    )
+
 scenario(
     "publish/qos-downgrade-v4",
     doc="""A subscription granted QoS 1 receives a QoS 0, a QoS 1 and a QoS 2 message:

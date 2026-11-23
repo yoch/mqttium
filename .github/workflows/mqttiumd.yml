@@ -280,9 +280,14 @@ jobs:
       # The bench is standard library only; its own tests start no broker.
       - name: Tests of the bench
         run: python3 -m unittest discover -s tests/compat -p "test_*.py"
+      # Mosquitto 2.1 requires cJSON; the broker links it at run time too.
+      - name: Install the build dependency of the reference
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends libcjson-dev
       # Downloads the pinned source archive, checks its digest and builds it.
       - name: Build the Mosquitto reference
-        run: sh preview/build-mosquitto-reference.sh "$RUNNER_TEMP/mosquitto-reference"
+        run: sh tests/compat/build-reference.sh "$RUNNER_TEMP/mosquitto-reference"
       - name: Build mqttiumd
         run: cargo build --release -p mqttiumd --locked
       - name: Differential scenarios

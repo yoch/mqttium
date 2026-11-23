@@ -20,7 +20,7 @@ import time
 import mqttwire as wire
 
 HOST = "127.0.0.1"
-MOSQUITTO_VERSION = "2.0.21"
+MOSQUITTO_VERSION = "2.1.4"
 START_TIMEOUT = 15.0
 STOP_TIMEOUT = 5.0
 START_ATTEMPTS = 4
@@ -35,7 +35,7 @@ class BrokerError(RuntimeError):
 
 def reference_binary(path: Path) -> Path:
     """The `mosquitto` executable named by a file, a build directory or
-    the output directory of `preview/build-mosquitto-reference.sh`."""
+    the output directory of `tests/compat/build-reference.sh`."""
     candidates = [path, path / "src/mosquitto", path / f"mosquitto-{MOSQUITTO_VERSION}/src/mosquitto"]
     for candidate in candidates:
         if candidate.is_file():
