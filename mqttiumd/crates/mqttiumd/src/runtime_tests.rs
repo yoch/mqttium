@@ -467,16 +467,22 @@ fn qos0_drops(directory: &Path) -> usize {
 }
 
 /// A subscriber at QoS 0 whose output the test holds: nothing drains it
-/// until the test takes a frame and reports it written. The hundred
-/// messages are published by `publish`, which returns once the broker has
-/// taken each one. No message may be dropped for the queue of the
-/// subscriber, and the hundred leave in the order of their publication.
+/// until the test takes a frame and reports it written. The messages, more
+/// than the output queue holds, are published by `publish`, which returns
+/// once the broker has taken each one. No message may be dropped for the
+/// queue of the subscriber, and they leave in the order of their
+/// publication. The broker leaves `RESERVE` places of the queue to
+/// acknowledgements and to QoS 1 and 2 publications.
 fn burst_reaches_a_subscriber_whose_output_is_held(
     client: &'static [u8],
-    publish: impl Fn(&mut Runtime<'_>, ConnectionGeneration, &mut TcpStream, u8),
+    publish: impl Fn(&mut Runtime<'_>, ConnectionGeneration, &mut TcpStream, u16),
 ) {
-    const MESSAGES: u8 = 100;
-    with_runtime(128, |runtime, directory| {
+    const MESSAGES: u16 = 300;
+    const RESERVE: usize = 32;
+    const _: () = assert!(MESSAGES as usize > net::OUTPUT_SLOTS);
+    // A table wide enough for the hundred to wait: deliveries that wait for
+    // a window may hold half of the volatile queue, which has its size.
+    with_runtime(4096, |runtime, directory| {
         let (subscriber, mut reader) = peer(runtime);
         runtime.connect(subscriber, connect_packet(client)).unwrap();
         until(runtime, |r| r.session_requests.is_empty());
@@ -526,19 +532,19 @@ fn burst_reaches_a_subscriber_whose_output_is_held(
         while delivered.len() < usize::from(MESSAGES) && Instant::now() < deadline {
             let frames: Vec<net::Write> = held.try_iter().collect();
             assert!(
-                frames.len() <= net::OUTPUT_SLOTS / 2,
+                frames.len() <= net::OUTPUT_SLOTS - RESERVE,
                 "{} QoS 0 frames at once leave no room for acknowledgements",
                 frames.len()
             );
             for frame in frames {
                 let (effect, connection) = frame.correlation.expect("a correlated PUBLISH");
-                let last = frame
-                    .payload
-                    .as_ref()
-                    .and_then(|payload| payload.as_slice().last().copied())
-                    .or_else(|| frame.bytes.as_slice().last().copied())
-                    .expect("a payload");
-                delivered.push(last);
+                // The payload is the rank of the message, on two bytes.
+                let mut bytes = frame.bytes.as_slice().to_vec();
+                if let Some(payload) = &frame.payload {
+                    bytes.extend_from_slice(payload.as_slice());
+                }
+                let rank = &bytes[bytes.len() - 2..];
+                delivered.push(u16::from_be_bytes([rank[0], rank[1]]));
                 runtime
                     .written_complete(effect, connection, frame.total_len())
                     .unwrap();
@@ -563,9 +569,12 @@ fn a_qos0_burst_waits_for_the_output_of_its_subscriber_and_keeps_its_order() {
     burst_reaches_a_subscriber_whose_output_is_held(
         b"burst-volatile",
         |runtime, publisher, _, index| {
+            let [high, low] = index.to_be_bytes();
             runtime
-                .packet(publisher, 0x30, vec![0, 1, b't', 0, index])
+                .packet(publisher, 0x30, vec![0, 1, b't', 0, high, low])
                 .unwrap();
+            // The broker takes each publication as it is read.
+            runtime.drain_inputs().unwrap();
         },
     );
 }
@@ -578,10 +587,14 @@ fn durable_publications_to_a_qos0_subscription_wait_for_its_output() {
     burst_reaches_a_subscriber_whose_output_is_held(
         b"burst-consumed",
         |runtime, publisher, writer, index| {
-            let id = u16::from(index) + 1;
-            let [high, low] = id.to_be_bytes();
+            let [high, low] = (index + 1).to_be_bytes();
+            let [first, second] = index.to_be_bytes();
             runtime
-                .packet(publisher, 0x32, vec![0, 1, b't', high, low, 0, index])
+                .packet(
+                    publisher,
+                    0x32,
+                    vec![0, 1, b't', high, low, 0, first, second],
+                )
                 .unwrap();
             until(runtime, |r| r.inputs.is_empty() && r.inflight.is_empty());
             assert_eq!(served_frame(runtime, writer).0, 0x40);

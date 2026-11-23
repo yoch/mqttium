@@ -9267,8 +9267,9 @@ mod tests {
     /// not handed whole to an output queue that drops what it cannot hold.
     #[test]
     fn product_qos0_burst_is_paced_by_the_window_and_resumes_in_order() {
-        const BURST: u64 = 100;
-        const WINDOW: usize = 32;
+        use std::collections::VecDeque;
+        const WINDOW: usize = pubsub::QOS0_WINDOW;
+        const BURST: u64 = WINDOW as u64 + 68;
         let mut world = burst_world();
         for order in 1..=BURST {
             world.applied(qos0_packet(CONN, order, b"p1/example"));
@@ -9291,7 +9292,7 @@ mod tests {
                 generation,
                 frames.iter().map(|frame| frame.2).collect::<Vec<_>>(),
             );
-            waiting.insert(generation, std::collections::VecDeque::from(frames));
+            waiting.insert(generation, VecDeque::from(frames));
         }
         assert!(
             world.owner.pubsub.continuation.is_none(),
@@ -9306,8 +9307,8 @@ mod tests {
         assert!(volatile_frames(&next, 12).is_empty());
         let frames = volatile_frames(&next, 11);
         assert_eq!(frames.len(), 1);
-        assert_eq!(frames[0].2, 33);
-        delivered.get_mut(&11).unwrap().push(33);
+        assert_eq!(frames[0].2, WINDOW as u64 + 1);
+        delivered.get_mut(&11).unwrap().push(WINDOW as u64 + 1);
         waiting.get_mut(&11).unwrap().push_back(frames[0]);
 
         // Every write completes in its turn.
@@ -9333,6 +9334,198 @@ mod tests {
         }
         assert!(world.owner.pubsub.volatile.is_empty());
         assert!(world.owner.pubsub.continuation.is_none());
+    }
+
+    /// The volatile deliveries to `session` that `effects` drop: the order
+    /// of their publication and the reason.
+    fn dropped(
+        effects: &[(EffectId, Effect)],
+        session: u64,
+    ) -> Vec<(u64, crate::contract::pubsub::Qos0DropReason)> {
+        effects
+            .iter()
+            .filter_map(|(_, effect)| match effect {
+                Effect::Qos0Dropped {
+                    origin: crate::contract::pubsub::Qos0Origin::Volatile { publication },
+                    target: Some(target),
+                    reason,
+                } if target.get() == session => Some((publication.ingress_order, *reason)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Record 0063: a connection keeps a bounded number of deliveries
+    /// waiting for its window. Past it the newest are dropped, the oldest
+    /// keep their place, and the other connection is served the same.
+    #[test]
+    fn product_qos0_past_what_a_connection_keeps_waiting_the_newest_is_dropped() {
+        use crate::contract::pubsub::Qos0DropReason;
+        use std::collections::VecDeque;
+        const WINDOW: usize = pubsub::QOS0_WINDOW;
+        const KEPT: u64 = (WINDOW + pubsub::QOS0_PARKED) as u64;
+        const BURST: u64 = KEPT + 44;
+        let mut world = burst_world();
+        for order in 1..=BURST {
+            world.applied(qos0_packet(CONN, order, b"p1/example"));
+        }
+        let first = run_volatile(&mut world);
+        // Sessions 2 and 3 are the subscribers, on connections 11 and 12.
+        for (session, generation) in [(2, 11), (3, 12)] {
+            assert_eq!(volatile_frames(&first, generation).len(), WINDOW);
+            assert_eq!(
+                dropped(&first, session),
+                (KEPT + 1..=BURST)
+                    .map(|order| (order, Qos0DropReason::OutputSaturated))
+                    .collect::<Vec<_>>(),
+                "session {session}"
+            );
+        }
+        assert_eq!(world.owner.pubsub.volatile.len(), 2 * KEPT as usize);
+        let mut waiting: VecDeque<_> = [11, 12]
+            .iter()
+            .flat_map(|generation| volatile_frames(&first, *generation))
+            .collect();
+        let mut delivered = BTreeMap::from([(11, WINDOW as u64), (12, WINDOW as u64)]);
+        while let Some((effect, connection, _)) = waiting.pop_front() {
+            world.applied(frame_written(effect, connection));
+            let next = run_volatile(&mut world);
+            assert!(!kinds(&next).contains(&"Qos0Dropped"));
+            for generation in [11, 12] {
+                for frame in volatile_frames(&next, generation) {
+                    let count = delivered.get_mut(&generation).unwrap();
+                    *count += 1;
+                    assert_eq!(frame.2, *count, "connection {generation} in order");
+                    waiting.push_back(frame);
+                }
+            }
+        }
+        assert_eq!(delivered, BTreeMap::from([(11, KEPT), (12, KEPT)]));
+        assert!(world.owner.pubsub.volatile.is_empty());
+    }
+
+    /// Record 0063: deliveries that wait for the window of a connection end
+    /// with it, each with its reason, while the other connection goes on;
+    /// the connection that replaces it starts with a window of its own.
+    #[test]
+    fn product_qos0_deliveries_that_wait_end_with_their_connection() {
+        use crate::contract::pubsub::Qos0DropReason;
+        use std::collections::VecDeque;
+        const WINDOW: usize = pubsub::QOS0_WINDOW;
+        const BURST: u64 = WINDOW as u64 + 68;
+        let mut world = burst_world();
+        for order in 1..=BURST {
+            world.applied(qos0_packet(CONN, order, b"p1/example"));
+        }
+        let first = run_volatile(&mut world);
+        let closing = volatile_frames(&first, 11);
+        let mut other: VecDeque<_> = volatile_frames(&first, 12).into();
+        assert_eq!((closing.len(), other.len()), (WINDOW, WINDOW));
+
+        // The tables of this world are wide: the close costs more work
+        // than the grant of the other tests.
+        let wide = TurnGrant {
+            work_limit: WorkUnits::new(1 << 16),
+        };
+        let outcome = world.owner.step(transport_closed(11), wide);
+        assert!(
+            matches!(outcome, StepOutcome::Applied { .. }),
+            "{outcome:?}"
+        );
+        let _ = world.drain();
+        // The runtime reports each frame the closed connection had in
+        // flight; the first report brings the waiting deliveries out.
+        let mut ended = Vec::new();
+        for (effect, connection, _) in closing {
+            world.applied(Input::Qos0EmitRefused {
+                effect,
+                connection,
+                reason: Qos0DropReason::ConnectionClosed,
+            });
+            let effects = run_volatile(&mut world);
+            assert!(volatile_frames(&effects, 11).is_empty());
+            ended.extend(dropped(&effects, 2));
+            other.extend(volatile_frames(&effects, 12));
+        }
+        ended.sort_unstable_by_key(|(order, _)| *order);
+        assert_eq!(
+            ended,
+            (1..=BURST)
+                .map(|order| (order, Qos0DropReason::ConnectionClosed))
+                .collect::<Vec<_>>(),
+            "every delivery of the closed connection ends once, with its reason"
+        );
+        // The other connection receives the burst whole.
+        let mut count = WINDOW as u64;
+        while let Some((effect, connection, _)) = other.pop_front() {
+            world.applied(frame_written(effect, connection));
+            let next = run_volatile(&mut world);
+            assert!(dropped(&next, 3).is_empty());
+            for frame in volatile_frames(&next, 12) {
+                count += 1;
+                assert_eq!(frame.2, count);
+                other.push_back(frame);
+            }
+        }
+        assert_eq!(count, BURST);
+        assert!(world.owner.pubsub.volatile.is_empty());
+
+        // The session comes back on another connection: a window of its own.
+        world.applied(connect(13, b"p1-b"));
+        let _ = world.drain();
+        world.applied(product_settings(13, 8));
+        let _ = world.drain();
+        for order in BURST + 1..=BURST + WINDOW as u64 + 8 {
+            world.applied(qos0_packet(CONN, order, b"p1/example"));
+        }
+        let again = run_volatile(&mut world);
+        assert_eq!(volatile_frames(&again, 13).len(), WINDOW);
+        assert!(volatile_frames(&again, 11).is_empty());
+    }
+
+    /// Record 0063: serving a delivery that waited reserves what it
+    /// publishes before it changes anything (P1-19).
+    #[test]
+    fn product_qos0_serving_a_waiting_delivery_is_handed_back_at_each_boundary() {
+        fn one_place_back() -> World {
+            let mut world = burst_world();
+            for order in 1..=pubsub::QOS0_WINDOW as u64 + 8 {
+                world.applied(qos0_packet(CONN, order, b"p1/example"));
+            }
+            let first = run_volatile(&mut world);
+            let (effect, connection, _) = volatile_frames(&first, 11)[0];
+            world.applied(frame_written(effect, connection));
+            // The continuation it armed is taken, not applied.
+            assert_eq!(kinds(&world.drain()), ["Continue"]);
+            world
+        }
+        let resume = |world: &World| Input::Continue {
+            continuation: world.owner.pubsub.continuation.expect("armed"),
+            budget: WorkUnits::new(65536),
+        };
+        // One frame: the window is full again and nothing else is pending.
+        // With no slot left in the box the input comes back and nothing
+        // changed.
+        let mut world = one_place_back();
+        let all = nonzero(world.outbox().free_slots());
+        let held = world.outbox().reserve(all).expect("free");
+        let before = world.snapshot();
+        let outcome = world.step(resume(&world));
+        let StepOutcome::NeedCapacity { input, need, .. } = outcome else {
+            panic!("{outcome:?}")
+        };
+        assert_eq!(input, resume(&world));
+        assert_eq!(need.resource, Resource::EffectSlots);
+        assert_eq!(world.snapshot(), before);
+        assert_eq!(world.outbox().release(held), Ok(all.get()));
+        // With room, the input that came back is applied.
+        world.applied(resume(&world));
+        let effects = world.drain();
+        assert_eq!(kinds(&effects), ["EmitQos0"]);
+        assert_eq!(
+            volatile_frames(&effects, 11)[0].2,
+            pubsub::QOS0_WINDOW as u64 + 1
+        );
     }
 
     #[test]

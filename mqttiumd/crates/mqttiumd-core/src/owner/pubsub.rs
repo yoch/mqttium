@@ -242,11 +242,46 @@ pub(super) struct Volatile {
     frame: Option<EffectId>,
 }
 
+/// Volatile QoS 0 frames the owner lets one connection have emitted and
+/// not yet written, failed or refused (record 0063). The output queue of a
+/// connection is bounded and drops a QoS 0 frame it cannot hold: the owner
+/// emits a window and the next frames as their writes complete. The
+/// product's queue has 256 places; the window leaves thirty-two of them to
+/// acknowledgements and to QoS 1 and 2 publications. It is several times
+/// what one publisher adds in a turn of the runtime, so a connection that
+/// fell behind catches up.
+pub(super) const QOS0_WINDOW: usize = 224;
+
+/// Volatile QoS 0 messages kept waiting for the window of one connection.
+/// Past it the newest is dropped with `OutputSaturated`.
+pub(super) const QOS0_PARKED: usize = 1_024;
+
+/// Consumed QoS 0 deliveries one connection may have being written. Each
+/// is consumed in the store before its frame is emitted, so its frame must
+/// find a place in the output queue.
+pub(super) const QOS0_CONSUMED_WINDOW: usize = 16;
+
+/// The volatile deliveries of one connection generation: how many are in
+/// flight, and those that wait for the window, oldest first.
+#[derive(Debug, Default)]
+struct Lane {
+    window: usize,
+    parked: VecDeque<Volatile>,
+    /// Whether the lane is in `VolatileQueue::ready`.
+    ready: bool,
+}
+
 #[derive(Debug)]
 pub(super) struct VolatileQueue {
     capacity: usize,
     pending: VecDeque<Volatile>,
     inflight: ScopedFlatMap<EffectId, Volatile>,
+    lanes: FlatMap<ConnectionGeneration, Lane>,
+    /// The lanes whose oldest waiting delivery can leave or be dropped, in
+    /// the order they became so: each is served one delivery in its turn.
+    ready: VecDeque<ConnectionGeneration>,
+    parked_len: usize,
+    parked_bytes: u64,
     payload_bytes: u64,
     expiring_count: usize,
 }
@@ -258,6 +293,10 @@ impl VolatileQueue {
             capacity,
             pending: VecDeque::new(),
             inflight: ScopedFlatMap::new(),
+            lanes: FlatMap::new(),
+            ready: VecDeque::new(),
+            parked_len: 0,
+            parked_bytes: 0,
             payload_bytes: 0,
             expiring_count: 0,
         })
@@ -268,11 +307,11 @@ impl VolatileQueue {
     }
 
     pub(super) fn len(&self) -> usize {
-        self.pending.len() + self.inflight.len()
+        self.pending.len() + self.inflight.len() + self.parked_len
     }
 
     pub(super) fn is_empty(&self) -> bool {
-        self.pending.is_empty() && self.inflight.is_empty()
+        self.len() == 0
     }
 
     fn payload_bytes(&self) -> u64 {
@@ -302,19 +341,128 @@ impl VolatileQueue {
         self.pending.len() > 1
     }
 
+    fn has_pending(&self) -> bool {
+        !self.pending.is_empty()
+    }
+
+    /// Frames of `generation` in flight.
+    fn window(&self, generation: ConnectionGeneration) -> usize {
+        self.lanes.get(&generation).map_or(0, |lane| lane.window)
+    }
+
+    /// Deliveries of `generation` that wait for its window.
+    fn parked(&self, generation: ConnectionGeneration) -> usize {
+        self.lanes
+            .get(&generation)
+            .map_or(0, |lane| lane.parked.len())
+    }
+
+    /// Whether one more delivery of `bytes` may wait for a window: within
+    /// what one connection may keep waiting, and within half of the queue
+    /// and of its payload, so that connections that wait never take the
+    /// place of the publications of the others.
+    fn may_park(&self, generation: ConnectionGeneration, bytes: usize, payload_limit: u64) -> bool {
+        self.parked(generation) < QOS0_PARKED
+            && self.parked_len < self.capacity / 2
+            && self
+                .parked_bytes
+                .checked_add(bytes as u64)
+                .is_some_and(|total| total <= payload_limit / 2)
+    }
+
+    /// The lane to serve next and its oldest waiting delivery.
+    fn front_ready(&self) -> Option<(ConnectionGeneration, &Volatile)> {
+        let generation = *self.ready.front()?;
+        let item = self.lanes.get(&generation)?.parked.front()?;
+        Some((generation, item))
+    }
+
+    fn other_ready(&self) -> bool {
+        self.ready.len() > 1
+    }
+
+    fn generation_of(item: &Volatile) -> Result<ConnectionGeneration, CoreFault> {
+        item.connection
+            .map(|key| key.generation)
+            .ok_or(CoreFault::StalePlan)
+    }
+
+    fn forget(&mut self, item: &Volatile) {
+        self.payload_bytes = self.payload_bytes.saturating_sub(item.payload.len() as u64);
+        if item.expiry.is_some() {
+            self.expiring_count = self.expiring_count.saturating_sub(1);
+        }
+    }
+
+    fn lane_done(&mut self, generation: ConnectionGeneration) {
+        if self
+            .lanes
+            .get(&generation)
+            .is_some_and(|lane| lane.window == 0 && lane.parked.is_empty() && !lane.ready)
+        {
+            self.lanes.remove(&generation);
+        }
+    }
+
     fn promote_front_to_inflight(&mut self, effect: EffectId) -> Result<(), CoreFault> {
         let mut item = self.pending.pop_front().ok_or(CoreFault::StalePlan)?;
+        let generation = Self::generation_of(&item)?;
         item.frame = Some(effect);
         self.inflight.insert(effect, item);
+        self.lanes.get_or_insert_default(generation).window += 1;
         Ok(())
     }
 
     fn drop_front_pending(&mut self) -> Result<(), CoreFault> {
         let item = self.pending.pop_front().ok_or(CoreFault::StalePlan)?;
-        self.payload_bytes = self.payload_bytes.saturating_sub(item.payload.len() as u64);
-        if item.expiry.is_some() {
-            self.expiring_count = self.expiring_count.saturating_sub(1);
+        self.forget(&item);
+        Ok(())
+    }
+
+    /// The oldest pending delivery waits behind the window of its
+    /// connection.
+    fn park_front_pending(&mut self) -> Result<(), CoreFault> {
+        let item = self.pending.pop_front().ok_or(CoreFault::StalePlan)?;
+        let generation = Self::generation_of(&item)?;
+        self.parked_len += 1;
+        self.parked_bytes = self
+            .parked_bytes
+            .checked_add(item.payload.len() as u64)
+            .ok_or(CoreFault::StalePlan)?;
+        self.lanes
+            .get_or_insert_default(generation)
+            .parked
+            .push_back(item);
+        Ok(())
+    }
+
+    /// The oldest waiting delivery of the lane served next leaves it: with
+    /// `effect` it is in flight, without it it was dropped. `stays` keeps
+    /// the lane among those to serve.
+    fn serve_ready(&mut self, effect: Option<EffectId>, stays: bool) -> Result<(), CoreFault> {
+        let generation = self.ready.pop_front().ok_or(CoreFault::StalePlan)?;
+        let lane = self
+            .lanes
+            .get_mut(&generation)
+            .ok_or(CoreFault::StalePlan)?;
+        let mut item = lane.parked.pop_front().ok_or(CoreFault::StalePlan)?;
+        lane.ready = stays;
+        if effect.is_some() {
+            lane.window += 1;
         }
+        self.parked_len = self.parked_len.saturating_sub(1);
+        self.parked_bytes = self.parked_bytes.saturating_sub(item.payload.len() as u64);
+        if stays {
+            self.ready.push_back(generation);
+        }
+        match effect {
+            Some(effect) => {
+                item.frame = Some(effect);
+                self.inflight.insert(effect, item);
+            }
+            None => self.forget(&item),
+        }
+        self.lane_done(generation);
         Ok(())
     }
 
@@ -322,12 +470,29 @@ impl VolatileQueue {
         self.inflight.get(&effect)
     }
 
+    /// Whether the end of the frame `effect` lets a waiting delivery of its
+    /// connection be served: the lane has one and is not already among
+    /// those to serve.
+    fn wakes(&self, effect: EffectId) -> bool {
+        self.inflight
+            .get(&effect)
+            .and_then(|item| item.connection)
+            .and_then(|key| self.lanes.get(&key.generation))
+            .is_some_and(|lane| !lane.parked.is_empty() && !lane.ready)
+    }
+
     fn remove_inflight(&mut self, effect: EffectId) -> Result<(), CoreFault> {
         let item = self.inflight.remove(&effect).ok_or(CoreFault::StalePlan)?;
-        self.payload_bytes = self.payload_bytes.saturating_sub(item.payload.len() as u64);
-        if item.expiry.is_some() {
-            self.expiring_count = self.expiring_count.saturating_sub(1);
+        self.forget(&item);
+        let generation = Self::generation_of(&item)?;
+        if let Some(lane) = self.lanes.get_mut(&generation) {
+            lane.window = lane.window.saturating_sub(1);
+            if !lane.parked.is_empty() && !lane.ready {
+                lane.ready = true;
+                self.ready.push_back(generation);
+            }
         }
+        self.lane_done(generation);
         Ok(())
     }
 
@@ -338,6 +503,7 @@ impl VolatileQueue {
         self.pending
             .iter()
             .chain(self.inflight.values())
+            .chain(self.lanes.values().flat_map(|lane| lane.parked.iter()))
             .filter_map(|v| v.expiry)
             .all(|expiry| expiry.state(now).is_ok())
     }
@@ -346,6 +512,11 @@ impl VolatileQueue {
     pub(super) fn to_vec(&self) -> alloc::vec::Vec<Volatile> {
         let mut out = alloc::vec::Vec::with_capacity(self.len());
         out.extend(self.inflight.values().cloned());
+        out.extend(
+            self.lanes
+                .values()
+                .flat_map(|lane| lane.parked.iter().cloned()),
+        );
         out.extend(self.pending.iter().cloned());
         out
     }
@@ -411,8 +582,20 @@ pub(super) enum Change {
     Qos0Drop {
         continuation: Option<ContinuationId>,
     },
+    /// The oldest pending delivery waits for the window of its connection.
+    Qos0Park {
+        continuation: Option<ContinuationId>,
+    },
+    /// The lane served next gives its oldest waiting delivery: emitted as
+    /// `effect`, or dropped.
+    Qos0Serve {
+        effect: Option<EffectId>,
+        stays: bool,
+        continuation: Option<ContinuationId>,
+    },
     Qos0Done {
         effect: EffectId,
+        continuation: Option<ContinuationId>,
     },
     Qos0Idle,
     Consume {
@@ -1128,6 +1311,23 @@ impl State {
         self.active_by_gen.get(&generation).copied().unwrap_or(0)
     }
 
+    /// Consumed QoS 0 deliveries of `session` whose frame is being written
+    /// on `generation`.
+    fn qos0_writing(&self, session: SessionId, generation: ConnectionGeneration) -> usize {
+        let Some(indices) = self.deliveries_by_session.get(&session) else {
+            return 0;
+        };
+        let slice = self.deliveries.as_slice();
+        indices
+            .iter()
+            .filter(|&&index| {
+                let d = &slice[index];
+                matches!(d.phase, Phase::Qos0Writing(_))
+                    && d.frame.is_some_and(|(_, key)| key.generation == generation)
+            })
+            .count()
+    }
+
     fn next_send(
         &self,
         session: SessionId,
@@ -1493,6 +1693,13 @@ impl Owner {
             self.pubsub
                 .next_send(session, generation, self.message_now, room)
         {
+            if delivery.phase == Phase::Queued
+                && delivery.qos == Qos::AtMostOnce
+                && self.pubsub.qos0_writing(session, generation) >= QOS0_CONSUMED_WINDOW
+            {
+                // Held until a write of the connection ends (record 0063).
+                return false;
+            }
             if delivery.ready_to_send(generation, room) {
                 return true;
             }
@@ -1946,6 +2153,43 @@ impl Owner {
                 Err(IMPOSSIBLE)
             };
         }
+        // A connection whose window has room is served first, one
+        // delivery in its turn: what waited leaves before what came after.
+        if let Some((generation, v)) = self.pubsub.volatile.front_ready() {
+            let closed = self.connection_of(v.target) != Some(generation);
+            let window = self.pubsub.volatile.window(generation);
+            if !closed && window >= QOS0_WINDOW {
+                return Err(IMPOSSIBLE);
+            }
+            let reason = self.qos0_drop_reason(v)?;
+            let window = window + usize::from(reason.is_none());
+            let stays =
+                self.pubsub.volatile.parked(generation) > 1 && (closed || window < QOS0_WINDOW);
+            let next = if stays
+                || self.pubsub.volatile.other_ready()
+                || self.pubsub.volatile.has_pending()
+            {
+                Some(self.qos0_continuation(draft)?)
+            } else {
+                None
+            };
+            let effect = match reason {
+                Some(reason) => {
+                    draft.emit(Effect::Qos0Dropped {
+                        origin: v.origin,
+                        target: Some(v.target),
+                        reason,
+                    })?;
+                    None
+                }
+                None => Some(self.emit_volatile(v, draft)?),
+            };
+            return Ok(changed(Change::Qos0Serve {
+                effect,
+                stays,
+                continuation: next,
+            }));
+        }
         let Some(v) = self.pubsub.volatile.front_pending() else {
             return Ok(changed(Change::Qos0Idle));
         };
@@ -1954,6 +2198,44 @@ impl Owner {
         } else {
             None
         };
+        if let Some(reason) = self.qos0_drop_reason(v)? {
+            draft.emit(Effect::Qos0Dropped {
+                origin: v.origin,
+                target: Some(v.target),
+                reason,
+            })?;
+            return Ok(changed(Change::Qos0Drop { continuation: next }));
+        }
+        let generation = v.connection.ok_or(IMPOSSIBLE)?.generation;
+        // The window of the connection is full, or earlier deliveries wait
+        // for it: this one waits behind them, in its order. Past what a
+        // connection may keep waiting, it is dropped.
+        if self.pubsub.volatile.parked(generation) > 0
+            || self.pubsub.volatile.window(generation) >= QOS0_WINDOW
+        {
+            if self.pubsub.volatile.may_park(
+                generation,
+                v.payload.len(),
+                self.pubsub.payload_limit.get(),
+            ) {
+                return Ok(changed(Change::Qos0Park { continuation: next }));
+            }
+            draft.emit(Effect::Qos0Dropped {
+                origin: v.origin,
+                target: Some(v.target),
+                reason: Qos0DropReason::OutputSaturated,
+            })?;
+            return Ok(changed(Change::Qos0Drop { continuation: next }));
+        }
+        let effect = self.emit_volatile(v, draft)?;
+        Ok(changed(Change::Qos0Send {
+            effect,
+            continuation: next,
+        }))
+    }
+
+    /// Why a volatile delivery cannot be sent now, if it cannot.
+    fn qos0_drop_reason(&self, v: &Volatile) -> Result<Option<Qos0DropReason>, Stop> {
         let reason = if let Some(expiry) = v.expiry {
             match self.message_now.map(|now| expiry.state(now)) {
                 Some(Ok(ExpiryState::Fresh { .. })) => None,
@@ -1964,7 +2246,7 @@ impl Owner {
         } else {
             None
         };
-        let reason = reason.or(match v.connection {
+        Ok(reason.or(match v.connection {
             None => Some(Qos0DropReason::DestinationAbsent),
             Some(key) if self.connection_of(v.target) != Some(key.generation) => {
                 Some(Qos0DropReason::ConnectionClosed)
@@ -1981,17 +2263,12 @@ impl Owner {
                 Some(Qos0DropReason::PacketTooLarge)
             }
             _ => None,
-        });
-        if let Some(reason) = reason {
-            draft.emit(Effect::Qos0Dropped {
-                origin: v.origin,
-                target: Some(v.target),
-                reason,
-            })?;
-            return Ok(changed(Change::Qos0Drop { continuation: next }));
-        }
+        }))
+    }
+
+    fn emit_volatile(&self, v: &Volatile, draft: &mut Draft) -> Result<EffectId, Stop> {
         let connection = v.connection.ok_or(IMPOSSIBLE)?;
-        let effect = draft.emit(Effect::EmitQos0 {
+        draft.emit(Effect::EmitQos0 {
             connection,
             origin: v.origin,
             cause: DeliveryCause::LiveExact,
@@ -2000,11 +2277,7 @@ impl Owner {
             payload: v.payload.clone(),
             expiry: v.expiry,
             properties: v.properties.clone(),
-        })?;
-        Ok(changed(Change::Qos0Send {
-            effect,
-            continuation: next,
-        }))
+        })
     }
 
     fn plan_qos0_terminal(
@@ -2027,7 +2300,18 @@ impl Owner {
                     reason,
                 })?;
             }
-            return Ok(Some(changed(Change::Qos0Done { effect })));
+            // A place of the window returns: a delivery that waited for it
+            // is served, by the continuation if one runs, else by a new one.
+            let continuation =
+                if self.pubsub.volatile.wakes(effect) && self.pubsub.continuation.is_none() {
+                    Some(self.qos0_continuation(draft)?)
+                } else {
+                    None
+                };
+            return Ok(Some(changed(Change::Qos0Done {
+                effect,
+                continuation,
+            })));
         }
         if let Some(&slot) = self.pubsub.delivery_by_frame.get(&effect) {
             let d = &self.pubsub.deliveries.as_slice()[slot];
@@ -2823,6 +3107,13 @@ impl Owner {
             && d.qos == Qos::AtMostOnce
             && d.payload.is_some()
         {
+            // The frame of a consumed delivery must find a place in the
+            // output queue: the store no longer owes the message. No more
+            // are consumed than the connection may have being written
+            // (record 0063); the end of a write brings this work back.
+            if self.pubsub.qos0_writing(session, generation) >= QOS0_CONSUMED_WINDOW {
+                return Ok(super::Change::Nothing);
+            }
             let operation = self.operation(draft)?;
             let recipe = Recipe::ConsumeDelivery(ConsumeDelivery {
                 operation,
@@ -4066,8 +4357,27 @@ impl Owner {
                 self.pubsub.volatile.drop_front_pending()?;
                 self.pubsub.continuation = continuation;
             }
-            Change::Qos0Done { effect } => {
+            Change::Qos0Park { continuation } => {
+                self.pubsub.volatile.park_front_pending()?;
+                self.pubsub.continuation = continuation;
+            }
+            Change::Qos0Serve {
+                effect,
+                stays,
+                continuation,
+            } => {
+                self.pubsub.volatile.serve_ready(effect, stays)?;
+                self.pubsub.continuation = continuation;
+            }
+            Change::Qos0Done {
+                effect,
+                continuation,
+            } => {
                 self.pubsub.volatile.remove_inflight(effect)?;
+                if let Some(c) = continuation {
+                    self.pubsub.continuation = Some(c);
+                    self.pubsub.continuations_started = true;
+                }
             }
             Change::Qos0Idle => self.pubsub.continuation = None,
             Change::Consume {
