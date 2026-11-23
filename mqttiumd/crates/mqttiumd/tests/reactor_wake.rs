@@ -1100,6 +1100,141 @@ fn stale_qos2_exchanges_of_a_3_1_1_session_do_not_stop_or_lose_a_publication() {
     );
 }
 
+/// One packet, or `None` once the broker ended the stream.
+fn packet_or_end(stream: &mut TcpStream) -> Option<(u8, Vec<u8>)> {
+    fn fill(stream: &mut TcpStream, bytes: &mut [u8]) -> Option<()> {
+        match stream.read_exact(bytes) {
+            Ok(()) => Some(()),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::UnexpectedEof
+                        | std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::BrokenPipe
+                ) =>
+            {
+                None
+            }
+            Err(error) => panic!("the broker neither answered nor closed: {error}"),
+        }
+    }
+    let mut first = [0u8; 1];
+    fill(stream, &mut first)?;
+    let mut length = 0usize;
+    let mut shift = 0;
+    loop {
+        let mut byte = [0u8; 1];
+        fill(stream, &mut byte)?;
+        length |= usize::from(byte[0] & 0x7f) << shift;
+        if byte[0] & 0x80 == 0 {
+            break;
+        }
+        shift += 7;
+    }
+    let mut body = vec![0; length];
+    fill(stream, &mut body)?;
+    Some((first[0], body))
+}
+
+/// An MQTT 5 client publishes one QoS 1 and one QoS 2 message and is
+/// acknowledged for both: the broker admitted them.
+fn another_client_is_served(broker: &Broker) {
+    let mut other = connect(broker.address, "another-client");
+    for (first, id, answer) in [(0x32u8, 1u16, 0x40u8), (0x34, 2, 0x50)] {
+        let mut body = Vec::new();
+        text("other/t", &mut body);
+        body.extend_from_slice(&id.to_be_bytes());
+        body.push(0);
+        body.push(b'x');
+        other.write_all(&packet(first, &body)).unwrap();
+        let received = packet_or_end(&mut other);
+        let Some((kind, body)) = received else {
+            panic!(
+                "the broker closed a client that held nothing:\n{}",
+                broker.refusals()
+            );
+        };
+        assert_eq!(
+            (kind, &body[..2]),
+            (answer, &id.to_be_bytes()[..]),
+            "{body:?}\n{}",
+            broker.refusals()
+        );
+        assert!(
+            body.len() == 2 || body[2] == 0 || body[2] == 0x10,
+            "the publication is accepted: {body:?}"
+        );
+    }
+}
+
+/// A session that never completes its QoS 2 exchanges must not take the
+/// place of the other clients. Each connection of the session leaves a
+/// window of exchanges at PUBREC and the next one starts with a fresh
+/// window; with sixteen connections allowed the broker held 128 exchanges
+/// for all its clients, and sixteen such connections took them all (report
+/// 0033). Whatever the broker answers that session, another client is
+/// still acknowledged.
+#[test]
+fn one_session_cannot_hold_the_inbound_exchanges_of_every_client() {
+    const WINDOW: u16 = 8;
+    let broker = Broker::start_with("exchange-hoard", &["--max-connections", "16"]);
+    let mut id = 0u16;
+    'connections: for _ in 0..16 {
+        let (mut holder, _) = resume_311(broker.address, "exchange-holder");
+        let mut publications = Vec::new();
+        for _ in 0..WINDOW {
+            id += 1;
+            let mut body = Vec::new();
+            text("held/t", &mut body);
+            body.extend_from_slice(&id.to_be_bytes());
+            body.push(b'x');
+            publications.extend_from_slice(&packet(0x34, &body));
+        }
+        // The broker may have closed this connection already.
+        let _ = holder.write_all(&publications);
+        for _ in 0..WINDOW {
+            match packet_or_end(&mut holder) {
+                Some((0x50, _)) => {}
+                Some(other) => panic!("PUBREC expected, got {other:?}"),
+                None => break 'connections,
+            }
+        }
+    }
+    another_client_is_served(&broker);
+}
+
+/// The same for the payload bytes the broker lends to the publications it
+/// is admitting: an exchange whose publication is committed and
+/// acknowledged no longer holds its payload, so sessions that leave their
+/// exchanges at PUBREC do not use up the 64 MiB every client shares.
+#[test]
+fn exchanges_left_at_pubrec_do_not_hold_the_payload_bytes_of_every_client() {
+    const SESSIONS: usize = 8;
+    const WINDOW: u16 = 8;
+    // The largest payload, 1 MiB: eight sessions of eight are 64 MiB.
+    let payload = vec![b'x'; 1_048_576];
+    let broker = Broker::start_with("payload-hoard", &["--max-connections", "16"]);
+    let mut holders = Vec::new();
+    for session in 0..SESSIONS {
+        let (mut holder, _) = resume_311(broker.address, &format!("payload-holder-{session}"));
+        for id in 1..=WINDOW {
+            let mut body = Vec::new();
+            text("held/t", &mut body);
+            body.extend_from_slice(&id.to_be_bytes());
+            body.extend_from_slice(&payload);
+            holder.write_all(&packet(0x34, &body)).unwrap();
+            assert_eq!(
+                read_packet(&mut holder),
+                (0x50, id.to_be_bytes().to_vec()),
+                "{}",
+                broker.refusals()
+            );
+        }
+        holders.push(holder);
+    }
+    another_client_is_served(&broker);
+}
+
 /// An MQTT 5 client that keeps its session for an hour (Clean Start 0), and
 /// the Session Present flag of its CONNACK.
 fn session_v5(address: SocketAddr, client_id: &str) -> (TcpStream, bool) {
