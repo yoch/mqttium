@@ -29,6 +29,15 @@
 # upward ties): 61; after the connection table of lot 5: 59; after its
 # volatile queue: 56; after its delivery table: 46; after the end of
 # `pubsub::State`: 43.
+# - The delivery table (`Deliveries`, lot 5) is closed to writes: every
+#   change goes through its transitions. It still lends its rows read only
+#   (`rows`, 26 places in `owner::pubsub`) and the rows of a session
+#   (`of_session`). Written as `&self.rows`, `rows` is reported as a field
+#   leak; its body `self.rows.as_slice()` hides it from the linter. The
+#   read side of `State::deliveries` and `State::deliveries_by_session`,
+#   removed above, is therefore renamed, not narrowed. Narrowing it, or
+#   keeping read-only lending as the interface of the table, is left to
+#   the owner of the repository.
 # - field-leak of the effective settings (SqliteStore::settings,
 #   LogStore::sqlite_settings, VolatileHandle::sqlite_settings): a record of
 #   what the engine read back, which every reader only copies; its main
