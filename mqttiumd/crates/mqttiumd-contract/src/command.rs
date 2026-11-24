@@ -116,6 +116,162 @@ pub struct Target {
     pub cause: DeliveryCause,
 }
 
+#[derive(Debug)]
+enum TargetStorage {
+    Empty,
+    One(Target),
+    Many(BoundedVec<Target>),
+}
+
+/// Bounded target list storing 0 or 1 destinations inline (zero heap
+/// allocation on the dominant 1:1 pub/sub path) and spilling to a
+/// [`BoundedVec`] for multi-subscriber fan-out.
+#[derive(Debug)]
+pub struct TargetVec {
+    storage: TargetStorage,
+    capacity: usize,
+}
+
+impl TargetVec {
+    /// Reserves capacity for up to `capacity` targets without allocating when
+    /// `capacity <= 1`.
+    pub fn with_capacity(capacity: usize) -> Result<Self, crate::capacity::AllocationFailed> {
+        let storage = if capacity <= 1 {
+            TargetStorage::Empty
+        } else {
+            TargetStorage::Many(BoundedVec::with_capacity(capacity)?)
+        };
+        Ok(Self { storage, capacity })
+    }
+
+    /// Builds a bounded target list holding a copy of `items`, with bound
+    /// `capacity`. Returns `None` when `items.len() > capacity` or allocation
+    /// fails.
+    #[must_use]
+    pub fn from_slice(items: &[Target], capacity: usize) -> Option<Self> {
+        if items.len() > capacity {
+            return None;
+        }
+        let storage = match items {
+            [] => TargetStorage::Empty,
+            [one] => TargetStorage::One(*one),
+            many => TargetStorage::Many(BoundedVec::from_slice(many, capacity)?),
+        };
+        Some(Self { storage, capacity })
+    }
+
+    /// Appends `target` if the bound has not been reached.
+    pub fn try_push(&mut self, target: Target) -> Result<(), Target> {
+        match &mut self.storage {
+            TargetStorage::Empty => {
+                if self.capacity == 0 {
+                    return Err(target);
+                }
+                self.storage = TargetStorage::One(target);
+                Ok(())
+            }
+            TargetStorage::One(first) => {
+                if self.capacity <= 1 {
+                    return Err(target);
+                }
+                let Ok(mut vec) = BoundedVec::with_capacity(self.capacity) else {
+                    return Err(target);
+                };
+                let _ = vec.try_push(*first);
+                let _ = vec.try_push(target);
+                self.storage = TargetStorage::Many(vec);
+                Ok(())
+            }
+            TargetStorage::Many(vec) => vec.try_push(target),
+        }
+    }
+
+    /// Removes and returns the last target.
+    pub fn pop(&mut self) -> Option<Target> {
+        match &mut self.storage {
+            TargetStorage::Empty => None,
+            TargetStorage::One(_) => {
+                let TargetStorage::One(target) =
+                    core::mem::replace(&mut self.storage, TargetStorage::Empty)
+                else {
+                    panic!("target storage was matched as One");
+                };
+                Some(target)
+            }
+            TargetStorage::Many(vec) => vec.pop(),
+        }
+    }
+
+    #[must_use]
+    pub fn len(&self) -> usize {
+        match &self.storage {
+            TargetStorage::Empty => 0,
+            TargetStorage::One(_) => 1,
+            TargetStorage::Many(vec) => vec.len(),
+        }
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    #[must_use]
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    #[must_use]
+    pub fn as_slice(&self) -> &[Target] {
+        match &self.storage {
+            TargetStorage::Empty => &[],
+            TargetStorage::One(target) => core::slice::from_ref(target),
+            TargetStorage::Many(vec) => vec.as_slice(),
+        }
+    }
+
+    #[must_use]
+    pub fn as_mut_slice(&mut self) -> &mut [Target] {
+        match &mut self.storage {
+            TargetStorage::Empty => &mut [],
+            TargetStorage::One(target) => core::slice::from_mut(target),
+            TargetStorage::Many(vec) => vec.as_mut_slice(),
+        }
+    }
+
+    /// Converts into a [`BoundedVec<Target>`] with the same bound.
+    #[must_use]
+    pub fn into_bounded(self) -> BoundedVec<Target> {
+        match self.storage {
+            TargetStorage::Empty => BoundedVec::with_capacity(self.capacity).expect("empty fits"),
+            TargetStorage::One(target) => {
+                BoundedVec::from_slice(&[target], self.capacity).expect("one fits")
+            }
+            TargetStorage::Many(vec) => vec,
+        }
+    }
+}
+
+impl From<BoundedVec<Target>> for TargetVec {
+    fn from(vec: BoundedVec<Target>) -> Self {
+        let capacity = vec.capacity();
+        match vec.as_slice() {
+            [] => Self {
+                storage: TargetStorage::Empty,
+                capacity,
+            },
+            [one] => Self {
+                storage: TargetStorage::One(*one),
+                capacity,
+            },
+            _ => Self {
+                storage: TargetStorage::Many(vec),
+                capacity,
+            },
+        }
+    }
+}
+
 /// Durable costs charged by an admission, checked and committed with it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Costs {
@@ -144,7 +300,7 @@ pub struct AdmitPublication {
     pub topic: SharedBytes,
     pub payload: PayloadRef,
     pub costs: Costs,
-    pub targets: BoundedVec<Target>,
+    pub targets: TargetVec,
 }
 
 impl PartialEq for AdmitPublication {
@@ -1035,25 +1191,20 @@ impl<'a> Reader<'a> {
     }
 }
 
-#[derive(Debug)]
-struct FrozenInner {
-    recipe: Recipe,
-    canonical: Arc<[u8]>,
-}
-
 /// A recipe that can no longer change.
 ///
 /// The `Arc` is private and no method hands out a mutable reference, so
 /// neither interior mutation nor copy-on-write is reachable: immutability is
 /// the contract of this wrapper (DEM-009). The owner keeps one clone until
-/// the operation is resolved. Its exact canonical bytes are frozen once at
-/// construction so stores never re-encode the same command.
+/// the operation is resolved. Validation runs eagerly in [`Self::freeze`],
+/// while canonical wire encoding is computed only when a durable medium or
+/// snapshot actually needs the serialized bytes.
 #[derive(Clone, Debug)]
-pub struct FrozenRecipe(Arc<FrozenInner>);
+pub struct FrozenRecipe(Arc<Recipe>);
 
 impl PartialEq for FrozenRecipe {
     fn eq(&self, other: &Self) -> bool {
-        self.0.canonical == other.0.canonical
+        Arc::ptr_eq(&self.0, &other.0) || *self.0 == *other.0
     }
 }
 
@@ -1134,40 +1285,174 @@ fn encode_admit_body_stack<const N: usize>(out: &mut StackBuf<N>, admit: &AdmitP
 }
 
 impl FrozenRecipe {
-    /// Freezes a well-formed recipe together with its canonical encoding.
+    /// Freezes a well-formed recipe after validating its canonical invariants.
     pub fn freeze(recipe: Recipe) -> Result<Self, RecipeError> {
-        let canonical = encode_canonical_arc(&recipe)?;
-        Ok(Self(Arc::new(FrozenInner { recipe, canonical })))
+        recipe.check()?;
+        Ok(Self(Arc::new(recipe)))
     }
 
     /// The frozen recipe.
     #[must_use]
     pub fn get(&self) -> &Recipe {
-        &self.0.recipe
+        &self.0
     }
 
-    /// The exact canonical bytes of this frozen recipe (DEM-009).
+    /// Appends the exact canonical bytes of this already-checked recipe to `out`.
+    pub fn encode_canonical_into(&self, out: &mut Vec<u8>) {
+        encode_checked_into(&self.0, out);
+    }
+
+    /// Encodes the exact canonical bytes of this frozen recipe into a fresh `Vec<u8>`.
     #[must_use]
-    pub fn canonical_bytes(&self) -> &[u8] {
-        &self.0.canonical
+    pub fn to_canonical_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(self.canonical_len());
+        encode_checked_into(&self.0, &mut out);
+        out
     }
 
-    /// Zero-copy shared handle to the canonical bytes of this frozen recipe.
+    /// Encodes the exact canonical bytes of this frozen recipe into an `Arc<[u8]>`.
     #[must_use]
     pub fn canonical_arc(&self) -> Arc<[u8]> {
-        Arc::clone(&self.0.canonical)
+        encode_checked_arc(&self.0)
+    }
+
+    /// Exact canonical byte length without allocating or serializing hot variants.
+    #[must_use]
+    pub fn canonical_len(&self) -> usize {
+        const ADMIT_FIXED: usize = 215;
+        const TARGET_BYTES: usize = 22;
+        match self.0.as_ref() {
+            Recipe::FinishDelivery(_) | Recipe::PreparePubrel(_) => 125,
+            Recipe::ClaimDelivery(_) => 93,
+            Recipe::ConsumeDelivery(_) => 91,
+            Recipe::ReleaseInbound(_) => 57,
+            Recipe::AdmitPublication(admit) => ADMIT_FIXED
+                .saturating_add(admit.topic.len())
+                .saturating_add(admit.targets.len().saturating_mul(TARGET_BYTES)),
+            Recipe::ClaimedPublication(claimed) => (ADMIT_FIXED + 4)
+                .saturating_add(claimed.admission.topic.len())
+                .saturating_add(claimed.admission.targets.len().saturating_mul(TARGET_BYTES)),
+            _ => {
+                let mut out = Vec::with_capacity(128);
+                encode_checked_into(&self.0, &mut out);
+                out.len()
+            }
+        }
     }
 
     /// The operation this recipe belongs to.
     #[must_use]
     pub fn operation(&self) -> OperationId {
-        self.0.recipe.operation()
+        self.0.operation()
     }
 }
 
-fn encode_canonical_arc(recipe: &Recipe) -> Result<Arc<[u8]>, RecipeError> {
+fn encode_checked_into(recipe: &Recipe, out: &mut Vec<u8>) {
     const STACK_CAP: usize = 384;
-    // Fixed bytes of AdmitPublication header + body excluding topic and targets.
+    const ADMIT_FIXED: usize = 215;
+    const TARGET_BYTES: usize = 22;
+
+    match recipe {
+        Recipe::FinishDelivery(finish) | Recipe::PreparePubrel(finish) => {
+            let mut buf = StackBuf::<128>::new();
+            buf.extend(MAGIC);
+            buf.extend(&RECIPE_FORMAT.to_be_bytes());
+            buf.push(if matches!(recipe, Recipe::PreparePubrel(_)) {
+                19
+            } else {
+                KIND_FINISH_DELIVERY
+            });
+            encode_delivery_stack(
+                &mut buf,
+                finish.operation,
+                finish.delivery,
+                finish.target,
+                finish.target_revision,
+                finish.packet_id,
+            );
+            buf.extend(&finish.claim.to_be_bytes());
+            out.extend_from_slice(buf.as_slice());
+            return;
+        }
+        Recipe::ClaimDelivery(claim) => {
+            let mut buf = StackBuf::<96>::new();
+            buf.extend(MAGIC);
+            buf.extend(&RECIPE_FORMAT.to_be_bytes());
+            buf.push(KIND_CLAIM_DELIVERY);
+            encode_delivery_stack(
+                &mut buf,
+                claim.operation,
+                claim.delivery,
+                claim.target,
+                claim.target_revision,
+                claim.packet_id,
+            );
+            out.extend_from_slice(buf.as_slice());
+            return;
+        }
+        Recipe::ConsumeDelivery(consume) => {
+            let mut buf = StackBuf::<96>::new();
+            buf.extend(MAGIC);
+            buf.extend(&RECIPE_FORMAT.to_be_bytes());
+            buf.push(KIND_CONSUME_DELIVERY);
+            buf.extend(&consume.operation.to_be_bytes());
+            buf.extend(&consume.delivery.publication.to_be_bytes());
+            buf.extend(&consume.delivery.index.to_be_bytes());
+            buf.extend(&consume.target.to_be_bytes());
+            buf.extend(&consume.target_revision.to_be_bytes());
+            out.extend_from_slice(buf.as_slice());
+            return;
+        }
+        Recipe::ReleaseInbound(release) => {
+            let mut buf = StackBuf::<64>::new();
+            buf.extend(MAGIC);
+            buf.extend(&RECIPE_FORMAT.to_be_bytes());
+            buf.push(KIND_RELEASE_INBOUND);
+            buf.extend(&release.operation.to_be_bytes());
+            buf.extend(&release.source_session.to_be_bytes());
+            buf.extend(&release.packet_id.get().to_be_bytes());
+            buf.extend(&release.exchange.generation.to_be_bytes());
+            out.extend_from_slice(buf.as_slice());
+            return;
+        }
+        Recipe::AdmitPublication(admit) => {
+            let needed = ADMIT_FIXED
+                .saturating_add(admit.topic.len())
+                .saturating_add(admit.targets.len().saturating_mul(TARGET_BYTES));
+            if needed <= STACK_CAP {
+                let mut buf = StackBuf::<STACK_CAP>::new();
+                buf.extend(MAGIC);
+                buf.extend(&RECIPE_FORMAT.to_be_bytes());
+                buf.push(KIND_ADMIT_PUBLICATION);
+                encode_admit_body_stack(&mut buf, admit);
+                out.extend_from_slice(buf.as_slice());
+                return;
+            }
+        }
+        Recipe::ClaimedPublication(claimed) => {
+            let needed = ADMIT_FIXED
+                .saturating_add(4)
+                .saturating_add(claimed.admission.topic.len())
+                .saturating_add(claimed.admission.targets.len().saturating_mul(TARGET_BYTES));
+            if needed <= STACK_CAP {
+                let mut buf = StackBuf::<STACK_CAP>::new();
+                buf.extend(MAGIC);
+                buf.extend(&RECIPE_FORMAT.to_be_bytes());
+                buf.push(KIND_CLAIMED_PUBLICATION);
+                encode_admit_body_stack(&mut buf, &claimed.admission);
+                buf.extend(&claimed.claim.target_index.to_be_bytes());
+                buf.extend(&claimed.claim.packet_id.get().to_be_bytes());
+                out.extend_from_slice(buf.as_slice());
+                return;
+            }
+        }
+        _ => {}
+    }
+    let _ = recipe.encode_canonical(out);
+}
+
+fn encode_checked_arc(recipe: &Recipe) -> Arc<[u8]> {
+    const STACK_CAP: usize = 384;
     const ADMIT_FIXED: usize = 215;
     const TARGET_BYTES: usize = 22;
 
@@ -1190,7 +1475,7 @@ fn encode_canonical_arc(recipe: &Recipe) -> Result<Arc<[u8]>, RecipeError> {
                 finish.packet_id,
             );
             out.extend(&finish.claim.to_be_bytes());
-            return Ok(Arc::from(out.as_slice()));
+            return Arc::from(out.as_slice());
         }
         Recipe::ClaimDelivery(claim) => {
             let mut out = StackBuf::<96>::new();
@@ -1205,7 +1490,7 @@ fn encode_canonical_arc(recipe: &Recipe) -> Result<Arc<[u8]>, RecipeError> {
                 claim.target_revision,
                 claim.packet_id,
             );
-            return Ok(Arc::from(out.as_slice()));
+            return Arc::from(out.as_slice());
         }
         Recipe::ConsumeDelivery(consume) => {
             let mut out = StackBuf::<96>::new();
@@ -1217,10 +1502,9 @@ fn encode_canonical_arc(recipe: &Recipe) -> Result<Arc<[u8]>, RecipeError> {
             out.extend(&consume.delivery.index.to_be_bytes());
             out.extend(&consume.target.to_be_bytes());
             out.extend(&consume.target_revision.to_be_bytes());
-            return Ok(Arc::from(out.as_slice()));
+            return Arc::from(out.as_slice());
         }
         Recipe::ReleaseInbound(release) => {
-            recipe.check()?;
             let mut out = StackBuf::<64>::new();
             out.extend(MAGIC);
             out.extend(&RECIPE_FORMAT.to_be_bytes());
@@ -1229,20 +1513,19 @@ fn encode_canonical_arc(recipe: &Recipe) -> Result<Arc<[u8]>, RecipeError> {
             out.extend(&release.source_session.to_be_bytes());
             out.extend(&release.packet_id.get().to_be_bytes());
             out.extend(&release.exchange.generation.to_be_bytes());
-            return Ok(Arc::from(out.as_slice()));
+            return Arc::from(out.as_slice());
         }
         Recipe::AdmitPublication(admit) => {
             let needed = ADMIT_FIXED
                 .saturating_add(admit.topic.len())
                 .saturating_add(admit.targets.len().saturating_mul(TARGET_BYTES));
             if needed <= STACK_CAP {
-                admit.check_retained()?;
                 let mut out = StackBuf::<STACK_CAP>::new();
                 out.extend(MAGIC);
                 out.extend(&RECIPE_FORMAT.to_be_bytes());
                 out.push(KIND_ADMIT_PUBLICATION);
                 encode_admit_body_stack(&mut out, admit);
-                return Ok(Arc::from(out.as_slice()));
+                return Arc::from(out.as_slice());
             }
         }
         Recipe::ClaimedPublication(claimed) => {
@@ -1251,7 +1534,6 @@ fn encode_canonical_arc(recipe: &Recipe) -> Result<Arc<[u8]>, RecipeError> {
                 .saturating_add(claimed.admission.topic.len())
                 .saturating_add(claimed.admission.targets.len().saturating_mul(TARGET_BYTES));
             if needed <= STACK_CAP {
-                claimed.check()?;
                 let mut out = StackBuf::<STACK_CAP>::new();
                 out.extend(MAGIC);
                 out.extend(&RECIPE_FORMAT.to_be_bytes());
@@ -1259,14 +1541,14 @@ fn encode_canonical_arc(recipe: &Recipe) -> Result<Arc<[u8]>, RecipeError> {
                 encode_admit_body_stack(&mut out, &claimed.admission);
                 out.extend(&claimed.claim.target_index.to_be_bytes());
                 out.extend(&claimed.claim.packet_id.get().to_be_bytes());
-                return Ok(Arc::from(out.as_slice()));
+                return Arc::from(out.as_slice());
             }
         }
         _ => {}
     }
     let mut canonical = Vec::with_capacity(256);
-    recipe.encode_canonical(&mut canonical)?;
-    Ok(Arc::from(canonical))
+    let _ = recipe.encode_canonical(&mut canonical);
+    Arc::from(canonical)
 }
 
 /// A frozen command proposed to the store. The payload bytes travel with an
@@ -1398,7 +1680,7 @@ impl AdmitPublication {
             });
         }
         let mut targets =
-            BoundedVec::with_capacity(count).map_err(|_| RecipeError::AllocationFailed)?;
+            TargetVec::with_capacity(count).map_err(|_| RecipeError::AllocationFailed)?;
         for _ in 0..count {
             let target = Target {
                 session: SessionId::new(reader.u64()?),
@@ -1555,7 +1837,7 @@ mod tests {
                 exchange_slots: ExchangeSlots::new(1),
                 receipt_slots: ReceiptSlots::new(1),
             },
-            targets: BoundedVec::from_slice(targets, 4).expect("fits"),
+            targets: TargetVec::from_slice(targets, 4).expect("fits"),
         })
     }
 
@@ -1649,7 +1931,7 @@ mod tests {
             topic: SharedBytes::copy_from(b"$share/literal", 1024).unwrap(),
             payload: a.payload,
             costs: a.costs,
-            targets: a.targets,
+            targets: a.targets.into_bounded(),
             retain_targets: crate::retained::RetainMask::EMPTY,
         });
         assert_eq!(
@@ -1714,7 +1996,7 @@ mod tests {
         assert!(mask.is_set(198));
         let (incarnation, epoch, owner) = scope();
         let session = SessionId::new(10);
-        let mut targets = BoundedVec::with_capacity(count).unwrap();
+        let mut targets = TargetVec::with_capacity(count).unwrap();
         for t in &list {
             targets.try_push(*t).unwrap();
         }
@@ -1917,7 +2199,7 @@ mod tests {
         let Recipe::AdmitPublication(mut admit) = admission(targets) else {
             panic!("kind changed");
         };
-        admit.targets = BoundedVec::from_slice(targets, bound).expect("fits");
+        admit.targets = TargetVec::from_slice(targets, bound).expect("fits");
         Recipe::AdmitPublication(admit)
     }
 
@@ -2226,7 +2508,8 @@ mod tests {
             let mut expected = Vec::new();
             recipe.encode_canonical(&mut expected).unwrap();
             let frozen = FrozenRecipe::freeze(recipe).unwrap();
-            assert_eq!(frozen.canonical_bytes(), expected.as_slice());
+            assert_eq!(frozen.to_canonical_bytes(), expected);
+            assert_eq!(frozen.canonical_len(), expected.len());
         };
 
         let claim = ClaimDelivery {

@@ -23,7 +23,7 @@ pub(super) struct Read {
     effect: EffectId,
     after: Option<OperationId>,
 }
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub(super) struct Flight {
     will: OperationId,
     publication: PublicationId,
@@ -46,8 +46,12 @@ impl State {
             deferred: None,
         }
     }
+    pub(super) fn has_flight(&self) -> bool {
+        self.flight.is_some()
+    }
     pub(super) fn deadline_is_live(&self, token: DeadlineToken) -> bool {
         self.flight
+            .as_ref()
             .is_some_and(|flight| flight.in_flight.deadline == token)
     }
 }
@@ -69,7 +73,7 @@ pub(super) enum Change {
     },
 }
 fn changed(change: Change) -> super::Change {
-    super::Change::Will(change)
+    super::Change::Will(alloc::boxed::Box::new(change))
 }
 impl Owner {
     #[must_use]
@@ -84,12 +88,14 @@ impl Owner {
     pub fn will_dispatch(&self) -> Option<(OperationId, DeadlineToken)> {
         self.wills
             .flight
+            .as_ref()
             .map(|flight| (flight.in_flight.operation, flight.in_flight.deadline))
     }
     #[must_use]
     pub fn will_operation_is_live(&self, operation: OperationId) -> bool {
         self.wills
             .flight
+            .as_ref()
             .is_some_and(|flight| flight.in_flight.operation == operation)
     }
     pub(super) fn will_work_bound(&self, input: &Input) -> u64 {
@@ -267,6 +273,7 @@ impl Owner {
         let Some(flight) = self
             .wills
             .flight
+            .as_ref()
             .filter(|flight| flight.in_flight.operation == operation)
         else {
             return Ok(None);
@@ -311,12 +318,7 @@ impl Owner {
         };
         draft.receipt_consumed = Some(operation);
         Ok(Some(changed(Change::Done {
-            finished: Finished {
-                operation,
-                answers: flight.in_flight.answers,
-                phase,
-                facts,
-            },
+            finished: Finished::new(operation, flight.in_flight.answers.clone(), phase, facts),
             deferred,
         })))
     }
@@ -328,6 +330,7 @@ impl Owner {
         let Some(flight) = self
             .wills
             .flight
+            .as_ref()
             .filter(|flight| flight.in_flight.deadline == token)
         else {
             return Ok(None);
@@ -367,7 +370,9 @@ impl Owner {
                 flight.in_flight.phase = phase;
                 if let Some((deadline, effect)) = resolution {
                     flight.in_flight.deadline = deadline;
-                    flight.in_flight.answers = flight.in_flight.answers.with(effect);
+                    let prev =
+                        core::mem::replace(&mut flight.in_flight.answers, Answers::new(effect));
+                    flight.in_flight.answers = prev.with(effect);
                 }
             }
             Change::Done { finished, deferred } => {
@@ -378,7 +383,7 @@ impl Owner {
                 if !deferred && self.inline_claim_enabled {
                     self.mark_all_sessions_dirty(true);
                 }
-                remember(&mut self.finished, finished)?;
+                self.remember_finished(finished)?;
             }
         }
         Ok(())

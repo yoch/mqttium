@@ -254,6 +254,11 @@ pub struct LogStore {
     sqlite_settings: Option<Settings>,
     lease: WriterLease,
     durability: Durability,
+    /// True after a SQLite checkpoint has replaced `<path>` on disk but the
+    /// matching fresh `.mlog` rotation has not yet completed. While set, all
+    /// durable appends fail closed so no commit can be confirmed onto a stale
+    /// or unlinked WAL descriptor.
+    wal_desynced: bool,
     encode_buf: Vec<u8>,
 }
 
@@ -306,6 +311,7 @@ impl LogStore {
                 sqlite_settings: None,
                 lease,
                 durability: Durability::Available,
+                wal_desynced: false,
                 encode_buf: Vec::new(),
             });
         }
@@ -395,6 +401,7 @@ impl LogStore {
             sqlite_settings: Some(settings),
             lease,
             durability: Durability::Available,
+            wal_desynced: false,
             encode_buf: Vec::new(),
         })
     }
@@ -427,6 +434,13 @@ impl LogStore {
         self.store.has_will_for_client(client)
     }
 
+    /// Borrow the underlying in-memory [`VolatileStore`].
+    #[must_use]
+    #[inline]
+    pub fn store(&self) -> &VolatileStore {
+        &self.store
+    }
+
     /// Atomically checkpoints the full state into the Schema-14 / Schema-15
     /// SQLite database at `<path>` and rotates `<path>.mlog` to an empty log
     /// rooted at the new revision.
@@ -435,11 +449,15 @@ impl LogStore {
         let rev = state.revision;
         let incarnation = state.ledger.incarnation();
         save_state_atomic(&self.path, &state, self.policy.as_ref(), &self.lease)?;
+        // Once the SQLite checkpoint has advanced on disk, `self.wal` no longer
+        // matches the checkpoint's base revision until replacement succeeds.
+        self.wal_desynced = true;
         let fresh =
             write_fresh_wal_atomic(&self.wal_path, incarnation, rev, self.policy.is_some())?;
         self.wal = fresh;
         self.wal_len = WAL_HEADER_LEN;
         self.wal_alloc_len = WAL_HEADER_LEN;
+        self.wal_desynced = false;
         Ok(())
     }
 
@@ -492,7 +510,7 @@ impl LogStore {
     /// On any I/O failure (or `Durability::Failing`), truncates `.mlog` back
     /// to `prev_len` and returns `Err(())`.
     fn flush_prepared_frame(&mut self) -> Result<u64, ()> {
-        if self.durability == Durability::Failing {
+        if self.durability == Durability::Failing || self.wal_desynced {
             return Err(());
         }
         let prev_len = self.wal_len;
@@ -865,10 +883,12 @@ impl DurableStore for LogStore {
 
 fn encode_command_record(buf: &mut Vec<u8>, cmd: &Command) {
     buf.push(TAG_COMMAND);
-    let canonical = cmd.recipe.canonical_bytes();
-    let rlen = u32::try_from(canonical.len()).expect("recipe fits in u32");
-    buf.extend_from_slice(&rlen.to_be_bytes());
-    buf.extend_from_slice(canonical);
+    let len_pos = buf.len();
+    buf.extend_from_slice(&0u32.to_be_bytes());
+    let recipe_start = buf.len();
+    cmd.recipe.encode_canonical_into(buf);
+    let rlen = u32::try_from(buf.len() - recipe_start).expect("recipe fits in u32");
+    buf[len_pos..len_pos + 4].copy_from_slice(&rlen.to_be_bytes());
     match &cmd.payload {
         None => buf.push(0),
         Some(payload) => {

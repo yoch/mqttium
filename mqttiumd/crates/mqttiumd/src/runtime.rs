@@ -19,22 +19,24 @@ use mqttiumd_contract::effects::{
 };
 use mqttiumd_contract::flat_map::{FlatMap, FlatSet, ScopedFlatMap};
 use mqttiumd_contract::ids::{
-    AccountId, ConnectionGeneration, ConnectionKey, DeadlineToken, EffectId, LogicalDuration,
-    LogicalOwnerId, LogicalTime, OperationId, OutboundPacketId, PublicationId, SessionId,
+    AccountId, ConnectionGeneration, ConnectionKey, DeadlineToken, DeliveryId, EffectId,
+    LogicalDuration, LogicalOwnerId, LogicalTime, OperationId, OperationSeq, OutboundPacketId,
+    PublicationId, RunEpoch, SessionId, StoreIncarnation,
 };
 use mqttiumd_contract::message_expiry::{MessageExpiry, MessageTime};
 use mqttiumd_contract::outcome::{CommitFacts, StoreOutcome, StoreReply};
-use mqttiumd_contract::packet::{InboundPacket, OutboundFrame, Qos2Ack};
+use mqttiumd_contract::packet::{InboundPacket, OutboundFrame, Qos, SharedBytes};
+#[cfg(feature = "test-hooks")]
+use mqttiumd_contract::pubsub::WorkItem;
 use mqttiumd_contract::pubsub::{PubackTarget, Qos0DropReason, Qos0Origin};
 use mqttiumd_contract::receipts::{
-    ClosedReceiptCollection, ClosedReceiptReply, ReceiptCollectionReply,
+    ClosedReceiptCollection, ClosedReceiptReply, ReceiptClosure, ReceiptCollection,
+    ReceiptCollectionReply,
 };
 use mqttiumd_contract::session::{
     SessionAction, SessionChange, SessionDetachment, SessionEndReason, SessionExpiry, SessionGuard,
 };
 use mqttiumd_contract::step::{StepOutcome, TurnGrant};
-#[cfg(feature = "test-hooks")]
-use mqttiumd_contract::{ids::DeliveryId, pubsub::WorkItem};
 use mqttiumd_core::owner::{Owner, OwnerConfig};
 use mqttiumd_store_api::{ReadError, ReadPhase, SessionClockAnchor, SessionClockReading};
 use serde_json::json;
@@ -223,45 +225,86 @@ pub struct Config {
     pub hooks: Hooks,
     pub tls: Option<TlsFiles>,
 }
-struct Peer {
-    io: net::Connection,
-    created: Instant,
-    last_packet: Instant,
-    connected: bool,
-    version: Option<Version>,
-    session: Option<SessionId>,
-    opened_by: Option<OperationId>,
-    will_managed: bool,
+/// Cold connection state allocated lazily only when a peer holds backpressure
+/// buffers, multi-part subscribe requests, deferred publishes, or close state.
+/// Idle and steady-state peers keep `cold == None` (zero heap bytes).
+#[derive(Default)]
+struct PeerCold {
+    opened_by_foreign: Option<OperationId>,
     will_disconnect: Option<bool>,
-    connect_expiry: SessionExpiry,
     disconnect_expiry: Option<SessionExpiry>,
     close_observed_at: Option<u64>,
     /// The next packet of this connection, taken from its lane and not
     /// yet given to the core: a packet behind a CONNECT that is still
-    /// being opened, or a business packet the lane has no place for. The
-    /// packets behind it stay with the transport, in order.
+    /// being opened, or a business packet the lane has no place for.
     held_packet: Option<(u8, net::FrameBytes, net::FrameObservation)>,
     /// Since when a packet of this connection waits for a credit that
-    /// other work holds. The results of the store return such credits; a
-    /// wait during which the broker returned none for [`CAPACITY_WAIT`] is
-    /// not pressure any more and ends the connection.
+    /// other work holds.
     capacity_wait: Option<Instant>,
     requests: Option<Requests>,
-    pending: bool,
-    keep_alive: u16,
-    max_packet: usize,
-    ingress: u64,
-    receiving: crate::receiving::Window,
     closing: Option<(&'static str, Instant)>,
     deferred_publish: Option<DeferredPublish>,
     /// The packets read past `deferred_publish`, in their order, with their
-    /// bytes counted. The reader goes on behind a publication that waits
-    /// for a slot of the window, because the PUBREL that frees one is
-    /// behind it in the stream; what is not such a PUBREL waits here.
+    /// bytes counted.
     behind: VecDeque<(u8, net::FrameBytes, net::FrameObservation)>,
     behind_bytes: usize,
     blocked_output: Option<EffectId>,
     retire_code: Option<&'static str>,
+}
+
+impl PeerCold {
+    #[inline]
+    fn is_empty(&self) -> bool {
+        self.opened_by_foreign.is_none()
+            && self.will_disconnect.is_none()
+            && self.disconnect_expiry.is_none()
+            && self.close_observed_at.is_none()
+            && self.held_packet.is_none()
+            && self.capacity_wait.is_none()
+            && self.requests.is_none()
+            && self.closing.is_none()
+            && self.deferred_publish.is_none()
+            && self.behind.is_empty()
+            && self.blocked_output.is_none()
+            && self.retire_code.is_none()
+    }
+
+    #[inline]
+    fn state_active(&self) -> bool {
+        self.retire_code.is_some()
+            || self.held_packet.is_some()
+            || self.deferred_publish.is_some()
+            || !self.behind.is_empty()
+            || self.requests.is_some()
+            || self.blocked_output.is_some()
+            || self.closing.is_some()
+    }
+
+    #[inline]
+    fn needs_poll(&self) -> bool {
+        self.state_active() || self.capacity_wait.is_some()
+    }
+}
+
+/// Compact per-connection state (~96 bytes in release vs 944 bytes previously).
+/// Rare fields live in `cold`, and QoS 1/2 receive windows live in `receiving`.
+struct Peer {
+    io: net::Connection,
+    created_ns: u64,
+    last_packet_ns: u64,
+    ingress: u64,
+    opened_by_seq: u64,
+    session: Option<SessionId>,
+    receiving: Option<Box<crate::receiving::Window>>,
+    cold: Option<Box<PeerCold>>,
+    connect_expiry: SessionExpiry,
+    max_packet: u32,
+    keep_alive: u16,
+    version: Option<Version>,
+    connected: bool,
+    pending: bool,
+    will_managed: bool,
+    has_opened_by: bool,
 }
 /// The packets kept behind a waiting publication: one more lane of them,
 /// and no more bytes than one packet of the largest size.
@@ -282,6 +325,130 @@ fn raw_publish_id(first: u8, body: &[u8]) -> Option<u16> {
 }
 
 impl Peer {
+    #[inline]
+    fn cold_mut(&mut self) -> &mut PeerCold {
+        self.cold.get_or_insert_with(Default::default)
+    }
+
+    #[inline]
+    fn gc_cold(&mut self) {
+        if self.cold.as_ref().is_some_and(|c| c.is_empty()) {
+            self.cold = None;
+        }
+    }
+
+    #[inline]
+    fn max_packet_bytes(&self) -> usize {
+        self.max_packet as usize
+    }
+
+    #[inline]
+    fn created_instant(&self, started: Instant) -> Instant {
+        started + Duration::from_nanos(self.created_ns)
+    }
+
+    #[inline]
+    fn last_packet_instant(&self, started: Instant) -> Instant {
+        started + Duration::from_nanos(self.last_packet_ns)
+    }
+
+    #[inline]
+    fn opened_by(
+        &self,
+        origin: (StoreIncarnation, RunEpoch, LogicalOwnerId),
+    ) -> Option<OperationId> {
+        if !self.has_opened_by {
+            return None;
+        }
+        if let Some(foreign) = self.cold.as_ref().and_then(|c| c.opened_by_foreign) {
+            return Some(foreign);
+        }
+        Some(OperationId::new(
+            origin.0,
+            origin.1,
+            origin.2,
+            OperationSeq::new(self.opened_by_seq),
+        ))
+    }
+
+    #[inline]
+    fn set_opened_by(
+        &mut self,
+        id: OperationId,
+        origin: (StoreIncarnation, RunEpoch, LogicalOwnerId),
+    ) {
+        self.has_opened_by = true;
+        if (id.incarnation(), id.epoch(), id.owner()) == origin {
+            self.opened_by_seq = id.sequence().get();
+            if let Some(c) = self.cold.as_mut() {
+                c.opened_by_foreign = None;
+            }
+        } else {
+            self.cold_mut().opened_by_foreign = Some(id);
+        }
+    }
+
+    #[inline]
+    fn closing(&self) -> Option<(&'static str, Instant)> {
+        self.cold.as_ref().and_then(|c| c.closing)
+    }
+
+    #[inline]
+    fn set_closing(&mut self, value: (&'static str, Instant)) {
+        self.cold_mut().closing = Some(value);
+    }
+
+    #[inline]
+    fn retire_code(&self) -> Option<&'static str> {
+        self.cold.as_ref().and_then(|c| c.retire_code)
+    }
+
+    #[inline]
+    fn blocked_output(&self) -> Option<EffectId> {
+        self.cold.as_ref().and_then(|c| c.blocked_output)
+    }
+
+    #[inline]
+    fn deferred_publish(&self) -> Option<&DeferredPublish> {
+        self.cold.as_ref().and_then(|c| c.deferred_publish.as_ref())
+    }
+
+    #[inline]
+    #[cfg(test)]
+    fn held_packet(&self) -> Option<&(u8, net::FrameBytes, net::FrameObservation)> {
+        self.cold.as_ref().and_then(|c| c.held_packet.as_ref())
+    }
+
+    #[inline]
+    fn receiving_mut(&mut self) -> &mut crate::receiving::Window {
+        self.receiving.get_or_insert_with(Default::default)
+    }
+
+    #[inline]
+    fn receiving_can_complete(&self, id: u16, serial: Option<u64>, terminal: Terminal) -> bool {
+        self.receiving
+            .as_ref()
+            .is_some_and(|w| w.can_complete_frame(id, serial, terminal))
+    }
+
+    #[inline]
+    fn receiving_complete(&mut self, id: u16, serial: Option<u64>, terminal: Terminal) -> bool {
+        self.receiving
+            .as_mut()
+            .is_some_and(|w| w.complete_frame(id, serial, terminal))
+    }
+
+    #[inline]
+    fn receiving_contains(&self, id: u16) -> bool {
+        self.receiving.as_ref().is_some_and(|w| w.contains(id))
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[inline]
+    fn receiving_serial(&self, id: u16) -> Option<u64> {
+        self.receiving.as_ref().and_then(|w| w.serial(id))
+    }
+
     /// Whether this packet goes ahead of the publication that waits for a
     /// slot: only a PUBREL, which completes another exchange and frees its
     /// slot, and commutes with every packet but the PUBLISH of its own
@@ -290,8 +457,11 @@ impl Peer {
         if first >> 4 != 6 || body.len() < 2 {
             return false;
         }
+        let Some(cold) = self.cold.as_deref() else {
+            return true;
+        };
         let id = u16::from_be_bytes([body[0], body[1]]);
-        let waiting = self
+        let waiting = cold
             .deferred_publish
             .as_ref()
             .and_then(|deferred| match &deferred.packet {
@@ -299,7 +469,7 @@ impl Peer {
                 _ => None,
             });
         waiting != Some(id)
-            && self
+            && cold
                 .behind
                 .iter()
                 .all(|(first, body, _)| raw_publish_id(*first, body) != Some(id))
@@ -313,35 +483,30 @@ impl Peer {
         packet: (u8, net::FrameBytes, net::FrameObservation),
     ) -> Result<(), (u8, net::FrameBytes, net::FrameObservation)> {
         let bytes = packet.1.len();
-        if self.behind.len() >= BEHIND_PACKETS || self.behind_bytes + bytes > BEHIND_BYTES {
+        let cold = self.cold_mut();
+        if cold.behind.len() >= BEHIND_PACKETS || cold.behind_bytes + bytes > BEHIND_BYTES {
             return Err(packet);
         }
-        self.behind_bytes += bytes;
-        self.behind.push_back(packet);
+        cold.behind_bytes += bytes;
+        cold.behind.push_back(packet);
         Ok(())
     }
 
+    #[inline]
     fn submitted_output(&mut self, effect: EffectId) -> bool {
-        if self.blocked_output == Some(effect) {
-            self.blocked_output = None;
-            true
-        } else {
-            false
+        if let Some(cold) = self.cold.as_mut()
+            && cold.blocked_output == Some(effect)
+        {
+            cold.blocked_output = None;
+            self.gc_cold();
+            return true;
         }
+        false
     }
 
     #[inline]
     fn needs_poll(&self) -> bool {
-        self.retire_code.is_some()
-            || self.held_packet.is_some()
-            || self.deferred_publish.is_some()
-            || !self.behind.is_empty()
-            || self.requests.is_some()
-            || self.blocked_output.is_some()
-            || self.closing.is_some()
-            || self.pending
-            || !self.connected
-            || self.capacity_wait.is_some()
+        !self.connected || self.pending || self.cold.as_ref().is_some_and(|c| c.needs_poll())
     }
 }
 /// A SUBSCRIBE or UNSUBSCRIBE served as several requests of the core, in
@@ -411,6 +576,151 @@ struct AppliedSessionChange {
     client_id: mqttiumd_contract::packet::SharedBytes,
     change: SessionChange,
 }
+/// Dense slab storage for live `Peer` records indexed by a compact
+/// `FlatMap<ConnectionGeneration, u32>`, so empty hash slots cost 16 B instead
+/// of `size_of::<Peer>()`.
+#[derive(Default)]
+struct PeerTable {
+    entries: Vec<Option<(ConnectionGeneration, Peer)>>,
+    free: Vec<u32>,
+    index: FlatMap<ConnectionGeneration, u32>,
+    len: usize,
+}
+
+impl PeerTable {
+    fn new() -> Self {
+        Self {
+            entries: Vec::new(),
+            free: Vec::new(),
+            index: FlatMap::new(),
+            len: 0,
+        }
+    }
+
+    #[inline]
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    #[cfg(test)]
+    #[inline]
+    fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    #[inline]
+    fn contains_key(&self, key: &ConnectionGeneration) -> bool {
+        self.index.contains_key(key)
+    }
+
+    #[inline]
+    fn get(&self, key: &ConnectionGeneration) -> Option<&Peer> {
+        let &slot = self.index.get(key)?;
+        self.entries[slot as usize].as_ref().map(|(_, p)| p)
+    }
+
+    #[inline]
+    fn get_mut(&mut self, key: &ConnectionGeneration) -> Option<&mut Peer> {
+        let &slot = self.index.get(key)?;
+        self.entries[slot as usize].as_mut().map(|(_, p)| p)
+    }
+
+    fn insert(&mut self, key: ConnectionGeneration, peer: Peer) -> Option<Peer> {
+        if let Some(&slot) = self.index.get(&key) {
+            return self.entries[slot as usize]
+                .replace((key, peer))
+                .map(|(_, old)| old);
+        }
+        let slot = if let Some(free) = self.free.pop() {
+            self.entries[free as usize] = Some((key, peer));
+            free
+        } else {
+            let slot = self.entries.len() as u32;
+            self.entries.push(Some((key, peer)));
+            slot
+        };
+        self.index.insert(key, slot);
+        self.len += 1;
+        None
+    }
+
+    fn remove(&mut self, key: &ConnectionGeneration) -> Option<Peer> {
+        let slot = self.index.remove(key)?;
+        let (_, removed) = self.entries[slot as usize].take()?;
+        self.len -= 1;
+        if self.len == 0 {
+            self.entries.clear();
+            self.free.clear();
+        } else {
+            self.free.push(slot);
+        }
+        Some(removed)
+    }
+
+    #[inline]
+    fn keys(&self) -> impl Iterator<Item = &ConnectionGeneration> + '_ {
+        self.entries
+            .iter()
+            .filter_map(|slot| slot.as_ref().map(|(k, _)| k))
+    }
+
+    #[inline]
+    fn values(&self) -> impl Iterator<Item = &Peer> + '_ {
+        self.entries
+            .iter()
+            .filter_map(|slot| slot.as_ref().map(|(_, p)| p))
+    }
+
+    #[cfg(test)]
+    #[inline]
+    fn iter(&self) -> impl Iterator<Item = (&ConnectionGeneration, &Peer)> + '_ {
+        self.entries
+            .iter()
+            .filter_map(|slot| slot.as_ref().map(|(k, p)| (k, p)))
+    }
+
+    #[allow(dead_code)]
+    #[inline]
+    fn iter_mut(&mut self) -> impl Iterator<Item = (&ConnectionGeneration, &mut Peer)> + '_ {
+        self.entries
+            .iter_mut()
+            .filter_map(|slot| slot.as_mut().map(|(k, p)| (&*k, p)))
+    }
+
+    #[allow(dead_code)]
+    #[inline]
+    fn values_mut(&mut self) -> impl Iterator<Item = &mut Peer> + '_ {
+        self.entries
+            .iter_mut()
+            .filter_map(|slot| slot.as_mut().map(|(_, p)| p))
+    }
+}
+
+impl std::ops::Index<&ConnectionGeneration> for PeerTable {
+    type Output = Peer;
+
+    #[inline]
+    fn index(&self, key: &ConnectionGeneration) -> &Self::Output {
+        self.get(key).expect("peer generation present")
+    }
+}
+
+impl std::ops::IndexMut<&ConnectionGeneration> for PeerTable {
+    #[inline]
+    fn index_mut(&mut self, key: &ConnectionGeneration) -> &mut Self::Output {
+        self.get_mut(key).expect("peer generation present")
+    }
+}
+
+impl IntoIterator for PeerTable {
+    type Item = (ConnectionGeneration, Peer);
+    type IntoIter = std::iter::Flatten<std::vec::IntoIter<Option<(ConnectionGeneration, Peer)>>>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.entries.into_iter().flatten()
+    }
+}
+
 struct Runtime<'a> {
     /// Counts what a pass achieved: a value taken from a lane, an applied
     /// transition, an effect accepted by an adapter. A pass that leaves it
@@ -439,15 +749,18 @@ struct Runtime<'a> {
     last_expiry_inventory: Option<(usize, bool)>,
     owner: Owner,
     _authority: OwnerAuthority,
+    incarnation: StoreIncarnation,
+    epoch: RunEpoch,
     writer: StoreHandle<'a>,
     events: Events,
-    peers: FlatMap<ConnectionGeneration, Peer>,
+    peers: PeerTable,
+    topic_cache: codec::TopicCache,
     ready_peers: Arc<net::ReadyQueue>,
     ready_raw: Vec<u64>,
     pending_peers: FlatSet<ConnectionGeneration>,
     capacity_waiters: usize,
     retiring: Vec<net::Connection>,
-    sessions: BTreeMap<Vec<u8>, Session>,
+    sessions: BTreeMap<SharedBytes, Session>,
     session_ids: BTreeSet<SessionId>,
     session_requests: BTreeMap<u64, PendingSession>,
     will_connects: BTreeMap<ConnectionGeneration, PendingWillConnect>,
@@ -457,6 +770,9 @@ struct Runtime<'a> {
     generation: ConnectionGeneration,
     peer_cursor: usize,
     peer_keys: Vec<ConnectionGeneration>,
+    scratch_incoming: VecDeque<net::Incoming>,
+    scratch_written: Vec<net::Written>,
+    scratch_progress: Vec<net::WireProgress>,
     last_peer_deadline_scan: Instant,
     inputs: VecDeque<Input>,
     control_inputs: VecDeque<Input>,
@@ -546,6 +862,16 @@ fn ordinary_room(inputs: &VecDeque<Input>, reservations: usize, limit: usize) ->
     limit.saturating_sub(occupied + reservations)
 }
 impl Runtime<'_> {
+    #[inline]
+    fn origin(&self) -> (StoreIncarnation, RunEpoch, LogicalOwnerId) {
+        (self.incarnation, self.epoch, LogicalOwnerId::new(0))
+    }
+
+    #[inline]
+    fn elapsed_ns(&self, now: Instant) -> u64 {
+        u64::try_from(now.saturating_duration_since(self.started).as_nanos()).unwrap_or(u64::MAX)
+    }
+
     fn message_now(&mut self) -> Result<MessageTime, Failure> {
         let reading = self
             .clock
@@ -626,6 +952,14 @@ impl Runtime<'_> {
                 // Reusing a completed header could give an old duplicated page
                 // authority over a later scan while the provider is stopped.
                 self.message_expiry_scan = now_instant;
+                return Ok(());
+            }
+            if !cfg!(any(test, feature = "test-hooks"))
+                && now.domain == self.clock_anchor.reading.domain
+                && self.writer.skip_empty_message_expiry_sweep()
+            {
+                self.message_expiry_scan = now_instant;
+                self.message_expiry_observation = Some(now);
                 return Ok(());
             }
             now
@@ -887,36 +1221,27 @@ impl Runtime<'_> {
         }
         .map_err(|_| Failure::plain("socket_spawn"))?;
         let sendbuf = io.send_buffer_bytes();
+        let now_ns = self.elapsed_ns(Instant::now());
         self.pending_peers.insert(self.generation);
         self.peers.insert(
             self.generation,
             Peer {
                 io,
-                created: Instant::now(),
-                last_packet: Instant::now(),
-                connected: false,
-                version: None,
-                session: None,
-                opened_by: None,
-                will_managed: false,
-                will_disconnect: None,
-                connect_expiry: SessionExpiry::OnDisconnect,
-                disconnect_expiry: None,
-                close_observed_at: None,
-                held_packet: None,
-                capacity_wait: None,
-                requests: None,
-                pending: false,
-                keep_alive: 0,
-                max_packet: 268435455,
+                created_ns: now_ns,
+                last_packet_ns: now_ns,
                 ingress: 0,
-                receiving: crate::receiving::Window::default(),
-                closing: None,
-                deferred_publish: None,
-                behind: VecDeque::new(),
-                behind_bytes: 0,
-                blocked_output: None,
-                retire_code: None,
+                opened_by_seq: 0,
+                session: None,
+                receiving: None,
+                cold: None,
+                connect_expiry: SessionExpiry::OnDisconnect,
+                max_packet: 268_435_455,
+                keep_alive: 0,
+                version: None,
+                connected: false,
+                pending: false,
+                will_managed: false,
+                has_opened_by: false,
             },
         );
         self.events.emit("connection_opened", json!({"connection":self.generation.get().to_string(),"details":{"send_buffer_bytes":sendbuf}})).map_err(event_failure)?;
@@ -1071,10 +1396,16 @@ impl Runtime<'_> {
         let Some(p) = self.peers.get_mut(&generation) else {
             return Ok(());
         };
-        let Some(requests) = p.requests.as_mut() else {
+        let Some(cold) = p.cold.as_mut() else {
             return Ok(());
         };
-        if requests.awaiting || p.closing.is_some() {
+        if cold.closing.is_some() {
+            return Ok(());
+        }
+        let Some(requests) = cold.requests.as_mut() else {
+            return Ok(());
+        };
+        if requests.awaiting {
             return Ok(());
         }
         if !requests.parts.is_empty() {
@@ -1113,12 +1444,11 @@ impl Runtime<'_> {
         else {
             return self.close(generation, "failure_without_wire_ack");
         };
-        if bytes.len() > p.max_packet {
+        if bytes.len() > p.max_packet as usize {
             return self.close(generation, "outgoing_packet_limit");
         }
         if p.io
-            .outgoing
-            .try_send(net::Write {
+            .try_send_outgoing(net::Write {
                 expiry: None,
                 correlation: None,
                 bytes: net::FrameBytes::from(bytes),
@@ -1127,7 +1457,8 @@ impl Runtime<'_> {
             })
             .is_ok()
         {
-            p.requests = None;
+            cold.requests = None;
+            p.gc_cold();
             self.progress = self.progress.wrapping_add(1);
         }
         Ok(())
@@ -1220,17 +1551,20 @@ impl Runtime<'_> {
         let Some(peer) = self.peers.get_mut(&generation) else {
             return Ok(());
         };
-        if peer.retire_code.is_some() {
+        if peer.retire_code().is_some() {
             return Ok(());
         }
-        peer.retire_code = Some(code);
-        peer.closing.get_or_insert((code, Instant::now()));
+        let cold = peer.cold_mut();
+        cold.retire_code = Some(code);
+        cold.closing.get_or_insert((code, Instant::now()));
+        let needs_observed = cold.close_observed_at.is_none();
         self.pending_peers.insert(generation);
-        if self.peers[&generation].close_observed_at.is_none() {
+        if needs_observed {
             let observed = self.session_now()?;
             self.peers
                 .get_mut(&generation)
                 .expect("live retiring peer")
+                .cold_mut()
                 .close_observed_at = Some(observed);
         }
         self.peers[&generation].io.close();
@@ -1276,9 +1610,21 @@ impl Runtime<'_> {
         generation: ConnectionGeneration,
         code: &'static str,
     ) -> Result<(), Failure> {
+        let origin = self.origin();
         if let Some(peer) = self.peers.remove(&generation) {
             self.pending_peers.remove(&generation);
-            if peer.capacity_wait.is_some() {
+            let (capacity_wait, close_observed_at, disconnect_expiry, will_disconnect) =
+                match peer.cold.as_deref() {
+                    Some(c) => (
+                        c.capacity_wait,
+                        c.close_observed_at,
+                        c.disconnect_expiry,
+                        c.will_disconnect,
+                    ),
+                    None => (None, None, None, None),
+                };
+            let opened_by = peer.opened_by(origin);
+            if capacity_wait.is_some() {
                 self.capacity_waiters = self.capacity_waiters.saturating_sub(1);
             }
             self.bindings_dirty = true;
@@ -1301,7 +1647,7 @@ impl Runtime<'_> {
                 let observation = SessionCloseObservation {
                     generation,
                     session,
-                    opened_by: peer.opened_by,
+                    opened_by,
                 };
                 self.events
                     .emit("session_close_copied", observation.fields())
@@ -1309,17 +1655,15 @@ impl Runtime<'_> {
                 self.copied_session_close = Some(observation);
             }
             // Freeze the observation before any delayed Open/COMMIT result.
-            let observed_at = match peer.close_observed_at {
+            let observed_at = match close_observed_at {
                 Some(value) => value,
                 None => self.session_now()?,
             };
             let intent = CloseIntent {
-                expiry: peer.disconnect_expiry.unwrap_or(peer.connect_expiry),
+                expiry: disconnect_expiry.unwrap_or(peer.connect_expiry),
                 observed_at,
-                explicit: peer.disconnect_expiry.is_some(),
-                will: peer
-                    .will_managed
-                    .then_some(peer.will_disconnect.unwrap_or(true)),
+                explicit: disconnect_expiry.is_some(),
+                will: peer.will_managed.then_some(will_disconnect.unwrap_or(true)),
             };
             for pending in self
                 .session_requests
@@ -1331,8 +1675,7 @@ impl Runtime<'_> {
                 }
             }
             if let Some(session) = peer.session
-                && let Some(input) =
-                    Self::closure_input(session, generation, peer.opened_by, intent)
+                && let Some(input) = Self::closure_input(session, generation, opened_by, intent)
             {
                 self.queue(input)?;
             }
@@ -1508,7 +1851,7 @@ impl Runtime<'_> {
                     return Err(Failure::plain("session_cache_budget"));
                 }
                 if let Some(replaced) = self.sessions.insert(
-                    client_id.as_slice().to_vec(),
+                    client_id.clone(),
                     Session {
                         id: session,
                         revision,
@@ -1522,6 +1865,7 @@ impl Runtime<'_> {
                     self.session_ids.remove(&replaced.id);
                 }
                 self.session_ids.insert(session);
+                let origin = self.origin();
                 if let Some(generation) = connection {
                     let close_intent = self
                         .session_requests
@@ -1533,17 +1877,18 @@ impl Runtime<'_> {
                     if let Some(peer) = self.peers.get_mut(&generation) {
                         if peer.session.is_some_and(|original| original != session)
                             || peer
-                                .opened_by
+                                .opened_by(origin)
                                 .is_some_and(|original| original != changed_by)
                         {
                             return Err(Failure::plain("transport_session_rebound"));
                         }
                         peer.session = Some(session);
-                        peer.opened_by = Some(changed_by);
+                        peer.set_opened_by(changed_by, origin);
                         if let Some(intent) = close_intent {
-                            peer.will_disconnect = intent.will;
-                            peer.disconnect_expiry = Some(intent.expiry);
-                            peer.close_observed_at = Some(intent.observed_at);
+                            let cold = peer.cold_mut();
+                            cold.will_disconnect = intent.will;
+                            cold.disconnect_expiry = Some(intent.expiry);
+                            cold.close_observed_at = Some(intent.observed_at);
                         }
                         peer.connected = true;
                         // The ordered CONNACK, not cache installation, releases
@@ -1590,7 +1935,7 @@ impl Runtime<'_> {
                     .find(|s| s.id == session)
                     .ok_or_else(|| Failure::plain("detached_session_missing"))?;
                 value.expiry = expiry;
-                value.detached = Some(detached);
+                value.detached = Some(Box::new(detached));
                 if detached.deadline.is_some() {
                     self.expiry_timers.insert(
                         session,
@@ -1904,9 +2249,7 @@ impl Runtime<'_> {
                         } else {
                             target
                         };
-                        if target.is_none()
-                            || self.owner.puback_target(connection, packet_id) != target
-                        {
+                        if target.is_none() {
                             self.events
                                 .emit(
                                     "puback_ignored",
@@ -2022,72 +2365,305 @@ impl Runtime<'_> {
                     },
                     other => other,
                 };
-                let finish = match &input {
+                let mut finish: Option<(OperationId, DeliveryId)> = None;
+                let mut wakes_business = false;
+                let mut collected: Option<(ReceiptCollection, ReceiptClosure, u16, u64, bool)> =
+                    None;
+                let mut ready_work: Option<(SessionId, bool)> = None;
+                let mut will_progress = false;
+                let mut opening: Option<ConnectionGeneration> = None;
+                let mut lifecycle_result: Option<OperationId> = None;
+                let mut business: Option<ConnectionGeneration> = None;
+                let mut returns_credit = false;
+                let mut is_recovery = false;
+                let mut may_change_bindings = false;
+                let mut outgoing_binding_prune = OutgoingPrune::None;
+                let mut is_receipt_collected = false;
+                let mut may_change_timers = false;
+                let mut fast_batch_step = false;
+                let mut zero_effect_step = false;
+                let has_outgoing_bindings = !self.outgoing_bindings.is_empty();
+                let has_timers = !self.timers.is_empty();
+
+                match &input {
+                    Input::Packet {
+                        connection, packet, ..
+                    } => match packet {
+                        InboundPacket::Publish { qos, .. } => {
+                            business = Some(*connection);
+                            fast_batch_step = !matches!(qos, Qos::AtMostOnce);
+                        }
+                        InboundPacket::Pubrel { .. } => {
+                            fast_batch_step = true;
+                            may_change_timers = has_timers;
+                        }
+                        InboundPacket::Subscribe { .. } | InboundPacket::Unsubscribe { .. } => {
+                            business = Some(*connection);
+                        }
+                        InboundPacket::Pingreq => {}
+                        InboundPacket::ConnectResume { client_id } => {
+                            may_change_bindings = true;
+                            may_change_timers = has_timers;
+                            if has_outgoing_bindings {
+                                outgoing_binding_prune = OutgoingPrune::Full;
+                            }
+                            ready_work = self
+                                .sessions
+                                .get(client_id.as_slice())
+                                .map(|s| (s.id, true));
+                        }
+                        InboundPacket::Puback { .. } => {
+                            if has_outgoing_bindings {
+                                outgoing_binding_prune = OutgoingPrune::Full;
+                            }
+                            ready_work = self
+                                .owner
+                                .session_for_connection(*connection)
+                                .map(|id| (id, false));
+                        }
+                        InboundPacket::Qos2Ack { .. } => {
+                            if has_outgoing_bindings {
+                                outgoing_binding_prune = OutgoingPrune::Full;
+                            }
+                        }
+                    },
                     Input::StoreResult {
-                        operation,
-                        reply:
-                            StoreReply::Outcome(StoreOutcome::Committed(
-                                CommitFacts::DeliveryFinished { delivery, .. },
-                            )),
+                        operation, reply, ..
+                    } => {
+                        wakes_business = true;
+                        may_change_timers = has_timers;
+                        match reply {
+                            StoreReply::Outcome(StoreOutcome::Committed(facts)) => match facts {
+                                CommitFacts::PublicationAdmitted { .. } => {
+                                    fast_batch_step = true;
+                                }
+                                CommitFacts::DeliveryFinished {
+                                    delivery,
+                                    target,
+                                    packet_id,
+                                    ..
+                                } => {
+                                    finish = Some((*operation, *delivery));
+                                    fast_batch_step = true;
+                                    zero_effect_step = true;
+                                    ready_work = Some((*target, false));
+                                    if has_outgoing_bindings {
+                                        outgoing_binding_prune =
+                                            match self.owner.connection_of(*target) {
+                                                Some(generation) => OutgoingPrune::Key((
+                                                    ConnectionKey {
+                                                        session: *target,
+                                                        generation,
+                                                    },
+                                                    *packet_id,
+                                                )),
+                                                None => OutgoingPrune::Full,
+                                            };
+                                    }
+                                }
+                                CommitFacts::DeliveryClaimed { target, .. }
+                                | CommitFacts::DeliveryConsumed { target, .. } => {
+                                    fast_batch_step =
+                                        matches!(facts, CommitFacts::DeliveryClaimed { .. });
+                                    ready_work = Some((*target, false));
+                                }
+                                CommitFacts::DeliveryStarted {
+                                    target, packet_id, ..
+                                }
+                                | CommitFacts::DeliveryPubrelReady {
+                                    target, packet_id, ..
+                                }
+                                | CommitFacts::DeliveryExpired {
+                                    target, packet_id, ..
+                                } => {
+                                    fast_batch_step = matches!(
+                                        facts,
+                                        CommitFacts::DeliveryStarted { .. }
+                                            | CommitFacts::DeliveryPubrelReady { .. }
+                                    );
+                                    ready_work = Some((*target, false));
+                                    if has_outgoing_bindings {
+                                        outgoing_binding_prune =
+                                            match self.owner.connection_of(*target) {
+                                                Some(generation) => OutgoingPrune::Key((
+                                                    ConnectionKey {
+                                                        session: *target,
+                                                        generation,
+                                                    },
+                                                    *packet_id,
+                                                )),
+                                                None => OutgoingPrune::Full,
+                                            };
+                                    }
+                                }
+                                CommitFacts::InboundReleased { .. } => {
+                                    fast_batch_step = true;
+                                }
+                                CommitFacts::RetainedQos0Stored { .. } => {}
+                                CommitFacts::SubscriptionsChanged { session, .. } => {
+                                    ready_work = Some((*session, false));
+                                }
+                                CommitFacts::WillPublished { .. } => {
+                                    will_progress = true;
+                                }
+                                CommitFacts::SessionLifecycle(_) => {
+                                    may_change_bindings = true;
+                                    if has_outgoing_bindings {
+                                        outgoing_binding_prune = OutgoingPrune::Full;
+                                    }
+                                    will_progress = matches!(
+                                        self.owner.lifecycle_action(),
+                                        Some(SessionAction::EndWill { .. })
+                                    );
+                                }
+                            },
+                            StoreReply::Outcome(StoreOutcome::RejectedCertain(_)) => {
+                                if has_outgoing_bindings {
+                                    outgoing_binding_prune = OutgoingPrune::Full;
+                                }
+                                if self.owner.lifecycle_operation_is_live(*operation) {
+                                    lifecycle_result = Some(*operation);
+                                }
+                            }
+                            _ => {
+                                if has_outgoing_bindings {
+                                    outgoing_binding_prune = OutgoingPrune::Full;
+                                }
+                            }
+                        }
+                    }
+                    Input::ObservedPuback {
+                        connection,
+                        packet_id,
                         ..
-                    } => Some((*operation, *delivery)),
-                    _ => None,
-                };
-                let wakes_business = matches!(
-                    input,
-                    Input::StoreResult { .. } | Input::ReceiptsCollected { .. }
-                );
-                let collected = match &input {
+                    }
+                    | Input::ObservedQos2Ack {
+                        connection,
+                        packet_id,
+                        ..
+                    } => {
+                        fast_batch_step = true;
+                        ready_work = Some((connection.session, false));
+                        if has_outgoing_bindings {
+                            outgoing_binding_prune = OutgoingPrune::Key((*connection, *packet_id));
+                        }
+                    }
+                    Input::FrameResult {
+                        connection,
+                        progress,
+                        ..
+                    } => {
+                        ready_work = Some((connection.session, false));
+                        returns_credit = !matches!(progress, FrameProgress::Started);
+                        if matches!(
+                            progress,
+                            FrameProgress::Written { .. } | FrameProgress::Started
+                        ) {
+                            fast_batch_step = true;
+                            zero_effect_step = !self.owner.has_held_answers();
+                        } else if has_outgoing_bindings {
+                            outgoing_binding_prune = OutgoingPrune::Full;
+                        }
+                    }
+                    Input::WorkAvailable { session } | Input::WorkPage { session, .. } => {
+                        fast_batch_step = true;
+                        ready_work = Some((*session, false));
+                    }
+                    Input::Continue { .. } | Input::MessageClock { .. } | Input::DiscoverWills => {}
+                    Input::Qos0EmitRefused { connection, .. } => {
+                        ready_work = Some((connection.session, false));
+                    }
+                    Input::WillPage { next, .. } => {
+                        will_progress = next.is_some();
+                    }
+                    Input::MaintainReceipts => {
+                        may_change_timers = has_timers;
+                    }
                     Input::ReceiptsCollected {
                         effect,
                         collection,
-                        reply:
-                            ReceiptCollectionReply::Applied {
-                                closure,
-                                removed,
-                                retained,
-                                more,
-                            },
-                    } if self.owner.collection_reply_is_live(*effect, *collection) => {
-                        Some((*collection, *closure, *removed, *retained, *more))
-                    }
-                    _ => None,
-                };
-                let ready_work = self.work_progress_hint(&input);
-                let will_progress = matches!(
-                    &input,
-                    Input::StoreResult {
-                        reply: StoreReply::Outcome(StoreOutcome::Committed(
-                            CommitFacts::WillPublished { .. }
-                        )),
-                        ..
-                    }
-                ) || matches!(&input, Input::WillPage { next: Some(_), .. })
-                    || (matches!(
-                        &input,
-                        Input::StoreResult {
-                            reply: StoreReply::Outcome(StoreOutcome::Committed(
-                                CommitFacts::SessionLifecycle(_)
-                            )),
-                            ..
+                        reply,
+                    } => {
+                        wakes_business = true;
+                        is_receipt_collected = true;
+                        may_change_timers = has_timers;
+                        if let ReceiptCollectionReply::Applied {
+                            closure,
+                            removed,
+                            retained,
+                            more,
+                        } = reply
+                            && self.owner.collection_reply_is_live(*effect, *collection)
+                        {
+                            collected = Some((*collection, *closure, *removed, *retained, *more));
                         }
-                    ) && matches!(
-                        self.owner.lifecycle_action(),
-                        Some(SessionAction::EndWill { .. })
-                    ));
-
-                let opening = match &input {
+                    }
+                    Input::ConnectionClosed { .. }
+                    | Input::EndSession { .. }
+                    | Input::EndSessionWill { .. }
+                    | Input::DetachSession { .. } => {
+                        returns_credit = true;
+                        may_change_bindings = true;
+                        may_change_timers = has_timers;
+                        if has_outgoing_bindings {
+                            outgoing_binding_prune = OutgoingPrune::Full;
+                        }
+                    }
                     Input::OpenSessionWillAt { connection, .. }
                     | Input::OpenSession { connection, .. }
-                    | Input::OpenSessionAt { connection, .. } => Some(*connection),
-                    _ => None,
-                };
-                let lifecycle_result = match &input {
-                    Input::StoreResult {
-                        operation,
-                        reply: StoreReply::Outcome(StoreOutcome::RejectedCertain(_)),
+                    | Input::OpenSessionAt { connection, .. } => {
+                        opening = Some(*connection);
+                        may_change_bindings = true;
+                        may_change_timers = has_timers;
+                        if has_outgoing_bindings {
+                            outgoing_binding_prune = OutgoingPrune::Full;
+                        }
+                    }
+                    Input::SessionEstablished {
+                        session,
+                        connection,
                         ..
-                    } if self.owner.lifecycle_operation_is_live(*operation) => Some(*operation),
+                    } => {
+                        may_change_bindings = true;
+                        may_change_timers = has_timers;
+                        if has_outgoing_bindings {
+                            outgoing_binding_prune = OutgoingPrune::Full;
+                        }
+                        if connection.is_some() {
+                            ready_work = Some((*session, true));
+                        }
+                    }
+                    Input::ExpireSession { .. } => {
+                        may_change_bindings = true;
+                        may_change_timers = has_timers;
+                        if has_outgoing_bindings {
+                            outgoing_binding_prune = OutgoingPrune::Full;
+                        }
+                    }
+                    Input::Recovery { .. } => {
+                        is_recovery = true;
+                        may_change_bindings = true;
+                        may_change_timers = has_timers;
+                        if has_outgoing_bindings {
+                            outgoing_binding_prune = OutgoingPrune::Full;
+                        }
+                    }
+                    Input::ConnectionSettings { .. }
+                    | Input::Deadline { .. }
+                    | Input::MessagesExpired { .. } => {
+                        may_change_timers = has_timers;
+                        if has_outgoing_bindings {
+                            outgoing_binding_prune = OutgoingPrune::Full;
+                        }
+                    }
+                }
+                let observed_puback_meta = match &input {
+                    Input::ObservedPuback {
+                        connection,
+                        packet_id,
+                        reason,
+                        target: Some(target),
+                    } => Some((*connection, *packet_id, *reason, *target)),
                     _ => None,
                 };
                 let control_refusal =
@@ -2096,170 +2672,86 @@ impl Runtime<'_> {
                         Some(SessionAction::Expire { .. }) => Some("session_expire_rejected"),
                         _ => None,
                     });
-                let previous_lifecycle = self.owner.lifecycle_dispatch().map(|(op, _)| op);
+                let previous_lifecycle =
+                    opening.and_then(|_| self.owner.lifecycle_dispatch().map(|(op, _)| op));
                 let mut applied = false;
-                let business = business_connection(&input);
-                // What can end an inbound exchange without an answer of the
-                // store: the terminal receipt of a frame, a closed connection.
-                let closes = Self::closing_input(&input);
-                let returns_credit = closes
-                    || matches!(&input, Input::FrameResult { progress, .. }
-                    if !matches!(progress, FrameProgress::Started));
-                let is_recovery = matches!(&input, Input::Recovery { .. });
-                let may_change_bindings = is_recovery
-                    || closes
-                    || matches!(
-                        &input,
-                        Input::SessionEstablished { .. }
-                            | Input::OpenSession { .. }
-                            | Input::OpenSessionAt { .. }
-                            | Input::OpenSessionWillAt { .. }
-                            | Input::ExpireSession { .. }
-                            | Input::Packet {
-                                packet: InboundPacket::ConnectResume { .. },
-                                ..
-                            }
-                            | Input::StoreResult {
-                                reply: StoreReply::Outcome(StoreOutcome::Committed(
-                                    CommitFacts::SessionLifecycle(_)
-                                )),
-                                ..
-                            }
-                    );
-                let outgoing_binding_prune = if self.outgoing_bindings.is_empty() {
-                    OutgoingPrune::None
-                } else {
-                    match &input {
-                        Input::ObservedPuback {
-                            connection,
-                            packet_id,
-                            ..
-                        }
-                        | Input::ObservedQos2Ack {
-                            connection,
-                            packet_id,
-                            ..
-                        } => OutgoingPrune::Key((*connection, *packet_id)),
-                        Input::StoreResult {
-                            reply:
-                                StoreReply::Outcome(StoreOutcome::Committed(
-                                    CommitFacts::DeliveryFinished {
-                                        target, packet_id, ..
-                                    }
-                                    | CommitFacts::DeliveryStarted {
-                                        target, packet_id, ..
-                                    }
-                                    | CommitFacts::DeliveryPubrelReady {
-                                        target, packet_id, ..
-                                    }
-                                    | CommitFacts::DeliveryExpired {
-                                        target, packet_id, ..
-                                    },
-                                )),
-                            ..
-                        } => match self.owner.connection_of(*target) {
-                            Some(generation) => OutgoingPrune::Key((
-                                ConnectionKey {
-                                    session: *target,
-                                    generation,
-                                },
-                                *packet_id,
-                            )),
-                            None => OutgoingPrune::Full,
-                        },
-                        Input::StoreResult {
-                            reply:
-                                StoreReply::Outcome(StoreOutcome::Committed(
-                                    CommitFacts::PublicationAdmitted { .. }
-                                    | CommitFacts::RetainedQos0Stored { .. }
-                                    | CommitFacts::InboundReleased { .. }
-                                    | CommitFacts::SubscriptionsChanged { .. }
-                                    | CommitFacts::DeliveryClaimed { .. }
-                                    | CommitFacts::DeliveryConsumed { .. }
-                                    | CommitFacts::WillPublished { .. },
-                                )),
-                            ..
-                        }
-                        | Input::FrameResult {
-                            progress: FrameProgress::Written { .. } | FrameProgress::Started,
-                            ..
-                        }
-                        | Input::Packet {
-                            packet:
-                                InboundPacket::Publish { .. }
-                                | InboundPacket::Subscribe { .. }
-                                | InboundPacket::Unsubscribe { .. }
-                                | InboundPacket::Pingreq,
-                            ..
-                        }
-                        | Input::Continue { .. }
-                        | Input::WorkAvailable { .. }
-                        | Input::WorkPage { .. }
-                        | Input::MessageClock { .. }
-                        | Input::MaintainReceipts
-                        | Input::ReceiptsCollected { .. }
-                        | Input::DiscoverWills
-                        | Input::WillPage { .. }
-                        | Input::Qos0EmitRefused { .. } => OutgoingPrune::None,
-                        _ => OutgoingPrune::Full,
-                    }
-                };
-                let is_receipt_collected = matches!(&input, Input::ReceiptsCollected { .. });
-                let may_change_timers = !self.timers.is_empty()
-                    && !matches!(
-                        &input,
-                        Input::Packet {
-                            packet: InboundPacket::Publish { .. }
-                                | InboundPacket::Subscribe { .. }
-                                | InboundPacket::Unsubscribe { .. }
-                                | InboundPacket::Pingreq
-                                | InboundPacket::Puback { .. }
-                                | InboundPacket::Qos2Ack { .. },
-                            ..
-                        } | Input::ObservedPuback { .. }
-                            | Input::ObservedQos2Ack { .. }
-                            | Input::FrameResult { .. }
-                            | Input::Continue { .. }
-                            | Input::WorkAvailable { .. }
-                            | Input::WorkPage { .. }
-                            | Input::MessageClock { .. }
-                            | Input::Qos0EmitRefused { .. }
-                    );
-                let fast_batch_step = matches!(
-                    &input,
-                    Input::StoreResult {
-                        reply: StoreReply::Outcome(StoreOutcome::Committed(
-                            CommitFacts::PublicationAdmitted { .. }
-                                | CommitFacts::DeliveryClaimed { .. }
-                                | CommitFacts::DeliveryFinished { .. }
-                                | CommitFacts::DeliveryStarted { .. }
-                                | CommitFacts::DeliveryPubrelReady { .. }
-                                | CommitFacts::InboundReleased { .. },
-                        )),
-                        ..
-                    } | Input::WorkAvailable { .. }
-                        | Input::WorkPage { .. }
-                        | Input::ObservedPuback { .. }
-                        | Input::ObservedQos2Ack { .. }
-                        | Input::FrameResult {
-                            progress: FrameProgress::Written { .. } | FrameProgress::Started,
-                            ..
-                        }
-                        | Input::Packet {
-                            packet: InboundPacket::Publish {
-                                qos: mqttiumd_contract::packet::Qos::AtLeastOnce
-                                    | mqttiumd_contract::packet::Qos::ExactlyOnce,
-                                ..
-                            } | InboundPacket::Pubrel { .. },
-                            ..
-                        }
-                );
                 let work_limit = if is_recovery {
                     WorkUnits::new(u64::MAX)
                 } else {
                     WorkUnits::new(65536)
                 };
-                match self.owner.step(input, TurnGrant { work_limit }) {
+                let inputs_before_dispatch = self.inputs.len();
+                let mut dispatched_inline = false;
+                let mut inline_accepted = 0usize;
+                let mut inline_close: Vec<(ConnectionGeneration, &'static str)> = Vec::new();
+                let mut inline_mark_pending: Vec<ConnectionGeneration> = Vec::new();
+                let mut inline_work_targets: Vec<SessionId> = Vec::new();
+                let mut inline_changed: Option<AppliedSessionChange> = None;
+                let mut inline_error: Option<Failure> = None;
+                let step_outcome = if !cfg!(feature = "test-hooks")
+                    && !zero_effect_step
+                    && (!fast_batch_step || self.writer.is_direct())
+                    && self.owner.outbox_is_empty()
+                    && !self.bindings_dirty
+                    && !self.timers_dirty
+                    && opening.is_none()
+                    && lifecycle_result.is_none()
+                    && !will_progress
+                    && !may_change_bindings
+                    && self.owner.lifecycle_dispatch().is_none()
+                    && self.owner.will_dispatch().is_none()
+                {
+                    dispatched_inline = true;
+                    let mut sink = Sink {
+                        writer: &mut self.writer,
+                        limits: self.limits,
+                        peers: &mut self.peers,
+                        events: &self.events,
+                        inflight: &mut self.inflight,
+                        lifecycle_inflight: &mut self.lifecycle_inflight,
+                        lifecycle_operation: None,
+                        will_operation: None,
+                        will_reads: &mut self.will_reads,
+                        work_reads: &mut self.work_reads,
+                        bindings: &self.cached_bindings,
+                        #[cfg(feature = "test-hooks")]
+                        work_cache: &self.work_cache,
+                        #[cfg(feature = "test-hooks")]
+                        hooks: &self.hooks,
+                        #[cfg(feature = "test-hooks")]
+                        emission_barriers: &mut self.emission_barriers,
+                        #[cfg(feature = "test-hooks")]
+                        releasing_qos0: false,
+                        timers: &mut self.timers,
+                        inputs: &mut self.inputs,
+                        queued_work_sessions: &mut self.queued_work_sessions,
+                        terminal_inputs: &mut self.terminal_inputs,
+                        terminal_effects: &mut self.terminal_effects,
+                        ordinary_reserved: self.deferred_inputs.len() + self.will_connects.len(),
+                        queued_writer_replies: None,
+                        frames: &mut self.frames,
+                        outgoing_bindings: &mut self.outgoing_bindings,
+                        close: Vec::new(),
+                        mark_pending_peers: Vec::new(),
+                        pending_work_targets: Vec::new(),
+                        direct_skip_next_deadline: false,
+                        session_change: None,
+                        error: None,
+                    };
+                    let (outcome, accepted) =
+                        self.owner
+                            .step_and_dispatch(input, TurnGrant { work_limit }, &mut sink);
+                    inline_accepted = accepted;
+                    inline_close = std::mem::take(&mut sink.close);
+                    inline_mark_pending = std::mem::take(&mut sink.mark_pending_peers);
+                    inline_work_targets = std::mem::take(&mut sink.pending_work_targets);
+                    inline_changed = sink.session_change.take();
+                    inline_error = sink.error.take();
+                    outcome
+                } else {
+                    self.owner.step(input, TurnGrant { work_limit })
+                };
+                match step_outcome {
                     StepOutcome::Applied { .. } => {
                         applied = true;
                         self.progress = self.progress.wrapping_add(1);
@@ -2267,9 +2759,11 @@ impl Runtime<'_> {
                             self.receipt_pressure_blocked = false;
                         }
                         if let Some(peer) = business.and_then(|key| self.peers.get_mut(&key))
-                            && peer.capacity_wait.take().is_some()
+                            && let Some(cold) = peer.cold.as_mut()
+                            && cold.capacity_wait.take().is_some()
                         {
                             self.capacity_waiters = self.capacity_waiters.saturating_sub(1);
+                            peer.gc_cold();
                         }
                         if let Some(connection) = opening
                             && let Some((operation, _)) = self.owner.lifecycle_dispatch()
@@ -2379,8 +2873,9 @@ impl Runtime<'_> {
                                 if let Some(key) = business
                                     && let Some(peer) = self.peers.get_mut(&key)
                                 {
-                                    if peer.capacity_wait.is_none() {
-                                        peer.capacity_wait = Some(Instant::now());
+                                    let cold = peer.cold_mut();
+                                    if cold.capacity_wait.is_none() {
+                                        cold.capacity_wait = Some(Instant::now());
                                         self.capacity_waiters += 1;
                                     }
                                     self.pending_peers.insert(key);
@@ -2428,6 +2923,23 @@ impl Runtime<'_> {
                     }
                 }
                 if applied {
+                    if let Some((connection, packet_id, reason, target)) = observed_puback_meta
+                        && self.owner.last_observed_puback_ignored()
+                    {
+                        self.events
+                            .emit(
+                                "puback_ignored",
+                                puback_fields(
+                                    connection,
+                                    packet_id,
+                                    reason,
+                                    Some(target),
+                                    None,
+                                    "no_current_matching_occurrence",
+                                ),
+                            )
+                            .map_err(event_failure)?;
+                    }
                     self.session_cardinality_dirty = true;
                     if may_change_bindings {
                         self.bindings_dirty = true;
@@ -2447,19 +2959,62 @@ impl Runtime<'_> {
                 if applied && (returns_credit || wakes_business) {
                     dispatch_blocked = false;
                 }
-                let inputs_before_dispatch = self.inputs.len();
-                let must_dispatch = !applied
-                    || !fast_batch_step
-                    || cfg!(feature = "test-hooks")
-                    || self.owner.outbox().is_some_and(|box_| {
-                        box_.free_slots() < 16
-                            || (!dispatch_blocked
-                                && box_.len().saturating_sub(outbox_len_at_dispatch) >= 32)
-                    });
-                if must_dispatch {
-                    let accepted = self.dispatch_returning_accepted()?;
+                if dispatched_inline {
+                    for generation in inline_mark_pending {
+                        self.pending_peers.insert(generation);
+                    }
+                    for target in inline_work_targets {
+                        self.notify_work(target)?;
+                    }
+                    if inline_accepted != 0 {
+                        self.progress = self.progress.wrapping_add(1);
+                        if std::mem::take(&mut self.effects_awaited) {
+                            self.deferred_retries = self.deferred_inputs.len();
+                        }
+                    }
+                    if let Some(error) = inline_error {
+                        return Err(error);
+                    }
+                    let had_close_or_change = inline_changed.is_some() || !inline_close.is_empty();
+                    for (generation, code) in inline_close {
+                        if code == "outgoing_queue_full"
+                            && self.peers.get(&generation).is_some_and(|peer| {
+                                peer.io.is_tls()
+                                    && peer.io.terminal_reason().is_some()
+                                    && peer.closing().is_none()
+                            })
+                        {
+                            continue;
+                        }
+                        self.close(generation, code)?;
+                    }
+                    if let Some(changed) = inline_changed {
+                        self.session_changed(changed)?;
+                    }
+                    if had_close_or_change && !self.timers.is_empty() {
+                        self.timers
+                            .retain(|token, _| self.owner.deadline_is_live(*token));
+                    }
+                    if inline_accepted != 0 || had_close_or_change {
+                        self.session_cardinality_dirty = true;
+                        self.emit_session_cardinality()?;
+                    }
                     outbox_len_at_dispatch = self.owner.outbox().map_or(0, |b| b.len());
-                    dispatch_blocked = accepted == 0 && outbox_len_at_dispatch > 0;
+                    dispatch_blocked = inline_accepted == 0 && outbox_len_at_dispatch > 0;
+                } else {
+                    let must_dispatch = !applied
+                        || !fast_batch_step
+                        || cfg!(feature = "test-hooks")
+                        || self.owner.outbox().is_some_and(|box_| {
+                            box_.free_slots() < 16
+                                || (!dispatch_blocked
+                                    && box_.len().saturating_sub(outbox_len_at_dispatch) >= 32)
+                        });
+                    if must_dispatch {
+                        let accepted = self.dispatch_returning_accepted()?;
+                        outbox_len_at_dispatch = self.owner.outbox().map_or(0, |b| b.len());
+                        dispatch_blocked = accepted == 0 && outbox_len_at_dispatch > 0;
+                    }
                 }
                 if applied
                     && let Some(operation) = lifecycle_result
@@ -2484,8 +3039,12 @@ impl Runtime<'_> {
                 {
                     self.queue(Input::DiscoverWills)?;
                 }
-                if applied && let Some((session, initial)) = ready_work {
-                    self.rearm_ready_work(session, initial);
+                if applied && self.owner.last_step_may_unblock_work() {
+                    if let Some((session, initial)) = ready_work {
+                        self.rearm_ready_work(session, initial);
+                    } else if let Some(target) = self.owner.last_inline_ready_target() {
+                        self.rearm_ready_work(target, false);
+                    }
                 }
                 if applied && self.inputs.len() > inputs_before_dispatch {
                     step_budget = step_budget
@@ -2520,6 +3079,18 @@ impl Runtime<'_> {
             outbox_len_at_dispatch = self.owner.outbox().map_or(0, |b| b.len());
             dispatch_blocked = false;
         }
+        if self.inputs.is_empty() {
+            self.inputs.clear();
+        }
+        if self.terminal_inputs.is_empty() {
+            self.terminal_inputs.clear();
+        }
+        if self.closing_inputs.is_empty() {
+            self.closing_inputs.clear();
+        }
+        if self.deferred_inputs.is_empty() {
+            self.deferred_inputs.clear();
+        }
         self.schedule_maintenance();
         let deferred = self.owner.will_status().deferred;
         if deferred != self.last_will_deferred {
@@ -2537,22 +3108,19 @@ impl Runtime<'_> {
         self.emit_session_cardinality()?;
         Ok(())
     }
+    #[inline]
     fn prune_outgoing_binding_key(&mut self, key: (ConnectionKey, OutboundPacketId)) {
-        if let Some(&target) = self.outgoing_bindings.get(&key) {
-            let live = self.owner.puback_target(key.0, key.1) == Some(target)
-                || self.owner.qos2_ack_target(key.0, key.1, Qos2Ack::Pubrec) == Some(target);
-            if !live {
-                self.outgoing_bindings.remove(&key);
-            }
+        if let Some(&target) = self.outgoing_bindings.get(&key)
+            && !self.owner.outgoing_binding_is_live(key.0, key.1, target)
+        {
+            self.outgoing_bindings.remove(&key);
         }
     }
     fn prune_outgoing_bindings(&mut self) {
         let owner = &self.owner;
         self.outgoing_bindings
             .retain(|(connection, packet_id), target| {
-                owner.puback_target(*connection, *packet_id) == Some(*target)
-                    || owner.qos2_ack_target(*connection, *packet_id, Qos2Ack::Pubrec)
-                        == Some(*target)
+                owner.outgoing_binding_is_live(*connection, *packet_id, *target)
             });
     }
     fn schedule_maintenance(&mut self) {
@@ -2620,15 +3188,14 @@ impl Runtime<'_> {
         Ok(())
     }
     /// The connection of every cached session the owner has attached. One
-    /// pass over each side, where a lookup per session was quadratic.
-    fn bindings(&self) -> FlatMap<SessionId, ConnectionGeneration> {
-        let mut out = FlatMap::new();
+    /// pass over each side, reusing the existing map buffer in place.
+    fn refresh_bindings(&mut self) {
+        self.cached_bindings.clear();
         for (session, generation) in self.owner.connections() {
             if self.session_ids.contains(&session) {
-                out.insert(session, generation);
+                self.cached_bindings.insert(session, generation);
             }
         }
-        out
     }
 
     fn dispatch(&mut self) -> Result<(), Failure> {
@@ -2647,7 +3214,7 @@ impl Runtime<'_> {
                 .retain(|token, _| self.owner.deadline_is_live(*token));
         }
         if self.bindings_dirty {
-            self.cached_bindings = self.bindings();
+            self.refresh_bindings();
             self.bindings_dirty = false;
         }
         let mut sink = Sink {
@@ -2721,7 +3288,7 @@ impl Runtime<'_> {
                 && self.peers.get(&generation).is_some_and(|peer| {
                     peer.io.is_tls()
                         && peer.io.terminal_reason().is_some()
-                        && peer.closing.is_none()
+                        && peer.closing().is_none()
                 })
             {
                 continue;
@@ -3086,84 +3653,22 @@ impl Runtime<'_> {
         self.queue_work(session);
         Ok(())
     }
-    /// A hint follows only a relevant input actually applied by the owner.
-    /// Eligibility remains a pure-core decision; an applied no-op is not
-    /// authority to poll a blocked destination or repeatedly read an empty page.
-    fn work_progress_hint(&self, input: &Input) -> Option<(SessionId, bool)> {
-        match input {
-            Input::WorkPage { session, .. } | Input::WorkAvailable { session } => {
-                Some((*session, false))
-            }
-            Input::SessionEstablished {
-                session,
-                connection: Some(_),
-                ..
-            } => Some((*session, true)),
-            Input::StoreResult {
-                reply:
-                    StoreReply::Outcome(StoreOutcome::Committed(
-                        CommitFacts::DeliveryClaimed { target, .. }
-                        | CommitFacts::DeliveryFinished { target, .. }
-                        | CommitFacts::DeliveryConsumed { target, .. }
-                        | CommitFacts::DeliveryPubrelReady { target, .. }
-                        | CommitFacts::DeliveryStarted { target, .. }
-                        | CommitFacts::DeliveryExpired { target, .. },
-                    )),
-                ..
-            } => Some((*target, false)),
-            Input::StoreResult {
-                operation,
-                reply:
-                    StoreReply::Outcome(
-                        StoreOutcome::Committed(CommitFacts::PublicationAdmitted { .. })
-                        | StoreOutcome::RejectedCertain(_),
-                    ),
-                ..
-            } => self
-                .owner
-                .inline_claim_target(*operation)
-                .map(|target| (target, false)),
-            Input::StoreResult {
-                reply:
-                    StoreReply::Outcome(StoreOutcome::Committed(CommitFacts::SubscriptionsChanged {
-                        session,
-                        ..
-                    })),
-                ..
-            } => Some((*session, false)),
-            Input::ObservedPuback { connection, .. }
-            | Input::ObservedQos2Ack { connection, .. } => Some((connection.session, false)),
-            Input::FrameResult { connection, .. } | Input::Qos0EmitRefused { connection, .. } => {
-                Some((connection.session, false))
-            }
-            Input::Packet {
-                packet: InboundPacket::ConnectResume { client_id },
-                ..
-            } => self
-                .sessions
-                .get(client_id.as_slice())
-                .map(|s| (s.id, true)),
-            Input::Packet {
-                connection,
-                packet: InboundPacket::Puback { .. },
-                ..
-            } => self
-                .owner
-                .session_for_connection(*connection)
-                .map(|id| (id, false)),
-            _ => None,
-        }
-    }
+    #[inline]
     fn rearm_ready_work(&mut self, session: SessionId, initial: bool) {
         if self.queued_work_sessions.contains(&session) {
             return;
         }
-        let usable = self.owner.connection_of(session).is_some_and(|generation| {
-            self.peers
+        let generation = if initial {
+            self.owner.connection_of(session)
+        } else {
+            self.owner.ready_work_generation(session)
+        };
+        if let Some(generation) = generation
+            && self
+                .peers
                 .get(&generation)
-                .is_some_and(|p| p.connected && !p.pending && p.closing.is_none())
-        });
-        if usable && (initial || self.owner.has_ready_work(session)) {
+                .is_some_and(|p| p.connected && !p.pending && p.closing().is_none())
+        {
             self.queue_work_front(session);
         }
     }
@@ -3276,13 +3781,14 @@ impl Runtime<'_> {
             }
         }
         self.events.emit("connect_validated",json!({"connection":generation.get().to_string(),"details":{"protocol_level":connect.version.level(),"keep_alive":connect.keep_alive,"max_packet_size":connect.max_packet_size,"receive_maximum":connect.receive_maximum,"topic_alias_maximum":connect.topic_alias_maximum,"request_problem_information":connect.request_problem_information,"clean_start":connect.clean_start,"expiry":expiry_json(connect.expiry)}})).map_err(event_failure)?;
+        let now_ns = self.elapsed_ns(Instant::now());
         if let Some(p) = self.peers.get_mut(&generation) {
             if p.connected || p.pending {
                 return self.close(generation, "second_connect");
             }
             p.keep_alive = connect.keep_alive;
-            p.max_packet = connect.max_packet_size as usize;
-            p.last_packet = Instant::now();
+            p.max_packet = connect.max_packet_size;
+            p.last_packet_ns = now_ns;
         }
         #[cfg(feature = "test-hooks")]
         if self.captured.is_none() {
@@ -3314,8 +3820,6 @@ impl Runtime<'_> {
         if let Some(peer) = self.peers.get_mut(&generation) {
             peer.pending = true;
             peer.connect_expiry = connect.expiry;
-        }
-        if let Some(peer) = self.peers.get_mut(&generation) {
             peer.will_managed = connect.will.is_some();
         }
         let old = self
@@ -3347,8 +3851,7 @@ impl Runtime<'_> {
             let bytes = codec::disconnect_reason(0x8e);
             if peer
                 .io
-                .outgoing
-                .try_send(net::Write {
+                .try_send_outgoing(net::Write {
                     expiry: None,
                     correlation: None,
                     bytes: net::FrameBytes::from(bytes),
@@ -3357,7 +3860,7 @@ impl Runtime<'_> {
                 })
                 .is_ok()
             {
-                peer.closing = Some(("session_taken_over", Instant::now()));
+                peer.set_closing(("session_taken_over", Instant::now()));
                 self.pending_peers.insert(old);
             } else {
                 self.close(old, "session_taken_over")?;
@@ -3469,11 +3972,10 @@ impl Runtime<'_> {
                 None
             };
             if let Some(bytes) = bytes
-                && bytes.len() <= before_connack.unwrap_or(peer.max_packet)
+                && bytes.len() <= before_connack.unwrap_or(peer.max_packet_bytes())
                 && peer
                     .io
-                    .outgoing
-                    .try_send(net::Write {
+                    .try_send_outgoing(net::Write {
                         correlation: None,
                         bytes: net::FrameBytes::from(bytes),
                         payload: None,
@@ -3482,7 +3984,7 @@ impl Runtime<'_> {
                     })
                     .is_ok()
             {
-                peer.closing = Some(("not_authorized", Instant::now()));
+                peer.set_closing(("not_authorized", Instant::now()));
                 self.pending_peers.insert(generation);
                 return Ok(());
             }
@@ -3514,13 +4016,12 @@ impl Runtime<'_> {
         if let Some(p) = self.peers.get_mut(&generation)
             && p.connected
             && p.version == Some(codec::Version::V5)
-            && p.closing.is_none()
+            && p.closing().is_none()
         {
             let bytes = codec::disconnect_reason(reason);
-            if bytes.len() <= p.max_packet
+            if bytes.len() <= p.max_packet_bytes()
                 && p.io
-                    .outgoing
-                    .try_send(net::Write {
+                    .try_send_outgoing(net::Write {
                         expiry: None,
                         correlation: None,
                         bytes: net::FrameBytes::from(bytes),
@@ -3529,7 +4030,7 @@ impl Runtime<'_> {
                     })
                     .is_ok()
             {
-                p.closing = Some((code, Instant::now()));
+                p.set_closing((code, Instant::now()));
                 self.pending_peers.insert(generation);
                 return Ok(());
             }
@@ -3545,17 +4046,18 @@ impl Runtime<'_> {
         observed: net::FrameObservation,
     ) -> Result<(), Failure> {
         let body = body.into();
-        if !self.admit_generation(generation)? {
-            return Ok(());
-        }
-        if self
-            .peers
-            .get(&generation)
-            .is_some_and(|peer| peer.io.wire_progress.has_pending())
-        {
+        let (has_wire_progress, version) = match self.peers.get(&generation) {
+            Some(peer) => (peer.io.has_pending_wire_progress(), peer.version),
+            None => {
+                if !self.admit_generation(generation)? {
+                    return Ok(());
+                }
+                (false, None)
+            }
+        };
+        if has_wire_progress {
             self.wire_progress(generation)?;
         }
-        let version = self.peers.get(&generation).and_then(|peer| peer.version);
         if first >> 4 == 1 && version.is_some() {
             return self.close(generation, "second_connect");
         }
@@ -3567,15 +4069,20 @@ impl Runtime<'_> {
         {
             return self.header_refused(generation, "packet_too_large");
         }
-        let mut decoded = match codec::decode_for(version.unwrap_or_default(), first, &body, BOUNDS)
-        {
+        let mut decoded = match codec::decode_for_with_cache(
+            version.unwrap_or_default(),
+            first,
+            &body,
+            BOUNDS,
+            Some(&mut self.topic_cache),
+        ) {
             Ok(v) => v,
             Err(error) => {
                 self.events.emit("packet_refused",json!({"connection":generation.get().to_string(),"details":{"code":error.code(),"reason":error.reason_code()}})).map_err(event_failure)?;
                 // Refusal output has the same bounded absolute write path as business frames.
                 if let Some(p) = self.peers.get_mut(&generation) {
                     let cap = if p.connected {
-                        Some(p.max_packet as u32)
+                        Some(p.max_packet)
                     } else {
                         error.peer_maximum()
                     };
@@ -3591,8 +4098,7 @@ impl Runtime<'_> {
                             codec::refusal_for(response_version, error, !p.connected)
                         && bytes.len() <= cap as usize
                         && p.io
-                            .outgoing
-                            .try_send(net::Write {
+                            .try_send_outgoing(net::Write {
                                 expiry: None,
                                 correlation: None,
                                 bytes: net::FrameBytes::from(bytes),
@@ -3601,7 +4107,7 @@ impl Runtime<'_> {
                             })
                             .is_ok()
                     {
-                        p.closing = Some(("packet_refused", Instant::now()));
+                        p.set_closing(("packet_refused", Instant::now()));
                         self.pending_peers.insert(generation);
                         return Ok(());
                     }
@@ -3610,15 +4116,11 @@ impl Runtime<'_> {
             }
         };
         if let Some(security) = &self.security {
-            let targets: Vec<&mut InboundPacket> = match &mut decoded {
-                Packet::Core(packet) | Packet::TimedPublish { packet, .. } => vec![packet],
-                // Each unit request is authorized as a request of its own.
-                Packet::Requests { parts, .. } => parts.iter_mut().collect(),
-                _ => Vec::new(),
-            };
-            let principal = if targets.is_empty() {
-                None
-            } else {
+            let needs_auth = matches!(
+                decoded,
+                Packet::Core(_) | Packet::TimedPublish { .. } | Packet::Requests { .. }
+            );
+            if needs_auth {
                 let Some(principal) = self
                     .peers
                     .get(&generation)
@@ -3626,43 +4128,62 @@ impl Runtime<'_> {
                 else {
                     return self.close(generation, "tls_principal_missing");
                 };
-                Some(principal)
-            };
-            let mut filters_denied = false;
-            for packet in targets {
-                let principal = principal.expect("a principal for every target");
-                if let InboundPacket::Subscribe {
-                    filters, denied, ..
-                } = packet
-                {
-                    for (index, filter) in filters.as_slice().iter().enumerate() {
-                        if !security
-                            .policy
-                            .allows_filter(principal, filter.filter.as_slice())
-                        {
-                            *denied |= 1 << index;
+                let mut filters_denied = false;
+                let mut authorize = |packet: &mut InboundPacket| -> Option<&'static str> {
+                    if let InboundPacket::Subscribe {
+                        filters, denied, ..
+                    } = packet
+                    {
+                        for (index, filter) in filters.as_slice().iter().enumerate() {
+                            if !security
+                                .policy
+                                .allows_filter(principal, filter.filter.as_slice())
+                            {
+                                *denied |= 1 << index;
+                            }
+                        }
+                        filters_denied |= *denied != 0;
+                        None
+                    } else if !security.policy.allows_packet(principal, packet) {
+                        Some(if matches!(packet, InboundPacket::Publish { .. }) {
+                            "publish"
+                        } else {
+                            "unsubscribe"
+                        })
+                    } else {
+                        None
+                    }
+                };
+                let mut refused_stage: Option<&'static str> = None;
+                match &mut decoded {
+                    Packet::Core(packet) | Packet::TimedPublish { packet, .. } => {
+                        refused_stage = authorize(packet);
+                    }
+                    // Each unit request is authorized as a request of its own.
+                    Packet::Requests { parts, .. } => {
+                        for packet in parts.iter_mut() {
+                            if let Some(stage) = authorize(packet) {
+                                refused_stage = Some(stage);
+                                break;
+                            }
                         }
                     }
-                    filters_denied |= *denied != 0;
-                } else if !security.policy.allows_packet(principal, packet) {
-                    let stage = if matches!(packet, InboundPacket::Publish { .. }) {
-                        "publish"
-                    } else {
-                        "unsubscribe"
-                    };
+                    _ => {}
+                }
+                if let Some(stage) = refused_stage {
                     return self.authorization_refusal(generation, stage, None);
                 }
-            }
-            if filters_denied {
-                self.events
-                    .emit(
-                        "authorization_refused",
-                        json!({
-                            "connection":generation.get().to_string(),
-                            "details":{"stage":"subscribe","reason":0x87}
-                        }),
-                    )
-                    .map_err(event_failure)?;
+                if filters_denied {
+                    self.events
+                        .emit(
+                            "authorization_refused",
+                            json!({
+                                "connection":generation.get().to_string(),
+                                "details":{"stage":"subscribe","reason":0x87}
+                            }),
+                        )
+                        .map_err(event_failure)?;
+                }
             }
         }
         let decoded = match decoded {
@@ -3703,12 +4224,15 @@ impl Runtime<'_> {
             }
             other => other,
         };
+        let started = self.started;
         let p = self
             .peers
             .get_mut(&generation)
             .ok_or_else(|| Failure::plain("generation_missing"))?;
         if p.keep_alive != 0 && p.io.last_heard().is_none() {
-            p.last_packet = Instant::now();
+            p.last_packet_ns =
+                u64::try_from(Instant::now().saturating_duration_since(started).as_nanos())
+                    .unwrap_or(u64::MAX);
         }
         match decoded {
             Packet::TimedPublish { .. } => Err(Failure::plain("timed_publish_not_anchored")),
@@ -3722,10 +4246,11 @@ impl Runtime<'_> {
                 if !p.connected {
                     return self.close(generation, "packet_before_connack");
                 }
-                if p.requests.is_some() {
+                let cold = p.cold_mut();
+                if cold.requests.is_some() {
                     return Err(Failure::plain("requests_overlap"));
                 }
-                p.requests = Some(Requests {
+                cold.requests = Some(Requests {
                     packet_id,
                     unsubscribe,
                     parts: parts.into(),
@@ -3745,10 +4270,9 @@ impl Runtime<'_> {
                 {
                     let bytes = codec::disconnect_reason(0x82);
                     self.events.emit("packet_refused", json!({"connection":generation.get().to_string(),"details":{"code":"SessionExpiryIncreaseForbidden","reason":0x82}})).map_err(event_failure)?;
-                    if bytes.len() <= p.max_packet
+                    if bytes.len() <= p.max_packet_bytes()
                         && p.io
-                            .outgoing
-                            .try_send(net::Write {
+                            .try_send_outgoing(net::Write {
                                 expiry: None,
                                 correlation: None,
                                 bytes: net::FrameBytes::from(bytes),
@@ -3757,7 +4281,7 @@ impl Runtime<'_> {
                             })
                             .is_ok()
                     {
-                        p.closing = Some(("packet_refused", Instant::now()));
+                        p.set_closing(("packet_refused", Instant::now()));
                         self.pending_peers.insert(generation);
                         return Ok(());
                     }
@@ -3768,19 +4292,24 @@ impl Runtime<'_> {
                     .peers
                     .get_mut(&generation)
                     .ok_or_else(|| Failure::plain("generation_missing"))?;
-                p.will_disconnect = Some(publish_will);
-                p.disconnect_expiry = expiry;
-                p.close_observed_at = Some(observed_at);
+                let connect_expiry = p.connect_expiry;
+                let will_managed = p.will_managed;
+                {
+                    let cold = p.cold_mut();
+                    cold.will_disconnect = Some(publish_will);
+                    cold.disconnect_expiry = expiry;
+                    cold.close_observed_at = Some(observed_at);
+                }
                 if let Some(pending) = self
                     .session_requests
                     .values_mut()
                     .find(|pending| pending.connection == generation)
                 {
                     pending.close_intent = Some(CloseIntent {
-                        expiry: expiry.unwrap_or(p.connect_expiry),
+                        expiry: expiry.unwrap_or(connect_expiry),
                         observed_at,
                         explicit: expiry.is_some(),
-                        will: p.will_managed.then_some(publish_will),
+                        will: will_managed.then_some(publish_will),
                     });
                 }
                 // Earlier decoded packets precede this close in the TCP stream.
@@ -3798,6 +4327,7 @@ impl Runtime<'_> {
                     .checked_add(1)
                     .ok_or_else(|| Failure::plain("ingress_exhausted"))?;
                 let ingress_order = p.ingress;
+                let peer_session = p.session;
                 #[cfg(feature = "test-hooks")]
                 if MUTANT_QOS0_ACCOUNTING
                     && matches!(
@@ -3809,7 +4339,7 @@ impl Runtime<'_> {
                     )
                 {
                     let charged = p
-                        .receiving
+                        .receiving_mut()
                         .publish_qos(
                             65535,
                             ingress_order,
@@ -3835,18 +4365,18 @@ impl Runtime<'_> {
                     qos,
                     ..
                 } = &packet
-                    && p.receiving
+                    && p.receiving_mut()
                         .publish_qos(id.get(), ingress_order, *qos)
                         .is_err()
                 {
                     let id_raw = id.get();
                     let qos_val = *qos;
-                    if p.io.written.has_pending() {
+                    if p.io.has_pending_written() {
                         if let Some(code) = self.collect_written(generation)? {
                             return self.close(generation, code);
                         }
                         if self.peers.get_mut(&generation).is_some_and(|peer| {
-                            peer.receiving
+                            peer.receiving_mut()
                                 .publish_qos(id_raw, ingress_order, qos_val)
                                 .is_ok()
                         }) {
@@ -3866,25 +4396,22 @@ impl Runtime<'_> {
                                 .packet_id
                                 .zip(frame.terminal)
                                 .is_some_and(|(id, terminal)| {
-                                    p.receiving.can_complete_frame(
-                                        id,
-                                        frame.receive_serial,
-                                        terminal,
-                                    )
+                                    p.receiving_can_complete(id, frame.receive_serial, terminal)
                                 })
                     });
                     // MQTT 3.1.1 has no Receive Maximum to announce: a burst
                     // beyond the window is pressure, never a violation.
                     let unannounced = p.version == Some(codec::Version::V311);
                     if pending_terminal || unannounced {
-                        if p.deferred_publish.is_some() {
+                        let cold = p.cold_mut();
+                        if cold.deferred_publish.is_some() {
                             return Err(Failure::plain("deferred_publish_overlap"));
                         }
                         // A successful write can become visible to the client
                         // just before the network thread publishes its progress.
                         // Keep this one bounded input instead of declaring a
                         // Receive Maximum violation from a stale window.
-                        p.deferred_publish = Some(DeferredPublish {
+                        cold.deferred_publish = Some(DeferredPublish {
                             packet,
                             ingress_order,
                             since: Instant::now(),
@@ -3896,10 +4423,9 @@ impl Runtime<'_> {
                     }
                     let bytes = net::FrameBytes::from_slice(&[0xe0, 2, 0x93, 0]);
                     if p.version != Some(codec::Version::V311)
-                        && bytes.len() <= p.max_packet
+                        && bytes.len() <= p.max_packet_bytes()
                         && p.io
-                            .outgoing
-                            .try_send(net::Write {
+                            .try_send_outgoing(net::Write {
                                 expiry: None,
                                 correlation: None,
                                 bytes,
@@ -3908,7 +4434,7 @@ impl Runtime<'_> {
                             })
                             .is_ok()
                     {
-                        p.closing = Some(("receive_maximum", Instant::now()));
+                        p.set_closing(("receive_maximum", Instant::now()));
                         self.pending_peers.insert(generation);
                         return Ok(());
                     }
@@ -3920,11 +4446,8 @@ impl Runtime<'_> {
                     // owner authority while its old Close effect is blocked.
                     // Preserve the original key, never retarget or fail other
                     // connections merely because this generation is stale.
-                    let session = self
-                        .peers
-                        .get(&generation)
-                        .and_then(|peer| peer.session)
-                        .ok_or_else(|| Failure::plain("puback_session_unconfirmed"))?;
+                    let session =
+                        peer_session.ok_or_else(|| Failure::plain("puback_session_unconfirmed"))?;
                     let connection = ConnectionKey {
                         session,
                         generation,
@@ -3982,10 +4505,7 @@ impl Runtime<'_> {
                     reason,
                 } = packet
                 {
-                    let session = self
-                        .peers
-                        .get(&generation)
-                        .and_then(|peer| peer.session)
+                    let session = peer_session
                         .ok_or_else(|| Failure::plain("qos2_ack_session_unconfirmed"))?;
                     let connection = ConnectionKey {
                         session,
@@ -4071,24 +4591,33 @@ impl Runtime<'_> {
         }
         let result = (|| -> Result<(), Failure> {
             for &generation in &keys {
-                let (active, needs_deadline_check, is_retiring) = match self.peers.get(&generation)
-                {
+                let (
+                    active,
+                    needs_deadline_check,
+                    is_retiring,
+                    tls,
+                    has_wire_progress,
+                    has_written,
+                    has_cold,
+                ) = match self.peers.get(&generation) {
                     Some(peer) => {
                         let io_active = peer.io.take_activity();
-                        let state_active = io_active
-                            || peer.retire_code.is_some()
-                            || peer.held_packet.is_some()
-                            || peer.deferred_publish.is_some()
-                            || !peer.behind.is_empty()
-                            || peer.requests.is_some()
-                            || peer.blocked_output.is_some()
-                            || peer.closing.is_some();
+                        let cold = peer.cold.as_deref();
+                        let state_active = io_active || cold.is_some_and(PeerCold::state_active);
                         let needs_deadline = deadline_sweep
-                            || peer.closing.is_some()
                             || peer.pending
                             || !peer.connected
-                            || peer.capacity_wait.is_some();
-                        (state_active, needs_deadline, peer.retire_code)
+                            || cold
+                                .is_some_and(|c| c.closing.is_some() || c.capacity_wait.is_some());
+                        (
+                            state_active,
+                            needs_deadline,
+                            cold.and_then(|c| c.retire_code),
+                            peer.io.is_tls(),
+                            peer.io.has_pending_wire_progress(),
+                            peer.io.has_pending_written(),
+                            cold.is_some(),
+                        )
                     }
                     None => {
                         if !self.pending_peers.is_empty() {
@@ -4129,14 +4658,6 @@ impl Runtime<'_> {
                 }
                 let mut drained_incoming = true;
                 if active {
-                    let (tls, has_wire_progress, has_written) = match self.peers.get(&generation) {
-                        Some(peer) => (
-                            peer.io.is_tls(),
-                            peer.io.wire_progress.has_pending(),
-                            peer.io.written.has_pending(),
-                        ),
-                        None => continue,
-                    };
                     let mut tls_close = None;
                     let mut write_close = None;
                     let mut input_ended = false;
@@ -4146,175 +4667,358 @@ impl Runtime<'_> {
                     if has_written && let Some(code) = self.collect_written(generation)? {
                         write_close = Some(code);
                     }
-                    let backpressured = self.peers.get_mut(&generation).is_some_and(|peer| {
-                        if let Some(effect) = peer.blocked_output
-                            && self.owner.outbox().is_some_and(|outbox| {
-                                outbox.pending().any(|pending| pending.id() == effect)
-                            })
-                        {
-                            peer.io.terminal_reason().is_none()
-                        } else {
-                            peer.blocked_output = None;
-                            false
+                    let backpressured = if has_cold {
+                        self.peers.get_mut(&generation).is_some_and(|peer| {
+                            if let Some(effect) = peer.blocked_output()
+                                && self.owner.outbox().is_some_and(|outbox| {
+                                    outbox.pending().any(|pending| pending.id() == effect)
+                                })
+                            {
+                                peer.io.terminal_reason().is_none()
+                            } else {
+                                if let Some(c) = peer.cold.as_mut() {
+                                    c.blocked_output = None;
+                                }
+                                peer.gc_cold();
+                                false
+                            }
+                        })
+                    } else {
+                        false
+                    };
+                    if has_cold {
+                        if !backpressured {
+                            self.retry_deferred_publish(generation)?;
                         }
-                    });
-                    if !backpressured {
-                        self.retry_deferred_publish(generation)?;
+                        self.serve_requests(generation)?;
                     }
-                    self.serve_requests(generation)?;
                     drained_incoming = false;
-                    for _ in 0..32 {
-                        // A CONNECT can use one slot now and reserve one for Open.
-                        // Leave the bytes with their socket reader until both fit.
-                        if backpressured || self.ordinary_room() < 2 {
-                            break;
-                        }
-                        let business_waits = self.business_waits(generation);
-                        // A packet that was kept behind a publication is
-                        // older than the held packet and than the lane.
-                        let mut from_behind = false;
-                        let incoming = match self.peers.get_mut(&generation) {
-                            Some(p) if p.closing.is_some() || p.requests.is_some() => {
+                    let steady_fast = !backpressured
+                        && self.ordinary_room() >= 2
+                        && self
+                            .peers
+                            .get(&generation)
+                            .is_some_and(|p| p.connected && !p.pending && p.cold.is_none());
+                    if steady_fast {
+                        let max_drain = 32.min(self.ordinary_room().saturating_sub(1));
+                        let mut batch = std::mem::take(&mut self.scratch_incoming);
+                        batch.clear();
+                        let status = match self.peers.get(&generation) {
+                            Some(p) if p.io.has_pending_incoming() => {
+                                p.io.drain_incoming(&mut batch, max_drain)
+                            }
+                            Some(_) => net::DrainStatus::Empty,
+                            None => net::DrainStatus::Empty,
+                        };
+                        let mut hit_terminal = false;
+                        while let Some(incoming) = batch.pop_front() {
+                            self.progress = self.progress.wrapping_add(1);
+                            if self.ordinary_room() < 2 {
+                                batch.push_front(incoming);
                                 break;
                             }
-                            Some(p) if p.pending && p.held_packet.is_some() => break,
-                            Some(p) if p.deferred_publish.is_none() && !p.behind.is_empty() => {
-                                if business_waits
-                                    && p.behind
-                                        .front()
-                                        .is_some_and(|(first, ..)| business_header(*first))
+                            let business_waits = self.business_waits(generation);
+                            let (stop, peer_pending, has_deferred) =
+                                match self.peers.get(&generation) {
+                                    Some(p) => {
+                                        let c = p.cold.as_deref();
+                                        (
+                                            c.is_some_and(|c| {
+                                                c.closing.is_some() || c.requests.is_some()
+                                            }),
+                                            p.pending,
+                                            c.is_some_and(|c| c.deferred_publish.is_some()),
+                                        )
+                                    }
+                                    None => (true, false, false),
+                                };
+                            if stop {
+                                batch.push_front(incoming);
+                                break;
+                            }
+                            match incoming {
+                                net::Incoming::Authenticated { elapsed } => {
+                                    self.events.emit("tls_authenticated", json!({"connection":generation.get().to_string(),
+                                        "details":{"version":"TLS1.3","handshake_us":elapsed.as_micros() as u64}}))
+                                        .map_err(event_failure)?;
+                                }
+                                net::Incoming::Packet {
+                                    first,
+                                    body,
+                                    observed,
+                                } => {
+                                    if first >> 4 != 14 && peer_pending {
+                                        if let Some(peer) = self.peers.get_mut(&generation) {
+                                            peer.cold_mut().held_packet =
+                                                Some((first, body, observed));
+                                        }
+                                        break;
+                                    }
+                                    if has_deferred
+                                        && let Some(peer) = self.peers.get_mut(&generation)
+                                        && !peer.overtakes_deferred(first, &body)
+                                    {
+                                        match peer.keep_behind((first, body, observed)) {
+                                            Ok(()) => continue,
+                                            Err(packet) => {
+                                                peer.cold_mut().held_packet = Some(packet);
+                                                break;
+                                            }
+                                        }
+                                    }
+                                    if business_waits
+                                        && business_header(first)
+                                        && let Some(peer) = self.peers.get_mut(&generation)
+                                    {
+                                        peer.cold_mut().held_packet = Some((first, body, observed));
+                                        break;
+                                    }
+                                    self.packet_at(generation, first, body, observed)?;
+                                }
+                                net::Incoming::Refused { code } => {
+                                    hit_terminal = true;
+                                    self.header_refused(generation, code)?;
+                                    break;
+                                }
+                                net::Incoming::Closed { code } => {
+                                    hit_terminal = true;
+                                    if tls {
+                                        input_ended = true;
+                                        tls_close = Some(code);
+                                        break;
+                                    }
+                                    self.drain_inputs()?;
+                                    self.close(generation, code)?;
+                                    break;
+                                }
+                            }
+                        }
+                        if !batch.is_empty() {
+                            if let Some(peer) = self.peers.get(&generation) {
+                                peer.io.push_front_incoming(&mut batch);
+                            }
+                            batch.clear();
+                        } else if !hit_terminal {
+                            match status {
+                                net::DrainStatus::Empty => {
+                                    drained_incoming = true;
+                                }
+                                net::DrainStatus::Disconnected => {
+                                    drained_incoming = true;
+                                    let code = self
+                                        .peers
+                                        .get(&generation)
+                                        .and_then(|p| p.io.terminal_reason())
+                                        .unwrap_or("reader_closed");
+                                    if tls {
+                                        input_ended = true;
+                                        tls_close = Some(code);
+                                    } else {
+                                        self.drain_inputs()?;
+                                        self.close(generation, code)?;
+                                    }
+                                }
+                                net::DrainStatus::More => {}
+                            }
+                        }
+                        self.scratch_incoming = batch;
+                    } else {
+                        let mut one = std::mem::take(&mut self.scratch_incoming);
+                        one.clear();
+                        for _ in 0..32 {
+                            // A CONNECT can use one slot now and reserve one for Open.
+                            // Leave the bytes with their socket reader until both fit.
+                            if backpressured || self.ordinary_room() < 2 {
+                                break;
+                            }
+                            let business_waits = self.business_waits(generation);
+                            // A packet that was kept behind a publication is
+                            // older than the held packet and than the lane.
+                            let mut from_behind = false;
+                            let incoming = match self.peers.get_mut(&generation) {
+                                Some(p)
+                                    if p.cold.as_deref().is_some_and(|c| {
+                                        c.closing.is_some() || c.requests.is_some()
+                                    }) =>
                                 {
                                     break;
                                 }
-                                let (first, body, observed) =
-                                    p.behind.pop_front().expect("checked packet behind");
-                                p.behind_bytes -= body.len();
-                                from_behind = true;
+                                Some(p)
+                                    if p.pending
+                                        && p.cold
+                                            .as_deref()
+                                            .is_some_and(|c| c.held_packet.is_some()) =>
+                                {
+                                    break;
+                                }
+                                Some(p)
+                                    if p.cold.as_deref().is_some_and(|c| {
+                                        c.deferred_publish.is_none() && !c.behind.is_empty()
+                                    }) =>
+                                {
+                                    let cold = p.cold.as_mut().expect("checked cold");
+                                    if business_waits
+                                        && cold
+                                            .behind
+                                            .front()
+                                            .is_some_and(|(first, ..)| business_header(*first))
+                                    {
+                                        break;
+                                    }
+                                    let (first, body, observed) =
+                                        cold.behind.pop_front().expect("checked packet behind");
+                                    cold.behind_bytes -= body.len();
+                                    p.gc_cold();
+                                    from_behind = true;
+                                    Ok(net::Incoming::Packet {
+                                        first,
+                                        body,
+                                        observed,
+                                    })
+                                }
+                                Some(p)
+                                    if business_waits
+                                        && p.cold.as_deref().is_some_and(|c| {
+                                            c.deferred_publish.is_none()
+                                                && c.held_packet.as_ref().is_some_and(
+                                                    |(first, ..)| business_header(*first),
+                                                )
+                                        }) =>
+                                {
+                                    break;
+                                }
+                                Some(p) => {
+                                    let held = p.cold.as_mut().and_then(|c| c.held_packet.take());
+                                    if held.is_some() {
+                                        p.gc_cold();
+                                    }
+                                    match held {
+                                        Some((first, body, observed)) => {
+                                            Ok(net::Incoming::Packet {
+                                                first,
+                                                body,
+                                                observed,
+                                            })
+                                        }
+                                        None if !p.io.has_pending_incoming() => {
+                                            drained_incoming = true;
+                                            break;
+                                        }
+                                        None => {
+                                            one.clear();
+                                            let status = p.io.drain_incoming(&mut one, 1);
+                                            if let Some(pkt) = one.pop_front() {
+                                                Ok(pkt)
+                                            } else if status == net::DrainStatus::Disconnected {
+                                                Err(TryRecvError::Disconnected)
+                                            } else {
+                                                Err(TryRecvError::Empty)
+                                            }
+                                        }
+                                    }
+                                }
+                                None => break,
+                            };
+                            if incoming.is_ok() {
+                                self.progress = self.progress.wrapping_add(1);
+                            }
+                            match incoming {
+                                Ok(net::Incoming::Authenticated { elapsed }) => {
+                                    self.events.emit("tls_authenticated", json!({"connection":generation.get().to_string(),
+                                        "details":{"version":"TLS1.3","handshake_us":elapsed.as_micros() as u64}}))
+                                        .map_err(event_failure)?;
+                                }
                                 Ok(net::Incoming::Packet {
                                     first,
                                     body,
                                     observed,
-                                })
-                            }
-                            Some(p)
-                                if business_waits
-                                    && p.deferred_publish.is_none()
-                                    && p.held_packet
-                                        .as_ref()
-                                        .is_some_and(|(first, ..)| business_header(*first)) =>
-                            {
-                                break;
-                            }
-                            Some(p) => match p.held_packet.take() {
-                                Some((first, body, observed)) => Ok(net::Incoming::Packet {
-                                    first,
-                                    body,
-                                    observed,
-                                }),
-                                None if !p.io.incoming.has_pending() => {
+                                }) => {
+                                    if first >> 4 != 14
+                                        && self.peers.get(&generation).is_some_and(|p| p.pending)
+                                    {
+                                        self.peers
+                                            .get_mut(&generation)
+                                            .expect("checked peer")
+                                            .cold_mut()
+                                            .held_packet = Some((first, body, observed));
+                                        break;
+                                    }
+                                    // A publication waits for a slot of the window.
+                                    // The PUBREL of another exchange goes ahead: it
+                                    // frees a slot. Every other packet waits behind
+                                    // it, in order, up to a bound; past the bound
+                                    // the reader stops as it did.
+                                    if let Some(peer) = self.peers.get_mut(&generation)
+                                        && peer.deferred_publish().is_some()
+                                        && !peer.overtakes_deferred(first, &body)
+                                    {
+                                        match peer.keep_behind((first, body, observed)) {
+                                            Ok(()) => continue,
+                                            Err(packet) => {
+                                                peer.cold_mut().held_packet = Some(packet);
+                                                break;
+                                            }
+                                        }
+                                    }
+                                    // It was taken from the lane to learn what it is;
+                                    // it goes no further for now (record 0046).
+                                    if business_waits
+                                        && business_header(first)
+                                        && let Some(peer) = self.peers.get_mut(&generation)
+                                    {
+                                        let cold = peer.cold_mut();
+                                        if from_behind {
+                                            cold.behind_bytes += body.len();
+                                            cold.behind.push_front((first, body, observed));
+                                        } else {
+                                            cold.held_packet = Some((first, body, observed));
+                                        }
+                                        break;
+                                    }
+                                    self.packet_at(generation, first, body, observed)?
+                                }
+                                Ok(net::Incoming::Refused { code }) => {
+                                    self.header_refused(generation, code)?;
+                                    break;
+                                }
+                                Ok(net::Incoming::Closed { code }) => {
+                                    if tls {
+                                        input_ended = true;
+                                        tls_close = Some(code);
+                                        break;
+                                    }
+                                    self.drain_inputs()?;
+                                    self.close(generation, code)?;
+                                    break;
+                                }
+                                Err(TryRecvError::Empty) => {
                                     drained_incoming = true;
                                     break;
                                 }
-                                None => p.io.incoming.try_recv(),
-                            },
-                            None => break,
-                        };
-                        if incoming.is_ok() {
-                            self.progress = self.progress.wrapping_add(1);
-                        }
-                        match incoming {
-                            Ok(net::Incoming::Authenticated { elapsed }) => {
-                                self.events.emit("tls_authenticated", json!({"connection":generation.get().to_string(),
-                                    "details":{"version":"TLS1.3","handshake_us":elapsed.as_micros() as u64}}))
-                                    .map_err(event_failure)?;
-                            }
-                            Ok(net::Incoming::Packet {
-                                first,
-                                body,
-                                observed,
-                            }) => {
-                                if first >> 4 != 14
-                                    && self.peers.get(&generation).is_some_and(|p| p.pending)
-                                {
-                                    self.peers
-                                        .get_mut(&generation)
-                                        .expect("checked peer")
-                                        .held_packet = Some((first, body, observed));
-                                    break;
-                                }
-                                // A publication waits for a slot of the window.
-                                // The PUBREL of another exchange goes ahead: it
-                                // frees a slot. Every other packet waits behind
-                                // it, in order, up to a bound; past the bound
-                                // the reader stops as it did.
-                                if let Some(peer) = self.peers.get_mut(&generation)
-                                    && peer.deferred_publish.is_some()
-                                    && !peer.overtakes_deferred(first, &body)
-                                {
-                                    match peer.keep_behind((first, body, observed)) {
-                                        Ok(()) => continue,
-                                        Err(packet) => {
-                                            peer.held_packet = Some(packet);
-                                            break;
-                                        }
+                                Err(TryRecvError::Disconnected) => {
+                                    drained_incoming = true;
+                                    let code = self
+                                        .peers
+                                        .get(&generation)
+                                        .and_then(|p| p.io.terminal_reason())
+                                        .unwrap_or("reader_closed");
+                                    if tls {
+                                        input_ended = true;
+                                        tls_close = Some(code);
+                                        break;
                                     }
-                                }
-                                // It was taken from the lane to learn what it is;
-                                // it goes no further for now (record 0046).
-                                if business_waits
-                                    && business_header(first)
-                                    && let Some(peer) = self.peers.get_mut(&generation)
-                                {
-                                    if from_behind {
-                                        peer.behind_bytes += body.len();
-                                        peer.behind.push_front((first, body, observed));
-                                    } else {
-                                        peer.held_packet = Some((first, body, observed));
-                                    }
+                                    self.drain_inputs()?;
+                                    self.close(generation, code)?;
                                     break;
                                 }
-                                self.packet_at(generation, first, body, observed)?
-                            }
-                            Ok(net::Incoming::Refused { code }) => {
-                                self.header_refused(generation, code)?;
-                                break;
-                            }
-                            Ok(net::Incoming::Closed { code }) => {
-                                if tls {
-                                    input_ended = true;
-                                    tls_close = Some(code);
-                                    break;
-                                }
-                                self.drain_inputs()?;
-                                self.close(generation, code)?;
-                                break;
-                            }
-                            Err(TryRecvError::Empty) => {
-                                drained_incoming = true;
-                                break;
-                            }
-                            Err(TryRecvError::Disconnected) => {
-                                drained_incoming = true;
-                                let code = self
-                                    .peers
-                                    .get(&generation)
-                                    .and_then(|p| p.io.terminal_reason())
-                                    .unwrap_or("reader_closed");
-                                if tls {
-                                    input_ended = true;
-                                    tls_close = Some(code);
-                                    break;
-                                }
-                                self.drain_inputs()?;
-                                self.close(generation, code)?;
-                                break;
                             }
                         }
+                        self.scratch_incoming = one;
                     }
                     if self
                         .peers
                         .get(&generation)
-                        .is_some_and(|peer| peer.io.written.has_pending())
+                        .is_some_and(|peer| peer.io.has_pending_written())
                         && let Some(code) = self.collect_written(generation)?
                     {
                         write_close.get_or_insert(code);
@@ -4334,7 +5038,7 @@ impl Runtime<'_> {
                             || self
                                 .peers
                                 .get(&generation)
-                                .is_some_and(|peer| peer.closing.is_some()))
+                                .is_some_and(|peer| peer.closing().is_some()))
                     {
                         // The two queue observations may race even though they come
                         // from one TLS task. Apply the frame facts while the exact
@@ -4345,7 +5049,7 @@ impl Runtime<'_> {
                                 Input::FrameResult { connection, .. } | Input::Qos0EmitRefused { connection, .. }
                                     if connection.generation == generation))
                         {
-                            let (_, since) = peer.closing.get_or_insert((code, now));
+                            let (_, since) = peer.cold_mut().closing.get_or_insert((code, now));
                             if now.saturating_duration_since(*since) < Duration::from_millis(300) {
                                 self.pending_peers.insert(generation);
                                 continue;
@@ -4354,16 +5058,22 @@ impl Runtime<'_> {
                         self.close(generation, code)?;
                     }
                 }
-                if needs_deadline_check && let Some(p) = self.peers.get(&generation) {
-                    let expired = if let Some((code, since)) = p.closing
+                if needs_deadline_check && let Some(p) = self.peers.get_mut(&generation) {
+                    let closing = p.closing();
+                    let capacity_wait = p.cold.as_deref().and_then(|c| c.capacity_wait);
+                    let last_heard_or_pkt =
+                        p.io.last_heard()
+                            .unwrap_or_else(|| p.last_packet_instant(self.started));
+                    let expired = if let Some((code, since)) = closing
                         && now.saturating_duration_since(since) > Duration::from_millis(300)
                     {
                         Some(code)
                     } else if (p.pending || !p.connected)
-                        && now.saturating_duration_since(p.created) > Duration::from_secs(3)
+                        && now.saturating_duration_since(p.created_instant(self.started))
+                            > Duration::from_secs(3)
                     {
                         Some("connect_deadline")
-                    } else if p.capacity_wait.is_some_and(|since| {
+                    } else if capacity_wait.is_some_and(|since| {
                         now.saturating_duration_since(since.max(self.credit_progress))
                             > CAPACITY_WAIT
                     }) {
@@ -4376,11 +5086,24 @@ impl Runtime<'_> {
                         // old packet does not restart it. The time the core
                         // took a packet stands in only for a transport that
                         // has reported no reception.
-                        && now.saturating_duration_since(p.io.last_heard().unwrap_or(p.last_packet))
+                        && now.saturating_duration_since(last_heard_or_pkt)
                             > Duration::from_millis(u64::from(p.keep_alive) * 1500)
                     {
                         Some("keep_alive")
                     } else {
+                        if deadline_sweep
+                            && !active
+                            && p.connected
+                            && !p.pending
+                            && p.cold.is_none()
+                            && now.saturating_duration_since(last_heard_or_pkt)
+                                >= Duration::from_millis(200)
+                        {
+                            p.io.shrink_idle_queues();
+                            if p.receiving.as_ref().is_some_and(|w| w.is_empty()) {
+                                p.receiving = None;
+                            }
+                        }
                         None
                     };
                     if let Some(code) = expired {
@@ -4438,146 +5161,154 @@ impl Runtime<'_> {
         &mut self,
         generation: ConnectionGeneration,
     ) -> Result<Option<&'static str>, Failure> {
-        let tls = self
-            .peers
-            .get(&generation)
-            .is_some_and(|peer| peer.io.is_tls());
-        let mut tls_close = None;
-        let receipt_limit = net::WRITTEN_SLOTS;
-        for _ in 0..receipt_limit {
-            let written = match self.peers.get(&generation) {
-                Some(p) => p.io.written.try_recv(),
-                None => break,
-            };
-            if written.is_ok() {
-                self.progress = self.progress.wrapping_add(1);
+        let mut batch = std::mem::take(&mut self.scratch_written);
+        batch.clear();
+        let (tls, status) = match self.peers.get(&generation) {
+            Some(peer) => (
+                peer.io.is_tls(),
+                peer.io.drain_written(&mut batch, net::WRITTEN_SLOTS),
+            ),
+            None => {
+                self.scratch_written = batch;
+                return Ok(None);
             }
-            match written {
-                Ok(net::Written::Started { correlation }) => {
-                    if let Some((effect, connection)) = correlation
-                        && self.frames.get(&effect).is_some_and(|frame| {
-                            frame.connection == connection
-                                && matches!(frame.kind, "PUBLISH" | "PUBLISH0")
-                        })
-                    {
-                        self.events.emit("message_transmission_started",json!({"connection":connection.generation.get().to_string(),"details":{"effect":effect_text(effect),"authority":"positive_socket_write"}})).map_err(event_failure)?;
-                        self.queue(Input::FrameResult {
-                            effect,
-                            connection,
-                            progress: FrameProgress::Started,
-                        })?;
-                    }
-                }
-                Ok(net::Written::NotStarted {
-                    correlation,
-                    reason,
-                }) => {
-                    if let Some((effect, connection)) = correlation
-                        && let Some(pending) = self.frames.remove(&effect)
-                    {
-                        if pending.connection != connection {
-                            return Err(Failure::plain("frame_connection_mismatch"));
-                        }
-                        self.outgoing_bindings
-                            .retain(|_, value| value.frame != effect);
-                        self.events.emit("message_transmission_not_started",json!({"connection":connection.generation.get().to_string(),"details":{"effect":effect_text(effect),"reason":format!("{reason:?}"),"authority":"zero_socket_bytes"}})).map_err(event_failure)?;
-                        if pending.kind == "PUBLISH0" {
-                            let reason = match reason {
-                                mqttiumd_contract::message_expiry::MessageExpiryBlock::Expired => Qos0DropReason::MessageExpired,
-                                mqttiumd_contract::message_expiry::MessageExpiryBlock::TemporalUncertain => Qos0DropReason::TemporalUncertain,
-                            };
-                            self.queue(Input::Qos0EmitRefused {
-                                effect,
-                                connection,
-                                reason,
-                            })?;
-                        } else {
+        };
+        let mut tls_close = None;
+        let mut broke_early = false;
+        let res = (|| -> Result<(), Failure> {
+            for written in batch.drain(..) {
+                self.progress = self.progress.wrapping_add(1);
+                match written {
+                    net::Written::Started { correlation } => {
+                        if let Some((effect, connection)) = correlation
+                            && self.frames.get(&effect).is_some_and(|frame| {
+                                frame.connection == connection
+                                    && matches!(frame.kind, "PUBLISH" | "PUBLISH0")
+                            })
+                        {
+                            self.events.emit("message_transmission_started",json!({"connection":connection.generation.get().to_string(),"details":{"effect":effect_text(effect),"authority":"positive_socket_write"}})).map_err(event_failure)?;
                             self.queue(Input::FrameResult {
                                 effect,
                                 connection,
-                                progress: FrameProgress::NotStarted { reason },
+                                progress: FrameProgress::Started,
                             })?;
                         }
                     }
-                }
-                Ok(net::Written::Complete { correlation, bytes }) => {
-                    if let Some((effect, connection)) = correlation {
-                        #[cfg(feature = "test-hooks")]
-                        if self
-                            .frames
-                            .get(&effect)
-                            .is_some_and(|frame| frame.kind == "PUBLISH")
-                            && self.hooks.directory.as_ref().is_some_and(|dir| {
-                                consume_control(&dir.join("hold-next-outgoing-written"))
-                            })
+                    net::Written::NotStarted {
+                        correlation,
+                        reason,
+                    } => {
+                        if let Some((effect, connection)) = correlation
+                            && let Some(pending) = self.frames.remove(&effect)
                         {
-                            if self.deferred_outgoing_written.is_some() {
-                                return Err(Failure::plain("outgoing_written_hold_overlap"));
+                            if pending.connection != connection {
+                                return Err(Failure::plain("frame_connection_mismatch"));
                             }
-                            self.copied_outgoing_frame = Some((
+                            self.outgoing_bindings
+                                .retain(|_, value| value.frame != effect);
+                            self.events.emit("message_transmission_not_started",json!({"connection":connection.generation.get().to_string(),"details":{"effect":effect_text(effect),"reason":format!("{reason:?}"),"authority":"zero_socket_bytes"}})).map_err(event_failure)?;
+                            if pending.kind == "PUBLISH0" {
+                                let reason = match reason {
+                                    mqttiumd_contract::message_expiry::MessageExpiryBlock::Expired => Qos0DropReason::MessageExpired,
+                                    mqttiumd_contract::message_expiry::MessageExpiryBlock::TemporalUncertain => Qos0DropReason::TemporalUncertain,
+                                };
+                                self.queue(Input::Qos0EmitRefused {
+                                    effect,
+                                    connection,
+                                    reason,
+                                })?;
+                            } else {
+                                self.queue(Input::FrameResult {
+                                    effect,
+                                    connection,
+                                    progress: FrameProgress::NotStarted { reason },
+                                })?;
+                            }
+                        }
+                    }
+                    net::Written::Complete { correlation, bytes } => {
+                        if let Some((effect, connection)) = correlation {
+                            #[cfg(feature = "test-hooks")]
+                            if self
+                                .frames
+                                .get(&effect)
+                                .is_some_and(|frame| frame.kind == "PUBLISH")
+                                && self.hooks.directory.as_ref().is_some_and(|dir| {
+                                    consume_control(&dir.join("hold-next-outgoing-written"))
+                                })
+                            {
+                                if self.deferred_outgoing_written.is_some() {
+                                    return Err(Failure::plain("outgoing_written_hold_overlap"));
+                                }
+                                self.copied_outgoing_frame = Some((
+                                    effect,
+                                    connection,
+                                    FrameProgress::Written {
+                                        confirmed: bytes as u64,
+                                        total: bytes as u64,
+                                    },
+                                ));
+                                self.deferred_outgoing_written =
+                                    Some((effect, connection, bytes, Instant::now()));
+                                self.events.emit("outgoing_written_held",json!({"connection":connection.generation.get().to_string(),"details":{"effect":effect_text(effect),"socket_write_complete":true,"bytes":bytes}})).map_err(event_failure)?;
+                                continue;
+                            }
+                            #[cfg(feature = "test-hooks")]
+                            if !self.deferred_ack_used
+                                && self.hooks.pause.iter().any(|p| p == "ack.receipt")
+                                && let Some(pending) = self.frames.get(&effect)
+                                && pending.kind == "PUBACK"
+                            {
+                                self.events.emit("barrier_hit", json!({"point":"ack.receipt","connection":generation.get().to_string(),"details":{"effect":effect_text(effect),"packet_id":pending.packet_id.unwrap_or(0),"publish_order":pending.receive_serial.map(|v|v.to_string()).unwrap_or_default(),"bytes":bytes,"socket_write_complete":true}})).map_err(event_failure)?;
+                                self.deferred_ack_used = true;
+                                self.deferred_ack =
+                                    Some((effect, connection, bytes, Instant::now()));
+                                continue;
+                            }
+                            self.written_complete(effect, connection, bytes)?;
+                        } else if let Some((code, _)) =
+                            self.peers.get(&generation).and_then(Peer::closing)
+                        {
+                            tls_close = Some(code);
+                        }
+                    }
+                    net::Written::Failed { correlation, code } => {
+                        if let Some((effect, connection)) = correlation {
+                            if let Some(frame) = self.frames.remove(&effect) {
+                                self.retained_write_failed(effect, &frame, code)?;
+                            }
+                            self.queue(Input::FrameResult {
                                 effect,
                                 connection,
-                                FrameProgress::Written {
-                                    confirmed: bytes as u64,
-                                    total: bytes as u64,
-                                },
-                            ));
-                            self.deferred_outgoing_written =
-                                Some((effect, connection, bytes, Instant::now()));
-                            self.events.emit("outgoing_written_held",json!({"connection":connection.generation.get().to_string(),"details":{"effect":effect_text(effect),"socket_write_complete":true,"bytes":bytes}})).map_err(event_failure)?;
-                            continue;
+                                progress: FrameProgress::Failed,
+                            })?;
                         }
-                        #[cfg(feature = "test-hooks")]
-                        if !self.deferred_ack_used
-                            && self.hooks.pause.iter().any(|p| p == "ack.receipt")
-                            && let Some(pending) = self.frames.get(&effect)
-                            && pending.kind == "PUBACK"
-                        {
-                            self.events.emit("barrier_hit", json!({"point":"ack.receipt","connection":generation.get().to_string(),"details":{"effect":effect_text(effect),"packet_id":pending.packet_id.unwrap_or(0),"publish_order":pending.receive_serial.map(|v|v.to_string()).unwrap_or_default(),"bytes":bytes,"socket_write_complete":true}})).map_err(event_failure)?;
-                            self.deferred_ack_used = true;
-                            self.deferred_ack = Some((effect, connection, bytes, Instant::now()));
-                            continue;
+                        if tls {
+                            tls_close.get_or_insert(code);
+                        } else {
+                            tls_close = Some(code);
+                            broke_early = true;
+                            break;
                         }
-                        self.written_complete(effect, connection, bytes)?;
-                    } else if let Some((code, _)) =
-                        self.peers.get(&generation).and_then(|p| p.closing)
-                    {
-                        tls_close = Some(code);
                     }
-                }
-                Ok(net::Written::Failed { correlation, code }) => {
-                    if let Some((effect, connection)) = correlation {
-                        if let Some(frame) = self.frames.remove(&effect) {
-                            self.retained_write_failed(effect, &frame, code)?;
-                        }
-                        self.queue(Input::FrameResult {
-                            effect,
-                            connection,
-                            progress: FrameProgress::Failed,
-                        })?;
-                    }
-                    if tls {
-                        tls_close.get_or_insert(code);
-                    } else {
-                        tls_close = Some(code);
-                        break;
-                    }
-                }
-                Err(TryRecvError::Empty) => break,
-                Err(TryRecvError::Disconnected) => {
-                    if tls {
-                        let reason = self
-                            .peers
-                            .get(&generation)
-                            .and_then(|peer| peer.io.terminal_reason());
-                        tls_close.get_or_insert(reason.unwrap_or("writer_closed"));
-                    } else {
-                        tls_close = Some("writer_closed");
-                    }
-                    break;
                 }
             }
-        }
+            if !broke_early && status == net::DrainStatus::Disconnected {
+                if tls {
+                    let reason = self
+                        .peers
+                        .get(&generation)
+                        .and_then(|peer| peer.io.terminal_reason());
+                    tls_close.get_or_insert(reason.unwrap_or("writer_closed"));
+                } else {
+                    tls_close = Some("writer_closed");
+                }
+            }
+            Ok(())
+        })();
+        batch.clear();
+        self.scratch_written = batch;
+        res?;
         Ok(tls_close)
     }
 
@@ -4585,38 +5316,45 @@ impl Runtime<'_> {
     /// No lock is held across I/O. Scope/occurrence/QoS are checked for every
     /// early receive-credit release; stale progress is never inferred by PI.
     fn wire_progress(&mut self, generation: ConnectionGeneration) -> Result<(), Failure> {
-        let Some(peer) = self.peers.get_mut(&generation) else {
-            return Ok(());
-        };
-        for _ in 0..net::OUTPUT_SLOTS + 1 + 8 {
-            let progress = match peer.io.wire_progress.try_recv() {
-                Ok(progress) => {
-                    self.progress = self.progress.wrapping_add(1);
-                    progress
-                }
-                Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
-            };
-            // Written may already have consumed a completion between two
-            // polls of these independent lanes. Its late copy is harmless.
-            let Some(frame) = self.frames.get_mut(&progress.effect) else {
-                continue;
-            };
-            if frame.connection != progress.connection
-                || progress.connection.generation != generation
-            {
-                return Err(Failure::plain("wire_progress_connection_mismatch"));
-            }
-            if let Some((id, terminal)) = frame.packet_id.zip(frame.terminal) {
-                let released = peer
-                    .receiving
-                    .complete_frame(id, frame.receive_serial, terminal);
-                frame.wire_released |= released;
-                let frame_kind = frame.kind;
-                let frame_serial = frame.receive_serial;
-                self.events.emit_with("wire_receive_credit",||json!({"connection":generation.get().to_string(),"details":{"effect":effect_text(progress.effect),"packet_kind":frame_kind,"packet_id":id,"publish_order":frame_serial.map(|v|v.to_string()).unwrap_or_default(),"released":released}})).map_err(event_failure)?;
-            }
+        let mut batch = std::mem::take(&mut self.scratch_progress);
+        batch.clear();
+        if let Some(peer) = self.peers.get(&generation) {
+            peer.io
+                .drain_wire_progress(&mut batch, net::OUTPUT_SLOTS + 1 + 8);
         }
-        Ok(())
+        if batch.is_empty() {
+            self.scratch_progress = batch;
+            return Ok(());
+        }
+        let res = (|| -> Result<(), Failure> {
+            let Some(peer) = self.peers.get_mut(&generation) else {
+                return Ok(());
+            };
+            for progress in batch.drain(..) {
+                self.progress = self.progress.wrapping_add(1);
+                // Written may already have consumed a completion between two
+                // polls of these independent lanes. Its late copy is harmless.
+                let Some(frame) = self.frames.get_mut(&progress.effect) else {
+                    continue;
+                };
+                if frame.connection != progress.connection
+                    || progress.connection.generation != generation
+                {
+                    return Err(Failure::plain("wire_progress_connection_mismatch"));
+                }
+                if let Some((id, terminal)) = frame.packet_id.zip(frame.terminal) {
+                    let released = peer.receiving_complete(id, frame.receive_serial, terminal);
+                    frame.wire_released |= released;
+                    let frame_kind = frame.kind;
+                    let frame_serial = frame.receive_serial;
+                    self.events.emit_with("wire_receive_credit",||json!({"connection":generation.get().to_string(),"details":{"effect":effect_text(progress.effect),"packet_kind":frame_kind,"packet_id":id,"publish_order":frame_serial.map(|v|v.to_string()).unwrap_or_default(),"released":released}})).map_err(event_failure)?;
+                }
+            }
+            Ok(())
+        })();
+        batch.clear();
+        self.scratch_progress = batch;
+        res
     }
 
     fn retry_deferred_publish(&mut self, generation: ConnectionGeneration) -> Result<(), Failure> {
@@ -4626,7 +5364,7 @@ impl Runtime<'_> {
         let Some(peer) = self.peers.get_mut(&generation) else {
             return Ok(());
         };
-        let Some(deferred) = peer.deferred_publish.as_ref() else {
+        let Some(deferred) = peer.deferred_publish() else {
             return Ok(());
         };
         let InboundPacket::Publish {
@@ -4637,21 +5375,30 @@ impl Runtime<'_> {
         else {
             return Err(Failure::plain("deferred_publish_kind"));
         };
+        let (id_raw, qos_val, ingress_order, wire, since) = (
+            id.get(),
+            *qos,
+            deferred.ingress_order,
+            deferred.wire,
+            deferred.since,
+        );
         if peer
-            .receiving
-            .publish_qos(id.get(), deferred.ingress_order, *qos)
+            .receiving_mut()
+            .publish_qos(id_raw, ingress_order, qos_val)
             .is_ok()
         {
             let deferred = peer
-                .deferred_publish
-                .take()
+                .cold
+                .as_mut()
+                .and_then(|c| c.deferred_publish.take())
                 .ok_or_else(|| Failure::plain("deferred_publish_missing"))?;
+            peer.gc_cold();
             self.queue(Input::Packet {
                 connection: generation,
                 ingress_order: deferred.ingress_order,
                 packet: deferred.packet,
             })?;
-        } else if deferred.wire && deferred.since.elapsed() > Duration::from_millis(500) {
+        } else if wire && since.elapsed() > Duration::from_millis(500) {
             self.close(generation, "wire_progress_deadline")?;
         }
         Ok(())
@@ -4686,16 +5433,14 @@ impl Runtime<'_> {
             && let Some(p) = self.peers.get_mut(&generation)
             && let Some(id) = id
         {
-            let released_now = p
-                .receiving
-                .complete_frame(id, pending.receive_serial, terminal);
+            let released_now = p.receiving_complete(id, pending.receive_serial, terminal);
             // If no newer occurrence occupies the identifier, this receipt
             // confirms its own already published wire completion. A newer
             // occurrence still meets the exact guards and is left untouched.
-            let released = released_now || (pending.wire_released && !p.receiving.contains(id));
+            let released = released_now || (pending.wire_released && !p.receiving_contains(id));
             #[cfg(feature = "test-hooks")]
             let released = if MUTANT_STALE_RECEIPT && !released {
-                p.receiving.complete_current(id)
+                p.receiving.as_mut().is_some_and(|w| w.complete_current(id))
             } else {
                 released
             };
@@ -4992,7 +5737,7 @@ enum OutgoingPrune {
 
 struct Sink<'a, 'b> {
     writer: &'a mut StoreHandle<'b>,
-    peers: &'a mut FlatMap<ConnectionGeneration, Peer>,
+    peers: &'a mut PeerTable,
     events: &'a Events,
     inflight: &'a mut ScopedFlatMap<EffectId, OperationId>,
     lifecycle_inflight: &'a mut BTreeMap<EffectId, OperationId>,
@@ -5182,11 +5927,10 @@ impl EffectSink for Sink<'_, '_> {
                             return refused(effect, SubmitBlock::Closed);
                         }
                     };
-                    if bytes.len() <= peer.max_packet
+                    if bytes.len() <= peer.max_packet_bytes()
                         && peer
                             .io
-                            .outgoing
-                            .try_send(net::Write {
+                            .try_send_outgoing(net::Write {
                                 expiry: None,
                                 correlation: None,
                                 bytes: net::FrameBytes::from(bytes),
@@ -5195,7 +5939,7 @@ impl EffectSink for Sink<'_, '_> {
                             })
                             .is_ok()
                     {
-                        peer.closing = Some(("session_refused", Instant::now()));
+                        peer.set_closing(("session_refused", Instant::now()));
                         self.mark_pending_peers.push(generation);
                     } else {
                         self.close.push((generation, "session_refused"));
@@ -5285,24 +6029,27 @@ impl EffectSink for Sink<'_, '_> {
                 }
                 let generation = connection.generation;
                 let result = if let Some(peer) = self.peers.get_mut(&generation).filter(|p| {
-                    p.closing.is_none()
+                    p.closing().is_none()
                         && self.bindings.get(&connection.session) == Some(&generation)
                 }) {
                     let version = peer.version.unwrap_or_default();
+                    let expiry_val = expiry.as_deref().copied();
                     match codec::encode_qos0_segments(
                         version,
                         topic,
                         payload,
                         *retain
                             && (version == Version::V5 || *cause == DeliveryCause::RetainedReplay),
-                        expiry.map(|value| value.interval),
+                        expiry_val.map(|value| value.interval),
                         properties.as_deref(),
                     ) {
-                        Ok(encoded) if encoded.total_len <= peer.max_packet => {
-                            let write_expiry = expiry.map(|expiry| net::WriteExpiry {
-                                expiry,
-                                value_offset: encoded.expiry_value_offset,
-                                started: false,
+                        Ok(encoded) if encoded.total_len <= peer.max_packet_bytes() => {
+                            let write_expiry = expiry_val.map(|expiry| {
+                                Box::new(net::WriteExpiry {
+                                    expiry,
+                                    value_offset: encoded.expiry_value_offset,
+                                    started: false,
+                                })
                             });
                             #[cfg(feature = "test-hooks")]
                             let duplicate = if MUTANT_REPLAY_QOS0
@@ -5312,7 +6059,7 @@ impl EffectSink for Sink<'_, '_> {
                             } else {
                                 None
                             };
-                            let result = peer.io.outgoing.try_send(net::Write {
+                            let result = peer.io.try_send_outgoing(net::Write {
                                 expiry: write_expiry,
                                 correlation: Some((id, connection)),
                                 bytes: encoded.header,
@@ -5323,7 +6070,7 @@ impl EffectSink for Sink<'_, '_> {
                             if result.is_ok()
                                 && let Some((bytes, payload)) = duplicate
                             {
-                                let _ = peer.io.outgoing.try_send(net::Write {
+                                let _ = peer.io.try_send_outgoing(net::Write {
                                     expiry: None,
                                     correlation: None,
                                     bytes,
@@ -5391,7 +6138,7 @@ impl EffectSink for Sink<'_, '_> {
                     && self
                         .peers
                         .values()
-                        .any(|p| p.session == Some(guard.session) && p.closing.is_some())
+                        .any(|p| p.session == Some(guard.session) && p.closing().is_some())
                 {
                     return refused(effect, SubmitBlock::QueueFull);
                 }
@@ -5402,11 +6149,13 @@ impl EffectSink for Sink<'_, '_> {
                     return refused(effect, SubmitBlock::InFlightLimit);
                 }
                 let operation_id = command.recipe.operation();
-                let command_kind = crate::writer::recipe_kind(command.recipe.get());
-                let details = self
-                    .events
-                    .records("command_submitted")
-                    .then(|| recipe_details(command.recipe.get()));
+                let record_submitted = self.events.records("command_submitted");
+                let submitted_meta = record_submitted.then(|| {
+                    (
+                        crate::writer::recipe_kind(command.recipe.get()),
+                        recipe_details(command.recipe.get()),
+                    )
+                });
                 #[cfg(feature = "test-hooks")]
                 if MUTANT_EARLY_QOS0
                     && let Recipe::ConsumeDelivery(c) = command.recipe.get()
@@ -5415,7 +6164,7 @@ impl EffectSink for Sink<'_, '_> {
                     && let Some(peer) = self.peers.get(g)
                     && let Ok(bytes) = codec::encode_qos0(&item.topic, &item.payload)
                 {
-                    let _ = peer.io.outgoing.try_send(net::Write {
+                    let _ = peer.io.try_send_outgoing(net::Write {
                         expiry: None,
                         correlation: None,
                         bytes: net::FrameBytes::from(bytes),
@@ -5451,7 +6200,7 @@ impl EffectSink for Sink<'_, '_> {
                     && let Ok(bytes) =
                         codec::encode_publish(c.packet_id, &item.topic, &item.payload, false)
                 {
-                    let _ = peer.io.outgoing.try_send(net::Write {
+                    let _ = peer.io.try_send_outgoing(net::Write {
                         expiry: None,
                         correlation: None,
                         bytes: net::FrameBytes::from(bytes),
@@ -5465,12 +6214,11 @@ impl EffectSink for Sink<'_, '_> {
                         command.recipe.get()
                     && admission.qos == mqttiumd_contract::packet::Qos::ExactlyOnce
                     && let Some(p) = self.peers.values().find(|p| {
-                        p.receiving
-                            .serial(admission.source.packet_id.get())
+                        p.receiving_serial(admission.source.packet_id.get())
                             .is_some()
                     })
                 {
-                    let _ = p.io.outgoing.try_send(net::Write {
+                    let _ = p.io.try_send_outgoing(net::Write {
                         expiry: None,
                         correlation: None,
                         bytes: net::FrameBytes::from(
@@ -5490,12 +6238,11 @@ impl EffectSink for Sink<'_, '_> {
                         command.recipe.get()
                     && admission.qos == mqttiumd_contract::packet::Qos::AtLeastOnce
                     && let Some(p) = self.peers.values().find(|p| {
-                        p.receiving
-                            .serial(admission.source.packet_id.get())
+                        p.receiving_serial(admission.source.packet_id.get())
                             .is_some()
                     })
                 {
-                    let _ = p.io.outgoing.try_send(net::Write {
+                    let _ = p.io.try_send_outgoing(net::Write {
                         expiry: None,
                         correlation: None,
                         bytes: net::FrameBytes::from(
@@ -5509,7 +6256,13 @@ impl EffectSink for Sink<'_, '_> {
                         report: net::WriteReport::Complete,
                     });
                 }
-                if let Some((reply, targets)) = self.writer.apply_persist_direct(command) {
+                if self.writer.is_direct() {
+                    let (id, Effect::Persist { command }) = effect.into_parts() else {
+                        unreachable!("matched Effect::Persist");
+                    };
+                    let reply = self
+                        .writer
+                        .apply_persist_direct(command, &mut self.pending_work_targets);
                     self.inputs.push_back(Input::StoreResult {
                         effect: id,
                         operation: operation_id,
@@ -5518,25 +6271,23 @@ impl EffectSink for Sink<'_, '_> {
                     if let Some(count) = self.queued_writer_replies.as_mut() {
                         *count += 1;
                     }
-                    if !targets.is_empty() {
-                        self.pending_work_targets.extend(targets);
-                    }
                     self.direct_skip_next_deadline = matches!(
                         reply,
                         StoreReply::Outcome(
                             StoreOutcome::Committed(_) | StoreOutcome::RejectedCertain(_)
                         )
                     );
-                    if self
-                        .events
-                        .emit_with("command_submitted", || {
-                            json!({"operation":operation(operation_id),"command_kind":command_kind,"details":details.unwrap_or_else(|| json!({}))})
-                        })
-                        .is_err()
+                    if let Some((command_kind, details)) = submitted_meta
+                        && self
+                            .events
+                            .emit(
+                                "command_submitted",
+                                json!({"operation":operation(operation_id),"command_kind":command_kind,"details":details}),
+                            )
+                            .is_err()
                     {
                         self.error = Some(Failure::plain("events_unavailable"));
                     }
-                    let _ = effect.into_parts();
                     return SubmitResult::Accepted;
                 }
                 match self.writer.try_send(Request::Effect(effect)) {
@@ -5549,12 +6300,14 @@ impl EffectSink for Sink<'_, '_> {
                                 *count += 1;
                             }
                         }
-                        if self
-                            .events
-                            .emit_with("command_submitted", || {
-                                json!({"operation":operation(operation_id),"command_kind":command_kind,"details":details.unwrap_or_else(|| json!({}))})
-                            })
-                            .is_err()
+                        if let Some((command_kind, details)) = submitted_meta
+                            && self
+                                .events
+                                .emit(
+                                    "command_submitted",
+                                    json!({"operation":operation(operation_id),"command_kind":command_kind,"details":details}),
+                                )
+                                .is_err()
                         {
                             self.error = Some(Failure::plain("events_unavailable"));
                         }
@@ -5653,7 +6406,7 @@ impl EffectSink for Sink<'_, '_> {
                     return refused(effect, SubmitBlock::QueueFull);
                 }
                 let Some(peer) = self.peers.get_mut(&generation).filter(|peer| {
-                    peer.closing.is_none()
+                    peer.closing().is_none()
                         && self.bindings.get(&connection.session) == Some(&generation)
                 }) else {
                     let _ = effect.into_parts();
@@ -5671,7 +6424,7 @@ impl EffectSink for Sink<'_, '_> {
                 let part_of = matches!(frame, OutboundFrame::Unsuback { .. });
                 if let Some(answered) = packet_id
                     && matches!(kind, "SUBACK" | "UNSUBACK")
-                    && let Some(requests) = peer.requests.as_mut()
+                    && let Some(requests) = peer.cold.as_mut().and_then(|c| c.requests.as_mut())
                     && requests.awaiting
                     && requests.packet_id.get() == answered
                     && requests.unsubscribe == part_of
@@ -5698,7 +6451,7 @@ impl EffectSink for Sink<'_, '_> {
                 }
                 let bytes = match codec::encode_frame_bytes(peer.version.unwrap_or_default(), frame)
                 {
-                    Ok(bytes) if bytes.len() <= peer.max_packet => bytes,
+                    Ok(bytes) if bytes.len() <= peer.max_packet_bytes() => bytes,
                     Err(error) if error.code() == "AckNotEncodableInMqtt311" => {
                         let code = if matches!(
                             frame,
@@ -5727,7 +6480,7 @@ impl EffectSink for Sink<'_, '_> {
                 } else {
                     net::WriteReport::Complete
                 };
-                match peer.io.outgoing.try_send(net::Write {
+                match peer.io.try_send_outgoing(net::Write {
                     expiry: None,
                     correlation: Some((id, connection)),
                     bytes,
@@ -5771,7 +6524,7 @@ impl EffectSink for Sink<'_, '_> {
                     }
                     Err(TrySendError::Full(_)) => {
                         self.mark_pending_peers.push(generation);
-                        if peer.blocked_output.replace(id) != Some(id)
+                        if peer.cold_mut().blocked_output.replace(id) != Some(id)
                             && self.events.emit_with("effect_retained",||json!({"connection":generation.get().to_string(),"details":{"code":"output_queue_full","effect":effect_text(id),"packet_kind":kind}})).is_err(){self.error=Some(Failure::plain("events_unavailable"));}
                         refused(effect, SubmitBlock::TransportBackpressure)
                     }
@@ -5799,15 +6552,14 @@ impl EffectSink for Sink<'_, '_> {
                 if let Some(notice) = notice
                     && let Some(peer) = self.peers.get_mut(connection)
                 {
-                    if peer.closing.is_some() {
+                    if peer.closing().is_some() {
                         flushing = true;
                     } else if peer.version != Some(Version::V311) {
                         let bytes = codec::disconnect_reason(notice);
-                        if bytes.len() <= peer.max_packet
+                        if bytes.len() <= peer.max_packet_bytes()
                             && peer
                                 .io
-                                .outgoing
-                                .try_send(net::Write {
+                                .try_send_outgoing(net::Write {
                                     expiry: None,
                                     correlation: None,
                                     bytes: net::FrameBytes::from(bytes),
@@ -5816,7 +6568,7 @@ impl EffectSink for Sink<'_, '_> {
                                 })
                                 .is_ok()
                         {
-                            peer.closing = Some((code, Instant::now()));
+                            peer.set_closing((code, Instant::now()));
                             self.mark_pending_peers.push(*connection);
                             flushing = true;
                         }
@@ -5978,7 +6730,7 @@ impl EffectSink for Sink<'_, '_> {
                 }
                 let generation = connection.generation;
                 let Some(peer) = self.peers.get_mut(&generation).filter(|p| {
-                    p.closing.is_none()
+                    p.closing().is_none()
                         && self.bindings.get(&connection.session) == Some(&generation)
                 }) else {
                     let _ = effect.into_parts();
@@ -6006,6 +6758,7 @@ impl EffectSink for Sink<'_, '_> {
                 let version = peer.version.unwrap_or_default();
                 let retain =
                     retain && (version == Version::V5 || *cause == DeliveryCause::RetainedReplay);
+                let expiry_val = expiry.as_deref().copied();
                 let encoded = match codec::encode_delivery_segments(
                     version,
                     (packet_id, *qos),
@@ -6013,19 +6766,21 @@ impl EffectSink for Sink<'_, '_> {
                     payload,
                     dup,
                     retain,
-                    expiry.map(|value| value.interval),
+                    expiry_val.map(|value| value.interval),
                     properties.as_deref(),
                 ) {
-                    Ok(encoded) if encoded.total_len <= peer.max_packet => encoded,
+                    Ok(encoded) if encoded.total_len <= peer.max_packet_bytes() => encoded,
                     _ => {
                         self.close.push((generation, "outgoing_packet_limit"));
                         return refused(effect, SubmitBlock::Closed);
                     }
                 };
-                let write_expiry = expiry.map(|expiry| net::WriteExpiry {
-                    expiry,
-                    value_offset: encoded.expiry_value_offset,
-                    started: *started,
+                let write_expiry = expiry_val.map(|expiry| {
+                    Box::new(net::WriteExpiry {
+                        expiry,
+                        value_offset: encoded.expiry_value_offset,
+                        started: *started,
+                    })
                 });
                 let binding_key = (connection, packet_id);
                 let binding = PubackTarget {
@@ -6044,10 +6799,10 @@ impl EffectSink for Sink<'_, '_> {
                 // A rejected queue submission rolls this precise entry back.
                 self.outgoing_bindings.insert(binding_key, binding);
                 let track_written = write_expiry.is_some()
-                    || peer.blocked_output == Some(id)
+                    || peer.blocked_output() == Some(id)
                     || self.events.records("frame_written")
                     || cfg!(any(test, feature = "test-hooks"));
-                match peer.io.outgoing.try_send(net::Write {
+                match peer.io.try_send_outgoing(net::Write {
                     expiry: write_expiry,
                     correlation: track_written.then_some((id, connection)),
                     bytes: encoded.header,
@@ -6081,7 +6836,7 @@ impl EffectSink for Sink<'_, '_> {
                     Err(TrySendError::Full(_)) => {
                         self.outgoing_bindings.remove(&binding_key);
                         self.mark_pending_peers.push(generation);
-                        if peer.blocked_output.replace(id) != Some(id)
+                        if peer.cold_mut().blocked_output.replace(id) != Some(id)
                             && self.events.emit_with("effect_retained",||json!({"connection":generation.get().to_string(),"details":{"code":"output_queue_full","effect":effect_text(id),"packet_kind":"PUBLISH"}})).is_err(){self.error=Some(Failure::plain("events_unavailable"));}
                         refused(effect, SubmitBlock::TransportBackpressure)
                     }
@@ -6577,7 +7332,7 @@ fn run_inner(
         .create_outbox(
             LogicalOwnerId::new(0),
             NonZeroUsize::new(limits.effect_box).expect("nonzero"),
-            nz(65536),
+            nz(64),
         )
         .map_err(|_| Failure::plain("outbox_creation"))?;
     // Every session can hold a window of exchanges only its client ends:
@@ -6611,19 +7366,23 @@ fn run_inner(
         .sessions
         .values()
         .filter_map(|s| {
-            s.detached.filter(|d| d.deadline.is_some()).map(|detached| {
-                (
-                    s.id,
-                    ExpiryTimer {
-                        guard: SessionGuard {
-                            session: s.id,
-                            opened_by: s.opened_by,
+            s.detached
+                .as_deref()
+                .copied()
+                .filter(|d| d.deadline.is_some())
+                .map(|detached| {
+                    (
+                        s.id,
+                        ExpiryTimer {
+                            guard: SessionGuard {
+                                session: s.id,
+                                opened_by: s.opened_by,
+                            },
+                            detached,
+                            queued: false,
                         },
-                        detached,
-                        queued: false,
-                    },
-                )
-            })
+                    )
+                })
         })
         .collect();
     let mut runtime = Runtime {
@@ -6651,9 +7410,12 @@ fn run_inner(
         last_expiry_inventory: None,
         owner,
         _authority: authority,
+        incarnation,
+        epoch,
         writer,
         events: events.clone(),
-        peers: FlatMap::new(),
+        peers: PeerTable::new(),
+        topic_cache: codec::TopicCache::new(),
         ready_peers: net::ReadyQueue::new(),
         ready_raw: Vec::new(),
         pending_peers: FlatSet::new(),
@@ -6669,6 +7431,9 @@ fn run_inner(
         generation: ConnectionGeneration::new(0),
         peer_cursor: 0,
         peer_keys: Vec::new(),
+        scratch_incoming: VecDeque::new(),
+        scratch_written: Vec::new(),
+        scratch_progress: Vec::new(),
         last_peer_deadline_scan: Instant::now(),
         inputs: VecDeque::new(),
         control_inputs: VecDeque::new(),

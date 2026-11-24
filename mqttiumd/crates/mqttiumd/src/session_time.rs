@@ -51,6 +51,12 @@ pub trait SessionClock: Send + Sync {
     fn origin_status(&self) -> &'static str {
         "injected_clock"
     }
+
+    /// Returns the immutable process clock domain when the provider never
+    /// changes domains across its lifetime (for example [`SystemClock`]).
+    fn fixed_domain(&self) -> Option<[u8; 32]> {
+        None
+    }
 }
 
 pub struct SystemClock {
@@ -87,6 +93,11 @@ impl SystemClock {
 impl SessionClock for SystemClock {
     fn origin_status(&self) -> &'static str {
         self.origin_status
+    }
+
+    #[inline]
+    fn fixed_domain(&self) -> Option<[u8; 32]> {
+        Some(self.domain)
     }
 
     fn read(&self) -> Result<SessionClockReading, TimeError> {

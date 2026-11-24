@@ -3351,7 +3351,8 @@ impl DurableStore for SqliteStore {
     fn apply(&mut self, command: &Command) -> Applied {
         let recipe = command.recipe.get();
         let operation = recipe.operation();
-        let canonical = command.recipe.canonical_bytes();
+        let canonical_buf = command.recipe.to_canonical_bytes();
+        let canonical = canonical_buf.as_slice();
         if self.caches.get_mut().sync(&self.conn).is_err() {
             self.caches.get_mut().clear();
             return UNKNOWN;

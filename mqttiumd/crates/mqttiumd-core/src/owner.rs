@@ -52,13 +52,14 @@ use crate::contract::outcome::{
 use crate::contract::packet::{
     AckReason, InboundPacket, OutboundFrame, PubackReason, Qos, SharedBytes,
 };
-use crate::contract::step::{CoreFault, Exhaustion, PlanStamp, Progress, StepOutcome, TurnGrant};
+use crate::contract::step::{CoreFault, Exhaustion, Progress, StepOutcome, TurnGrant};
 use crate::credits::{Credits, ReleaseOutcome};
 use crate::leases::{LeaseRefused, LeaseTable};
 
 use crate::contract::message_expiry::{
     ExpiryState, MessageExpiry, MessageExpiryBlock, MessageTime,
 };
+use crate::slab::{BoundedSlab, SmallIndexSet};
 
 mod pubsub;
 mod receipts;
@@ -258,9 +259,15 @@ struct Session {
     connection: Option<ConnectionGeneration>,
     expiry: crate::contract::session::SessionExpiry,
     opened_by: Option<OperationId>,
-    detached: Option<crate::contract::session::SessionDetachment>,
+    detached: Option<alloc::boxed::Box<crate::contract::session::SessionDetachment>>,
     /// Product closure authority carries an explicit Will disposition.
     will_managed: bool,
+}
+
+impl Session {
+    fn detached(&self) -> Option<crate::contract::session::SessionDetachment> {
+        self.detached.as_deref().copied()
+    }
 }
 
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -315,11 +322,8 @@ struct Limits {
 /// Prefix-stripped answer set (bbtree-inspired): all retained effects for an
 /// operation belong to one `(epoch, owner)` scope, so only 8-byte `EffectSeq`
 /// values plus a presence bitmask are stored inline (88 B vs 280 B).
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-struct Answers {
-    epoch: RunEpoch,
-    owner: LogicalOwnerId,
-    persist: EffectSeq,
+#[derive(Clone, PartialEq, Eq, Debug)]
+struct Resolutions {
     recent: [EffectSeq; RECENT_RESOLUTIONS],
     landmarks: [EffectSeq; LANDMARK_RESOLUTIONS],
     /// Resolutions emitted for the operation so far.
@@ -328,46 +332,43 @@ struct Answers {
     present: u8,
 }
 
+#[derive(Clone, PartialEq, Eq, Debug)]
+struct Answers {
+    persist: EffectId,
+    resolutions: Option<alloc::boxed::Box<Resolutions>>,
+}
+
 impl Answers {
     fn new(persist: EffectId) -> Self {
         Self {
-            epoch: persist.epoch,
-            owner: persist.owner,
-            persist: persist.sequence,
-            recent: [EffectSeq::new(0); RECENT_RESOLUTIONS],
-            landmarks: [EffectSeq::new(0); LANDMARK_RESOLUTIONS],
-            emitted: 0,
-            present: 0,
+            persist,
+            resolutions: None,
         }
     }
 
     #[allow(dead_code)]
     fn persist_id(&self) -> EffectId {
-        EffectId {
-            epoch: self.epoch,
-            owner: self.owner,
-            sequence: self.persist,
-        }
+        self.persist
     }
 
     fn names(&self, effect: EffectId) -> bool {
-        if effect.epoch != self.epoch || effect.owner != self.owner {
+        if effect.epoch != self.persist.epoch || effect.owner != self.persist.owner {
             return false;
         }
         let seq = effect.sequence;
-        if self.persist == seq {
+        if self.persist.sequence == seq {
             return true;
         }
-        if self.emitted == 0 {
+        let Some(res) = self.resolutions.as_deref() else {
             return false;
-        }
+        };
         for i in 0..RECENT_RESOLUTIONS {
-            if (self.present & (1u8 << i)) != 0 && self.recent[i] == seq {
+            if (res.present & (1u8 << i)) != 0 && res.recent[i] == seq {
                 return true;
             }
         }
         for i in 0..LANDMARK_RESOLUTIONS {
-            if (self.present & (1u8 << (RECENT_RESOLUTIONS + i))) != 0 && self.landmarks[i] == seq {
+            if (res.present & (1u8 << (RECENT_RESOLUTIONS + i))) != 0 && res.landmarks[i] == seq {
                 return true;
             }
         }
@@ -376,25 +377,33 @@ impl Answers {
 
     /// Retains the next resolution of the operation.
     fn with(mut self, resolution: EffectId) -> Self {
-        if resolution.epoch != self.epoch || resolution.owner != self.owner {
+        if resolution.epoch != self.persist.epoch || resolution.owner != self.persist.owner {
             return self;
         }
-        self.emitted = self.emitted.saturating_add(1);
-        let rank = self.emitted;
+        let res = self.resolutions.get_or_insert_with(|| {
+            alloc::boxed::Box::new(Resolutions {
+                recent: [EffectSeq::new(0); RECENT_RESOLUTIONS],
+                landmarks: [EffectSeq::new(0); LANDMARK_RESOLUTIONS],
+                emitted: 0,
+                present: 0,
+            })
+        });
+        res.emitted = res.emitted.saturating_add(1);
+        let rank = res.emitted;
         let place = |rank: u64, len: usize| {
             usize::try_from(rank % u64::try_from(len).unwrap_or(1)).unwrap_or(0)
         };
         let recent_idx = place(rank, RECENT_RESOLUTIONS);
-        if let Some(slot) = self.recent.get_mut(recent_idx) {
+        if let Some(slot) = res.recent.get_mut(recent_idx) {
             *slot = resolution.sequence;
-            self.present |= 1u8 << recent_idx;
+            res.present |= 1u8 << recent_idx;
         }
         if rank.is_power_of_two() {
             let landmark = u64::from(rank.trailing_zeros());
             let landmark_idx = place(landmark, LANDMARK_RESOLUTIONS);
-            if let Some(slot) = self.landmarks.get_mut(landmark_idx) {
+            if let Some(slot) = res.landmarks.get_mut(landmark_idx) {
                 *slot = resolution.sequence;
-                self.present |= 1u8 << (RECENT_RESOLUTIONS + landmark_idx);
+                res.present |= 1u8 << (RECENT_RESOLUTIONS + landmark_idx);
             }
         }
         self
@@ -402,7 +411,7 @@ impl Answers {
 }
 
 /// The operation an exchange waits for.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 struct InFlight {
     operation: OperationId,
     /// `Submitted` or `Indeterminate`.
@@ -412,25 +421,280 @@ struct InFlight {
     answers: Answers,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum DeliveryFactKind {
+    Claimed,
+    Finished,
+    Started,
+    PubrelReady,
+    Expired,
+}
+
+/// Prefix-stripped compact representation of `CommitFacts` for retained
+/// terminal operations: zero heap allocations for hot QoS 1/2 facts.
+#[derive(Clone, PartialEq, Eq, Debug)]
+enum CompactFacts {
+    PublicationAdmitted {
+        publication_seq: PublicationSeq,
+        exchange: ExchangeId,
+    },
+    DeliveryLocal {
+        kind: DeliveryFactKind,
+        packet_id: OutboundPacketId,
+        index: u32,
+        pub_seq: PublicationSeq,
+        target: SessionId,
+        claim_seq: OperationSeq,
+    },
+    InboundReleased {
+        exchange: ExchangeId,
+    },
+    Boxed(alloc::boxed::Box<CommitFacts>),
+}
+
+impl CompactFacts {
+    fn from_commit(operation: OperationId, facts: CommitFacts) -> Self {
+        let scope = (
+            operation.incarnation(),
+            operation.epoch(),
+            operation.owner(),
+        );
+        match facts {
+            CommitFacts::PublicationAdmitted {
+                publication,
+                exchange,
+            } if (
+                publication.incarnation(),
+                publication.epoch(),
+                publication.owner(),
+            ) == scope =>
+            {
+                Self::PublicationAdmitted {
+                    publication_seq: publication.sequence(),
+                    exchange,
+                }
+            }
+            CommitFacts::InboundReleased { exchange } => Self::InboundReleased { exchange },
+            CommitFacts::DeliveryClaimed {
+                delivery,
+                target,
+                packet_id,
+                claim,
+            }
+            | CommitFacts::DeliveryFinished {
+                delivery,
+                target,
+                packet_id,
+                claim,
+            }
+            | CommitFacts::DeliveryStarted {
+                delivery,
+                target,
+                packet_id,
+                claim,
+            }
+            | CommitFacts::DeliveryPubrelReady {
+                delivery,
+                target,
+                packet_id,
+                claim,
+            }
+            | CommitFacts::DeliveryExpired {
+                delivery,
+                target,
+                packet_id,
+                claim,
+            } if (
+                delivery.publication.incarnation(),
+                delivery.publication.epoch(),
+                delivery.publication.owner(),
+            ) == scope
+                && (claim.incarnation(), claim.epoch(), claim.owner()) == scope =>
+            {
+                let kind = match facts {
+                    CommitFacts::DeliveryClaimed { .. } => DeliveryFactKind::Claimed,
+                    CommitFacts::DeliveryFinished { .. } => DeliveryFactKind::Finished,
+                    CommitFacts::DeliveryStarted { .. } => DeliveryFactKind::Started,
+                    CommitFacts::DeliveryPubrelReady { .. } => DeliveryFactKind::PubrelReady,
+                    CommitFacts::DeliveryExpired { .. } => DeliveryFactKind::Expired,
+                    _ => panic!("matched delivery commit facts variant"),
+                };
+                Self::DeliveryLocal {
+                    kind,
+                    packet_id,
+                    index: delivery.index,
+                    pub_seq: delivery.publication.sequence(),
+                    target,
+                    claim_seq: claim.sequence(),
+                }
+            }
+            other => Self::Boxed(alloc::boxed::Box::new(other)),
+        }
+    }
+
+    fn matches(&self, operation: OperationId, facts: CommitFacts) -> bool {
+        let scope = (
+            operation.incarnation(),
+            operation.epoch(),
+            operation.owner(),
+        );
+        match (self, facts) {
+            (
+                Self::PublicationAdmitted {
+                    publication_seq,
+                    exchange,
+                },
+                CommitFacts::PublicationAdmitted {
+                    publication,
+                    exchange: other_ex,
+                },
+            ) => {
+                (
+                    publication.incarnation(),
+                    publication.epoch(),
+                    publication.owner(),
+                ) == scope
+                    && publication.sequence() == *publication_seq
+                    && other_ex == *exchange
+            }
+            (
+                Self::InboundReleased { exchange },
+                CommitFacts::InboundReleased { exchange: other },
+            ) => *exchange == other,
+            (
+                Self::DeliveryLocal {
+                    kind,
+                    packet_id,
+                    index,
+                    pub_seq,
+                    target,
+                    claim_seq,
+                },
+                other,
+            ) => {
+                let (other_kind, delivery, other_target, other_pi, claim) = match other {
+                    CommitFacts::DeliveryClaimed {
+                        delivery,
+                        target,
+                        packet_id,
+                        claim,
+                    } => (
+                        DeliveryFactKind::Claimed,
+                        delivery,
+                        target,
+                        packet_id,
+                        claim,
+                    ),
+                    CommitFacts::DeliveryFinished {
+                        delivery,
+                        target,
+                        packet_id,
+                        claim,
+                    } => (
+                        DeliveryFactKind::Finished,
+                        delivery,
+                        target,
+                        packet_id,
+                        claim,
+                    ),
+                    CommitFacts::DeliveryStarted {
+                        delivery,
+                        target,
+                        packet_id,
+                        claim,
+                    } => (
+                        DeliveryFactKind::Started,
+                        delivery,
+                        target,
+                        packet_id,
+                        claim,
+                    ),
+                    CommitFacts::DeliveryPubrelReady {
+                        delivery,
+                        target,
+                        packet_id,
+                        claim,
+                    } => (
+                        DeliveryFactKind::PubrelReady,
+                        delivery,
+                        target,
+                        packet_id,
+                        claim,
+                    ),
+                    CommitFacts::DeliveryExpired {
+                        delivery,
+                        target,
+                        packet_id,
+                        claim,
+                    } => (
+                        DeliveryFactKind::Expired,
+                        delivery,
+                        target,
+                        packet_id,
+                        claim,
+                    ),
+                    _ => return false,
+                };
+                *kind == other_kind
+                    && *packet_id == other_pi
+                    && *index == delivery.index
+                    && *target == other_target
+                    && (
+                        delivery.publication.incarnation(),
+                        delivery.publication.epoch(),
+                        delivery.publication.owner(),
+                    ) == scope
+                    && delivery.publication.sequence() == *pub_seq
+                    && (claim.incarnation(), claim.epoch(), claim.owner()) == scope
+                    && claim.sequence() == *claim_seq
+            }
+            (Self::Boxed(stored), other) => **stored == other,
+            _ => false,
+        }
+    }
+}
+
 /// An operation that ended, as the owner knows it: kept so that a late
 /// result that contradicts it is a fault, not a stale answer.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 struct Finished {
     operation: OperationId,
     answers: Answers,
     /// `Consumed` or `RejectedCertain`.
     phase: CommandPhase,
     /// What its commit established, when it committed.
-    facts: Option<CommitFacts>,
+    facts: Option<CompactFacts>,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+impl Finished {
+    fn new(
+        operation: OperationId,
+        answers: Answers,
+        phase: CommandPhase,
+        facts: Option<CommitFacts>,
+    ) -> Self {
+        Self {
+            operation,
+            answers,
+            phase,
+            facts: facts.map(|f| CompactFacts::from_commit(operation, f)),
+        }
+    }
+
+    fn facts_match(&self, facts: CommitFacts) -> bool {
+        self.facts
+            .as_ref()
+            .is_none_or(|established| established.matches(self.operation, facts))
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, Debug)]
 enum SlotState {
     AdmissionPending(InFlight),
     AwaitPubrel,
     ReleasePending(InFlight),
     /// A known fenced termination awaits room for a fresh preparation.
-    ReleaseRetry(Finished),
+    ReleaseRetry(alloc::boxed::Box<Finished>),
     /// The admission ended, but its own PUBACK frame is still outstanding.
     /// A later PUBLISH may reuse the Packet Identifier before this frame's
     /// write receipt is processed. Only effect + generation identifies it.
@@ -479,7 +743,7 @@ struct Seen {
 }
 
 /// One bounded inbound occurrence, using the shared admission path.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 struct Slot {
     session: SessionId,
     packet_id: InboundPacketId,
@@ -518,8 +782,8 @@ impl Slot {
         }
     }
 
-    fn in_flight(&self) -> Option<InFlight> {
-        match self.state {
+    fn in_flight(&self) -> Option<&InFlight> {
+        match &self.state {
             SlotState::AdmissionPending(in_flight) | SlotState::ReleasePending(in_flight) => {
                 Some(in_flight)
             }
@@ -550,24 +814,13 @@ impl From<AllocationFailed> for Stop {
 /// An input the adapters cannot produce in this state.
 const IMPOSSIBLE: Stop = Stop::Fatal(CoreFault::ImpossibleInput);
 
-/// A refused plan, with the work its planning spent.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-struct Refusal {
-    stop: Stop,
-    work_used: WorkUnits,
-}
-
-#[derive(Debug)]
+#[derive(Clone, Copy, Debug)]
 struct InlineClaimPlan {
-    delivery: DeliveryId,
     target: SessionId,
     target_revision: Revision,
     qos: Qos,
     packet_id: OutboundPacketId,
     generation: ConnectionGeneration,
-    topic: SharedBytes,
-    payload: SharedBytes,
-    properties: Option<alloc::sync::Arc<crate::contract::properties::PublishProperties>>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -582,14 +835,10 @@ enum InlineOutcome {
 /// The change of state of a transition. Indices name entries of the
 /// tables at the revision the plan was computed against.
 #[derive(Debug)]
-#[expect(
-    clippy::large_enum_variant,
-    reason = "bounded plans retain lifecycle flights inline; heap allocation would add a failure after reservation"
-)]
 enum Change {
-    Session(sessions::Change),
-    Will(will::Change),
-    Receipts(receipts::Change),
+    Session(alloc::boxed::Box<sessions::Change>),
+    Will(alloc::boxed::Box<will::Change>),
+    Receipts(alloc::boxed::Box<receipts::Change>),
     Pubsub(pubsub::Change),
     /// The input is absorbed: late, repeated, or answered by effects only.
     Nothing,
@@ -599,7 +848,7 @@ enum Change {
     /// The exclusive writer confirmed this durable session after the
     /// recovery inventory closed. Its table place was checked by the plan.
     Establish {
-        session: Session,
+        session: alloc::boxed::Box<Session>,
     },
     /// The connection becomes the current one of the session.
     Bind {
@@ -621,8 +870,8 @@ enum Change {
         unmatched: bool,
         cost: Credits,
         in_flight: InFlight,
-        inline_claim: Option<alloc::boxed::Box<InlineClaimPlan>>,
-        dirty_targets: alloc::vec::Vec<SessionId>,
+        inline_claim: Option<InlineClaimPlan>,
+        dirty_targets: Option<alloc::boxed::Box<[SessionId]>>,
     },
     /// The admission of the exchange is known committed.
     Committed {
@@ -692,35 +941,8 @@ struct Effects {
     count: usize,
 }
 
-/// A transition computed and not yet applied.
-///
-/// It is private, it cannot be copied, and `apply` takes it by value: a
-/// plan is used once (ADR 0006).
-#[derive(Debug)]
-struct Plan {
-    stamp: PlanStamp,
-    /// The whole transition budget, including a bounded apply-time scan.
-    work: WorkUnits,
-    /// Work already spent if the final Outbox reservation refuses the plan.
-    planned_work: WorkUnits,
-    /// The counters after the identities of the plan were drawn.
-    counters: Counters,
-    change: Change,
-    effects: Effects,
-    progress: Progress,
-    /// The connection the transition closes, or saw fail.
-    closed: Option<ConnectionGeneration>,
-    receipt_issued: Option<receipts::Entry>,
-    receipt_consumed: Option<OperationId>,
-    /// The held answer the transition releases beside its change.
-    released: Option<Released>,
-    /// Inline-claimed delivery transition resolved beside an admission result.
-    inline_outcome: Option<InlineOutcome>,
-    /// Non-inline admission resolved `(operation, committed)` for dirty tracking.
-    non_inline_resolved: Option<(OperationId, bool)>,
-}
-
 /// What a plan draws and publishes while it is computed.
+#[derive(Debug)]
 struct Draft {
     epoch: RunEpoch,
     owner: LogicalOwnerId,
@@ -882,70 +1104,6 @@ impl Draft {
 /// let owner = Owner::new(config, outbox).unwrap();
 /// let twin = Owner::new(config, outbox).unwrap();
 /// ```
-/// Redis `listpack`-inspired compact sorted index set for per-session /
-/// per-window tables (typically 1..8 entries, contiguous in one cache line).
-#[derive(Clone, Default, PartialEq, Eq, Debug)]
-pub(super) struct SmallIndexSet(alloc::vec::Vec<usize>);
-
-impl SmallIndexSet {
-    pub(super) fn len(&self) -> usize {
-        self.0.len()
-    }
-
-    pub(super) fn is_empty(&self) -> bool {
-        self.0.is_empty()
-    }
-
-    pub(super) fn insert(&mut self, value: usize) -> bool {
-        match self.0.binary_search(&value) {
-            Ok(_) => false,
-            Err(pos) => {
-                self.0.insert(pos, value);
-                true
-            }
-        }
-    }
-
-    pub(super) fn remove(&mut self, value: &usize) -> bool {
-        match self.0.binary_search(value) {
-            Ok(pos) => {
-                self.0.remove(pos);
-                true
-            }
-            Err(_) => false,
-        }
-    }
-
-    pub(super) fn replace(&mut self, from: usize, to: usize) {
-        if let Ok(pos) = self.0.binary_search(&from) {
-            self.0.remove(pos);
-        }
-        let _ = self.insert(to);
-    }
-
-    pub(super) fn iter(&self) -> core::slice::Iter<'_, usize> {
-        self.0.iter()
-    }
-}
-
-impl IntoIterator for SmallIndexSet {
-    type Item = usize;
-    type IntoIter = alloc::vec::IntoIter<usize>;
-
-    fn into_iter(self) -> Self::IntoIter {
-        self.0.into_iter()
-    }
-}
-
-impl<'a> IntoIterator for &'a SmallIndexSet {
-    type Item = &'a usize;
-    type IntoIter = core::slice::Iter<'a, usize>;
-
-    fn into_iter(self) -> Self::IntoIter {
-        self.0.iter()
-    }
-}
-
 #[derive(Debug)]
 pub struct Owner {
     id: LogicalOwnerId,
@@ -966,19 +1124,36 @@ pub struct Owner {
     session_by_id: FlatMap<SessionId, usize>,
     session_by_client: BTreeMap<SharedBytes, usize>,
     session_by_conn: FlatMap<ConnectionGeneration, usize>,
-    slots: BoundedVec<Slot>,
+    slots: BoundedSlab<Slot>,
     slot_by_key: FlatMap<(SessionId, InboundPacketId), usize>,
     slot_by_op: ScopedFlatMap<OperationId, usize>,
     slot_by_deadline: FlatMap<DeadlineToken, usize>,
     slot_by_effect: ScopedFlatMap<EffectId, usize>,
     slots_by_session: FlatMap<SessionId, SmallIndexSet>,
+    held_answers: usize,
+    /// Total slots currently in `AdmissionPending` or `AnswerHeld`.
+    unanswered_slots: usize,
+    /// Set when the last applied `Input::ObservedPuback` did not match a live
+    /// delivery on the connection, so the runtime can emit `puback_ignored`
+    /// without a redundant pre-step `puback_target` lookup.
+    last_observed_puback_ignored: bool,
+    /// Conservative hint: false only when the last applied transition provably
+    /// could not make new outbound pub/sub work ready for its target session.
+    last_step_may_unblock_work: bool,
+    /// If the last applied `PublicationAdmitted` / `RejectedCertain` resolved
+    /// an inline claim that may still have ready work, holds its target session.
+    last_inline_ready_target: Option<SessionId>,
     /// See `OwnerConfig::session_qos2_exchanges`.
     session_qos2_exchanges: usize,
     release_retry_slots: BTreeSet<usize>,
     leases: LeaseTable,
     /// The latest operations that ended; see `OwnerConfig`.
     finished: BoundedQueue<Finished>,
-    finished_by_op: ScopedFlatMap<OperationId, (Finished, u32)>,
+    /// Optional lookup index used only when `retained_operations > 256`; for
+    /// small rings (e.g. production `128`), `remember_finished` is an O(1)
+    /// overwrite with zero hashing or cloning, and cold late-result lookups
+    /// scan the small ring directly.
+    finished_by_op: Option<ScopedFlatMap<OperationId, (Finished, u32)>>,
     /// The latest connections that were closed; see `OwnerConfig`.
     closed: BoundedQueue<ConnectionGeneration>,
     closed_set: BTreeSet<ConnectionGeneration>,
@@ -1006,18 +1181,12 @@ fn table<T>(bound: NonZeroU32) -> Result<BoundedVec<T>, AllocationFailed> {
     BoundedVec::with_capacity(usize::try_from(bound.get()).map_err(|_| AllocationFailed)?)
 }
 
-fn ring<T>(bound: NonZeroU32) -> Result<BoundedQueue<T>, AllocationFailed> {
-    BoundedQueue::with_capacity(usize::try_from(bound.get()).map_err(|_| AllocationFailed)?)
+fn slab<T>(bound: NonZeroU32) -> Result<BoundedSlab<T>, AllocationFailed> {
+    BoundedSlab::with_capacity(usize::try_from(bound.get()).map_err(|_| AllocationFailed)?)
 }
 
-/// Keeps `item` as the latest of `ring`, forgetting the oldest when the
-/// ring is full. The capacity is not zero, so it never refuses.
-fn remember<T>(ring: &mut BoundedQueue<T>, item: T) -> Result<(), CoreFault> {
-    if ring.len() == ring.capacity() {
-        let _ = ring.pop_front();
-    }
-    ring.try_push_back(item)
-        .map_err(|_| CoreFault::ReservationOverrun)
+fn ring<T>(bound: NonZeroU32) -> Result<BoundedQueue<T>, AllocationFailed> {
+    BoundedQueue::with_capacity(usize::try_from(bound.get()).map_err(|_| AllocationFailed)?)
 }
 
 fn capacity_of(bound: usize) -> u64 {
@@ -1074,7 +1243,7 @@ impl Owner {
             Ok::<_, AllocationFailed>((
                 table(config.max_routes)?,
                 table(config.max_sessions)?,
-                table(config.max_exchanges)?,
+                slab(config.max_exchanges)?,
                 LeaseTable::new(config.account, credit, config.max_exchanges)?,
                 ring(config.retained_operations)?,
                 ring(config.remembered_connections)?,
@@ -1114,12 +1283,18 @@ impl Owner {
             slot_by_deadline: FlatMap::new(),
             slot_by_effect: ScopedFlatMap::with_scope((id.epoch(), id.owner())),
             slots_by_session: FlatMap::new(),
+            held_answers: 0,
+            unanswered_slots: 0,
+            last_observed_puback_ignored: false,
+            last_step_may_unblock_work: true,
+            last_inline_ready_target: None,
             session_qos2_exchanges: usize::try_from(config.session_qos2_exchanges.get())
                 .unwrap_or(usize::MAX),
             release_retry_slots: BTreeSet::new(),
             leases,
             finished,
-            finished_by_op: ScopedFlatMap::with_scope((id.incarnation(), id.epoch(), id.owner())),
+            finished_by_op: (config.retained_operations.get() > 256)
+                .then(|| ScopedFlatMap::with_scope((id.incarnation(), id.epoch(), id.owner()))),
             closed,
             closed_set: BTreeSet::new(),
             resolution_delay: config.resolution_delay,
@@ -1354,25 +1529,35 @@ impl Owner {
     }
 
     fn remember_finished(&mut self, item: Finished) -> Result<(), CoreFault> {
+        let Some(index) = self.finished_by_op.as_mut() else {
+            if self.finished.len() == self.finished.capacity() {
+                let _ = self.finished.pop_front();
+            }
+            return self
+                .finished
+                .try_push_back(item)
+                .map_err(|_| CoreFault::ReservationOverrun);
+        };
         if self.finished.len() == self.finished.capacity()
             && let Some(evicted) = self.finished.pop_front()
-            && let Some((_, count)) = self.finished_by_op.get_mut(&evicted.operation)
+            && let Some((_, count)) = index.get_mut(&evicted.operation)
         {
             *count = count.saturating_sub(1);
             if *count == 0 {
-                self.finished_by_op.remove(&evicted.operation);
+                index.remove(&evicted.operation);
             }
         }
+        let op = item.operation;
         self.finished
-            .try_push_back(item)
+            .try_push_back(item.clone())
             .map_err(|_| CoreFault::ReservationOverrun)?;
-        match self.finished_by_op.get_mut(&item.operation) {
+        match index.get_mut(&op) {
             Some((stored, count)) => {
                 *stored = item;
                 *count = count.saturating_add(1);
             }
             None => {
-                self.finished_by_op.insert(item.operation, (item, 1));
+                index.insert(op, (item, 1));
             }
         }
         Ok(())
@@ -1472,118 +1657,125 @@ impl Owner {
             self.sessions.as_mut_slice().swap(index, last);
         }
         let removed = self.sessions.pop().ok_or(CoreFault::StalePlan)?;
+        if self
+            .slots_by_session
+            .get(&removed.id)
+            .is_some_and(SmallIndexSet::is_empty)
+        {
+            self.slots_by_session.remove(&removed.id);
+        }
+        self.pubsub.drop_session_cache(removed.id);
         if index != last {
             self.index_session(index);
         }
         Ok(removed)
     }
 
-    fn index_slot(&mut self, index: usize) {
-        let slot = self.slots.as_slice()[index];
-        self.slots_by_session
-            .get_or_insert_default(slot.session)
-            .insert(index);
-        match slot.state {
+    fn index_slot_state(&mut self, index: usize) {
+        let slot = &self.slots[index];
+        let session = slot.session;
+        let packet_id = slot.packet_id;
+        match &slot.state {
             SlotState::AckPending { effect, .. } => {
-                self.slot_by_effect.insert(effect, index);
+                self.slot_by_effect.insert(*effect, index);
             }
-            SlotState::AdmissionPending(f) | SlotState::ReleasePending(f) => {
-                self.slot_by_key
-                    .insert((slot.session, slot.packet_id), index);
-                self.slot_by_op.insert(f.operation, index);
-                self.slot_by_deadline.insert(f.deadline, index);
+            SlotState::AdmissionPending(f) => {
+                let op = f.operation;
+                let dl = f.deadline;
+                self.slot_by_key.insert((session, packet_id), index);
+                self.slot_by_op.insert(op, index);
+                self.slot_by_deadline.insert(dl, index);
+                self.unanswered_slots += 1;
+            }
+            SlotState::ReleasePending(f) => {
+                let op = f.operation;
+                let dl = f.deadline;
+                self.slot_by_key.insert((session, packet_id), index);
+                self.slot_by_op.insert(op, index);
+                self.slot_by_deadline.insert(dl, index);
             }
             SlotState::ReleaseRetry(_) => {
-                self.slot_by_key
-                    .insert((slot.session, slot.packet_id), index);
+                self.slot_by_key.insert((session, packet_id), index);
                 self.release_retry_slots.insert(index);
             }
-            SlotState::AwaitPubrel | SlotState::AnswerHeld { .. } => {
-                self.slot_by_key
-                    .insert((slot.session, slot.packet_id), index);
+            SlotState::AnswerHeld { .. } => {
+                self.slot_by_key.insert((session, packet_id), index);
+                self.held_answers += 1;
+                self.unanswered_slots += 1;
+            }
+            SlotState::AwaitPubrel => {
+                self.slot_by_key.insert((session, packet_id), index);
             }
         }
+    }
+
+    fn unindex_slot_state(&mut self, index: usize) {
+        let slot = &self.slots[index];
+        let session = slot.session;
+        let packet_id = slot.packet_id;
+        match &slot.state {
+            SlotState::AckPending { effect, .. } => {
+                let effect = *effect;
+                self.slot_by_effect.remove(&effect);
+            }
+            SlotState::AdmissionPending(f) => {
+                let op = f.operation;
+                let dl = f.deadline;
+                self.slot_by_key.remove(&(session, packet_id));
+                self.slot_by_op.remove(&op);
+                self.slot_by_deadline.remove(&dl);
+                self.unanswered_slots = self.unanswered_slots.saturating_sub(1);
+            }
+            SlotState::ReleasePending(f) => {
+                let op = f.operation;
+                let dl = f.deadline;
+                self.slot_by_key.remove(&(session, packet_id));
+                self.slot_by_op.remove(&op);
+                self.slot_by_deadline.remove(&dl);
+            }
+            SlotState::ReleaseRetry(_) => {
+                self.slot_by_key.remove(&(session, packet_id));
+                self.release_retry_slots.remove(&index);
+            }
+            SlotState::AnswerHeld { .. } => {
+                self.slot_by_key.remove(&(session, packet_id));
+                self.held_answers = self.held_answers.saturating_sub(1);
+                self.unanswered_slots = self.unanswered_slots.saturating_sub(1);
+            }
+            SlotState::AwaitPubrel => {
+                self.slot_by_key.remove(&(session, packet_id));
+            }
+        }
+    }
+
+    fn index_slot(&mut self, index: usize) {
+        let session = self.slots[index].session;
+        self.slots_by_session
+            .get_or_insert_default(session)
+            .insert(index);
+        self.index_slot_state(index);
     }
 
     fn unindex_slot(&mut self, index: usize) {
-        let slot = self.slots.as_slice()[index];
-        if let Some(set) = self.slots_by_session.get_mut(&slot.session) {
+        let session = self.slots[index].session;
+        if let Some(set) = self.slots_by_session.get_mut(&session) {
             set.remove(&index);
-            if set.is_empty() {
-                self.slots_by_session.remove(&slot.session);
-            }
         }
-        match slot.state {
-            SlotState::AckPending { effect, .. } => {
-                self.slot_by_effect.remove(&effect);
-            }
-            SlotState::AdmissionPending(f) | SlotState::ReleasePending(f) => {
-                self.slot_by_key.remove(&(slot.session, slot.packet_id));
-                self.slot_by_op.remove(&f.operation);
-                self.slot_by_deadline.remove(&f.deadline);
-            }
-            SlotState::ReleaseRetry(_) => {
-                self.slot_by_key.remove(&(slot.session, slot.packet_id));
-                self.release_retry_slots.remove(&index);
-            }
-            SlotState::AwaitPubrel | SlotState::AnswerHeld { .. } => {
-                self.slot_by_key.remove(&(slot.session, slot.packet_id));
-            }
-        }
-    }
-
-    fn reindex_moved_slot(&mut self, from: usize, to: usize) {
-        let slot = self.slots.as_slice()[to];
-        if let Some(set) = self.slots_by_session.get_mut(&slot.session) {
-            set.replace(from, to);
-        }
-        match slot.state {
-            SlotState::AckPending { effect, .. } => {
-                self.slot_by_effect.insert(effect, to);
-            }
-            SlotState::AdmissionPending(f) | SlotState::ReleasePending(f) => {
-                self.slot_by_key.insert((slot.session, slot.packet_id), to);
-                self.slot_by_op.insert(f.operation, to);
-                self.slot_by_deadline.insert(f.deadline, to);
-            }
-            SlotState::ReleaseRetry(_) => {
-                self.slot_by_key.insert((slot.session, slot.packet_id), to);
-                self.release_retry_slots.remove(&from);
-                self.release_retry_slots.insert(to);
-            }
-            SlotState::AwaitPubrel | SlotState::AnswerHeld { .. } => {
-                self.slot_by_key.insert((slot.session, slot.packet_id), to);
-            }
-        }
+        self.unindex_slot_state(index);
     }
 
     fn push_slot(&mut self, slot: Slot) -> Result<(), CoreFault> {
-        let index = self.slots.len();
-        self.slots
-            .try_push(slot)
-            .map_err(|_| CoreFault::StalePlan)?;
+        let index = self.slots.insert(slot).map_err(|_| CoreFault::StalePlan)?;
         self.index_slot(index);
         Ok(())
     }
 
     fn remove_slot_at(&mut self, index: usize) -> Result<Slot, CoreFault> {
-        let last = self
-            .slots
-            .len()
-            .checked_sub(1)
-            .ok_or(CoreFault::StalePlan)?;
-        if index > last {
+        if self.slots.get(index).is_none() {
             return Err(CoreFault::StalePlan);
         }
         self.unindex_slot(index);
-        if index != last {
-            self.slots.as_mut_slice().swap(index, last);
-        }
-        let removed = self.slots.pop().ok_or(CoreFault::StalePlan)?;
-        if index != last {
-            self.reindex_moved_slot(last, index);
-        }
-        Ok(removed)
+        self.slots.remove(index).ok_or(CoreFault::StalePlan)
     }
 
     /// The exchange the session holds under this Packet Identifier, and
@@ -1594,10 +1786,7 @@ impl Owner {
         session: SessionId,
         packet_id: InboundPacketId,
     ) -> Option<(ExchangeId, ExchangePhase)> {
-        let slot = self
-            .slots
-            .as_slice()
-            .get(self.slot_of(session, packet_id)?)?;
+        let slot = self.slots.get(self.slot_of(session, packet_id)?)?;
         let phase = match slot.state {
             SlotState::AdmissionPending(_) => ExchangePhase::AdmissionPending,
             SlotState::AwaitPubrel => ExchangePhase::AwaitPubrel,
@@ -1610,71 +1799,218 @@ impl Owner {
         Some((slot.exchange, phase))
     }
 
+    /// Whether any inbound exchange currently has an answer held behind an
+    /// earlier unanswered PUBLISH on the same connection.
+    #[must_use]
+    pub fn has_held_answers(&self) -> bool {
+        self.held_answers != 0
+    }
+
+    /// Whether the last applied transition could have unblocked outbound
+    /// pub/sub work (returns `false` only when provably no work became ready).
+    #[must_use]
+    pub fn last_step_may_unblock_work(&self) -> bool {
+        self.last_step_may_unblock_work
+    }
+
+    /// Target session of an inline-claimed admission whose resolution may have
+    /// left ready work to re-arm.
+    #[must_use]
+    pub fn last_inline_ready_target(&self) -> Option<SessionId> {
+        self.last_inline_ready_target
+    }
+
+    /// Whether the owner's effect outbox is currently empty.
+    #[must_use]
+    pub fn outbox_is_empty(&self) -> bool {
+        self.outbox.is_empty()
+    }
+
+    /// Whether the last applied `Input::ObservedPuback` did not match any
+    /// current delivery occurrence on its connection.
+    #[must_use]
+    pub fn last_observed_puback_ignored(&self) -> bool {
+        self.last_observed_puback_ignored
+    }
+
     /// Applies `input` entirely, or hands it back intact (DEM-006).
     ///
     /// A refusal keeps the input, the state, the identity counters, the
     /// account, the reservations held and the content of the box as they
     /// were.
     pub fn step(&mut self, input: Input, grant: TurnGrant) -> StepOutcome {
-        self.step_into(input, grant)
+        self.step_with_sink(input, grant, None).0
     }
 
-    fn step_into(&mut self, input: Input, grant: TurnGrant) -> StepOutcome {
-        let plan = match self.plan(&input, grant) {
-            Ok(plan) => plan,
-            Err(Refusal { stop, work_used }) => {
-                return match stop {
-                    Stop::Need(need) => StepOutcome::NeedCapacity {
-                        input,
-                        need,
-                        work_used,
+    /// Applies `input` and, when the outbox is empty and has no live
+    /// reservations, dispatches the transition's effects straight into `sink`
+    /// without passing them through the outbox queue. Refused effects fall back
+    /// into the outbox in exact FIFO order.
+    pub fn step_and_dispatch(
+        &mut self,
+        input: Input,
+        grant: TurnGrant,
+        sink: &mut dyn EffectSink,
+    ) -> (StepOutcome, usize) {
+        self.step_with_sink(input, grant, Some(sink))
+    }
+
+    fn step_with_sink(
+        &mut self,
+        input: Input,
+        grant: TurnGrant,
+        sink: Option<&mut dyn EffectSink>,
+    ) -> (StepOutcome, usize) {
+        self.last_observed_puback_ignored = false;
+        self.last_step_may_unblock_work = true;
+        self.last_inline_ready_target = None;
+        let planned_work = self.cost(&input);
+        if let Some(missing) = planned_work.checked_sub(grant.work_limit)
+            && missing > WorkUnits::ZERO
+        {
+            return (
+                StepOutcome::NeedCapacity {
+                    input,
+                    need: CapacityNeed {
+                        resource: Resource::Work,
+                        amount: missing.get(),
+                        wake: WakeCondition::TurnGranted,
                     },
-                    Stop::Exhausted(exhaustion) => StepOutcome::Exhausted {
-                        input,
-                        exhaustion,
-                        work_used,
+                    work_used: WorkUnits::ZERO,
+                },
+                0,
+            );
+        }
+        let mut draft = Draft {
+            epoch: self.epoch,
+            owner: self.id,
+            counters: self.counters,
+            effects: Effects {
+                items: [None, None, None],
+                count: 0,
+            },
+            progress: Progress::Complete,
+            closed: None,
+            receipt_issued: None,
+            receipt_consumed: None,
+            released: None,
+            inline_outcome: None,
+            non_inline_resolved: None,
+        };
+        let change = match self
+            .revision
+            .checked_next()
+            .map_or(Err(Stop::Exhausted(Exhaustion::IdentityCounter)), |_| {
+                self.plan_change(&input, &mut draft)
+            }) {
+            Ok(change) => change,
+            Err(stop) => {
+                return (
+                    match stop {
+                        Stop::Need(need) => StepOutcome::NeedCapacity {
+                            input,
+                            need,
+                            work_used: planned_work,
+                        },
+                        Stop::Exhausted(exhaustion) => StepOutcome::Exhausted {
+                            input,
+                            exhaustion,
+                            work_used: planned_work,
+                        },
+                        Stop::Fatal(fault) => StepOutcome::Fatal(fault),
                     },
-                    Stop::Fatal(fault) => StepOutcome::Fatal(fault),
-                };
+                    0,
+                );
             }
         };
+        let cleanup = if draft.closed.is_some() {
+            capacity_of(self.slots.capacity())
+                .min(32)
+                .saturating_mul(3)
+                .saturating_add(capacity_of(self.sessions.capacity()).min(16))
+                .saturating_add(self.pubsub.close_work())
+        } else {
+            0
+        };
+        let work_used = WorkUnits::new(planned_work.get().saturating_add(cleanup));
+        if let Some(missing) = work_used.checked_sub(grant.work_limit)
+            && missing > WorkUnits::ZERO
+        {
+            return (
+                StepOutcome::NeedCapacity {
+                    input,
+                    need: CapacityNeed {
+                        resource: Resource::Work,
+                        amount: missing.get(),
+                        wake: WakeCondition::TurnGranted,
+                    },
+                    work_used: planned_work,
+                },
+                0,
+            );
+        }
         if self.receipts.enabled
             && !self.receipts.maintenance_input(&input)
-            && plan.effects.count > 0
-            && self.outbox.free_slots() < plan.effects.count.saturating_add(2)
+            && draft.effects.count > 0
+            && self.outbox.free_slots() < draft.effects.count.saturating_add(2)
         {
-            return StepOutcome::NeedCapacity {
-                input,
-                need: CapacityNeed {
-                    resource: Resource::EffectSlots,
-                    amount: u64::try_from(
-                        plan.effects.count.saturating_add(2) - self.outbox.free_slots(),
-                    )
-                    .unwrap_or(u64::MAX),
-                    wake: WakeCondition::EffectAccepted,
+            return (
+                StepOutcome::NeedCapacity {
+                    input,
+                    need: CapacityNeed {
+                        resource: Resource::EffectSlots,
+                        amount: u64::try_from(
+                            draft.effects.count.saturating_add(2) - self.outbox.free_slots(),
+                        )
+                        .unwrap_or(u64::MAX),
+                        wake: WakeCondition::EffectAccepted,
+                    },
+                    work_used: planned_work,
                 },
-                work_used: plan.planned_work,
-            };
+                0,
+            );
         }
-        let work_used = plan.work;
-        let planned_work = plan.planned_work;
-        // The last acquisition, and the only one a plan cannot check: one
-        // reservation for all the slots of the plan.
-        let reservation = match NonZeroUsize::new(plan.effects.count) {
-            None => None,
-            Some(slots) => match self.outbox.reserve(slots) {
+        let direct_sink =
+            sink.filter(|_| self.outbox.is_empty() && !self.outbox.has_live_reservations());
+        let reservation = match (
+            NonZeroUsize::new(draft.effects.count),
+            direct_sink.is_some(),
+        ) {
+            (None, _) => None,
+            (Some(slots), true) => {
+                if let Err(refusal) = self.outbox.check_reserve(slots) {
+                    return (
+                        StepOutcome::reservation_refused(input, refusal, planned_work),
+                        0,
+                    );
+                }
+                None
+            }
+            (Some(slots), false) => match self.outbox.reserve(slots) {
                 Ok(key) => Some(key),
                 Err(refusal) => {
-                    return StepOutcome::reservation_refused(input, refusal, planned_work);
+                    return (
+                        StepOutcome::reservation_refused(input, refusal, planned_work),
+                        0,
+                    );
                 }
             },
         };
-        match self.apply(plan, input, reservation) {
-            Ok(progress) => StepOutcome::Applied {
-                work_used,
-                progress,
-            },
-            Err(fault) => StepOutcome::Fatal(fault),
+        if matches!(input, Input::ObservedPuback { .. })
+            && matches!(change, Change::Nothing)
+            && draft.closed.is_none()
+        {
+            self.last_observed_puback_ignored = true;
+        }
+        match self.apply_draft(draft, change, input, reservation, direct_sink) {
+            Ok((progress, accepted)) => (
+                StepOutcome::Applied {
+                    work_used,
+                    progress,
+                },
+                accepted,
+            ),
+            Err(fault) => (StepOutcome::Fatal(fault), 0),
         }
     }
 
@@ -1730,97 +2066,6 @@ impl Owner {
             work = work.saturating_add(routes.saturating_mul(sessions).saturating_add(1));
         }
         WorkUnits::new(work)
-    }
-
-    /// Computes the transition of `input` and mutates nothing.
-    fn plan(&self, input: &Input, grant: TurnGrant) -> Result<Plan, Refusal> {
-        let work = self.cost(input);
-        if let Some(missing) = work.checked_sub(grant.work_limit)
-            && missing > WorkUnits::ZERO
-        {
-            // Refused before anything was read: no work was spent.
-            return Err(Refusal {
-                stop: Stop::Need(CapacityNeed {
-                    resource: Resource::Work,
-                    amount: missing.get(),
-                    wake: WakeCondition::TurnGranted,
-                }),
-                work_used: WorkUnits::ZERO,
-            });
-        }
-        let mut draft = Draft {
-            epoch: self.epoch,
-            owner: self.id,
-            counters: self.counters,
-            effects: Effects {
-                items: [None, None, None],
-                count: 0,
-            },
-            progress: Progress::Complete,
-            closed: None,
-            receipt_issued: None,
-            receipt_consumed: None,
-            released: None,
-            inline_outcome: None,
-            non_inline_resolved: None,
-        };
-        let planned = self
-            .revision
-            .checked_next()
-            .map_or(Err(Stop::Exhausted(Exhaustion::IdentityCounter)), |_| {
-                self.plan_change(input, &mut draft)
-            });
-        match planned {
-            Ok(change) => {
-                // Once the plan identifies a closed generation, its indexed
-                // per-session ACK and connection cleanup is charged before any
-                // mutation or effect reservation (ADR 0051).
-                let cleanup = if draft.closed.is_some() {
-                    capacity_of(self.slots.capacity())
-                        .min(32)
-                        .saturating_mul(3)
-                        .saturating_add(capacity_of(self.sessions.capacity()).min(16))
-                        .saturating_add(self.pubsub.close_work())
-                } else {
-                    0
-                };
-                let total = WorkUnits::new(work.get().saturating_add(cleanup));
-                if let Some(missing) = total.checked_sub(grant.work_limit)
-                    && missing > WorkUnits::ZERO
-                {
-                    return Err(Refusal {
-                        stop: Stop::Need(CapacityNeed {
-                            resource: Resource::Work,
-                            amount: missing.get(),
-                            wake: WakeCondition::TurnGranted,
-                        }),
-                        work_used: work,
-                    });
-                }
-                Ok(Plan {
-                    stamp: PlanStamp {
-                        owner: self.id,
-                        state_revision: self.revision,
-                    },
-                    work: total,
-                    planned_work: work,
-                    counters: draft.counters,
-                    change,
-                    effects: draft.effects,
-                    progress: draft.progress,
-                    closed: draft.closed,
-                    receipt_issued: draft.receipt_issued,
-                    receipt_consumed: draft.receipt_consumed,
-                    released: draft.released,
-                    inline_outcome: draft.inline_outcome,
-                    non_inline_resolved: draft.non_inline_resolved,
-                })
-            }
-            Err(stop) => Err(Refusal {
-                stop,
-                work_used: work,
-            }),
-        }
     }
 
     fn plan_change(&self, input: &Input, draft: &mut Draft) -> Result<Change, Stop> {
@@ -2094,7 +2339,7 @@ impl Owner {
             )?;
         }
         Ok(Change::Establish {
-            session: Session {
+            session: alloc::boxed::Box::new(Session {
                 id: session,
                 client_id: client_id.clone(),
                 revision,
@@ -2103,7 +2348,7 @@ impl Owner {
                 opened_by: None,
                 detached: None,
                 will_managed: false,
-            },
+            }),
         })
     }
 
@@ -2249,7 +2494,7 @@ impl Owner {
                 let Some(slot) = self.slot_of(session.id, packet_id) else {
                     return self.plan_admission(index, (connection, ingress_order), packet, draft);
                 };
-                let held = self.slots.as_slice()[slot];
+                let held = &self.slots[slot];
                 if held.qos != *qos {
                     return protocol_error(draft);
                 }
@@ -2308,7 +2553,7 @@ impl Owner {
                     draft.frame(key, frame)?;
                     return Ok(Change::Nothing);
                 };
-                let held = self.slots.as_slice()[slot];
+                let held = &self.slots[slot];
                 if held.qos != Qos::ExactlyOnce {
                     return protocol_error(draft);
                 }
@@ -2477,10 +2722,9 @@ impl Owner {
         if qos == Qos::ExactlyOnce
             && let Some(held) = self.slots_by_session.get(&source.id)
         {
-            let slots = self.slots.as_slice();
             let exchanges = || {
                 held.iter()
-                    .map(|index| &slots[*index])
+                    .map(|index| &self.slots[index])
                     .filter(|slot| slot.qos == Qos::ExactlyOnce)
             };
             if exchanges().count() >= self.session_qos2_exchanges {
@@ -2514,7 +2758,8 @@ impl Owner {
             .unwrap_or(u64::MAX)
             .checked_add(u64::from(*retain && !payload.is_empty()))
             .ok_or(IMPOSSIBLE)?;
-        let mut list = BoundedVec::with_capacity(targets).map_err(Stop::from)?;
+        let mut list =
+            crate::contract::command::TargetVec::with_capacity(targets).map_err(Stop::from)?;
 
         let generation = draw(&mut draft.counters.generation, next_generation)?;
         let exchange = ExchangeId {
@@ -2583,8 +2828,8 @@ impl Owner {
             },
             targets: list,
         };
-        let mut inline_claim_plan: Option<alloc::boxed::Box<InlineClaimPlan>> = None;
-        let mut dirty_targets = alloc::vec::Vec::new();
+        let mut inline_claim_plan: Option<InlineClaimPlan> = None;
+        let mut dirty_targets: Option<alloc::boxed::Box<[SessionId]>> = None;
         let recipe = if *retain || expiry.is_some() {
             let retain_targets = if *retain {
                 let mut iter = selected.iter();
@@ -2611,20 +2856,13 @@ impl Owner {
             && let Some(only) = selected.iter().next().copied()
             && let Some((target_gen, out_packet_id)) = self.plan_inline_claim(only, length)
         {
-            inline_claim_plan = Some(alloc::boxed::Box::new(InlineClaimPlan {
-                delivery: DeliveryId {
-                    publication,
-                    index: 0,
-                },
+            inline_claim_plan = Some(InlineClaimPlan {
                 target: only.session,
                 target_revision: only.revision,
                 qos: only.qos,
                 packet_id: out_packet_id,
                 generation: target_gen,
-                topic: topic.clone(),
-                payload: payload.clone(),
-                properties: properties.clone(),
-            }));
+            });
             Recipe::ClaimedPublication(ClaimedPublication {
                 admission,
                 claim: InlineClaim {
@@ -2636,10 +2874,11 @@ impl Owner {
             Recipe::AdmitPublication(admission)
         };
         if self.inline_claim_enabled && inline_claim_plan.is_none() && targets > 0 {
-            dirty_targets.reserve(targets);
+            let mut vec = alloc::vec::Vec::with_capacity(targets);
             for target in selected.iter() {
-                dirty_targets.push(target.session);
+                vec.push(target.session);
             }
+            dirty_targets = Some(vec.into_boxed_slice());
         }
         let recipe = if let Some(props) = properties {
             Recipe::AnnotatedPublication(crate::contract::command::AnnotatedPublication {
@@ -2698,8 +2937,8 @@ impl Owner {
             }
             let Some((slot, refused)) =
                 self.release_retry_slots.first().copied().and_then(|slot| {
-                    match self.slots.as_slice()[slot].state {
-                        SlotState::ReleaseRetry(refused) => Some((slot, refused)),
+                    match &self.slots[slot].state {
+                        SlotState::ReleaseRetry(refused) => Some((slot, (**refused).clone())),
                         _ => None,
                     }
                 })
@@ -2727,7 +2966,7 @@ impl Owner {
         refused: Option<Finished>,
         draft: &mut Draft,
     ) -> Result<Change, Stop> {
-        let held = &self.slots.as_slice()[slot];
+        let held = &self.slots[slot];
         let operation = self.operation(draft)?;
         let recipe = Recipe::ReleaseInbound(ReleaseInbound {
             operation,
@@ -2762,12 +3001,20 @@ impl Owner {
     /// or its own answer held. `seen` replaces what the state says of the
     /// one slot the transition being planned changes.
     fn preceded(&self, session: SessionId, order: u64, seen: Option<Seen>) -> bool {
+        if seen.is_none() && self.unanswered_slots == 0 {
+            return false;
+        }
         let Some(indices) = self.slots_by_session.get(&session) else {
             return false;
         };
-        let slots = self.slots.as_slice();
-        indices.iter().any(|&index| {
-            let slot = &slots[index];
+        if seen.is_none() && indices.len() <= 1 {
+            return false;
+        }
+        let Some(generation) = self.connection_of(session) else {
+            return false;
+        };
+        indices.iter().any(|index| {
+            let slot = &self.slots[index];
             let unanswered = match seen {
                 Some(seen) if seen.slot == index => seen.order,
                 _ if matches!(
@@ -2775,7 +3022,9 @@ impl Owner {
                     SlotState::AdmissionPending(_) | SlotState::AnswerHeld { .. }
                 ) =>
                 {
-                    self.place(slot)
+                    slot.publish_origin
+                        .filter(|(origin, _)| *origin == generation)
+                        .map(|(_, order)| order)
                 }
                 _ => None,
             };
@@ -2785,6 +3034,13 @@ impl Owner {
 
     /// Whether the answer of `slot` must wait its turn.
     fn must_wait(&self, slot: &Slot) -> bool {
+        let self_unanswered = matches!(
+            slot.state,
+            SlotState::AdmissionPending(_) | SlotState::AnswerHeld { .. }
+        );
+        if self.unanswered_slots <= usize::from(self_unanswered) {
+            return false;
+        }
         self.place(slot)
             .is_some_and(|order| self.preceded(slot.session, order, None))
     }
@@ -2799,7 +3055,10 @@ impl Owner {
         seen: Option<Seen>,
         draft: &mut Draft,
     ) -> Result<(), Stop> {
-        if draft.released.is_some() || draft.effects.count >= MAX_TRANSITION_EFFECTS {
+        if self.held_answers == 0
+            || draft.released.is_some()
+            || draft.effects.count >= MAX_TRANSITION_EFFECTS
+        {
             return Ok(());
         }
         let Some(generation) = self.connection_of(session) else {
@@ -2812,14 +3071,12 @@ impl Owner {
             Some(seen) if seen.slot == index => seen.order,
             _ => self.place(slot),
         };
-        let slots = self.slots.as_slice();
         let oldest = indices
             .iter()
-            .copied()
             // A slot the transition answers itself holds nothing to release.
             .filter(|index| !seen.is_some_and(|seen| seen.slot == *index && seen.order.is_none()))
             .filter_map(|index| {
-                let slot = &slots[index];
+                let slot = &self.slots[index];
                 match slot.state {
                     SlotState::AnswerHeld { frame, .. } => Some((place(index, slot), index, frame)),
                     _ => None,
@@ -2889,7 +3146,7 @@ impl Owner {
         reason: PubackReason,
         draft: &mut Draft,
     ) -> Result<Change, Stop> {
-        let slot = &self.slots.as_slice()[index];
+        let slot = &self.slots[index];
         let frame = OutboundFrame::Puback {
             packet_id: slot.packet_id,
             reason,
@@ -2928,6 +3185,9 @@ impl Owner {
         draft: &mut Draft,
     ) -> Result<Change, Stop> {
         let change = self.plan_result_change(effect, operation, reply, draft)?;
+        if self.held_answers == 0 {
+            return Ok(change);
+        }
         let (index, seen) = match change {
             Change::Committed { slot, .. }
             | Change::AckReady { slot, .. }
@@ -2936,7 +3196,7 @@ impl Owner {
             Change::Hold { slot, .. } => (slot, None),
             _ => return Ok(change),
         };
-        let session = self.slots.as_slice()[index].session;
+        let session = self.slots[index].session;
         self.plan_held_release(session, seen, draft)?;
         Ok(change)
     }
@@ -2956,21 +3216,24 @@ impl Owner {
             return Err(IMPOSSIBLE);
         }
         let contradiction = Stop::Fatal(CoreFault::ContradictoryOutcome { operation });
-        if let Some(change) = self.plan_session_result(effect, operation, reply, draft)? {
+        if self.lifecycle.is_some()
+            && let Some(change) = self.plan_session_result(effect, operation, reply, draft)?
+        {
             return Ok(change);
         }
-        if let Some(change) = self.plan_will_result(effect, operation, reply, draft)? {
+        if self.wills.has_flight()
+            && let Some(change) = self.plan_will_result(effect, operation, reply, draft)?
+        {
             return Ok(change);
         }
         if let Some(change) = self.plan_pubsub_result(effect, operation, reply, draft)? {
             return Ok(change);
         }
-        let slots = self.slots.as_slice();
         let waiting = self.slot_by_op.get(&operation).copied();
         let Some(index) = waiting else {
             return self.plan_late_result(effect, operation, reply);
         };
-        let slot = &slots[index];
+        let slot = &self.slots[index];
         let Some(in_flight) = slot.in_flight() else {
             return Err(IMPOSSIBLE);
         };
@@ -2990,12 +3253,8 @@ impl Owner {
         let verdict = in_flight
             .phase
             .on(CommandEvent::StoreResult(OutcomeClass::of(&outcome)));
-        let finished = |phase, facts| Finished {
-            operation,
-            answers: in_flight.answers,
-            phase,
-            facts,
-        };
+        let finished =
+            |phase, facts| Finished::new(operation, in_flight.answers.clone(), phase, facts);
         match (verdict, outcome) {
             (Verdict::Transition(CommandPhase::Committed), StoreOutcome::Committed(facts)) => {
                 let expected = if admission {
@@ -3151,24 +3410,27 @@ impl Owner {
         operation: OperationId,
         reply: &StoreReply,
     ) -> Result<Change, Stop> {
-        let known = self
-            .finished_by_op
-            .get(&operation)
-            .map(|(item, _)| *item)
-            .or_else(|| self.pubsub.known(operation))
-            .or_else(|| {
-                self.slots
-                    .as_slice()
-                    .iter()
-                    .filter_map(|slot| slot.admission)
-                    .chain(self.release_retry_slots.iter().filter_map(|&idx| {
-                        match self.slots.as_slice()[idx].state {
-                            SlotState::ReleaseRetry(finished) => Some(finished),
-                            _ => None,
-                        }
-                    }))
-                    .find(|finished| finished.operation == operation)
-            });
+        let known: Option<&Finished> = match self.finished_by_op.as_ref() {
+            Some(index) => index.get(&operation).map(|(item, _)| item),
+            None => self
+                .finished
+                .iter()
+                .filter(|item| item.operation == operation)
+                .last(),
+        }
+        .or_else(|| self.pubsub.known(operation))
+        .or_else(|| {
+            self.slots
+                .values()
+                .filter_map(|slot| slot.admission.as_ref())
+                .chain(self.release_retry_slots.iter().filter_map(|&idx| {
+                    match &self.slots[idx].state {
+                        SlotState::ReleaseRetry(finished) => Some(finished.as_ref()),
+                        _ => None,
+                    }
+                }))
+                .find(|finished| finished.operation == operation)
+        });
         let Some(known) = known else {
             return Ok(Change::Nothing);
         };
@@ -3189,8 +3451,8 @@ impl Owner {
         if known.phase.on(event) == Verdict::Fault {
             return Err(contradiction);
         }
-        if let (StoreOutcome::Committed(facts), Some(established)) = (outcome, known.facts)
-            && facts != established
+        if let StoreOutcome::Committed(facts) = outcome
+            && !known.facts_match(facts)
         {
             return Err(contradiction);
         }
@@ -3218,7 +3480,7 @@ impl Owner {
             .get(&token)
             .copied()
             .and_then(|index| {
-                let held = self.slots.as_slice()[index].in_flight()?;
+                let held = self.slots[index].in_flight()?;
                 (held.deadline == token).then_some((index, held))
             });
         // A deadline of an operation that is resolved, or that a later
@@ -3254,10 +3516,7 @@ impl Owner {
         progress: FrameProgress,
         draft: &mut Draft,
     ) -> Result<Change, Stop> {
-        if let Some(change) = self.plan_qos0_frame(effect, connection, progress, draft)? {
-            return Ok(change);
-        }
-        if let Some(change) = self.plan_pubsub_frame(effect, connection, progress, draft)? {
+        if let Some(change) = self.plan_qos0_or_pubsub_frame(effect, connection, progress, draft)? {
             return Ok(change);
         }
         let failed = matches!(progress, FrameProgress::Failed);
@@ -3266,7 +3525,7 @@ impl Owner {
             FrameProgress::Written { confirmed, total } if total > 0 && confirmed == total
         );
         let ended = self.slot_by_effect.get(&effect).copied().and_then(|index| {
-            let slot = self.slots.as_slice()[index];
+            let slot = &self.slots[index];
             let SlotState::AckPending {
                 effect: held,
                 connection: destination,
@@ -3274,7 +3533,7 @@ impl Owner {
             else {
                 return None;
             };
-            (held == effect && destination == connection).then_some((index, slot.admission))
+            (held == effect && destination == connection).then(|| (index, slot.admission.clone()))
         });
         // The receipt of a frame of the current connection is where the
         // next held answer of its session leaves (record 0050): each
@@ -3413,7 +3672,7 @@ impl Owner {
                     let older = generation_epoch(exchange.generation) < self.epoch.get();
                     self.slots.len() + same.len() < self.slots.capacity()
                         && session_named(sessions, exchange.session)
-                        && !self.slots.as_slice().iter().any(|held| {
+                        && !self.slots.values().any(|held| {
                             held.exchange == *exchange
                                 || (held.session == exchange.session && held.packet_id == *packet_id)
                         })
@@ -3459,20 +3718,17 @@ impl Owner {
         Ok(Change::Recover)
     }
 
-    /// Applies a plan. It fails only on a plan that is not of this owner
-    /// at this revision, or on a reservation that is not the one of the
-    /// plan: both are faults of the core.
-    fn apply(
+    fn apply_draft(
         &mut self,
-        plan: Plan,
+        draft: Draft,
+        change: Change,
         input: Input,
         reservation: Option<EffectReservation>,
-    ) -> Result<Progress, CoreFault> {
-        plan.stamp.check(self.id, self.revision)?;
-        let Plan {
+        direct_sink: Option<&mut dyn EffectSink>,
+    ) -> Result<(Progress, usize), CoreFault> {
+        let Draft {
             counters,
-            change,
-            effects,
+            mut effects,
             progress,
             closed,
             receipt_issued,
@@ -3481,16 +3737,18 @@ impl Owner {
             inline_outcome,
             non_inline_resolved,
             ..
-        } = plan;
-        let reserved = match reservation {
-            Some(key) => self
-                .outbox
-                .remaining(key)
-                .map_err(|_| CoreFault::ReservationOverrun)?,
-            None => 0,
-        };
-        if reserved != effects.count {
-            return Err(CoreFault::ReservationOverrun);
+        } = draft;
+        if direct_sink.is_none() {
+            let reserved = match reservation {
+                Some(key) => self
+                    .outbox
+                    .remaining(key)
+                    .map_err(|_| CoreFault::ReservationOverrun)?,
+                None => 0,
+            };
+            if reserved != effects.count {
+                return Err(CoreFault::ReservationOverrun);
+            }
         }
         let revision = self
             .revision
@@ -3564,24 +3822,36 @@ impl Owner {
         self.counters = counters;
         self.revision = revision;
 
-        if let Some(key) = reservation {
-            for effect in effects.items.into_iter().flatten() {
-                self.outbox
-                    .publish(key, effect)
+        let mut accepted = 0;
+        if let Some(sink) = direct_sink {
+            if effects.count > 0 {
+                accepted = self
+                    .outbox
+                    .dispatch_immediate(&mut effects.items[..effects.count], sink)
                     .map_err(|_| CoreFault::ReservationOverrun)?;
             }
+        } else if let Some(key) = reservation {
+            for slot in &mut effects.items[..effects.count] {
+                if let Some(effect) = slot.take() {
+                    self.outbox
+                        .publish(key, effect)
+                        .map_err(|_| CoreFault::ReservationOverrun)?;
+                }
+            }
         }
-        Ok(progress)
+        Ok((progress, accepted))
     }
 
     fn apply_change(&mut self, change: Change, input: Input) -> Result<(), CoreFault> {
         const STALE: CoreFault = CoreFault::StalePlan;
         match change {
-            Change::Session(change) => self.apply_session(change)?,
-            Change::Receipts(change) => self.receipts.apply(change)?,
+            Change::Session(change) => self.apply_session(*change)?,
+            Change::Receipts(change) => self.receipts.apply(*change)?,
             Change::Pubsub(change) => self.apply_pubsub(change, input)?,
-            Change::Will(change) => self.apply_will(change)?,
-            Change::Nothing => {}
+            Change::Will(change) => self.apply_will(*change)?,
+            Change::Nothing => {
+                self.last_step_may_unblock_work = false;
+            }
             Change::MessageClock(now) => {
                 self.message_now = Some(now);
                 self.pubsub.evict_expired_cache(now);
@@ -3598,7 +3868,7 @@ impl Owner {
                 }
             }
             Change::Establish { session } => {
-                self.push_session(session)?;
+                self.push_session(*session)?;
             }
             Change::Bind {
                 session,
@@ -3641,8 +3911,29 @@ impl Owner {
                 };
                 self.push_slot(slot)?;
                 if let Some(plan) = inline_claim {
-                    self.apply_inline_claim_insert(op, *plan)?;
-                } else if !dirty_targets.is_empty() {
+                    let Input::Packet {
+                        packet:
+                            InboundPacket::Publish {
+                                topic,
+                                payload,
+                                properties,
+                                ..
+                            },
+                        ..
+                    } = input
+                    else {
+                        return Err(STALE);
+                    };
+                    self.apply_inline_claim_insert(
+                        op,
+                        publication,
+                        plan,
+                        topic,
+                        payload,
+                        properties,
+                    )?;
+                } else if let Some(dirty_targets) = dirty_targets {
+                    let dirty_targets = dirty_targets.into_vec();
                     for &target in &dirty_targets {
                         *self
                             .pubsub
@@ -3655,19 +3946,19 @@ impl Owner {
             }
             Change::Committed { slot, admission } => {
                 if !matches!(
-                    self.slots.as_slice().get(slot).map(|h| h.state),
+                    self.slots.get(slot).map(|h| &h.state),
                     Some(SlotState::AdmissionPending(_))
                 ) {
                     return Err(STALE);
                 }
-                self.slots.as_mut_slice()[slot].admission = Some(admission);
+                self.slots[slot].admission = Some(admission);
                 self.await_pubrel(slot)?;
             }
             Change::Replay {
                 slot,
                 publish_origin,
             } => {
-                let held = self.slots.as_mut_slice().get_mut(slot).ok_or(STALE)?;
+                let held = self.slots.get_mut(slot).ok_or(STALE)?;
                 held.publish_origin = Some(publish_origin);
             }
             Change::AckReady {
@@ -3676,7 +3967,7 @@ impl Owner {
                 effect,
                 connection,
             } => {
-                let Some(current) = self.slots.as_slice().get(slot) else {
+                let Some(current) = self.slots.get(slot) else {
                     return Err(STALE);
                 };
                 if !matches!(current.state, SlotState::AdmissionPending(_))
@@ -3684,11 +3975,11 @@ impl Owner {
                 {
                     return Err(STALE);
                 }
-                self.unindex_slot(slot);
-                let held = &mut self.slots.as_mut_slice()[slot];
+                self.unindex_slot_state(slot);
+                let held = &mut self.slots[slot];
                 held.admission = Some(admission);
                 held.state = SlotState::AckPending { effect, connection };
-                self.index_slot(slot);
+                self.index_slot_state(slot);
             }
             Change::Hold {
                 slot,
@@ -3697,12 +3988,12 @@ impl Owner {
                 resent,
                 publish_origin,
             } => {
-                let Some(current) = self.slots.as_slice().get(slot) else {
+                let Some(current) = self.slots.get(slot) else {
                     return Err(STALE);
                 };
                 // A first answer is held with the result that produced it;
                 // a PUBREC sent again, for an exchange that awaits PUBREL.
-                let expected = match (resent, current.state) {
+                let expected = match (resent, &current.state) {
                     (false, SlotState::AdmissionPending(_)) => admission.is_some(),
                     (true, SlotState::AwaitPubrel) => admission.is_none(),
                     _ => false,
@@ -3710,8 +4001,8 @@ impl Owner {
                 if !expected {
                     return Err(STALE);
                 }
-                self.unindex_slot(slot);
-                let held = &mut self.slots.as_mut_slice()[slot];
+                self.unindex_slot_state(slot);
+                let held = &mut self.slots[slot];
                 if admission.is_some() {
                     held.admission = admission;
                 }
@@ -3719,14 +4010,17 @@ impl Owner {
                     held.publish_origin = publish_origin;
                 }
                 held.state = SlotState::AnswerHeld { frame, resent };
-                self.index_slot(slot);
+                self.index_slot_state(slot);
             }
             Change::End { slot, finished } => {
-                let held = *self.slots.as_slice().get(slot).ok_or(STALE)?;
-                if self.leases.release(held.lease) != Ok(ReleaseOutcome::Released) {
+                if matches!(input, Input::FrameResult { .. }) {
+                    self.last_step_may_unblock_work = false;
+                }
+                let lease = self.slots.get(slot).ok_or(STALE)?.lease;
+                if self.leases.release(lease) != Ok(ReleaseOutcome::Released) {
                     return Err(STALE);
                 }
-                let _ = self.remove_slot_at(slot)?;
+                let held = self.remove_slot_at(slot)?;
                 // The operations of the exchange stay visible, the latest
                 // last.
                 if let Some(admission) = held.admission
@@ -3742,13 +4036,13 @@ impl Owner {
                 resolution,
             } => {
                 if !matches!(
-                    self.slots.as_slice().get(slot).map(|h| h.state),
+                    self.slots.get(slot).map(|h| &h.state),
                     Some(SlotState::AdmissionPending(_) | SlotState::ReleasePending(_))
                 ) {
                     return Err(STALE);
                 }
-                self.unindex_slot(slot);
-                let held = &mut self.slots.as_mut_slice()[slot];
+                self.unindex_slot_state(slot);
+                let held = &mut self.slots[slot];
                 let (SlotState::AdmissionPending(in_flight) | SlotState::ReleasePending(in_flight)) =
                     &mut held.state
                 else {
@@ -3757,17 +4051,18 @@ impl Owner {
                 in_flight.phase = phase;
                 if let Some((deadline, effect)) = resolution {
                     in_flight.deadline = deadline;
-                    in_flight.answers = in_flight.answers.with(effect);
+                    let prev = core::mem::replace(&mut in_flight.answers, Answers::new(effect));
+                    in_flight.answers = prev.with(effect);
                 }
-                self.index_slot(slot);
+                self.index_slot_state(slot);
             }
             Change::ReleaseDeferred { slot, refused } => {
-                if slot >= self.slots.len() {
+                if self.slots.get(slot).is_none() {
                     return Err(STALE);
                 }
-                self.unindex_slot(slot);
-                self.slots.as_mut_slice()[slot].state = SlotState::ReleaseRetry(refused);
-                self.index_slot(slot);
+                self.unindex_slot_state(slot);
+                self.slots[slot].state = SlotState::ReleaseRetry(alloc::boxed::Box::new(refused));
+                self.index_slot_state(slot);
             }
             Change::ReleaseWake { continuation } => {
                 self.release_continuation = Some(continuation);
@@ -3780,17 +4075,17 @@ impl Owner {
                 in_flight,
                 refused,
             } => {
-                if slot >= self.slots.len() {
+                if self.slots.get(slot).is_none() {
                     return Err(STALE);
                 }
-                self.unindex_slot(slot);
-                let held = &mut self.slots.as_mut_slice()[slot];
+                self.unindex_slot_state(slot);
+                let held = &mut self.slots[slot];
                 held.state = SlotState::ReleasePending(in_flight);
                 if resumed {
                     self.release_continuation = None;
                 }
                 held.release_preparations = held.release_preparations.saturating_add(1);
-                self.index_slot(slot);
+                self.index_slot_state(slot);
                 if let Some(refused) = refused {
                     self.remember_finished(refused)?;
                 }
@@ -3802,7 +4097,7 @@ impl Owner {
     /// A held answer left: its exchange goes where the answer takes it.
     fn apply_release(&mut self, released: Released) -> Result<(), CoreFault> {
         const STALE: CoreFault = CoreFault::StalePlan;
-        let Some(current) = self.slots.as_slice().get(released.slot) else {
+        let Some(current) = self.slots.get(released.slot) else {
             return Err(STALE);
         };
         if !matches!(current.state, SlotState::AnswerHeld { .. }) {
@@ -3810,10 +4105,9 @@ impl Owner {
         }
         match released.next {
             Next::Ack { effect, connection } => {
-                self.unindex_slot(released.slot);
-                self.slots.as_mut_slice()[released.slot].state =
-                    SlotState::AckPending { effect, connection };
-                self.index_slot(released.slot);
+                self.unindex_slot_state(released.slot);
+                self.slots[released.slot].state = SlotState::AckPending { effect, connection };
+                self.index_slot_state(released.slot);
             }
             Next::AwaitPubrel => self.await_pubrel(released.slot)?,
             Next::End => self.end_held(released.slot)?,
@@ -3827,17 +4121,17 @@ impl Owner {
     /// lease of an exchange recovered from the store holds none (record
     /// 0061).
     fn await_pubrel(&mut self, index: usize) -> Result<(), CoreFault> {
-        let lease = self.slots.as_slice()[index].lease;
+        let lease = self.slots[index].lease;
         let kept = Credits::new(PayloadBytes::ZERO, ExchangeSlots::new(1));
         let lease = self
             .leases
             .lighten(lease, kept)
             .ok_or(CoreFault::StalePlan)?;
-        self.unindex_slot(index);
-        let held = &mut self.slots.as_mut_slice()[index];
+        self.unindex_slot_state(index);
+        let held = &mut self.slots[index];
         held.lease = lease;
         held.state = SlotState::AwaitPubrel;
-        self.index_slot(index);
+        self.index_slot_state(index);
         Ok(())
     }
 
@@ -3845,33 +4139,38 @@ impl Owner {
     /// operation its result ended stays visible to a late result.
     fn end_held(&mut self, index: usize) -> Result<(), CoreFault> {
         const STALE: CoreFault = CoreFault::StalePlan;
-        let held = *self.slots.as_slice().get(index).ok_or(STALE)?;
-        let finished = held.admission.ok_or(STALE)?;
-        if self.leases.release(held.lease) != Ok(ReleaseOutcome::Released) {
+        let lease = {
+            let held = self.slots.get(index).ok_or(STALE)?;
+            if held.admission.is_none() {
+                return Err(STALE);
+            }
+            held.lease
+        };
+        if self.leases.release(lease) != Ok(ReleaseOutcome::Released) {
             return Err(STALE);
         }
-        let _ = self.remove_slot_at(index)?;
+        let held = self.remove_slot_at(index)?;
+        let finished = held.admission.ok_or(STALE)?;
         self.remember_finished(finished)
     }
 
     fn finish_closed_acks(&mut self, connection: ConnectionGeneration) -> Result<(), CoreFault> {
         // Check only the session's slots when bound; fall back to scanning
         // slots only if the generation is already unbound.
-        let mut candidates: alloc::vec::Vec<usize> =
+        let candidates: alloc::vec::Vec<usize> =
             if let Some(session_idx) = self.session_of(connection) {
                 let sid = self.sessions.as_slice()[session_idx].id;
                 self.slots_by_session
                     .get(&sid)
-                    .map(|set| set.iter().copied().collect())
+                    .map(|set| set.iter().collect())
                     .unwrap_or_default()
             } else {
-                (0..self.slots.len()).collect()
+                self.slots.iter().map(|(i, _)| i).collect()
             };
-        // Process in descending index order so swap-removals never invalidate
-        // earlier candidate indices!
-        candidates.sort_unstable();
-        for index in candidates.into_iter().rev() {
-            let held = self.slots.as_slice()[index];
+        for index in candidates {
+            let Some(held) = self.slots.get(index) else {
+                continue;
+            };
             match held.state {
                 SlotState::AnswerHeld { frame, .. }
                     if held
@@ -3893,11 +4192,15 @@ impl Owner {
                 SlotState::AckPending {
                     connection: key, ..
                 } if key.generation == connection => {
-                    let finished = held.admission.ok_or(CoreFault::StalePlan)?;
-                    if self.leases.release(held.lease) != Ok(ReleaseOutcome::Released) {
+                    let lease = held.lease;
+                    if held.admission.is_none() {
                         return Err(CoreFault::StalePlan);
                     }
-                    let _ = self.remove_slot_at(index)?;
+                    if self.leases.release(lease) != Ok(ReleaseOutcome::Released) {
+                        return Err(CoreFault::StalePlan);
+                    }
+                    let removed = self.remove_slot_at(index)?;
+                    let finished = removed.admission.ok_or(CoreFault::StalePlan)?;
                     self.remember_finished(finished)?;
                 }
                 _ => {}
@@ -3971,7 +4274,7 @@ impl Owner {
                     connection: None,
                     expiry: *expiry,
                     opened_by: *opened_by,
-                    detached: *detached,
+                    detached: detached.map(alloc::boxed::Box::new),
                     will_managed: false,
                 };
                 self.push_session(session)?;
@@ -4026,6 +4329,87 @@ mod tests {
     use crate::contract::outcome::{
         EpochOpened, EpochOpening, Knowledge, OpeningOutcome, OpeningReply, RejectReason,
     };
+    use crate::contract::step::PlanStamp;
+
+    /// A refused plan, with the work its planning spent.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    struct Refusal {
+        #[allow(dead_code)]
+        stop: Stop,
+        #[allow(dead_code)]
+        work_used: WorkUnits,
+    }
+
+    /// Test-only transition plan wrapper exercising ADR 0006 `PlanStamp` checks.
+    #[derive(Debug)]
+    struct Plan {
+        stamp: PlanStamp,
+        draft: Draft,
+        change: Change,
+    }
+
+    impl Owner {
+        fn plan(&self, input: &Input, grant: TurnGrant) -> Result<Plan, Refusal> {
+            let work = self.cost(input);
+            if let Some(missing) = work.checked_sub(grant.work_limit)
+                && missing > WorkUnits::ZERO
+            {
+                return Err(Refusal {
+                    stop: Stop::Need(CapacityNeed {
+                        resource: Resource::Work,
+                        amount: missing.get(),
+                        wake: WakeCondition::TurnGranted,
+                    }),
+                    work_used: WorkUnits::ZERO,
+                });
+            }
+            let mut draft = Draft {
+                epoch: self.epoch,
+                owner: self.id,
+                counters: self.counters,
+                effects: Effects {
+                    items: [None, None, None],
+                    count: 0,
+                },
+                progress: Progress::Complete,
+                closed: None,
+                receipt_issued: None,
+                receipt_consumed: None,
+                released: None,
+                inline_outcome: None,
+                non_inline_resolved: None,
+            };
+            let change = self
+                .revision
+                .checked_next()
+                .map_or(Err(Stop::Exhausted(Exhaustion::IdentityCounter)), |_| {
+                    self.plan_change(input, &mut draft)
+                })
+                .map_err(|stop| Refusal {
+                    stop,
+                    work_used: work,
+                })?;
+            Ok(Plan {
+                stamp: PlanStamp {
+                    owner: self.id,
+                    state_revision: self.revision,
+                },
+                draft,
+                change,
+            })
+        }
+
+        fn apply(
+            &mut self,
+            plan: Plan,
+            input: Input,
+            reservation: Option<EffectReservation>,
+        ) -> Result<Progress, CoreFault> {
+            plan.stamp.check(self.id, self.revision)?;
+            self.apply_draft(plan.draft, plan.change, input, reservation, None)
+                .map(|(progress, _)| progress)
+        }
+    }
 
     const INCARNATION: u64 = 1;
     const EPOCH: u64 = 2;
@@ -4566,9 +4950,10 @@ mod tests {
                 .owner
                 .slot_of(SessionId::new(PRODUCER), packet_id(raw))
                 .expect("an exchange");
-            self.owner.slots.as_slice()[index]
+            self.owner.slots[index]
                 .in_flight()
                 .expect("an operation in flight")
+                .clone()
         }
 
         fn snapshot(&self) -> Snapshot {
@@ -4588,11 +4973,11 @@ mod tests {
                 route_revision: owner.route_revision,
                 routes: owner.routes.as_slice().to_vec(),
                 sessions: owner.sessions.as_slice().to_vec(),
-                slots: owner.slots.as_slice().to_vec(),
+                slots: owner.slots.to_vec(),
                 outgoing_connections: owner.pubsub.connections.as_slice().to_vec(),
-                outgoing_deliveries: owner.pubsub.deliveries.as_slice().to_vec(),
+                outgoing_deliveries: owner.pubsub.deliveries.to_vec(),
                 volatile: owner.pubsub.volatile.to_vec(),
-                retained_qos0: owner.pubsub.retained,
+                retained_qos0: owner.pubsub.retained.clone(),
                 continuation: (
                     owner.pubsub.continuation,
                     owner.pubsub.continuations_started,
@@ -4607,10 +4992,10 @@ mod tests {
                         .project_routes(c.session, c.session_revision, c.changes.as_slice())
                         .map(|r| r.as_slice().to_vec())
                         .unwrap_or_default(),
-                    in_flight: c.in_flight,
+                    in_flight: c.in_flight.clone(),
                 }),
                 leases: owner.leases.snapshot(),
-                finished: owner.finished.iter().copied().collect(),
+                finished: owner.finished.iter().cloned().collect(),
                 closed: owner.closed.iter().copied().collect(),
                 waiting: self.held().pending().map(OwnedEffect::id).collect(),
                 free_slots: self.held().free_slots(),
@@ -5272,13 +5657,7 @@ mod tests {
             world.owner.leases.account().used(),
             Credits::new(PayloadBytes::ZERO, ExchangeSlots::new(2))
         );
-        let leases: Vec<LeaseKey> = world
-            .owner
-            .slots
-            .as_slice()
-            .iter()
-            .map(|s| s.lease)
-            .collect();
+        let leases: Vec<LeaseKey> = world.owner.slots.values().map(|s| s.lease).collect();
         assert!(leases.iter().all(|lease| world.owner.leases.holds(*lease)));
         assert_ne!(leases[0], leases[1]);
         // The table is full: a new exchange waits for one to end.
@@ -6192,8 +6571,7 @@ mod tests {
         handed_back(
             qos1_ack_pending_world,
             &|world| {
-                let SlotState::AckPending { effect, connection } =
-                    world.owner.slots.as_slice()[0].state
+                let SlotState::AckPending { effect, connection } = world.owner.slots[0].state
                 else {
                     panic!("an ACK pending")
                 };
@@ -6655,9 +7033,8 @@ mod tests {
     #[test]
     fn rule_inbound_qos2_await_pubrel_release_result_current() {
         let mut world = World::await_pubrel();
-        let slots = world.owner.slots.as_slice();
-        assert_eq!(slots.len(), 1);
-        assert_eq!(slots[0].in_flight(), None);
+        assert_eq!(world.owner.slots.len(), 1);
+        assert_eq!(world.owner.slots[0].in_flight(), None);
         let admission = world.flights[0];
         let CommitFacts::PublicationAdmitted { exchange, .. } = admission.facts else {
             panic!("an admission")
@@ -7072,7 +7449,11 @@ mod tests {
                 exchange_slots: ExchangeSlots::new(1),
                 receipt_slots: ReceiptSlots::new(1),
             },
-            targets: BoundedVec::from_slice(&[target(2, 0), target(3, 1)], 2).expect("fits"),
+            targets: crate::contract::command::TargetVec::from_slice(
+                &[target(2, 0), target(3, 1)],
+                2,
+            )
+            .expect("fits"),
         });
         assert_eq!(command.recipe.get(), &expected);
         assert_eq!(command.payload, Some(bytes(b"payload")));
@@ -7401,25 +7782,13 @@ mod tests {
             [("PUBREC", 7, CONN), ("PUBREC", 8, CONN)]
         );
         assert_eq!(used(&world), (0, 2));
-        let leases: Vec<LeaseKey> = world
-            .owner
-            .slots
-            .as_slice()
-            .iter()
-            .map(|s| s.lease)
-            .collect();
+        let leases: Vec<LeaseKey> = world.owner.slots.values().map(|s| s.lease).collect();
         // The PUBREC sent again: the same leases.
         assert_eq!(
             world.sent(ordered(CONN, 7, Qos::ExactlyOnce, 3)),
             ["EmitPubrec"]
         );
-        let after: Vec<LeaseKey> = world
-            .owner
-            .slots
-            .as_slice()
-            .iter()
-            .map(|s| s.lease)
-            .collect();
+        let after: Vec<LeaseKey> = world.owner.slots.values().map(|s| s.lease).collect();
         assert_eq!(after, leases);
         assert!(leases.iter().all(|lease| world.owner.leases.holds(*lease)));
 

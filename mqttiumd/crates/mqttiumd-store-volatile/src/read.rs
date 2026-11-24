@@ -23,10 +23,11 @@ use mqttiumd_store_api::{
     Decision, DurableState, InboundRecord, MAX_CLIENT_ID_BYTES, MAX_RECOVERY_INVENTORY_ROWS,
     MESSAGE_EXPIRY_SWEEP_DELIVERIES, ObligationPhase, ObligationRecord, OperationRecord,
     PayloadRecord, PublicationRecord, ReadBudget, ReadError, RecoveryCursor, RecoveryPage,
-    RecoveryRefused, RouteTarget, SessionRecord, SessionState, WillPage, WorkPage,
+    RecoveryRefused, RouteTarget, SessionState, WillPage, WorkPage,
 };
 
 use crate::VolatileStore;
+use crate::tables::VSession;
 
 pub(crate) struct ReadMeter {
     budget: ReadBudget,
@@ -108,7 +109,7 @@ pub(crate) fn check_delivery_metadata(
         .publications
         .get(&delivery.publication)
         .ok_or(ReadError::InvalidData)?;
-    if let Some(expiry) = publication.expiry {
+    if let Some(expiry) = publication.expiry() {
         expiry.deadline().map_err(|_| ReadError::InvalidData)?;
     }
     if (record.retain && !publication.retain)
@@ -162,8 +163,8 @@ pub(crate) fn validate_wills(store: &VolatileStore) -> Result<(), ReadError> {
         if intent.state == WillState::Armed
             && !store.sessions.get(&intent.session).is_some_and(|s| {
                 s.state == SessionState::Active
-                    && s.opened_by == Some(*id)
-                    && s.client_id == intent.client_id.as_slice()
+                    && store.sessions.opened_by(intent.session, s) == Some(*id)
+                    && s.client_id.as_slice() == intent.client_id.as_slice()
                     && s.detached.is_none()
             })
         {
@@ -198,7 +199,7 @@ pub(crate) fn validate_retained(
             .publications
             .get(&record.publication)
             .ok_or(ReadError::InvalidData)?;
-        if let Some(expiry) = publication.expiry {
+        if let Some(expiry) = publication.expiry() {
             if expiry.observed.domain == [0; 32] {
                 return Err(ReadError::InvalidData);
             }
@@ -239,14 +240,15 @@ pub(crate) fn validate_retained(
 pub(crate) fn check_inventory_bound(store: &VolatileStore) -> Result<(), ReadError> {
     validate_wills(store)?;
     for publication in store.publications.values() {
-        if let Some(expiry) = publication.expiry {
+        if let Some(expiry) = publication.expiry() {
             if expiry.observed.domain == [0; 32] {
                 return Err(ReadError::InvalidData);
             }
             expiry.deadline().map_err(|_| ReadError::InvalidData)?;
         }
     }
-    for row in store.sessions.values() {
+    for (&id, row) in store.sessions.iter() {
+        let opened_by = store.sessions.opened_by(id, row);
         if matches!(row.expiry, SessionExpiry::After(_)) && store.session_clock.is_none() {
             return Err(ReadError::InvalidData);
         }
@@ -255,8 +257,8 @@ pub(crate) fn check_inventory_bound(store: &VolatileStore) -> Result<(), ReadErr
         {
             return Err(ReadError::InvalidData);
         }
-        if let Some(detached) = row.detached
-            && (row.opened_by.is_none()
+        if let Some(detached) = row.detached()
+            && (opened_by.is_none()
                 || detached.operation.incarnation() != store.ledger.incarnation()
                 || detached.operation.epoch().get() == 0
                 || detached.operation.epoch() > store.ledger.last_opened()
@@ -264,7 +266,7 @@ pub(crate) fn check_inventory_bound(store: &VolatileStore) -> Result<(), ReadErr
         {
             return Err(ReadError::InvalidData);
         }
-        if row.opened_by.is_some_and(|id| {
+        if opened_by.is_some_and(|id| {
             id.incarnation() != store.ledger.incarnation()
                 || id.epoch().get() == 0
                 || id.epoch() > store.ledger.last_opened()
@@ -356,7 +358,7 @@ pub(crate) fn check_message_candidate(
     id: PublicationId,
 ) -> Result<(), ReadError> {
     let publication = store.publications.get(&id).ok_or(ReadError::InvalidData)?;
-    if let Some(expiry) = publication.expiry {
+    if let Some(expiry) = publication.expiry() {
         if expiry.observed.domain == [0; 32] {
             return Err(ReadError::InvalidData);
         }
@@ -371,21 +373,20 @@ pub(crate) fn check_message_candidate(
     {
         return Err(ReadError::InvalidData);
     }
-    let range = DeliveryId {
-        publication: id,
-        index: 0,
-    }..=DeliveryId {
-        publication: id,
-        index: u32::MAX,
-    };
+    let mut matching_obligations: Vec<(DeliveryId, &ObligationRecord)> = store
+        .obligations
+        .iter()
+        .filter(|(delivery, _)| delivery.publication == id)
+        .collect();
+    matching_obligations.sort_unstable_by_key(|(delivery, _)| *delivery);
     let mut references = 0u64;
-    for (delivery, record) in store.obligations.range(range.clone()) {
+    for (delivery, record) in matching_obligations {
         references = references.checked_add(1).ok_or(ReadError::LimitExceeded)?;
         if references > MESSAGE_EXPIRY_SWEEP_DELIVERIES as u64 {
             return Err(ReadError::LimitExceeded);
         }
-        check_delivery_metadata(store, *delivery, record)?;
-        delivery_claim(store, *delivery, record)?;
+        check_delivery_metadata(store, delivery, record)?;
+        delivery_claim(store, delivery, record)?;
     }
     if !store.validated {
         for (delivery, _) in store.outbound.iter() {
@@ -509,95 +510,70 @@ pub(crate) fn work_page(
     }
     if !store.validated {
         check_inventory_bound(store)?;
-        for (delivery, record) in &store.obligations {
+        for (delivery, record) in store.obligations.iter() {
             if record.target == session {
-                check_delivery_metadata(store, *delivery, record)?;
+                check_delivery_metadata(store, delivery, record)?;
             }
         }
     }
     let mut meter = ReadMeter::new(budget);
     let mut items = BoundedVec::with_capacity(limit).map_err(|_| ReadError::AllocationFailed)?;
     let mut more = false;
-    let start = match after {
-        Some(prev) => Bound::Excluded((session, prev)),
-        None => Bound::Included((
-            session,
-            DeliveryId {
-                publication: PublicationId::new(
-                    mqttiumd_contract::ids::StoreIncarnation::new(0),
-                    mqttiumd_contract::ids::RunEpoch::new(0),
-                    mqttiumd_contract::ids::LogicalOwnerId::new(0),
-                    mqttiumd_contract::ids::PublicationSeq::new(0),
-                ),
-                index: 0,
-            },
-        )),
-    };
-    let end = Bound::Included((
-        session,
-        DeliveryId {
-            publication: PublicationId::new(
-                mqttiumd_contract::ids::StoreIncarnation::new(u64::MAX),
-                mqttiumd_contract::ids::RunEpoch::new(u64::MAX),
-                mqttiumd_contract::ids::LogicalOwnerId::new(u64::MAX),
-                mqttiumd_contract::ids::PublicationSeq::new(u64::MAX),
-            ),
-            index: u32::MAX,
-        },
-    ));
-    for &(_, delivery) in store.obligations_by_target.range((start, end)) {
-        if items.len() == limit {
-            more = true;
-            break;
-        }
-        let record = store
-            .obligations
-            .get(&delivery)
-            .ok_or(ReadError::InvalidData)?;
-        let publication = store
-            .publications
-            .get(&delivery.publication)
-            .ok_or(ReadError::InvalidData)?;
-        let payload = store
-            .payloads
-            .get(&publication.payload)
-            .ok_or(ReadError::InvalidData)?;
-        meter.field(publication.topic.len(), store.limits.max_topic_bytes)?;
-        meter.field(payload.bytes.len(), store.limits.max_payload_bytes)?;
-        let props_bytes = publication.properties.as_ref().map_or(0, |p| p.wire_len());
-        if props_bytes > 0 {
-            meter.field(
-                props_bytes,
-                mqttiumd_contract::properties::MAX_PROPERTY_BYTES + 1024,
+    if let Some(set) = store.obligations_by_target.get(&session) {
+        for delivery in set.iter_after(after) {
+            if items.len() == limit {
+                more = true;
+                break;
+            }
+            let record = store
+                .obligations
+                .get(&delivery)
+                .ok_or(ReadError::InvalidData)?;
+            let publication = store
+                .publications
+                .get(&delivery.publication)
+                .ok_or(ReadError::InvalidData)?;
+            let payload = store
+                .payloads
+                .get(&publication.payload)
+                .ok_or(ReadError::InvalidData)?;
+            meter.field(publication.topic.len(), store.limits.max_topic_bytes)?;
+            meter.field(payload.bytes.len(), store.limits.max_payload_bytes)?;
+            let props_bytes = publication.properties.as_ref().map_or(0, |p| p.wire_len());
+            if props_bytes > 0 {
+                meter.field(
+                    props_bytes,
+                    mqttiumd_contract::properties::MAX_PROPERTY_BYTES + 1024,
+                )?;
+            }
+            meter.charge(
+                256usize
+                    .checked_add(publication.topic.len())
+                    .and_then(|n| n.checked_add(payload.bytes.len()))
+                    .and_then(|n| n.checked_add(props_bytes))
+                    .ok_or(ReadError::LimitExceeded)?,
             )?;
+            if !store.validated {
+                check_delivery_metadata(store, delivery, record)?;
+            }
+            let claim = delivery_claim(store, delivery, record)?;
+            items
+                .try_push(WorkItem {
+                    delivery,
+                    target: record.target,
+                    target_revision: record.target_revision,
+                    qos: record.qos,
+                    cause: record.cause,
+                    retain: record.retain,
+                    expiry: publication.expiry(),
+                    properties: publication.properties.clone(),
+                    // Zero-copy Arc clone on the hot delivery path!
+                    topic: publication.topic.clone(),
+                    payload: payload.bytes.clone(),
+                    claim,
+                })
+                .map_err(|_| ReadError::LimitExceeded)?;
         }
-        meter.charge(
-            256usize
-                .checked_add(publication.topic.len())
-                .and_then(|n| n.checked_add(payload.bytes.len()))
-                .and_then(|n| n.checked_add(props_bytes))
-                .ok_or(ReadError::LimitExceeded)?,
-        )?;
-        if !store.validated {
-            check_delivery_metadata(store, delivery, record)?;
-        }
-        let claim = delivery_claim(store, delivery, record)?;
-        items
-            .try_push(WorkItem {
-                delivery,
-                target: record.target,
-                target_revision: record.target_revision,
-                qos: record.qos,
-                cause: record.cause,
-                retain: record.retain,
-                expiry: publication.expiry,
-                properties: publication.properties.clone(),
-                // Zero-copy Arc clone on the hot delivery path!
-                topic: publication.topic.clone(),
-                payload: payload.bytes.clone(),
-                claim,
-            })
-            .map_err(|_| ReadError::LimitExceeded)?;
     }
     let next = if more {
         items.as_slice().last().map(|item| item.delivery)
@@ -615,7 +591,7 @@ enum FactRef<'a> {
     Limits,
     Table,
     Route(&'a [u8], &'a RouteTarget),
-    Session(SessionId, &'a SessionRecord),
+    Session(SessionId, &'a VSession),
     Inbound(mqttiumd_contract::ids::InboundPacketId, &'a InboundRecord),
     Operation(OperationId, &'a crate::VOperation),
     Fence(OperationId),
@@ -675,12 +651,11 @@ impl FactRef<'_> {
                 meter.field(record.client_id.len(), MAX_CLIENT_ID_BYTES)?;
                 RecoveredFact::Session {
                     session,
-                    client_id: SharedBytes::copy_from(&record.client_id, MAX_CLIENT_ID_BYTES)
-                        .map_err(|_| ReadError::LimitExceeded)?,
+                    client_id: record.client_id.clone(),
                     revision: record.revision,
                     expiry: record.expiry,
-                    opened_by: record.opened_by,
-                    detached: record.detached,
+                    opened_by: store.sessions.opened_by(session, record),
+                    detached: record.detached(),
                 }
             }
             Self::Inbound(packet_id, marker) => {
@@ -714,7 +689,7 @@ impl FactRef<'_> {
                         .publications
                         .get(&delivery.publication)
                         .ok_or(ReadError::InvalidData)?
-                        .expiry,
+                        .expiry(),
                     started: claim.is_some_and(|c| c.started),
                     claim,
                 }
@@ -747,18 +722,29 @@ fn inventory(store: &VolatileStore) -> impl Iterator<Item = FactRef<'_>> {
             .iter()
             .map(move |target| FactRef::Route(topic, target))
     });
-    let sessions = store
+    let mut sessions: Vec<(SessionId, &VSession)> = store
         .sessions
         .iter()
         .filter(|(_, record)| record.state == SessionState::Active)
-        .map(|(session, record)| FactRef::Session(*session, record));
+        .map(|(session, record)| (*session, record))
+        .collect();
+    sessions.sort_unstable_by_key(|(id, _)| *id);
+    let sessions = sessions
+        .into_iter()
+        .map(|(session, record)| FactRef::Session(session, record));
     let inbound = store
         .inbound
         .iter()
         .map(|((_, packet), marker)| FactRef::Inbound(*packet, marker));
+    let mut obligations: Vec<(DeliveryId, &ObligationRecord)> = store.obligations.iter().collect();
+    obligations.sort_unstable_by_key(|(id, _)| *id);
+    let obligations = obligations
+        .into_iter()
+        .map(|(id, record)| FactRef::Outbound(id, record));
     let operations = store
         .operations
         .iter_ordered()
+        .into_iter()
         .filter(move |(operation, _)| older(operation))
         .map(|(operation, record)| FactRef::Operation(operation, record));
     let fences = store
@@ -772,12 +758,7 @@ fn inventory(store: &VolatileStore) -> impl Iterator<Item = FactRef<'_>> {
         .chain(routes)
         .chain(sessions)
         .chain(inbound)
-        .chain(
-            store
-                .obligations
-                .iter()
-                .map(|(id, record)| FactRef::Outbound(*id, record)),
-        )
+        .chain(obligations)
         .chain(
             store
                 .receipt_frontiers
@@ -881,7 +862,7 @@ pub(crate) fn build_snapshot(
         meter.charge(
             160usize
                 .checked_add(if record.detached.is_some() { 40 } else { 0 })
-                .and_then(|n| n.checked_add(if record.opened_by.is_some() { 32 } else { 0 }))
+                .and_then(|n| n.checked_add(if record.has_opened_by() { 32 } else { 0 }))
                 .and_then(|n| n.checked_add(record.client_id.len()))
                 .ok_or(ReadError::LimitExceeded)?,
         )?;
@@ -897,8 +878,9 @@ pub(crate) fn build_snapshot(
         }
     }
     for record in store.operations.values() {
+        let rlen = record.canonical_len as usize;
         meter.field(32, 32)?;
-        meter.field(record.recipe.len(), budget.max_field_bytes)?;
+        meter.field(rlen, budget.max_field_bytes)?;
         let decision_bytes = match record.decision {
             Decision::Committed(CommitFacts::PublicationAdmitted { .. }) => 56,
             Decision::Committed(CommitFacts::InboundReleased { .. }) => 24,
@@ -909,7 +891,7 @@ pub(crate) fn build_snapshot(
         meter.charge(
             160usize
                 .checked_add(decision_bytes)
-                .and_then(|n| n.checked_add(record.recipe.len()))
+                .and_then(|n| n.checked_add(rlen))
                 .ok_or(ReadError::LimitExceeded)?,
         )?;
     }
@@ -942,8 +924,9 @@ pub(crate) fn build_snapshot(
         )?;
     }
     let mut publications = BTreeMap::new();
-    for (id, record) in &store.publications {
-        if let Some(expiry) = record.expiry {
+    for (id, record) in store.publications.iter() {
+        let expiry = record.expiry();
+        if let Some(expiry) = expiry {
             expiry.deadline().map_err(|_| ReadError::InvalidData)?;
         }
         meter.field(32, 32)?;
@@ -957,15 +940,15 @@ pub(crate) fn build_snapshot(
         }
         meter.charge(
             248usize
-                .checked_add(if record.expiry.is_some() { 44 } else { 0 })
+                .checked_add(if expiry.is_some() { 44 } else { 0 })
                 .and_then(|n| n.checked_add(record.topic.len()))
                 .and_then(|n| n.checked_add(props_bytes))
                 .ok_or(ReadError::LimitExceeded)?,
         )?;
         publications.insert(
-            *id,
+            id,
             PublicationRecord {
-                expiry: record.expiry,
+                expiry,
                 properties: record.properties.clone(),
                 retained_version: record.retained_version,
                 operation: record.operation,
@@ -994,10 +977,12 @@ pub(crate) fn build_snapshot(
             },
         );
     }
-    for (delivery, record) in &store.obligations {
-        check_delivery_metadata(store, *delivery, record)?;
+    let mut obligations = BTreeMap::new();
+    for (delivery, record) in store.obligations.iter() {
+        check_delivery_metadata(store, delivery, record)?;
         meter.field(32, 32)?;
         meter.charge(208)?;
+        obligations.insert(delivery, *record);
     }
     let mut outbound = BTreeMap::new();
     for (delivery, out) in store.outbound.iter() {
@@ -1019,10 +1004,14 @@ pub(crate) fn build_snapshot(
         operations.insert(
             op,
             OperationRecord {
-                recipe: record.recipe.to_vec(),
+                recipe: record.recipe.to_canonical_vec(),
                 decision: record.decision,
             },
         );
+    }
+    let mut sessions = BTreeMap::new();
+    for (&id, row) in store.sessions.iter() {
+        sessions.insert(id, store.sessions.to_record(id, row));
     }
     Ok(DurableState {
         ledger: store.ledger,
@@ -1033,7 +1022,7 @@ pub(crate) fn build_snapshot(
         next_session: store.next_session,
         session_clock: store.session_clock,
         route_revision: store.route_revision,
-        sessions: store.sessions.clone(),
+        sessions,
         routes: store.routes.clone(),
         operations,
         fences: store.fences.clone(),
@@ -1042,7 +1031,7 @@ pub(crate) fn build_snapshot(
         wills: store.wills.clone(),
         publications,
         payloads,
-        obligations: store.obligations.clone(),
+        obligations,
         inbound: store.inbound.clone(),
         outbound,
     })

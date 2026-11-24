@@ -28,9 +28,7 @@
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use mqttiumd_contract::capacity::{
-    BoundedVec, ExchangeSlots, PayloadBytes, ReceiptSlots, References,
-};
+use mqttiumd_contract::capacity::{ExchangeSlots, PayloadBytes, ReceiptSlots, References};
 use mqttiumd_contract::command::{
     AdmitPublication, Command, Costs, DeliveryCause, FrozenRecipe, PayloadRef, Recipe,
     ReleaseInbound, Source, Target,
@@ -196,7 +194,8 @@ fn admission(
             exchange_slots: ExchangeSlots::new(1),
             receipt_slots: ReceiptSlots::new(1),
         },
-        targets: BoundedVec::from_slice(&targets, targets.len().max(1)).expect("fits"),
+        targets: mqttiumd_contract::command::TargetVec::from_slice(&targets, targets.len().max(1))
+            .expect("fits"),
     });
     Command {
         recipe: FrozenRecipe::freeze(recipe).expect("well formed"),

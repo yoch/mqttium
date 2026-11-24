@@ -2,15 +2,15 @@ diff --git a/mqttiumd/crates/mqttiumd-core/src/owner.rs b/mqttiumd/crates/mqttiu
 index a44121e..bcbd452 100644
 --- a/mqttiumd/crates/mqttiumd-core/src/owner.rs
 +++ b/mqttiumd/crates/mqttiumd-core/src/owner.rs
-@@ -357,7 +357,11 @@ impl Answers {
+@@ -367,7 +367,11 @@ impl Answers {
              }
          }
          for i in 0..LANDMARK_RESOLUTIONS {
--            if (self.present & (1u8 << (RECENT_RESOLUTIONS + i))) != 0 && self.landmarks[i] == seq {
+-            if (res.present & (1u8 << (RECENT_RESOLUTIONS + i))) != 0 && res.landmarks[i] == seq {
 +            // MUTANT M4: the landmark resolutions answer nothing.
 +            if false
-+                && (self.present & (1u8 << (RECENT_RESOLUTIONS + i))) != 0
-+                && self.landmarks[i] == seq
++                && (res.present & (1u8 << (RECENT_RESOLUTIONS + i))) != 0
++                && res.landmarks[i] == seq
 +            {
                  return true;
              }

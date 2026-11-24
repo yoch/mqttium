@@ -22,16 +22,16 @@ use crate::scoped_map::ScopedKey;
 
 const MIN_CAPACITY: usize = 16;
 
-/// Deterministic 64-bit avalanche mixer (SplitMix64 finalizer).
-fn mix64(mut x: u64) -> u64 {
-    x = x.wrapping_add(0x9e37_79b9_7f4a_7c15);
-    x = (x ^ (x >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-    x = (x ^ (x >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-    x ^ (x >> 31)
+/// Deterministic 64-bit Fibonacci mixer (2 instructions on ARM64: `mul` +
+/// shifted `eor`, zero collisions on sequential IDs in power-of-two tables).
+fn mix64(x: u64) -> u64 {
+    let h = x.wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    h ^ (h >> 32)
 }
 
 fn combine64(a: u64, b: u64) -> u64 {
-    mix64(a.wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ mix64(b))
+    let h = a.wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ b.wrapping_mul(0x517c_c1b7_2722_0a95);
+    h ^ (h >> 32)
 }
 
 /// A compact `Copy + Eq` key with a deterministic 64-bit hash.

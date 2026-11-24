@@ -424,7 +424,7 @@ pub enum Effect {
         origin: Qos0Origin,
         cause: crate::command::DeliveryCause,
         retain: bool,
-        expiry: Option<MessageExpiry>,
+        expiry: Option<alloc::boxed::Box<MessageExpiry>>,
         properties: Option<alloc::sync::Arc<crate::properties::PublishProperties>>,
         topic: SharedBytes,
         payload: SharedBytes,
@@ -467,7 +467,7 @@ pub enum Effect {
         payload: SharedBytes,
         dup: bool,
         retain: bool,
-        expiry: Option<MessageExpiry>,
+        expiry: Option<alloc::boxed::Box<MessageExpiry>>,
         properties: Option<alloc::sync::Arc<crate::properties::PublishProperties>>,
         started: bool,
     },
@@ -560,10 +560,6 @@ pub enum SubmitBlock {
 /// Result of a non-blocking submission.
 #[must_use]
 #[derive(PartialEq, Eq, Debug)]
-#[expect(
-    clippy::large_enum_variant,
-    reason = "a refused effect is returned intact without a heap allocation"
-)]
 pub enum SubmitResult {
     /// Ownership moved to the adapter, which tracks the effect until an
     /// outcome or a defined resolution. Afterwards a cancellation, a timeout
@@ -900,6 +896,84 @@ impl Outbox {
     /// The waiting effects, oldest first.
     pub fn pending(&self) -> impl Iterator<Item = &OwnedEffect> {
         self.queue.iter()
+    }
+
+    /// Checks whether `slots` places could be reserved right now, returning
+    /// the exact same refusal as [`Self::reserve`] without mutating the box.
+    pub fn check_reserve(&self, slots: NonZeroUsize) -> Result<(), ReserveRefused> {
+        let slots = slots.get();
+        let capacity = self.queue.capacity();
+        if slots > capacity {
+            return Err(ReserveRefused::LargerThanBox {
+                requested: slots,
+                capacity,
+            });
+        }
+        let records = self.records.as_slice();
+        let entry = records
+            .iter()
+            .position(|record| !record.held && !record.spent);
+        if entry.is_none()
+            && !records
+                .iter()
+                .any(|record| record.held && record.generation != u64::MAX)
+        {
+            return Err(ReserveRefused::TableExhausted);
+        }
+        let free = self.free_slots();
+        if slots > free {
+            let missing = slots - free;
+            let wake = if self.reserved == 0 {
+                WakeCondition::EffectAccepted
+            } else {
+                WakeCondition::EffectAcceptedOrResourceReleased
+            };
+            return Err(ReserveRefused::Need(CapacityNeed {
+                resource: Resource::EffectSlots,
+                amount: missing as u64,
+                wake,
+            }));
+        }
+        if entry.is_none() {
+            return Err(ReserveRefused::Need(CapacityNeed {
+                resource: Resource::Reservations,
+                amount: 1,
+                wake: WakeCondition::ResourceReleased,
+            }));
+        }
+        Ok(())
+    }
+
+    /// Delivers `effects` straight to `sink` when the box is empty and has no
+    /// live reservations, avoiding queue round-trips on the steady-state path.
+    /// Any refused effect and all subsequent effects in the batch are pushed
+    /// onto the queue in exact FIFO order.
+    pub fn dispatch_immediate(
+        &mut self,
+        effects: &mut [Option<OwnedEffect>],
+        sink: &mut dyn EffectSink,
+    ) -> Result<usize, ReservationError> {
+        let mut accepted = 0usize;
+        for slot in effects.iter_mut() {
+            let Some(effect) = slot.take() else {
+                continue;
+            };
+            if self.queue.is_empty() && self.reserved == 0 {
+                match sink.try_submit(effect) {
+                    SubmitResult::Accepted => {
+                        accepted += 1;
+                    }
+                    SubmitResult::NotSubmitted { effect, .. } => {
+                        if self.push_back_tracked(effect).is_err() {
+                            return Err(ReservationError::Inconsistent);
+                        }
+                    }
+                }
+            } else if self.push_back_tracked(effect).is_err() {
+                return Err(ReservationError::Inconsistent);
+            }
+        }
+        Ok(accepted)
     }
 
     /// Reserves `slots` places, or says why not. Nothing changes on

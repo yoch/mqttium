@@ -48,7 +48,7 @@ pub(super) enum Change {
 }
 
 fn changed(change: Change) -> super::Change {
-    super::Change::Session(change)
+    super::Change::Session(alloc::boxed::Box::new(change))
 }
 fn waiting() -> Stop {
     Stop::Need(CapacityNeed {
@@ -113,8 +113,7 @@ impl Owner {
             bindings: self.session_by_conn.len(),
             retired_flights: self
                 .slots
-                .as_slice()
-                .iter()
+                .values()
                 .filter(|s| s.retired && s.in_flight().is_some())
                 .count()
                 + self.pubsub.retired_flights(),
@@ -418,7 +417,7 @@ impl Owner {
         };
         if session.opened_by != guard.opened_by
             || session.connection.is_some()
-            || session.detached != Some(detached)
+            || session.detached() != Some(detached)
             || !detached.deadline.is_some_and(|deadline| now >= deadline)
         {
             return Ok(super::Change::Nothing);
@@ -617,12 +616,12 @@ impl Owner {
                     return Err(Stop::Fatal(CoreFault::ContradictoryOutcome { operation }));
                 }
                 draft.receipt_consumed = Some(operation);
-                let finished = Finished {
+                let finished = Finished::new(
                     operation,
-                    answers: flight.in_flight.answers,
-                    phase: CommandPhase::Consumed,
-                    facts: Some(CommitFacts::SessionLifecycle(change)),
-                };
+                    flight.in_flight.answers.clone(),
+                    CommandPhase::Consumed,
+                    Some(CommitFacts::SessionLifecycle(change)),
+                );
                 draft.emit(Effect::SessionChanged {
                     operation,
                     connection: if matches!(flight.command.action, SessionAction::Expire { .. }) {
@@ -661,12 +660,12 @@ impl Owner {
                 StoreOutcome::RejectedCertain(reason),
             ) => {
                 draft.receipt_consumed = Some(operation);
-                let finished = Finished {
+                let finished = Finished::new(
                     operation,
-                    answers: flight.in_flight.answers,
-                    phase: CommandPhase::RejectedCertain,
-                    facts: None,
-                };
+                    flight.in_flight.answers.clone(),
+                    CommandPhase::RejectedCertain,
+                    None,
+                );
                 if matches!(
                     flight.command.action,
                     SessionAction::Open { .. }
@@ -745,7 +744,7 @@ impl Owner {
                     !*clean_start
                         && s.expiry != SessionExpiry::OnDisconnect
                         && !s
-                            .detached
+                            .detached()
                             .and_then(|d| d.deadline)
                             .is_some_and(|deadline| now.is_some_and(|now| now >= deadline))
                 });
@@ -833,7 +832,7 @@ impl Owner {
                         s.id == guard.session
                             && s.opened_by == guard.opened_by
                             && s.connection.is_none()
-                            && s.detached == Some(*detached)
+                            && s.detached() == Some(*detached)
                             && detached.deadline.is_some_and(|deadline| *now >= deadline)
                     })
             }
@@ -886,7 +885,9 @@ impl Owner {
                 flight.in_flight.phase = phase;
                 if let Some((deadline, effect)) = resolution {
                     flight.in_flight.deadline = deadline;
-                    flight.in_flight.answers = flight.in_flight.answers.with(effect);
+                    let prev =
+                        core::mem::replace(&mut flight.in_flight.answers, Answers::new(effect));
+                    flight.in_flight.answers = prev.with(effect);
                 }
             }
             Change::Applied {
@@ -942,7 +943,7 @@ impl Owner {
                         self.set_session_connection(index, None)?;
                         let held = &mut self.sessions.as_mut_slice()[index];
                         held.expiry = expiry;
-                        held.detached = Some(detached);
+                        held.detached = Some(alloc::boxed::Box::new(detached));
                     }
                     SessionChange::Closed {
                         session,
@@ -988,22 +989,21 @@ impl Owner {
         let slot_indices: alloc::vec::Vec<usize> = self
             .slots_by_session
             .get(&session)
-            .map(|set| set.iter().copied().collect())
+            .map(|set| set.iter().collect())
             .unwrap_or_default();
-        // Process in descending index order so swap-removals preserve lower indices.
-        for index in slot_indices.into_iter().rev() {
-            if self.slots.as_slice()[index].in_flight().is_some() {
-                self.slots.as_mut_slice()[index].retired = true;
+        for index in slot_indices {
+            if self.slots[index].in_flight().is_some() {
+                self.slots[index].retired = true;
                 continue;
             }
-            let held = self.slots.as_slice()[index];
-            if self.leases.release(held.lease) != Ok(ReleaseOutcome::Released) {
+            let lease = self.slots[index].lease;
+            if self.leases.release(lease) != Ok(ReleaseOutcome::Released) {
                 return Err(CoreFault::StalePlan);
             }
+            let held = self.remove_slot_at(index)?;
             if let Some(done) = held.admission {
                 self.remember_finished(done)?;
             }
-            let _ = self.remove_slot_at(index)?;
         }
         self.pubsub.retire_session(session);
         Ok(())
@@ -1810,7 +1810,7 @@ mod tests {
                 ))),
             },
         );
-        assert_eq!(owner.sessions.as_slice()[0].detached, Some(detached));
+        assert_eq!(owner.sessions.as_slice()[0].detached(), Some(detached));
         assert!(
             apply(
                 &mut owner,
@@ -1944,7 +1944,7 @@ mod tests {
             .is_empty()
         );
         assert_eq!(
-            owner.sessions.as_slice()[0].detached,
+            owner.sessions.as_slice()[0].detached(),
             Some(current_detached)
         );
         let expiry = apply(
@@ -2153,7 +2153,7 @@ mod tests {
             1,
             "expiry_unknown_freed_session_capacity"
         );
-        assert_eq!(owner.sessions.as_slice()[0].detached, Some(detached));
+        assert_eq!(owner.sessions.as_slice()[0].detached(), Some(detached));
         let resolution = apply(
             &mut owner,
             Input::Deadline {
@@ -2300,7 +2300,7 @@ mod tests {
                     assert!(matches!(outcome, StepOutcome::Applied { .. }));
                     assert!(!owner.is_recovering());
                     assert_eq!(
-                        owner.sessions.as_slice()[0].detached.unwrap().deadline,
+                        owner.sessions.as_slice()[0].detached().unwrap().deadline,
                         Some(deadline)
                     );
                 }

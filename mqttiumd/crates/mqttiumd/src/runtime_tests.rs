@@ -70,6 +70,7 @@ fn with_runtime_clock_hooks(
         .recv_timeout(Duration::from_secs(3))
         .unwrap()
         .unwrap();
+    let (incarnation, epoch) = (boot.grant.incarnation(), boot.grant.epoch());
     let mut authority = OwnerAuthority::from_grant(boot.grant, NonZeroU32::MIN).unwrap();
     let outbox = authority
         .create_outbox(
@@ -118,9 +119,12 @@ fn with_runtime_clock_hooks(
         last_expiry_inventory: None,
         owner,
         _authority: authority,
+        incarnation,
+        epoch,
         writer: StoreHandle::Threaded(&mut writer),
         events,
-        peers: FlatMap::new(),
+        peers: PeerTable::new(),
+        topic_cache: codec::TopicCache::new(),
         ready_peers: net::ReadyQueue::new(),
         ready_raw: Vec::new(),
         pending_peers: FlatSet::new(),
@@ -136,6 +140,9 @@ fn with_runtime_clock_hooks(
         generation: ConnectionGeneration::new(0),
         peer_cursor: 0,
         peer_keys: Vec::new(),
+        scratch_incoming: VecDeque::new(),
+        scratch_written: Vec::new(),
+        scratch_progress: Vec::new(),
         last_peer_deadline_scan: Instant::now(),
         inputs: VecDeque::new(),
         control_inputs: VecDeque::new(),
@@ -270,36 +277,27 @@ fn peer(runtime: &mut Runtime<'_>) -> (ConnectionGeneration, TcpStream) {
     let generation = runtime.generation;
     let ready = (runtime.ready_peers.clone(), generation.get());
     runtime.pending_peers.insert(generation);
+    let now_ns = runtime.elapsed_ns(Instant::now());
     runtime.peers.insert(
         generation,
         Peer {
             io: net::spawn_with_ready(socket, runtime.clock.clone(), runtime.wake.clone(), ready)
                 .unwrap(),
-            created: Instant::now(),
-            last_packet: Instant::now(),
-            connected: false,
-            version: None,
-            session: None,
-            opened_by: None,
-            will_managed: false,
-            will_disconnect: None,
-            connect_expiry: SessionExpiry::OnDisconnect,
-            disconnect_expiry: None,
-            close_observed_at: None,
-            held_packet: None,
-            capacity_wait: None,
-            requests: None,
-            pending: false,
-            keep_alive: 0,
-            max_packet: 268435455,
+            created_ns: now_ns,
+            last_packet_ns: now_ns,
             ingress: 0,
-            receiving: crate::receiving::Window::default(),
-            closing: None,
-            deferred_publish: None,
-            behind: VecDeque::new(),
-            behind_bytes: 0,
-            blocked_output: None,
-            retire_code: None,
+            opened_by_seq: 0,
+            session: None,
+            receiving: None,
+            cold: None,
+            connect_expiry: SessionExpiry::OnDisconnect,
+            max_packet: 268_435_455,
+            keep_alive: 0,
+            version: None,
+            connected: false,
+            pending: false,
+            will_managed: false,
+            has_opened_by: false,
         },
     );
     (generation, client)
@@ -522,7 +520,7 @@ fn burst_reaches_a_subscriber_whose_output_is_held(
             "a message was dropped for the output queue of a connected subscriber"
         );
         assert!(
-            runtime.peers[&subscriber].closing.is_none(),
+            runtime.peers[&subscriber].closing().is_none(),
             "the subscriber was closed for its output queue"
         );
 
@@ -913,7 +911,7 @@ fn a_delivery_over_the_subscribers_maximum_packet_size_is_discarded_and_the_sess
         let open = |r: &Runtime<'_>| {
             r.peers
                 .get(&subscriber)
-                .is_some_and(|p| p.closing.is_none())
+                .is_some_and(|p| p.closing().is_none())
         };
         until(runtime, |r| !discards(directory).is_empty() || !open(r));
         assert!(
@@ -1191,11 +1189,11 @@ fn a_3_1_1_burst_beyond_the_receive_window_is_acknowledged_not_refused() {
             // The transport hands packets over one at a time; a waiting
             // publication keeps the later ones in their lane.
             let deadline = Instant::now() + Duration::from_secs(5);
-            while runtime.peers[&generation].deferred_publish.is_some() {
+            while runtime.peers[&generation].deferred_publish().is_some() {
                 assert!(
-                    runtime.peers[&generation].closing.is_none(),
+                    runtime.peers[&generation].closing().is_none(),
                     "closed: {:?}",
-                    runtime.peers[&generation].closing
+                    runtime.peers[&generation].closing()
                 );
                 assert!(Instant::now() < deadline, "publication {id} never admitted");
                 pump(runtime);
@@ -1208,9 +1206,12 @@ fn a_3_1_1_burst_beyond_the_receive_window_is_acknowledged_not_refused() {
                 runtime
                     .peers
                     .get(&generation)
-                    .is_some_and(|peer| peer.closing.is_none()),
+                    .is_some_and(|peer| peer.closing().is_none()),
                 "publication {id} closed the connection: {:?}",
-                runtime.peers.get(&generation).and_then(|peer| peer.closing)
+                runtime
+                    .peers
+                    .get(&generation)
+                    .and_then(|peer| peer.closing())
             );
         }
         client
@@ -1325,7 +1326,7 @@ fn the_last_places_of_the_lane_are_kept_for_packets_that_release_capacity() {
             0,
             "a packet overtook the publication of its own connection"
         );
-        assert!(runtime.peers[&publisher].closing.is_none());
+        assert!(runtime.peers[&publisher].closing().is_none());
 
         // Room returns: the publication is taken, then what followed it.
         for _ in 0..filler {
@@ -1409,7 +1410,7 @@ fn a_connection_keeps_at_most_its_window_of_business_packets_waiting() {
             1,
             "a packet overtook a held publication"
         );
-        assert!(runtime.peers[&waiting].closing.is_none());
+        assert!(runtime.peers[&waiting].closing().is_none());
 
         // One waiting publication is taken up again: the held one follows.
         let resumed = runtime.pop_deferred_front().unwrap();
@@ -1543,7 +1544,7 @@ fn late_first_result(version: codec::Version, qos: u8) {
                     [7, 8],
                     "{case}: the acknowledgements in the order of reception"
                 );
-                assert!(runtime.peers[&publisher].closing.is_none(), "{case}");
+                assert!(runtime.peers[&publisher].closing().is_none(), "{case}");
             },
         );
     }
@@ -1723,7 +1724,7 @@ fn a_publication_without_a_subscriber_is_acknowledged_as_matching_no_subscriptio
                 "{case}"
             );
             publish(runtime, 3, 0, &[0, 3]);
-            assert!(runtime.peers[&publisher].closing.is_none(), "{case}");
+            assert!(runtime.peers[&publisher].closing().is_none(), "{case}");
         });
     }
 }
@@ -1748,10 +1749,13 @@ fn a_publication_waits_for_the_exchange_credit_of_an_admission_in_flight() {
                 (kind, &body[..2]),
                 (0x40, &[0, id][..]),
                 "closing: {:?}",
-                runtime.peers.get(&generation).and_then(|peer| peer.closing)
+                runtime
+                    .peers
+                    .get(&generation)
+                    .and_then(|peer| peer.closing())
             );
         }
-        assert!(runtime.peers[&generation].closing.is_none());
+        assert!(runtime.peers[&generation].closing().is_none());
     });
 }
 
@@ -1817,7 +1821,10 @@ fn a_write_confirmation_alone_takes_up_a_publication_that_waits_for_a_credit() {
                     "publication {id} was not taken up once the credit was returned: \
                      deferred={} closing={:?}",
                     business_packets(&runtime.deferred_inputs, generation),
-                    runtime.peers.get(&generation).and_then(|peer| peer.closing)
+                    runtime
+                        .peers
+                        .get(&generation)
+                        .and_then(|peer| peer.closing())
                 );
                 pump(runtime);
             }
@@ -1842,7 +1849,7 @@ fn a_write_confirmation_alone_takes_up_a_publication_that_waits_for_a_credit() {
                 thread::sleep(Duration::from_millis(1));
             }
         }
-        assert!(runtime.peers[&generation].closing.is_none());
+        assert!(runtime.peers[&generation].closing().is_none());
         // The connection is usable: a control packet and a new publication.
         runtime.packet(generation, 0xc0, vec![]).unwrap();
         loop {
@@ -1858,7 +1865,7 @@ fn a_write_confirmation_alone_takes_up_a_publication_that_waits_for_a_credit() {
         forward(&held);
         let (kind, body) = served_frame(runtime, &mut client);
         assert_eq!((kind, &body[..2]), (0x40, &[0, 4][..]));
-        assert!(runtime.peers[&generation].closing.is_none());
+        assert!(runtime.peers[&generation].closing().is_none());
     });
 }
 
@@ -1959,7 +1966,15 @@ fn the_bindings_of_a_dispatch_equal_a_lookup_per_session() {
                 .filter_map(|s| runtime.owner.connection_of(s.id).map(|c| (s.id, c)))
                 .collect()
         };
-        assert!(runtime.bindings().is_empty());
+        let cached = |runtime: &mut Runtime<'_>| -> BTreeMap<_, _> {
+            runtime.refresh_bindings();
+            runtime
+                .cached_bindings
+                .iter()
+                .map(|(&s, &g)| (s, g))
+                .collect()
+        };
+        assert!(cached(runtime).is_empty());
         let (first, mut first_client) = peer(runtime);
         runtime.connect(first, connect_packet(b"bound-1")).unwrap();
         until(runtime, |r| r.session_requests.is_empty());
@@ -1968,15 +1983,15 @@ fn the_bindings_of_a_dispatch_equal_a_lookup_per_session() {
         runtime.connect(second, connect_packet(b"bound-2")).unwrap();
         until(runtime, |r| r.session_requests.is_empty());
         assert_eq!(read_frame(&mut second_client).0, 0x20);
-        assert_eq!(runtime.bindings().len(), 2);
-        assert_eq!(runtime.bindings(), per_session(runtime));
+        assert_eq!(cached(runtime).len(), 2);
+        assert_eq!(cached(runtime), per_session(runtime));
         // A persistent session that lost its transport stays cached and
         // has no binding.
         drop(first_client);
         until(runtime, |r| !r.peers.contains_key(&first));
         assert_eq!(runtime.sessions.len(), 2);
-        assert_eq!(runtime.bindings(), per_session(runtime));
-        assert_eq!(runtime.bindings().len(), 1);
+        assert_eq!(cached(runtime), per_session(runtime));
+        assert_eq!(cached(runtime).len(), 1);
     });
 }
 
@@ -2107,7 +2122,7 @@ fn closing_transport_reconciles_late_commit_without_acknowledging_after_disconne
             codec::ErrorKind::Protocol
         );
         runtime.packet(generation, 0x82, subscription).unwrap();
-        assert!(runtime.peers[&generation].closing.is_some());
+        assert!(runtime.peers[&generation].closing().is_some());
         assert_eq!(read_frame(&mut client), (0xe0, vec![0xa1, 0]));
 
         // Reconcile the actual commit without collecting the refusal's socket
@@ -2122,7 +2137,7 @@ fn closing_transport_reconciles_late_commit_without_acknowledging_after_disconne
             "correlated writer result arrived"
         );
         runtime.drain_inputs().unwrap();
-        assert!(runtime.peers[&generation].closing.is_some());
+        assert!(runtime.peers[&generation].closing().is_some());
         assert!(
             runtime
                 .owner
@@ -2259,13 +2274,13 @@ fn a_real_delayed_pubcomp_write_receipt_cannot_release_a_new_packet_identifier_u
         assert_eq!(read_frame(&mut client).0, 0x70);
         assert!(runtime.frames.values().any(|p| p.kind == "PUBCOMP"));
         runtime.packet(generation, 0x34, publish_body(1)).unwrap();
-        let serial = runtime.peers[&generation].receiving.serial(1).unwrap();
+        let serial = runtime.peers[&generation].receiving_serial(1).unwrap();
         let deadline = Instant::now() + Duration::from_secs(1);
         while runtime.frames.values().any(|p| p.kind == "PUBCOMP") && Instant::now() < deadline {
             runtime.connections().unwrap();
             thread::sleep(Duration::from_millis(1));
         }
-        assert_eq!(runtime.peers[&generation].receiving.serial(1), Some(serial));
+        assert_eq!(runtime.peers[&generation].receiving_serial(1), Some(serial));
         for next in 2..=8 {
             runtime
                 .packet(generation, 0x34, publish_body(next))
@@ -2273,7 +2288,7 @@ fn a_real_delayed_pubcomp_write_receipt_cannot_release_a_new_packet_identifier_u
         }
         runtime.packet(generation, 0x34, publish_body(9)).unwrap();
         assert_eq!(
-            runtime.peers[&generation].closing.map(|v| v.0),
+            runtime.peers[&generation].closing().map(|v| v.0),
             Some("receive_maximum"),
             "the ninth actual PUBLISH is refused despite the late old completion"
         );
@@ -2294,7 +2309,7 @@ fn a_real_puback_write_receipt_returns_its_receive_credit() {
         assert_eq!(read_frame(&mut client).0, 0x40);
         until(runtime, |r| !r.frames.values().any(|p| p.kind == "PUBACK"));
         assert_eq!(
-            runtime.peers[&generation].receiving.serial(1),
+            runtime.peers[&generation].receiving_serial(1),
             None,
             "a terminal PUBACK must return the QoS 1 receive credit"
         );
@@ -2359,7 +2374,7 @@ fn a_new_identifier_after_received_puback_does_not_exceed_receive_maximum() {
             .packet_at(generation, first, body, observed)
             .unwrap();
         assert!(
-            runtime.peers[&generation].closing.is_none(),
+            runtime.peers[&generation].closing().is_none(),
             "received PUBACK already returned a flow credit; the new identifier is legal"
         );
         until(runtime, |r| {
@@ -2413,11 +2428,11 @@ fn a_received_puback_can_precede_publication_of_its_network_progress() {
             .packet_at(generation, first, body, observed)
             .unwrap();
         assert!(
-            runtime.peers[&generation].closing.is_none(),
+            runtime.peers[&generation].closing().is_none(),
             "a preempted completion publisher is not a Receive Maximum violation"
         );
         assert!(
-            runtime.peers[&generation].deferred_publish.is_some(),
+            runtime.peers[&generation].deferred_publish().is_some(),
             "the input remains bounded and unapplied until progress arrives"
         );
         runtime.peers[&generation].io.pause_wire_progress(false);
@@ -2427,7 +2442,7 @@ fn a_received_puback_can_precede_publication_of_its_network_progress() {
                 .any(|p| p.kind == "PUBACK" && p.packet_id == Some(9))
         });
         assert_eq!(read_frame(&mut client), (0x40, unmatched(9)));
-        assert!(runtime.peers[&generation].deferred_publish.is_none());
+        assert!(runtime.peers[&generation].deferred_publish().is_none());
     });
 }
 
@@ -2451,10 +2466,10 @@ fn eight_live_qos2_exchanges_still_refuse_a_genuine_ninth_identifier() {
         assert_eq!(read_frame(&mut client), (0x50, vec![0, 8]));
         runtime.packet(generation, 0x32, publish_body(9)).unwrap();
         assert_eq!(
-            runtime.peers[&generation].closing.map(|v| v.0),
+            runtime.peers[&generation].closing().map(|v| v.0),
             Some("receive_maximum")
         );
-        assert!(runtime.peers[&generation].deferred_publish.is_none());
+        assert!(runtime.peers[&generation].deferred_publish().is_none());
         assert_eq!(read_frame(&mut client), (0xe0, vec![0x93, 0]));
     });
 }
@@ -2483,7 +2498,7 @@ fn a_new_identifier_progresses_while_the_old_core_ack_receipt_is_held() {
             && runtime
                 .peers
                 .get(&generation)
-                .is_some_and(|p| p.closing.is_none())
+                .is_some_and(|p| p.closing().is_none())
             && !runtime
                 .frames
                 .values()
@@ -2496,7 +2511,7 @@ fn a_new_identifier_progresses_while_the_old_core_ack_receipt_is_held() {
             runtime
                 .peers
                 .get(&generation)
-                .is_some_and(|p| p.closing.is_none()),
+                .is_some_and(|p| p.closing().is_none()),
             "Receive Maximum must use actual wire progress independently of the held core receipt"
         );
         assert_eq!(read_frame(&mut client), (0x40, unmatched(9)));
@@ -2530,7 +2545,7 @@ fn a_peer_reuses_qos1_identifier_before_the_old_internal_written_receipt() {
             .unwrap()
             .0;
         runtime.packet(generation, 0x3a, publish_body(1)).unwrap();
-        let serial = runtime.peers[&generation].receiving.serial(1);
+        let serial = runtime.peers[&generation].receiving_serial(1);
         runtime.drain_inputs().unwrap();
         assert_eq!(
             runtime.inflight.len(),
@@ -2549,7 +2564,7 @@ fn a_peer_reuses_qos1_identifier_before_the_old_internal_written_receipt() {
         );
         runtime.drain_inputs().unwrap();
         assert_eq!(
-            runtime.peers[&generation].receiving.serial(1),
+            runtime.peers[&generation].receiving_serial(1),
             serial,
             "old receipt cannot return the new PUBLISH receive credit"
         );
@@ -2619,7 +2634,7 @@ fn finish_retained_durable_publish(close_before_enqueue: bool) {
             runtime.peers.contains_key(&target),
             "temporary_publish_queue_full_closed_generation"
         );
-        assert!(runtime.peers[&target].closing.is_none());
+        assert!(runtime.peers[&target].closing().is_none());
         let retained:Vec<_>=runtime.owner.outbox().unwrap().pending().filter(|effect|matches!(effect.effect(),Effect::EmitPublish{connection,..}if connection.generation==target)).map(|effect|(effect.id(),effect.effect().clone())).collect();
         assert_eq!(retained.len(), 1);
         let (effect, publication) = &retained[0];
@@ -2970,7 +2985,7 @@ fn keep_alive_expires_a_silent_peer_although_its_last_packet_is_still_held() {
         client.write_all(&[0xc0, 0]).unwrap();
         thread::sleep(Duration::from_millis(1700));
         runtime.connections().unwrap();
-        let closing = runtime.peers.get(&generation).map(|peer| peer.closing);
+        let closing = runtime.peers.get(&generation).map(|peer| peer.closing());
         assert!(
             !matches!(closing, Some(None)),
             "a peer silent for 1.7 s with Keep Alive 1 is still open"
@@ -3004,12 +3019,12 @@ fn keep_alive_is_not_extended_by_taking_an_old_packet() {
             runtime.peers[&generation].ingress
         );
         assert!(
-            runtime.peers[&generation].closing.is_none(),
+            runtime.peers[&generation].closing().is_none(),
             "closed 1.2 s after the last packet with Keep Alive 1"
         );
         thread::sleep(Duration::from_millis(500));
         runtime.connections().unwrap();
-        let closing = runtime.peers.get(&generation).map(|peer| peer.closing);
+        let closing = runtime.peers.get(&generation).map(|peer| peer.closing());
         assert!(
             !matches!(closing, Some(None)),
             "a peer silent for 1.7 s is still open because an old packet was taken 0.5 s ago"
@@ -3038,9 +3053,12 @@ fn keep_alive_does_not_expire_a_peer_the_broker_keeps_hearing() {
             runtime
                 .peers
                 .get(&generation)
-                .is_some_and(|peer| peer.closing.is_none()),
+                .is_some_and(|peer| peer.closing().is_none()),
             "a peer heard 0.4 s ago was closed: {:?}",
-            runtime.peers.get(&generation).and_then(|peer| peer.closing)
+            runtime
+                .peers
+                .get(&generation)
+                .and_then(|peer| peer.closing())
         );
         assert_eq!(
             runtime.peers[&generation].ingress, ingress,
@@ -3323,7 +3341,7 @@ fn a_framed_publish_waiting_for_connack_keeps_its_reader_expiry_origin() {
         frames.extend_from_slice(&[0x31, 10, 0, 1, b't', 5, 2, 0, 0, 0, 1, b'v']);
         client.write_all(&frames).unwrap();
         let deadline = Instant::now() + Duration::from_secs(1);
-        while runtime.peers[&generation].held_packet.is_none() {
+        while runtime.peers[&generation].held_packet().is_none() {
             runtime.connections().unwrap();
             assert!(
                 Instant::now() < deadline,
@@ -3337,7 +3355,7 @@ fn a_framed_publish_waiting_for_connack_keeps_its_reader_expiry_origin() {
         runtime.drain_inputs().unwrap();
         until(runtime, |r| {
             r.session_requests.is_empty()
-                && r.peers[&generation].held_packet.is_none()
+                && r.peers[&generation].held_packet().is_none()
                 && r.inputs.is_empty()
                 && r.inflight.is_empty()
         });
@@ -3388,7 +3406,7 @@ fn a_regressed_reader_sample_is_not_reclassified_as_message_expiration() {
         client
             .write_all(&[0x31, 10, 0, 1, b't', 5, 2, 0, 0, 0, 1, b'v'])
             .unwrap();
-        while runtime.peers[&generation].held_packet.is_none() {
+        while runtime.peers[&generation].held_packet().is_none() {
             runtime.connections().unwrap();
             assert!(
                 Instant::now() < deadline,
@@ -4159,7 +4177,7 @@ fn stale_puback_during_takeover_with_a_blocked_close_cannot_stop_other_connectio
                     peer.session,
                     peer.connected,
                     peer.pending,
-                    peer.closing
+                    peer.closing()
                 ))
                 .collect::<Vec<_>>(),
             std::fs::read_to_string(path.join("events.jsonl"))
@@ -4280,7 +4298,7 @@ fn stale_puback_during_takeover_with_a_blocked_close_cannot_stop_other_connectio
             "Peer keeps its original confirmed durable identity"
         );
         assert!(
-            runtime.peers[&old_generation].closing.is_some(),
+            runtime.peers[&old_generation].closing().is_some(),
             "reserved Close reaches the old socket even behind sixteen held ordinary operations"
         );
         assert_eq!(
@@ -5297,7 +5315,7 @@ fn copied_lifecycle_effect_and_actual_old_close_cannot_rebind_a_replaced_client_
         until(runtime, |r| r.session_requests.is_empty());
         assert_eq!(&read_frame(&mut client).1[..2], &[0, 0]);
         let current_sid = runtime.peers[&current].session.unwrap();
-        let current_token = runtime.peers[&current].opened_by;
+        let current_token = runtime.peers[&current].opened_by(runtime.origin());
         assert_ne!(current_sid, old_sid);
         std::fs::write(hook_dir.join("replay-session-change"), []).unwrap();
         std::fs::write(hook_dir.join("replay-session-close"), []).unwrap();
@@ -5309,7 +5327,10 @@ fn copied_lifecycle_effect_and_actual_old_close_cannot_rebind_a_replaced_client_
             "stale_session_change_rebound"
         );
         assert_eq!(runtime.peers[&current].session, Some(current_sid));
-        assert_eq!(runtime.peers[&current].opened_by, current_token);
+        assert_eq!(
+            runtime.peers[&current].opened_by(runtime.origin()),
+            current_token
+        );
         assert_eq!(
             runtime.owner.connection_of(current_sid),
             Some(current),
@@ -6398,14 +6419,14 @@ fn takeover_waits_for_old_will_admission_and_old_close_cannot_publish_new_will()
             .unwrap();
         until(runtime, |r| r.session_requests.is_empty());
         assert_eq!(read_frame(&mut old_client).0, 0x20);
-        let old_open = runtime.peers[&old].opened_by.unwrap();
+        let old_open = runtime.peers[&old].opened_by(runtime.origin()).unwrap();
         let (new, mut new_client) = peer(runtime);
         runtime
             .connect(new, will_connect(b"will-takeover", SessionExpiry::Never))
             .unwrap();
         until(runtime, |r| r.session_requests.is_empty());
         assert_eq!(read_frame(&mut new_client).0, 0x20);
-        let new_open = runtime.peers[&new].opened_by.unwrap();
+        let new_open = runtime.peers[&new].opened_by(runtime.origin()).unwrap();
         assert_ne!(old_open, new_open);
         runtime.close(old, "delayed_old_close").unwrap();
         runtime.drain_inputs().unwrap();
@@ -7144,6 +7165,7 @@ fn direct_volatile_store_commits_inline_and_saves_snapshot() {
         },
     )
     .unwrap();
+    let (incarnation, epoch) = (boot.grant.incarnation(), boot.grant.epoch());
     let mut authority = OwnerAuthority::from_grant(boot.grant, NonZeroU32::MIN).unwrap();
     let outbox = authority
         .create_outbox(
@@ -7193,9 +7215,12 @@ fn direct_volatile_store_commits_inline_and_saves_snapshot() {
         last_expiry_inventory: None,
         owner,
         _authority: authority,
+        incarnation,
+        epoch,
         writer: StoreHandle::Direct(&mut direct),
         events,
-        peers: FlatMap::new(),
+        peers: PeerTable::new(),
+        topic_cache: codec::TopicCache::new(),
         ready_peers: net::ReadyQueue::new(),
         ready_raw: Vec::new(),
         pending_peers: FlatSet::new(),
@@ -7211,6 +7236,9 @@ fn direct_volatile_store_commits_inline_and_saves_snapshot() {
         generation: ConnectionGeneration::new(0),
         peer_cursor: 0,
         peer_keys: Vec::new(),
+        scratch_incoming: VecDeque::new(),
+        scratch_written: Vec::new(),
+        scratch_progress: Vec::new(),
         last_peer_deadline_scan: Instant::now(),
         inputs: VecDeque::new(),
         control_inputs: VecDeque::new(),
@@ -7373,7 +7401,7 @@ fn only_the_pubrel_of_another_exchange_goes_ahead_of_a_waiting_publication() {
             panic!("QoS 2 PUBLISH")
         };
         let peer = runtime.peers.get_mut(&generation).unwrap();
-        peer.deferred_publish = Some(DeferredPublish {
+        peer.cold_mut().deferred_publish = Some(DeferredPublish {
             packet: waiting,
             ingress_order: 9,
             since: Instant::now(),
@@ -7424,15 +7452,18 @@ fn only_the_pubrel_of_another_exchange_goes_ahead_of_a_waiting_publication() {
             peer.keep_behind(raw(0xc0, &[])).is_err(),
             "one lane of packets"
         );
-        peer.behind.clear();
-        peer.behind_bytes = 0;
+        peer.cold_mut().behind.clear();
+        peer.cold_mut().behind_bytes = 0;
         let large = vec![0u8; BEHIND_BYTES];
         peer.keep_behind(raw(0x30, &large)).unwrap();
         assert!(
             peer.keep_behind(raw(0x30, &[0])).is_err(),
             "bytes of one packet"
         );
-        assert_eq!(peer.behind_bytes, BEHIND_BYTES);
+        assert_eq!(
+            peer.cold.as_deref().map_or(0, |c| c.behind_bytes),
+            BEHIND_BYTES
+        );
     });
 }
 
@@ -7519,12 +7550,13 @@ fn an_unsuback_owed_while_the_output_is_full_is_delivered_when_room_returns() {
                 routes(directory) == routes_after
                     && r.inflight.is_empty()
                     && r.inputs.is_empty()
-                    && r.peers
-                        .get(&generation)
-                        .is_none_or(|peer| peer.blocked_output.is_some() || peer.requests.is_some())
+                    && r.peers.get(&generation).is_none_or(|peer| {
+                        peer.blocked_output().is_some()
+                            || peer.cold.as_deref().is_some_and(|c| c.requests.is_some())
+                    })
             });
             let peer = runtime.peers.get(&generation).expect(name);
-            assert!(peer.closing.is_none(), "{name}: closed for a full output");
+            assert!(peer.closing().is_none(), "{name}: closed for a full output");
             assert!(
                 stays_silent(runtime, &mut client),
                 "{name}: a frame left a full output"
@@ -7541,9 +7573,10 @@ fn an_unsuback_owed_while_the_output_is_full_is_delivered_when_room_returns() {
                 "{name}"
             );
             until(runtime, |r| {
-                r.peers
-                    .get(&generation)
-                    .is_some_and(|peer| peer.blocked_output.is_none() && peer.requests.is_none())
+                r.peers.get(&generation).is_some_and(|peer| {
+                    peer.blocked_output().is_none()
+                        && peer.cold.as_deref().is_none_or(|c| c.requests.is_none())
+                })
             });
         }
         // The connection goes on.

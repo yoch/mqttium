@@ -126,7 +126,7 @@ fn admitted<S: DurableStore>(
                 topic: bytes(topic),
                 payload: payload_ref,
                 costs,
-                targets,
+                targets: targets.into(),
             },
             retain_targets: mqttiumd_contract::retained::RetainMask::EMPTY,
         })

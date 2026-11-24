@@ -13,13 +13,11 @@ const RECORD_BODY: usize = 16 * 1024;
 const MUTANT_TLS_EARLY_STARTED: bool = false;
 
 pub(super) struct Task {
-    pub stream: Arc<TcpStream>,
+    pub core: Arc<ConnCore>,
     pub state: ServerConnection,
     pub clock: Arc<dyn SessionClock>,
-    pub control: Control,
-    pub principal: Arc<OnceLock<Principal>>,
     pub policy: Arc<Policy>,
-    pub lanes: Lanes,
+    pub stalled: Option<Box<StalledState>>,
     pub machine: Machine,
     #[cfg(feature = "test-hooks")]
     pub trace: (crate::writer::Hooks, crate::events::Events),
@@ -34,7 +32,7 @@ enum Phase {
 pub(super) struct Machine {
     phase: Phase,
     parser: Parser,
-    output: Option<Encoded>,
+    output: Option<Box<Encoded>>,
     control_pending: Option<Instant>,
     /// Frame correlations taken from the lane that could not be sealed.
     unsealed: Vec<Option<(EffectId, ConnectionKey)>>,
@@ -257,7 +255,7 @@ impl Task {
         self.trace.0.barrier_fields(point, serde_json::json!({"point":point,
             "connection":connection.generation.get().to_string(), "details":{
                 "effect":format!("{}/{}/{}",effect.epoch.get(),effect.owner.get(),effect.sequence.get()),
-                "ciphertext_bytes_sent":sent}}), &self.trace.1, &self.control.0.cancelled)
+                "ciphertext_bytes_sent":sent}}), &self.trace.1, &self.core.cancelled)
             .map_err(|_| "tls_hook_failed")
     }
 
@@ -265,7 +263,7 @@ impl Task {
         if !self.state.wants_read() {
             return Ok(0);
         }
-        let mut reader = &*self.stream;
+        let mut reader = &self.core.stream;
         match self
             .state
             .read_tls(&mut (&mut reader).take(limit.min(READ_CHUNK) as u64))
@@ -276,7 +274,7 @@ impl Task {
                 if let Err(error) = self.state.process_new_packets() {
                     // A best-effort fatal alert carries no application data.
                     if handshake {
-                        let mut writer = &*self.stream;
+                        let mut writer = &self.core.stream;
                         let _ = self.state.write_tls(&mut writer);
                     }
                     return Err(tls_failure(&error));
@@ -292,7 +290,7 @@ impl Task {
         if !self.state.wants_write() {
             return Ok(0);
         }
-        let mut writer = &*self.stream;
+        let mut writer = &self.core.stream;
         match self.state.write_tls(&mut writer) {
             Ok(0) => Err("tls_write_zero"),
             Ok(count) => Ok(count),
@@ -316,7 +314,7 @@ impl Task {
         }
         self.state.send_close_notify();
         while self.state.wants_write() {
-            let mut writer = &*self.stream;
+            let mut writer = &self.core.stream;
             if !matches!(self.state.write_tls(&mut writer), Ok(count) if count != 0) {
                 break;
             }
@@ -363,13 +361,20 @@ impl Task {
             .and_then(|chain| chain.first())
             .and_then(|leaf| self.policy.certificate(leaf))
             .ok_or("tls_identity_not_allowed")?;
-        self.principal
+        self.core
+            .principal
+            .as_deref()
+            .ok_or("tls_duplicate_authentication")?
             .set(principal)
             .map_err(|_| "tls_duplicate_authentication")?;
-        self.lanes
-            .input
-            .try_send(Incoming::Authenticated { elapsed })
-            .map_err(|_| "tls_authentication_receipt")?;
+        if self
+            .core
+            .push_incoming_one(Incoming::Authenticated { elapsed })
+            .map_err(|_| "tls_authentication_receipt")?
+            .is_some()
+        {
+            return Err("tls_authentication_receipt");
+        }
         self.machine.phase = Phase::Active;
         // Application data may already be decrypted: the next turn reads it.
         Ok(Turn {
@@ -380,7 +385,10 @@ impl Task {
 
     /// The next frame, sealed. The flag says whether the attempt advanced
     /// anything although no frame came out of it.
-    fn next_write(&mut self) -> Result<(Option<Encoded>, bool), &'static str> {
+    fn next_write(
+        &mut self,
+        scratch: &mut ReactorScratch,
+    ) -> Result<(Option<Box<Encoded>>, bool), &'static str> {
         // Empty plaintext flushes a queued peer KeyUpdate response into the
         // control lane without creating an application record.
         let _ = self
@@ -391,73 +399,78 @@ impl Task {
         if self.state.wants_write() {
             return Ok((None, self.flush_control()? != 0));
         }
-        let Some(mut frame) = self.lanes.next_frame()? else {
+        if self.stalled.as_ref().is_some_and(|s| !s.reports.is_empty()) {
             return Ok((None, false));
-        };
+        }
+        self.core
+            .pop_outgoing_batch(
+                &mut scratch.write_batch,
+                true,
+                RECORD_BODY,
+                MAX_COALESCE_FRAMES,
+            )
+            .map_err(|()| "output_producer_closed")?;
+        if scratch.write_batch.is_empty() {
+            return Ok((None, false));
+        }
         let deadline = Instant::now() + WRITE_TIMEOUT;
         let mut batch = Vec::new();
-        if let Some(expiry) = frame.expiry {
-            match prepare_expiry(&mut frame.bytes, expiry, self.clock.as_ref()) {
-                Ok(()) => {}
-                Err(WriteFailure::NotStarted(reason)) => {
-                    self.lanes.report(Written::NotStarted {
-                        correlation: frame.correlation,
-                        reason,
-                    });
-                    return Ok((None, true));
+        let (frame, ciphertext) = if scratch.write_batch.len() == 1 {
+            let mut frame = scratch.write_batch.pop().expect("len == 1");
+            if let Some(expiry) = frame.expiry.as_deref().copied() {
+                match prepare_expiry(&mut frame.bytes, expiry, self.clock.as_ref()) {
+                    Ok(()) => {}
+                    Err(WriteFailure::NotStarted(reason)) => {
+                        scratch
+                            .reports_batch
+                            .push(Report::Written(Written::NotStarted {
+                                correlation: frame.correlation,
+                                reason,
+                            }));
+                        return Ok((None, true));
+                    }
+                    Err(WriteFailure::Failed(code)) => {
+                        self.machine.unsealed.push(frame.correlation);
+                        return Err(code);
+                    }
                 }
-                Err(WriteFailure::Failed(code)) => {
-                    // The frame was taken: it is one of the terminal facts.
+            }
+            let ciphertext = match frame_ciphertext(
+                &mut self.state,
+                &frame.bytes,
+                frame.payload.as_ref().map(SharedBytes::as_slice),
+            ) {
+                Ok(ciphertext) => ciphertext,
+                Err(code) => {
                     self.machine.unsealed.push(frame.correlation);
                     return Err(code);
                 }
+            };
+            (frame, ciphertext)
+        } else {
+            scratch.coalesce_bytes.clear();
+            for f in scratch.write_batch.drain(..) {
+                batch.push((f.correlation, f.report, f.total_len()));
+                f.append_to_vec(&mut scratch.coalesce_bytes);
             }
-        } else if frame.can_coalesce(RECORD_BODY)
-            && let Some(next) = self.lanes.pop_coalesce_candidate()
-        {
-            if next.can_coalesce(RECORD_BODY) && frame.total_len() + next.total_len() <= RECORD_BODY
+            let ciphertext = match frame_ciphertext(&mut self.state, &scratch.coalesce_bytes, None)
             {
-                let first_len = frame.total_len();
-                let next_len = next.total_len();
-                batch.push((frame.correlation, frame.report, first_len));
-                batch.push((next.correlation, next.report, next_len));
-                frame.flatten_into_bytes();
-                next.append_to(&mut frame.bytes);
-                frame.correlation = None;
-                while batch.len() < MAX_COALESCE_FRAMES {
-                    let Some(more) = self.lanes.pop_coalesce_candidate() else {
-                        break;
-                    };
-                    if more.can_coalesce(RECORD_BODY)
-                        && frame.bytes.len() + more.total_len() <= RECORD_BODY
-                    {
-                        batch.push((more.correlation, more.report, more.total_len()));
-                        more.append_to(&mut frame.bytes);
-                    } else {
-                        self.lanes.peeked = Some(more);
-                        break;
-                    }
-                }
-            } else {
-                self.lanes.peeked = Some(next);
-            }
-        }
-        let ciphertext = match frame_ciphertext(
-            &mut self.state,
-            &frame.bytes,
-            frame.payload.as_ref().map(SharedBytes::as_slice),
-        ) {
-            Ok(ciphertext) => ciphertext,
-            Err(code) => {
-                if batch.is_empty() {
-                    self.machine.unsealed.push(frame.correlation);
-                } else {
+                Ok(ciphertext) => ciphertext,
+                Err(code) => {
                     self.machine
                         .unsealed
                         .extend(batch.into_iter().map(|(c, _, _)| c));
+                    return Err(code);
                 }
-                return Err(code);
-            }
+            };
+            let frame = Write {
+                correlation: None,
+                bytes: FrameBytes::empty(),
+                payload: None,
+                expiry: None,
+                report: WriteReport::None,
+            };
+            (frame, ciphertext)
         };
         #[cfg(feature = "test-hooks")]
         let fragment = frame.expiry.is_some()
@@ -466,9 +479,11 @@ impl Task {
         #[cfg(feature = "test-hooks")]
         if frame.expiry.is_some() && frame.correlation.is_some() {
             if MUTANT_TLS_EARLY_STARTED {
-                self.lanes.report(Written::Started {
-                    correlation: frame.correlation,
-                });
+                scratch
+                    .reports_batch
+                    .push(Report::Written(Written::Started {
+                        correlation: frame.correlation,
+                    }));
             }
             // A held barrier keeps this reactor thread: test builds only.
             if self.armed("hold-next-tls-frame") {
@@ -476,7 +491,7 @@ impl Task {
             }
         }
         Ok((
-            Some(Encoded {
+            Some(Box::new(Encoded {
                 frame,
                 batch,
                 ciphertext,
@@ -484,14 +499,18 @@ impl Task {
                 deadline,
                 #[cfg(feature = "test-hooks")]
                 fragment,
-            }),
+            })),
             true,
         ))
     }
 
-    fn output_turn(&mut self, output: &mut Option<Encoded>) -> Result<bool, &'static str> {
+    fn output_turn(
+        &mut self,
+        output: &mut Option<Box<Encoded>>,
+        scratch: &mut ReactorScratch,
+    ) -> Result<bool, &'static str> {
         if output.is_none() {
-            let (next, advanced) = self.next_write()?;
+            let (next, advanced) = self.next_write(scratch)?;
             *output = next;
             if output.is_none() {
                 return Ok(advanced);
@@ -501,7 +520,7 @@ impl Task {
             return Ok(false);
         };
         if encoded.offset == 0
-            && let Some(expiry) = encoded.frame.expiry
+            && let Some(expiry) = encoded.frame.expiry.as_deref().copied()
         {
             let prior = expiry
                 .value_offset
@@ -522,10 +541,12 @@ impl Task {
                     if prior.is_none_or(|(range, bytes)| encoded.frame.bytes[range] == bytes) => {}
                 Ok(()) => return Err("tls_expiry_value_aged"),
                 Err(WriteFailure::NotStarted(reason)) => {
-                    self.lanes.report(Written::NotStarted {
-                        correlation: encoded.frame.correlation,
-                        reason,
-                    });
+                    scratch
+                        .reports_batch
+                        .push(Report::Written(Written::NotStarted {
+                            correlation: encoded.frame.correlation,
+                            reason,
+                        }));
                     // The frame has its terminal receipt. The sealed records
                     // advanced TLS sequence numbers: close rather than reuse
                     // that connection with a sequence gap.
@@ -545,7 +566,7 @@ impl Task {
         } else {
             ciphertext
         };
-        let count = match (&*self.stream).write(ciphertext) {
+        let count = match (&self.core.stream).write(ciphertext) {
             Ok(0) => return Err("tls_write_zero"),
             Ok(count) => count,
             Err(error) if retryable(&error) => return Ok(false),
@@ -553,9 +574,11 @@ impl Task {
         };
         let first = encoded.offset == 0;
         if first && encoded.frame.expiry.is_some() && encoded.frame.correlation.is_some() {
-            self.lanes.report(Written::Started {
-                correlation: encoded.frame.correlation,
-            });
+            scratch
+                .reports_batch
+                .push(Report::Written(Written::Started {
+                    correlation: encoded.frame.correlation,
+                }));
         }
         encoded.offset += count;
         #[cfg(feature = "test-hooks")]
@@ -564,56 +587,82 @@ impl Task {
         }
         if encoded.offset == encoded.ciphertext.len() {
             if encoded.batch.is_empty() {
-                let report = encoded.frame.report;
-                if report == WriteReport::CompleteAndWireProgress
-                    && let Some((effect, connection)) = encoded.frame.correlation
-                {
-                    self.lanes
-                        .wire_progress(WireProgress { effect, connection });
-                }
-                if report != WriteReport::None {
-                    self.lanes.report(Written::Complete {
-                        correlation: encoded.frame.correlation,
-                        bytes: encoded.frame.total_len(),
-                    });
-                }
+                super::Task::push_completion(
+                    &mut scratch.reports_batch,
+                    encoded.frame.correlation,
+                    encoded.frame.report,
+                    encoded.frame.total_len(),
+                );
                 *output = None;
             } else {
                 let completed = output.take().expect("encoded batch");
                 for (correlation, report, bytes) in completed.batch {
-                    if report == WriteReport::CompleteAndWireProgress
-                        && let Some((effect, connection)) = correlation
-                    {
-                        self.lanes
-                            .wire_progress(WireProgress { effect, connection });
-                    }
-                    if report != WriteReport::None {
-                        self.lanes.report(Written::Complete { correlation, bytes });
-                    }
+                    super::Task::push_completion(
+                        &mut scratch.reports_batch,
+                        correlation,
+                        report,
+                        bytes,
+                    );
                 }
             }
         }
         Ok(true)
     }
 
-    fn input_turn(&mut self) -> Result<bool, &'static str> {
+    fn input_turn(&mut self, scratch: &mut ReactorScratch) -> Result<bool, &'static str> {
         let mut progressed = false;
-        for _ in 0..BURST {
-            if !self.lanes.deliver()? {
+        if let Some(st) = self.stalled.as_mut()
+            && !st.held.is_empty()
+        {
+            let before = st.held.len();
+            let drained = self.core.flush_held_incoming(st)?;
+            progressed |= st.held.len() < before;
+            if st.is_empty() {
+                self.stalled = None;
+            }
+            if !drained {
                 return Ok(progressed);
             }
-            let packet = self
-                .machine
-                .parser
-                .packet(&mut Plaintext(&mut self.state), self.clock.as_ref())?;
-            if let Some(packet) = packet {
-                self.lanes.hold(packet);
-                progressed = true;
-                continue;
+        }
+        let avail = self.core.incoming_free_slots();
+        let limit = if avail == 0 { 1 } else { avail.min(BURST) };
+        scratch.incoming_batch.clear();
+        let mut heard_packet = false;
+        let mut cached_fixed: Option<FrameObservation> = None;
+        let mut parse_err: Option<&'static str> = None;
+        let mut iterations = 0usize;
+        while scratch.incoming_batch.len() < limit && iterations < BURST {
+            iterations += 1;
+            match self.machine.parser.packet(
+                &mut Plaintext(&mut self.state),
+                self.clock.as_ref(),
+                &mut cached_fixed,
+            ) {
+                Ok(Some(packet)) => {
+                    if matches!(packet, Incoming::Packet { .. }) {
+                        heard_packet = true;
+                    }
+                    scratch.incoming_batch.push(packet);
+                    progressed = true;
+                    continue;
+                }
+                Ok(None) => {}
+                Err(code) => {
+                    parse_err = Some(code);
+                    break;
+                }
             }
-            if self.read_ciphertext(READ_CHUNK, false)? != 0 {
-                progressed = true;
-                continue;
+            match self.read_ciphertext(READ_CHUNK, false) {
+                Ok(0) => {}
+                Ok(_) => {
+                    cached_fixed = None;
+                    progressed = true;
+                    continue;
+                }
+                Err(code) => {
+                    parse_err = Some(code);
+                    break;
+                }
             }
             if !self.machine.eof {
                 break;
@@ -621,22 +670,34 @@ impl Task {
             // After the end of the transport the TLS state refuses the next
             // plaintext read with the reason; one more pass obtains it.
             if self.machine.eof_reported {
-                return Err("tls_eof");
+                parse_err = Some("tls_eof");
+                break;
             }
             self.machine.eof_reported = true;
             progressed = true;
         }
-        // A packet parsed by the last pass is offered before the turn ends.
-        self.lanes.deliver()?;
+        if heard_packet {
+            record_heard(&self.core);
+        }
+        if !scratch.incoming_batch.is_empty() {
+            self.core
+                .push_incoming_batch(&mut scratch.incoming_batch, &mut self.stalled)?;
+        }
+        if let Some(code) = parse_err {
+            return Err(code);
+        }
         Ok(progressed)
     }
 
-    fn active_turn(&mut self) -> Result<Turn, &'static str> {
-        let mut progress = self.lanes.flush()?;
+    fn active_turn(&mut self, scratch: &mut ReactorScratch) -> Result<Turn, &'static str> {
+        scratch.reports_batch.clear();
+        let mut progress = self
+            .core
+            .flush_reports(&mut scratch.reports_batch, &mut self.stalled)?;
         let mut output = self.machine.output.take();
         let mut written = Ok(());
         for _ in 0..BURST {
-            match self.output_turn(&mut output) {
+            match self.output_turn(&mut output, scratch) {
                 Ok(true) => progress = true,
                 Ok(false) => break,
                 Err(code) => {
@@ -644,10 +705,21 @@ impl Task {
                     break;
                 }
             }
-            if let Err(code) = self.lanes.flush() {
+            if !scratch.reports_batch.is_empty()
+                && let Err(code) = self
+                    .core
+                    .flush_reports(&mut scratch.reports_batch, &mut self.stalled)
+            {
                 written = Err(code);
                 break;
             }
+        }
+        if !scratch.reports_batch.is_empty()
+            && let Err(code) = self
+                .core
+                .flush_reports(&mut scratch.reports_batch, &mut self.stalled)
+        {
+            written = written.and(Err(code));
         }
         // A frame in progress stays visible to the terminal facts.
         self.machine.output = output;
@@ -663,44 +735,43 @@ impl Task {
         } else {
             self.machine.control_pending = None;
         }
-        progress |= self.lanes.flush()?;
-        progress |= self.input_turn()?;
+        progress |= self.input_turn(scratch)?;
         Ok(Turn {
             progress,
             waiting: self.machine.output.is_some()
                 || self.machine.control_pending.is_some()
                 || self.machine.parser.is_partial()
-                || self.lanes.pending(),
+                || self.stalled.as_ref().is_some_and(|s| !s.is_empty()),
         })
     }
 }
 
 impl Driven for Task {
     fn descriptor(&self) -> RawFd {
-        self.stream.as_raw_fd()
+        self.core.stream.as_raw_fd()
     }
 
-    fn turn(&mut self, _scratch: &mut [u8]) -> Result<Turn, &'static str> {
-        if self.control.is_cancelled() {
+    fn turn(&mut self, scratch: &mut ReactorScratch) -> Result<Turn, &'static str> {
+        if self.core.is_cancelled() {
             return Err("cancelled");
         }
         match self.machine.phase {
             Phase::Handshake { start, received } => self.handshake_turn(start, received),
-            Phase::Active => self.active_turn(),
+            Phase::Active => self.active_turn(scratch),
         }
     }
 
     fn finish(self: Box<Self>, code: &'static str) {
         let mut task = *self;
         task.close_notify(code);
-        task.control.stop(&task.stream, code);
+        task.core.stop(code);
         let active = task
             .machine
             .output
-            .map(Encoded::correlations)
+            .map(|e| e.correlations())
             .unwrap_or_default()
             .into_iter()
             .chain(task.machine.unsealed);
-        task.lanes.finish(code, active);
+        task.core.finish_task(task.stalled, code, active);
     }
 }

@@ -22,28 +22,23 @@ impl Terminal {
     }
 }
 
-#[derive(Clone, Copy)]
-struct Occurrence {
-    serial: u64,
-    qos: Qos,
-}
-
-const EMPTY_OCCURRENCE: Occurrence = Occurrence {
-    serial: 0,
-    qos: Qos::AtMostOnce,
-};
-
-/// Inline compact receive-window table (`MAXIMUM = 8`), inspired by Redis
-/// `listpack`: zero heap allocation per connection and single-cache-line scan.
+/// Inline compact receive-window table (`MAXIMUM = 8`), laid out as a
+/// structure of arrays so `ids` packs into 16 bytes (one SIMD register) and
+/// the entire window fits in 96 bytes instead of 200 bytes.
 pub struct Window {
-    entries: [(u16, Occurrence); MAXIMUM],
+    serials: [u64; MAXIMUM],
+    ids: [u16; MAXIMUM],
+    qos: [Qos; MAXIMUM],
     len: u8,
 }
 
 impl Default for Window {
+    #[inline]
     fn default() -> Self {
         Self {
-            entries: [(0, EMPTY_OCCURRENCE); MAXIMUM],
+            serials: [0; MAXIMUM],
+            ids: [0; MAXIMUM],
+            qos: [Qos::AtMostOnce; MAXIMUM],
             len: 0,
         }
     }
@@ -51,15 +46,22 @@ impl Default for Window {
 
 impl Window {
     #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    #[inline]
     fn find(&self, id: u16) -> Option<usize> {
         let len = usize::from(self.len);
-        self.entries[..len].iter().position(|(key, _)| *key == id)
+        self.ids[..len].iter().position(|&key| key == id)
     }
 
     #[inline]
     fn remove_at(&mut self, idx: usize) {
         let last = usize::from(self.len) - 1;
-        self.entries[idx] = self.entries[last];
+        self.serials[idx] = self.serials[last];
+        self.ids[idx] = self.ids[last];
+        self.qos[idx] = self.qos[last];
         self.len = last as u8;
     }
 
@@ -77,19 +79,23 @@ impl Window {
 
     /// Refreshing a reusable identifier does not consume another receive
     /// slot. Older accepted frames retain their own frozen occurrence serial.
+    #[inline]
     pub fn publish_qos(&mut self, id: u16, serial: u64, qos: Qos) -> Result<(), ()> {
         if qos == Qos::AtMostOnce {
             return Err(());
         }
         if let Some(idx) = self.find(id) {
-            self.entries[idx].1 = Occurrence { serial, qos };
+            self.serials[idx] = serial;
+            self.qos[idx] = qos;
             return Ok(());
         }
         let len = usize::from(self.len);
         if len >= MAXIMUM {
             return Err(());
         }
-        self.entries[len] = (id, Occurrence { serial, qos });
+        self.serials[len] = serial;
+        self.ids[len] = id;
+        self.qos[len] = qos;
         self.len = (len + 1) as u8;
         Ok(())
     }
@@ -97,6 +103,7 @@ impl Window {
     /// Only a terminal ACK for this QoS and this exact PUBLISH occurrence
     /// releases its credit. The caller supplies a core-frozen serial, never
     /// one inferred later from the current use of the Packet Identifier.
+    #[inline]
     pub fn complete_frame(&mut self, id: u16, serial: Option<u64>, terminal: Terminal) -> bool {
         let Some(serial) = serial else {
             return false;
@@ -104,8 +111,7 @@ impl Window {
         let Some(idx) = self.find(id) else {
             return false;
         };
-        let occurrence = self.entries[idx].1;
-        if occurrence.serial == serial && occurrence.qos == terminal.qos() {
+        if self.serials[idx] == serial && self.qos[idx] == terminal.qos() {
             self.remove_at(idx);
             true
         } else {
@@ -113,22 +119,22 @@ impl Window {
         }
     }
 
+    #[inline]
     pub fn can_complete_frame(&self, id: u16, serial: Option<u64>, terminal: Terminal) -> bool {
         serial.is_some_and(|serial| {
-            self.find(id).is_some_and(|idx| {
-                let occurrence = self.entries[idx].1;
-                occurrence.serial == serial && occurrence.qos == terminal.qos()
-            })
+            self.find(id)
+                .is_some_and(|idx| self.serials[idx] == serial && self.qos[idx] == terminal.qos())
         })
     }
 
+    #[inline]
     pub fn contains(&self, id: u16) -> bool {
         self.find(id).is_some()
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
     pub fn serial(&self, id: u16) -> Option<u64> {
-        self.find(id).map(|idx| self.entries[idx].1.serial)
+        self.find(id).map(|idx| self.serials[idx])
     }
 }
 

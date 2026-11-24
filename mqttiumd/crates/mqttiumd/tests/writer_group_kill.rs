@@ -35,9 +35,7 @@ use std::time::{Duration, Instant};
 
 use mqttiumd::events::Events;
 use mqttiumd::writer::{Hooks, MAX_CLIENT, MAX_PAYLOAD, MAX_TOPIC, Request, Response, Writer};
-use mqttiumd_contract::capacity::{
-    BoundedVec, ExchangeSlots, PayloadBytes, ReceiptSlots, References,
-};
+use mqttiumd_contract::capacity::{ExchangeSlots, PayloadBytes, ReceiptSlots, References};
 use mqttiumd_contract::command::{
     AdmitPublication, Command, Costs, DeliveryCause, FrozenRecipe, PayloadRef, Recipe,
     ReleaseInbound, Source, Target,
@@ -179,7 +177,8 @@ impl Fixture {
                 exchange_slots: ExchangeSlots::new(1),
                 receipt_slots: ReceiptSlots::new(1),
             },
-            targets: BoundedVec::from_slice(&targets, targets.len()).expect("fits"),
+            targets: mqttiumd_contract::command::TargetVec::from_slice(&targets, targets.len())
+                .expect("fits"),
         });
         Command {
             recipe: FrozenRecipe::freeze(recipe).expect("well formed"),

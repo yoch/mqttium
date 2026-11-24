@@ -20,3 +20,4 @@ pub mod command;
 pub mod credits;
 pub mod leases;
 pub mod owner;
+mod slab;

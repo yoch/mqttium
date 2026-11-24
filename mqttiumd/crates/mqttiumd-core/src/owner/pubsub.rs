@@ -27,14 +27,12 @@ pub(super) struct Read {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(super) struct Connection {
     generation: ConnectionGeneration,
-    receive_maximum: u16,
+    last_qos0_ingress: u64,
     maximum_packet_size: u32,
-    after: Option<DeliveryId>,
-    loading: Option<Read>,
+    receive_maximum: u16,
     rescan_needed: bool,
     caught_up: bool,
     dirty_during_load: bool,
-    last_qos0_ingress: u64,
 }
 
 #[derive(Debug)]
@@ -49,7 +47,7 @@ pub(super) struct Control {
     pub(super) in_flight: InFlight,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub(super) struct RetainedFlight {
     publication: PublicationId,
     origin: VolatilePublicationId,
@@ -57,7 +55,7 @@ pub(super) struct RetainedFlight {
     retired: bool,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 enum Phase {
     Queued,
     ClaimPending(InFlight),
@@ -75,7 +73,7 @@ enum Phase {
     StartRetry,
     ExpireRetry,
     ConsumePending(InFlight, ConnectionKey),
-    Qos0Writing(Finished),
+    Qos0Writing(alloc::boxed::Box<Finished>),
 }
 
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -86,13 +84,13 @@ pub(super) struct Delivery {
     qos: Qos,
     cause: DeliveryCause,
     retain: bool,
-    expiry: Option<MessageExpiry>,
+    expiry: Option<alloc::boxed::Box<MessageExpiry>>,
     properties: Option<alloc::sync::Arc<crate::contract::properties::PublishProperties>>,
     claim: Option<DeliveryClaim>,
     topic: Option<SharedBytes>,
     payload: Option<SharedBytes>,
     phase: Phase,
-    claim_result: Option<Finished>,
+    claim_result: Option<alloc::boxed::Box<Finished>>,
     /// Send quota reserved for a PUBLISH on this generation. Its PUBREL
     /// retains this reservation through PUBCOMP. A resumed PUBREL has none.
     window: Option<ConnectionGeneration>,
@@ -114,6 +112,10 @@ pub(super) struct Delivery {
 }
 
 impl Delivery {
+    fn expiry(&self) -> Option<MessageExpiry> {
+        self.expiry.as_deref().copied()
+    }
+
     fn awaits_pubcomp(&self) -> bool {
         self.claim.is_some_and(|claim| claim.await_pubcomp)
     }
@@ -154,7 +156,7 @@ impl Delivery {
     fn expiry_allows_send(&self, now: Option<MessageTime>) -> bool {
         self.claim
             .is_some_and(|claim| claim.started || claim.await_pubcomp)
-            || self.expiry.is_none_or(|expiry| {
+            || self.expiry().is_none_or(|expiry| {
                 now.is_some_and(|now| matches!(expiry.state(now), Ok(ExpiryState::Fresh { .. })))
             })
     }
@@ -173,15 +175,15 @@ impl Delivery {
                         && self.frame.is_none()
                         && !self.early_puback
                         && self.early_pubrec.is_none()
-                        && self.expiry.is_some_and(|expiry| {
+                        && self.expiry().is_some_and(|expiry| {
                             now.is_some_and(|now| expiry.state(now) == Ok(ExpiryState::Expired))
                         })
                 }
                 _ => false,
             }
     }
-    fn in_flight(&self) -> Option<InFlight> {
-        match self.phase {
+    fn in_flight(&self) -> Option<&InFlight> {
+        match &self.phase {
             Phase::ClaimPending(f)
             | Phase::FinishPending(f)
             | Phase::DiscardPending(f)
@@ -237,9 +239,15 @@ pub(super) struct Volatile {
     connection: Option<ConnectionKey>,
     topic: SharedBytes,
     payload: SharedBytes,
-    expiry: Option<MessageExpiry>,
+    expiry: Option<alloc::boxed::Box<MessageExpiry>>,
     properties: Option<alloc::sync::Arc<crate::contract::properties::PublishProperties>>,
     frame: Option<EffectId>,
+}
+
+impl Volatile {
+    fn expiry(&self) -> Option<MessageExpiry> {
+        self.expiry.as_deref().copied()
+    }
 }
 
 /// Volatile QoS 0 frames the owner lets one connection have emitted and
@@ -504,7 +512,7 @@ impl VolatileQueue {
             .iter()
             .chain(self.inflight.values())
             .chain(self.lanes.values().flat_map(|lane| lane.parked.iter()))
-            .filter_map(|v| v.expiry)
+            .filter_map(Volatile::expiry)
             .all(|expiry| expiry.state(now).is_ok())
     }
 
@@ -522,12 +530,116 @@ impl VolatileQueue {
     }
 }
 
+/// Per-session delivery index and O(1) counters consolidated into a single
+/// `FlatMap` entry (replacing five separate per-session/generation maps) and
+/// kept warm across 0↔1 steady-state transitions until session removal.
+#[derive(Default, Debug)]
+struct SessionDeliveries {
+    all: SmallIndexSet,
+    inline_pending: SmallIndexSet,
+    busy: u16,
+    queued: u16,
+    sent_gen: Option<ConnectionGeneration>,
+    sent_count: u16,
+    sent_mixed: u16,
+    used_pi_mask: u64,
+    pi_collisions: u16,
+}
+
+impl SessionDeliveries {
+    fn add_sent(&mut self, generation: ConnectionGeneration) {
+        if self.sent_gen == Some(generation) {
+            self.sent_count = self.sent_count.saturating_add(1);
+        } else if self.sent_count == 0 && self.sent_mixed == 0 {
+            self.sent_gen = Some(generation);
+            self.sent_count = 1;
+        } else {
+            self.sent_mixed = self.sent_mixed.saturating_add(1);
+        }
+    }
+
+    fn sub_sent(&mut self, generation: ConnectionGeneration) {
+        if self.sent_gen == Some(generation) && self.sent_count > 0 {
+            self.sent_count -= 1;
+            if self.sent_count == 0 && self.sent_mixed == 0 {
+                self.sent_gen = None;
+            }
+        } else {
+            self.sent_mixed = self.sent_mixed.saturating_sub(1);
+        }
+    }
+
+    fn sent_on(
+        &self,
+        generation: ConnectionGeneration,
+        deliveries: &BoundedSlab<Delivery>,
+    ) -> usize {
+        if self.sent_mixed == 0 {
+            if self.sent_gen == Some(generation) {
+                usize::from(self.sent_count)
+            } else {
+                0
+            }
+        } else {
+            self.all
+                .iter()
+                .filter(|&idx| {
+                    let d = &deliveries[idx];
+                    State::sent_gen(d).is_some_and(|(_, g)| g == generation)
+                })
+                .count()
+        }
+    }
+
+    fn add_pi(&mut self, packet_id: OutboundPacketId) {
+        let id = packet_id.get();
+        if id <= 64 {
+            let bit = 1u64 << (id - 1);
+            if self.used_pi_mask & bit != 0 {
+                self.pi_collisions = self.pi_collisions.saturating_add(1);
+            } else {
+                self.used_pi_mask |= bit;
+            }
+        }
+    }
+
+    fn sub_pi(&mut self, packet_id: OutboundPacketId, deliveries: &BoundedSlab<Delivery>) {
+        let id = packet_id.get();
+        if id <= 64 {
+            if self.pi_collisions == 0 {
+                self.used_pi_mask &= !(1u64 << (id - 1));
+            } else {
+                // Rare collision fallback: recompute exact bitmask from live entries.
+                let mut mask = 0u64;
+                let mut collisions = 0u16;
+                for idx in &self.all {
+                    if let Some(claim) = deliveries[idx].claim {
+                        let cid = claim.packet_id.get();
+                        if cid <= 64 {
+                            let bit = 1u64 << (cid - 1);
+                            if mask & bit != 0 {
+                                collisions = collisions.saturating_add(1);
+                            } else {
+                                mask |= bit;
+                            }
+                        }
+                    }
+                }
+                self.used_pi_mask = mask;
+                self.pi_collisions = collisions;
+            }
+        }
+    }
+}
+
 #[derive(Debug)]
 pub(super) struct State {
     pub(super) connections: BoundedVec<Connection>,
     conn_by_gen: FlatMap<ConnectionGeneration, usize>,
     conn_by_loading_effect: ScopedFlatMap<EffectId, usize>,
-    pub(super) deliveries: BoundedVec<Delivery>,
+    after_by_gen: FlatMap<ConnectionGeneration, DeliveryId>,
+    loading_by_gen: FlatMap<ConnectionGeneration, Read>,
+    pub(super) deliveries: BoundedSlab<Delivery>,
     delivery_by_id: ScopedFlatMap<DeliveryId, usize>,
     delivery_by_op: ScopedFlatMap<OperationId, usize>,
     delivery_by_deadline: FlatMap<DeadlineToken, usize>,
@@ -535,14 +647,11 @@ pub(super) struct State {
     delivery_by_claim_op: ScopedFlatMap<OperationId, usize>,
     delivery_by_claim_result_op: ScopedFlatMap<OperationId, usize>,
     delivery_by_target_pi: FlatMap<(SessionId, OutboundPacketId), usize>,
-    deliveries_by_session: FlatMap<SessionId, SmallIndexSet>,
+    session_deliveries: FlatMap<SessionId, SessionDeliveries>,
     deliveries_by_window: FlatMap<ConnectionGeneration, SmallIndexSet>,
-    sent_on_gen: FlatMap<(SessionId, ConnectionGeneration), usize>,
-    busy_by_session: FlatMap<SessionId, usize>,
     control_candidates: BTreeSet<usize>,
     expiring_deliveries: BTreeSet<usize>,
     pubrec_pending_count: usize,
-    active_by_gen: FlatMap<ConnectionGeneration, usize>,
     pub(super) non_inline_by_session: FlatMap<SessionId, u32>,
     loaded_payload_bytes: u64,
     pub(super) control: Option<Control>,
@@ -564,7 +673,7 @@ pub(super) enum StartFollowUp {
 pub(super) enum Change {
     RetainedSubmit {
         connection: usize,
-        flight: RetainedFlight,
+        flight: alloc::boxed::Box<RetainedFlight>,
     },
     RetainedDone {
         finished: Finished,
@@ -613,7 +722,7 @@ pub(super) enum Change {
         index: Option<usize>,
         value: Connection,
     },
-    Control(Control),
+    Control(alloc::boxed::Box<Control>),
     ControlEnd {
         revision: Option<Revision>,
         finished: Finished,
@@ -693,7 +802,7 @@ pub(super) enum Change {
     Started {
         slot: usize,
         finished: Finished,
-        follow_up: Option<StartFollowUp>,
+        follow_up: Option<alloc::boxed::Box<StartFollowUp>>,
     },
     Expire {
         slot: usize,
@@ -720,10 +829,57 @@ impl State {
                         || (d.certain_never_started && d.frame.is_none() && d.expiry.is_some()))))
     }
 
+    fn after_of(&self, generation: ConnectionGeneration) -> Option<DeliveryId> {
+        if self.after_by_gen.is_empty() {
+            None
+        } else {
+            self.after_by_gen.get(&generation).copied()
+        }
+    }
+
+    fn loading_of(&self, generation: ConnectionGeneration) -> Option<Read> {
+        if self.loading_by_gen.is_empty() {
+            None
+        } else {
+            self.loading_by_gen.get(&generation).copied()
+        }
+    }
+
+    fn is_loading(&self, generation: ConnectionGeneration) -> bool {
+        !self.loading_by_gen.is_empty() && self.loading_by_gen.contains_key(&generation)
+    }
+
+    fn has_after(&self, generation: ConnectionGeneration) -> bool {
+        !self.after_by_gen.is_empty() && self.after_by_gen.contains_key(&generation)
+    }
+
+    fn set_loading(&mut self, generation: ConnectionGeneration, index: usize, read: Option<Read>) {
+        if let Some(old) = self.loading_by_gen.remove(&generation) {
+            self.conn_by_loading_effect.remove(&old.effect);
+        }
+        if let Some(read) = read {
+            self.loading_by_gen.insert(generation, read);
+            self.conn_by_loading_effect.insert(read.effect, index);
+        }
+    }
+
+    fn set_after(&mut self, generation: ConnectionGeneration, after: Option<DeliveryId>) {
+        match after {
+            Some(id) => {
+                self.after_by_gen.insert(generation, id);
+            }
+            None => {
+                if !self.after_by_gen.is_empty() {
+                    self.after_by_gen.remove(&generation);
+                }
+            }
+        }
+    }
+
     fn index_conn(&mut self, index: usize) {
         let c = self.connections.as_slice()[index];
         self.conn_by_gen.insert(c.generation, index);
-        if let Some(read) = c.loading {
+        if let Some(read) = self.loading_of(c.generation) {
             self.conn_by_loading_effect.insert(read.effect, index);
         }
     }
@@ -731,7 +887,7 @@ impl State {
     fn unindex_conn(&mut self, index: usize) {
         let c = self.connections.as_slice()[index];
         self.conn_by_gen.remove(&c.generation);
-        if let Some(read) = c.loading {
+        if let Some(read) = self.loading_of(c.generation) {
             self.conn_by_loading_effect.remove(&read.effect);
         }
     }
@@ -747,7 +903,10 @@ impl State {
 
     fn remove_conn_at(&mut self, index: usize) {
         let last = self.connections.len() - 1;
+        let removed_gen = self.connections.as_slice()[index].generation;
         self.unindex_conn(index);
+        self.loading_by_gen.remove(&removed_gen);
+        self.after_by_gen.remove(&removed_gen);
         if index != last {
             self.unindex_conn(last);
             self.connections.as_mut_slice().swap(index, last);
@@ -788,12 +947,17 @@ impl State {
             )
     }
 
+    fn is_inline_pending(d: &Delivery) -> bool {
+        !d.retired && matches!(d.phase, Phase::InlineClaimPending(_))
+    }
+
+    fn is_queued_delivery(d: &Delivery) -> bool {
+        !d.retired && d.phase == Phase::Queued
+    }
+
     fn index_delivery(&mut self, index: usize) {
-        let d = &self.deliveries.as_slice()[index];
+        let d = &self.deliveries[index];
         self.delivery_by_id.insert(d.id, index);
-        self.deliveries_by_session
-            .get_or_insert_default(d.target)
-            .insert(index);
         if let Some(f) = d.in_flight() {
             self.delivery_by_op.insert(f.operation, index);
             self.delivery_by_deadline.insert(f.deadline, index);
@@ -808,21 +972,33 @@ impl State {
                     .insert((d.target, claim.packet_id), index);
             }
         }
-        if let Some(res) = d.claim_result {
+        if let Some(res) = d.claim_result.as_deref() {
             self.delivery_by_claim_result_op
                 .insert(res.operation, index);
         }
         if let Some(generation) = d.window {
-            *self.active_by_gen.get_or_insert_default(generation) += 1;
             self.deliveries_by_window
                 .get_or_insert_default(generation)
                 .insert(index);
         }
-        if let Some(key) = Self::sent_gen(d) {
-            *self.sent_on_gen.get_or_insert_default(key) += 1;
-        }
-        if Self::is_busy_delivery(d) {
-            *self.busy_by_session.get_or_insert_default(d.target) += 1;
+        {
+            let sd = self.session_deliveries.get_or_insert_default(d.target);
+            sd.all.insert(index);
+            if let Some(claim) = d.claim {
+                sd.add_pi(claim.packet_id);
+            }
+            if let Some((_, generation)) = Self::sent_gen(d) {
+                sd.add_sent(generation);
+            }
+            if Self::is_busy_delivery(d) {
+                sd.busy = sd.busy.saturating_add(1);
+            }
+            if Self::is_inline_pending(d) {
+                sd.inline_pending.insert(index);
+            }
+            if Self::is_queued_delivery(d) {
+                sd.queued = sd.queued.saturating_add(1);
+            }
         }
         if let Some(payload) = &d.payload {
             self.loaded_payload_bytes = self
@@ -841,14 +1017,8 @@ impl State {
     }
 
     fn unindex_delivery(&mut self, index: usize) {
-        let d = &self.deliveries.as_slice()[index];
+        let d = &self.deliveries[index];
         self.delivery_by_id.remove(&d.id);
-        if let Some(set) = self.deliveries_by_session.get_mut(&d.target) {
-            set.remove(&index);
-            if set.is_empty() {
-                self.deliveries_by_session.remove(&d.target);
-            }
-        }
         if let Some(f) = d.in_flight() {
             self.delivery_by_op.remove(&f.operation);
             self.delivery_by_deadline.remove(&f.deadline);
@@ -856,127 +1026,96 @@ impl State {
         if let Some((effect, _)) = d.frame {
             self.delivery_by_frame.remove(&effect);
         }
-        if let Some(claim) = d.claim {
+        let removed_pi = if let Some(claim) = d.claim {
             self.delivery_by_claim_op.remove(&claim.operation);
             if !d.retired {
                 self.delivery_by_target_pi
                     .remove(&(d.target, claim.packet_id));
             }
-        }
-        if let Some(res) = d.claim_result {
+            Some(claim.packet_id)
+        } else {
+            None
+        };
+        if let Some(res) = d.claim_result.as_deref() {
             self.delivery_by_claim_result_op.remove(&res.operation);
-        }
-        if let Some(generation) = d.window {
-            if let Some(count) = self.active_by_gen.get_mut(&generation) {
-                *count = count.saturating_sub(1);
-                if *count == 0 {
-                    self.active_by_gen.remove(&generation);
-                }
-            }
-            if let Some(set) = self.deliveries_by_window.get_mut(&generation) {
-                set.remove(&index);
-                if set.is_empty() {
-                    self.deliveries_by_window.remove(&generation);
-                }
-            }
-        }
-        if let Some(key) = Self::sent_gen(d)
-            && let Some(count) = self.sent_on_gen.get_mut(&key)
-        {
-            *count = count.saturating_sub(1);
-            if *count == 0 {
-                self.sent_on_gen.remove(&key);
-            }
-        }
-        if Self::is_busy_delivery(d)
-            && let Some(count) = self.busy_by_session.get_mut(&d.target)
-        {
-            *count = count.saturating_sub(1);
-            if *count == 0 {
-                self.busy_by_session.remove(&d.target);
-            }
-        }
-        if let Some(payload) = &d.payload {
-            self.loaded_payload_bytes = self
-                .loaded_payload_bytes
-                .saturating_sub(payload.len() as u64);
-        }
-        self.control_candidates.remove(&index);
-        self.expiring_deliveries.remove(&index);
-        if Self::is_pubrec_pending(d) {
-            self.pubrec_pending_count = self.pubrec_pending_count.saturating_sub(1);
-        }
-    }
-
-    fn reindex_moved_delivery(&mut self, from: usize, to: usize) {
-        let d = &self.deliveries.as_slice()[to];
-        self.delivery_by_id.insert(d.id, to);
-        if let Some(set) = self.deliveries_by_session.get_mut(&d.target) {
-            set.replace(from, to);
-        }
-        if let Some(f) = d.in_flight() {
-            self.delivery_by_op.insert(f.operation, to);
-            self.delivery_by_deadline.insert(f.deadline, to);
-        }
-        if let Some((effect, _)) = d.frame {
-            self.delivery_by_frame.insert(effect, to);
-        }
-        if let Some(claim) = d.claim {
-            self.delivery_by_claim_op.insert(claim.operation, to);
-            if !d.retired {
-                self.delivery_by_target_pi
-                    .insert((d.target, claim.packet_id), to);
-            }
-        }
-        if let Some(res) = d.claim_result {
-            self.delivery_by_claim_result_op.insert(res.operation, to);
         }
         if let Some(generation) = d.window
             && let Some(set) = self.deliveries_by_window.get_mut(&generation)
         {
-            set.replace(from, to);
+            set.remove(&index);
         }
-        if Self::is_control_candidate(d) {
-            self.control_candidates.remove(&from);
-            self.control_candidates.insert(to);
+        let target = d.target;
+        let sent_gen = Self::sent_gen(d).map(|(_, g)| g);
+        let was_busy = Self::is_busy_delivery(d);
+        let was_inline = Self::is_inline_pending(d);
+        let was_queued = Self::is_queued_delivery(d);
+        let payload_len = d.payload.as_ref().map_or(0, |p| p.len() as u64);
+        let was_pubrec = Self::is_pubrec_pending(d);
+        if let Some(sd) = self.session_deliveries.get_mut(&target) {
+            sd.all.remove(&index);
+            if let Some(pi) = removed_pi {
+                sd.sub_pi(pi, &self.deliveries);
+            }
+            if let Some(generation) = sent_gen {
+                sd.sub_sent(generation);
+            }
+            if was_busy {
+                sd.busy = sd.busy.saturating_sub(1);
+            }
+            if was_inline {
+                sd.inline_pending.remove(&index);
+            }
+            if was_queued {
+                sd.queued = sd.queued.saturating_sub(1);
+            }
         }
-        if d.expiry.is_some() {
-            self.expiring_deliveries.remove(&from);
-            self.expiring_deliveries.insert(to);
+        if payload_len != 0 {
+            self.loaded_payload_bytes = self.loaded_payload_bytes.saturating_sub(payload_len);
+        }
+        self.control_candidates.remove(&index);
+        self.expiring_deliveries.remove(&index);
+        if was_pubrec {
+            self.pubrec_pending_count = self.pubrec_pending_count.saturating_sub(1);
         }
     }
 
     /// Updates a `Delivery` in place when `id`, `target`, `payload`, and `expiry`
     /// are unchanged, touching only the secondary indices whose keys changed.
     fn mutate_delivery(&mut self, index: usize, f: impl FnOnce(&mut Delivery)) {
-        let d = &self.deliveries.as_slice()[index];
+        let d = &self.deliveries[index];
         let old_flight = d.in_flight().map(|fl| (fl.operation, fl.deadline));
         let old_frame = d.frame.map(|(e, _)| e);
         let old_claim = d.claim.map(|c| c.operation);
+        let old_pi = d.claim.map(|c| c.packet_id);
         let old_target_pi = (!d.retired)
             .then(|| d.claim.map(|c| (d.target, c.packet_id)))
             .flatten();
-        let old_claim_res = d.claim_result.map(|r| r.operation);
+        let old_claim_res = d.claim_result.as_deref().map(|r| r.operation);
         let old_window = d.window;
-        let old_sent = Self::sent_gen(d);
+        let old_sent = Self::sent_gen(d).map(|(_, g)| g);
         let old_busy = Self::is_busy_delivery(d);
+        let old_inline = Self::is_inline_pending(d);
+        let old_queued = Self::is_queued_delivery(d);
         let old_ctrl = Self::is_control_candidate(d);
         let old_pubrec = Self::is_pubrec_pending(d);
 
-        f(&mut self.deliveries.as_mut_slice()[index]);
+        f(&mut self.deliveries[index]);
 
-        let d = &self.deliveries.as_slice()[index];
+        let d = &self.deliveries[index];
         let target = d.target;
         let new_flight = d.in_flight().map(|fl| (fl.operation, fl.deadline));
         let new_frame = d.frame.map(|(e, _)| e);
         let new_claim = d.claim.map(|c| c.operation);
+        let new_pi = d.claim.map(|c| c.packet_id);
         let new_target_pi = (!d.retired)
             .then(|| d.claim.map(|c| (d.target, c.packet_id)))
             .flatten();
-        let new_claim_res = d.claim_result.map(|r| r.operation);
+        let new_claim_res = d.claim_result.as_deref().map(|r| r.operation);
         let new_window = d.window;
-        let new_sent = Self::sent_gen(d);
+        let new_sent = Self::sent_gen(d).map(|(_, g)| g);
         let new_busy = Self::is_busy_delivery(d);
+        let new_inline = Self::is_inline_pending(d);
+        let new_queued = Self::is_queued_delivery(d);
         let new_ctrl = Self::is_control_candidate(d);
         let new_pubrec = Self::is_pubrec_pending(d);
 
@@ -1023,49 +1162,63 @@ impl State {
             }
         }
         if old_window != new_window {
-            if let Some(generation) = old_window {
-                if let Some(count) = self.active_by_gen.get_mut(&generation) {
-                    *count = count.saturating_sub(1);
-                    if *count == 0 {
-                        self.active_by_gen.remove(&generation);
-                    }
-                }
-                if let Some(set) = self.deliveries_by_window.get_mut(&generation) {
-                    set.remove(&index);
-                    if set.is_empty() {
-                        self.deliveries_by_window.remove(&generation);
-                    }
-                }
+            if let Some(generation) = old_window
+                && let Some(set) = self.deliveries_by_window.get_mut(&generation)
+            {
+                set.remove(&index);
             }
             if let Some(generation) = new_window {
-                *self.active_by_gen.get_or_insert_default(generation) += 1;
                 self.deliveries_by_window
                     .get_or_insert_default(generation)
                     .insert(index);
             }
         }
-        if old_sent != new_sent {
-            if let Some(key) = old_sent
-                && let Some(count) = self.sent_on_gen.get_mut(&key)
-            {
-                *count = count.saturating_sub(1);
-                if *count == 0 {
-                    self.sent_on_gen.remove(&key);
+        if (old_pi != new_pi
+            || old_sent != new_sent
+            || old_busy != new_busy
+            || old_inline != new_inline
+            || old_queued != new_queued)
+            && let Some(sd) = self.session_deliveries.get_mut(&target)
+        {
+            if old_pi != new_pi {
+                if let Some(pi) = old_pi {
+                    sd.sub_pi(pi, &self.deliveries);
+                }
+                if let Some(pi) = new_pi {
+                    sd.add_pi(pi);
                 }
             }
-            if let Some(key) = new_sent {
-                *self.sent_on_gen.get_or_insert_default(key) += 1;
-            }
-        }
-        if old_busy != new_busy {
-            if old_busy && let Some(count) = self.busy_by_session.get_mut(&target) {
-                *count = count.saturating_sub(1);
-                if *count == 0 {
-                    self.busy_by_session.remove(&target);
+            if old_sent != new_sent {
+                if let Some(generation) = old_sent {
+                    sd.sub_sent(generation);
+                }
+                if let Some(generation) = new_sent {
+                    sd.add_sent(generation);
                 }
             }
-            if new_busy {
-                *self.busy_by_session.get_or_insert_default(target) += 1;
+            if old_busy != new_busy {
+                if old_busy {
+                    sd.busy = sd.busy.saturating_sub(1);
+                }
+                if new_busy {
+                    sd.busy = sd.busy.saturating_add(1);
+                }
+            }
+            if old_inline != new_inline {
+                if old_inline {
+                    sd.inline_pending.remove(&index);
+                }
+                if new_inline {
+                    sd.inline_pending.insert(index);
+                }
+            }
+            if old_queued != new_queued {
+                if old_queued {
+                    sd.queued = sd.queued.saturating_sub(1);
+                }
+                if new_queued {
+                    sd.queued = sd.queued.saturating_add(1);
+                }
             }
         }
         if old_ctrl != new_ctrl {
@@ -1084,37 +1237,39 @@ impl State {
         }
     }
 
+    pub(super) fn drop_session_cache(&mut self, session: SessionId) {
+        if self
+            .session_deliveries
+            .get(&session)
+            .is_some_and(|sd| sd.all.is_empty())
+        {
+            self.session_deliveries.remove(&session);
+        }
+    }
+
     fn push_delivery(&mut self, delivery: Delivery) -> Result<(), CoreFault> {
-        let index = self.deliveries.len();
-        self.deliveries
-            .try_push(delivery)
+        let index = self
+            .deliveries
+            .insert(delivery)
             .map_err(|_| CoreFault::StalePlan)?;
         self.index_delivery(index);
         Ok(())
     }
 
     fn remove_delivery_at(&mut self, index: usize) {
-        let last = self.deliveries.len() - 1;
         self.unindex_delivery(index);
-        if index != last {
-            self.deliveries.as_mut_slice().swap(index, last);
-        }
-        let _ = self.deliveries.pop();
-        if index != last {
-            self.reindex_moved_delivery(last, index);
-        }
+        let _ = self.deliveries.remove(index);
     }
 
     pub(super) fn retired_flights(&self) -> usize {
         self.deliveries
-            .as_slice()
-            .iter()
+            .values()
             .filter(|d| {
                 d.retired
                     && (d.in_flight().is_some() || matches!(d.phase, Phase::InlineClaimPending(_)))
             })
             .count()
-            + usize::from(self.retained.is_some_and(|flight| flight.retired))
+            + usize::from(self.retained.as_ref().is_some_and(|flight| flight.retired))
     }
     pub(super) fn retire_session(&mut self, session: SessionId) {
         if let Some(flight) = self
@@ -1125,14 +1280,13 @@ impl State {
             flight.retired = true;
         }
         let indices: alloc::vec::Vec<usize> = self
-            .deliveries_by_session
+            .session_deliveries
             .get(&session)
-            .map(|set| set.iter().copied().collect())
+            .map(|sd| sd.all.iter().collect())
             .unwrap_or_default();
-        // Process in descending index order so swap-removals preserve lower indices.
-        for index in indices.into_iter().rev() {
+        for index in indices {
             let keep = {
-                let d = &self.deliveries.as_slice()[index];
+                let d = &self.deliveries[index];
                 d.in_flight().is_some()
                     || matches!(
                         d.phase,
@@ -1141,7 +1295,7 @@ impl State {
             };
             if keep {
                 self.unindex_delivery(index);
-                let d = &mut self.deliveries.as_mut_slice()[index];
+                let d = &mut self.deliveries[index];
                 d.retired = true;
                 d.window = None;
                 d.topic = None;
@@ -1167,18 +1321,25 @@ impl State {
     /// Among N live claims of this session, a free value is found in the
     /// first N+1 values or the finite domain is genuinely full.
     fn free_packet_id(&self, session: SessionId, maximum: u16) -> Option<OutboundPacketId> {
-        let Some(indices) = self.deliveries_by_session.get(&session) else {
+        let Some(sd) = self.session_deliveries.get(&session) else {
             return OutboundPacketId::new(1).filter(|id| id.get() <= maximum);
         };
-        if MUTANT_IGNORE_OCCUPIED_PI {
+        if sd.all.is_empty() || MUTANT_IGNORE_OCCUPIED_PI {
             return OutboundPacketId::new(1).filter(|id| id.get() <= maximum);
         }
-        let slice = self.deliveries.as_slice();
-        // Redis bitfield-inspired O(1) bitmask fast path for IDs 1..=64:
-        // finding the smallest free ID is a single `trailing_ones()` op.
+        // O(1) maintained bitmask fast path for IDs 1..=64: finding the
+        // smallest free packet ID is a single `trailing_ones()` instruction
+        // with zero per-delivery dereferences.
+        if !MUTANT_EARLY_PI_RELEASE && sd.pi_collisions == 0 && sd.used_pi_mask != u64::MAX {
+            let candidate = (sd.used_pi_mask.trailing_ones() + 1) as u16;
+            if candidate <= maximum {
+                return OutboundPacketId::new(candidate);
+            }
+            return None;
+        }
         let mut mask = 0u64;
-        for &idx in indices {
-            let delivery = &slice[idx];
+        for idx in &sd.all {
+            let delivery = &self.deliveries[idx];
             if Self::reserves_packet_id(delivery, session)
                 && let Some(claim) = delivery.claim
             {
@@ -1199,8 +1360,8 @@ impl State {
             return None;
         }
         let mut used = BTreeSet::new();
-        for &idx in indices {
-            let delivery = &slice[idx];
+        for idx in &sd.all {
+            let delivery = &self.deliveries[idx];
             if Self::reserves_packet_id(delivery, session)
                 && let Some(claim) = delivery.claim
             {
@@ -1274,7 +1435,9 @@ impl State {
             connections: table(config.max_sessions)?,
             conn_by_gen: FlatMap::new(),
             conn_by_loading_effect: ScopedFlatMap::new(),
-            deliveries: table(config.max_exchanges)?,
+            after_by_gen: FlatMap::new(),
+            loading_by_gen: FlatMap::new(),
+            deliveries: slab(config.max_exchanges)?,
             delivery_by_id: ScopedFlatMap::new(),
             delivery_by_op: ScopedFlatMap::new(),
             delivery_by_deadline: FlatMap::new(),
@@ -1282,14 +1445,11 @@ impl State {
             delivery_by_claim_op: ScopedFlatMap::new(),
             delivery_by_claim_result_op: ScopedFlatMap::new(),
             delivery_by_target_pi: FlatMap::new(),
-            deliveries_by_session: FlatMap::new(),
+            session_deliveries: FlatMap::new(),
             deliveries_by_window: FlatMap::new(),
-            sent_on_gen: FlatMap::new(),
-            busy_by_session: FlatMap::new(),
             control_candidates: BTreeSet::new(),
             expiring_deliveries: BTreeSet::new(),
             pubrec_pending_count: 0,
-            active_by_gen: FlatMap::new(),
             non_inline_by_session: FlatMap::new(),
             loaded_payload_bytes: 0,
             control: None,
@@ -1308,20 +1468,21 @@ impl State {
         self.delivery_by_id.get(&id).copied()
     }
     fn active(&self, generation: ConnectionGeneration) -> usize {
-        self.active_by_gen.get(&generation).copied().unwrap_or(0)
+        self.deliveries_by_window
+            .get(&generation)
+            .map_or(0, SmallIndexSet::len)
     }
 
     /// Consumed QoS 0 deliveries of `session` whose frame is being written
     /// on `generation`.
     fn qos0_writing(&self, session: SessionId, generation: ConnectionGeneration) -> usize {
-        let Some(indices) = self.deliveries_by_session.get(&session) else {
+        let Some(sd) = self.session_deliveries.get(&session) else {
             return 0;
         };
-        let slice = self.deliveries.as_slice();
-        indices
+        sd.all
             .iter()
-            .filter(|&&index| {
-                let d = &slice[index];
+            .filter(|&index| {
+                let d = &self.deliveries[index];
                 matches!(d.phase, Phase::Qos0Writing(_))
                     && d.frame.is_some_and(|(_, key)| key.generation == generation)
             })
@@ -1335,21 +1496,19 @@ impl State {
         now: Option<MessageTime>,
         room: bool,
     ) -> Option<(usize, &Delivery)> {
-        let indices = self.deliveries_by_session.get(&session)?;
+        let sd = self.session_deliveries.get(&session)?;
+        if sd.all.is_empty() {
+            return None;
+        }
         // O(1) fast path: when every delivery of this session is either already
         // transmitted on `generation` (AwaitPuback with frame on `generation`)
         // or in a non-sending terminal/busy phase, none can satisfy
         // `waiting_to_send(generation, now)`.
-        let sent = self
-            .sent_on_gen
-            .get(&(session, generation))
-            .copied()
-            .unwrap_or(0);
-        let busy = self.busy_by_session.get(&session).copied().unwrap_or(0);
-        if sent + busy == indices.len() {
+        let sent = sd.sent_on(generation, &self.deliveries);
+        if sent + usize::from(sd.busy) == sd.all.len() {
             return None;
         }
-        let slice = self.deliveries.as_slice();
+        let indices = &sd.all;
         let mut publish: Option<(usize, &Delivery)> = None;
         let mut pubrel: Option<(usize, &Delivery)> = None;
         // PUBREL leaves in the order of the first positive PUBREC
@@ -1362,8 +1521,8 @@ impl State {
         } else {
             indices
                 .iter()
-                .filter_map(|&idx| {
-                    let d = &slice[idx];
+                .filter_map(|idx| {
+                    let d = &self.deliveries[idx];
                     if Self::is_pubrec_pending(d) {
                         d.pubrec_rank
                     } else {
@@ -1373,8 +1532,8 @@ impl State {
                 .min()
         };
         let received = |delivery: &Delivery| delivery.pubrec_rank;
-        for &index in indices {
-            let delivery = &slice[index];
+        for index in indices {
+            let delivery = &self.deliveries[index];
             if !delivery.waiting_to_send(generation, now) {
                 continue;
             }
@@ -1429,19 +1588,19 @@ impl State {
         if !room {
             return (None, false);
         }
-        let Some(indices) = self.deliveries_by_session.get(&session) else {
+        let Some(sd) = self.session_deliveries.get(&session) else {
             return (None, true);
         };
-        let slice = self.deliveries.as_slice();
+        let indices = &sd.all;
         let mut blocker: Option<DeliveryId> = None;
         let mut best_queued: Option<(usize, &Delivery)> = None;
         let mut blocked_all = false;
-        for &idx in indices {
-            let d = &slice[idx];
+        for idx in indices {
+            let d = &self.deliveries[idx];
             if !d.waiting_to_send(generation, now) || d.awaits_pubcomp() {
                 continue;
             }
-            match d.phase {
+            match &d.phase {
                 Phase::ClaimPending(f) if f.phase == CommandPhase::Submitted => {}
                 Phase::AwaitPuback => {}
                 Phase::Queued if d.qos != Qos::AtMostOnce && d.payload.is_some() => {
@@ -1469,16 +1628,14 @@ impl State {
         Some(self.loaded_payload_bytes)
     }
     pub(super) fn accepts_message_time(&self, now: MessageTime) -> bool {
-        if !self.expiring_deliveries.is_empty() {
-            let slice = self.deliveries.as_slice();
-            if !self
+        if !self.expiring_deliveries.is_empty()
+            && !self
                 .expiring_deliveries
                 .iter()
-                .filter_map(|&idx| slice[idx].expiry)
+                .filter_map(|&idx| self.deliveries[idx].expiry())
                 .all(|expiry| expiry.state(now).is_ok())
-            {
-                return false;
-            }
+        {
+            return false;
         }
         self.volatile.accepts_message_time(now)
     }
@@ -1491,22 +1648,21 @@ impl State {
             .iter()
             .copied()
             .filter(|&idx| {
-                let d = &self.deliveries.as_slice()[idx];
+                let d = &self.deliveries[idx];
                 d.claim.is_none()
                     && d.phase == Phase::Queued
-                    && d.expiry
+                    && d.expiry()
                         .is_some_and(|expiry| expiry.state(now) == Ok(ExpiryState::Expired))
             })
             .collect();
-        for index in expired.into_iter().rev() {
+        for index in expired {
             self.remove_delivery_at(index);
         }
     }
     pub(super) fn has_control_work(&self, now: Option<MessageTime>) -> bool {
-        let slice = self.deliveries.as_slice();
         self.control_candidates
             .iter()
-            .any(|&idx| slice[idx].control_ready(now))
+            .any(|&idx| self.deliveries[idx].control_ready(now))
     }
     pub(super) fn close_work(&self) -> u64 {
         if self.connections.is_empty() {
@@ -1531,16 +1687,14 @@ impl State {
         self.delivery_by_claim_op.clear();
         self.delivery_by_claim_result_op.clear();
         self.delivery_by_target_pi.clear();
-        self.deliveries_by_session.clear();
+        self.session_deliveries.clear();
         self.deliveries_by_window.clear();
-        self.sent_on_gen.clear();
-        self.busy_by_session.clear();
         self.control_candidates.clear();
         self.expiring_deliveries.clear();
         self.pubrec_pending_count = 0;
-        self.active_by_gen.clear();
         self.loaded_payload_bytes = 0;
-        for index in 0..self.deliveries.len() {
+        let live: alloc::vec::Vec<usize> = self.deliveries.iter().map(|(idx, _)| idx).collect();
+        for index in live {
             self.index_delivery(index);
         }
     }
@@ -1549,10 +1703,9 @@ impl State {
             self.remove_conn_at(index);
         }
         if let Some(indices) = self.deliveries_by_window.remove(&generation) {
-            self.active_by_gen.remove(&generation);
             for idx in indices {
                 self.unindex_delivery(idx);
-                let delivery = &mut self.deliveries.as_mut_slice()[idx];
+                let delivery = &mut self.deliveries[idx];
                 if delivery.window == Some(generation) {
                     delivery.window = None;
                     if delivery.frame.is_some() {
@@ -1564,7 +1717,9 @@ impl State {
         }
     }
     pub(super) fn deadline_is_live(&self, token: DeadlineToken) -> bool {
-        self.retained.is_some_and(|f| f.in_flight.deadline == token)
+        self.retained
+            .as_ref()
+            .is_some_and(|f| f.in_flight.deadline == token)
             || self
                 .control
                 .as_ref()
@@ -1572,23 +1727,28 @@ impl State {
             || self.delivery_by_deadline.contains_key(&token)
     }
 
-    pub(super) fn known(&self, operation: OperationId) -> Option<Finished> {
+    pub(super) fn known(&self, operation: OperationId) -> Option<&Finished> {
         self.delivery_by_claim_result_op
             .get(&operation)
-            .and_then(|&idx| self.deliveries.as_slice().get(idx))
-            .and_then(|d| d.claim_result)
+            .and_then(|&idx| self.deliveries.get(idx))
+            .and_then(|d| d.claim_result.as_deref())
     }
     pub(super) fn control_pending(&self) -> bool {
         self.control.is_some()
     }
     fn invalidate_reads(&mut self, session: SessionId) {
-        for c in self.connections.as_mut_slice() {
-            if let Some(read) = &mut c.loading
-                && read.session == session
-            {
+        if self.loading_by_gen.is_empty() {
+            return;
+        }
+        let mut invalidated_gens = alloc::vec::Vec::new();
+        for (&generation, read) in self.loading_by_gen.iter_mut() {
+            if read.session == session {
                 read.invalidated = true;
-                c.after = None;
+                invalidated_gens.push(generation);
             }
+        }
+        for generation in invalidated_gens {
+            self.after_by_gen.remove(&generation);
         }
     }
 }
@@ -1663,62 +1823,90 @@ impl Owner {
     /// periodic fallback supply the authority to start a new discovery scan.
     #[must_use]
     pub fn has_ready_work(&self, session: SessionId) -> bool {
+        self.ready_work_generation(session).is_some()
+    }
+
+    /// Returns the active connection generation of `session` when a bounded
+    /// work wake-up can advance already known online work, avoiding duplicate
+    /// session-binding lookups in the runtime.
+    #[must_use]
+    pub fn ready_work_generation(&self, session: SessionId) -> Option<ConnectionGeneration> {
         if self.recovery.is_some() {
-            return false;
+            return None;
         }
+        let generation = self.connection_of(session);
+        let sd = self.pubsub.session_deliveries.get(&session);
         if self.receipts.control_available()
             && !self.pubsub.control_candidates.is_empty()
-            && self
-                .pubsub
-                .deliveries_by_session
-                .get(&session)
-                .is_some_and(|indices| {
-                    let slice = self.pubsub.deliveries.as_slice();
-                    indices
-                        .iter()
-                        .any(|&idx| slice[idx].control_ready(self.message_now))
-                })
+            && sd.is_some_and(|sd| {
+                sd.all
+                    .iter()
+                    .any(|idx| self.pubsub.deliveries[idx].control_ready(self.message_now))
+            })
         {
-            return true;
+            return generation;
         }
-        let Some(generation) = self.connection_of(session) else {
-            return false;
-        };
-        let Some(index) = self.pubsub.connection(generation) else {
-            return false;
-        };
+        let generation = generation?;
+        let index = self.pubsub.connection(generation)?;
         let settings = self.pubsub.connections.as_slice()[index];
         let room = self.pubsub.active(generation) < usize::from(settings.receive_maximum);
-        if let Some((_, delivery)) =
-            self.pubsub
-                .next_send(session, generation, self.message_now, room)
+        let needs_scan = settings.rescan_needed || self.pubsub.has_after(generation);
+        if let Some(sd) = sd
+            && !sd.all.is_empty()
         {
-            if delivery.phase == Phase::Queued
-                && delivery.qos == Qos::AtMostOnce
-                && self.pubsub.qos0_writing(session, generation) >= QOS0_CONSUMED_WINDOW
-            {
-                // Held until a write of the connection ends (record 0063).
-                return false;
-            }
-            if delivery.ready_to_send(generation, room) {
-                return true;
-            }
-            if matches!(
-                delivery.phase,
-                Phase::ClaimPending(_) | Phase::ConsumePending(_, _) | Phase::InlineClaimPending(_)
-            ) {
-                let (candidate, can_prefetch) =
-                    self.pubsub
-                        .next_pipelined_claim(session, generation, self.message_now, room);
-                if candidate.is_some() {
-                    return true;
+            let sent = sd.sent_on(generation, &self.pubsub.deliveries);
+            let busy = usize::from(sd.busy);
+            let inline_pending = sd.inline_pending.len();
+            // O(1) fast path for steady-state inline-claimed QoS 1: when every
+            // delivery is already sent, busy, or awaiting inline admission and
+            // no rescan/page cursor is pending, nothing can be emitted or claimed.
+            if sent + busy + inline_pending == sd.all.len() {
+                if !needs_scan {
+                    return None;
                 }
-                if !can_prefetch {
-                    return false;
+                if inline_pending == 0 {
+                    return (room && !self.pubsub.is_loading(generation)).then_some(generation);
+                }
+            }
+            if let Some((_, delivery)) =
+                self.pubsub
+                    .next_send(session, generation, self.message_now, room)
+            {
+                if delivery.phase == Phase::Queued
+                    && delivery.qos == Qos::AtMostOnce
+                    && self.pubsub.qos0_writing(session, generation) >= QOS0_CONSUMED_WINDOW
+                {
+                    // Held until a write of the connection ends (record 0063).
+                    return None;
+                }
+                if delivery.ready_to_send(generation, room) {
+                    return Some(generation);
+                }
+                if matches!(
+                    delivery.phase,
+                    Phase::ClaimPending(_)
+                        | Phase::ConsumePending(_, _)
+                        | Phase::InlineClaimPending(_)
+                ) {
+                    if sd.queued == 0 && !needs_scan {
+                        return None;
+                    }
+                    let (candidate, can_prefetch) = self.pubsub.next_pipelined_claim(
+                        session,
+                        generation,
+                        self.message_now,
+                        room,
+                    );
+                    if candidate.is_some() {
+                        return Some(generation);
+                    }
+                    if !can_prefetch {
+                        return None;
+                    }
                 }
             }
         }
-        room && settings.loading.is_none() && (settings.after.is_some() || settings.rescan_needed)
+        (room && !self.pubsub.is_loading(generation) && needs_scan).then_some(generation)
     }
 
     fn qos0_continuation(&self, draft: &mut Draft) -> Result<ContinuationId, Stop> {
@@ -1902,7 +2090,7 @@ impl Owner {
         let in_flight = self.plan_submission(operation, recipe, Some(payload.clone()), draft)?;
         Ok(changed(Change::RetainedSubmit {
             connection,
-            flight: RetainedFlight {
+            flight: alloc::boxed::Box::new(RetainedFlight {
                 publication,
                 origin: VolatilePublicationId {
                     source: ConnectionKey {
@@ -1913,7 +2101,7 @@ impl Owner {
                 },
                 in_flight,
                 retired: false,
-            },
+            }),
         }))
     }
     fn plan_retained_qos0_result(
@@ -1926,6 +2114,7 @@ impl Owner {
         let Some(flight) = self
             .pubsub
             .retained
+            .as_ref()
             .filter(|f| f.in_flight.operation == operation)
         else {
             return Ok(None);
@@ -1982,12 +2171,7 @@ impl Owner {
         };
         draft.receipt_consumed = Some(operation);
         Ok(Some(changed(Change::RetainedDone {
-            finished: Finished {
-                operation,
-                answers: flight.in_flight.answers,
-                phase,
-                facts,
-            },
+            finished: Finished::new(operation, flight.in_flight.answers.clone(), phase, facts),
         })))
     }
     pub(super) fn plan_qos0_packet(
@@ -2097,7 +2281,7 @@ impl Owner {
                     connection,
                     topic: topic.clone(),
                     payload: payload.clone(),
-                    expiry: *expiry,
+                    expiry: expiry.map(alloc::boxed::Box::new),
                     properties: properties.clone(),
                     frame: None,
                 })
@@ -2236,7 +2420,8 @@ impl Owner {
 
     /// Why a volatile delivery cannot be sent now, if it cannot.
     fn qos0_drop_reason(&self, v: &Volatile) -> Result<Option<Qos0DropReason>, Stop> {
-        let reason = if let Some(expiry) = v.expiry {
+        let expiry = v.expiry();
+        let reason = if let Some(expiry) = expiry {
             match self.message_now.map(|now| expiry.state(now)) {
                 Some(Ok(ExpiryState::Fresh { .. })) => None,
                 Some(Ok(ExpiryState::Expired)) => Some(Qos0DropReason::MessageExpired),
@@ -2252,13 +2437,7 @@ impl Owner {
                 Some(Qos0DropReason::ConnectionClosed)
             }
             Some(key)
-                if !self.qos0_fits(
-                    key,
-                    &v.topic,
-                    &v.payload,
-                    v.expiry,
-                    v.properties.as_deref(),
-                ) =>
+                if !self.qos0_fits(key, &v.topic, &v.payload, expiry, v.properties.as_deref()) =>
             {
                 Some(Qos0DropReason::PacketTooLarge)
             }
@@ -2275,7 +2454,7 @@ impl Owner {
             retain: false,
             topic: v.topic.clone(),
             payload: v.payload.clone(),
-            expiry: v.expiry,
+            expiry: v.expiry.clone(),
             properties: v.properties.clone(),
         })
     }
@@ -2287,11 +2466,12 @@ impl Owner {
         reason: Option<Qos0DropReason>,
         draft: &mut Draft,
     ) -> Result<Option<super::Change>, Stop> {
-        if let Some(v) = self
-            .pubsub
-            .volatile
-            .get_inflight(effect)
-            .filter(|v| v.connection == Some(connection))
+        if !self.pubsub.volatile.is_empty()
+            && let Some(v) = self
+                .pubsub
+                .volatile
+                .get_inflight(effect)
+                .filter(|v| v.connection == Some(connection))
         {
             if let Some(reason) = reason {
                 draft.emit(Effect::Qos0Dropped {
@@ -2314,11 +2494,10 @@ impl Owner {
             })));
         }
         if let Some(&slot) = self.pubsub.delivery_by_frame.get(&effect) {
-            let d = &self.pubsub.deliveries.as_slice()[slot];
-            if matches!(d.phase, Phase::Qos0Writing(_)) && d.frame == Some((effect, connection)) {
-                let Phase::Qos0Writing(finished) = d.phase else {
-                    return Err(IMPOSSIBLE);
-                };
+            let d = &self.pubsub.deliveries[slot];
+            if let Phase::Qos0Writing(finished) = &d.phase
+                && d.frame == Some((effect, connection))
+            {
                 if let Some(reason) = reason {
                     draft.emit(Effect::Qos0Dropped {
                         origin: Qos0Origin::Consumed {
@@ -2329,7 +2508,10 @@ impl Owner {
                         reason,
                     })?;
                 }
-                return Ok(Some(changed(Change::Finished { slot, finished })));
+                return Ok(Some(changed(Change::Finished {
+                    slot,
+                    finished: (**finished).clone(),
+                })));
             }
         }
         Ok(None)
@@ -2347,34 +2529,134 @@ impl Owner {
             .unwrap_or(super::Change::Nothing))
     }
 
-    pub(super) fn plan_qos0_frame(
+    pub(super) fn plan_qos0_or_pubsub_frame(
         &self,
         effect: EffectId,
         connection: ConnectionKey,
         progress: FrameProgress,
         draft: &mut Draft,
     ) -> Result<Option<super::Change>, Stop> {
-        match progress {
-            FrameProgress::NotStarted { reason } => self.plan_qos0_terminal(
-                effect,
-                connection,
-                Some(match reason {
-                    MessageExpiryBlock::Expired => Qos0DropReason::MessageExpired,
-                    MessageExpiryBlock::TemporalUncertain => Qos0DropReason::TemporalUncertain,
-                }),
-                draft,
-            ),
-            FrameProgress::Failed => self.plan_qos0_terminal(
-                effect,
-                connection,
-                Some(Qos0DropReason::WriteFailed),
-                draft,
-            ),
+        let qos0_terminal = match progress {
+            FrameProgress::NotStarted { reason } => Some(Some(match reason {
+                MessageExpiryBlock::Expired => Qos0DropReason::MessageExpired,
+                MessageExpiryBlock::TemporalUncertain => Qos0DropReason::TemporalUncertain,
+            })),
+            FrameProgress::Failed => Some(Some(Qos0DropReason::WriteFailed)),
             FrameProgress::Written { confirmed, total } if total > 0 && confirmed == total => {
-                self.plan_qos0_terminal(effect, connection, None, draft)
+                Some(None)
             }
-            _ => Ok(None),
+            _ => None,
+        };
+        if let Some(reason) = qos0_terminal
+            && !self.pubsub.volatile.is_empty()
+            && let Some(v) = self
+                .pubsub
+                .volatile
+                .get_inflight(effect)
+                .filter(|v| v.connection == Some(connection))
+        {
+            if let Some(reason) = reason {
+                draft.emit(Effect::Qos0Dropped {
+                    origin: v.origin,
+                    target: Some(v.target),
+                    reason,
+                })?;
+            }
+            let continuation =
+                if self.pubsub.volatile.wakes(effect) && self.pubsub.continuation.is_none() {
+                    Some(self.qos0_continuation(draft)?)
+                } else {
+                    None
+                };
+            return Ok(Some(changed(Change::Qos0Done {
+                effect,
+                continuation,
+            })));
         }
+        let found = if MUTANT_STALE_OUTGOING_FRAME_RESULT {
+            self.pubsub
+                .deliveries
+                .iter()
+                .find(|(_, d)| !d.retired && d.frame.is_some_and(|(_, sent)| sent == connection))
+        } else {
+            self.pubsub
+                .delivery_by_frame
+                .get(&effect)
+                .copied()
+                .and_then(|slot| {
+                    let d = &self.pubsub.deliveries[slot];
+                    (d.frame == Some((effect, connection))).then_some((slot, d))
+                })
+        };
+        let Some((slot, d)) = found else {
+            return Ok(None);
+        };
+        if let Some(reason) = qos0_terminal
+            && let Phase::Qos0Writing(finished) = &d.phase
+        {
+            if let Some(reason) = reason {
+                draft.emit(Effect::Qos0Dropped {
+                    origin: Qos0Origin::Consumed {
+                        delivery: d.id,
+                        operation: finished.operation,
+                    },
+                    target: Some(d.target),
+                    reason,
+                })?;
+            }
+            return Ok(Some(changed(Change::Finished {
+                slot,
+                finished: (**finished).clone(),
+            })));
+        }
+        if d.retired {
+            return Ok(None);
+        }
+        // A callback for a replaced generation never establishes transmission
+        // authority for the new connection or for another reusable PI.
+        if self.connection_of(d.target) != Some(connection.generation) {
+            return Ok(None);
+        }
+        let change = match progress {
+            FrameProgress::Started
+                if d.expiry.is_some()
+                    && d.phase == Phase::AwaitPuback
+                    && !d
+                        .claim
+                        .is_some_and(|claim| claim.started || claim.await_pubcomp) =>
+            {
+                Change::Start {
+                    slot,
+                    in_flight: self.submit_start(d, draft)?,
+                }
+            }
+            FrameProgress::NotStarted {
+                reason: MessageExpiryBlock::Expired,
+            } if d.phase == Phase::AwaitPuback
+                && d.certain_never_started
+                && !d.early_puback
+                && d.expiry().is_some_and(|expiry| {
+                    self.message_now
+                        .is_some_and(|now| expiry.state(now) == Ok(ExpiryState::Expired))
+                }) =>
+            {
+                Change::Expire {
+                    slot,
+                    in_flight: self.submit_expiry(d, draft)?,
+                }
+            }
+            FrameProgress::NotStarted { .. } if d.phase == Phase::AwaitPuback => {
+                Change::NotStarted { slot }
+            }
+            FrameProgress::Written { confirmed, total } if confirmed > 0 && confirmed <= total => {
+                Change::Written {
+                    slot,
+                    complete: confirmed == total,
+                }
+            }
+            _ => return Ok(None),
+        };
+        Ok(Some(changed(change)))
     }
 
     pub(super) fn plan_settings(
@@ -2397,14 +2679,12 @@ impl Owner {
         }
         let mut value = Connection {
             generation: connection,
-            receive_maximum: receive_maximum.min(64),
+            last_qos0_ingress: 0,
             maximum_packet_size,
-            after: None,
-            loading: None,
+            receive_maximum: receive_maximum.min(64),
             rescan_needed: false,
             caught_up: false,
             dirty_during_load: false,
-            last_qos0_ingress: 0,
         };
         if let Some(index) = index {
             let current = self.pubsub.connections.as_slice()[index];
@@ -2475,6 +2755,49 @@ impl Owner {
         })
     }
 
+    /// Fused check used by runtime outgoing-binding pruning: verifies in a
+    /// single lookup whether `(connection, packet_id)` still resolves to
+    /// `target` for either QoS 1 PUBACK or QoS 2 PUBREC.
+    #[must_use]
+    pub fn outgoing_binding_is_live(
+        &self,
+        connection: ConnectionKey,
+        packet_id: OutboundPacketId,
+        target: PubackTarget,
+    ) -> bool {
+        if self.connection_of(connection.session) != Some(connection.generation) {
+            return false;
+        }
+        if !MUTANT_IGNORE_OCCUPIED_PI && !MUTANT_EARLY_PI_RELEASE {
+            let Some(&idx) = self
+                .pubsub
+                .delivery_by_target_pi
+                .get(&(connection.session, packet_id))
+            else {
+                return false;
+            };
+            let delivery = &self.pubsub.deliveries[idx];
+            let Some(claim) = delivery.claim else {
+                return false;
+            };
+            let Some((frame, sent)) = delivery.frame else {
+                return false;
+            };
+            return sent == connection
+                && claim.packet_id == packet_id
+                && delivery.id == target.delivery
+                && claim.operation == target.claim
+                && frame == target.frame
+                && matches!(delivery.qos, Qos::AtLeastOnce | Qos::ExactlyOnce)
+                && matches!(
+                    delivery.phase,
+                    Phase::AwaitPuback | Phase::StartPending(_) | Phase::StartRetry
+                );
+        }
+        self.puback_target(connection, packet_id) == Some(target)
+            || self.qos2_ack_target(connection, packet_id, Qos2Ack::Pubrec) == Some(target)
+    }
+
     /// Whether the owner currently holds any expiring deliveries or volatile
     /// publications requiring up-to-date message clock observations.
     #[must_use]
@@ -2482,12 +2805,12 @@ impl Owner {
         !self.pubsub.expiring_deliveries.is_empty() || self.pubsub.volatile.expiring_count > 0
     }
 
-    fn outgoing_ack_target(
+    fn outgoing_ack_slot(
         &self,
         connection: ConnectionKey,
         packet_id: OutboundPacketId,
         eligible: impl Fn(&Delivery, DeliveryClaim) -> bool,
-    ) -> Option<PubackTarget> {
+    ) -> Option<(usize, PubackTarget)> {
         if self.connection_of(connection.session) != Some(connection.generation) {
             return None;
         }
@@ -2496,31 +2819,46 @@ impl Owner {
                 .pubsub
                 .delivery_by_target_pi
                 .get(&(connection.session, packet_id))?;
-            let delivery = &self.pubsub.deliveries.as_slice()[idx];
+            let delivery = &self.pubsub.deliveries[idx];
             let claim = delivery.claim?;
             let (frame, sent) = delivery.frame?;
             return (eligible(delivery, claim)
                 && sent == connection
                 && claim.packet_id == packet_id)
-                .then_some(PubackTarget {
-                    delivery: delivery.id,
-                    claim: claim.operation,
-                    frame,
-                });
+                .then_some((
+                    idx,
+                    PubackTarget {
+                        delivery: delivery.id,
+                        claim: claim.operation,
+                        frame,
+                    },
+                ));
         }
-        let indices = self.pubsub.deliveries_by_session.get(&connection.session)?;
-        let slice = self.pubsub.deliveries.as_slice();
-        indices.iter().find_map(|&idx| {
-            let delivery = &slice[idx];
+        let sd = self.pubsub.session_deliveries.get(&connection.session)?;
+        sd.all.iter().find_map(|idx| {
+            let delivery = &self.pubsub.deliveries[idx];
             let claim = delivery.claim?;
             let (frame, sent) = delivery.frame?;
             (eligible(delivery, claim) && sent == connection && claim.packet_id == packet_id)
-                .then_some(PubackTarget {
-                    delivery: delivery.id,
-                    claim: claim.operation,
-                    frame,
-                })
+                .then_some((
+                    idx,
+                    PubackTarget {
+                        delivery: delivery.id,
+                        claim: claim.operation,
+                        frame,
+                    },
+                ))
         })
+    }
+
+    fn outgoing_ack_target(
+        &self,
+        connection: ConnectionKey,
+        packet_id: OutboundPacketId,
+        eligible: impl Fn(&Delivery, DeliveryClaim) -> bool,
+    ) -> Option<PubackTarget> {
+        self.outgoing_ack_slot(connection, packet_id, eligible)
+            .map(|(_, target)| target)
     }
 
     pub(super) fn plan_observed_qos2_ack(
@@ -2550,7 +2888,7 @@ impl Owner {
             return Ok(super::Change::Nothing);
         }
         let slot = self.pubsub.delivery(target.delivery).ok_or(IMPOSSIBLE)?;
-        let delivery = &self.pubsub.deliveries.as_slice()[slot];
+        let delivery = &self.pubsub.deliveries[slot];
         if kind == Qos2Ack::Pubrec {
             if delivery.claim.is_some_and(|c| c.await_pubcomp) {
                 if reason < 0x80 && delivery.frame.is_some_and(|(_, sent)| sent == connection) {
@@ -2628,11 +2966,19 @@ impl Owner {
         let Some(target) = target else {
             return Ok(super::Change::Nothing);
         };
-        if self.puback_target(connection, packet_id) != Some(target) {
+        let Some((slot, matched)) = self.outgoing_ack_slot(connection, packet_id, |delivery, _| {
+            delivery.qos == Qos::AtLeastOnce
+                && matches!(
+                    delivery.phase,
+                    Phase::AwaitPuback | Phase::StartPending(_) | Phase::StartRetry
+                )
+        }) else {
+            return Ok(super::Change::Nothing);
+        };
+        if matched != target {
             return Ok(super::Change::Nothing);
         }
-        let slot = self.pubsub.delivery(target.delivery).ok_or(IMPOSSIBLE)?;
-        let delivery = &self.pubsub.deliveries.as_slice()[slot];
+        let delivery = &self.pubsub.deliveries[slot];
         if delivery.expiry.is_some() && !delivery.claim.is_some_and(|claim| claim.started) {
             return Ok(changed(Change::PubackObserved { slot }));
         }
@@ -2798,7 +3144,7 @@ impl Owner {
             Recipe::UpdateSubscriptions(update)
         };
         let in_flight = self.plan_submission(operation, recipe, None, draft)?;
-        Ok(changed(Change::Control(Control {
+        Ok(changed(Change::Control(alloc::boxed::Box::new(Control {
             session: session.id,
             session_revision: session.revision,
             connection: key,
@@ -2807,7 +3153,7 @@ impl Owner {
             results,
             changes: control_changes,
             in_flight,
-        })))
+        }))))
     }
 
     fn subscription_changes(
@@ -2985,12 +3331,11 @@ impl Owner {
         if !self.receipts.control_available() || self.pubsub.control_candidates.is_empty() {
             return Ok(None);
         }
-        let slice = self.pubsub.deliveries.as_slice();
         let Some((slot, d)) = self
             .pubsub
             .control_candidates
             .iter()
-            .map(|&slot| (slot, &slice[slot]))
+            .map(|&slot| (slot, &self.pubsub.deliveries[slot]))
             .filter(|(_, d)| {
                 session.is_none_or(|session| d.target == session)
                     && d.control_ready(self.message_now)
@@ -3040,6 +3385,36 @@ impl Owner {
         };
         let settings = self.pubsub.connections.as_slice()[connection];
         let room = self.pubsub.active(generation) < usize::from(settings.receive_maximum);
+        let after = self.pubsub.after_of(generation);
+        let loading = self.pubsub.is_loading(generation);
+        let needs_scan = settings.rescan_needed || after.is_some();
+        if let Some(sd) = self.pubsub.session_deliveries.get(&session)
+            && !sd.all.is_empty()
+        {
+            let sent = sd.sent_on(generation, &self.pubsub.deliveries);
+            let busy = usize::from(sd.busy);
+            let inline_pending = sd.inline_pending.len();
+            if sent + busy + inline_pending == sd.all.len() {
+                if !room || loading || (inline_pending > 0 && !needs_scan) {
+                    return Ok(super::Change::Nothing);
+                }
+                if inline_pending == 0 {
+                    let effect = draft.emit(Effect::LoadWork {
+                        session,
+                        limit: WORK_PAGE_LIMIT,
+                        after,
+                    })?;
+                    return Ok(changed(Change::Scan {
+                        connection,
+                        read: Read {
+                            effect,
+                            session,
+                            invalidated: false,
+                        },
+                    }));
+                }
+            }
+        }
         let next = self
             .pubsub
             .next_send(session, generation, self.message_now, room);
@@ -3051,6 +3426,14 @@ impl Owner {
                 Phase::ClaimPending(_) | Phase::ConsumePending(_, _) | Phase::InlineClaimPending(_)
             )
         {
+            let has_queued = self
+                .pubsub
+                .session_deliveries
+                .get(&session)
+                .is_some_and(|sd| sd.queued > 0);
+            if !has_queued && (!needs_scan || loading) {
+                return Ok(super::Change::Nothing);
+            }
             // A lost (Indeterminate) claim result or a pending QoS 0 consume
             // must be reconciled before a later publication can be claimed on
             // this destination. Healthy in-flight Submitted claims allow
@@ -3061,10 +3444,7 @@ impl Owner {
                     .next_pipelined_claim(session, generation, self.message_now, room);
             if let Some(pair) = candidate {
                 claim_target = Some(pair);
-            } else if can_prefetch
-                && settings.loading.is_none()
-                && (settings.after.is_some() || settings.rescan_needed)
-            {
+            } else if can_prefetch && !loading && needs_scan {
                 allow_prefetch = true;
             } else {
                 return Ok(super::Change::Nothing);
@@ -3166,7 +3546,7 @@ impl Owner {
             }));
         }
         if room
-            && settings.loading.is_none()
+            && !loading
             && (allow_prefetch
                 || next.is_none_or(|(_, d)| {
                     !matches!(
@@ -3180,7 +3560,7 @@ impl Owner {
             let effect = draft.emit(Effect::LoadWork {
                 session,
                 limit: WORK_PAGE_LIMIT,
-                after: settings.after,
+                after,
             })?;
             return Ok(changed(Change::Scan {
                 connection,
@@ -3207,15 +3587,19 @@ impl Owner {
             .get(&effect)
             .copied()
             .filter(|&idx| {
-                self.pubsub.connections.as_slice()[idx]
-                    .loading
+                let conn_gen = self.pubsub.connections.as_slice()[idx].generation;
+                self.pubsub
+                    .loading_of(conn_gen)
                     .is_some_and(|r| r.effect == effect && r.session == session)
             })
         else {
             return Ok(super::Change::Nothing);
         };
         let settings = self.pubsub.connections.as_slice()[connection];
-        let read = settings.loading.ok_or(IMPOSSIBLE)?;
+        let read = self
+            .pubsub
+            .loading_of(settings.generation)
+            .ok_or(IMPOSSIBLE)?;
         if read.invalidated || self.connection_of(session) != Some(settings.generation) {
             return Ok(changed(Change::Page {
                 connection,
@@ -3225,8 +3609,9 @@ impl Owner {
         }
         if items.len() > WORK_PAGE_LIMIT as usize
             || items.windows(2).any(|w| w[0].delivery >= w[1].delivery)
-            || settings
-                .after
+            || self
+                .pubsub
+                .after_of(settings.generation)
                 .is_some_and(|after| items.first().is_some_and(|first| first.delivery <= after))
             || next.is_some_and(|id| items.last().is_none_or(|last| last.delivery != id))
         {
@@ -3262,15 +3647,14 @@ impl Owner {
                     .pubsub
                     .delivery_by_claim_op
                     .get(&claim.operation)
-                    .is_some_and(|&idx| self.pubsub.deliveries.as_slice()[idx].id != item.delivery);
+                    .is_some_and(|&idx| self.pubsub.deliveries[idx].id != item.delivery);
                 let pi_conflict = self
                     .pubsub
-                    .deliveries_by_session
+                    .session_deliveries
                     .get(&item.target)
-                    .is_some_and(|indices| {
-                        let slice = self.pubsub.deliveries.as_slice();
-                        indices.iter().any(|&idx| {
-                            let d = &slice[idx];
+                    .is_some_and(|sd| {
+                        sd.all.iter().any(|idx| {
+                            let d = &self.pubsub.deliveries[idx];
                             d.id != item.delivery
                                 && d.claim
                                     .is_some_and(|other| other.packet_id == claim.packet_id)
@@ -3292,12 +3676,12 @@ impl Owner {
             let known = self
                 .pubsub
                 .delivery(item.delivery)
-                .map(|i| &self.pubsub.deliveries.as_slice()[i]);
+                .map(|i| &self.pubsub.deliveries[i]);
             if let Some(known) = known {
                 if known.target != item.target
                     || known.revision != item.target_revision
                     || known.qos != item.qos
-                    || known.expiry != item.expiry
+                    || known.expiry() != item.expiry
                     || (known.topic.is_some()
                         && (known.retain != item.retain
                             || known.cause != item.cause
@@ -3393,22 +3777,34 @@ impl Owner {
         {
             return Ok(Emission::Held);
         }
-        if self
-            .pubsub
-            .deliveries_by_session
-            .get(&delivery.target)
-            .is_some_and(|indices| {
-                let slice = self.pubsub.deliveries.as_slice();
-                indices.iter().any(|&idx| {
-                    let earlier = &slice[idx];
+        if let Some(sd) = self.pubsub.session_deliveries.get(&delivery.target)
+            && !sd.all.is_empty()
+        {
+            let sent = sd.sent_on(generation, &self.pubsub.deliveries);
+            let busy = usize::from(sd.busy);
+            let self_uncounted = !State::is_busy_delivery(delivery)
+                && State::sent_gen(delivery) != Some((delivery.target, generation));
+            let only_self_waiting = self_uncounted && sent + busy + 1 == sd.all.len();
+            if !only_self_waiting {
+                let inline_len = sd.inline_pending.len();
+                if sent + busy + inline_len == sd.all.len() {
+                    if sd.inline_pending.iter().any(|idx| {
+                        let earlier = &self.pubsub.deliveries[idx];
+                        earlier.id < delivery.id
+                            && earlier.waiting_to_send(generation, self.message_now)
+                    }) {
+                        return Ok(Emission::Held);
+                    }
+                } else if sd.all.iter().any(|idx| {
+                    let earlier = &self.pubsub.deliveries[idx];
                     earlier.id < delivery.id
                         && earlier.waiting_to_send(generation, self.message_now)
-                })
-            })
-        {
-            // This also protects a claim result delivered after takeover:
-            // restored earlier exchanges are replayed before newer ones.
-            return Ok(Emission::Held);
+                }) {
+                    // This also protects a claim result delivered after takeover:
+                    // restored earlier exchanges are replayed before newer ones.
+                    return Ok(Emission::Held);
+                }
+            }
         }
         let (Some(topic), Some(payload)) = (&delivery.topic, &delivery.payload) else {
             return Ok(Emission::Held);
@@ -3438,7 +3834,7 @@ impl Owner {
             payload: payload.clone(),
             dup: delivery.may_have_started,
             retain: delivery.retain,
-            expiry: delivery.expiry,
+            expiry: delivery.expiry.clone(),
             properties: delivery.properties.clone(),
             started: claim.started,
         })?;
@@ -3452,7 +3848,9 @@ impl Owner {
         reply: &StoreReply,
         draft: &mut Draft,
     ) -> Result<Option<super::Change>, Stop> {
-        if let Some(change) = self.plan_retained_qos0_result(effect, operation, reply, draft)? {
+        if self.pubsub.retained.is_some()
+            && let Some(change) = self.plan_retained_qos0_result(effect, operation, reply, draft)?
+        {
             return Ok(Some(change));
         }
         let control = self
@@ -3465,9 +3863,9 @@ impl Owner {
             .delivery_by_op
             .get(&operation)
             .copied()
-            .map(|slot| (slot, &self.pubsub.deliveries.as_slice()[slot]));
+            .map(|slot| (slot, &self.pubsub.deliveries[slot]));
         let in_flight = if let Some(c) = control {
-            c.in_flight
+            &c.in_flight
         } else if let Some((_, d)) = delivery {
             d.in_flight().ok_or(IMPOSSIBLE)?
         } else {
@@ -3485,12 +3883,8 @@ impl Owner {
         let verdict = in_flight
             .phase
             .on(CommandEvent::StoreResult(OutcomeClass::of(&outcome)));
-        let finished = |phase, facts| Finished {
-            operation,
-            answers: in_flight.answers,
-            phase,
-            facts,
-        };
+        let finished =
+            |phase, facts| Finished::new(operation, in_flight.answers.clone(), phase, facts);
         match (verdict, outcome) {
             (Verdict::Transition(CommandPhase::Committed), StoreOutcome::Committed(facts)) => {
                 draft.receipt_consumed = Some(operation);
@@ -3569,27 +3963,31 @@ impl Owner {
                     }
                     let follow_up = if d.early_puback && self.receipts.control_available() {
                         let operation = self.operation(draft)?;
-                        Some(StartFollowUp::Finish(self.plan_submission(
-                            operation,
-                            Recipe::FinishDelivery(self.finish_recipe(d, operation)?),
-                            None,
-                            draft,
-                        )?))
+                        Some(alloc::boxed::Box::new(StartFollowUp::Finish(
+                            self.plan_submission(
+                                operation,
+                                Recipe::FinishDelivery(self.finish_recipe(d, operation)?),
+                                None,
+                                draft,
+                            )?,
+                        )))
                     } else if let Some(reason) = d.early_pubrec
                         && self.receipts.control_available()
                     {
                         let operation = self.operation(draft)?;
                         let guarded = self.finish_recipe(d, operation)?;
                         if reason >= 0x80 {
-                            Some(StartFollowUp::Finish(self.plan_submission(
-                                operation,
-                                Recipe::FinishDelivery(guarded),
-                                None,
-                                draft,
-                            )?))
+                            Some(alloc::boxed::Box::new(StartFollowUp::Finish(
+                                self.plan_submission(
+                                    operation,
+                                    Recipe::FinishDelivery(guarded),
+                                    None,
+                                    draft,
+                                )?,
+                            )))
                         } else {
                             let rank = d.pubrec_rank.unwrap_or(self.pubsub.next_pubrec_rank);
-                            Some(StartFollowUp::PreparePubrel {
+                            Some(alloc::boxed::Box::new(StartFollowUp::PreparePubrel {
                                 in_flight: self.plan_submission(
                                     operation,
                                     Recipe::PreparePubrel(guarded),
@@ -3597,7 +3995,7 @@ impl Owner {
                                     draft,
                                 )?,
                                 rank,
-                            })
+                            }))
                         }
                     } else {
                         None
@@ -3678,7 +4076,7 @@ impl Owner {
                     };
                     let reason = if d.expiry.is_some() && !d.expiry_allows_send(self.message_now) {
                         Some(
-                            if d.expiry.is_some_and(|expiry| {
+                            if d.expiry().is_some_and(|expiry| {
                                 self.message_now.is_some_and(|now| {
                                     expiry.state(now) == Ok(ExpiryState::Expired)
                                 })
@@ -3694,7 +4092,7 @@ impl Owner {
                         connection,
                         topic,
                         payload,
-                        d.expiry,
+                        d.expiry(),
                         d.properties.as_deref(),
                     ) {
                         Some(Qos0DropReason::PacketTooLarge)
@@ -3717,7 +4115,7 @@ impl Owner {
                                 retain: d.retain,
                                 topic: topic.clone(),
                                 payload: payload.clone(),
-                                expiry: d.expiry,
+                                expiry: d.expiry.clone(),
                                 properties: d.properties.clone(),
                             })?,
                             connection,
@@ -3815,7 +4213,7 @@ impl Owner {
                         d.phase,
                         Phase::ClaimPending(_) | Phase::ConsumePending(_, _)
                     )
-                    && d.expiry.is_some_and(|expiry| {
+                    && d.expiry().is_some_and(|expiry| {
                         self.message_now
                             .is_some_and(|now| expiry.state(now) == Ok(ExpiryState::Expired))
                     })
@@ -3898,19 +4296,20 @@ impl Owner {
         let waiting = self
             .pubsub
             .retained
-            .map(|f| f.in_flight)
+            .as_ref()
+            .map(|f| &f.in_flight)
             .filter(|f| f.deadline == token)
             .or_else(|| {
                 self.pubsub
                     .control
                     .as_ref()
-                    .map(|c| c.in_flight)
+                    .map(|c| &c.in_flight)
                     .filter(|f| f.deadline == token)
                     .or_else(|| {
                         self.pubsub
                             .delivery_by_deadline
                             .get(&token)
-                            .and_then(|&idx| self.pubsub.deliveries.as_slice()[idx].in_flight())
+                            .and_then(|&idx| self.pubsub.deliveries[idx].in_flight())
                     })
             });
         let Some(in_flight) = waiting else {
@@ -3969,7 +4368,7 @@ impl Owner {
     }
 
     fn submit_expiry(&self, delivery: &Delivery, draft: &mut Draft) -> Result<InFlight, Stop> {
-        let expiry = delivery.expiry.ok_or(IMPOSSIBLE)?;
+        let expiry = delivery.expiry().ok_or(IMPOSSIBLE)?;
         let observed = self.message_now.ok_or(IMPOSSIBLE)?;
         if expiry.state(observed) != Ok(ExpiryState::Expired) || !delivery.certain_never_started {
             return Err(IMPOSSIBLE);
@@ -3985,80 +4384,6 @@ impl Owner {
             None,
             draft,
         )
-    }
-
-    pub(super) fn plan_pubsub_frame(
-        &self,
-        effect: EffectId,
-        connection: ConnectionKey,
-        progress: FrameProgress,
-        draft: &mut Draft,
-    ) -> Result<Option<super::Change>, Stop> {
-        let found = if MUTANT_STALE_OUTGOING_FRAME_RESULT {
-            self.pubsub
-                .deliveries
-                .as_slice()
-                .iter()
-                .enumerate()
-                .find(|(_, d)| !d.retired && d.frame.is_some_and(|(_, sent)| sent == connection))
-        } else {
-            self.pubsub
-                .delivery_by_frame
-                .get(&effect)
-                .copied()
-                .and_then(|slot| {
-                    let d = &self.pubsub.deliveries.as_slice()[slot];
-                    (!d.retired && d.frame == Some((effect, connection))).then_some((slot, d))
-                })
-        };
-        let Some((slot, d)) = found else {
-            return Ok(None);
-        };
-        // A callback for a replaced generation never establishes transmission
-        // authority for the new connection or for another reusable PI.
-        if self.connection_of(d.target) != Some(connection.generation) {
-            return Ok(None);
-        }
-        let change = match progress {
-            FrameProgress::Started
-                if d.expiry.is_some()
-                    && d.phase == Phase::AwaitPuback
-                    && !d
-                        .claim
-                        .is_some_and(|claim| claim.started || claim.await_pubcomp) =>
-            {
-                Change::Start {
-                    slot,
-                    in_flight: self.submit_start(d, draft)?,
-                }
-            }
-            FrameProgress::NotStarted {
-                reason: MessageExpiryBlock::Expired,
-            } if d.phase == Phase::AwaitPuback
-                && d.certain_never_started
-                && !d.early_puback
-                && d.expiry.is_some_and(|expiry| {
-                    self.message_now
-                        .is_some_and(|now| expiry.state(now) == Ok(ExpiryState::Expired))
-                }) =>
-            {
-                Change::Expire {
-                    slot,
-                    in_flight: self.submit_expiry(d, draft)?,
-                }
-            }
-            FrameProgress::NotStarted { .. } if d.phase == Phase::AwaitPuback => {
-                Change::NotStarted { slot }
-            }
-            FrameProgress::Written { confirmed, total } if confirmed > 0 && confirmed <= total => {
-                Change::Written {
-                    slot,
-                    complete: confirmed == total,
-                }
-            }
-            _ => return Ok(None),
-        };
-        Ok(Some(changed(change)))
     }
 
     pub(super) fn plan_messages_expired(
@@ -4104,7 +4429,7 @@ impl Owner {
         };
         claim.is_none_or(|claim| claim.valid_for(qos, expiry.is_some()))&&session_ok&&self.pubsub.deliveries.len()+same.len()<self.pubsub.deliveries.capacity()
             &&claim.is_none_or(|c|c.operation.incarnation()==self.incarnation&&c.operation.epoch()<self.epoch)
-            &&!self.pubsub.deliveries.as_slice().iter().any(|d|conflict(d.id,d.target,d.claim))
+            &&!self.pubsub.deliveries.values().any(|d|conflict(d.id,d.target,d.claim))
             &&!same.iter().any(|f|matches!(f,RecoveredFact::OutboundDelivery{delivery:id,target:to,claim:other,..}if conflict(*id,*to,*other)))
     }
 
@@ -4117,7 +4442,7 @@ impl Owner {
     ) -> Result<(), CoreFault> {
         let (qos, claim, expiry, _) = kind;
         let mut delivery = Delivery::metadata(id, target, revision, qos, claim);
-        delivery.expiry = expiry;
+        delivery.expiry = expiry.map(alloc::boxed::Box::new);
         self.pubsub.push_delivery(delivery)
     }
 
@@ -4125,7 +4450,7 @@ impl Owner {
     #[must_use]
     pub fn inline_claim_target(&self, operation: OperationId) -> Option<SessionId> {
         let &slot = self.pubsub.delivery_by_claim_op.get(&operation)?;
-        let d = &self.pubsub.deliveries.as_slice()[slot];
+        let d = &self.pubsub.deliveries[slot];
         matches!(d.phase, Phase::InlineClaimPending(op) if op == operation).then_some(d.target)
     }
 
@@ -4133,9 +4458,10 @@ impl Owner {
         if let Some(generation) = self.connection_of(session)
             && let Some(index) = self.pubsub.connection(generation)
         {
+            let is_loading = self.pubsub.is_loading(generation);
             let c = &mut self.pubsub.connections.as_mut_slice()[index];
             c.caught_up = false;
-            if c.loading.is_some() {
+            if is_loading {
                 c.dirty_during_load = true;
             }
             if rescan {
@@ -4145,9 +4471,10 @@ impl Owner {
     }
 
     pub(super) fn mark_all_sessions_dirty(&mut self, rescan: bool) {
+        let has_any_loading = !self.pubsub.loading_by_gen.is_empty();
         for c in self.pubsub.connections.as_mut_slice() {
             c.caught_up = false;
-            if c.loading.is_some() {
+            if has_any_loading && self.pubsub.loading_by_gen.contains_key(&c.generation) {
                 c.dirty_during_load = true;
             }
             if rescan {
@@ -4177,8 +4504,8 @@ impl Owner {
         let conn_idx = self.pubsub.connection(generation)?;
         let settings = self.pubsub.connections.as_slice()[conn_idx];
         if !settings.caught_up
-            || settings.loading.is_some()
-            || settings.after.is_some()
+            || self.pubsub.is_loading(generation)
+            || self.pubsub.has_after(generation)
             || settings.rescan_needed
             || self.pubsub.active(generation) >= usize::from(settings.receive_maximum)
             || self.pubsub.deliveries.len() >= self.pubsub.deliveries.capacity()
@@ -4190,24 +4517,46 @@ impl Owner {
         {
             return None;
         }
-        if let Some(indices) = self.pubsub.deliveries_by_session.get(&selected.session) {
-            let slice = self.pubsub.deliveries.as_slice();
-            for &idx in indices {
-                let d = &slice[idx];
-                if !d.waiting_to_send(generation, self.message_now) || d.awaits_pubcomp() {
-                    continue;
-                }
-                match d.phase {
-                    Phase::AwaitPuback => {}
-                    Phase::ClaimPending(f) if f.phase == CommandPhase::Submitted => {}
-                    Phase::InlineClaimPending(op)
-                        if self.slot_by_op.get(&op).is_some_and(|&slot_idx| {
+        if let Some(sd) = self.pubsub.session_deliveries.get(&selected.session)
+            && !sd.all.is_empty()
+        {
+            let sent = sd.sent_on(generation, &self.pubsub.deliveries);
+            let busy = usize::from(sd.busy);
+            let inline_len = sd.inline_pending.len();
+            if sent + busy + inline_len == sd.all.len() {
+                for idx in &sd.inline_pending {
+                    let d = &self.pubsub.deliveries[idx];
+                    if let Phase::InlineClaimPending(op) = &d.phase {
+                        if !self.slot_by_op.get(op).is_some_and(|&slot_idx| {
                             matches!(
-                                self.slots.as_slice()[slot_idx].state,
+                                &self.slots[slot_idx].state,
                                 SlotState::AdmissionPending(f) if f.phase == CommandPhase::Submitted
                             )
-                        }) => {}
-                    _ => return None,
+                        }) {
+                            return None;
+                        }
+                    } else {
+                        return None;
+                    }
+                }
+            } else {
+                for idx in &sd.all {
+                    let d = &self.pubsub.deliveries[idx];
+                    if !d.waiting_to_send(generation, self.message_now) || d.awaits_pubcomp() {
+                        continue;
+                    }
+                    match &d.phase {
+                        Phase::AwaitPuback => {}
+                        Phase::ClaimPending(f) if f.phase == CommandPhase::Submitted => {}
+                        Phase::InlineClaimPending(op)
+                            if self.slot_by_op.get(op).is_some_and(|&slot_idx| {
+                                matches!(
+                                    &self.slots[slot_idx].state,
+                                    SlotState::AdmissionPending(f) if f.phase == CommandPhase::Submitted
+                                )
+                            }) => {}
+                        _ => return None,
+                    }
                 }
             }
         }
@@ -4224,7 +4573,7 @@ impl Owner {
         let Some(&slot) = self.pubsub.delivery_by_claim_op.get(&operation) else {
             return Ok(None);
         };
-        let d = &self.pubsub.deliveries.as_slice()[slot];
+        let d = &self.pubsub.deliveries[slot];
         if !matches!(d.phase, Phase::InlineClaimPending(op) if op == operation) {
             return Ok(None);
         }
@@ -4245,7 +4594,11 @@ impl Owner {
     pub(super) fn apply_inline_claim_insert(
         &mut self,
         operation: OperationId,
+        publication: PublicationId,
         plan: super::InlineClaimPlan,
+        topic: SharedBytes,
+        payload: SharedBytes,
+        properties: Option<alloc::sync::Arc<crate::contract::properties::PublishProperties>>,
     ) -> Result<(), CoreFault> {
         let claim = DeliveryClaim {
             operation,
@@ -4254,7 +4607,10 @@ impl Owner {
             await_pubcomp: false,
         };
         let mut d = Delivery::metadata(
-            plan.delivery,
+            DeliveryId {
+                publication,
+                index: 0,
+            },
             plan.target,
             plan.target_revision,
             plan.qos,
@@ -4264,10 +4620,37 @@ impl Owner {
         d.window = Some(plan.generation);
         d.may_have_started = false;
         d.certain_never_started = true;
-        d.topic = Some(plan.topic);
-        d.payload = Some(plan.payload);
-        d.properties = plan.properties;
+        d.topic = Some(topic);
+        d.payload = Some(payload);
+        d.properties = properties;
         self.pubsub.push_delivery(d)
+    }
+
+    /// Fast O(1) check whether `session` definitely has no ready outbound work
+    /// right now (no control candidates, no rescan/after cursor, and all
+    /// deliveries already sent, busy, or inline-pending).
+    fn session_provably_idle_work(&self, session: SessionId) -> bool {
+        if !self.pubsub.control_candidates.is_empty() {
+            return false;
+        }
+        let Some(generation) = self.connection_of(session) else {
+            return true;
+        };
+        let Some(index) = self.pubsub.connection(generation) else {
+            return true;
+        };
+        let settings = self.pubsub.connections.as_slice()[index];
+        if settings.rescan_needed || self.pubsub.has_after(generation) {
+            return false;
+        }
+        let Some(sd) = self.pubsub.session_deliveries.get(&session) else {
+            return true;
+        };
+        if sd.all.is_empty() {
+            return true;
+        }
+        let sent = sd.sent_on(generation, &self.pubsub.deliveries);
+        sent + usize::from(sd.busy) + sd.inline_pending.len() == sd.all.len()
     }
 
     pub(super) fn apply_inline_claim_outcome(
@@ -4276,16 +4659,23 @@ impl Owner {
     ) -> Result<(), CoreFault> {
         match outcome {
             super::InlineOutcome::Remove(slot) => {
-                if slot >= self.pubsub.deliveries.len() {
+                let Some(d) = self.pubsub.deliveries.get(slot) else {
                     return Err(CoreFault::StalePlan);
-                }
+                };
+                let target = d.target;
                 self.pubsub.remove_delivery_at(slot);
+                if self.session_provably_idle_work(target) {
+                    self.last_step_may_unblock_work = false;
+                } else {
+                    self.last_inline_ready_target = Some(target);
+                }
                 Ok(())
             }
             super::InlineOutcome::Committed { slot, emission } => {
-                if slot >= self.pubsub.deliveries.len() {
+                let Some(d) = self.pubsub.deliveries.get(slot) else {
                     return Err(CoreFault::StalePlan);
-                }
+                };
+                let target = d.target;
                 self.pubsub.mutate_delivery(slot, |d| {
                     d.phase = Phase::AwaitPuback;
                     if let Some((effect, connection)) = emission {
@@ -4298,6 +4688,11 @@ impl Owner {
                         d.local_write_completed = false;
                     }
                 });
+                if emission.is_some() && self.session_provably_idle_work(target) {
+                    self.last_step_may_unblock_work = false;
+                } else {
+                    self.last_inline_ready_target = Some(target);
+                }
                 Ok(())
             }
         }
@@ -4317,7 +4712,7 @@ impl Owner {
                     .get_mut(connection)
                     .ok_or(stale)?
                     .last_qos0_ingress = flight.origin.ingress_order;
-                self.pubsub.retained = Some(flight);
+                self.pubsub.retained = Some(*flight);
             }
             Change::RetainedDone { finished } => {
                 self.pubsub.retained.take().ok_or(stale)?;
@@ -4385,7 +4780,7 @@ impl Owner {
                 in_flight,
                 connection,
             } => {
-                if slot >= self.pubsub.deliveries.len() {
+                if self.pubsub.deliveries.get(slot).is_none() {
                     return Err(stale);
                 }
                 self.pubsub.mutate_delivery(slot, |d| {
@@ -4397,17 +4792,14 @@ impl Owner {
                 finished,
                 emission,
             } => {
-                if slot >= self.pubsub.deliveries.len() {
-                    return Err(stale);
-                }
-                let target = self.pubsub.deliveries.as_slice()[slot].target;
+                let target = self.pubsub.deliveries.get(slot).ok_or(stale)?.target;
                 if emission.is_none() {
                     self.remember_finished(finished)?;
                     self.pubsub.remove_delivery_at(slot);
                 } else {
                     self.pubsub.mutate_delivery(slot, |d| {
-                        d.phase = Phase::Qos0Writing(finished);
-                        d.claim_result = Some(finished);
+                        d.phase = Phase::Qos0Writing(alloc::boxed::Box::new(finished.clone()));
+                        d.claim_result = Some(alloc::boxed::Box::new(finished));
                         d.frame = emission;
                     });
                 }
@@ -4424,7 +4816,7 @@ impl Owner {
                 }
                 None => self.pubsub.push_conn(value)?,
             },
-            Change::Control(control) => self.pubsub.control = Some(control),
+            Change::Control(control) => self.pubsub.control = Some(*control),
             Change::ControlEnd { revision, finished } => {
                 let control = self.pubsub.control.take().ok_or(stale)?;
                 if let Some(revision) = revision {
@@ -4472,13 +4864,14 @@ impl Owner {
                 if connection >= self.pubsub.connections.len() {
                     return Err(stale);
                 }
-                self.pubsub.unindex_conn(connection);
-                let state = &mut self.pubsub.connections.as_mut_slice()[connection];
-                state.loading = Some(read);
-                state.rescan_needed = false;
-                state.caught_up = false;
-                state.dirty_during_load = false;
-                self.pubsub.index_conn(connection);
+                let generation = {
+                    let state = &mut self.pubsub.connections.as_mut_slice()[connection];
+                    state.rescan_needed = false;
+                    state.caught_up = false;
+                    state.dirty_during_load = false;
+                    state.generation
+                };
+                self.pubsub.set_loading(generation, connection, Some(read));
             }
             Change::Page {
                 connection,
@@ -4497,24 +4890,25 @@ impl Owner {
                     && self.pubsub.control.is_none()
                     && self.pubsub.retained.is_none()
                     && !self.will_status().admission_pending;
-                self.pubsub.unindex_conn(connection);
-                let c = &mut self.pubsub.connections.as_mut_slice()[connection];
-                c.loading = None;
-                c.after = next;
-                c.rescan_needed = discard;
-                c.caught_up =
-                    !discard && next.is_none() && !c.dirty_during_load && no_pending_non_inline;
-                c.dirty_during_load = false;
-                self.pubsub.index_conn(connection);
+                let generation = {
+                    let c = &mut self.pubsub.connections.as_mut_slice()[connection];
+                    c.rescan_needed = discard;
+                    c.caught_up =
+                        !discard && next.is_none() && !c.dirty_during_load && no_pending_non_inline;
+                    c.dirty_during_load = false;
+                    c.generation
+                };
+                self.pubsub.set_loading(generation, connection, None);
+                self.pubsub.set_after(generation, next);
                 if !discard {
                     let Input::WorkPage { items, .. } = input else {
                         return Err(stale);
                     };
                     for item in items.as_slice() {
                         if let Some(i) = self.pubsub.delivery(item.delivery) {
-                            if self.pubsub.deliveries.as_slice()[i].topic.is_none() {
+                            if self.pubsub.deliveries[i].topic.is_none() {
                                 self.pubsub.unindex_delivery(i);
-                                let d = &mut self.pubsub.deliveries.as_mut_slice()[i];
+                                let d = &mut self.pubsub.deliveries[i];
                                 d.cause = item.cause;
                                 d.retain = item.retain;
                                 d.properties = item.properties.clone();
@@ -4530,7 +4924,7 @@ impl Owner {
                                 item.qos,
                                 item.claim,
                             );
-                            d.expiry = item.expiry;
+                            d.expiry = item.expiry.map(alloc::boxed::Box::new);
                             d.properties = item.properties.clone();
                             d.cause = item.cause;
                             d.retain = item.retain;
@@ -4554,7 +4948,7 @@ impl Owner {
                     .get(connection)
                     .ok_or(stale)?
                     .generation;
-                if slot >= self.pubsub.deliveries.len() {
+                if self.pubsub.deliveries.get(slot).is_none() {
                     return Err(stale);
                 }
                 self.pubsub.mutate_delivery(slot, |d| {
@@ -4568,11 +4962,11 @@ impl Owner {
                 finished,
                 emission,
             } => {
-                if slot >= self.pubsub.deliveries.len() {
+                if self.pubsub.deliveries.get(slot).is_none() {
                     return Err(stale);
                 }
                 self.pubsub.mutate_delivery(slot, |d| {
-                    d.claim_result = Some(finished);
+                    d.claim_result = Some(alloc::boxed::Box::new(finished));
                     d.phase = Phase::AwaitPuback;
                     if let Some((effect, connection)) = emission {
                         d.window = Some(connection.generation);
@@ -4590,7 +4984,7 @@ impl Owner {
                 effect,
                 connection,
             } => {
-                if slot >= self.pubsub.deliveries.len() {
+                if self.pubsub.deliveries.get(slot).is_none() {
                     return Err(stale);
                 }
                 self.pubsub.mutate_delivery(slot, |d| {
@@ -4606,16 +5000,19 @@ impl Owner {
                 });
             }
             Change::Finish { slot, in_flight } => {
-                if slot >= self.pubsub.deliveries.len() {
+                if self.pubsub.deliveries.get(slot).is_none() {
                     return Err(stale);
                 }
                 self.pubsub.mutate_delivery(slot, |d| {
                     d.early_pubrec = None;
                     d.phase = Phase::FinishPending(in_flight);
                 });
+                if matches!(input, Input::ObservedPuback { .. }) {
+                    self.last_step_may_unblock_work = false;
+                }
             }
             Change::Discard { slot, in_flight } => {
-                if slot >= self.pubsub.deliveries.len() {
+                if self.pubsub.deliveries.get(slot).is_none() {
                     return Err(stale);
                 }
                 self.pubsub.mutate_delivery(slot, |d| {
@@ -4627,7 +5024,7 @@ impl Owner {
                 in_flight,
                 rank,
             } => {
-                if slot >= self.pubsub.deliveries.len() {
+                if self.pubsub.deliveries.get(slot).is_none() {
                     return Err(stale);
                 }
                 let mut advance_rank = false;
@@ -4645,10 +5042,12 @@ impl Owner {
                 }
             }
             Change::PubrelReady { slot, finished } => {
-                if slot >= self.pubsub.deliveries.len() {
-                    return Err(stale);
-                }
-                if self.pubsub.deliveries.as_slice()[slot].claim.is_none() {
+                if self
+                    .pubsub
+                    .deliveries
+                    .get(slot)
+                    .is_none_or(|d| d.claim.is_none())
+                {
                     return Err(stale);
                 }
                 self.pubsub.mutate_delivery(slot, |d| {
@@ -4662,25 +5061,29 @@ impl Owner {
                 self.remember_finished(finished)?;
             }
             Change::Finished { slot, finished } => {
-                let (claim_result, target) = {
-                    let d = self.pubsub.deliveries.as_slice().get(slot).ok_or(stale)?;
-                    (d.claim_result, d.target)
-                };
+                if self.pubsub.deliveries.get(slot).is_none() {
+                    return Err(stale);
+                }
+                let target = self.pubsub.deliveries[slot].target;
+                let claim_result = self.pubsub.deliveries[slot].claim_result.clone();
                 if let Some(known) = claim_result
                     && known.operation != finished.operation
                 {
-                    self.remember_finished(known)?;
+                    self.remember_finished(*known)?;
                 }
                 self.remember_finished(finished)?;
                 self.pubsub.remove_delivery_at(slot);
                 self.pubsub.invalidate_reads(target);
+                if self.session_provably_idle_work(target) {
+                    self.last_step_may_unblock_work = false;
+                }
             }
             Change::Refused {
                 slot,
                 finished,
                 claiming,
             } => {
-                if slot >= self.pubsub.deliveries.len() {
+                if self.pubsub.deliveries.get(slot).is_none() {
                     return Err(stale);
                 }
                 self.pubsub.mutate_delivery(slot, |d| {
@@ -4708,7 +5111,11 @@ impl Owner {
                     control.in_flight.phase = phase;
                     if let Some((deadline, effect)) = resolution {
                         control.in_flight.deadline = deadline;
-                        control.in_flight.answers = control.in_flight.answers.with(effect);
+                        let prev = core::mem::replace(
+                            &mut control.in_flight.answers,
+                            Answers::new(effect),
+                        );
+                        control.in_flight.answers = prev.with(effect);
                     }
                 } else if let Some(flight) = self
                     .pubsub
@@ -4719,12 +5126,14 @@ impl Owner {
                     flight.in_flight.phase = phase;
                     if let Some((deadline, effect)) = resolution {
                         flight.in_flight.deadline = deadline;
-                        flight.in_flight.answers = flight.in_flight.answers.with(effect);
+                        let prev =
+                            core::mem::replace(&mut flight.in_flight.answers, Answers::new(effect));
+                        flight.in_flight.answers = prev.with(effect);
                     }
                 } else {
                     let &slot = self.pubsub.delivery_by_op.get(&operation).ok_or(stale)?;
                     self.pubsub.unindex_delivery(slot);
-                    let d = &mut self.pubsub.deliveries.as_mut_slice()[slot];
+                    let d = &mut self.pubsub.deliveries[slot];
                     let held = match &mut d.phase {
                         Phase::ClaimPending(f)
                         | Phase::FinishPending(f)
@@ -4741,13 +5150,14 @@ impl Owner {
                     held.phase = phase;
                     if let Some((deadline, effect)) = resolution {
                         held.deadline = deadline;
-                        held.answers = held.answers.with(effect);
+                        let prev = core::mem::replace(&mut held.answers, Answers::new(effect));
+                        held.answers = prev.with(effect);
                     }
                     self.pubsub.index_delivery(slot);
                 }
             }
             Change::PubackObserved { slot } => {
-                if slot >= self.pubsub.deliveries.len() {
+                if self.pubsub.deliveries.get(slot).is_none() {
                     return Err(stale);
                 }
                 self.pubsub.mutate_delivery(slot, |d| {
@@ -4755,7 +5165,7 @@ impl Owner {
                 });
             }
             Change::PubrecObserved { slot, reason, rank } => {
-                if slot >= self.pubsub.deliveries.len() {
+                if self.pubsub.deliveries.get(slot).is_none() {
                     return Err(stale);
                 }
                 let mut advance_rank = false;
@@ -4774,7 +5184,7 @@ impl Owner {
                 }
             }
             Change::Start { slot, in_flight } => {
-                if slot >= self.pubsub.deliveries.len() {
+                if self.pubsub.deliveries.get(slot).is_none() {
                     return Err(stale);
                 }
                 self.pubsub.mutate_delivery(slot, |d| {
@@ -4787,8 +5197,11 @@ impl Owner {
                 finished,
                 follow_up,
             } => {
-                if slot >= self.pubsub.deliveries.len()
-                    || self.pubsub.deliveries.as_slice()[slot].claim.is_none()
+                if self
+                    .pubsub
+                    .deliveries
+                    .get(slot)
+                    .is_none_or(|d| d.claim.is_none())
                 {
                     return Err(stale);
                 }
@@ -4797,7 +5210,7 @@ impl Owner {
                     if let Some(claim) = d.claim.as_mut() {
                         claim.started = true;
                     }
-                    match follow_up {
+                    match follow_up.map(|b| *b) {
                         None => d.phase = Phase::AwaitPuback,
                         Some(StartFollowUp::Finish(in_flight)) => {
                             d.early_pubrec = None;
@@ -4820,7 +5233,7 @@ impl Owner {
                 self.remember_finished(finished)?;
             }
             Change::Expire { slot, in_flight } => {
-                if slot >= self.pubsub.deliveries.len() {
+                if self.pubsub.deliveries.get(slot).is_none() {
                     return Err(stale);
                 }
                 self.pubsub.mutate_delivery(slot, |d| {
@@ -4832,7 +5245,7 @@ impl Owner {
                 finished,
                 expiring,
             } => {
-                if slot >= self.pubsub.deliveries.len() {
+                if self.pubsub.deliveries.get(slot).is_none() {
                     return Err(stale);
                 }
                 self.pubsub.mutate_delivery(slot, |d| {
@@ -4849,7 +5262,7 @@ impl Owner {
                 self.remember_finished(finished)?;
             }
             Change::NotStarted { slot } => {
-                if slot >= self.pubsub.deliveries.len() {
+                if self.pubsub.deliveries.get(slot).is_none() {
                     return Err(stale);
                 }
                 self.pubsub.mutate_delivery(slot, |d| {
@@ -4869,7 +5282,7 @@ impl Owner {
                         continue;
                     };
                     let (target, skip, retire) = {
-                        let d = &self.pubsub.deliveries.as_slice()[slot];
+                        let d = &self.pubsub.deliveries[slot];
                         let skip = d.target != expired.target
                             || (d.claim.is_some() && !matches!(d.phase, Phase::ClaimPending(_)));
                         (d.target, skip, d.in_flight().is_some())
@@ -4879,7 +5292,7 @@ impl Owner {
                     }
                     if retire {
                         self.pubsub.unindex_delivery(slot);
-                        let d = &mut self.pubsub.deliveries.as_mut_slice()[slot];
+                        let d = &mut self.pubsub.deliveries[slot];
                         d.retired = true;
                         d.window = None;
                         d.topic = None;
@@ -4892,13 +5305,14 @@ impl Owner {
                 }
             }
             Change::Written { slot, complete } => {
-                if slot >= self.pubsub.deliveries.len() {
+                if self.pubsub.deliveries.get(slot).is_none() {
                     return Err(stale);
                 }
                 self.pubsub.mutate_delivery(slot, |d| {
                     d.local_write_completed |= complete;
                     d.certain_never_started = false;
                 });
+                self.last_step_may_unblock_work = false;
             }
         }
         Ok(())
@@ -5112,7 +5526,7 @@ mod tests {
         let mut owner = world();
         owner.pubsub.connections.as_mut_slice()[0].receive_maximum = 1;
         queued(&mut owner, 0);
-        owner.pubsub.deliveries.as_mut_slice()[0].qos = Qos::ExactlyOnce;
+        owner.pubsub.deliveries[0].qos = Qos::ExactlyOnce;
         queued(&mut owner, 1);
         let key = ConnectionKey {
             session: TARGET,
@@ -5206,7 +5620,7 @@ mod tests {
                 (Qos::ExactlyOnce, Some(claim), None, false),
             )
             .unwrap();
-        let item = &mut owner.pubsub.deliveries.as_mut_slice()[0];
+        let item = &mut owner.pubsub.deliveries[0];
         item.topic = Some(bytes(b"topic"));
         item.payload = Some(bytes(b"payload"));
         let frames = apply(&mut owner, Input::WorkAvailable { session: TARGET });
@@ -5255,7 +5669,7 @@ mod tests {
                     )
                     .unwrap();
                 if index != pubrel_index {
-                    let item = &mut owner.pubsub.deliveries.as_mut_slice()[index];
+                    let item = &mut owner.pubsub.deliveries[index];
                     item.topic = Some(bytes(b"topic"));
                     item.payload = Some(bytes(b"payload"));
                 }
@@ -5397,7 +5811,7 @@ mod tests {
             );
             queued(&mut owner, 0);
             if phase == 2 {
-                owner.pubsub.deliveries.as_mut_slice()[0].qos = Qos::AtMostOnce;
+                owner.pubsub.deliveries[0].qos = Qos::AtMostOnce;
             }
             let mut other = Delivery::metadata(
                 delivery(1),
@@ -5489,7 +5903,7 @@ mod tests {
             );
             assert_eq!(owner.session_status().retired_flights, 0);
             assert_eq!(
-                owner.pubsub.deliveries.as_slice(),
+                owner.pubsub.deliveries.to_vec().as_slice(),
                 &[other],
                 "other_destination_responsibility_changed phase={phase}"
             );
@@ -5866,7 +6280,7 @@ mod tests {
             panic!("claim")
         };
         let _ = known(&mut owner, claim[0].0, command);
-        assert!(!owner.pubsub.deliveries.as_slice()[0].local_write_completed);
+        assert!(!owner.pubsub.deliveries[0].local_write_completed);
         let key = ConnectionKey {
             session: TARGET,
             generation: CONNECTION,
@@ -6034,7 +6448,7 @@ mod tests {
             known(&mut owner, finish[0].0, command).is_empty(),
             "old_finish_released_reused_pi"
         );
-        let before_callback = owner.pubsub.deliveries.as_slice().to_vec();
+        let before_callback = owner.pubsub.deliveries.to_vec();
         let before_counters = owner.counters;
         assert!(
             apply(
@@ -6051,7 +6465,7 @@ mod tests {
             .is_empty()
         );
         assert_eq!(
-            owner.pubsub.deliveries.as_slice(),
+            owner.pubsub.deliveries.to_vec().as_slice(),
             before_callback.as_slice(),
             "stale_outgoing_frame_result_applied"
         );
@@ -6063,7 +6477,7 @@ mod tests {
             "old_callback_returned_current_credit"
         );
         assert!(
-            !owner.pubsub.deliveries.as_slice()[0].local_write_completed,
+            !owner.pubsub.deliveries[0].local_write_completed,
             "old_callback_rebound: a local callback belongs to its exact frame occurrence"
         );
     }
@@ -6222,7 +6636,7 @@ mod tests {
                 _ => None,
             })
             .unwrap();
-        let flight = owner.pubsub.retained.unwrap();
+        let flight = owner.pubsub.retained.clone().unwrap();
         (effect, command, flight)
     }
     #[test]
@@ -6298,7 +6712,7 @@ mod tests {
             },
         );
         assert!(
-            owner.pubsub.retained.unwrap().retired,
+            owner.pubsub.retained.as_ref().unwrap().retired,
             "source_termination_lost_unknown_retained_qos0"
         );
         assert_eq!(owner.pubsub.retired_flights(), 1);
@@ -6366,7 +6780,7 @@ mod tests {
             *connection = ConnectionGeneration::new(11);
         }
         apply(&mut owner, next);
-        let current = owner.pubsub.retained.unwrap();
+        let current = owner.pubsub.retained.clone().unwrap();
         assert_ne!(current.in_flight.operation, operation);
         assert!(
             apply(
@@ -6380,8 +6794,8 @@ mod tests {
             .is_empty()
         );
         assert_eq!(
-            owner.pubsub.retained,
-            Some(current),
+            owner.pubsub.retained.as_ref(),
+            Some(&current),
             "old_retained_qos0_result_rebound"
         );
         apply(
@@ -6597,7 +7011,7 @@ mod tests {
                     owner
                         .pubsub
                         .deliveries
-                        .try_push(Delivery::metadata(
+                        .insert(Delivery::metadata(
                             delivery(0),
                             TARGET,
                             Revision::new(1),
@@ -6635,7 +7049,7 @@ mod tests {
                         next: None,
                     },
                 );
-                assert!(owner.pubsub.deliveries.as_slice()[0].retain);
+                assert!(owner.pubsub.deliveries[0].retain);
                 let effects = apply(&mut owner, Input::WorkAvailable { session: TARGET });
                 let (effect, command) = effects
                     .iter()
@@ -6660,7 +7074,7 @@ mod tests {
     fn a_later_work_page_cannot_rewrite_an_already_loaded_retain_flag() {
         let mut owner = world();
         queued(&mut owner, 0);
-        owner.pubsub.deliveries.as_mut_slice()[0].retain = true;
+        owner.pubsub.deliveries[0].retain = true;
         let claim = apply(&mut owner, Input::WorkAvailable { session: TARGET });
         let Effect::Persist { command } = &claim[0].1 else {
             panic!("claim")
@@ -6671,7 +7085,7 @@ mod tests {
             .iter()
             .find_map(|(effect, item)| matches!(item, Effect::LoadWork { .. }).then_some(*effect))
             .unwrap();
-        let held = &owner.pubsub.deliveries.as_slice()[0];
+        let held = &owner.pubsub.deliveries[0];
         let changed = WorkItem {
             cause: DeliveryCause::LiveExact,
             expiry: None,
@@ -6698,7 +7112,7 @@ mod tests {
             matches!(result, StepOutcome::Fatal(CoreFault::ImpossibleInput)),
             "work_page_rewrote_frozen_retain_flag"
         );
-        assert!(owner.pubsub.deliveries.as_slice()[0].retain);
+        assert!(owner.pubsub.deliveries[0].retain);
     }
 
     fn message_time(seconds: u64) -> MessageTime {
@@ -6735,13 +7149,7 @@ mod tests {
     }
     fn message_frame(owner: &mut Owner, index: u32) -> (EffectId, ConnectionKey, OutboundPacketId) {
         queued(owner, index);
-        owner
-            .pubsub
-            .deliveries
-            .as_mut_slice()
-            .last_mut()
-            .unwrap()
-            .expiry = Some(message_expiry());
+        owner.pubsub.deliveries.last_mut().unwrap().expiry = Some(Box::new(message_expiry()));
         let (effect, command) =
             message_command(apply(owner, Input::WorkAvailable { session: TARGET }));
         let emitted = known(owner, effect, &command);
@@ -6755,7 +7163,7 @@ mod tests {
                     started,
                     ..
                 } => {
-                    assert_eq!(expiry, Some(message_expiry()));
+                    assert_eq!(expiry.as_deref().copied(), Some(message_expiry()));
                     assert!(!started);
                     Some((id, connection, packet_id))
                 }
@@ -6802,8 +7210,8 @@ mod tests {
             for unknown in [false, true] {
                 let mut owner = world();
                 queued(&mut owner, 0);
-                let d = &mut owner.pubsub.deliveries.as_mut_slice()[0];
-                d.expiry = Some(message_expiry());
+                let d = &mut owner.pubsub.deliveries[0];
+                d.expiry = Some(Box::new(message_expiry()));
                 d.qos = qos;
                 let mut now = message_time(12);
                 if unknown {
@@ -6826,14 +7234,7 @@ mod tests {
                     usize::from(unknown),
                     "uncertain_cache_was_freed_or_expired_cache_pinned"
                 );
-                assert!(
-                    owner
-                        .pubsub
-                        .deliveries
-                        .as_slice()
-                        .iter()
-                        .all(|d| d.claim.is_none())
-                );
+                assert!(owner.pubsub.deliveries.values().all(|d| d.claim.is_none()));
             }
         }
     }
@@ -6890,7 +7291,7 @@ mod tests {
         let (frame, key, pi) = message_frame(&mut owner, 0);
         let target = owner.puback_target(key, pi).unwrap();
         assert!(message_puback(&mut owner, key, pi).is_empty());
-        assert!(owner.pubsub.deliveries.as_slice()[0].early_puback);
+        assert!(owner.pubsub.deliveries[0].early_puback);
         assert!(
             message_progress(
                 &mut owner,
@@ -6904,7 +7305,7 @@ mod tests {
             .is_empty()
         );
         assert!(
-            !owner.pubsub.deliveries.as_slice()[0].claim.unwrap().started,
+            !owner.pubsub.deliveries[0].claim.unwrap().started,
             "complete_callback_invented_durable_started"
         );
         message_clock(&mut owner, 12);
@@ -6931,10 +7332,7 @@ mod tests {
         );
         assert!(message_puback(&mut owner, key, pi).is_empty());
         assert!(message_progress(&mut owner, frame, key, FrameProgress::Started).is_empty());
-        let deadline = owner.pubsub.deliveries.as_slice()[0]
-            .in_flight()
-            .unwrap()
-            .deadline;
+        let deadline = owner.pubsub.deliveries[0].in_flight().unwrap().deadline;
         let effects = apply(
             &mut owner,
             Input::Deadline {
@@ -6954,7 +7352,7 @@ mod tests {
         assert!(
             matches!(finish.recipe.get(), Recipe::FinishDelivery(end) if end.claim == target.claim)
         );
-        assert!(owner.pubsub.deliveries.as_slice()[0].claim.unwrap().started);
+        assert!(owner.pubsub.deliveries[0].claim.unwrap().started);
         assert_eq!(
             owner.pubsub.free_packet_id(TARGET, 1),
             None,
@@ -7005,7 +7403,7 @@ mod tests {
             },
         );
         let replay = apply(&mut owner, Input::WorkAvailable { session: TARGET });
-        assert!(replay.iter().any(|(_, e)| matches!(e, Effect::EmitPublish { started: true, expiry: Some(expiry), packet_id, claim, dup: true, .. } if *expiry == message_expiry() && *packet_id == pi && *claim == original.claim)), "known_started_not_replayed_past_ttl");
+        assert!(replay.iter().any(|(_, e)| matches!(e, Effect::EmitPublish { started: true, expiry: Some(expiry), packet_id, claim, dup: true, .. } if **expiry == message_expiry() && *packet_id == pi && *claim == original.claim)), "known_started_not_replayed_past_ttl");
         let current = ConnectionKey {
             session: TARGET,
             generation: ConnectionGeneration::new(11),
@@ -7018,7 +7416,7 @@ mod tests {
             message_command(apply(&mut owner, Input::WorkAvailable { session: TARGET }));
         known(&mut owner, claim_effect, &claim);
         let newer = owner.puback_target(current, pi).unwrap();
-        let held = owner.pubsub.deliveries.as_slice()[0].clone();
+        let held = owner.pubsub.deliveries[0].clone();
         for progress in [
             FrameProgress::Started,
             FrameProgress::NotStarted {
@@ -7035,8 +7433,7 @@ mod tests {
         assert!(known(&mut owner, end_effect, &end).is_empty());
         assert_eq!(owner.puback_target(current, pi), Some(newer));
         assert_eq!(
-            owner.pubsub.deliveries.as_slice()[0],
-            held,
+            owner.pubsub.deliveries[0], held,
             "old_fact_changed_reused_pi"
         );
     }
@@ -7071,10 +7468,7 @@ mod tests {
         );
         assert_eq!(owner.pubsub.free_packet_id(TARGET, 1), None);
         assert!(message_progress(&mut owner, frame, key, FrameProgress::Started).is_empty());
-        let deadline = owner.pubsub.deliveries.as_slice()[0]
-            .in_flight()
-            .unwrap()
-            .deadline;
+        let deadline = owner.pubsub.deliveries[0].in_flight().unwrap().deadline;
         let effects = apply(
             &mut owner,
             Input::Deadline {
@@ -7131,8 +7525,8 @@ mod tests {
             let mut owner = world();
             message_clock(&mut owner, 10);
             queued(&mut owner, 0);
-            let d = &mut owner.pubsub.deliveries.as_mut_slice()[0];
-            d.expiry = Some(message_expiry());
+            let d = &mut owner.pubsub.deliveries[0];
+            d.expiry = Some(Box::new(message_expiry()));
             d.claim = Some(DeliveryClaim {
                 operation: operation(100),
                 packet_id: OutboundPacketId::new(1).unwrap(),
@@ -7200,8 +7594,8 @@ mod tests {
             message_clock(&mut owner, 10);
             owner.pubsub.connections.as_mut_slice()[0].maximum_packet_size = 128;
             queued(&mut owner, 0);
-            let d = &mut owner.pubsub.deliveries.as_mut_slice()[0];
-            d.expiry = timed.then(message_expiry);
+            let d = &mut owner.pubsub.deliveries[0];
+            d.expiry = timed.then(|| Box::new(message_expiry()));
             d.payload = Some(payload.clone());
             let (effect, command) =
                 message_command(apply(&mut owner, Input::WorkAvailable { session: TARGET }));
@@ -7254,7 +7648,7 @@ mod tests {
                 deliveries: BoundedVec::from_slice(&[expired], 1).unwrap(),
             },
         );
-        assert!(owner.pubsub.deliveries.as_slice()[0].retired);
+        assert!(owner.pubsub.deliveries[0].retired);
         let operation = claim.recipe.operation();
         assert!(
             apply(
@@ -7287,14 +7681,14 @@ mod tests {
         let (effect, command) =
             message_command(apply(&mut owner, Input::WorkAvailable { session: TARGET }));
         known(&mut owner, effect, &command);
-        let newer = owner.pubsub.deliveries.as_slice()[0].clone();
+        let newer = owner.pubsub.deliveries[0].clone();
         apply(
             &mut owner,
             Input::MessagesExpired {
                 deliveries: BoundedVec::from_slice(&[expired], 1).unwrap(),
             },
         );
-        assert_eq!(owner.pubsub.deliveries.as_slice()[0], newer);
+        assert_eq!(owner.pubsub.deliveries[0], newer);
     }
 
     #[test]
@@ -7437,7 +7831,7 @@ mod tests {
         let mut owner = world();
         message_clock(&mut owner, 10);
         queued(&mut owner, 0);
-        owner.pubsub.deliveries.as_mut_slice()[0].expiry = Some(message_expiry());
+        owner.pubsub.deliveries[0].expiry = Some(Box::new(message_expiry()));
         let before = owner.leases.account().used();
         // The store's sweep may already have committed, with its removed-key
         // notification lost. Evict only the obsolete cache, not a claim.
@@ -7489,8 +7883,8 @@ mod tests {
             let mut owner = world();
             message_clock(&mut owner, 10);
             queued(&mut owner, 0);
-            let d = &mut owner.pubsub.deliveries.as_mut_slice()[0];
-            d.expiry = Some(message_expiry());
+            let d = &mut owner.pubsub.deliveries[0];
+            d.expiry = Some(Box::new(message_expiry()));
             d.qos = qos;
             let (effect, command) =
                 message_command(apply(&mut owner, Input::WorkAvailable { session: TARGET }));
@@ -7616,9 +8010,9 @@ mod tests {
             )
             .is_empty()
         );
-        assert!(!owner.pubsub.deliveries.as_slice()[0].local_write_completed);
+        assert!(!owner.pubsub.deliveries[0].local_write_completed);
         assert!(
-            !owner.pubsub.deliveries.as_slice()[0].claim.unwrap().started,
+            !owner.pubsub.deliveries[0].claim.unwrap().started,
             "partial_callback_invented_started_marker"
         );
         message_clock(&mut owner, 12);
@@ -7950,7 +8344,7 @@ mod tests {
             },
         );
         message_clock(&mut owner, 12);
-        let flight = owner.pubsub.retained.unwrap();
+        let flight = owner.pubsub.retained.clone().unwrap();
         assert!(flight.retired);
         let effects = apply(
             &mut owner,
@@ -8001,7 +8395,7 @@ mod tests {
                 }
             };
             let counters = owner.counters;
-            let delivery = owner.pubsub.deliveries.as_slice()[0].clone();
+            let delivery = owner.pubsub.deliveries[0].clone();
             let held = owner
                 .outbox
                 .reserve(NonZeroUsize::new(owner.outbox.free_slots() - 1).unwrap())
@@ -8028,7 +8422,7 @@ mod tests {
                 "expiry_transition_did_not_reserve_whole_operation"
             );
             assert_eq!(owner.counters, counters);
-            assert_eq!(owner.pubsub.deliveries.as_slice()[0], delivery);
+            assert_eq!(owner.pubsub.deliveries[0], delivery);
             owner.outbox.release(held).unwrap();
             let (_, command) =
                 message_command(message_progress(&mut owner, effect, connection, progress));
@@ -8105,14 +8499,14 @@ mod tests {
                     },
                 );
                 let effects = apply(&mut owner, Input::WorkAvailable { session: TARGET });
-                assert_eq!(effects.iter().any(|(_, e)| matches!(e, Effect::EmitPublish { started: true, packet_id, expiry: Some(expiry), .. } if *packet_id == claim.packet_id && *expiry == message_expiry())), started, "recovery_invented_unsent_or_started_authority");
+                assert_eq!(effects.iter().any(|(_, e)| matches!(e, Effect::EmitPublish { started: true, packet_id, expiry: Some(expiry), .. } if *packet_id == claim.packet_id && **expiry == message_expiry())), started, "recovery_invented_unsent_or_started_authority");
                 assert!(
                     !effects
                         .iter()
                         .any(|(_, e)| matches!(e, Effect::Persist { .. }))
                 );
                 assert_eq!(owner.pubsub.free_packet_id(TARGET, 1), None);
-                assert!(!owner.pubsub.deliveries.as_slice()[0].certain_never_started);
+                assert!(!owner.pubsub.deliveries[0].certain_never_started);
             }
         }
     }
@@ -8282,9 +8676,9 @@ mod tests {
     /// besides its payload, 17 with a Message Expiry Interval.
     fn sized(owner: &mut Owner, index: u32, qos: Qos, timed: bool, payload: usize) {
         queued(owner, index);
-        let d = owner.pubsub.deliveries.as_mut_slice().last_mut().unwrap();
+        let d = owner.pubsub.deliveries.last_mut().unwrap();
         d.qos = qos;
-        d.expiry = timed.then(message_expiry);
+        d.expiry = timed.then(|| Box::new(message_expiry()));
         d.payload = Some(SharedBytes::copy_from(&alloc::vec![7; payload], 128).unwrap());
     }
 
@@ -8329,12 +8723,11 @@ mod tests {
         let held = owner
             .pubsub
             .deliveries
-            .as_slice()
-            .iter()
+            .values()
             .find(|d| d.id == claimed.delivery)
             .expect("the delivery is kept until its finish is known");
         assert!(
-            matches!(held.phase, Phase::DiscardPending(flight) if flight.operation == command.recipe.operation()),
+            matches!(&held.phase, Phase::DiscardPending(flight) if flight.operation == command.recipe.operation()),
             "{:?}",
             held.phase
         );
@@ -8426,7 +8819,7 @@ mod tests {
         );
         queued(&mut owner, 0);
         queued(&mut owner, 1);
-        owner.pubsub.deliveries.as_mut_slice()[1].target = OTHER;
+        owner.pubsub.deliveries[1].target = OTHER;
         let (_, sent) = claim_next(&mut owner, TARGET);
         assert!(matches!(
             &sent[..],
@@ -8442,7 +8835,7 @@ mod tests {
             discarded(&observed),
             (delivery(1), OTHER, discard.recipe.operation())
         );
-        let left = owner.pubsub.deliveries.as_slice();
+        let left = owner.pubsub.deliveries.to_vec();
         assert_eq!(left.len(), 1, "the other destination keeps its delivery");
         assert_eq!((left[0].id, left[0].target), (delivery(0), TARGET));
         assert!(left[0].frame.is_some() && left[0].phase == Phase::AwaitPuback);
@@ -8521,7 +8914,7 @@ mod tests {
                 (Qos::AtLeastOnce, Some(claim), None, false),
             )
             .unwrap();
-        let item = &mut owner.pubsub.deliveries.as_mut_slice()[0];
+        let item = &mut owner.pubsub.deliveries[0];
         item.topic = Some(bytes(b"topic"));
         item.payload = Some(bytes(b"payload"));
         claim
@@ -8769,7 +9162,7 @@ mod tests {
             let mut owner = limited(u32::MAX, 8);
             message_clock(&mut owner, 10);
             sized(&mut owner, 0, qos, true, 128);
-            owner.pubsub.deliveries.as_mut_slice()[0].topic = Some(bytes(&[b't'; 128]));
+            owner.pubsub.deliveries[0].topic = Some(bytes(&[b't'; 128]));
             let (_, sent) = claim_next(&mut owner, TARGET);
             assert_eq!(names(&sent), ["EmitPublish"]);
         }
@@ -8790,7 +9183,7 @@ mod tests {
         let mut pids = Vec::new();
         for index in 0..2 {
             queued(&mut owner, index);
-            owner.pubsub.deliveries.as_mut_slice()[index as usize].qos = Qos::ExactlyOnce;
+            owner.pubsub.deliveries[index as usize].qos = Qos::ExactlyOnce;
             let claim = apply(&mut owner, Input::WorkAvailable { session: TARGET });
             let (id, Effect::Persist { command }) = &claim[0] else {
                 panic!("claim")
@@ -8881,12 +9274,12 @@ mod tests {
         // Delivery 0: QoS 2 WITH Message Expiry Interval.
         queued(&mut owner, 0);
         {
-            let d0 = &mut owner.pubsub.deliveries.as_mut_slice()[0];
+            let d0 = &mut owner.pubsub.deliveries[0];
             d0.qos = Qos::ExactlyOnce;
-            d0.expiry = Some(MessageExpiry {
+            d0.expiry = Some(Box::new(MessageExpiry {
                 observed: now,
                 interval: 60,
-            });
+            }));
         }
         let claim0 = apply(&mut owner, Input::WorkAvailable { session: TARGET });
         let (id0, Effect::Persist { command: cmd0 }) = &claim0[0] else {
@@ -8905,7 +9298,7 @@ mod tests {
 
         // Delivery 1: QoS 2 WITHOUT Message Expiry Interval.
         queued(&mut owner, 1);
-        owner.pubsub.deliveries.as_mut_slice()[1].qos = Qos::ExactlyOnce;
+        owner.pubsub.deliveries[1].qos = Qos::ExactlyOnce;
         let claim1 = apply(&mut owner, Input::WorkAvailable { session: TARGET });
         let (id1, Effect::Persist { command: cmd1 }) = &claim1[0] else {
             panic!("claim1")

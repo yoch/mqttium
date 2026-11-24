@@ -172,7 +172,8 @@ fn member(
     };
     let recipe = command.recipe.get();
     let operation = recipe.operation();
-    let canonical = command.recipe.canonical_bytes();
+    let canonical_buf = command.recipe.to_canonical_bytes();
+    let canonical = canonical_buf.as_slice();
     let phase = match recognise_with_meta(conn, meta, command, canonical, caches, group_delta) {
         Recognised::Settled(applied) => return Ok(applied),
         Recognised::Absent(phase) => phase,

@@ -289,7 +289,11 @@ impl<'a> Cursor<'a> {
     }
 }
 
+#[inline]
 pub(crate) fn utf8(bytes: &[u8]) -> Result<(), Error> {
+    if bytes.iter().all(|&b| (0x20..0x7f).contains(&b)) {
+        return Ok(());
+    }
     let text = std::str::from_utf8(bytes).map_err(|_| malformed("InvalidUtf8"))?;
     // MQTT forbids NUL; the experimental profile also rejects the disallowed
     // controls and noncharacters of MQTT 5 section 1.5.4. BOM is preserved.
@@ -725,7 +729,53 @@ fn versioned_properties<'a>(
     }
 }
 
-fn publish(version: Version, first: u8, body: &[u8], bounds: Bounds) -> Result<Packet, Error> {
+/// Small fixed-size direct-mapped cache of recently seen validated PUBLISH
+/// topic names, avoiding per-message `Arc<[u8]>` allocations on repeated topics
+/// while bounding broker-wide memory to 512 bytes.
+pub struct TopicCache {
+    slots: [Option<SharedBytes>; 32],
+}
+
+impl Default for TopicCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl TopicCache {
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            slots: [const { None }; 32],
+        }
+    }
+
+    #[inline]
+    pub fn intern(&mut self, bytes: &[u8], max: usize) -> Result<SharedBytes, Error> {
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for &b in bytes {
+            h ^= u64::from(b);
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        let idx = (h as usize) & 31;
+        if let Some(cached) = &self.slots[idx]
+            && cached.as_slice() == bytes
+        {
+            return Ok(cached.clone());
+        }
+        let fresh = SharedBytes::copy_from(bytes, max).map_err(|_| oversized("TopicTooLarge"))?;
+        self.slots[idx] = Some(fresh.clone());
+        Ok(fresh)
+    }
+}
+
+fn publish(
+    version: Version,
+    first: u8,
+    body: &[u8],
+    bounds: Bounds,
+    mut topic_cache: Option<&mut TopicCache>,
+) -> Result<Packet, Error> {
     let mut input = Cursor::new(body);
     let topic_bytes = input.string()?;
     let qos = Qos::from_wire((first >> 1) & 3).ok_or_else(|| malformed("InvalidQos"))?;
@@ -734,6 +784,46 @@ fn publish(version: Version, first: u8, body: &[u8], bounds: Bounds) -> Result<P
     } else {
         Some(identifier(&mut input)?)
     };
+    // Fast path for the common case: MQTT 3.1.1 (no properties) or MQTT 5 with
+    // zero-length property section (`0x00`).
+    let no_properties = if version == Version::V311 {
+        true
+    } else if input.bytes.get(input.at) == Some(&0) {
+        input.at += 1;
+        true
+    } else {
+        false
+    };
+    if no_properties {
+        if topic_bytes.is_empty() {
+            return Err(protocol("EmptyTopicName"));
+        }
+        topic(topic_bytes)?;
+        let payload = &body[input.at..];
+        if topic_bytes.len() > bounds.max_topic {
+            return Err(oversized("TopicTooLarge"));
+        }
+        if payload.len() > bounds.max_payload {
+            return Err(oversized("PayloadTooLarge"));
+        }
+        let topic = match topic_cache.as_deref_mut() {
+            Some(cache) => cache.intern(topic_bytes, bounds.max_topic)?,
+            None => SharedBytes::copy_from(topic_bytes, bounds.max_topic)
+                .map_err(|_| oversized("TopicTooLarge"))?,
+        };
+        let payload = SharedBytes::copy_from(payload, bounds.max_payload)
+            .map_err(|_| oversized("PayloadTooLarge"))?;
+        return Ok(Packet::Core(InboundPacket::Publish {
+            topic,
+            qos,
+            retain: first & 1 != 0,
+            dup: first & 8 != 0,
+            packet_id,
+            expiry: None,
+            properties: None,
+            payload,
+        }));
+    }
     let props = versioned_properties(version, &mut input, Context::Publish)?;
     // No Topic Alias reaches this point: Topic Alias Maximum 0 was announced
     // and the properties refused any. An empty name therefore designates
@@ -816,8 +906,11 @@ fn publish(version: Version, first: u8, body: &[u8], bounds: Bounds) -> Result<P
     } else {
         None
     };
-    let topic = SharedBytes::copy_from(topic_bytes, bounds.max_topic)
-        .map_err(|_| oversized("TopicTooLarge"))?;
+    let topic = match topic_cache {
+        Some(cache) => cache.intern(topic_bytes, bounds.max_topic)?,
+        None => SharedBytes::copy_from(topic_bytes, bounds.max_topic)
+            .map_err(|_| oversized("TopicTooLarge"))?,
+    };
     let payload = SharedBytes::copy_from(payload, bounds.max_payload)
         .map_err(|_| oversized("PayloadTooLarge"))?;
     let packet = InboundPacket::Publish {
@@ -1120,6 +1213,16 @@ pub fn decode_for(
     body: &[u8],
     bounds: Bounds,
 ) -> Result<Packet, Error> {
+    decode_for_with_cache(version, first, body, bounds, None)
+}
+
+pub fn decode_for_with_cache(
+    version: Version,
+    first: u8,
+    body: &[u8],
+    bounds: Bounds,
+    topic_cache: Option<&mut TopicCache>,
+) -> Result<Packet, Error> {
     flags(first)?;
     if body.len() > 268_435_455 {
         return Err(oversized("PacketTooLarge"));
@@ -1142,7 +1245,7 @@ pub fn decode_for(
     }
     match first >> 4 {
         1 => client_connect(body, bounds),
-        3 => publish(version, first, body, bounds),
+        3 => publish(version, first, body, bounds, topic_cache),
         4 => puback(version, body),
         5 => qos2_ack(version, Qos2Ack::Pubrec, body),
         6 => pubrel(version, body),

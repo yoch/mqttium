@@ -21,7 +21,7 @@ use std::collections::VecDeque;
 use std::io;
 use std::os::fd::RawFd;
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -38,7 +38,7 @@ const REST: Duration = Duration::from_secs(1);
 /// Consecutive turns one task may take before the others are served.
 const TURNS: usize = 64;
 const WAKER: Token = Token(usize::MAX);
-const UNREGISTERED: usize = usize::MAX;
+const UNREGISTERED: u32 = u32::MAX;
 static CONFIGURED_THREADS: AtomicUsize = AtomicUsize::new(0);
 
 /// Sets the reactor thread count used when the shared pool initializes.
@@ -69,8 +69,8 @@ pub(crate) trait Driven: Send {
     /// The descriptor whose readiness runs the task.
     fn descriptor(&self) -> RawFd;
     /// One bounded, non-blocking step using the reactor thread's reusable
-    /// read scratch buffer. An error is terminal.
-    fn turn(&mut self, scratch: &mut [u8]) -> Result<Turn, &'static str>;
+    /// scratch buffers. An error is terminal.
+    fn turn(&mut self, scratch: &mut super::ReactorScratch) -> Result<Turn, &'static str>;
     /// Publishes the terminal facts of the task. Called once, last.
     fn finish(self: Box<Self>, code: &'static str);
 }
@@ -78,11 +78,11 @@ pub(crate) trait Driven: Send {
 /// The core's handle on one registered task.
 pub(crate) struct Link {
     shared: Arc<Shared>,
-    slot: AtomicUsize,
+    wake: Wake,
+    slot: AtomicU32,
     dirty: AtomicBool,
     owed: AtomicBool,
     finished: AtomicBool,
-    wake: Wake,
 }
 
 impl Link {
@@ -101,7 +101,7 @@ impl Link {
 
     /// The core took a value from a lane of this task.
     pub fn consumed(self: &Arc<Self>) {
-        if self.owed.swap(false, Ordering::SeqCst) {
+        if self.owed.load(Ordering::SeqCst) && self.owed.swap(false, Ordering::SeqCst) {
             self.notify();
         }
     }
@@ -260,11 +260,11 @@ impl Reactors {
         let index = self.next.fetch_add(1, Ordering::Relaxed) % self.threads.len();
         Arc::new(Link {
             shared: self.threads[index].0.clone(),
-            slot: AtomicUsize::new(UNREGISTERED),
+            wake,
+            slot: AtomicU32::new(UNREGISTERED),
             dirty: AtomicBool::new(false),
             owed: AtomicBool::new(false),
             finished: AtomicBool::new(false),
-            wake,
         })
     }
 
@@ -310,9 +310,9 @@ fn run(mut poll: Poll, shared: &Shared) {
     let mut slots: Vec<Option<Entry>> = Vec::new();
     let mut free: Vec<usize> = Vec::new();
     let mut ready: VecDeque<usize> = VecDeque::new();
-    // Single reusable scratch read buffer shared across all tasks on this
-    // reactor thread so idle plain TCP connections hold zero read buffer RAM.
-    let mut scratch = vec![0u8; super::READ_BUFFER].into_boxed_slice();
+    // Reusable scratch read/batch buffers shared across all tasks on this
+    // reactor thread so idle connections hold zero I/O buffer RAM.
+    let mut scratch = super::ReactorScratch::new();
     let mut waiting = 0usize;
     let mut last_tick = Instant::now();
     loop {
@@ -349,19 +349,20 @@ fn run(mut poll: Poll, shared: &Shared) {
                         retire(&poll, entry, "reactor_registration");
                         continue;
                     }
-                    entry.link.slot.store(slot, Ordering::SeqCst);
+                    entry.link.slot.store(slot as u32, Ordering::SeqCst);
                     slots[slot] = Some(entry);
                     ready.push_back(slot);
                 }
                 Message::Run(link) => {
                     link.dirty.store(false, Ordering::SeqCst);
-                    let slot = link.slot.load(Ordering::SeqCst);
-                    if let Some(Some(entry)) = slots.get_mut(slot)
+                    let raw_slot = link.slot.load(Ordering::SeqCst);
+                    if raw_slot != UNREGISTERED
+                        && let Some(Some(entry)) = slots.get_mut(raw_slot as usize)
                         && Arc::ptr_eq(&entry.link, &link)
                         && !entry.queued
                     {
                         entry.queued = true;
-                        ready.push_back(slot);
+                        ready.push_back(raw_slot as usize);
                     }
                 }
                 #[cfg(test)]
@@ -427,6 +428,9 @@ fn run(mut poll: Poll, shared: &Shared) {
                 // the bounded bursts of a busy one.
                 break;
             }
+        }
+        if ready.is_empty() {
+            ready.clear();
         }
         let timeout = if !ready.is_empty() {
             Duration::ZERO
@@ -494,7 +498,10 @@ mod tests {
         fn descriptor(&self) -> RawFd {
             self.stream.as_raw_fd()
         }
-        fn turn(&mut self, _scratch: &mut [u8]) -> Result<Turn, &'static str> {
+        fn turn(
+            &mut self,
+            _scratch: &mut super::super::ReactorScratch,
+        ) -> Result<Turn, &'static str> {
             self.turns.fetch_add(1, Ordering::SeqCst);
             if self.hold.load(Ordering::SeqCst) {
                 return Ok(Turn {

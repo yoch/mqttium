@@ -293,7 +293,8 @@ pub fn admission_in(
             exchange_slots: ExchangeSlots::new(1),
             receipt_slots: ReceiptSlots::new(1),
         },
-        targets: BoundedVec::from_slice(&targets, targets.len().max(1)).expect("fits"),
+        targets: mqttiumd_contract::command::TargetVec::from_slice(&targets, targets.len().max(1))
+            .expect("fits"),
     });
     Command {
         recipe: FrozenRecipe::freeze(recipe).expect("well formed"),

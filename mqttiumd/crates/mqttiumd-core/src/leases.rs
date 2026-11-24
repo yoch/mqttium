@@ -16,7 +16,7 @@
 //! as well, so no record is rebuilt from its parts and no account is
 //! charged by hand.
 
-use alloc::collections::BTreeSet;
+use alloc::vec::Vec;
 use core::num::NonZeroU32;
 
 use crate::contract::capacity::{AllocationFailed, BoundedVec, Resource};
@@ -24,6 +24,76 @@ use crate::contract::ids::{AccountId, LeaseGeneration, LeaseKey};
 use crate::credits::{
     Account, Credits, LeaseRecord, ReleaseError, ReleaseOutcome, release_if_current,
 };
+
+/// Two-level O(1) deterministic bitset of free slot indices.
+///
+/// Replaces a 32,768-node `BTreeSet<usize>` (~1 MiB) with 4 KiB of bit words
+/// plus a 64-byte summary line, preserving exact lowest-free-slot selection.
+#[derive(Debug)]
+struct FreeBitset {
+    words: Vec<u64>,
+    summary: Vec<u64>,
+}
+
+impl FreeBitset {
+    fn all_free(count: usize) -> Result<Self, AllocationFailed> {
+        let word_count = count.div_ceil(64);
+        let summary_count = word_count.div_ceil(64);
+        let mut words = Vec::new();
+        words
+            .try_reserve_exact(word_count)
+            .map_err(|_| AllocationFailed)?;
+        words.resize(word_count, u64::MAX);
+        let rem = count & 63;
+        if rem != 0
+            && let Some(last) = words.last_mut()
+        {
+            *last = (1u64 << rem) - 1;
+        }
+        let mut summary = Vec::new();
+        summary
+            .try_reserve_exact(summary_count)
+            .map_err(|_| AllocationFailed)?;
+        summary.resize(summary_count, u64::MAX);
+        let srem = word_count & 63;
+        if srem != 0
+            && let Some(last) = summary.last_mut()
+        {
+            *last = (1u64 << srem) - 1;
+        }
+        Ok(Self { words, summary })
+    }
+
+    fn first(&self) -> Option<usize> {
+        for (si, &sw) in self.summary.iter().enumerate() {
+            if sw != 0 {
+                let wi = (si << 6) + (sw.trailing_zeros() as usize);
+                let w = self.words[wi];
+                return Some((wi << 6) + (w.trailing_zeros() as usize));
+            }
+        }
+        None
+    }
+
+    fn set(&mut self, index: usize) {
+        let wi = index >> 6;
+        let bit = 1u64 << (index & 63);
+        let was_zero = self.words[wi] == 0;
+        self.words[wi] |= bit;
+        if was_zero {
+            self.summary[wi >> 6] |= 1u64 << (wi & 63);
+        }
+    }
+
+    fn clear(&mut self, index: usize) {
+        let wi = index >> 6;
+        let bit = 1u64 << (index & 63);
+        self.words[wi] &= !bit;
+        if self.words[wi] == 0 {
+            self.summary[wi >> 6] &= !(1u64 << (wi & 63));
+        }
+    }
+}
 
 /// Why a lease was not granted. Nothing changed.
 ///
@@ -76,7 +146,7 @@ struct LeaseSlot {
 pub struct LeaseTable {
     account: Account,
     slots: BoundedVec<LeaseSlot>,
-    free_slots: BTreeSet<usize>,
+    free_slots: FreeBitset,
     held_count: usize,
     exhausted_count: usize,
 }
@@ -91,14 +161,13 @@ impl LeaseTable {
     ) -> Result<Self, AllocationFailed> {
         let count = usize::try_from(max_leases.get()).map_err(|_| AllocationFailed)?;
         let mut slots = BoundedVec::with_capacity(count)?;
-        let mut free_slots = BTreeSet::new();
-        for index in 0..count {
+        let free_slots = FreeBitset::all_free(count)?;
+        for _ in 0..count {
             let free = LeaseSlot {
                 next_generation: Some(LeaseGeneration::new(0)),
                 record: None,
             };
             slots.try_push(free).map_err(|_| AllocationFailed)?;
-            free_slots.insert(index);
         }
         Ok(Self {
             account: Account::new(account, limit),
@@ -119,7 +188,7 @@ impl LeaseTable {
 
     /// The slot the next lease takes, or why there is none.
     fn free_slot(&self) -> Result<usize, LeaseRefused> {
-        if let Some(&index) = self.free_slots.first() {
+        if let Some(index) = self.free_slots.first() {
             return Ok(index);
         }
         // A held slot is freed by a release unless its lease took the
@@ -223,7 +292,7 @@ impl LeaseTable {
         entry.record = Some(record);
         // The generation is used whatever follows; the last leaves `None`.
         entry.next_generation = generation.checked_next().ok();
-        self.free_slots.remove(&index);
+        self.free_slots.clear(index);
         self.held_count += 1;
         if entry.next_generation.is_none() {
             self.exhausted_count += 1;
@@ -251,7 +320,7 @@ impl LeaseTable {
             entry.record = None;
             self.held_count -= 1;
             if entry.next_generation.is_some() {
-                self.free_slots.insert(index);
+                self.free_slots.set(index);
             }
         }
         Ok(outcome)
@@ -321,7 +390,7 @@ impl LeaseTable {
         let entry = &mut self.slots.as_mut_slice()[index];
         entry.record = Some(record);
         entry.next_generation = key.generation.checked_next().ok();
-        self.free_slots.remove(&index);
+        self.free_slots.clear(index);
         self.held_count += 1;
         if entry.next_generation.is_none() {
             self.exhausted_count += 1;

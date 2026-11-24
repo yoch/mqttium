@@ -496,7 +496,7 @@ fn claimed_publication_matches_sqlite_and_recovers_after_crash() {
     let make_claimed = |world: &World<LogStore>, seq: u64, in_pi: u16, out_pi: u16, body: &[u8]| {
         let base = world.admission(seq, in_pi, body, &[world.b]);
         let Recipe::AdmitPublication(admit) =
-            Recipe::decode_canonical(base.recipe.canonical_bytes(), 16, 64).unwrap()
+            Recipe::decode_canonical(&base.recipe.to_canonical_bytes(), 16, 64).unwrap()
         else {
             panic!("expected AdmitPublication");
         };
@@ -602,5 +602,63 @@ fn claimed_publication_matches_sqlite_and_recovers_after_crash() {
 
     drop(reopened);
     drop(sql_world);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn failed_wal_replacement_suspends_durable_writes_until_repaired() {
+    let dir = temp_dir("wal-replace-fail");
+    let path = dir.join("broker.sqlite");
+    let wal_path = dir.join("broker.sqlite.mlog");
+    let limits = fixture_limits();
+
+    let mut world = World::with_limits(
+        &|incarnation, lim| {
+            LogStore::open_or_create(&path, incarnation, lim, None, false).expect("log store")
+        },
+        limits,
+    );
+    let a1 = world.admission(1, 7, b"before-compact", &[world.b]);
+    assert!(world.store.apply(&a1).committed_now);
+    let snapshot_before = world.store.snapshot().expect("snapshot before");
+
+    // Replace the WAL path with a directory so `save_state_atomic(&path)`
+    // advances the SQLite checkpoint on disk while `write_fresh_wal_atomic`
+    // fails at rename (EISDIR).
+    std::fs::remove_file(&wal_path).expect("remove old wal");
+    std::fs::create_dir(&wal_path).expect("block wal path with directory");
+    assert!(
+        world.store.compact().is_err(),
+        "compact must report WAL replacement failure"
+    );
+
+    // Subsequent durable writes MUST fail closed rather than confirming onto
+    // the stale/unlinked WAL file descriptor and vanishing on restart.
+    let a2 = world.admission(2, 8, b"must-not-confirm-desynced", &[world.b]);
+    let blocked = world.store.apply(&a2);
+    assert_eq!(
+        blocked.reply,
+        StoreReply::Outcome(StoreOutcome::PendingOrUnknown),
+        "desynced WAL must suspend durable confirmations"
+    );
+    assert!(!blocked.committed_now && !blocked.wrote);
+    assert_eq!(world.store.snapshot().expect("unchanged"), snapshot_before);
+
+    // Once the WAL path is restored, a fresh compaction recovers durability.
+    std::fs::remove_dir(&wal_path).expect("remove blocking directory");
+    world
+        .store
+        .compact()
+        .expect("compaction succeeds after WAL path restored");
+    let resumed = world.store.apply(&a2);
+    assert!(resumed.committed_now);
+    let expected = world.store.snapshot().expect("snapshot after resume");
+    drop(world);
+
+    let reopened = LogStore::open_or_create(&path, StoreIncarnation::new(1), limits, None, true)
+        .expect("reopen after repaired compaction");
+    assert_eq!(reopened.snapshot().expect("recovered"), expected);
+
+    drop(reopened);
     let _ = std::fs::remove_dir_all(&dir);
 }

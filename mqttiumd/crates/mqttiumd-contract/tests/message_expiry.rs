@@ -75,7 +75,7 @@ fn admission(qos: Qos, retain: bool) -> AdmitPublication {
             exchange_slots: ExchangeSlots::new(1),
             receipt_slots: ReceiptSlots::new(1),
         },
-        targets: BoundedVec::from_slice(
+        targets: mqttiumd_contract::command::TargetVec::from_slice(
             &[Target {
                 session: SessionId::new(14),
                 session_revision: Revision::new(15),
@@ -105,7 +105,7 @@ fn qos0() -> RetainedQos0 {
         topic: a.topic,
         payload: a.payload,
         costs: a.costs,
-        targets: a.targets,
+        targets: a.targets.into_bounded(),
         retain_targets: mqttiumd_contract::retained::RetainMask::from_u16(1),
     }
 }

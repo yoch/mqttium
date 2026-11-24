@@ -101,11 +101,38 @@ enum StoreBackend {
 }
 
 impl StoreBackend {
+    #[inline]
+    fn has_expiring_publications(&self) -> bool {
+        match self {
+            Self::Durable(_) => true,
+            Self::Log(s) => s.store().has_expiring_publications(),
+            Self::Volatile { handle, .. } => handle.has_expiring_publications(),
+        }
+    }
+
     fn has_will_for_client(&self, client: &[u8]) -> Result<bool, ReadError> {
         match self {
             Self::Durable(s) => s.has_will_for_client(client),
             Self::Log(s) => s.has_will_for_client(client),
             Self::Volatile { handle, .. } => handle.has_will_for_client(client),
+        }
+    }
+
+    #[inline]
+    fn apply_owned(
+        &mut self,
+        command: mqttiumd_contract::command::Command,
+    ) -> mqttiumd_store_api::Applied {
+        match self {
+            Self::Durable(s) => s.apply(&command),
+            Self::Log(s) => s.apply(&command),
+            Self::Volatile { handle, dirty, .. } => {
+                let res = handle.apply_owned(command);
+                if res.wrote {
+                    *dirty = true;
+                }
+                res
+            }
         }
     }
 
@@ -524,11 +551,11 @@ pub struct Session {
     pub present: bool,
     pub expiry: SessionExpiry,
     pub opened_by: Option<OperationId>,
-    pub detached: Option<SessionDetachment>,
+    pub detached: Option<Box<SessionDetachment>>,
 }
 pub struct Boot {
     pub grant: EpochGrant,
-    pub sessions: BTreeMap<Vec<u8>, Session>,
+    pub sessions: BTreeMap<SharedBytes, Session>,
     pub collect_closed: bool,
     pub sqlite: Option<mqttiumd_store_sqlite::Settings>,
     pub storage_mode: StorageMode,
@@ -1055,28 +1082,50 @@ impl DirectWriter {
         ))
     }
 
+    #[inline]
     pub(crate) fn apply_persist_inline(
         &mut self,
-        command: &mqttiumd_contract::command::Command,
-    ) -> (StoreReply, Vec<SessionId>) {
+        command: mqttiumd_contract::command::Command,
+        out_targets: &mut Vec<SessionId>,
+    ) -> StoreReply {
         use mqttiumd_contract::outcome::{CommitFacts, StoreOutcome};
-        let recipe = command.recipe.get();
-        let applied = self.store.apply(command);
-        record_applied(recipe, &applied, &self.events, &self.cancel);
-        record_result(recipe, &applied, &self.events, &self.cancel);
-        let targets = if matches!(
-            applied.reply,
-            StoreReply::Outcome(StoreOutcome::Committed(
-                CommitFacts::PublicationAdmitted { .. }
-                    | CommitFacts::RetainedQos0Stored { .. }
-                    | CommitFacts::SubscriptionsChanged { .. }
-            ))
-        ) {
-            targets_of(recipe)
+        let is_will = matches!(command.recipe.get(), Recipe::WillPublication(_));
+        let needs_result_record = matches!(
+            command.recipe.get(),
+            Recipe::SessionLifecycle(_) | Recipe::WillPublication(_)
+        ) || self.events.records("store_result");
+        let is_single_claimed = matches!(
+            command.recipe.get().inner_publication(),
+            Recipe::ClaimedPublication(claimed) if claimed.admission.targets.len() <= 1
+        );
+        let recipe_for_post = if is_will || needs_result_record || !is_single_claimed {
+            Some(command.recipe.clone())
         } else {
-            Vec::new()
+            None
         };
-        (applied.reply, targets)
+        let applied = self.store.apply_owned(command);
+        if let Some(frozen) = recipe_for_post {
+            let recipe = frozen.get();
+            if is_will {
+                record_applied(recipe, &applied, &self.events, &self.cancel);
+            }
+            if needs_result_record {
+                record_result(recipe, &applied, &self.events, &self.cancel);
+            }
+            if !is_single_claimed
+                && matches!(
+                    applied.reply,
+                    StoreReply::Outcome(StoreOutcome::Committed(
+                        CommitFacts::PublicationAdmitted { .. }
+                            | CommitFacts::RetainedQos0Stored { .. }
+                            | CommitFacts::SubscriptionsChanged { .. }
+                    ))
+                )
+            {
+                push_targets_of(recipe, out_targets);
+            }
+        }
+        applied.reply
     }
 
     pub(crate) fn exec_request(&mut self, request: Request) {
@@ -1151,6 +1200,14 @@ impl StoreHandle<'_> {
         matches!(self, Self::Direct(_))
     }
 
+    #[inline]
+    pub(crate) fn skip_empty_message_expiry_sweep(&self) -> bool {
+        match self {
+            Self::Threaded(_) => false,
+            Self::Direct(direct) => !direct.store.has_expiring_publications(),
+        }
+    }
+
     pub(crate) fn try_send(&mut self, request: Request) -> Result<(), TrySendError<Request>> {
         match self {
             Self::Threaded(writer) => writer.sender.try_send(request),
@@ -1191,11 +1248,12 @@ impl StoreHandle<'_> {
     #[inline]
     pub(crate) fn apply_persist_direct(
         &mut self,
-        command: &mqttiumd_contract::command::Command,
-    ) -> Option<(StoreReply, Vec<SessionId>)> {
+        command: mqttiumd_contract::command::Command,
+        out_targets: &mut Vec<SessionId>,
+    ) -> StoreReply {
         match self {
-            Self::Threaded(_) => None,
-            Self::Direct(direct) => Some(direct.apply_persist_inline(command)),
+            Self::Threaded(_) => unreachable!("apply_persist_direct requires Direct writer"),
+            Self::Direct(direct) => direct.apply_persist_inline(command, out_targets),
         }
     }
 
@@ -1293,33 +1351,35 @@ fn business_response(
 }
 
 /// The sessions a committed command may have given work to.
-fn targets_of(recipe: &Recipe) -> Vec<SessionId> {
+#[inline]
+fn push_targets_of(recipe: &Recipe, out: &mut Vec<SessionId>) {
     if let Recipe::ClaimedPublication(claimed) = recipe.inner_publication() {
-        let claimed_idx = usize::from(claimed.claim.target_index);
         if claimed.admission.targets.len() <= 1 {
-            return Vec::new();
+            return;
         }
-        return claimed
-            .admission
-            .targets
-            .as_slice()
-            .iter()
-            .enumerate()
-            .filter(|(i, _)| *i != claimed_idx)
-            .map(|(_, t)| t.session)
-            .collect();
+        let claimed_idx = usize::from(claimed.claim.target_index);
+        for (i, t) in claimed.admission.targets.as_slice().iter().enumerate() {
+            if i != claimed_idx {
+                out.push(t.session);
+            }
+        }
+        return;
     }
     if let Recipe::WillPublication(a) = recipe {
-        a.targets.as_slice().iter().map(|t| t.session).collect()
+        out.extend(a.targets.as_slice().iter().map(|t| t.session));
     } else if let Some(a) = recipe.admission() {
-        a.targets.as_slice().iter().map(|t| t.session).collect()
+        out.extend(a.targets.as_slice().iter().map(|t| t.session));
     } else if let Some(a) = recipe.retained_qos0() {
-        a.targets.as_slice().iter().map(|t| t.session).collect()
+        out.extend(a.targets.as_slice().iter().map(|t| t.session));
     } else if let Some(a) = recipe.replay_subscriptions() {
-        vec![a.update.session]
-    } else {
-        Vec::new()
+        out.push(a.update.session);
     }
+}
+
+fn targets_of(recipe: &Recipe) -> Vec<SessionId> {
+    let mut out = Vec::new();
+    push_targets_of(recipe, &mut out);
+    out
 }
 
 /// The records of one applied command. They are written after its commit
@@ -2398,7 +2458,7 @@ fn bootstrap_bound(
             return Err(Failure::read(ReadError::LimitExceeded, ReadPhase::Snapshot));
         }
         sessions.insert(
-            s.client_id.clone(),
+            client.clone(),
             Session {
                 id: *id,
                 revision: s.revision,
@@ -2406,7 +2466,7 @@ fn bootstrap_bound(
                 present: true,
                 expiry: s.expiry,
                 opened_by: s.opened_by,
-                detached: s.detached,
+                detached: s.detached.map(Box::new),
             },
         );
     }
@@ -2446,7 +2506,7 @@ fn session(store: &mut StoreBackend, client: SharedBytes) -> Result<Session, Fai
             present: true,
             expiry: s.expiry,
             opened_by: s.opened_by,
-            detached: s.detached,
+            detached: s.detached.map(Box::new),
         });
     }
     match store.admin(AdminCommand::CreateSession {

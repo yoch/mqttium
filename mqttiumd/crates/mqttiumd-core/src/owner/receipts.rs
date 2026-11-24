@@ -15,7 +15,7 @@ pub(super) struct Entry {
     consumed: bool,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub(super) struct Flight {
     collection: ReceiptCollection,
     answers: Answers,
@@ -198,14 +198,16 @@ impl State {
     }
 
     pub(super) fn priority(&self) -> Option<(EffectId, DeadlineToken)> {
-        self.pending.map(|flight| (flight.effect, flight.deadline))
+        self.pending
+            .as_ref()
+            .map(|flight| (flight.effect, flight.deadline))
     }
 
     pub(super) fn maintenance_input(&self, input: &Input) -> bool {
         matches!(
             input,
             Input::MaintainReceipts | Input::ReceiptsCollected { .. }
-        ) || matches!(input,Input::Deadline {token,..} if self.pending.is_some_and(|f|f.deadline==*token))
+        ) || matches!(input,Input::Deadline {token,..} if self.pending.as_ref().is_some_and(|f|f.deadline==*token))
     }
 }
 
@@ -226,6 +228,7 @@ impl Owner {
     ) -> bool {
         self.receipts
             .pending
+            .as_ref()
             .is_some_and(|flight| flight.collection == collection && flight.answers.names(effect))
     }
 
@@ -246,6 +249,7 @@ impl Owner {
     pub fn collection_deadline_is_live(&self, token: DeadlineToken) -> bool {
         self.receipts
             .pending
+            .as_ref()
             .is_some_and(|flight| flight.deadline == token)
     }
 
@@ -254,6 +258,7 @@ impl Owner {
     pub fn deadline_is_live(&self, token: DeadlineToken) -> bool {
         self.receipts
             .pending
+            .as_ref()
             .is_some_and(|flight| flight.deadline == token)
             || self.slot_by_deadline.contains_key(&token)
             || self.pubsub.deadline_is_live(token)
@@ -267,7 +272,7 @@ impl Owner {
     fn receipt_flight(
         &self,
         collection: ReceiptCollection,
-        previous: Option<Flight>,
+        previous: Option<&Flight>,
         draft: &mut Draft,
     ) -> Result<Flight, Stop> {
         let effect = draft.emit(Effect::CollectReceipts { collection })?;
@@ -280,7 +285,10 @@ impl Owner {
             collection,
             effect,
             deadline,
-            answers: previous.map_or_else(|| Answers::new(effect), |old| old.answers.with(effect)),
+            answers: previous.map_or_else(
+                || Answers::new(effect),
+                |old| old.answers.clone().with(effect),
+            ),
         })
     }
 
@@ -309,10 +317,12 @@ impl Owner {
             return Ok(super::Change::Nothing);
         };
         let flight = self.receipt_flight(collection, None, draft)?;
-        Ok(super::Change::Receipts(Change::Submit {
-            flight,
-            activate: !self.receipts.enabled,
-        }))
+        Ok(super::Change::Receipts(alloc::boxed::Box::new(
+            Change::Submit {
+                flight,
+                activate: !self.receipts.enabled,
+            },
+        )))
     }
 
     pub(super) fn plan_receipt_result(
@@ -327,7 +337,7 @@ impl Owner {
         {
             return Err(IMPOSSIBLE);
         }
-        let Some(flight) = self.receipts.pending else {
+        let Some(flight) = self.receipts.pending.as_ref() else {
             return Ok(super::Change::Nothing);
         };
         if collection != flight.collection || !flight.answers.names(effect) {
@@ -340,7 +350,9 @@ impl Owner {
                 if closure != collection.closure {
                     return Err(IMPOSSIBLE);
                 }
-                Ok(super::Change::Receipts(Change::Confirm { closure, more }))
+                Ok(super::Change::Receipts(alloc::boxed::Box::new(
+                    Change::Confirm { closure, more },
+                )))
             }
         }
     }
@@ -353,15 +365,18 @@ impl Owner {
         let Some(previous) = self
             .receipts
             .pending
+            .as_ref()
             .filter(|flight| flight.deadline == token)
         else {
             return Ok(None);
         };
         let flight = self.receipt_flight(previous.collection, Some(previous), draft)?;
-        Ok(Some(super::Change::Receipts(Change::Submit {
-            flight,
-            activate: false,
-        })))
+        Ok(Some(super::Change::Receipts(alloc::boxed::Box::new(
+            Change::Submit {
+                flight,
+                activate: false,
+            },
+        ))))
     }
 
     pub(super) fn prepare_receipt_entry(
@@ -424,7 +439,7 @@ mod test_support {
                 registered: self.registered,
                 acknowledged: self.acknowledged,
                 entries: self.entries.iter().copied().collect(),
-                pending: self.pending,
+                pending: self.pending.clone(),
                 sweep: self.sweep,
             }
         }

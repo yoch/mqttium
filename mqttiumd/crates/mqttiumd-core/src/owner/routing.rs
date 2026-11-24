@@ -1032,12 +1032,15 @@ mod tests {
         }
     }
     fn answer_control(owner: &mut Owner, reply: StoreOutcome) -> Vec<(EffectId, Effect)> {
-        let flight = owner.pubsub.control.as_ref().unwrap().in_flight;
+        let (effect, operation) = {
+            let flight = &owner.pubsub.control.as_ref().unwrap().in_flight;
+            (flight.answers.persist_id(), flight.operation)
+        };
         apply(
             owner,
             Input::StoreResult {
-                effect: flight.answers.persist_id(),
-                operation: flight.operation,
+                effect,
+                operation,
                 reply: StoreReply::Outcome(reply),
             },
         )
