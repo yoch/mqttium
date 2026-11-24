@@ -345,7 +345,7 @@ fn main() {
         };
         let result = Security::load(&files)
             .map_err(writer::Failure::plain)
-            .and_then(|security| writer::initialize_secured(db, security.policy.storage()));
+            .and_then(|security| writer::initialize_secured(db, &security.policy.storage_policy()));
         if let Err(error) = result {
             eprintln!("{}", error.fields());
             std::process::exit(2);

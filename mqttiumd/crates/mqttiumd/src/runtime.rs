@@ -6354,7 +6354,7 @@ pub fn run(config: Config) -> Result<(), Failure> {
     events.emit("starting",json!({"details":{"test_hooks":cfg!(feature="test-hooks"),"sqlite_kill_points":mqttiumd_store_sqlite::KILL_POINTS_ENABLED}})).map_err(event_failure)?;
     let policy = security
         .as_ref()
-        .map(|security| security.policy.storage().clone());
+        .map(|security| security.policy.storage_policy());
     let use_direct = matches!(
         config.storage_mode,
         crate::writer::StorageMode::Volatile { .. }
@@ -6439,6 +6439,17 @@ struct Acceptor {
 }
 
 impl Acceptor {
+    /// The next accepted connection, if one waits. The acceptor stops
+    /// after a failure to accept, and a stopped acceptor is a failure too:
+    /// both are `accept_failed`.
+    fn try_accept(&self) -> Result<Option<std::net::TcpStream>, Failure> {
+        match self.accepted.try_recv() {
+            Ok(Ok(stream)) => Ok(Some(stream)),
+            Ok(Err(())) | Err(TryRecvError::Disconnected) => Err(Failure::plain("accept_failed")),
+            Err(TryRecvError::Empty) => Ok(None),
+        }
+    }
+
     fn spawn(
         listener: TcpListener,
         cancel: Arc<AtomicBool>,
@@ -6864,7 +6875,7 @@ fn run_inner(
         }
         if let Some(security) = &runtime.security {
             events.emit("tls_profile", json!({"details":{"version":"TLS1.3","client_certificate":"required",
-                "policy_fingerprint":hex_domain(security.policy.storage().fingerprint),"max_handshakes":security::MAX_UNAUTHENTICATED,
+                "policy_fingerprint":hex_domain(security.policy.fingerprint()),"max_handshakes":security::MAX_UNAUTHENTICATED,
                 "handshake_ms":security::HANDSHAKE_TIMEOUT.as_millis() as u64,"handshake_bytes":security::HANDSHAKE_BYTES,
                 "certificate_bytes":security::CERT_BYTES,"chain_bytes":security::CHAIN_BYTES,"chain_certificates":security::CHAIN_CERTS,
                 "tls_buffer_bytes":security::TLS_BUFFER_BYTES,"resumption":false,"early_data":false}})).map_err(event_failure)?;
@@ -6897,17 +6908,11 @@ fn run_inner(
                     if !runtime.admits_handshake() {
                         break;
                     }
-                    match acceptor.accepted.try_recv() {
-                        Ok(Ok(stream)) => {
-                            runtime.progress = runtime.progress.wrapping_add(1);
-                            let _ = runtime.accept(stream)?;
-                        }
-                        Ok(Err(())) => return Err(Failure::plain("accept_failed")),
-                        Err(TryRecvError::Empty) => break,
-                        Err(TryRecvError::Disconnected) => {
-                            return Err(Failure::plain("accept_failed"));
-                        }
-                    }
+                    let Some(stream) = acceptor.try_accept()? else {
+                        break;
+                    };
+                    runtime.progress = runtime.progress.wrapping_add(1);
+                    let _ = runtime.accept(stream)?;
                 }
                 runtime.turn()?;
                 let idle = runtime.progress == before;
