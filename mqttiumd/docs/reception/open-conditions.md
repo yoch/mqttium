@@ -39,7 +39,6 @@ corresponding snapshot panic and false allocation diagnoses are removed below.
 | Finding | Reception | Closed by | Blocks |
 | - | - | - | - |
 | **`validate` accepts a qualifying result whose conditions no longer hold.** It checks the document: schema, digests and sizes of the files cited, contracts, assertions and faults of the scenario, coherence of the verdict. It does not judge the trace and does not check the conditions of a qualifying run, so a qualifying result without its `source.tar` is still accepted by it. Only `recompute` says that a result is evidence, which the guide of the oracle and record 0017 state | Either `validate` refuses to be read as that check, by its name or its output, or it runs the conditions too | L3 | A reader who takes `validate` for the check |
-| **`Owner::outbox()` still returns an `Option`.** Since the correction of finding R2 an owner never lives without a box, and the bench no longer treats its absence (lot L4, `51b0bca`); the signature of the core still says the box may be absent | The signature says what holds | L1 | G1 |
 
 ## Before a result may be used as evidence (L3, gate G0)
 
