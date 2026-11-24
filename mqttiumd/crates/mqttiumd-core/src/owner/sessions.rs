@@ -186,7 +186,7 @@ impl Owner {
         if self.is_closed(connection) {
             return Ok(super::Change::Nothing);
         }
-        if self.lifecycle.is_some() || self.pubsub.control_pending() {
+        if self.lifecycle.is_some() || self.control_pending() {
             return Err(waiting());
         }
         if self.session_of(connection).is_some() {
@@ -293,7 +293,7 @@ impl Owner {
         if expiry.deadline(observed_at).is_none() {
             return Err(IMPOSSIBLE);
         }
-        if self.lifecycle.is_some() || self.pubsub.control_pending() {
+        if self.lifecycle.is_some() || self.control_pending() {
             return Err(waiting());
         }
         draft.end(connection.generation)?;
@@ -336,7 +336,7 @@ impl Owner {
         {
             return Ok(super::Change::Nothing);
         }
-        if self.lifecycle.is_some() || self.pubsub.control_pending() {
+        if self.lifecycle.is_some() || self.control_pending() {
             return Err(waiting());
         }
         draft.end(connection.generation)?;
@@ -382,7 +382,7 @@ impl Owner {
         if expiry == SessionExpiry::OnDisconnect || expiry.deadline(observed_at).is_none() {
             return Err(IMPOSSIBLE);
         }
-        if self.lifecycle.is_some() || self.pubsub.control_pending() {
+        if self.lifecycle.is_some() || self.control_pending() {
             return Err(waiting());
         }
         draft.end(connection.generation)?;
@@ -423,7 +423,7 @@ impl Owner {
         {
             return Ok(super::Change::Nothing);
         }
-        if self.lifecycle.is_some() || self.pubsub.control_pending() {
+        if self.lifecycle.is_some() || self.control_pending() {
             return Err(waiting());
         }
         // This transportless flight never emits a frame/close or exposes the

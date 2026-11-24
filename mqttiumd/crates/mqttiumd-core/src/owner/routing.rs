@@ -1028,7 +1028,7 @@ mod tests {
         }
     }
     fn answer_control(owner: &mut Owner, reply: StoreOutcome) -> Vec<(EffectId, Effect)> {
-        let flight = owner.pubsub.control.as_ref().unwrap().in_flight;
+        let flight = owner.control.as_ref().unwrap().in_flight;
         apply(
             owner,
             Input::StoreResult {

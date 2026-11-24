@@ -1,6 +1,6 @@
 //! Hierarchical subscriptions and outgoing QoS 1/2 under the same owner authority.
-use super::connections::{Connection, Connections, Read};
-use super::deliveries::{Deliveries, Delivery, Phase};
+use super::connections::{Connection, Read};
+use super::deliveries::{Delivery, Phase};
 use super::*;
 use crate::contract::command::{
     ClaimDelivery, ConsumeDelivery, ExpireDelivery, FinishDelivery, MarkDeliveryStarted,
@@ -425,12 +425,51 @@ impl VolatileQueue {
     }
 }
 
+/// The admissions committed without an inline claim whose targets wait
+/// for their result: per operation, the sessions it may deliver to, and per
+/// session, how many such admissions are pending. A session with one pending
+/// cannot take an inline claim, which would pass it.
 #[derive(Debug)]
-pub(super) struct State {
-    pub(super) non_inline_by_session: FlatMap<SessionId, u32>,
-    pub(super) control: Option<Control>,
-    pub(super) retained: Option<RetainedFlight>,
-    payload_limit: PayloadBytes,
+pub(super) struct NonInlineAdmissions {
+    targets_by_op: ScopedFlatMap<OperationId, alloc::vec::Vec<SessionId>>,
+    pending_by_session: FlatMap<SessionId, u32>,
+}
+
+impl NonInlineAdmissions {
+    pub(super) fn new(scope: (StoreIncarnation, RunEpoch, LogicalOwnerId)) -> Self {
+        Self {
+            targets_by_op: ScopedFlatMap::with_scope(scope),
+            pending_by_session: FlatMap::new(),
+        }
+    }
+    /// Whether an admission waits for its result.
+    pub(super) fn is_empty(&self) -> bool {
+        self.targets_by_op.is_empty()
+    }
+    /// Whether an admission to `session` waits for its result.
+    pub(super) fn holds(&self, session: SessionId) -> bool {
+        self.pending_by_session.contains_key(&session)
+    }
+    /// `operation` admits a publication to `targets`.
+    pub(super) fn admit(&mut self, operation: OperationId, targets: alloc::vec::Vec<SessionId>) {
+        for &target in &targets {
+            *self.pending_by_session.get_or_insert_default(target) += 1;
+        }
+        self.targets_by_op.insert(operation, targets);
+    }
+    /// The result of `operation` is known: its targets, which no longer wait.
+    pub(super) fn resolve(&mut self, operation: OperationId) -> Option<alloc::vec::Vec<SessionId>> {
+        let targets = self.targets_by_op.remove(&operation)?;
+        for target in &targets {
+            if let Some(count) = self.pending_by_session.get_mut(target) {
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    self.pending_by_session.remove(target);
+                }
+            }
+        }
+        Some(targets)
+    }
 }
 
 #[derive(Debug)]
@@ -587,93 +626,6 @@ pub(super) enum Change {
         finished: Finished,
         expiring: bool,
     },
-}
-
-impl State {
-    pub(super) fn work_bound(
-        &self,
-        input: &Input,
-        connections: &Connections,
-        deliveries: &Deliveries,
-        volatile: &VolatileQueue,
-        _routes: usize,
-    ) -> u64 {
-        if let Input::MessagesExpired { deliveries } = input {
-            let count = capacity_of(deliveries.len());
-            return count.saturating_mul(16).saturating_add(16);
-        }
-        let new = matches!(
-            input,
-            Input::ObservedPuback { .. }
-                | Input::ObservedQos2Ack { .. }
-                | Input::ConnectionSettings { .. }
-                | Input::WorkPage { .. }
-                | Input::Packet {
-                    packet: InboundPacket::Subscribe { .. }
-                        | InboundPacket::Unsubscribe { .. }
-                        | InboundPacket::Puback { .. }
-                        | InboundPacket::Qos2Ack { .. },
-                    ..
-                }
-        );
-        if !new
-            && connections.is_empty()
-            && self.control.is_none()
-            && volatile.is_empty()
-            && deliveries.is_empty()
-        {
-            return 0;
-        }
-        let slots = capacity_of(deliveries.capacity()).min(32);
-        let connection_work = connections.visit_work();
-        if let Input::WorkPage { items, .. } = input {
-            let count = capacity_of(items.len());
-            return connection_work
-                .saturating_add(count.saturating_mul(16))
-                .saturating_add(slots);
-        }
-        let filters = match input {
-            Input::Packet {
-                packet: InboundPacket::Subscribe { filters, .. },
-                ..
-            } => capacity_of(filters.len()),
-            Input::Packet {
-                packet: InboundPacket::Unsubscribe { filters, .. },
-                ..
-            } => capacity_of(filters.len()),
-            _ => 0,
-        };
-        // Indexed per-session maps bound connection, delivery, packet-id and
-        // filter transitions independently of global table sizes (ADR 0051).
-        connection_work
-            .saturating_add(slots)
-            .saturating_add(filters.saturating_mul(8))
-    }
-    pub(super) fn new(config: OwnerConfig) -> Self {
-        Self {
-            non_inline_by_session: FlatMap::new(),
-            control: None,
-            retained: None,
-            payload_limit: config.payload_bytes,
-        }
-    }
-    /// Whether a control or a retained operation is in flight.
-    pub(super) fn control_or_retained_in_flight(&self) -> bool {
-        self.control.is_some() || self.retained.is_some()
-    }
-
-    /// Whether `token` is the deadline of the control or retained operation
-    /// in flight.
-    pub(super) fn holds_deadline(&self, token: DeadlineToken) -> bool {
-        self.retained.is_some_and(|f| f.in_flight.deadline == token)
-            || self
-                .control
-                .as_ref()
-                .is_some_and(|c| c.in_flight.deadline == token)
-    }
-    pub(super) fn control_pending(&self) -> bool {
-        self.control.is_some()
-    }
 }
 
 /// What the owner may do now with a claimed delivery.
@@ -847,7 +799,7 @@ impl Owner {
         if ingress_order <= self.connections.row(connection).last_qos0_ingress {
             return Self::plan_close(generation, Some(session), CloseReason::ProtocolError, draft);
         }
-        if self.pubsub.retained.is_some() {
+        if self.retained.is_some() {
             return Err(blocked());
         }
         let limits = self.limits.ok_or(IMPOSSIBLE)?;
@@ -1005,11 +957,7 @@ impl Owner {
         reply: &StoreReply,
         draft: &mut Draft,
     ) -> Result<Option<super::Change>, Stop> {
-        let Some(flight) = self
-            .pubsub
-            .retained
-            .filter(|f| f.in_flight.operation == operation)
-        else {
+        let Some(flight) = self.retained.filter(|f| f.in_flight.operation == operation) else {
             return Ok(None);
         };
         if !flight.in_flight.answers.names(effect) {
@@ -1146,7 +1094,7 @@ impl Owner {
             && (payload.len() as u64)
                 .checked_mul(count as u64)
                 .and_then(|n| n.checked_add(used))
-                .is_some_and(|n| n <= self.pubsub.payload_limit.get());
+                .is_some_and(|n| n <= self.payload_limit.get());
         if count == 0 || !fits {
             draft.emit(Effect::Qos0Dropped {
                 origin,
@@ -1287,7 +1235,7 @@ impl Owner {
         if self.volatile.parked(generation) > 0 || self.volatile.window(generation) >= QOS0_WINDOW {
             if self
                 .volatile
-                .may_park(generation, v.payload.len(), self.pubsub.payload_limit.get())
+                .may_park(generation, v.payload.len(), self.payload_limit.get())
             {
                 return Ok(changed(Change::Qos0Park { continuation: next }));
             }
@@ -1492,7 +1440,7 @@ impl Owner {
         connection: ConnectionGeneration,
         packet: &InboundPacket,
     ) -> bool {
-        let Some(control) = &self.pubsub.control else {
+        let Some(control) = &self.control else {
             return false;
         };
         if control.connection.generation != connection {
@@ -1777,7 +1725,7 @@ impl Owner {
                 draft,
             );
         }
-        if let Some(control) = &self.pubsub.control {
+        if let Some(control) = &self.control {
             if control.connection == key && control.packet_id == packet_id {
                 return Self::plan_close(
                     connection,
@@ -2391,7 +2339,7 @@ impl Owner {
             }
         }
         if self.deliveries.len() + added > self.deliveries.capacity()
-            || total > self.pubsub.payload_limit.get()
+            || total > self.payload_limit.get()
         {
             return Err(Stop::Need(CapacityNeed {
                 resource: Resource::PayloadBytes,
@@ -2512,7 +2460,6 @@ impl Owner {
             return Ok(Some(change));
         }
         let control = self
-            .pubsub
             .control
             .as_ref()
             .filter(|c| c.in_flight.operation == operation);
@@ -2950,13 +2897,11 @@ impl Owner {
         draft: &mut Draft,
     ) -> Result<Option<super::Change>, Stop> {
         let waiting = self
-            .pubsub
             .retained
             .map(|f| f.in_flight)
             .filter(|f| f.deadline == token)
             .or_else(|| {
-                self.pubsub
-                    .control
+                self.control
                     .as_ref()
                     .map(|c| c.in_flight)
                     .filter(|f| f.deadline == token)
@@ -3176,17 +3121,86 @@ impl Owner {
         matches!(d.phase, Phase::InlineClaimPending(op) if op == operation).then_some(d.target)
     }
 
+    /// The work a step of pub/sub may cost.
+    pub(super) fn pubsub_work_bound(&self, input: &Input) -> u64 {
+        if let Input::MessagesExpired { deliveries } = input {
+            let count = capacity_of(deliveries.len());
+            return count.saturating_mul(16).saturating_add(16);
+        }
+        let new = matches!(
+            input,
+            Input::ObservedPuback { .. }
+                | Input::ObservedQos2Ack { .. }
+                | Input::ConnectionSettings { .. }
+                | Input::WorkPage { .. }
+                | Input::Packet {
+                    packet: InboundPacket::Subscribe { .. }
+                        | InboundPacket::Unsubscribe { .. }
+                        | InboundPacket::Puback { .. }
+                        | InboundPacket::Qos2Ack { .. },
+                    ..
+                }
+        );
+        if !new
+            && self.connections.is_empty()
+            && self.control.is_none()
+            && self.volatile.is_empty()
+            && self.deliveries.is_empty()
+        {
+            return 0;
+        }
+        let slots = capacity_of(self.deliveries.capacity()).min(32);
+        let connection_work = self.connections.visit_work();
+        if let Input::WorkPage { items, .. } = input {
+            let count = capacity_of(items.len());
+            return connection_work
+                .saturating_add(count.saturating_mul(16))
+                .saturating_add(slots);
+        }
+        let filters = match input {
+            Input::Packet {
+                packet: InboundPacket::Subscribe { filters, .. },
+                ..
+            } => capacity_of(filters.len()),
+            Input::Packet {
+                packet: InboundPacket::Unsubscribe { filters, .. },
+                ..
+            } => capacity_of(filters.len()),
+            _ => 0,
+        };
+        // Indexed per-session maps bound connection, delivery, packet-id and
+        // filter transitions independently of global table sizes (ADR 0051).
+        connection_work
+            .saturating_add(slots)
+            .saturating_add(filters.saturating_mul(8))
+    }
+    /// Whether a control or a retained operation is in flight.
+    pub(super) fn control_or_retained_in_flight(&self) -> bool {
+        self.control.is_some() || self.retained.is_some()
+    }
+    /// Whether `token` is the deadline of the control or retained operation
+    /// in flight.
+    pub(super) fn control_or_retained_holds(&self, token: DeadlineToken) -> bool {
+        self.retained.is_some_and(|f| f.in_flight.deadline == token)
+            || self
+                .control
+                .as_ref()
+                .is_some_and(|c| c.in_flight.deadline == token)
+    }
+    pub(super) fn control_pending(&self) -> bool {
+        self.control.is_some()
+    }
+
     /// The retired deliveries and retained operation whose command is still
     /// in flight.
     pub(super) fn retired_flights(&self) -> usize {
         self.deliveries.retired_flights()
-            + usize::from(self.pubsub.retained.is_some_and(|flight| flight.retired))
+            + usize::from(self.retained.is_some_and(|flight| flight.retired))
     }
     /// Retires the outgoing work of a session: its retained operation in
     /// flight and its deliveries.
     pub(super) fn retire_outgoing(&mut self, session: SessionId) {
         if let Some(flight) = self
-            .pubsub
             .retained
             .as_mut()
             .filter(|f| f.origin.source.session == session)
@@ -3283,10 +3297,7 @@ impl Owner {
         if !self.inline_claim_enabled
             || selected.qos == Qos::AtMostOnce
             || self.inline_claims_blocked()
-            || self
-                .pubsub
-                .non_inline_by_session
-                .contains_key(&selected.session)
+            || self.non_inline.holds(selected.session)
         {
             return None;
         }
@@ -3301,7 +3312,7 @@ impl Owner {
             || self.deliveries.is_full()
             || !self
                 .deliveries
-                .payload_fits(length, self.pubsub.payload_limit.get())
+                .payload_fits(length, self.payload_limit.get())
         {
             return None;
         }
@@ -3428,10 +3439,10 @@ impl Owner {
             Change::RetainedSubmit { connection, flight } => {
                 self.connections
                     .record_qos0_ingress(connection, flight.origin.ingress_order)?;
-                self.pubsub.retained = Some(flight);
+                self.retained = Some(flight);
             }
             Change::RetainedDone { finished } => {
-                self.pubsub.retained.take().ok_or(stale)?;
+                self.retained.take().ok_or(stale)?;
                 if self.inline_claim_enabled {
                     self.mark_all_sessions_dirty(true);
                 }
@@ -3510,9 +3521,9 @@ impl Owner {
                 Some(i) => self.connections.update(i, |c| *c = value)?,
                 None => self.connections.push(value)?,
             },
-            Change::Control(control) => self.pubsub.control = Some(control),
+            Change::Control(control) => self.control = Some(control),
             Change::ControlEnd { revision, finished } => {
-                let control = self.pubsub.control.take().ok_or(stale)?;
+                let control = self.control.take().ok_or(stale)?;
                 if let Some(revision) = revision {
                     let mut removed_any = false;
                     let changes = control.changes.as_slice();
@@ -3574,8 +3585,7 @@ impl Owner {
                     Input::WorkPage { session, .. } => Some(*session),
                     _ => None,
                 };
-                let no_pending_non_inline = page_session
-                    .is_some_and(|s| !self.pubsub.non_inline_by_session.contains_key(&s))
+                let no_pending_non_inline = page_session.is_some_and(|s| !self.non_inline.holds(s))
                     && !self.inline_claims_blocked();
                 self.connections.update(connection, |c| {
                     c.loading = None;
@@ -3771,7 +3781,6 @@ impl Owner {
                 resolution,
             } => {
                 if let Some(control) = self
-                    .pubsub
                     .control
                     .as_mut()
                     .filter(|c| c.in_flight.operation == operation)
@@ -3782,7 +3791,6 @@ impl Owner {
                         control.in_flight.answers = control.in_flight.answers.with(effect);
                     }
                 } else if let Some(flight) = self
-                    .pubsub
                     .retained
                     .as_mut()
                     .filter(|f| f.in_flight.operation == operation)
@@ -5304,7 +5312,7 @@ mod tests {
                 _ => None,
             })
             .unwrap();
-        let flight = owner.pubsub.retained.unwrap();
+        let flight = owner.retained.unwrap();
         (effect, command, flight)
     }
     #[test]
@@ -5380,7 +5388,7 @@ mod tests {
             },
         );
         assert!(
-            owner.pubsub.retained.unwrap().retired,
+            owner.retained.unwrap().retired,
             "source_termination_lost_unknown_retained_qos0"
         );
         assert_eq!(owner.retired_flights(), 1);
@@ -5421,7 +5429,7 @@ mod tests {
             )
             .is_empty()
         );
-        assert!(owner.pubsub.retained.is_none());
+        assert!(owner.retained.is_none());
         assert_eq!(owner.retired_flights(), 0);
         assert!(owner.slots.is_empty());
         assert_eq!(owner.leases.held(), 0);
@@ -5448,7 +5456,7 @@ mod tests {
             *connection = ConnectionGeneration::new(11);
         }
         apply(&mut owner, next);
-        let current = owner.pubsub.retained.unwrap();
+        let current = owner.retained.unwrap();
         assert_ne!(current.in_flight.operation, operation);
         assert!(
             apply(
@@ -5462,7 +5470,7 @@ mod tests {
             .is_empty()
         );
         assert_eq!(
-            owner.pubsub.retained,
+            owner.retained,
             Some(current),
             "old_retained_qos0_result_rebound"
         );
@@ -5478,7 +5486,7 @@ mod tests {
                 )),
             },
         );
-        assert!(owner.pubsub.retained.is_none());
+        assert!(owner.retained.is_none());
     }
     #[test]
     fn retained_qos0_certain_capacity_refusal_is_an_explicit_drop_without_mqtt_credit() {
@@ -5507,11 +5515,11 @@ mod tests {
             ),
             "retained_qos0_refusal_became_success_or_silent_loss"
         );
-        assert!(owner.pubsub.retained.is_none());
+        assert!(owner.retained.is_none());
         assert!(owner.slots.is_empty());
         assert_eq!(owner.leases.held(), 0);
         apply(&mut owner, retained_zero(2));
-        assert!(owner.pubsub.retained.is_some());
+        assert!(owner.retained.is_some());
     }
     fn product_subscribe() -> Input {
         Input::Packet {
@@ -5667,7 +5675,7 @@ mod tests {
             "replay_reservation_wrapped_or_submitted_a_partial_range"
         );
         assert_eq!(owner.counters, before);
-        assert!(owner.pubsub.control.is_none() && owner.routes.is_empty());
+        assert!(owner.control.is_none() && owner.routes.is_empty());
         assert!(drain(&mut owner).is_empty());
     }
     #[test]
@@ -5933,7 +5941,7 @@ mod tests {
                 reply: StoreReply::Outcome(StoreOutcome::PendingOrUnknown),
             },
         );
-        let deadline = owner.pubsub.control.as_ref().unwrap().in_flight.deadline;
+        let deadline = owner.control.as_ref().unwrap().in_flight.deadline;
         let resolutions = apply(
             &mut owner,
             Input::Deadline {
@@ -6653,7 +6661,7 @@ mod tests {
             "clocked_subscription_exceeded_work_grant"
         );
         assert_eq!(owner.counters, counters);
-        assert!(owner.pubsub.control.is_none());
+        assert!(owner.control.is_none());
         assert!(drain(&mut owner).is_empty());
     }
 
@@ -7008,7 +7016,7 @@ mod tests {
             },
         );
         message_clock(&mut owner, 12);
-        let flight = owner.pubsub.retained.unwrap();
+        let flight = owner.retained.unwrap();
         assert!(flight.retired);
         let effects = apply(
             &mut owner,
@@ -7037,7 +7045,7 @@ mod tests {
             )
             .is_empty()
         );
-        assert!(owner.pubsub.retained.is_none());
+        assert!(owner.retained.is_none());
         assert!(owner.deliveries.is_empty());
         assert_eq!(owner.leases.account().used().slots, ExchangeSlots::ZERO);
     }

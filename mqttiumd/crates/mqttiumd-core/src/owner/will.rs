@@ -108,7 +108,7 @@ impl Owner {
         if self.wills.read.is_some()
             || self.wills.flight.is_some()
             || self.lifecycle.is_some()
-            || self.pubsub.control_pending()
+            || self.control_pending()
         {
             return Ok(super::Change::Nothing);
         }

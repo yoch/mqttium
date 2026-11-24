@@ -985,7 +985,6 @@ pub struct Owner {
     closed: BoundedQueue<ConnectionGeneration>,
     closed_set: BTreeSet<ConnectionGeneration>,
     resolution_delay: LogicalDuration,
-    pubsub: pubsub::State,
     /// The outgoing QoS 1 and 2 deliveries.
     deliveries: deliveries::Deliveries,
     /// The online connections outgoing deliveries go to.
@@ -997,7 +996,14 @@ pub struct Owner {
     lifecycle: Option<sessions::Flight>,
     lifecycle_enabled: bool,
     inline_claim_enabled: bool,
-    non_inline_targets_by_op: ScopedFlatMap<OperationId, alloc::vec::Vec<SessionId>>,
+    /// The admissions without an inline claim that wait for their result.
+    non_inline: pubsub::NonInlineAdmissions,
+    /// The subscription change in flight, if any.
+    control: Option<pubsub::Control>,
+    /// The retained QoS 0 admission in flight, if any.
+    retained: Option<pubsub::RetainedFlight>,
+    /// The payload bytes the owner may hold loaded.
+    payload_limit: PayloadBytes,
     message_now: Option<MessageTime>,
     release_continuation: Option<ContinuationId>,
     release_continuations_started: bool,
@@ -1144,7 +1150,6 @@ impl Owner {
             closed,
             closed_set: BTreeSet::new(),
             resolution_delay: config.resolution_delay,
-            pubsub: pubsub::State::new(config),
             deliveries,
             connections,
             volatile,
@@ -1153,11 +1158,14 @@ impl Owner {
             lifecycle: None,
             lifecycle_enabled: false,
             inline_claim_enabled: false,
-            non_inline_targets_by_op: ScopedFlatMap::with_scope((
+            non_inline: pubsub::NonInlineAdmissions::new((
                 id.incarnation(),
                 id.epoch(),
                 id.owner(),
             )),
+            control: None,
+            retained: None,
+            payload_limit: config.payload_bytes,
             message_now: None,
             release_continuation: None,
             release_continuations_started: false,
@@ -1308,7 +1316,7 @@ impl Owner {
     /// control or retained operation of the pub/sub state, or a will
     /// admission, is in flight.
     fn inline_claims_blocked(&self) -> bool {
-        self.pubsub.control_or_retained_in_flight() || self.will_status().admission_pending
+        self.control_or_retained_in_flight() || self.will_status().admission_pending
     }
 
     /// Whether this owner registers sessions or serves connections. A
@@ -1323,7 +1331,7 @@ impl Owner {
     pub fn deadline_is_live(&self, token: DeadlineToken) -> bool {
         self.receipts.holds_deadline(token)
             || self.slot_by_deadline.contains_key(&token)
-            || self.pubsub.holds_deadline(token)
+            || self.control_or_retained_holds(token)
             || self.deliveries.holds_deadline(token)
             || self.wills.holds_deadline(token)
             || self
@@ -1742,27 +1750,21 @@ impl Owner {
         }
         let Input::Recovery { facts, last } = input else {
             return WorkUnits::new(
-                1u64.saturating_add(self.pubsub.work_bound(
-                    input,
-                    &self.connections,
-                    &self.deliveries,
-                    &self.volatile,
-                    self.routes.capacity(),
-                ))
-                .saturating_add(self.session_work_bound(input))
-                .saturating_add(self.routing_work_bound(input))
-                .saturating_add(self.retained_work_bound(input))
-                .saturating_add(self.receipts.work(input))
-                .saturating_add(self.will_work_bound(input))
-                .saturating_add(
-                    if self.receipts.enabled
-                        && matches!(input, Input::MaintainReceipts | Input::Continue { .. })
-                    {
-                        16
-                    } else {
-                        0
-                    },
-                ),
+                1u64.saturating_add(self.pubsub_work_bound(input))
+                    .saturating_add(self.session_work_bound(input))
+                    .saturating_add(self.routing_work_bound(input))
+                    .saturating_add(self.retained_work_bound(input))
+                    .saturating_add(self.receipts.work(input))
+                    .saturating_add(self.will_work_bound(input))
+                    .saturating_add(
+                        if self.receipts.enabled
+                            && matches!(input, Input::MaintainReceipts | Input::Continue { .. })
+                        {
+                            16
+                        } else {
+                            0
+                        },
+                    ),
             );
         };
         let routes = capacity_of(self.routes.capacity());
@@ -2258,7 +2260,7 @@ impl Owner {
             return protocol_error(draft);
         }
         if matches!(packet, InboundPacket::Publish { .. })
-            && (self.pubsub.control_pending() || self.lifecycle.is_some())
+            && (self.control_pending() || self.lifecycle.is_some())
         {
             return Err(Stop::Need(CapacityNeed {
                 resource: Resource::ResultSlots,
@@ -3113,7 +3115,7 @@ impl Owner {
                 };
                 if admission {
                     draft.inline_outcome = self.plan_inline_claim_result(operation, true, draft)?;
-                    if !self.non_inline_targets_by_op.is_empty() {
+                    if !self.non_inline.is_empty() {
                         draft.non_inline_resolved = Some((operation, true));
                     }
                 }
@@ -3128,7 +3130,7 @@ impl Owner {
                 if admission {
                     draft.inline_outcome =
                         self.plan_inline_claim_result(operation, false, draft)?;
-                    if !self.non_inline_targets_by_op.is_empty() {
+                    if !self.non_inline.is_empty() {
                         draft.non_inline_resolved = Some((operation, false));
                     }
                 }
@@ -3586,15 +3588,9 @@ impl Owner {
             self.apply_inline_claim_outcome(outcome)?;
         }
         if let Some((operation, committed)) = non_inline_resolved
-            && let Some(targets) = self.non_inline_targets_by_op.remove(&operation)
+            && let Some(targets) = self.non_inline.resolve(operation)
         {
             for target in targets {
-                if let Some(count) = self.pubsub.non_inline_by_session.get_mut(&target) {
-                    *count = count.saturating_sub(1);
-                    if *count == 0 {
-                        self.pubsub.non_inline_by_session.remove(&target);
-                    }
-                }
                 if committed {
                     self.mark_session_dirty(target, true);
                 }
@@ -3704,13 +3700,9 @@ impl Owner {
                     self.apply_inline_claim_insert(op, *plan)?;
                 } else if !dirty_targets.is_empty() {
                     for &target in &dirty_targets {
-                        *self
-                            .pubsub
-                            .non_inline_by_session
-                            .get_or_insert_default(target) += 1;
                         self.mark_session_dirty(target, false);
                     }
-                    self.non_inline_targets_by_op.insert(op, dirty_targets);
+                    self.non_inline.admit(op, dirty_targets);
                 }
             }
             Change::Committed { slot, admission } => {
@@ -4654,12 +4646,12 @@ mod tests {
                 outgoing_connections: owner.connections.to_vec(),
                 outgoing_deliveries: owner.deliveries.rows().to_vec(),
                 volatile: owner.volatile.to_vec(),
-                retained_qos0: owner.pubsub.retained,
+                retained_qos0: owner.retained,
                 continuation: (
                     owner.volatile.continuation_state().0,
                     owner.volatile.continuation_state().1,
                 ),
-                subscription: owner.pubsub.control.as_ref().map(|c| ControlSnapshot {
+                subscription: owner.control.as_ref().map(|c| ControlSnapshot {
                     session: c.session,
                     connection: c.connection,
                     packet_id: c.packet_id,
@@ -10386,14 +10378,7 @@ mod tests {
                 "identical MQTT control bytes do not permit reusing an active sender identifier"
             );
             assert_eq!(
-                world
-                    .owner
-                    .pubsub
-                    .control
-                    .as_ref()
-                    .unwrap()
-                    .in_flight
-                    .operation,
+                world.owner.control.as_ref().unwrap().in_flight.operation,
                 original.operation,
                 "transport refusal preserves the uncertain original durable command"
             );
