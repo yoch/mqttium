@@ -28,7 +28,8 @@
 # after lot 2 (contract): 75; after lot 3 (stores): 65; after lot 4 (core
 # upward ties): 61; after the connection table of lot 5: 59; after its
 # volatile queue: 56; after its delivery table: 46; after the end of
-# `pubsub::State`: 43. Lot 6 (runtime): 38 after `reactor::Shared`.
+# `pubsub::State`: 43. Lot 6 (runtime): 38 after `reactor::Shared`; 37
+# after the cycle `codec`, `net`, `security`.
 # - The delivery table (`Deliveries`, lot 5) is closed to writes: every
 #   change goes through its transitions. It still lends its rows read only
 #   (`rows`, 26 places in `owner::pubsub`) and the rows of a session
@@ -42,7 +43,6 @@
 #   LogStore::sqlite_settings, VolatileHandle::sqlite_settings): a record of
 #   what the engine read back, which every reader only copies; its main
 #   reader is the writer of the runtime. Decided with the runtime lot.
-module-cycle mqttiumd::codec,mqttiumd::net,mqttiumd::security
 field-leak mqttiumd::policy_transition::Plan::body
 field-leak mqttiumd::runtime::Acceptor::accepted
 field-leak mqttiumd::security::Policy::storage

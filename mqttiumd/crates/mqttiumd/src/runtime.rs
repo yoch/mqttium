@@ -182,7 +182,7 @@ impl Limits {
     }
 }
 const BOUNDS: Bounds = Bounds {
-    max_packet: net::MAX_PACKET_BYTES,
+    max_packet: codec::MAX_PACKET_BYTES,
     max_client_id: crate::writer::MAX_CLIENT,
     max_topic: crate::writer::MAX_TOPIC,
     max_payload: crate::writer::MAX_PAYLOAD,
@@ -240,7 +240,7 @@ struct Peer {
     /// yet given to the core: a packet behind a CONNECT that is still
     /// being opened, or a business packet the lane has no place for. The
     /// packets behind it stay with the transport, in order.
-    held_packet: Option<(u8, net::FrameBytes, net::FrameObservation)>,
+    held_packet: Option<(u8, codec::FrameBytes, net::FrameObservation)>,
     /// Since when a packet of this connection waits for a credit that
     /// other work holds. The results of the store return such credits; a
     /// wait during which the broker returned none for [`CAPACITY_WAIT`] is
@@ -258,7 +258,7 @@ struct Peer {
     /// bytes counted. The reader goes on behind a publication that waits
     /// for a slot of the window, because the PUBREL that frees one is
     /// behind it in the stream; what is not such a PUBREL waits here.
-    behind: VecDeque<(u8, net::FrameBytes, net::FrameObservation)>,
+    behind: VecDeque<(u8, codec::FrameBytes, net::FrameObservation)>,
     behind_bytes: usize,
     blocked_output: Option<EffectId>,
     retire_code: Option<&'static str>,
@@ -266,7 +266,7 @@ struct Peer {
 /// The packets kept behind a waiting publication: one more lane of them,
 /// and no more bytes than one packet of the largest size.
 const BEHIND_PACKETS: usize = net::INPUT_SLOTS;
-const BEHIND_BYTES: usize = net::MAX_PACKET_BYTES;
+const BEHIND_BYTES: usize = codec::MAX_PACKET_BYTES;
 
 /// The Packet Identifier of a raw PUBLISH above QoS 0. A packet too short
 /// to hold one has none: the codec refuses it when its turn comes.
@@ -310,8 +310,8 @@ impl Peer {
     /// rest stays with the transport.
     fn keep_behind(
         &mut self,
-        packet: (u8, net::FrameBytes, net::FrameObservation),
-    ) -> Result<(), (u8, net::FrameBytes, net::FrameObservation)> {
+        packet: (u8, codec::FrameBytes, net::FrameObservation),
+    ) -> Result<(), (u8, codec::FrameBytes, net::FrameObservation)> {
         let bytes = packet.1.len();
         if self.behind.len() >= BEHIND_PACKETS || self.behind_bytes + bytes > BEHIND_BYTES {
             return Err(packet);
@@ -1121,7 +1121,7 @@ impl Runtime<'_> {
             .try_send(net::Write {
                 expiry: None,
                 correlation: None,
-                bytes: net::FrameBytes::from(bytes),
+                bytes: codec::FrameBytes::from(bytes),
                 payload: None,
                 report: net::WriteReport::None,
             })
@@ -3351,7 +3351,7 @@ impl Runtime<'_> {
                 .try_send(net::Write {
                     expiry: None,
                     correlation: None,
-                    bytes: net::FrameBytes::from(bytes),
+                    bytes: codec::FrameBytes::from(bytes),
                     payload: None,
                     report: net::WriteReport::Complete,
                 })
@@ -3434,7 +3434,7 @@ impl Runtime<'_> {
         &mut self,
         generation: ConnectionGeneration,
         first: u8,
-        body: impl Into<net::FrameBytes>,
+        body: impl Into<codec::FrameBytes>,
     ) -> Result<(), Failure> {
         let observed = self.clock.read().map(|reading| MessageTime {
             domain: reading.domain,
@@ -3475,7 +3475,7 @@ impl Runtime<'_> {
                     .outgoing
                     .try_send(net::Write {
                         correlation: None,
-                        bytes: net::FrameBytes::from(bytes),
+                        bytes: codec::FrameBytes::from(bytes),
                         payload: None,
                         expiry: None,
                         report: net::WriteReport::Complete,
@@ -3523,7 +3523,7 @@ impl Runtime<'_> {
                     .try_send(net::Write {
                         expiry: None,
                         correlation: None,
-                        bytes: net::FrameBytes::from(bytes),
+                        bytes: codec::FrameBytes::from(bytes),
                         payload: None,
                         report: net::WriteReport::Complete,
                     })
@@ -3541,7 +3541,7 @@ impl Runtime<'_> {
         &mut self,
         generation: ConnectionGeneration,
         first: u8,
-        body: impl Into<net::FrameBytes>,
+        body: impl Into<codec::FrameBytes>,
         observed: net::FrameObservation,
     ) -> Result<(), Failure> {
         let body = body.into();
@@ -3595,7 +3595,7 @@ impl Runtime<'_> {
                             .try_send(net::Write {
                                 expiry: None,
                                 correlation: None,
-                                bytes: net::FrameBytes::from(bytes),
+                                bytes: codec::FrameBytes::from(bytes),
                                 payload: None,
                                 report: net::WriteReport::Complete,
                             })
@@ -3751,7 +3751,7 @@ impl Runtime<'_> {
                             .try_send(net::Write {
                                 expiry: None,
                                 correlation: None,
-                                bytes: net::FrameBytes::from(bytes),
+                                bytes: codec::FrameBytes::from(bytes),
                                 payload: None,
                                 report: net::WriteReport::Complete,
                             })
@@ -3894,7 +3894,7 @@ impl Runtime<'_> {
                         self.events.emit("publish_waiting_wire",json!({"connection":generation.get().to_string(),"details":{"publish_order":ingress_order.to_string()}})).map_err(event_failure)?;
                         return Ok(());
                     }
-                    let bytes = net::FrameBytes::from_slice(&[0xe0, 2, 0x93, 0]);
+                    let bytes = codec::FrameBytes::from_slice(&[0xe0, 2, 0x93, 0]);
                     if p.version != Some(codec::Version::V311)
                         && bytes.len() <= p.max_packet
                         && p.io
@@ -5189,7 +5189,7 @@ impl EffectSink for Sink<'_, '_> {
                             .try_send(net::Write {
                                 expiry: None,
                                 correlation: None,
-                                bytes: net::FrameBytes::from(bytes),
+                                bytes: codec::FrameBytes::from(bytes),
                                 payload: None,
                                 report: net::WriteReport::Complete,
                             })
@@ -5418,7 +5418,7 @@ impl EffectSink for Sink<'_, '_> {
                     let _ = peer.io.outgoing.try_send(net::Write {
                         expiry: None,
                         correlation: None,
-                        bytes: net::FrameBytes::from(bytes),
+                        bytes: codec::FrameBytes::from(bytes),
                         payload: None,
                         report: net::WriteReport::Complete,
                     });
@@ -5454,7 +5454,7 @@ impl EffectSink for Sink<'_, '_> {
                     let _ = peer.io.outgoing.try_send(net::Write {
                         expiry: None,
                         correlation: None,
-                        bytes: net::FrameBytes::from(bytes),
+                        bytes: codec::FrameBytes::from(bytes),
                         payload: None,
                         report: net::WriteReport::Complete,
                     });
@@ -5473,7 +5473,7 @@ impl EffectSink for Sink<'_, '_> {
                     let _ = p.io.outgoing.try_send(net::Write {
                         expiry: None,
                         correlation: None,
-                        bytes: net::FrameBytes::from(
+                        bytes: codec::FrameBytes::from(
                             codec::encode(OutboundFrame::Pubrec {
                                 packet_id: admission.source.packet_id,
                                 reason: mqttiumd_contract::packet::AckReason::Success,
@@ -5498,7 +5498,7 @@ impl EffectSink for Sink<'_, '_> {
                     let _ = p.io.outgoing.try_send(net::Write {
                         expiry: None,
                         correlation: None,
-                        bytes: net::FrameBytes::from(
+                        bytes: codec::FrameBytes::from(
                             codec::encode(OutboundFrame::Puback {
                                 packet_id: admission.source.packet_id,
                                 reason: mqttiumd_contract::packet::PubackReason::Success,
@@ -5810,7 +5810,7 @@ impl EffectSink for Sink<'_, '_> {
                                 .try_send(net::Write {
                                     expiry: None,
                                     correlation: None,
-                                    bytes: net::FrameBytes::from(bytes),
+                                    bytes: codec::FrameBytes::from(bytes),
                                     payload: None,
                                     report: net::WriteReport::Complete,
                                 })
@@ -6910,7 +6910,7 @@ fn run_inner(
         } else {
             "tcp-will-pubsub-v1"
         };
-        let mut readiness = json!({"details":{"address":address.to_string(),"epoch":epoch.get().to_string(),"incarnation":incarnation.get().to_string(),"max_connections":limits.connections,"max_sessions":crate::writer::SESSIONS,"max_packet_bytes":net::MAX_PACKET_BYTES,"max_client_id_bytes":crate::writer::MAX_CLIENT,"max_topic_bytes":crate::writer::MAX_TOPIC,"max_payload_bytes":crate::writer::MAX_PAYLOAD,"receive_maximum":crate::receiving::MAXIMUM,"max_exchange_slots":max_exchanges,"input_slots":net::INPUT_SLOTS,"output_slots":net::OUTPUT_SLOTS,"writer_slots":crate::writer::QUEUE,"commands_in_flight":limits.in_flight,"max_timers":limits.timers,"receipt_slots":crate::writer::limits().receipt_slots.get(),"partial_packet_ms":5000,"connect_ms":3000,"write_ms":250,"remembered_connections":8,"max_subscriptions":mqttiumd_contract::pubsub::MAX_SUBSCRIPTIONS,"max_targets":mqttiumd_contract::retained::MAX_RETAIN_MASK_TARGETS,"outgoing_per_connection":8,"outgoing_metadata":limits.outgoing_bindings,"outgoing_packet_identifier_max":65535,"outgoing_packet_identifier_probe_limit":129,"outgoing_payload_bytes":64*1024*1024,"work_page_items":8,"work_scan_ms":100,"wildcard_subscriptions":true,"no_local":true,"shared_subscriptions":false,"subscription_identifiers":false,"sqlite_schema":sqlite_schema,"retained_available":true,"retained_topics":mqttiumd_contract::retained::MAX_RETAINED_TOPICS,"retained_bytes":mqttiumd_contract::retained::MAX_RETAINED_BYTES,"max_replay_candidates":mqttiumd_contract::retained::MAX_REPLAYS,"profile":profile}});
+        let mut readiness = json!({"details":{"address":address.to_string(),"epoch":epoch.get().to_string(),"incarnation":incarnation.get().to_string(),"max_connections":limits.connections,"max_sessions":crate::writer::SESSIONS,"max_packet_bytes":codec::MAX_PACKET_BYTES,"max_client_id_bytes":crate::writer::MAX_CLIENT,"max_topic_bytes":crate::writer::MAX_TOPIC,"max_payload_bytes":crate::writer::MAX_PAYLOAD,"receive_maximum":crate::receiving::MAXIMUM,"max_exchange_slots":max_exchanges,"input_slots":net::INPUT_SLOTS,"output_slots":net::OUTPUT_SLOTS,"writer_slots":crate::writer::QUEUE,"commands_in_flight":limits.in_flight,"max_timers":limits.timers,"receipt_slots":crate::writer::limits().receipt_slots.get(),"partial_packet_ms":5000,"connect_ms":3000,"write_ms":250,"remembered_connections":8,"max_subscriptions":mqttiumd_contract::pubsub::MAX_SUBSCRIPTIONS,"max_targets":mqttiumd_contract::retained::MAX_RETAIN_MASK_TARGETS,"outgoing_per_connection":8,"outgoing_metadata":limits.outgoing_bindings,"outgoing_packet_identifier_max":65535,"outgoing_packet_identifier_probe_limit":129,"outgoing_payload_bytes":64*1024*1024,"work_page_items":8,"work_scan_ms":100,"wildcard_subscriptions":true,"no_local":true,"shared_subscriptions":false,"subscription_identifiers":false,"sqlite_schema":sqlite_schema,"retained_available":true,"retained_topics":mqttiumd_contract::retained::MAX_RETAINED_TOPICS,"retained_bytes":mqttiumd_contract::retained::MAX_RETAINED_BYTES,"max_replay_candidates":mqttiumd_contract::retained::MAX_REPLAYS,"profile":profile}});
         if let Some(details) = readiness["details"].as_object_mut() {
             details.insert("storage_mode".into(), json!(storage_mode.mode_name()));
             details.insert(

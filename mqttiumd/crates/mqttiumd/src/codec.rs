@@ -13,6 +13,192 @@ use mqttiumd_contract::pubsub::{FilterList, MAX_FILTERS, SubscriptionFilter, Sub
 use mqttiumd_contract::session::SessionExpiry;
 use mqttiumd_contract::will::{MAX_WILL_PAYLOAD_BYTES, MAX_WILL_TOPIC_BYTES, WillSpec};
 
+/// The size bound of an MQTT packet the broker reads or writes.
+pub const MAX_PACKET_BYTES: usize = 1_048_576 + 65_536;
+
+/// Inline byte buffer for small MQTT control frames, incoming bodies, and
+/// PUBLISH headers (PUBACK = 4 B, PUBREC/PUBREL/PUBCOMP = 4 B, PINGRESP = 2 B,
+/// short PUBLISH headers <= 32 B), eliminating per-frame heap allocations while
+/// spilling transparently to `Vec<u8>` for larger frames or coalesced batches.
+pub const INLINE_FRAME_CAP: usize = 32;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FrameBytes {
+    Inline {
+        buf: [u8; INLINE_FRAME_CAP],
+        len: u8,
+    },
+    Heap(Vec<u8>),
+}
+
+impl FrameBytes {
+    #[inline]
+    pub fn try_zeroed(len: usize) -> Result<Self, std::collections::TryReserveError> {
+        if len <= INLINE_FRAME_CAP {
+            Ok(Self::Inline {
+                buf: [0u8; INLINE_FRAME_CAP],
+                len: len as u8,
+            })
+        } else {
+            let mut vec = Vec::new();
+            vec.try_reserve_exact(len)?;
+            vec.resize(len, 0);
+            Ok(Self::Heap(vec))
+        }
+    }
+
+    #[inline]
+    #[must_use]
+    pub const fn empty() -> Self {
+        Self::Inline {
+            buf: [0u8; INLINE_FRAME_CAP],
+            len: 0,
+        }
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn from_slice(bytes: &[u8]) -> Self {
+        if bytes.len() <= INLINE_FRAME_CAP {
+            let mut buf = [0u8; INLINE_FRAME_CAP];
+            buf[..bytes.len()].copy_from_slice(bytes);
+            Self::Inline {
+                buf,
+                len: bytes.len() as u8,
+            }
+        } else {
+            Self::Heap(bytes.to_vec())
+        }
+    }
+
+    #[inline]
+    pub fn try_with_capacity(cap: usize) -> Result<Self, std::collections::TryReserveError> {
+        if cap <= INLINE_FRAME_CAP {
+            Ok(Self::empty())
+        } else {
+            let mut vec = Vec::new();
+            vec.try_reserve_exact(cap)?;
+            Ok(Self::Heap(vec))
+        }
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn as_slice(&self) -> &[u8] {
+        match self {
+            Self::Inline { buf, len } => &buf[..usize::from(*len)],
+            Self::Heap(vec) => vec.as_slice(),
+        }
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn as_mut_slice(&mut self) -> &mut [u8] {
+        match self {
+            Self::Inline { buf, len } => &mut buf[..usize::from(*len)],
+            Self::Heap(vec) => vec.as_mut_slice(),
+        }
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn len(&self) -> usize {
+        match self {
+            Self::Inline { len, .. } => usize::from(*len),
+            Self::Heap(vec) => vec.len(),
+        }
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    #[inline]
+    pub fn push(&mut self, byte: u8) {
+        match self {
+            Self::Inline { buf, len } if usize::from(*len) < INLINE_FRAME_CAP => {
+                buf[usize::from(*len)] = byte;
+                *len += 1;
+            }
+            Self::Inline { buf, len } => {
+                let mut vec = Vec::with_capacity(usize::from(*len) + 16);
+                vec.extend_from_slice(&buf[..usize::from(*len)]);
+                vec.push(byte);
+                *self = Self::Heap(vec);
+            }
+            Self::Heap(vec) => vec.push(byte),
+        }
+    }
+
+    #[inline]
+    pub fn extend_from_slice(&mut self, slice: &[u8]) {
+        if slice.is_empty() {
+            return;
+        }
+        match self {
+            Self::Inline { buf, len } => {
+                let cur = usize::from(*len);
+                let new_len = cur + slice.len();
+                if new_len <= INLINE_FRAME_CAP {
+                    buf[cur..new_len].copy_from_slice(slice);
+                    *len = new_len as u8;
+                } else {
+                    let mut vec = Vec::with_capacity(new_len.max(64));
+                    vec.extend_from_slice(&buf[..cur]);
+                    vec.extend_from_slice(slice);
+                    *self = Self::Heap(vec);
+                }
+            }
+            Self::Heap(vec) => vec.extend_from_slice(slice),
+        }
+    }
+}
+
+impl Default for FrameBytes {
+    #[inline]
+    fn default() -> Self {
+        Self::empty()
+    }
+}
+
+impl From<Vec<u8>> for FrameBytes {
+    #[inline]
+    fn from(vec: Vec<u8>) -> Self {
+        Self::Heap(vec)
+    }
+}
+
+impl PartialEq<[u8]> for FrameBytes {
+    #[inline]
+    fn eq(&self, other: &[u8]) -> bool {
+        self.as_slice() == other
+    }
+}
+
+impl<const N: usize> PartialEq<[u8; N]> for FrameBytes {
+    #[inline]
+    fn eq(&self, other: &[u8; N]) -> bool {
+        self.as_slice() == other.as_slice()
+    }
+}
+
+impl std::ops::Deref for FrameBytes {
+    type Target = [u8];
+    #[inline]
+    fn deref(&self) -> &[u8] {
+        self.as_slice()
+    }
+}
+
+impl std::ops::DerefMut for FrameBytes {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut [u8] {
+        self.as_mut_slice()
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Version {
     V311 = 4,
@@ -1269,12 +1455,8 @@ pub fn encode_for(version: Version, frame: OutboundFrame) -> Result<Vec<u8>, Err
 }
 
 /// Encodes a core-authorized control frame directly into an inline
-/// [`crate::net::FrameBytes`] buffer with zero heap allocation.
-pub fn encode_frame_bytes(
-    version: Version,
-    frame: OutboundFrame,
-) -> Result<crate::net::FrameBytes, Error> {
-    use crate::net::FrameBytes;
+/// [`FrameBytes`] buffer with zero heap allocation.
+pub fn encode_frame_bytes(version: Version, frame: OutboundFrame) -> Result<FrameBytes, Error> {
     let ack = |first: u8, packet_id: InboundPacketId, reason: AckReason| {
         let reason = match reason {
             AckReason::Success => 0,
@@ -1509,7 +1691,7 @@ pub struct EncodedPublish {
 /// fan-out recipients without copying it into each subscriber's frame buffer.
 #[derive(Debug, PartialEq, Eq)]
 pub struct EncodedSegments {
-    pub header: crate::net::FrameBytes,
+    pub header: FrameBytes,
     pub payload: Option<SharedBytes>,
     pub total_len: usize,
     pub expiry_value_offset: Option<usize>,
@@ -1665,7 +1847,7 @@ pub(crate) fn encode_delivery_segments(
     )
 }
 
-fn push_varint_frame(bytes: &mut crate::net::FrameBytes, mut value: usize) {
+fn push_varint_frame(bytes: &mut FrameBytes, mut value: usize) {
     for _ in 0..4 {
         let mut part = (value % 128) as u8;
         value /= 128;
@@ -1727,10 +1909,10 @@ fn encode_publication_segments(
     let length_bytes = varint_len(body);
     let total = body
         .checked_add(1 + length_bytes)
-        .filter(|n| *n <= crate::net::MAX_PACKET_BYTES)
+        .filter(|n| *n <= MAX_PACKET_BYTES)
         .ok_or_else(|| oversized("PacketTooLarge"))?;
     let header_len = total - payload.len();
-    let mut header = crate::net::FrameBytes::try_with_capacity(header_len)
+    let mut header = FrameBytes::try_with_capacity(header_len)
         .map_err(|_| protocol("OutgoingAllocationFailed"))?;
     header.push(
         (if let Some((_, qos)) = packet {

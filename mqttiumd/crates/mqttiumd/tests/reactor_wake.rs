@@ -529,7 +529,7 @@ fn a_refused_header_is_named_before_the_close() {
 
     let mut large = connect(broker.address, "too-large");
     let mut header = vec![0x32];
-    remaining_length(mqttiumd::net::MAX_PACKET_BYTES + 1, &mut header);
+    remaining_length(mqttiumd::codec::MAX_PACKET_BYTES + 1, &mut header);
     large.write_all(&header).unwrap();
     assert_eq!(
         read_until_close(&mut large),
@@ -698,7 +698,7 @@ fn a_packet_over_the_announced_maximum_packet_size_is_refused() {
         body.push(0);
     }
     let over = packet(0x82, &body);
-    assert!(over.len() > maximum && over.len() < mqttiumd::net::MAX_PACKET_BYTES);
+    assert!(over.len() > maximum && over.len() < mqttiumd::codec::MAX_PACKET_BYTES);
     subscriber.write_all(&over).unwrap();
     assert_eq!(
         read_until_close(&mut subscriber),

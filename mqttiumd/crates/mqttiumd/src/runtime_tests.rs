@@ -2601,7 +2601,7 @@ fn finish_retained_durable_publish(close_before_enqueue: bool) {
                 .try_send(net::Write {
                     expiry: None,
                     correlation: None,
-                    bytes: net::FrameBytes::from_slice(&[0xd0, 0]),
+                    bytes: codec::FrameBytes::from_slice(&[0xd0, 0]),
                     payload: None,
                     report: net::WriteReport::Complete,
                 })
@@ -2811,7 +2811,7 @@ fn a_slow_transport_holds_its_acks_while_an_independent_exchange_progresses() {
                     .try_send(net::Write {
                         expiry: None,
                         correlation: None,
-                        bytes: net::FrameBytes::from_slice(&[0xd0, 0]),
+                        bytes: codec::FrameBytes::from_slice(&[0xd0, 0]),
                         payload: None,
                         report: net::WriteReport::Complete,
                     })
@@ -2857,7 +2857,7 @@ fn a_slow_transport_holds_its_acks_while_an_independent_exchange_progresses() {
             incoming
                 .try_send(net::Incoming::Packet {
                     first: 0xc0,
-                    body: net::FrameBytes::empty(),
+                    body: codec::FrameBytes::empty(),
                     observed: Ok(runtime.message_now().unwrap()),
                 })
                 .unwrap();
@@ -3064,7 +3064,7 @@ fn a_full_input_lane_leaves_the_next_socket_packet_in_its_bounded_channel() {
         producer
             .try_send(net::Incoming::Packet {
                 first: 0xc0,
-                body: net::FrameBytes::empty(),
+                body: codec::FrameBytes::empty(),
                 observed: Ok(runtime.message_now().unwrap()),
             })
             .unwrap();
@@ -3156,7 +3156,7 @@ fn a_saturated_four_slot_output_retains_the_committed_puback_until_terminal_fail
                 .try_send(net::Write {
                     expiry: None,
                     correlation: None,
-                    bytes: net::FrameBytes::from_slice(&[0xd0, 0]),
+                    bytes: codec::FrameBytes::from_slice(&[0xd0, 0]),
                     payload: None,
                     report: net::WriteReport::Complete,
                 })
@@ -6906,7 +6906,7 @@ fn blocked_output_and_full_input_preserve_independent_work_and_reconnect_credit(
                     .try_send(net::Write {
                         expiry: None,
                         correlation: None,
-                        bytes: net::FrameBytes::from_slice(&[0xd0, 0]),
+                        bytes: codec::FrameBytes::from_slice(&[0xd0, 0]),
                         payload: None,
                         report: net::WriteReport::Complete,
                     })
@@ -7382,7 +7382,7 @@ fn only_the_pubrel_of_another_exchange_goes_ahead_of_a_waiting_publication() {
         let raw = |first: u8, body: &[u8]| {
             (
                 first,
-                net::FrameBytes::from_slice(body),
+                codec::FrameBytes::from_slice(body),
                 Err(crate::session_time::TimeError::ClockUnavailable),
             )
         };
@@ -7504,7 +7504,7 @@ fn an_unsuback_owed_while_the_output_is_full_is_delivered_when_room_returns() {
                 full.try_send(net::Write {
                     expiry: None,
                     correlation: None,
-                    bytes: net::FrameBytes::from_slice(&[0xd0, 0]),
+                    bytes: codec::FrameBytes::from_slice(&[0xd0, 0]),
                     payload: None,
                     report: net::WriteReport::Complete,
                 })
