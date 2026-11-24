@@ -1517,6 +1517,53 @@ impl State {
                 .saturating_add(capacity_of(self.deliveries.capacity()).min(32))
         }
     }
+    /// Every index and count of the state that a rebuild derives from the
+    /// rows, in an order that does not depend on how they were filled.
+    #[cfg(test)]
+    fn index_snapshot(&self) -> alloc::vec::Vec<alloc::string::String> {
+        use alloc::format;
+        use alloc::string::String;
+        use alloc::vec::Vec;
+        fn sorted(mut entries: Vec<String>) -> String {
+            entries.sort();
+            entries.join(";")
+        }
+        fn all<T: core::fmt::Debug>(entries: impl Iterator<Item = T>) -> String {
+            sorted(entries.map(|e| format!("{e:?}")).collect())
+        }
+        alloc::vec![
+            all(self.conn_by_gen.iter()),
+            all(self.conn_by_loading_effect.iter()),
+            all(self.delivery_by_id.iter()),
+            all(self.delivery_by_op.iter()),
+            all(self.delivery_by_deadline.iter()),
+            all(self.delivery_by_frame.iter()),
+            all(self.delivery_by_claim_op.iter()),
+            all(self.delivery_by_claim_result_op.iter()),
+            all(self.delivery_by_target_pi.iter()),
+            all(self.deliveries_by_session.iter()),
+            all(self.deliveries_by_window.iter()),
+            all(self.sent_on_gen.iter()),
+            all(self.busy_by_session.iter()),
+            all(self.active_by_gen.iter()),
+            format!("{:?}", self.control_candidates),
+            format!("{:?}", self.expiring_deliveries),
+            format!("{}", self.pubrec_pending_count),
+            format!("{}", self.loaded_payload_bytes),
+        ]
+    }
+    /// The indices kept step by step are those a rebuild from the rows
+    /// gives.
+    #[cfg(test)]
+    pub(super) fn assert_indices_kept(&mut self) {
+        let kept = self.index_snapshot();
+        self.rebuild_indices();
+        assert_eq!(
+            kept,
+            self.index_snapshot(),
+            "an index drifted from its rows"
+        );
+    }
     #[allow(dead_code)]
     pub(super) fn rebuild_indices(&mut self) {
         self.conn_by_gen.clear();
@@ -5064,6 +5111,119 @@ mod tests {
         item.topic = Some(bytes(b"topic"));
         item.payload = Some(bytes(b"payload"));
         owner.pubsub.push_delivery(item).unwrap();
+    }
+    /// The pub/sub state alone, with no owner around it: its rows are written
+    /// by hand.
+    fn bare_state() -> State {
+        State::new(OwnerConfig {
+            max_sessions: nonzero(2),
+            max_routes: nonzero(2),
+            max_exchanges: nonzero(8),
+            session_qos2_exchanges: NonZeroU32::MAX,
+            account: AccountId::new(1),
+            payload_bytes: PayloadBytes::new(1024),
+            resolution_delay: LogicalDuration::new(1),
+            retained_operations: nonzero(16),
+            remembered_connections: nonzero(4),
+        })
+        .unwrap()
+    }
+    #[test]
+    fn a_swap_removal_reindexes_the_row_it_moves_under_every_index() {
+        let key = ConnectionKey {
+            session: TARGET,
+            generation: CONNECTION,
+        };
+        let claim = |packet_id| DeliveryClaim {
+            operation: operation(50 + u64::from(packet_id)),
+            packet_id: OutboundPacketId::new(packet_id).unwrap(),
+            started: true,
+            await_pubcomp: false,
+        };
+        // The row removed: sent on the connection and a control candidate.
+        let mut sent = Delivery::metadata(
+            delivery(0),
+            TARGET,
+            Revision::new(1),
+            Qos::AtLeastOnce,
+            Some(claim(1)),
+        );
+        let frame = EffectId {
+            epoch: RunEpoch::new(2),
+            owner: LogicalOwnerId::new(4),
+            sequence: EffectSeq::new(90),
+        };
+        sent.frame = Some((frame, key));
+        sent.early_pubrec = Some(0x10);
+        // The rows moved into its slot, one at a time: in flight and
+        // expiring, then retrying its start.
+        let mut in_flight = Delivery::metadata(
+            delivery(1),
+            TARGET,
+            Revision::new(1),
+            Qos::AtLeastOnce,
+            Some(claim(2)),
+        );
+        in_flight.phase = Phase::StartPending(flight(2));
+        in_flight.expiry = Some(message_expiry());
+        let mut retrying = Delivery::metadata(
+            delivery(2),
+            TARGET,
+            Revision::new(1),
+            Qos::AtLeastOnce,
+            Some(claim(3)),
+        );
+        retrying.phase = Phase::StartRetry;
+        for moved in [in_flight, retrying] {
+            let mut state = bare_state();
+            state.push_delivery(sent.clone()).unwrap();
+            state.push_delivery(moved.clone()).unwrap();
+            assert_eq!(state.sent_on_gen.get(&(TARGET, CONNECTION)), Some(&1));
+            assert!(state.control_candidates.contains(&0));
+
+            state.remove_delivery_at(0);
+
+            assert_eq!(state.delivery(moved.id), Some(0));
+            assert_eq!(state.sent_on_gen.get(&(TARGET, CONNECTION)), None);
+            assert_eq!(
+                state.control_candidates.contains(&0),
+                State::is_control_candidate(&moved)
+            );
+            assert_eq!(
+                state.expiring_deliveries.contains(&0),
+                moved.expiry.is_some()
+            );
+            if let Some(f) = moved.in_flight() {
+                assert_eq!(state.delivery_by_op.get(&f.operation), Some(&0));
+            }
+            state.assert_indices_kept();
+        }
+    }
+    #[test]
+    fn a_mutation_that_changes_a_claim_moves_its_packet_identifier_key() {
+        let mut state = bare_state();
+        let claim = |packet_id| DeliveryClaim {
+            operation: operation(60),
+            packet_id: OutboundPacketId::new(packet_id).unwrap(),
+            started: false,
+            await_pubcomp: false,
+        };
+        state
+            .push_delivery(Delivery::metadata(
+                delivery(0),
+                TARGET,
+                Revision::new(1),
+                Qos::AtLeastOnce,
+                Some(claim(4)),
+            ))
+            .unwrap();
+
+        state.mutate_delivery(0, |d| d.claim = Some(claim(5)));
+
+        let pi = |id| (TARGET, OutboundPacketId::new(id).unwrap());
+        assert_eq!(state.delivery_by_target_pi.get(&pi(4)), None);
+        assert_eq!(state.delivery_by_target_pi.get(&pi(5)), Some(&0));
+        state.assert_indices_kept();
     }
     fn known(owner: &mut Owner, effect: EffectId, command: &Command) -> Vec<(EffectId, Effect)> {
         let facts = match command.recipe.get() {

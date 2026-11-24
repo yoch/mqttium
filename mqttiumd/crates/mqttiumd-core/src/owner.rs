@@ -1643,7 +1643,10 @@ impl Owner {
     /// account, the reservations held and the content of the box as they
     /// were.
     pub fn step(&mut self, input: Input, grant: TurnGrant) -> StepOutcome {
-        self.step_into(input, grant)
+        let outcome = self.step_into(input, grant);
+        #[cfg(test)]
+        self.pubsub.assert_indices_kept();
+        outcome
     }
 
     fn step_into(&mut self, input: Input, grant: TurnGrant) -> StepOutcome {
