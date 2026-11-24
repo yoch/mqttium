@@ -117,9 +117,9 @@ impl Owner {
                 .iter()
                 .filter(|s| s.retired && s.in_flight().is_some())
                 .count()
-                + self.pubsub.retired_flights(),
+                + self.retired_flights(),
             inbound: self.slots.len(),
-            outgoing: self.pubsub.deliveries.len() + self.volatile.len(),
+            outgoing: self.deliveries.len() + self.volatile.len(),
             closed_generations: self.closed.len(),
             lifecycle_pending: self.lifecycle.is_some(),
         }
@@ -1005,7 +1005,7 @@ impl Owner {
             }
             let _ = self.remove_slot_at(index)?;
         }
-        self.pubsub.retire_session(session);
+        self.retire_outgoing(session);
         Ok(())
     }
 }

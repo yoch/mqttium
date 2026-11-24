@@ -61,6 +61,7 @@ use crate::contract::message_expiry::{
 };
 
 mod connections;
+mod deliveries;
 mod pubsub;
 mod receipts;
 mod routing;
@@ -985,6 +986,8 @@ pub struct Owner {
     closed_set: BTreeSet<ConnectionGeneration>,
     resolution_delay: LogicalDuration,
     pubsub: pubsub::State,
+    /// The outgoing QoS 1 and 2 deliveries.
+    deliveries: deliveries::Deliveries,
     /// The online connections outgoing deliveries go to.
     connections: connections::Connections,
     /// The volatile QoS 0 deliveries and the continuation that serves them.
@@ -1083,7 +1086,7 @@ impl Owner {
                 LeaseTable::new(config.account, credit, config.max_exchanges)?,
                 ring(config.retained_operations)?,
                 ring(config.remembered_connections)?,
-                pubsub::State::new(config)?,
+                deliveries::Deliveries::new(config)?,
                 connections::Connections::new(config.max_sessions)?,
                 pubsub::VolatileQueue::new(config.max_exchanges)?,
                 receipts::State::new(crate::contract::receipts::ReceiptOrigin {
@@ -1100,7 +1103,7 @@ impl Owner {
             leases,
             finished,
             closed,
-            pubsub,
+            deliveries,
             connections,
             volatile,
             receipts,
@@ -1141,7 +1144,8 @@ impl Owner {
             closed,
             closed_set: BTreeSet::new(),
             resolution_delay: config.resolution_delay,
-            pubsub,
+            pubsub: pubsub::State::new(config),
+            deliveries,
             connections,
             volatile,
             receipts,
@@ -1320,6 +1324,7 @@ impl Owner {
         self.receipts.holds_deadline(token)
             || self.slot_by_deadline.contains_key(&token)
             || self.pubsub.holds_deadline(token)
+            || self.deliveries.holds_deadline(token)
             || self.wills.holds_deadline(token)
             || self
                 .lifecycle
@@ -1740,6 +1745,7 @@ impl Owner {
                 1u64.saturating_add(self.pubsub.work_bound(
                     input,
                     &self.connections,
+                    &self.deliveries,
                     &self.volatile,
                     self.routes.capacity(),
                 ))
@@ -1832,7 +1838,7 @@ impl Owner {
                         .min(32)
                         .saturating_mul(3)
                         .saturating_add(capacity_of(self.sessions.capacity()).min(16))
-                        .saturating_add(self.pubsub.close_work(&self.connections))
+                        .saturating_add(self.deliveries.close_work(&self.connections))
                 } else {
                     0
                 };
@@ -1883,7 +1889,8 @@ impl Owner {
             {
                 return Err(IMPOSSIBLE);
             }
-            if !self.pubsub.accepts_message_time(*now) || !self.volatile.accepts_message_time(*now)
+            if !self.deliveries.accepts_message_time(*now)
+                || !self.volatile.accepts_message_time(*now)
             {
                 return Err(IMPOSSIBLE);
             }
@@ -2725,7 +2732,7 @@ impl Owner {
             || self.release_continuation.is_some()
             || !self.receipts.control_available()
             || (self.release_retry_slots.is_empty()
-                && !self.pubsub.has_control_work(self.message_now))
+                && !self.deliveries.has_control_work(self.message_now))
         {
             return Ok(None);
         }
@@ -3208,7 +3215,7 @@ impl Owner {
             .finished_by_op
             .get(&operation)
             .map(|(item, _)| *item)
-            .or_else(|| self.pubsub.known(operation))
+            .or_else(|| self.deliveries.known(operation))
             .or_else(|| {
                 self.slots
                     .as_slice()
@@ -3637,7 +3644,7 @@ impl Owner {
             Change::Nothing => {}
             Change::MessageClock(now) => {
                 self.message_now = Some(now);
-                self.pubsub.evict_expired_cache(now);
+                self.deliveries.evict_expired_cache(now);
             }
             Change::Recover => {
                 let Input::Recovery { facts, last } = input else {
@@ -4146,7 +4153,7 @@ mod tests {
         sessions: Vec<Session>,
         slots: Vec<Slot>,
         outgoing_connections: Vec<connections::Connection>,
-        outgoing_deliveries: Vec<pubsub::Delivery>,
+        outgoing_deliveries: Vec<deliveries::Delivery>,
         volatile: Vec<pubsub::Volatile>,
         retained_qos0: Option<pubsub::RetainedFlight>,
         continuation: (Option<crate::contract::ids::ContinuationId>, bool),
@@ -4645,7 +4652,7 @@ mod tests {
                 sessions: owner.sessions.as_slice().to_vec(),
                 slots: owner.slots.as_slice().to_vec(),
                 outgoing_connections: owner.connections.to_vec(),
-                outgoing_deliveries: owner.pubsub.deliveries.as_slice().to_vec(),
+                outgoing_deliveries: owner.deliveries.rows().to_vec(),
                 volatile: owner.volatile.to_vec(),
                 retained_qos0: owner.pubsub.retained,
                 continuation: (
@@ -9158,7 +9165,7 @@ mod tests {
             },
         });
         assert!(world.drain().is_empty());
-        assert!(world.owner.pubsub.deliveries.is_empty());
+        assert!(world.owner.deliveries.is_empty());
         let remembered = world
             .owner
             .finished
@@ -9712,7 +9719,7 @@ mod tests {
             next: None,
         });
         assert!(world.drain().is_empty());
-        assert!(world.owner.pubsub.deliveries.is_empty());
+        assert!(world.owner.deliveries.is_empty());
         world.applied(committed(&consume));
         assert!(world.drain().is_empty());
     }
@@ -9743,7 +9750,7 @@ mod tests {
         world.applied(product_settings(CONN, 1));
         assert_eq!(world.sent(connect(CONN, b"p1-producer")), ["EmitConnack"]);
         load_work(&mut world, &[], None);
-        assert!(world.owner.pubsub.deliveries.is_empty());
+        assert!(world.owner.deliveries.is_empty());
         assert!(!world.owner.has_ready_work(SessionId::new(PRODUCER)));
     }
 
