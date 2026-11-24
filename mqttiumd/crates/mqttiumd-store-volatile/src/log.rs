@@ -412,8 +412,8 @@ impl LogStore {
 
     /// SQLite settings from initial checkpoint load, if loaded from an existing file.
     #[must_use]
-    pub fn sqlite_settings(&self) -> Option<&Settings> {
-        self.sqlite_settings.as_ref()
+    pub fn sqlite_settings(&self) -> Option<Settings> {
+        self.sqlite_settings.clone()
     }
 
     /// Sets whether the medium accepts durable writes (used by conformance and

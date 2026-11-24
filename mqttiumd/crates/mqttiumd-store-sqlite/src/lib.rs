@@ -2468,10 +2468,11 @@ impl SqliteStore {
         Ok(reply)
     }
 
-    /// The engine and the settings in force, read back at opening.
+    /// The engine and the settings in force, read back at opening: a copy,
+    /// which callers record or compare.
     #[must_use]
-    pub fn effective_settings(&self) -> &Settings {
-        &self.settings
+    pub fn effective_settings(&self) -> Settings {
+        self.settings.clone()
     }
 
     /// For a measurement only: sets `PRAGMA wal_autocheckpoint` on the

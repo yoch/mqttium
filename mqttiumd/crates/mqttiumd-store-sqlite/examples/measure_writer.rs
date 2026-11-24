@@ -502,7 +502,7 @@ fn main() {
                 .set_wal_autocheckpoint_for_measurement(pages)
                 .expect("the setting");
         }
-        let settings = store.effective_settings().clone();
+        let settings = store.effective_settings();
         let mut wal = path.clone().into_os_string();
         wal.push("-wal");
         let wal = PathBuf::from(wal);

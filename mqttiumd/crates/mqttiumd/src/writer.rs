@@ -2557,9 +2557,9 @@ fn bootstrap_bound(
     let collect_closed =
         state.receipt_frontiers.len() >= 32 || state.accounts.receipt_slots.get() >= 4096;
     let sqlite = match &store {
-        StoreBackend::Durable(s) => Some(s.effective_settings().clone()),
-        StoreBackend::Log(s) => s.sqlite_settings().cloned(),
-        StoreBackend::Volatile { handle, .. } => handle.sqlite_settings().cloned(),
+        StoreBackend::Durable(s) => Some(s.effective_settings()),
+        StoreBackend::Log(s) => s.sqlite_settings(),
+        StoreBackend::Volatile { handle, .. } => handle.sqlite_settings(),
     };
     Ok((
         store,
