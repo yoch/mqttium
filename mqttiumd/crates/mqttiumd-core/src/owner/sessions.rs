@@ -119,7 +119,7 @@ impl Owner {
                 .count()
                 + self.pubsub.retired_flights(),
             inbound: self.slots.len(),
-            outgoing: self.pubsub.deliveries.len() + self.pubsub.volatile.len(),
+            outgoing: self.pubsub.deliveries.len() + self.volatile.len(),
             closed_generations: self.closed.len(),
             lifecycle_pending: self.lifecycle.is_some(),
         }

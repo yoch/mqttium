@@ -912,7 +912,7 @@ mod tests {
             let effects = apply(&mut owner, publish(qos, 1, 1));
             if qos == Qos::AtMostOnce {
                 assert_eq!(
-                    owner.pubsub.volatile.len(),
+                    owner.volatile.len(),
                     16,
                     "routing_budget_counted_filters_instead_of_destinations"
                 );
@@ -997,10 +997,7 @@ mod tests {
                     "wildcard_fanout_truncated"
                 );
             }
-            assert!(
-                owner.pubsub.volatile.is_empty(),
-                "wildcard_fanout_truncated"
-            );
+            assert!(owner.volatile.is_empty(), "wildcard_fanout_truncated");
             assert!(owner.slots.is_empty());
             assert_eq!(owner.leases.held(), 0);
         }

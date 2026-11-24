@@ -987,6 +987,8 @@ pub struct Owner {
     pubsub: pubsub::State,
     /// The online connections outgoing deliveries go to.
     connections: connections::Connections,
+    /// The volatile QoS 0 deliveries and the continuation that serves them.
+    volatile: pubsub::VolatileQueue,
     receipts: receipts::State,
     wills: will::State,
     lifecycle: Option<sessions::Flight>,
@@ -1083,6 +1085,7 @@ impl Owner {
                 ring(config.remembered_connections)?,
                 pubsub::State::new(config)?,
                 connections::Connections::new(config.max_sessions)?,
+                pubsub::VolatileQueue::new(config.max_exchanges)?,
                 receipts::State::new(crate::contract::receipts::ReceiptOrigin {
                     incarnation: id.incarnation(),
                     epoch: id.epoch(),
@@ -1090,8 +1093,18 @@ impl Owner {
                 })?,
             ))
         })();
-        let Ok((routes, sessions, slots, leases, finished, closed, pubsub, connections, receipts)) =
-            tables
+        let Ok((
+            routes,
+            sessions,
+            slots,
+            leases,
+            finished,
+            closed,
+            pubsub,
+            connections,
+            volatile,
+            receipts,
+        )) = tables
         else {
             let reason = OwnerRefusal::AllocationFailed;
             return Err(OwnerRefused { outbox, reason });
@@ -1130,6 +1143,7 @@ impl Owner {
             resolution_delay: config.resolution_delay,
             pubsub,
             connections,
+            volatile,
             receipts,
             wills: will::State::new(),
             lifecycle: None,
@@ -1726,6 +1740,7 @@ impl Owner {
                 1u64.saturating_add(self.pubsub.work_bound(
                     input,
                     &self.connections,
+                    &self.volatile,
                     self.routes.capacity(),
                 ))
                 .saturating_add(self.session_work_bound(input))
@@ -1868,7 +1883,8 @@ impl Owner {
             {
                 return Err(IMPOSSIBLE);
             }
-            if !self.pubsub.accepts_message_time(*now) {
+            if !self.pubsub.accepts_message_time(*now) || !self.volatile.accepts_message_time(*now)
+            {
                 return Err(IMPOSSIBLE);
             }
             return Ok(Change::MessageClock(*now));
@@ -2748,7 +2764,7 @@ impl Owner {
             return self.plan_release(slot, Some(refused), draft);
         }
         if self.release_continuations_started
-            && self.pubsub.continuation != Some(continuation)
+            && !self.volatile.serves(continuation)
             && issued(continuation, self.counters.continuation)
         {
             return Ok(Change::Nothing);
@@ -4630,11 +4646,11 @@ mod tests {
                 slots: owner.slots.as_slice().to_vec(),
                 outgoing_connections: owner.connections.to_vec(),
                 outgoing_deliveries: owner.pubsub.deliveries.as_slice().to_vec(),
-                volatile: owner.pubsub.volatile.to_vec(),
+                volatile: owner.volatile.to_vec(),
                 retained_qos0: owner.pubsub.retained,
                 continuation: (
-                    owner.pubsub.continuation,
-                    owner.pubsub.continuations_started,
+                    owner.volatile.continuation_state().0,
+                    owner.volatile.continuation_state().1,
                 ),
                 subscription: owner.pubsub.control.as_ref().map(|c| ControlSnapshot {
                     session: c.session,
@@ -9334,7 +9350,7 @@ mod tests {
             waiting.insert(generation, VecDeque::from(frames));
         }
         assert!(
-            world.owner.pubsub.continuation.is_none(),
+            !world.owner.volatile.serving(),
             "nothing runs while every connection has its window in flight"
         );
 
@@ -9371,8 +9387,8 @@ mod tests {
                 "connection {generation} has the burst whole and in order"
             );
         }
-        assert!(world.owner.pubsub.volatile.is_empty());
-        assert!(world.owner.pubsub.continuation.is_none());
+        assert!(world.owner.volatile.is_empty());
+        assert!(!world.owner.volatile.serving());
     }
 
     /// The volatile deliveries to `session` that `effects` drop: the order
@@ -9420,7 +9436,7 @@ mod tests {
                 "session {session}"
             );
         }
-        assert_eq!(world.owner.pubsub.volatile.len(), 2 * KEPT as usize);
+        assert_eq!(world.owner.volatile.len(), 2 * KEPT as usize);
         let mut waiting: VecDeque<_> = [11, 12]
             .iter()
             .flat_map(|generation| volatile_frames(&first, *generation))
@@ -9440,7 +9456,7 @@ mod tests {
             }
         }
         assert_eq!(delivered, BTreeMap::from([(11, KEPT), (12, KEPT)]));
-        assert!(world.owner.pubsub.volatile.is_empty());
+        assert!(world.owner.volatile.is_empty());
     }
 
     /// Record 0063: deliveries that wait for the window of a connection end
@@ -9507,7 +9523,7 @@ mod tests {
             }
         }
         assert_eq!(count, BURST);
-        assert!(world.owner.pubsub.volatile.is_empty());
+        assert!(world.owner.volatile.is_empty());
 
         // The session comes back on another connection: a window of its own.
         world.applied(connect(13, b"p1-b"));
@@ -9539,7 +9555,7 @@ mod tests {
             world
         }
         let resume = |world: &World| Input::Continue {
-            continuation: world.owner.pubsub.continuation.expect("armed"),
+            continuation: world.owner.volatile.continuation_state().0.expect("armed"),
             budget: WorkUnits::new(65536),
         };
         // One frame: the window is full again and nothing else is pending.
@@ -9591,7 +9607,7 @@ mod tests {
             reason: crate::contract::pubsub::Qos0DropReason::OutputSaturated,
         });
         assert_eq!(kinds(&world.drain()), ["Qos0Dropped"]);
-        assert!(world.owner.pubsub.volatile.is_empty());
+        assert!(world.owner.volatile.is_empty());
         assert_eq!(world.owner.leases.snapshot(), before);
         world.applied(Input::Qos0EmitRefused {
             effect,
@@ -9628,7 +9644,7 @@ mod tests {
         });
         assert!(world.drain().is_empty());
         assert_eq!(
-            world.owner.pubsub.volatile.len(),
+            world.owner.volatile.len(),
             1,
             "the old receipt cannot free the new occurrence"
         );

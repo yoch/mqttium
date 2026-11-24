@@ -265,10 +265,15 @@ pub(super) struct VolatileQueue {
     parked_bytes: u64,
     payload_bytes: u64,
     expiring_count: usize,
+    /// The continuation that serves the queue, while one runs.
+    continuation: Option<ContinuationId>,
+    /// Whether a continuation was ever started: an unknown one is then an
+    /// old one, not an impossible one.
+    continuations_started: bool,
 }
 
 impl VolatileQueue {
-    fn new(bound: NonZeroU32) -> Result<Self, AllocationFailed> {
+    pub(super) fn new(bound: NonZeroU32) -> Result<Self, AllocationFailed> {
         let capacity = usize::try_from(bound.get()).map_err(|_| AllocationFailed)?;
         Ok(Self {
             capacity,
@@ -280,7 +285,96 @@ impl VolatileQueue {
             parked_bytes: 0,
             payload_bytes: 0,
             expiring_count: 0,
+            continuation: None,
+            continuations_started: false,
         })
+    }
+
+    /// Whether a continuation serves the queue.
+    pub(super) fn serving(&self) -> bool {
+        self.continuation.is_some()
+    }
+    /// Whether `continuation` is the one that serves the queue.
+    pub(super) fn serves(&self, continuation: ContinuationId) -> bool {
+        self.continuation == Some(continuation)
+    }
+    /// Whether a continuation was ever started.
+    fn continuations_started(&self) -> bool {
+        self.continuations_started
+    }
+    /// Whether a volatile publication carries a Message Expiry Interval.
+    fn has_expiring(&self) -> bool {
+        self.expiring_count > 0
+    }
+    fn start(&mut self, started: Option<ContinuationId>) {
+        if let Some(continuation) = started {
+            self.continuation = Some(continuation);
+            self.continuations_started = true;
+        }
+    }
+    /// Queues admitted QoS 0 deliveries; `started` serves them when the
+    /// queue had no continuation.
+    fn admit(
+        &mut self,
+        records: &[Volatile],
+        started: Option<ContinuationId>,
+    ) -> Result<(), CoreFault> {
+        for record in records {
+            self.push_pending(record.clone())?;
+        }
+        self.start(started);
+        Ok(())
+    }
+    /// The oldest waiting delivery leaves as `effect`; `next` serves the
+    /// queue after it.
+    fn send_front(
+        &mut self,
+        effect: EffectId,
+        next: Option<ContinuationId>,
+    ) -> Result<(), CoreFault> {
+        self.promote_front_to_inflight(effect)?;
+        self.continuation = next;
+        Ok(())
+    }
+    /// The oldest waiting delivery is dropped; `next` serves the queue.
+    fn drop_front(&mut self, next: Option<ContinuationId>) -> Result<(), CoreFault> {
+        self.drop_front_pending()?;
+        self.continuation = next;
+        Ok(())
+    }
+    /// The oldest waiting delivery waits for its window; `next` serves the
+    /// queue.
+    fn park_front(&mut self, next: Option<ContinuationId>) -> Result<(), CoreFault> {
+        self.park_front_pending()?;
+        self.continuation = next;
+        Ok(())
+    }
+    /// A connection whose window has room is served; `next` serves the
+    /// queue after it.
+    fn serve(
+        &mut self,
+        effect: Option<EffectId>,
+        stays: bool,
+        next: Option<ContinuationId>,
+    ) -> Result<(), CoreFault> {
+        self.serve_ready(effect, stays)?;
+        self.continuation = next;
+        Ok(())
+    }
+    /// The write of `effect` ended; `started` serves a delivery that waited
+    /// for its place.
+    fn finish(
+        &mut self,
+        effect: EffectId,
+        started: Option<ContinuationId>,
+    ) -> Result<(), CoreFault> {
+        self.remove_inflight(effect)?;
+        self.start(started);
+        Ok(())
+    }
+    /// Nothing is left for the continuation to serve.
+    fn idle(&mut self) {
+        self.continuation = None;
     }
 
     pub(super) fn capacity(&self) -> usize {
@@ -477,7 +571,7 @@ impl VolatileQueue {
         Ok(())
     }
 
-    fn accepts_message_time(&self, now: MessageTime) -> bool {
+    pub(super) fn accepts_message_time(&self, now: MessageTime) -> bool {
         if self.expiring_count == 0 {
             return true;
         }
@@ -526,9 +620,6 @@ pub(super) struct State {
     pub(super) control: Option<Control>,
     pub(super) retained: Option<RetainedFlight>,
     payload_limit: PayloadBytes,
-    pub(super) volatile: VolatileQueue,
-    pub(super) continuation: Option<ContinuationId>,
-    pub(super) continuations_started: bool,
     next_pubrec_rank: u64,
 }
 
@@ -1161,6 +1252,7 @@ impl State {
         &self,
         input: &Input,
         connections: &Connections,
+        volatile: &VolatileQueue,
         _routes: usize,
     ) -> u64 {
         if let Input::MessagesExpired { deliveries } = input {
@@ -1184,7 +1276,7 @@ impl State {
         if !new
             && connections.is_empty()
             && self.control.is_none()
-            && self.volatile.is_empty()
+            && volatile.is_empty()
             && self.deliveries.is_empty()
         {
             return 0;
@@ -1237,9 +1329,6 @@ impl State {
             control: None,
             retained: None,
             payload_limit: config.payload_bytes,
-            volatile: VolatileQueue::new(config.max_exchanges)?,
-            continuation: None,
-            continuations_started: false,
             next_pubrec_rank: 1,
         })
     }
@@ -1407,6 +1496,7 @@ impl State {
     fn loaded_bytes(&self) -> Option<u64> {
         Some(self.loaded_payload_bytes)
     }
+    /// Whether `now` keeps every expiring delivery in a known state.
     pub(super) fn accepts_message_time(&self, now: MessageTime) -> bool {
         if !self.expiring_deliveries.is_empty() {
             let slice = self.deliveries.as_slice();
@@ -1419,7 +1509,7 @@ impl State {
                 return false;
             }
         }
-        self.volatile.accepts_message_time(now)
+        true
     }
     pub(super) fn evict_expired_cache(&mut self, now: MessageTime) {
         if self.expiring_deliveries.is_empty() {
@@ -1985,9 +2075,9 @@ impl Owner {
             Err(super::routing::Refusal::Revision) => return Err(IMPOSSIBLE),
         };
         let count = selected.as_ref().map_or(0, super::routing::Selection::len);
-        let used = self.pubsub.volatile.payload_bytes();
+        let used = self.volatile.payload_bytes();
         let fits = selected.is_some()
-            && count <= self.pubsub.volatile.capacity() - self.pubsub.volatile.len()
+            && count <= self.volatile.capacity() - self.volatile.len()
             && (payload.len() as u64)
                 .checked_mul(count as u64)
                 .and_then(|n| n.checked_add(used))
@@ -2030,7 +2120,7 @@ impl Owner {
                 })
                 .map_err(|_| IMPOSSIBLE)?;
         }
-        let continuation = if self.pubsub.continuation.is_none() {
+        let continuation = if !self.volatile.serving() {
             Some(self.qos0_continuation(draft)?)
         } else {
             None
@@ -2069,8 +2159,8 @@ impl Owner {
         continuation: ContinuationId,
         draft: &mut Draft,
     ) -> Result<super::Change, Stop> {
-        if self.pubsub.continuation != Some(continuation) {
-            return if self.pubsub.continuations_started {
+        if !self.volatile.serves(continuation) {
+            return if self.volatile.continuations_started() {
                 Ok(super::Change::Nothing)
             } else {
                 Err(IMPOSSIBLE)
@@ -2078,20 +2168,16 @@ impl Owner {
         }
         // A connection whose window has room is served first, one
         // delivery in its turn: what waited leaves before what came after.
-        if let Some((generation, v)) = self.pubsub.volatile.front_ready() {
+        if let Some((generation, v)) = self.volatile.front_ready() {
             let closed = self.connection_of(v.target) != Some(generation);
-            let window = self.pubsub.volatile.window(generation);
+            let window = self.volatile.window(generation);
             if !closed && window >= QOS0_WINDOW {
                 return Err(IMPOSSIBLE);
             }
             let reason = self.qos0_drop_reason(v)?;
             let window = window + usize::from(reason.is_none());
-            let stays =
-                self.pubsub.volatile.parked(generation) > 1 && (closed || window < QOS0_WINDOW);
-            let next = if stays
-                || self.pubsub.volatile.other_ready()
-                || self.pubsub.volatile.has_pending()
-            {
+            let stays = self.volatile.parked(generation) > 1 && (closed || window < QOS0_WINDOW);
+            let next = if stays || self.volatile.other_ready() || self.volatile.has_pending() {
                 Some(self.qos0_continuation(draft)?)
             } else {
                 None
@@ -2113,10 +2199,10 @@ impl Owner {
                 continuation: next,
             }));
         }
-        let Some(v) = self.pubsub.volatile.front_pending() else {
+        let Some(v) = self.volatile.front_pending() else {
             return Ok(changed(Change::Qos0Idle));
         };
-        let next = if self.pubsub.volatile.has_more_pending() {
+        let next = if self.volatile.has_more_pending() {
             Some(self.qos0_continuation(draft)?)
         } else {
             None
@@ -2133,14 +2219,11 @@ impl Owner {
         // The window of the connection is full, or earlier deliveries wait
         // for it: this one waits behind them, in its order. Past what a
         // connection may keep waiting, it is dropped.
-        if self.pubsub.volatile.parked(generation) > 0
-            || self.pubsub.volatile.window(generation) >= QOS0_WINDOW
-        {
-            if self.pubsub.volatile.may_park(
-                generation,
-                v.payload.len(),
-                self.pubsub.payload_limit.get(),
-            ) {
+        if self.volatile.parked(generation) > 0 || self.volatile.window(generation) >= QOS0_WINDOW {
+            if self
+                .volatile
+                .may_park(generation, v.payload.len(), self.pubsub.payload_limit.get())
+            {
                 return Ok(changed(Change::Qos0Park { continuation: next }));
             }
             draft.emit(Effect::Qos0Dropped {
@@ -2211,7 +2294,6 @@ impl Owner {
         draft: &mut Draft,
     ) -> Result<Option<super::Change>, Stop> {
         if let Some(v) = self
-            .pubsub
             .volatile
             .get_inflight(effect)
             .filter(|v| v.connection == Some(connection))
@@ -2225,12 +2307,11 @@ impl Owner {
             }
             // A place of the window returns: a delivery that waited for it
             // is served, by the continuation if one runs, else by a new one.
-            let continuation =
-                if self.pubsub.volatile.wakes(effect) && self.pubsub.continuation.is_none() {
-                    Some(self.qos0_continuation(draft)?)
-                } else {
-                    None
-                };
+            let continuation = if self.volatile.wakes(effect) && !self.volatile.serving() {
+                Some(self.qos0_continuation(draft)?)
+            } else {
+                None
+            };
             return Ok(Some(changed(Change::Qos0Done {
                 effect,
                 continuation,
@@ -2402,7 +2483,7 @@ impl Owner {
     /// publications requiring up-to-date message clock observations.
     #[must_use]
     pub fn has_expiring_messages(&self) -> bool {
-        !self.pubsub.expiring_deliveries.is_empty() || self.pubsub.volatile.expiring_count > 0
+        !self.pubsub.expiring_deliveries.is_empty() || self.volatile.has_expiring()
     }
 
     fn outgoing_ack_target(
@@ -4228,48 +4309,34 @@ impl Owner {
             } => {
                 self.connections
                     .record_qos0_ingress(connection, ingress_order)?;
-                for record in records.as_slice() {
-                    self.pubsub.volatile.push_pending(record.clone())?;
-                }
-                if let Some(c) = continuation {
-                    self.pubsub.continuation = Some(c);
-                    self.pubsub.continuations_started = true;
-                }
+                self.volatile.admit(records.as_slice(), continuation)?;
             }
             Change::Qos0Send {
                 effect,
                 continuation,
             } => {
-                self.pubsub.volatile.promote_front_to_inflight(effect)?;
-                self.pubsub.continuation = continuation;
+                self.volatile.send_front(effect, continuation)?;
             }
             Change::Qos0Drop { continuation } => {
-                self.pubsub.volatile.drop_front_pending()?;
-                self.pubsub.continuation = continuation;
+                self.volatile.drop_front(continuation)?;
             }
             Change::Qos0Park { continuation } => {
-                self.pubsub.volatile.park_front_pending()?;
-                self.pubsub.continuation = continuation;
+                self.volatile.park_front(continuation)?;
             }
             Change::Qos0Serve {
                 effect,
                 stays,
                 continuation,
             } => {
-                self.pubsub.volatile.serve_ready(effect, stays)?;
-                self.pubsub.continuation = continuation;
+                self.volatile.serve(effect, stays, continuation)?;
             }
             Change::Qos0Done {
                 effect,
                 continuation,
             } => {
-                self.pubsub.volatile.remove_inflight(effect)?;
-                if let Some(c) = continuation {
-                    self.pubsub.continuation = Some(c);
-                    self.pubsub.continuations_started = true;
-                }
+                self.volatile.finish(effect, continuation)?;
             }
-            Change::Qos0Idle => self.pubsub.continuation = None,
+            Change::Qos0Idle => self.volatile.idle(),
             Change::Consume {
                 slot,
                 in_flight,
@@ -4782,6 +4849,14 @@ mod tests {
     use crate::contract::effects::{EffectSink, SubmitResult};
     use crate::contract::outcome::{EpochOpened, EpochOpening, OpeningOutcome, OpeningReply};
     use alloc::vec::Vec;
+
+    impl VolatileQueue {
+        /// The continuation that serves the queue, and whether one was ever
+        /// started.
+        pub(in crate::owner) fn continuation_state(&self) -> (Option<ContinuationId>, bool) {
+            (self.continuation, self.continuations_started)
+        }
+    }
 
     // The net lot 5 of `refactor/deslop-layers` moves the tables under: the
     // tests of the core step the owner through `step_checked`, which fails
@@ -7392,7 +7467,7 @@ mod tests {
             ),
             "invalid_qos0_expiry_was_admitted"
         );
-        assert!(owner.pubsub.volatile.is_empty());
+        assert!(owner.volatile.is_empty());
     }
 
     fn message_register_receipts(owner: &mut Owner) {
@@ -7957,7 +8032,7 @@ mod tests {
                 ..
             }
         )));
-        assert!(owner.pubsub.volatile.is_empty());
+        assert!(owner.volatile.is_empty());
         assert_eq!(owner.counters.operation, counters.operation);
         assert_eq!(owner.counters.publication, counters.publication);
         assert_eq!(owner.counters.payload, counters.payload);
