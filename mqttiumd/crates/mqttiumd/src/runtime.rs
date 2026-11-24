@@ -182,7 +182,7 @@ impl Limits {
     }
 }
 const BOUNDS: Bounds = Bounds {
-    max_packet: net::MAX_PACKET_BYTES,
+    max_packet: codec::MAX_PACKET_BYTES,
     max_client_id: crate::writer::MAX_CLIENT,
     max_topic: crate::writer::MAX_TOPIC,
     max_payload: crate::writer::MAX_PAYLOAD,
@@ -240,7 +240,7 @@ struct Peer {
     /// yet given to the core: a packet behind a CONNECT that is still
     /// being opened, or a business packet the lane has no place for. The
     /// packets behind it stay with the transport, in order.
-    held_packet: Option<(u8, net::FrameBytes, net::FrameObservation)>,
+    held_packet: Option<(u8, codec::FrameBytes, net::FrameObservation)>,
     /// Since when a packet of this connection waits for a credit that
     /// other work holds. The results of the store return such credits; a
     /// wait during which the broker returned none for [`CAPACITY_WAIT`] is
@@ -258,7 +258,7 @@ struct Peer {
     /// bytes counted. The reader goes on behind a publication that waits
     /// for a slot of the window, because the PUBREL that frees one is
     /// behind it in the stream; what is not such a PUBREL waits here.
-    behind: VecDeque<(u8, net::FrameBytes, net::FrameObservation)>,
+    behind: VecDeque<(u8, codec::FrameBytes, net::FrameObservation)>,
     behind_bytes: usize,
     blocked_output: Option<EffectId>,
     retire_code: Option<&'static str>,
@@ -266,7 +266,7 @@ struct Peer {
 /// The packets kept behind a waiting publication: one more lane of them,
 /// and no more bytes than one packet of the largest size.
 const BEHIND_PACKETS: usize = net::INPUT_SLOTS;
-const BEHIND_BYTES: usize = net::MAX_PACKET_BYTES;
+const BEHIND_BYTES: usize = codec::MAX_PACKET_BYTES;
 
 /// The Packet Identifier of a raw PUBLISH above QoS 0. A packet too short
 /// to hold one has none: the codec refuses it when its turn comes.
@@ -310,8 +310,8 @@ impl Peer {
     /// rest stays with the transport.
     fn keep_behind(
         &mut self,
-        packet: (u8, net::FrameBytes, net::FrameObservation),
-    ) -> Result<(), (u8, net::FrameBytes, net::FrameObservation)> {
+        packet: (u8, codec::FrameBytes, net::FrameObservation),
+    ) -> Result<(), (u8, codec::FrameBytes, net::FrameObservation)> {
         let bytes = packet.1.len();
         if self.behind.len() >= BEHIND_PACKETS || self.behind_bytes + bytes > BEHIND_BYTES {
             return Err(packet);
@@ -1121,7 +1121,7 @@ impl Runtime<'_> {
             .try_send(net::Write {
                 expiry: None,
                 correlation: None,
-                bytes: net::FrameBytes::from(bytes),
+                bytes: codec::FrameBytes::from(bytes),
                 payload: None,
                 report: net::WriteReport::None,
             })
@@ -1430,7 +1430,7 @@ impl Runtime<'_> {
                 && self.work_reads.is_empty()
                 && self.frames.is_empty()
                 && self.timers.is_empty()
-                && self.owner.outbox().unwrap().is_empty();
+                && !self.owner.has_pending_effects();
             if complete {
                 self.events.emit("session_shutdown_completed", json!({"details":{"persistent_sessions":self.sessions.len(),"owner_bindings":status.bindings}})).map_err(event_failure)?;
                 return Ok(());
@@ -1810,7 +1810,7 @@ impl Runtime<'_> {
             + self.deferred_retries)
             .min(self.limits.drain_steps);
         let mut steps_taken = 0usize;
-        let mut outbox_len_at_dispatch = self.owner.outbox().map_or(0, |b| b.len());
+        let mut outbox_len_at_dispatch = self.owner.pending_effect_count();
         let mut dispatch_blocked = false;
         loop {
             let progress_before_pass = self.progress;
@@ -2451,14 +2451,16 @@ impl Runtime<'_> {
                 let must_dispatch = !applied
                     || !fast_batch_step
                     || cfg!(feature = "test-hooks")
-                    || self.owner.outbox().is_some_and(|box_| {
-                        box_.free_slots() < 16
-                            || (!dispatch_blocked
-                                && box_.len().saturating_sub(outbox_len_at_dispatch) >= 32)
-                    });
+                    || self.owner.free_effect_slots() < 16
+                    || (!dispatch_blocked
+                        && self
+                            .owner
+                            .pending_effect_count()
+                            .saturating_sub(outbox_len_at_dispatch)
+                            >= 32);
                 if must_dispatch {
                     let accepted = self.dispatch_returning_accepted()?;
-                    outbox_len_at_dispatch = self.owner.outbox().map_or(0, |b| b.len());
+                    outbox_len_at_dispatch = self.owner.pending_effect_count();
                     dispatch_blocked = accepted == 0 && outbox_len_at_dispatch > 0;
                 }
                 if applied
@@ -2517,7 +2519,7 @@ impl Runtime<'_> {
             step_budget = steps_taken
                 .saturating_add(extra)
                 .min(self.limits.drain_steps);
-            outbox_len_at_dispatch = self.owner.outbox().map_or(0, |b| b.len());
+            outbox_len_at_dispatch = self.owner.pending_effect_count();
             dispatch_blocked = false;
         }
         self.schedule_maintenance();
@@ -2638,7 +2640,7 @@ impl Runtime<'_> {
 
     fn dispatch_returning_accepted(&mut self) -> Result<usize, Failure> {
         #[cfg(not(feature = "test-hooks"))]
-        if self.owner.outbox().is_some_and(|box_| box_.is_empty()) {
+        if !self.owner.has_pending_effects() {
             return Ok(0);
         }
         if self.timers_dirty && self.timers.len() >= self.limits.timers.saturating_sub(16) {
@@ -3351,7 +3353,7 @@ impl Runtime<'_> {
                 .try_send(net::Write {
                     expiry: None,
                     correlation: None,
-                    bytes: net::FrameBytes::from(bytes),
+                    bytes: codec::FrameBytes::from(bytes),
                     payload: None,
                     report: net::WriteReport::Complete,
                 })
@@ -3434,7 +3436,7 @@ impl Runtime<'_> {
         &mut self,
         generation: ConnectionGeneration,
         first: u8,
-        body: impl Into<net::FrameBytes>,
+        body: impl Into<codec::FrameBytes>,
     ) -> Result<(), Failure> {
         let observed = self.clock.read().map(|reading| MessageTime {
             domain: reading.domain,
@@ -3475,7 +3477,7 @@ impl Runtime<'_> {
                     .outgoing
                     .try_send(net::Write {
                         correlation: None,
-                        bytes: net::FrameBytes::from(bytes),
+                        bytes: codec::FrameBytes::from(bytes),
                         payload: None,
                         expiry: None,
                         report: net::WriteReport::Complete,
@@ -3523,7 +3525,7 @@ impl Runtime<'_> {
                     .try_send(net::Write {
                         expiry: None,
                         correlation: None,
-                        bytes: net::FrameBytes::from(bytes),
+                        bytes: codec::FrameBytes::from(bytes),
                         payload: None,
                         report: net::WriteReport::Complete,
                     })
@@ -3541,7 +3543,7 @@ impl Runtime<'_> {
         &mut self,
         generation: ConnectionGeneration,
         first: u8,
-        body: impl Into<net::FrameBytes>,
+        body: impl Into<codec::FrameBytes>,
         observed: net::FrameObservation,
     ) -> Result<(), Failure> {
         let body = body.into();
@@ -3595,7 +3597,7 @@ impl Runtime<'_> {
                             .try_send(net::Write {
                                 expiry: None,
                                 correlation: None,
-                                bytes: net::FrameBytes::from(bytes),
+                                bytes: codec::FrameBytes::from(bytes),
                                 payload: None,
                                 report: net::WriteReport::Complete,
                             })
@@ -3751,7 +3753,7 @@ impl Runtime<'_> {
                             .try_send(net::Write {
                                 expiry: None,
                                 correlation: None,
-                                bytes: net::FrameBytes::from(bytes),
+                                bytes: codec::FrameBytes::from(bytes),
                                 payload: None,
                                 report: net::WriteReport::Complete,
                             })
@@ -3894,7 +3896,7 @@ impl Runtime<'_> {
                         self.events.emit("publish_waiting_wire",json!({"connection":generation.get().to_string(),"details":{"publish_order":ingress_order.to_string()}})).map_err(event_failure)?;
                         return Ok(());
                     }
-                    let bytes = net::FrameBytes::from_slice(&[0xe0, 2, 0x93, 0]);
+                    let bytes = codec::FrameBytes::from_slice(&[0xe0, 2, 0x93, 0]);
                     if p.version != Some(codec::Version::V311)
                         && bytes.len() <= p.max_packet
                         && p.io
@@ -4148,9 +4150,7 @@ impl Runtime<'_> {
                     }
                     let backpressured = self.peers.get_mut(&generation).is_some_and(|peer| {
                         if let Some(effect) = peer.blocked_output
-                            && self.owner.outbox().is_some_and(|outbox| {
-                                outbox.pending().any(|pending| pending.id() == effect)
-                            })
+                            && self.owner.holds_effect(effect)
                         {
                             peer.io.terminal_reason().is_none()
                         } else {
@@ -5189,7 +5189,7 @@ impl EffectSink for Sink<'_, '_> {
                             .try_send(net::Write {
                                 expiry: None,
                                 correlation: None,
-                                bytes: net::FrameBytes::from(bytes),
+                                bytes: codec::FrameBytes::from(bytes),
                                 payload: None,
                                 report: net::WriteReport::Complete,
                             })
@@ -5418,7 +5418,7 @@ impl EffectSink for Sink<'_, '_> {
                     let _ = peer.io.outgoing.try_send(net::Write {
                         expiry: None,
                         correlation: None,
-                        bytes: net::FrameBytes::from(bytes),
+                        bytes: codec::FrameBytes::from(bytes),
                         payload: None,
                         report: net::WriteReport::Complete,
                     });
@@ -5454,7 +5454,7 @@ impl EffectSink for Sink<'_, '_> {
                     let _ = peer.io.outgoing.try_send(net::Write {
                         expiry: None,
                         correlation: None,
-                        bytes: net::FrameBytes::from(bytes),
+                        bytes: codec::FrameBytes::from(bytes),
                         payload: None,
                         report: net::WriteReport::Complete,
                     });
@@ -5473,7 +5473,7 @@ impl EffectSink for Sink<'_, '_> {
                     let _ = p.io.outgoing.try_send(net::Write {
                         expiry: None,
                         correlation: None,
-                        bytes: net::FrameBytes::from(
+                        bytes: codec::FrameBytes::from(
                             codec::encode(OutboundFrame::Pubrec {
                                 packet_id: admission.source.packet_id,
                                 reason: mqttiumd_contract::packet::AckReason::Success,
@@ -5498,7 +5498,7 @@ impl EffectSink for Sink<'_, '_> {
                     let _ = p.io.outgoing.try_send(net::Write {
                         expiry: None,
                         correlation: None,
-                        bytes: net::FrameBytes::from(
+                        bytes: codec::FrameBytes::from(
                             codec::encode(OutboundFrame::Puback {
                                 packet_id: admission.source.packet_id,
                                 reason: mqttiumd_contract::packet::PubackReason::Success,
@@ -5810,7 +5810,7 @@ impl EffectSink for Sink<'_, '_> {
                                 .try_send(net::Write {
                                     expiry: None,
                                     correlation: None,
-                                    bytes: net::FrameBytes::from(bytes),
+                                    bytes: codec::FrameBytes::from(bytes),
                                     payload: None,
                                     report: net::WriteReport::Complete,
                                 })
@@ -6354,7 +6354,7 @@ pub fn run(config: Config) -> Result<(), Failure> {
     events.emit("starting",json!({"details":{"test_hooks":cfg!(feature="test-hooks"),"sqlite_kill_points":mqttiumd_store_sqlite::KILL_POINTS_ENABLED}})).map_err(event_failure)?;
     let policy = security
         .as_ref()
-        .map(|security| security.policy.storage().clone());
+        .map(|security| security.policy.storage_policy());
     let use_direct = matches!(
         config.storage_mode,
         crate::writer::StorageMode::Volatile { .. }
@@ -6415,17 +6415,7 @@ pub fn run(config: Config) -> Result<(), Failure> {
     }
     cancel.store(true, Ordering::Relaxed);
     // Stop is queued after already accepted work. No accepted command is called rejected.
-    let deadline = Instant::now() + Duration::from_secs(5);
-    let mut stop_sent = false;
-    while Instant::now() < deadline && !writer.is_finished() {
-        if !stop_sent && writer.sender.try_send(Request::Stop).is_ok() {
-            stop_sent = true;
-        }
-        while writer.receiver.try_recv().is_ok() {}
-        while writer.control_receiver.try_recv().is_ok() {}
-        thread::sleep(Duration::from_millis(2));
-    }
-    if !writer.is_finished() {
+    if !writer.stop_within(Instant::now() + Duration::from_secs(5)) {
         let _ = events.emit(
             "shutdown_incomplete",
             json!({"details":{"code":"writer_deadline","accepted_outcome":"unknown"}}),
@@ -6449,6 +6439,17 @@ struct Acceptor {
 }
 
 impl Acceptor {
+    /// The next accepted connection, if one waits. The acceptor stops
+    /// after a failure to accept, and a stopped acceptor is a failure too:
+    /// both are `accept_failed`.
+    fn try_accept(&self) -> Result<Option<std::net::TcpStream>, Failure> {
+        match self.accepted.try_recv() {
+            Ok(Ok(stream)) => Ok(Some(stream)),
+            Ok(Err(())) | Err(TryRecvError::Disconnected) => Err(Failure::plain("accept_failed")),
+            Err(TryRecvError::Empty) => Ok(None),
+        }
+    }
+
     fn spawn(
         listener: TcpListener,
         cancel: Arc<AtomicBool>,
@@ -6515,34 +6516,6 @@ fn check_startup_cancel(cancel: &AtomicBool) -> Result<(), Failure> {
         Ok(())
     }
 }
-fn startup_reply<T>(
-    receiver: &std::sync::mpsc::Receiver<T>,
-    cancel: &AtomicBool,
-    deadline: Instant,
-    code: &'static str,
-) -> Result<T, Failure> {
-    loop {
-        // An already produced typed failure is read before observing the stop
-        // flag. Cancelling an outstanding request never calls it rejected.
-        match receiver.try_recv() {
-            Ok(reply) => return Ok(reply),
-            Err(TryRecvError::Disconnected) => return Err(Failure::plain("writer_disconnected")),
-            Err(TryRecvError::Empty) => {}
-        }
-        check_startup_cancel(cancel)?;
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            return Err(Failure::plain(code));
-        }
-        match receiver.recv_timeout(remaining.min(Duration::from_millis(10))) {
-            Ok(reply) => return Ok(reply),
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                return Err(Failure::plain("writer_disconnected"));
-            }
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
-        }
-    }
-}
 #[allow(clippy::too_many_arguments)]
 fn run_inner(
     listen: &SocketAddr,
@@ -6558,11 +6531,7 @@ fn run_inner(
     let (boot, wake) = match (&mut writer, direct_boot) {
         (StoreHandle::Direct(_), Some(boot)) => (boot, crate::wake::Wake::new()),
         (StoreHandle::Threaded(w), None) => {
-            let boot = w
-                .boot
-                .recv_timeout(Duration::from_secs(10))
-                .map_err(|_| Failure::plain("startup_deadline"))??;
-            (boot, w.wake.clone())
+            (w.await_boot(Duration::from_secs(10))?, w.wake.clone())
         }
         _ => return Err(Failure::plain("startup_protocol")),
     };
@@ -6740,17 +6709,9 @@ fn run_inner(
             check_startup_cancel(&cancel)?;
             let response = match runtime.writer.exec_recovery(cursor)? {
                 Some(reply) => reply,
-                None => {
-                    let StoreHandle::Threaded(w) = &runtime.writer else {
-                        return Err(Failure::plain("recovery_protocol"));
-                    };
-                    startup_reply(
-                        &w.receiver,
-                        &cancel,
-                        Instant::now() + Duration::from_secs(10),
-                        "recovery_deadline",
-                    )?
-                }
+                None => runtime
+                    .writer
+                    .await_recovery_reply(&cancel, Duration::from_secs(10))?,
             };
             let Response::Recovery(page) = response else {
                 return Err(Failure::plain("recovery_protocol"));
@@ -6814,17 +6775,7 @@ fn run_inner(
                 }
                 let reply = match runtime.writer.exec_closed_collection(collection)? {
                     Some(reply) => reply,
-                    None => {
-                        let StoreHandle::Threaded(w) = &runtime.writer else {
-                            return Err(Failure::plain("startup_collection_protocol"));
-                        };
-                        startup_reply(
-                            &w.control_receiver,
-                            &cancel,
-                            deadline,
-                            "startup_collection_deadline",
-                        )?
-                    }
+                    None => runtime.writer.await_collection_reply(&cancel, deadline)?,
                 };
                 let ControlResponse::Closed {
                     collection: found,
@@ -6910,7 +6861,7 @@ fn run_inner(
         } else {
             "tcp-will-pubsub-v1"
         };
-        let mut readiness = json!({"details":{"address":address.to_string(),"epoch":epoch.get().to_string(),"incarnation":incarnation.get().to_string(),"max_connections":limits.connections,"max_sessions":crate::writer::SESSIONS,"max_packet_bytes":net::MAX_PACKET_BYTES,"max_client_id_bytes":crate::writer::MAX_CLIENT,"max_topic_bytes":crate::writer::MAX_TOPIC,"max_payload_bytes":crate::writer::MAX_PAYLOAD,"receive_maximum":crate::receiving::MAXIMUM,"max_exchange_slots":max_exchanges,"input_slots":net::INPUT_SLOTS,"output_slots":net::OUTPUT_SLOTS,"writer_slots":crate::writer::QUEUE,"commands_in_flight":limits.in_flight,"max_timers":limits.timers,"receipt_slots":crate::writer::limits().receipt_slots.get(),"partial_packet_ms":5000,"connect_ms":3000,"write_ms":250,"remembered_connections":8,"max_subscriptions":mqttiumd_contract::pubsub::MAX_SUBSCRIPTIONS,"max_targets":mqttiumd_contract::retained::MAX_RETAIN_MASK_TARGETS,"outgoing_per_connection":8,"outgoing_metadata":limits.outgoing_bindings,"outgoing_packet_identifier_max":65535,"outgoing_packet_identifier_probe_limit":129,"outgoing_payload_bytes":64*1024*1024,"work_page_items":8,"work_scan_ms":100,"wildcard_subscriptions":true,"no_local":true,"shared_subscriptions":false,"subscription_identifiers":false,"sqlite_schema":sqlite_schema,"retained_available":true,"retained_topics":mqttiumd_contract::retained::MAX_RETAINED_TOPICS,"retained_bytes":mqttiumd_contract::retained::MAX_RETAINED_BYTES,"max_replay_candidates":mqttiumd_contract::retained::MAX_REPLAYS,"profile":profile}});
+        let mut readiness = json!({"details":{"address":address.to_string(),"epoch":epoch.get().to_string(),"incarnation":incarnation.get().to_string(),"max_connections":limits.connections,"max_sessions":crate::writer::SESSIONS,"max_packet_bytes":codec::MAX_PACKET_BYTES,"max_client_id_bytes":crate::writer::MAX_CLIENT,"max_topic_bytes":crate::writer::MAX_TOPIC,"max_payload_bytes":crate::writer::MAX_PAYLOAD,"receive_maximum":crate::receiving::MAXIMUM,"max_exchange_slots":max_exchanges,"input_slots":net::INPUT_SLOTS,"output_slots":net::OUTPUT_SLOTS,"writer_slots":crate::writer::QUEUE,"commands_in_flight":limits.in_flight,"max_timers":limits.timers,"receipt_slots":crate::writer::limits().receipt_slots.get(),"partial_packet_ms":5000,"connect_ms":3000,"write_ms":250,"remembered_connections":8,"max_subscriptions":mqttiumd_contract::pubsub::MAX_SUBSCRIPTIONS,"max_targets":mqttiumd_contract::retained::MAX_RETAIN_MASK_TARGETS,"outgoing_per_connection":8,"outgoing_metadata":limits.outgoing_bindings,"outgoing_packet_identifier_max":65535,"outgoing_packet_identifier_probe_limit":129,"outgoing_payload_bytes":64*1024*1024,"work_page_items":8,"work_scan_ms":100,"wildcard_subscriptions":true,"no_local":true,"shared_subscriptions":false,"subscription_identifiers":false,"sqlite_schema":sqlite_schema,"retained_available":true,"retained_topics":mqttiumd_contract::retained::MAX_RETAINED_TOPICS,"retained_bytes":mqttiumd_contract::retained::MAX_RETAINED_BYTES,"max_replay_candidates":mqttiumd_contract::retained::MAX_REPLAYS,"profile":profile}});
         if let Some(details) = readiness["details"].as_object_mut() {
             details.insert("storage_mode".into(), json!(storage_mode.mode_name()));
             details.insert(
@@ -6924,7 +6875,7 @@ fn run_inner(
         }
         if let Some(security) = &runtime.security {
             events.emit("tls_profile", json!({"details":{"version":"TLS1.3","client_certificate":"required",
-                "policy_fingerprint":hex_domain(security.policy.storage().fingerprint),"max_handshakes":security::MAX_UNAUTHENTICATED,
+                "policy_fingerprint":hex_domain(security.policy.fingerprint()),"max_handshakes":security::MAX_UNAUTHENTICATED,
                 "handshake_ms":security::HANDSHAKE_TIMEOUT.as_millis() as u64,"handshake_bytes":security::HANDSHAKE_BYTES,
                 "certificate_bytes":security::CERT_BYTES,"chain_bytes":security::CHAIN_BYTES,"chain_certificates":security::CHAIN_CERTS,
                 "tls_buffer_bytes":security::TLS_BUFFER_BYTES,"resumption":false,"early_data":false}})).map_err(event_failure)?;
@@ -6957,17 +6908,11 @@ fn run_inner(
                     if !runtime.admits_handshake() {
                         break;
                     }
-                    match acceptor.accepted.try_recv() {
-                        Ok(Ok(stream)) => {
-                            runtime.progress = runtime.progress.wrapping_add(1);
-                            let _ = runtime.accept(stream)?;
-                        }
-                        Ok(Err(())) => return Err(Failure::plain("accept_failed")),
-                        Err(TryRecvError::Empty) => break,
-                        Err(TryRecvError::Disconnected) => {
-                            return Err(Failure::plain("accept_failed"));
-                        }
-                    }
+                    let Some(stream) = acceptor.try_accept()? else {
+                        break;
+                    };
+                    runtime.progress = runtime.progress.wrapping_add(1);
+                    let _ = runtime.accept(stream)?;
                 }
                 runtime.turn()?;
                 let idle = runtime.progress == before;

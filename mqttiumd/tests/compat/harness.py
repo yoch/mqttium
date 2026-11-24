@@ -416,13 +416,23 @@ class Player:
             return {**record, "got": [], "end": "not-open"}
         got: list[dict] = []
         end = "timeout"
+        packet_id = step.get("suback")
+        if packet_id is not None and not connection.ended:
+            got, end = self.read(name, deadline=time.monotonic() + step["timeout"],
+                                 until=lambda packet: packet["type"] == "SUBACK"
+                                 and packet.get("packet_id") == packet_id)
+            if end == "timeout":
+                return {**record, "got": got, "end": "no-suback", **SORT[bool(step["sort"])]}
+            if end in CLOSED:
+                return {**record, "got": got, "end": end, **SORT[bool(step["sort"])]}
         if step["ping"] and not connection.ended:
             self.write(connection, wire.pingreq())
-            got, end = self.read(name, deadline=time.monotonic() + step["timeout"],
-                                 until=lambda packet: packet["type"] == "PINGRESP")
+            pinged, end = self.read(name, deadline=time.monotonic() + step["timeout"],
+                                    until=lambda packet: packet["type"] == "PINGRESP")
             if end == "ok":
-                got.pop()
-            elif end == "timeout":
+                pinged.pop()
+            got += pinged
+            if end == "timeout":
                 return {**record, "got": got, "end": "no-pingresp"}
         if end not in CLOSED:
             more, end = self.silent(name, window=step["window"], limit=step["limit"])

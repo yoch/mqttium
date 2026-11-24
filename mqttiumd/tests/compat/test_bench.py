@@ -346,6 +346,28 @@ def trickling(count, gap):
     return answer
 
 
+def acknowledged_late(delay, *, answer_subscribe=True):
+    """Answers PINGREQ at once, and a SUBSCRIBE `delay` seconds later with
+    its SUBACK and a retained message, as a broker does whose SUBACK waits
+    for a durable commit; with `answer_subscribe=False`, never. `delay` may
+    map a Packet Identifier to its own delay."""
+    def later(connection, packet_id):
+        time.sleep(delay[packet_id] if isinstance(delay, dict) else delay)
+        try:
+            connection.sendall(wire.suback(packet_id, [0]) + wire.publish("t", f"kept{packet_id}", retain=True))
+        except OSError:
+            return
+
+    def answer(connection, packet):
+        if packet["type"] == "CONNECT":
+            connection.sendall(wire.connack())
+        elif packet["type"] == "PINGREQ":
+            connection.sendall(wire.pingresp())
+        elif packet["type"] == "SUBSCRIBE" and answer_subscribe:
+            threading.Thread(target=later, args=(connection, packet["packet_id"]), daemon=True).start()
+    return answer
+
+
 def one_at_a_time(payloads, *, packet_id=1):
     """Sends the SUBACK of a subscription and one retained QoS 1 message,
     and each next one only when the one before is acknowledged, all under
@@ -498,6 +520,32 @@ class Stability(unittest.TestCase):
         # that follows the PINGRESP, and no gap between two of them does.
         raw = self.play(trickling(8, 0.1), [*SUBSCRIBED, dsl.collect("a", window=0.3)])
         self.assertEqual(self.payloads(raw[-1]), [f"r{index}" for index in range(8)])
+        self.assertEqual(raw[-1]["end"], "quiet")
+
+    def test_a_collect_after_a_subscribe_waits_for_its_suback(self):
+        # The SUBACK comes 0.5 s after a PINGRESP that comes at once: a
+        # PINGREQ round trip and a window of 0.3 s end before it.
+        raw = self.play(acknowledged_late(0.5), [*SUBSCRIBED, dsl.collect("a", sort=True, suback=1)])
+        self.assertEqual([packet["type"] for packet in raw[-1]["got"]], ["SUBACK", "PUBLISH"])
+        self.assertEqual(raw[-1]["end"], "quiet")
+
+    def test_a_suback_that_never_comes_is_recorded_as_such(self):
+        raw = self.play(acknowledged_late(0, answer_subscribe=False),
+                        [*SUBSCRIBED, dsl.collect("a", sort=True, suback=1, timeout=0.5)])
+        self.assertEqual(raw[-1]["got"], [])
+        self.assertEqual(raw[-1]["end"], "no-suback")
+        # The comparable form keeps it: it is not a quiet step.
+        self.assertEqual(normalize.normalize([raw[-1]], PLAIN)[0]["end"], "no-suback")
+
+    def test_the_suback_of_an_earlier_subscribe_does_not_end_the_wait(self):
+        # The first SUBACK comes during the wait for the second, and the
+        # second a second later, past the window that would follow a wait
+        # ended by the first.
+        steps = [*SUBSCRIBED, dsl.quiet("a", window=0.1),
+                 dsl.send("a", wire.subscribe(2, [("t/#", 1)])), dsl.collect("a", sort=True, suback=2, window=0.2)]
+        raw = self.play(acknowledged_late({1: 0.5, 2: 1.5}), steps)
+        identifiers = [packet["packet_id"] for packet in raw[-1]["got"] if packet["type"] == "SUBACK"]
+        self.assertEqual(identifiers[-1], 2)
         self.assertEqual(raw[-1]["end"], "quiet")
 
     def test_a_peer_that_never_falls_silent_is_recorded_as_such(self):

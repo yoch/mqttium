@@ -233,6 +233,17 @@ stable:
   packets still come after ten seconds. The PINGRESP of the round trip
   does not mark the end of an answer: a broker may answer PINGREQ before
   it has finished a replay that goes through its store.
+- A SUBSCRIBE sent without waiting for its SUBACK
+  (`subscribe(..., expect=0)`, so that the retained messages and the
+  SUBACK are read in one step) is followed by `collect(..., suback=N)`
+  with its Packet Identifier: the step reads up to that SUBACK first,
+  within the same wait as an expected packet. `mqttiumd` sends the SUBACK
+  of a durable subscription after its commit and answers PINGREQ at once,
+  so a round trip and the silent window alone can end before it. A
+  SUBACK that does not come ends the step as `no-suback`. A retained
+  message at QoS 0 still leaves `mqttiumd` after one more commit, past
+  the SUBACK: on a machine whose commits take longer than the window, it
+  can still miss the step.
 - Keep apart what a broker owes and what it may shed, in two scenarios
   when one exchange asks both questions:
   - what it owes whatever the timing (QoS 1 deliveries, the content of

@@ -18,7 +18,7 @@ use mqttiumd_contract::packet::{InboundPacket, Qos};
 static NEXT: AtomicU64 = AtomicU64::new(0);
 
 const BOUNDS: Bounds = Bounds {
-    max_packet: mqttiumd::net::MAX_PACKET_BYTES,
+    max_packet: mqttiumd::codec::MAX_PACKET_BYTES,
     max_client_id: 1024,
     max_topic: 1024,
     max_payload: 1_048_576,

@@ -21,9 +21,11 @@ use crate::ids::{
     ExchangeId, InboundPacketId, LogicalDuration, LogicalOwnerId, LogicalTime, OperationId,
     OutboundPacketId, OutboxSerial, PublicationId, Revision, RunEpoch, SessionId, StoreIncarnation,
 };
-use crate::message_expiry::{ExpiredDelivery, MessageExpiry, MessageExpiryBlock, MessageTime};
+use crate::message::{Qos, SharedBytes};
+use crate::message_expiry::ExpiredDelivery;
+use crate::message_time::{MessageExpiry, MessageExpiryBlock, MessageTime};
 use crate::outcome::{EpochGrant, Knowledge, StoreReply};
-use crate::packet::{InboundPacket, OutboundFrame, Qos, Qos2Ack, SharedBytes};
+use crate::packet::{InboundPacket, OutboundFrame, Qos2Ack};
 use crate::pubsub::{
     DeliveryClaim, DeliveryDiscardReason, PubackTarget, Qos0DropReason, Qos0Origin, WorkItem,
 };

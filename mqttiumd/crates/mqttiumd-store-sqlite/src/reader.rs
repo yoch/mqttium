@@ -195,7 +195,6 @@ impl Meter {
 /// Preflight the frozen read snapshot, with a stop at the first row or field
 /// beyond budget. Materialisation happens only after the whole preflight.
 pub(crate) fn snapshot(conn: &Connection, meta: &Meta, budget: ReadBudget) -> Result<(), Fault> {
-    super::will::receipt_capacity(conn, &[])?;
     let mut meter = Meter::new(budget);
     budget.check_field(8)?;
     if meta.ledger.opened_by().is_some() {

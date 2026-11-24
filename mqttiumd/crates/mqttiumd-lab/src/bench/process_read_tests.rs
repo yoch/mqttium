@@ -1,8 +1,8 @@
 use super::*;
 use crate::bench::backend::Memory;
-use crate::bench::campaign::Setup;
 use crate::bench::collector::KindTable;
 use crate::bench::failure::{Failure, ReadCause};
+use crate::bench::setup::Setup;
 use crate::store::durable::MemoryStore;
 use mqttiumd_contract::command::{Command, EpochLedger, OpenEpoch};
 use mqttiumd_contract::outcome::{OpeningOutcome, StoreOutcome};

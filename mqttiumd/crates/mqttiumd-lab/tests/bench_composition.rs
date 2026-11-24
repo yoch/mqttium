@@ -10,9 +10,9 @@ use std::fs;
 
 use mqttiumd_contract::ids::{LogicalOwnerId, RunEpoch};
 use mqttiumd_lab::bench::backend::Memory;
-use mqttiumd_lab::bench::campaign::Setup;
 use mqttiumd_lab::bench::collector::{Collector, KindTable};
 use mqttiumd_lab::bench::process::{Books, OWNER, Process};
+use mqttiumd_lab::bench::setup::Setup;
 use mqttiumd_lab::store::durable::MemoryStore;
 
 use bench_support::root;

@@ -18,10 +18,10 @@ use std::fs;
 
 use mqttiumd_contract::ids::{ConnectionGeneration, InboundPacketId};
 use mqttiumd_lab::bench::backend::Memory;
-use mqttiumd_lab::bench::campaign::Setup;
 use mqttiumd_lab::bench::collector::{Collector, KindTable, Origin};
 use mqttiumd_lab::bench::mqtt::peer;
 use mqttiumd_lab::bench::process::{Books, Choice, Process};
+use mqttiumd_lab::bench::setup::Setup;
 use mqttiumd_lab::store::adapter::{FaultAction, FaultPoint, FaultSpec, StoreAction, WorkKind};
 use mqttiumd_lab::store::durable::MemoryStore;
 use serde_json::json;

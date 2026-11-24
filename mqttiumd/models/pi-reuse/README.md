@@ -154,7 +154,7 @@ not by an unbounded complexity claim from this tiny domain.
 
 | Model action | Implementation predicate | Replay |
 | - | - | - |
-| `Reserve` | `State::free_packet_id` and `State::reserves_packet_id` count all live claims. | `mut-occupied`, `reach-reuse`; `an_applied_finish_reuses_a_free_identifier_after_the_historical_ceiling`, `a_submitted_unknown_claim_reserves_its_identifier_before_any_publish_or_callback`. |
+| `Reserve` | `Owner::free_packet_id` and `Owner::reserves_packet_id` count all live claims. | `mut-occupied`, `reach-reuse`; `an_applied_finish_reuses_a_free_identifier_after_the_historical_ceiling`, `a_submitted_unknown_claim_reserves_its_identifier_before_any_publish_or_callback`. |
 | `ClaimCommit` | Canonical guarded Claim commits with the original OperationId. | Safety configurations; store test `lost_claim_and_finish_reply_resolve_without_new_identity`. |
 | `ClaimKnown` | Validated direct result or same-operation resolution makes output eligible. | Safety configurations; core test `an_unknown_claim_keeps_its_packet_identifier_unavailable`. |
 | `RecoverClaim` | Complete recovery inventories stored outgoing claims before payload loading. | `reach-recovery-before-payload`; `the_complete_small_domain_counts_unknown_finish_and_unloaded_recovered_claims`. |

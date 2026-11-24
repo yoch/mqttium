@@ -135,7 +135,7 @@ pub(super) fn open(state: &mut DurableState, command: &SessionLifecycle) -> Guar
             now: *now,
         },
     };
-    let facts = state.stage_session(&legacy)?;
+    let facts = state.change_session(&legacy)?;
     if let (Some(spec), CommitFacts::SessionLifecycle(SessionChange::Opened { session, .. })) =
         (will, facts)
     {
@@ -181,7 +181,7 @@ pub(super) fn end(state: &mut DurableState, command: &SessionLifecycle) -> Guard
             state.wills.remove(&guard.opened_by.ok_or(failed)?);
         }
     }
-    state.stage_session(&SessionLifecycle {
+    state.change_session(&SessionLifecycle {
         operation: command.operation,
         action: SessionAction::Detach {
             guard,

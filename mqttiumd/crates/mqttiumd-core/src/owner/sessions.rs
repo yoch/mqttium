@@ -117,9 +117,9 @@ impl Owner {
                 .iter()
                 .filter(|s| s.retired && s.in_flight().is_some())
                 .count()
-                + self.pubsub.retired_flights(),
+                + self.retired_flights(),
             inbound: self.slots.len(),
-            outgoing: self.pubsub.deliveries.len() + self.pubsub.volatile.len(),
+            outgoing: self.deliveries.len() + self.volatile.len(),
             closed_generations: self.closed.len(),
             lifecycle_pending: self.lifecycle.is_some(),
         }
@@ -186,7 +186,7 @@ impl Owner {
         if self.is_closed(connection) {
             return Ok(super::Change::Nothing);
         }
-        if self.lifecycle.is_some() || self.pubsub.control_pending() {
+        if self.lifecycle.is_some() || self.control_pending() {
             return Err(waiting());
         }
         if self.session_of(connection).is_some() {
@@ -293,7 +293,7 @@ impl Owner {
         if expiry.deadline(observed_at).is_none() {
             return Err(IMPOSSIBLE);
         }
-        if self.lifecycle.is_some() || self.pubsub.control_pending() {
+        if self.lifecycle.is_some() || self.control_pending() {
             return Err(waiting());
         }
         draft.end(connection.generation)?;
@@ -336,7 +336,7 @@ impl Owner {
         {
             return Ok(super::Change::Nothing);
         }
-        if self.lifecycle.is_some() || self.pubsub.control_pending() {
+        if self.lifecycle.is_some() || self.control_pending() {
             return Err(waiting());
         }
         draft.end(connection.generation)?;
@@ -382,7 +382,7 @@ impl Owner {
         if expiry == SessionExpiry::OnDisconnect || expiry.deadline(observed_at).is_none() {
             return Err(IMPOSSIBLE);
         }
-        if self.lifecycle.is_some() || self.pubsub.control_pending() {
+        if self.lifecycle.is_some() || self.control_pending() {
             return Err(waiting());
         }
         draft.end(connection.generation)?;
@@ -423,7 +423,7 @@ impl Owner {
         {
             return Ok(super::Change::Nothing);
         }
-        if self.lifecycle.is_some() || self.pubsub.control_pending() {
+        if self.lifecycle.is_some() || self.control_pending() {
             return Err(waiting());
         }
         // This transportless flight never emits a frame/close or exposes the
@@ -967,7 +967,7 @@ impl Owner {
     fn retire_session(&mut self, session: SessionId) -> Result<(), CoreFault> {
         if let Some(&index) = self.session_by_id.get(&session) {
             if let Some(generation) = self.sessions.as_slice()[index].connection {
-                self.pubsub.close(generation);
+                self.close_outgoing(generation);
             }
             let _ = self.remove_session_at(index)?;
         }
@@ -1005,7 +1005,7 @@ impl Owner {
             }
             let _ = self.remove_slot_at(index)?;
         }
-        self.pubsub.retire_session(session);
+        self.retire_outgoing(session);
         Ok(())
     }
 }
@@ -1047,7 +1047,7 @@ mod tests {
         sink.0.into_iter().map(OwnedEffect::into_parts).collect()
     }
     fn apply(owner: &mut Owner, input: Input) -> Vec<(EffectId, Effect)> {
-        let result = owner.step(input, TURN);
+        let result = owner.step_checked(input, TURN);
         assert!(
             matches!(result, StepOutcome::Applied { .. }),
             "session_lifecycle_not_applied: {result:?}"
@@ -1405,7 +1405,7 @@ mod tests {
             1,
             "session_capacity_released_before_close_commit"
         );
-        let result = owner.step(
+        let result = owner.step_checked(
             Input::OpenSession {
                 connection: ConnectionGeneration::new(2),
                 client_id: bytes(b"other"),
@@ -1463,7 +1463,7 @@ mod tests {
         known(&mut owner, &first, opened(1, SessionExpiry::Never));
         let before = owner.sessions.as_slice().to_vec();
         let counters = owner.counters;
-        let result = owner.step(
+        let result = owner.step_checked(
             Input::OpenSession {
                 connection: ConnectionGeneration::new(2),
                 client_id: bytes(b"persistent"),
@@ -1581,7 +1581,7 @@ mod tests {
         };
         assert!(
             matches!(
-                owner.step(input, TURN),
+                owner.step_checked(input, TURN),
                 StepOutcome::Fatal(CoreFault::ContradictoryOutcome { .. })
             ),
             "committed_creation_exceeds_owner_capacity"
@@ -2104,7 +2104,7 @@ mod tests {
             },
         );
         let flight = owner.lifecycle.as_ref().unwrap().clone();
-        let outcome = owner.step(
+        let outcome = owner.step_checked(
             Input::StoreResult {
                 effect: flight.in_flight.answers.persist_id(),
                 operation: flight.command.operation,
@@ -2229,7 +2229,7 @@ mod tests {
         {
             *session_present = true;
         }
-        let outcome = owner.step(
+        let outcome = owner.step_checked(
             Input::StoreResult {
                 effect: flight.in_flight.answers.persist_id(),
                 operation: flight.command.operation,
@@ -2282,7 +2282,7 @@ mod tests {
                         }),
                     },
                 ];
-                let outcome = owner.step(
+                let outcome = owner.step_checked(
                     Input::Recovery {
                         facts: BoundedVec::from_slice(&facts, facts.len()).unwrap(),
                         last: true,

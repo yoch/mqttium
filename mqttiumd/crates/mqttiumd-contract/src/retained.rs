@@ -1,12 +1,12 @@
 //! Bounded retained values and transactional subscription replay (ADR 0032).
+use crate::canonical::RecipeError;
 use crate::capacity::BoundedVec;
-use crate::command::{
-    AdmitPublication, Costs, PayloadRef, Recipe, RecipeError, Target, UpdateSubscriptions,
-};
 use crate::ids::{
     ConnectionGeneration, OperationId, PayloadId, PublicationId, RequestId, Revision, SessionId,
 };
-use crate::packet::SharedBytes;
+use crate::message::SharedBytes;
+use crate::publication::{AdmitPublication, Costs, PayloadRef, Target};
+use crate::pubsub::UpdateSubscriptions;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
@@ -179,7 +179,7 @@ impl RetainMask {
     }
 
     pub(crate) fn decode_wide(
-        r: &mut crate::command::Reader<'_>,
+        r: &mut crate::canonical::Reader<'_>,
         target_count: usize,
         field: &'static str,
     ) -> Result<Self, RecipeError> {
@@ -232,76 +232,23 @@ pub struct ReplaySubscriptions {
     pub first_publication: PublicationId,
 }
 
-pub(crate) fn check(recipe: &Recipe) -> Result<(), RecipeError> {
-    match recipe {
-        Recipe::RetainedPublication(value) => value.check_retained(),
-        Recipe::RetainedQos0(value) => value.check_retained(),
-        Recipe::ReplaySubscriptions(value) => value.check_retained(),
-        _ => Err(RecipeError::InvalidField("retained_recipe")),
-    }
-}
-
-pub(crate) fn encode(recipe: &Recipe, out: &mut Vec<u8>) -> Result<(), RecipeError> {
-    match recipe {
-        Recipe::RetainedPublication(value) => value.encode_retained(out)?,
-        Recipe::ReplaySubscriptions(value) => value.encode_retained(out)?,
-        Recipe::RetainedQos0(value) => value.encode_retained(out)?,
-        _ => return Err(RecipeError::InvalidField("retained_recipe")),
-    }
-    Ok(())
-}
-
-pub(crate) fn decode(
-    kind: u8,
-    bytes: &mut &[u8],
-    max_targets: usize,
-    max_topic: usize,
-) -> Result<Recipe, RecipeError> {
-    use crate::capacity::{ExchangeSlots, PayloadBytes, ReceiptSlots, References};
-    use crate::command::{DeliveryCause, Reader};
-    use crate::ids::DeliveryId;
-    let mut r = Reader { bytes };
-    let recipe = if matches!(kind, 10 | 12 | 20) {
-        let len = r.u32()? as usize;
-        let nested = r.take(len)?;
-        // Reject nested extensions before decoding: depth is exactly one.
-        if nested.len() < 7
-            || (matches!(kind, 10 | 20) && nested[6] != 1)
-            || (kind == 12 && !matches!(nested[6], 7 | 9))
-        {
-            return Err(RecipeError::InvalidField("retained_nested_kind"));
+impl RetainedQos0 {
+    /// Kinds 11 and 21: a retained QoS 0 publication, its retain mask
+    /// narrow (11) or wide (21).
+    pub(crate) fn decode(
+        kind: u8,
+        bytes: &mut &[u8],
+        max_targets: usize,
+        max_topic: usize,
+    ) -> Result<Self, RecipeError> {
+        use crate::canonical::Reader;
+        use crate::capacity::{ExchangeSlots, PayloadBytes, ReceiptSlots, References};
+        use crate::ids::DeliveryId;
+        use crate::pubsub::DeliveryCause;
+        if !matches!(kind, 11 | 21) {
+            return Err(RecipeError::UnknownKind(kind));
         }
-        match Recipe::decode_canonical(nested, max_targets, max_topic)? {
-            Recipe::AdmitPublication(admission) if kind == 10 => {
-                if admission.targets.len() > LEGACY_MAX_TARGETS {
-                    return Err(RecipeError::InvalidField("retain_targets"));
-                }
-                Recipe::RetainedPublication(RetainedPublication {
-                    admission,
-                    retain_targets: RetainMask::from_u16(r.u16()?),
-                })
-            }
-            Recipe::AdmitPublication(admission) if kind == 20 => {
-                if admission.targets.len() <= LEGACY_MAX_TARGETS {
-                    return Err(RecipeError::InvalidField("noncanonical_wide_targets"));
-                }
-                let retain_targets =
-                    RetainMask::decode_wide(&mut r, admission.targets.len(), "retain_targets")?;
-                Recipe::RetainedPublication(RetainedPublication {
-                    admission,
-                    retain_targets,
-                })
-            }
-            Recipe::UpdateSubscriptions(update) if kind == 12 => {
-                Recipe::ReplaySubscriptions(ReplaySubscriptions {
-                    update,
-                    first_publication: PublicationId::from_be_slice(r.take(32)?)
-                        .map_err(|_| RecipeError::Truncated)?,
-                })
-            }
-            _ => return Err(RecipeError::InvalidField("retained_nested_kind")),
-        }
-    } else if matches!(kind, 11 | 21) {
+        let mut r = Reader { bytes };
         let wide = kind == 21;
         let operation = r.operation()?;
         let request = RequestId::from_be_slice(r.take(32)?).map_err(|_| RecipeError::Truncated)?;
@@ -370,7 +317,7 @@ pub(crate) fn decode(
         } else {
             RetainMask::from_u16(r.u16()?)
         };
-        Recipe::RetainedQos0(RetainedQos0 {
+        let value = RetainedQos0 {
             operation,
             request,
             publication,
@@ -384,12 +331,10 @@ pub(crate) fn decode(
             costs,
             targets,
             retain_targets,
-        })
-    } else {
-        return Err(RecipeError::UnknownKind(kind));
-    };
-    *bytes = r.bytes;
-    Ok(recipe)
+        };
+        *bytes = r.bytes;
+        Ok(value)
+    }
 }
 
 impl PartialEq for RetainedQos0 {
@@ -415,7 +360,7 @@ impl RetainedPublication {
     pub(crate) fn check_retained(&self) -> Result<(), RecipeError> {
         // Check the legacy-shaped payload without changing its encoding.
         self.admission.check_retained()?;
-        if self.admission.qos == crate::packet::Qos::AtMostOnce {
+        if self.admission.qos == crate::message::Qos::AtMostOnce {
             return Err(RecipeError::InvalidField("retained_qos"));
         }
         if !self.admission.retain {
@@ -432,7 +377,7 @@ impl RetainedQos0 {
             .targets
             .as_slice()
             .iter()
-            .any(|target| target.cause != crate::command::DeliveryCause::LiveExact)
+            .any(|target| target.cause != crate::pubsub::DeliveryCause::LiveExact)
         {
             return Err(RecipeError::InvalidField("admission_cause"));
         }

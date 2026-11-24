@@ -36,7 +36,6 @@ use serde_json::Value;
 use mqttiumd_contract::ids::{ConnectionGeneration, SessionId};
 
 use super::backend::sqlite_settings;
-use super::campaign::settings_of;
 use super::collector::{Cause, Collector, KindTable, Origin};
 use super::failure::{ControlCode, ControlPhase};
 use super::process::{Books, Choice, Process, Stop, Written};
@@ -44,8 +43,8 @@ use super::protocol::{
     Action, Evidence, Refusal, Report, Sequencer, Window, choices_digest, read_frame,
     resolve_choice, write_frame,
 };
-use super::runner::{Population, bound_exchanges, specification};
 use super::scenario::Scenario;
+use super::setup::settings_of;
 use mqttiumd_store_api::ReadPhase;
 
 /// How long the supervisor waits for one frame of a child before it stops
@@ -1283,30 +1282,19 @@ pub fn serve(arguments: &Arguments) -> Result<(), String> {
         &fixture,
         &arguments.run_id,
         arguments.seed,
-        scenario.faults.len(),
+        scenario.fault_count(),
     )?;
     settings.retained_enabled = scenario.uses_retained();
-    let population = Population {
-        clients: arguments
-            .sessions
-            .iter()
-            .map(|(name, id)| (name.clone(), Vec::new(), SessionId::new(*id)))
-            .collect(),
-    };
-    let bound = bound_exchanges(&scenario, &population).map_err(|error| error.to_string())?;
-    let mut faults = Vec::new();
-    for &index in &arguments.armed {
-        let fault = scenario
-            .faults
-            .get(index)
-            .ok_or_else(|| format!("no fault {index}"))?;
-        let name: &'static str = Box::leak(fault.id.clone().into_boxed_str());
-        faults.push((
-            index,
-            specification(fault, &bound).map_err(|error| error.to_string())?,
-            name,
-        ));
-    }
+    let faults = scenario.arm(
+        |client| {
+            arguments
+                .sessions
+                .iter()
+                .find(|(name, _)| name == client)
+                .map(|(_, id)| SessionId::new(*id))
+        },
+        arguments.armed.iter().copied(),
+    )?;
     let mut sockets = Vec::new();
     for origin in CHILD_ORIGINS {
         let path = arguments.sockets.join(format!("{}.sock", origin.name()));
@@ -1331,7 +1319,7 @@ pub fn serve(arguments: &Arguments) -> Result<(), String> {
     for _ in 0..arguments.rank {
         collector.restart_process();
     }
-    let mut books = Books::new(scenario.faults.len());
+    let mut books = Books::new(scenario.fault_count());
     let mut process: Option<Process<mqttiumd_store_sqlite::SqliteStore>> = None;
     let mut offered: Vec<Choice> = Vec::new();
     let mut published: Vec<String> = Vec::new();

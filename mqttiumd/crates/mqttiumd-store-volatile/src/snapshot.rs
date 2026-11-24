@@ -132,8 +132,8 @@ impl VolatileHandle {
 
     /// SQLite settings from initial load, if loaded from an existing file.
     #[must_use]
-    pub fn sqlite_settings(&self) -> Option<&Settings> {
-        self.sqlite_settings.as_ref()
+    pub fn sqlite_settings(&self) -> Option<Settings> {
+        self.sqlite_settings.clone()
     }
 }
 

@@ -28,7 +28,7 @@ use serde_json::{Value, json};
 
 use mqttiumd_contract::capacity::{PayloadBytes, WorkUnits};
 use mqttiumd_contract::effects::{
-    Effect, EffectSink, Input, Outbox, OwnedEffect, OwnerAuthority, RecoveredFact, SubmitBlock,
+    Effect, EffectSink, Input, OwnedEffect, OwnerAuthority, RecoveredFact, SubmitBlock,
     SubmitResult,
 };
 use mqttiumd_contract::ids::{
@@ -402,12 +402,12 @@ fn flush<S: DurableStore>(
     collector: &mut Collector,
     books: &mut Books,
 ) -> Result<Option<Cause>, Stop> {
-    if store.evidence_lost() {
-        return Err(Stop::new("the store adapter lost evidence"));
-    }
-    books.groups.absorb(store.take_group_evidence());
+    let recorded = store
+        .drain_evidence()
+        .ok_or_else(|| Stop::new("the store adapter lost evidence"))?;
+    books.groups.absorb(recorded.groups);
     let mut page = None;
-    for event in store.take_events() {
+    for event in recorded.events {
         // A submission names, as its cause, the record of the core input
         // whose step published the effect it carries (record 0016).
         let causes: Vec<EvidenceCause> = match &event {
@@ -733,8 +733,7 @@ impl<S: DurableStore> Process<S> {
             .map_err(|error| Stop::read(error, ReadPhase::Ledger, process_incarnation, None))?;
         let command = opening
             .submit(
-                sim.store()
-                    .ledger()
+                sim.ledger()
                     .map_err(|error| {
                         Stop::read(error, ReadPhase::Ledger, process_incarnation, None)
                     })?
@@ -979,7 +978,7 @@ impl<S: DurableStore> Process<S> {
                     None => None,
                 };
                 if let Some(cause) = cause {
-                    for effect in self.outbox().pending() {
+                    for effect in self.owner.pending_effects() {
                         books.published_by.entry(effect.id()).or_insert(cause);
                     }
                 }
@@ -1039,20 +1038,10 @@ impl<S: DurableStore> Process<S> {
         self.timer.armed.len()
     }
 
-    /// The box of the owner. Since finding R2 an owner never lives without
-    /// one (`Owner::renew_box` replaces it through the authority); the
-    /// `Option` of `Owner::outbox` is always `Some`, and the bench keeps no
-    /// branch for its absence.
-    fn outbox(&self) -> &Outbox {
-        self.owner
-            .outbox()
-            .expect("an owner always holds its box (finding R2)")
-    }
-
     /// Whether an effect still waits in the box, or an input for room.
     #[must_use]
     pub fn busy(&self) -> bool {
-        !self.outbox().is_empty() || self.parked.is_some()
+        self.owner.has_pending_effects() || self.parked.is_some()
     }
 
     /// After each choice: the parked input again, then the box.

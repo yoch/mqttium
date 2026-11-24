@@ -67,7 +67,7 @@ struct Authority {
 impl From<&Policy> for Authority {
     fn from(policy: &Policy) -> Self {
         Self {
-            authorization_sha256: hex(policy.storage().fingerprint),
+            authorization_sha256: hex(policy.fingerprint()),
             configured_credentials_sha256: hex(policy.credential_fingerprint()),
         }
     }
@@ -128,6 +128,36 @@ impl Plan {
             return Err(invalid());
         }
         Ok(plan)
+    }
+
+    /// The answer of `plan` once the plan is written: Planned with its
+    /// changes, or Refused with `non_monotone_policy_change` when it cannot
+    /// be applied.
+    fn planned(self) -> Result<Value, Value> {
+        if !self.body.applicable {
+            let mut result = self.summary("Refused");
+            result["code"] = json!("non_monotone_policy_change");
+            result["changes"] = self.body.changes;
+            return Err(result);
+        }
+        let mut result = self.summary("Planned");
+        result["changes"] = self.body.changes;
+        Ok(result)
+    }
+
+    /// The business state `apply` expects to find: refused with its
+    /// changes when the plan cannot be applied, `invalid_plan` when it does
+    /// not decode.
+    fn expected_state(&self) -> Result<PolicyInventory, Value> {
+        if !self.body.applicable {
+            let mut result = refusal("non_monotone_policy_change");
+            result["changes"] = self.body.changes.clone();
+            return Err(result);
+        }
+        self.body
+            .business
+            .decode()
+            .ok_or_else(|| refusal("invalid_plan"))
     }
 
     fn summary(&self, status: &str) -> Value {
@@ -268,7 +298,7 @@ fn execute(options: Options) -> Result<Value, Value> {
     let new = load_policy(&options.new, "invalid_new_policy")?;
     match options.action {
         Action::Plan { out } => {
-            let state = SqliteStore::inspect_policy(&options.db, old.storage())
+            let state = SqliteStore::inspect_policy(&options.db, &old.storage_policy())
                 .map_err(maintenance_error)?;
             let plan = Plan::new(&old, &new, state.into());
             let out = SqliteStore::policy_output_path(&options.db, &out)
@@ -286,15 +316,7 @@ fn execute(options: Options) -> Result<Value, Value> {
             file.write_all(&bytes)
                 .and_then(|()| file.sync_all())
                 .map_err(|_| refusal("plan_output_failed"))?;
-            if !plan.body.applicable {
-                let mut result = plan.summary("Refused");
-                result["code"] = json!("non_monotone_policy_change");
-                result["changes"] = plan.body.changes;
-                return Err(result);
-            }
-            let mut result = plan.summary("Planned");
-            result["changes"] = plan.body.changes;
-            Ok(result)
+            plan.planned()
         }
         Action::Apply {
             plan,
@@ -303,20 +325,11 @@ fn execute(options: Options) -> Result<Value, Value> {
             barrier,
         } => {
             let plan = Plan::load(&plan, &old, &new)?;
-            if !plan.body.applicable {
-                let mut result = refusal("non_monotone_policy_change");
-                result["changes"] = plan.body.changes;
-                return Err(result);
-            }
-            let state = plan
-                .body
-                .business
-                .decode()
-                .ok_or_else(|| refusal("invalid_plan"))?;
+            let state = plan.expected_state()?;
             let result = SqliteStore::apply_policy(
                 &options.db,
-                old.storage(),
-                new.storage(),
+                &old.storage_policy(),
+                &new.storage_policy(),
                 &state,
                 &backup,
                 |_point: PolicyTransitionPoint| {

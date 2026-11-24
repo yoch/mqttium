@@ -338,8 +338,14 @@ impl Policy {
         })
     }
 
-    pub fn storage(&self) -> &StoragePolicy {
-        &self.storage
+    /// The fingerprint of the authorization the store is bound to.
+    pub fn fingerprint(&self) -> [u8; 32] {
+        self.storage.fingerprint
+    }
+
+    /// A copy of the storage policy, for the store to open or change under.
+    pub fn storage_policy(&self) -> StoragePolicy {
+        self.storage.clone()
     }
 
     /// The previous pins are operator-supplied. Storage authenticates only

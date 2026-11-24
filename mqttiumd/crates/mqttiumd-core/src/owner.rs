@@ -60,6 +60,8 @@ use crate::contract::message_expiry::{
     ExpiryState, MessageExpiry, MessageExpiryBlock, MessageTime,
 };
 
+mod connections;
+mod deliveries;
 mod pubsub;
 mod receipts;
 mod routing;
@@ -983,13 +985,25 @@ pub struct Owner {
     closed: BoundedQueue<ConnectionGeneration>,
     closed_set: BTreeSet<ConnectionGeneration>,
     resolution_delay: LogicalDuration,
-    pubsub: pubsub::State,
+    /// The outgoing QoS 1 and 2 deliveries.
+    deliveries: deliveries::Deliveries,
+    /// The online connections outgoing deliveries go to.
+    connections: connections::Connections,
+    /// The volatile QoS 0 deliveries and the continuation that serves them.
+    volatile: pubsub::VolatileQueue,
     receipts: receipts::State,
     wills: will::State,
     lifecycle: Option<sessions::Flight>,
     lifecycle_enabled: bool,
     inline_claim_enabled: bool,
-    non_inline_targets_by_op: ScopedFlatMap<OperationId, alloc::vec::Vec<SessionId>>,
+    /// The admissions without an inline claim that wait for their result.
+    non_inline: pubsub::NonInlineAdmissions,
+    /// The subscription change in flight, if any.
+    control: Option<pubsub::Control>,
+    /// The retained QoS 0 admission in flight, if any.
+    retained: Option<pubsub::RetainedFlight>,
+    /// The payload bytes the owner may hold loaded.
+    payload_limit: PayloadBytes,
     message_now: Option<MessageTime>,
     release_continuation: Option<ContinuationId>,
     release_continuations_started: bool,
@@ -1078,7 +1092,9 @@ impl Owner {
                 LeaseTable::new(config.account, credit, config.max_exchanges)?,
                 ring(config.retained_operations)?,
                 ring(config.remembered_connections)?,
-                pubsub::State::new(config)?,
+                deliveries::Deliveries::new(config)?,
+                connections::Connections::new(config.max_sessions)?,
+                pubsub::VolatileQueue::new(config.max_exchanges)?,
                 receipts::State::new(crate::contract::receipts::ReceiptOrigin {
                     incarnation: id.incarnation(),
                     epoch: id.epoch(),
@@ -1086,7 +1102,18 @@ impl Owner {
                 })?,
             ))
         })();
-        let Ok((routes, sessions, slots, leases, finished, closed, pubsub, receipts)) = tables
+        let Ok((
+            routes,
+            sessions,
+            slots,
+            leases,
+            finished,
+            closed,
+            deliveries,
+            connections,
+            volatile,
+            receipts,
+        )) = tables
         else {
             let reason = OwnerRefusal::AllocationFailed;
             return Err(OwnerRefused { outbox, reason });
@@ -1123,17 +1150,22 @@ impl Owner {
             closed,
             closed_set: BTreeSet::new(),
             resolution_delay: config.resolution_delay,
-            pubsub,
+            deliveries,
+            connections,
+            volatile,
             receipts,
             wills: will::State::new(),
             lifecycle: None,
             lifecycle_enabled: false,
             inline_claim_enabled: false,
-            non_inline_targets_by_op: ScopedFlatMap::with_scope((
+            non_inline: pubsub::NonInlineAdmissions::new((
                 id.incarnation(),
                 id.epoch(),
                 id.owner(),
             )),
+            control: None,
+            retained: None,
+            payload_limit: config.payload_bytes,
             message_now: None,
             release_continuation: None,
             release_continuations_started: false,
@@ -1157,13 +1189,35 @@ impl Owner {
         self.inline_claim_enabled = true;
     }
 
-    /// The box of the owner. It is always present: a renewal replaces it
-    /// in place, and a refused renewal keeps it (review R2). The `Option`
-    /// is kept so that the callers written against the earlier form go on
-    /// compiling.
+    /// Whether an effect waits in the box of the owner (record 0064).
     #[must_use]
-    pub fn outbox(&self) -> Option<&Outbox> {
-        Some(&self.outbox)
+    pub fn has_pending_effects(&self) -> bool {
+        !self.outbox.is_empty()
+    }
+
+    /// How many effects wait in the box of the owner.
+    #[must_use]
+    pub fn pending_effect_count(&self) -> usize {
+        self.outbox.len()
+    }
+
+    /// How many slots of the box are neither published nor reserved.
+    #[must_use]
+    pub fn free_effect_slots(&self) -> usize {
+        self.outbox.free_slots()
+    }
+
+    /// Whether the effect `id` still waits in the box: it was published
+    /// and not yet handed to an adapter.
+    #[must_use]
+    pub fn holds_effect(&self, id: EffectId) -> bool {
+        self.outbox.pending().any(|pending| pending.id() == id)
+    }
+
+    /// The effects the owner will hand out, in order, lent read only: an
+    /// `OwnedEffect` is moved, never copied (record 0064).
+    pub fn pending_effects(&self) -> impl Iterator<Item = &OwnedEffect> {
+        self.outbox.pending()
     }
 
     /// Hands effects to `sink` with the receipt and lifecycle control lanes.
@@ -1280,6 +1334,34 @@ impl Owner {
     }
 
     /// The owner.
+    /// Whether no delivery may be claimed inline by its admission now: a
+    /// control or retained operation of the pub/sub state, or a will
+    /// admission, is in flight.
+    fn inline_claims_blocked(&self) -> bool {
+        self.control_or_retained_in_flight() || self.will_status().admission_pending
+    }
+
+    /// Whether this owner registers sessions or serves connections. A
+    /// historical S0 owner does neither, and keeps the one-transition work
+    /// abstraction of its fixtures.
+    fn serves_connections(&self) -> bool {
+        self.lifecycle_enabled || !self.connections.is_empty()
+    }
+
+    /// Only a live unresolved command or collector retains its current timer.
+    #[must_use]
+    pub fn deadline_is_live(&self, token: DeadlineToken) -> bool {
+        self.receipts.holds_deadline(token)
+            || self.slot_by_deadline.contains_key(&token)
+            || self.control_or_retained_holds(token)
+            || self.deliveries.holds_deadline(token)
+            || self.wills.holds_deadline(token)
+            || self
+                .lifecycle
+                .as_ref()
+                .is_some_and(|flight| flight.in_flight.deadline == token)
+    }
+
     #[must_use]
     pub fn id(&self) -> LogicalOwnerId {
         self.id
@@ -1690,7 +1772,7 @@ impl Owner {
         }
         let Input::Recovery { facts, last } = input else {
             return WorkUnits::new(
-                1u64.saturating_add(self.pubsub.work_bound(input, self.routes.capacity()))
+                1u64.saturating_add(self.pubsub_work_bound(input))
                     .saturating_add(self.session_work_bound(input))
                     .saturating_add(self.routing_work_bound(input))
                     .saturating_add(self.retained_work_bound(input))
@@ -1780,7 +1862,7 @@ impl Owner {
                         .min(32)
                         .saturating_mul(3)
                         .saturating_add(capacity_of(self.sessions.capacity()).min(16))
-                        .saturating_add(self.pubsub.close_work())
+                        .saturating_add(self.deliveries.close_work(&self.connections))
                 } else {
                     0
                 };
@@ -1831,7 +1913,9 @@ impl Owner {
             {
                 return Err(IMPOSSIBLE);
             }
-            if !self.pubsub.accepts_message_time(*now) {
+            if !self.deliveries.accepts_message_time(*now)
+                || !self.volatile.accepts_message_time(*now)
+            {
                 return Err(IMPOSSIBLE);
             }
             return Ok(Change::MessageClock(*now));
@@ -2198,7 +2282,7 @@ impl Owner {
             return protocol_error(draft);
         }
         if matches!(packet, InboundPacket::Publish { .. })
-            && (self.pubsub.control_pending() || self.lifecycle.is_some())
+            && (self.control_pending() || self.lifecycle.is_some())
         {
             return Err(Stop::Need(CapacityNeed {
                 resource: Resource::ResultSlots,
@@ -2672,7 +2756,7 @@ impl Owner {
             || self.release_continuation.is_some()
             || !self.receipts.control_available()
             || (self.release_retry_slots.is_empty()
-                && !self.pubsub.has_control_work(self.message_now))
+                && !self.deliveries.has_control_work(self.message_now))
         {
             return Ok(None);
         }
@@ -2711,7 +2795,7 @@ impl Owner {
             return self.plan_release(slot, Some(refused), draft);
         }
         if self.release_continuations_started
-            && self.pubsub.continuation != Some(continuation)
+            && !self.volatile.serves(continuation)
             && issued(continuation, self.counters.continuation)
         {
             return Ok(Change::Nothing);
@@ -3053,7 +3137,7 @@ impl Owner {
                 };
                 if admission {
                     draft.inline_outcome = self.plan_inline_claim_result(operation, true, draft)?;
-                    if !self.non_inline_targets_by_op.is_empty() {
+                    if !self.non_inline.is_empty() {
                         draft.non_inline_resolved = Some((operation, true));
                     }
                 }
@@ -3068,7 +3152,7 @@ impl Owner {
                 if admission {
                     draft.inline_outcome =
                         self.plan_inline_claim_result(operation, false, draft)?;
-                    if !self.non_inline_targets_by_op.is_empty() {
+                    if !self.non_inline.is_empty() {
                         draft.non_inline_resolved = Some((operation, false));
                     }
                 }
@@ -3155,7 +3239,7 @@ impl Owner {
             .finished_by_op
             .get(&operation)
             .map(|(item, _)| *item)
-            .or_else(|| self.pubsub.known(operation))
+            .or_else(|| self.deliveries.known(operation))
             .or_else(|| {
                 self.slots
                     .as_slice()
@@ -3526,15 +3610,9 @@ impl Owner {
             self.apply_inline_claim_outcome(outcome)?;
         }
         if let Some((operation, committed)) = non_inline_resolved
-            && let Some(targets) = self.non_inline_targets_by_op.remove(&operation)
+            && let Some(targets) = self.non_inline.resolve(operation)
         {
             for target in targets {
-                if let Some(count) = self.pubsub.non_inline_by_session.get_mut(&target) {
-                    *count = count.saturating_sub(1);
-                    if *count == 0 {
-                        self.pubsub.non_inline_by_session.remove(&target);
-                    }
-                }
                 if committed {
                     self.mark_session_dirty(target, true);
                 }
@@ -3555,7 +3633,7 @@ impl Owner {
             // ACKs, even if the adapter never accepted their Outbox effect.
             // Uncertain admissions are deliberately kept for reconciliation.
             self.finish_closed_acks(connection)?;
-            self.pubsub.close(connection);
+            self.close_outgoing(connection);
             if let Some(session) = self.session_of(connection) {
                 self.set_session_connection(session, None)?;
             }
@@ -3584,7 +3662,7 @@ impl Owner {
             Change::Nothing => {}
             Change::MessageClock(now) => {
                 self.message_now = Some(now);
-                self.pubsub.evict_expired_cache(now);
+                self.deliveries.evict_expired_cache(now);
             }
             Change::Recover => {
                 let Input::Recovery { facts, last } = input else {
@@ -3644,13 +3722,9 @@ impl Owner {
                     self.apply_inline_claim_insert(op, *plan)?;
                 } else if !dirty_targets.is_empty() {
                     for &target in &dirty_targets {
-                        *self
-                            .pubsub
-                            .non_inline_by_session
-                            .get_or_insert_default(target) += 1;
                         self.mark_session_dirty(target, false);
                     }
-                    self.non_inline_targets_by_op.insert(op, dirty_targets);
+                    self.non_inline.admit(op, dirty_targets);
                 }
             }
             Change::Committed { slot, admission } => {
@@ -3985,13 +4059,15 @@ impl Owner {
             } => {
                 // One lease per durable row, in the slot of its rank. The
                 // payload of the exchange never entered this process.
-                let lease = LeaseKey {
-                    account: self.leases.account().id(),
-                    slot: u32::try_from(self.slots.len()).map_err(|_| STALE)?,
-                    generation: LeaseGeneration::new(0),
-                };
                 let cost = Credits::new(PayloadBytes::ZERO, ExchangeSlots::new(1));
-                self.leases.restore(lease, cost).map_err(|_| STALE)?;
+                let lease = self
+                    .leases
+                    .restore_at(
+                        u32::try_from(self.slots.len()).map_err(|_| STALE)?,
+                        LeaseGeneration::new(0),
+                        cost,
+                    )
+                    .map_err(|_| STALE)?;
                 let slot = Slot {
                     session: exchange.session,
                     packet_id: *packet_id,
@@ -4090,8 +4166,8 @@ mod tests {
         routes: Vec<Route>,
         sessions: Vec<Session>,
         slots: Vec<Slot>,
-        outgoing_connections: Vec<pubsub::Connection>,
-        outgoing_deliveries: Vec<pubsub::Delivery>,
+        outgoing_connections: Vec<connections::Connection>,
+        outgoing_deliveries: Vec<deliveries::Delivery>,
         volatile: Vec<pubsub::Volatile>,
         retained_qos0: Option<pubsub::RetainedFlight>,
         continuation: (Option<crate::contract::ids::ContinuationId>, bool),
@@ -4438,7 +4514,7 @@ mod tests {
         }
 
         fn step(&mut self, input: Input) -> StepOutcome {
-            self.owner.step(input, GRANT)
+            self.owner.step_checked(input, GRANT)
         }
 
         fn applied(&mut self, input: Input) {
@@ -4589,15 +4665,15 @@ mod tests {
                 routes: owner.routes.as_slice().to_vec(),
                 sessions: owner.sessions.as_slice().to_vec(),
                 slots: owner.slots.as_slice().to_vec(),
-                outgoing_connections: owner.pubsub.connections.as_slice().to_vec(),
-                outgoing_deliveries: owner.pubsub.deliveries.as_slice().to_vec(),
-                volatile: owner.pubsub.volatile.to_vec(),
-                retained_qos0: owner.pubsub.retained,
+                outgoing_connections: owner.connections.to_vec(),
+                outgoing_deliveries: owner.deliveries.rows().to_vec(),
+                volatile: owner.volatile.to_vec(),
+                retained_qos0: owner.retained,
                 continuation: (
-                    owner.pubsub.continuation,
-                    owner.pubsub.continuations_started,
+                    owner.volatile.continuation_state().0,
+                    owner.volatile.continuation_state().1,
                 ),
-                subscription: owner.pubsub.control.as_ref().map(|c| ControlSnapshot {
+                subscription: owner.control.as_ref().map(|c| ControlSnapshot {
                     session: c.session,
                     connection: c.connection,
                     packet_id: c.packet_id,
@@ -4632,7 +4708,7 @@ mod tests {
         let short = TurnGrant {
             work_limit: WorkUnits::ZERO,
         };
-        let outcome = world.owner.step(input(&world), short);
+        let outcome = world.owner.step_checked(input(&world), short);
         assert_eq!(
             outcome,
             StepOutcome::NeedCapacity {
@@ -4785,6 +4861,58 @@ mod tests {
         assert_eq!(world.outbox().capacity(), MAX_TRANSITION_SLOTS);
     }
 
+    // The owner answers for its box (record 0064): each answer is the one
+    // the box gives, while an effect waits and once it was handed out.
+    #[test]
+    fn the_owner_answers_for_its_box() {
+        let mut world = World::connected();
+        assert!(!world.owner.has_pending_effects());
+        assert_eq!(world.owner.pending_effect_count(), 0);
+        assert_eq!(world.owner.free_effect_slots(), world.held().free_slots());
+        assert_eq!(world.owner.pending_effects().count(), 0);
+
+        world.applied(publish(7));
+        let waiting: Vec<EffectId> = world.held().pending().map(OwnedEffect::id).collect();
+        assert!(!waiting.is_empty());
+        assert!(world.owner.has_pending_effects());
+        assert_eq!(world.owner.pending_effect_count(), waiting.len());
+        assert_eq!(world.owner.free_effect_slots(), world.held().free_slots());
+        assert!(world.owner.free_effect_slots() < world.held().capacity());
+        assert_eq!(
+            world
+                .owner
+                .pending_effects()
+                .map(OwnedEffect::id)
+                .collect::<Vec<_>>(),
+            waiting
+        );
+        assert!(
+            world
+                .owner
+                .pending_effects()
+                .zip(world.held().pending())
+                .all(|(lent, held)| lent == held)
+        );
+        assert!(waiting.iter().all(|&id| world.owner.holds_effect(id)));
+
+        let handed = world.drain();
+        assert_eq!(
+            handed.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            waiting
+        );
+        assert!(!world.owner.has_pending_effects());
+        assert_eq!(world.owner.pending_effect_count(), 0);
+        assert_eq!(world.owner.free_effect_slots(), world.held().free_slots());
+        assert!(waiting.iter().all(|&id| !world.owner.holds_effect(id)));
+
+        // Effects handed out are not held while others wait.
+        world.applied(publish(8));
+        let again: Vec<EffectId> = world.held().pending().map(OwnedEffect::id).collect();
+        assert!(!again.is_empty());
+        assert!(again.iter().all(|&id| world.owner.holds_effect(id)));
+        assert!(waiting.iter().all(|&id| !world.owner.holds_effect(id)));
+    }
+
     #[test]
     fn a_box_is_renewed_only_under_the_authority_of_its_owner_and_with_room() {
         let mut world = World::connected();
@@ -4931,7 +5059,7 @@ mod tests {
             .expect("first box");
         let mut owner = Owner::new(config(), outbox).expect("large enough");
         for input in [page(&fixture(EPOCH), true), connect(CONN, b"p1-producer")] {
-            let outcome = owner.step(input, GRANT);
+            let outcome = owner.step_checked(input, GRANT);
             assert!(
                 matches!(outcome, StepOutcome::Applied { .. }),
                 "{outcome:?}"
@@ -6221,7 +6349,7 @@ mod tests {
             connection: ConnectionGeneration::new(CONN),
         };
         assert_eq!(
-            world.owner.step(
+            world.owner.step_checked(
                 input,
                 TurnGrant {
                     work_limit: WorkUnits::new(1)
@@ -7866,7 +7994,7 @@ mod tests {
             work_limit: WorkUnits::new(FIXTURE_WORK - 1),
         };
         assert_eq!(
-            world.owner.step(page(&fixture(EPOCH), true), short),
+            world.owner.step_checked(page(&fixture(EPOCH), true), short),
             StepOutcome::NeedCapacity {
                 input: page(&fixture(EPOCH), true),
                 need: CapacityNeed {
@@ -7881,7 +8009,7 @@ mod tests {
         let exact = TurnGrant {
             work_limit: WorkUnits::new(FIXTURE_WORK),
         };
-        let outcome = world.owner.step(page(&fixture(EPOCH), true), exact);
+        let outcome = world.owner.step_checked(page(&fixture(EPOCH), true), exact);
         assert!(
             matches!(outcome, StepOutcome::Applied { .. }),
             "{outcome:?}"
@@ -8273,7 +8401,7 @@ mod tests {
                 connect(CONN, b"p1-producer"),
                 publish_with(CONN, 7, Qos::ExactlyOnce, payload),
             ] {
-                let outcome = owner.step(input, GRANT);
+                let outcome = owner.step_checked(input, GRANT);
                 assert!(
                     matches!(outcome, StepOutcome::Applied { .. }),
                     "{outcome:?}"
@@ -8520,7 +8648,7 @@ mod tests {
             publish_with(CONN + 1, 8, Qos::ExactlyOnce, b"xyz"),
         ] {
             assert!(matches!(
-                second.step(input, GRANT),
+                second.step_checked(input, GRANT),
                 StepOutcome::Applied { .. }
             ));
         }
@@ -9103,7 +9231,7 @@ mod tests {
             },
         });
         assert!(world.drain().is_empty());
-        assert!(world.owner.pubsub.deliveries.is_empty());
+        assert!(world.owner.deliveries.is_empty());
         let remembered = world
             .owner
             .finished
@@ -9295,7 +9423,7 @@ mod tests {
             waiting.insert(generation, VecDeque::from(frames));
         }
         assert!(
-            world.owner.pubsub.continuation.is_none(),
+            !world.owner.volatile.serving(),
             "nothing runs while every connection has its window in flight"
         );
 
@@ -9332,8 +9460,8 @@ mod tests {
                 "connection {generation} has the burst whole and in order"
             );
         }
-        assert!(world.owner.pubsub.volatile.is_empty());
-        assert!(world.owner.pubsub.continuation.is_none());
+        assert!(world.owner.volatile.is_empty());
+        assert!(!world.owner.volatile.serving());
     }
 
     /// The volatile deliveries to `session` that `effects` drop: the order
@@ -9381,7 +9509,7 @@ mod tests {
                 "session {session}"
             );
         }
-        assert_eq!(world.owner.pubsub.volatile.len(), 2 * KEPT as usize);
+        assert_eq!(world.owner.volatile.len(), 2 * KEPT as usize);
         let mut waiting: VecDeque<_> = [11, 12]
             .iter()
             .flat_map(|generation| volatile_frames(&first, *generation))
@@ -9401,7 +9529,7 @@ mod tests {
             }
         }
         assert_eq!(delivered, BTreeMap::from([(11, KEPT), (12, KEPT)]));
-        assert!(world.owner.pubsub.volatile.is_empty());
+        assert!(world.owner.volatile.is_empty());
     }
 
     /// Record 0063: deliveries that wait for the window of a connection end
@@ -9427,7 +9555,7 @@ mod tests {
         let wide = TurnGrant {
             work_limit: WorkUnits::new(1 << 16),
         };
-        let outcome = world.owner.step(transport_closed(11), wide);
+        let outcome = world.owner.step_checked(transport_closed(11), wide);
         assert!(
             matches!(outcome, StepOutcome::Applied { .. }),
             "{outcome:?}"
@@ -9468,7 +9596,7 @@ mod tests {
             }
         }
         assert_eq!(count, BURST);
-        assert!(world.owner.pubsub.volatile.is_empty());
+        assert!(world.owner.volatile.is_empty());
 
         // The session comes back on another connection: a window of its own.
         world.applied(connect(13, b"p1-b"));
@@ -9500,7 +9628,7 @@ mod tests {
             world
         }
         let resume = |world: &World| Input::Continue {
-            continuation: world.owner.pubsub.continuation.expect("armed"),
+            continuation: world.owner.volatile.continuation_state().0.expect("armed"),
             budget: WorkUnits::new(65536),
         };
         // One frame: the window is full again and nothing else is pending.
@@ -9552,7 +9680,7 @@ mod tests {
             reason: crate::contract::pubsub::Qos0DropReason::OutputSaturated,
         });
         assert_eq!(kinds(&world.drain()), ["Qos0Dropped"]);
-        assert!(world.owner.pubsub.volatile.is_empty());
+        assert!(world.owner.volatile.is_empty());
         assert_eq!(world.owner.leases.snapshot(), before);
         world.applied(Input::Qos0EmitRefused {
             effect,
@@ -9589,7 +9717,7 @@ mod tests {
         });
         assert!(world.drain().is_empty());
         assert_eq!(
-            world.owner.pubsub.volatile.len(),
+            world.owner.volatile.len(),
             1,
             "the old receipt cannot free the new occurrence"
         );
@@ -9657,7 +9785,7 @@ mod tests {
             next: None,
         });
         assert!(world.drain().is_empty());
-        assert!(world.owner.pubsub.deliveries.is_empty());
+        assert!(world.owner.deliveries.is_empty());
         world.applied(committed(&consume));
         assert!(world.drain().is_empty());
     }
@@ -9688,7 +9816,7 @@ mod tests {
         world.applied(product_settings(CONN, 1));
         assert_eq!(world.sent(connect(CONN, b"p1-producer")), ["EmitConnack"]);
         load_work(&mut world, &[], None);
-        assert!(world.owner.pubsub.deliveries.is_empty());
+        assert!(world.owner.deliveries.is_empty());
         assert!(!world.owner.has_ready_work(SessionId::new(PRODUCER)));
     }
 
@@ -9866,7 +9994,7 @@ mod tests {
             };
             let StepOutcome::NeedCapacity {
                 input: back, need, ..
-            } = world.owner.step(input, grant)
+            } = world.owner.step_checked(input, grant)
             else {
                 panic!("capacity refusal")
             };
@@ -10324,14 +10452,7 @@ mod tests {
                 "identical MQTT control bytes do not permit reusing an active sender identifier"
             );
             assert_eq!(
-                world
-                    .owner
-                    .pubsub
-                    .control
-                    .as_ref()
-                    .unwrap()
-                    .in_flight
-                    .operation,
+                world.owner.control.as_ref().unwrap().in_flight.operation,
                 original.operation,
                 "transport refusal preserves the uncertain original durable command"
             );
@@ -10773,7 +10894,7 @@ mod tests {
     };
 
     fn gc_apply(world: &mut World, input: Input) {
-        let result = world.owner.step(input, GC_GRANT);
+        let result = world.owner.step_checked(input, GC_GRANT);
         assert!(matches!(result, StepOutcome::Applied { .. }), "{result:?}");
     }
 
@@ -11043,7 +11164,7 @@ mod tests {
         assert_eq!(world.owner.outbox.free_slots(), 2);
         let before = world.snapshot();
         assert!(matches!(
-            world.owner.step(ping(), GC_GRANT),
+            world.owner.step_checked(ping(), GC_GRANT),
             StepOutcome::NeedCapacity { .. }
         ));
         assert_eq!(world.snapshot(), before);
@@ -11063,7 +11184,7 @@ mod tests {
         gc_register(&mut world);
         let flight = gc_admit(&mut world, 7, Qos::AtLeastOnce);
         assert_eq!(
-            world.owner.step(retired(&flight), GC_GRANT),
+            world.owner.step_checked(retired(&flight), GC_GRANT),
             StepOutcome::Fatal(CoreFault::ImpossibleInput)
         );
         assert_eq!(world.owner.receipt_status().unwrap().2, 1);
@@ -11075,7 +11196,7 @@ mod tests {
         gc_register(&mut world);
         let key = world.owner.outbox.reserve(nonzero(CAPACITY - 2)).unwrap();
         let before = world.snapshot();
-        let outcome = world.owner.step(publish(7), GC_GRANT);
+        let outcome = world.owner.step_checked(publish(7), GC_GRANT);
         assert!(
             matches!(outcome, StepOutcome::NeedCapacity { .. }),
             "{outcome:?}"
@@ -11130,7 +11251,7 @@ mod tests {
             &release,
             StoreOutcome::RejectedCertain(RejectReason::Fenced),
         );
-        let outcome = world.owner.step(fenced, GC_GRANT);
+        let outcome = world.owner.step_checked(fenced, GC_GRANT);
         assert!(
             matches!(outcome, StepOutcome::Applied { .. }),
             "terminal consumption must progress at full receipt window: {outcome:?}"
@@ -11395,7 +11516,7 @@ mod tests {
             },
         };
         assert!(matches!(
-            world.owner.step(
+            world.owner.step_checked(
                 input,
                 TurnGrant {
                     work_limit: WorkUnits::new(100000)
@@ -11429,7 +11550,7 @@ mod tests {
             *retain = true;
         }
         assert!(matches!(
-            world.owner.step(first, turn),
+            world.owner.step_checked(first, turn),
             StepOutcome::Applied { .. }
         ));
         let effects = world.drain();
@@ -11473,7 +11594,7 @@ mod tests {
             *retain = true;
         }
         assert!(matches!(
-            world.owner.step(next, turn),
+            world.owner.step_checked(next, turn),
             StepOutcome::Applied { .. }
         ));
         let effects = world.drain();

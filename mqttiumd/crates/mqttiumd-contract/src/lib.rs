@@ -16,16 +16,20 @@
 
 extern crate alloc;
 
+pub mod canonical;
 pub mod capacity;
 pub mod command;
 pub mod decimal;
 pub mod effects;
 pub mod ids;
+pub mod message;
 pub mod message_expiry;
+pub mod message_time;
 pub mod opening;
 pub mod outcome;
 pub mod packet;
 pub mod properties;
+pub mod publication;
 pub mod pubsub;
 pub mod receipts;
 pub mod session;

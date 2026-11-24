@@ -47,7 +47,7 @@ for level in (4, 5):
             close("w"),
             recv("sub"), ack("sub"), quiet("sub"),
             connect("late", "w-ret-late", level=level),
-            subscribe("late", 1, [("willr/t", 0)], level=level, expect=0), collect("late", sort=True),
+            subscribe("late", 1, [("willr/t", 0)], level=level, expect=0), collect("late", sort=True, suback=1),
         ],
     )
 

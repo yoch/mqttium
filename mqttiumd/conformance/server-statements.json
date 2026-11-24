@@ -2956,7 +2956,7 @@
         "status": "implemented-untested",
         "evidence": [],
         "code": [
-          "mqttiumd/crates/mqttiumd-core/src/owner/pubsub.rs:expiry_allows_send",
+          "mqttiumd/crates/mqttiumd-core/src/owner/deliveries.rs:expiry_allows_send",
           "mqttiumd/crates/mqttiumd/src/net.rs:prepare_expiry"
         ],
         "note": "A delivery whose PUBLISH is known to have started, or that awaits PUBCOMP, is sent again whatever its lifetime (`expiry_allows_send`), and the writer gives a started frame a remaining interval of 0 instead of withholding it (`prepare_expiry`). No test exercises this for an outgoing QoS 2 delivery, the sender the statement is about: `a_known_started_exchange_replays_with_zero_after_expiry_or_clock_uncertainty` writes a QoS 0 frame (`encode_qos0_expiring`) and `message_expiry_started_claim_replays_past_ttl_and_old_facts_cannot_hit_reused_pi` replays a QoS 1 delivery (independent audit of 8e4303d, 21 November 2026); no test with an outgoing QoS 2 delivery that carries an expiry was found."

@@ -1,119 +1,17 @@
-//! Message lifetime in an explicitly identified monotonic clock domain.
-//!
-//! An observation is frozen at receipt and copied unchanged into retained
-//! replay. Unlike session retention, an unknown clock origin cannot pause or
-//! restart a message's lifetime: such a message is temporally uncertain.
+//! Recipes of a message with a lifetime (ADR 0033): a publication admitted
+//! with its expiry, a retained replay with the time it was observed, and
+//! the marking and cancellation of a claimed copy. The lifetime itself is
+//! in `message_time`, re-exported here.
 
 use alloc::vec::Vec;
 
-use crate::command::{FinishDelivery, Reader, Recipe, RecipeError};
+use crate::canonical::{Reader, RecipeError};
 use crate::ids::{DeliveryId, OperationId, OutboundPacketId, Revision, SessionId};
+pub use crate::message_time::{
+    ExpiryState, MessageExpiry, MessageExpiryBlock, MessageTime, MessageTimeError, NANOS_PER_SECOND,
+};
+use crate::pubsub::FinishDelivery;
 use crate::retained::{ReplaySubscriptions, RetainedPublication, RetainedQos0};
-
-pub const NANOS_PER_SECOND: u64 = 1_000_000_000;
-
-/// One observation supplied by the clock adapter, never UTC or an Instant.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct MessageTime {
-    pub domain: [u8; 32],
-    pub tick: u64,
-}
-
-/// The original MQTT lifetime; every u32 value, including its maximum, is finite.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct MessageExpiry {
-    pub observed: MessageTime,
-    pub interval: u32,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum ExpiryState {
-    Fresh { remaining: u32 },
-    Expired,
-    TemporalUncertain,
-}
-
-/// A bad reading or deadline is a refusal, never evidence of expiration.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum MessageTimeError {
-    ClockRegressed,
-    ArithmeticOverflow,
-}
-
-/// A correlated adapter refusal proves this frame wrote no bytes.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum MessageExpiryBlock {
-    Expired,
-    TemporalUncertain,
-}
-
-impl MessageExpiry {
-    pub fn deadline(self) -> Result<u64, MessageTimeError> {
-        u64::from(self.interval)
-            .checked_mul(NANOS_PER_SECOND)
-            .and_then(|lifetime| self.observed.tick.checked_add(lifetime))
-            .ok_or(MessageTimeError::ArithmeticOverflow)
-    }
-
-    /// Expiry is exact at the deadline. Before it, the remaining wire seconds
-    /// round up, equivalently subtracting only complete elapsed seconds.
-    pub fn state(self, now: MessageTime) -> Result<ExpiryState, MessageTimeError> {
-        let deadline = self.deadline()?;
-        if now.domain != self.observed.domain {
-            return Ok(ExpiryState::TemporalUncertain);
-        }
-        let elapsed = now
-            .tick
-            .checked_sub(self.observed.tick)
-            .ok_or(MessageTimeError::ClockRegressed)?;
-        if now.tick >= deadline {
-            return Ok(ExpiryState::Expired);
-        }
-        let waited = u32::try_from(elapsed / NANOS_PER_SECOND)
-            .map_err(|_| MessageTimeError::ArithmeticOverflow)?;
-        let remaining = self
-            .interval
-            .checked_sub(waited)
-            .ok_or(MessageTimeError::ArithmeticOverflow)?;
-        Ok(ExpiryState::Fresh { remaining })
-    }
-
-    pub(crate) fn check(self) -> Result<(), RecipeError> {
-        self.deadline()
-            .map(|_| ())
-            .map_err(|_| RecipeError::InvalidField("message_expiry_overflow"))
-    }
-
-    pub(crate) fn encode(self, out: &mut Vec<u8>) {
-        self.observed.encode(out);
-        out.extend_from_slice(&self.interval.to_be_bytes());
-    }
-
-    pub(crate) fn decode(reader: &mut Reader<'_>) -> Result<Self, RecipeError> {
-        let value = Self {
-            observed: MessageTime::decode(reader)?,
-            interval: reader.u32()?,
-        };
-        value.check()?;
-        Ok(value)
-    }
-}
-
-impl MessageTime {
-    pub(crate) fn encode(self, out: &mut Vec<u8>) {
-        out.extend_from_slice(&self.domain);
-        out.extend_from_slice(&self.tick.to_be_bytes());
-    }
-
-    pub(crate) fn decode(reader: &mut Reader<'_>) -> Result<Self, RecipeError> {
-        let mut domain = [0; 32];
-        domain.copy_from_slice(reader.take(32)?);
-        Ok(Self {
-            domain,
-            tick: reader.u64()?,
-        })
-    }
-}
 
 /// Legacy-shaped admission within tag 13. QoS0 is retained and has no exchange.
 #[derive(PartialEq, Eq, Debug)]
@@ -171,7 +69,7 @@ impl ExpiringPublication {
                     value.check_retained()
                 } else {
                     value.admission.check_retained()?;
-                    if value.admission.qos == crate::packet::Qos::AtMostOnce {
+                    if value.admission.qos == crate::message::Qos::AtMostOnce {
                         return Err(RecipeError::InvalidField("expiring_qos"));
                     }
                     if !value.retain_targets.is_zero() {
@@ -204,33 +102,6 @@ impl ExpiringPublication {
         self.expiry.encode(out);
         Ok(())
     }
-
-    pub(crate) fn decode(
-        reader: &mut Reader<'_>,
-        max_targets: usize,
-        max_topic: usize,
-    ) -> Result<Self, RecipeError> {
-        let nested = read_nested(reader, &[1, 10, 11, 20, 21])?;
-        // No temporal extension can appear within a temporal wrapper. Existing
-        // tag 10 retains its single legacy tag-1 envelope.
-        let admission = match Recipe::decode_canonical(nested, max_targets, max_topic)? {
-            Recipe::AdmitPublication(admission) if !admission.retain => {
-                ExpiringAdmission::Qos12(RetainedPublication {
-                    admission,
-                    retain_targets: crate::retained::RetainMask::EMPTY,
-                })
-            }
-            Recipe::RetainedPublication(value) => ExpiringAdmission::Qos12(value),
-            Recipe::RetainedQos0(value) => ExpiringAdmission::Qos0(value),
-            _ => return Err(RecipeError::InvalidField("message_expiry_nested_kind")),
-        };
-        let value = Self {
-            admission,
-            expiry: MessageExpiry::decode(reader)?,
-        };
-        value.check()?;
-        Ok(value)
-    }
 }
 
 impl TimedReplaySubscriptions {
@@ -246,23 +117,6 @@ impl TimedReplaySubscriptions {
         encode_nested(&nested, out)?;
         self.observed.encode(out);
         Ok(())
-    }
-
-    pub(crate) fn decode(
-        reader: &mut Reader<'_>,
-        max_targets: usize,
-        max_topic: usize,
-    ) -> Result<Self, RecipeError> {
-        let nested = read_nested(reader, &[12])?;
-        let Recipe::ReplaySubscriptions(replay) =
-            Recipe::decode_canonical(nested, max_targets, max_topic)?
-        else {
-            return Err(RecipeError::InvalidField("message_expiry_nested_kind"));
-        };
-        Ok(Self {
-            replay,
-            observed: MessageTime::decode(reader)?,
-        })
     }
 }
 
@@ -292,7 +146,10 @@ fn encode_nested(nested: &[u8], out: &mut Vec<u8>) -> Result<(), RecipeError> {
     Ok(())
 }
 
-fn read_nested<'a>(reader: &mut Reader<'a>, allowed: &[u8]) -> Result<&'a [u8], RecipeError> {
+pub(crate) fn read_nested<'a>(
+    reader: &mut Reader<'a>,
+    allowed: &[u8],
+) -> Result<&'a [u8], RecipeError> {
     let len = usize::try_from(reader.u32()?)
         .map_err(|_| RecipeError::InvalidField("message_expiry_nested_length"))?;
     let nested = reader.take(len)?;

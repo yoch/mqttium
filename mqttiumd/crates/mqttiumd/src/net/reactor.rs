@@ -184,6 +184,56 @@ impl Shared {
             let _ = self.waker.wake();
         }
     }
+
+    /// The reactor takes every message queued (`ReactorTake`). `None` when
+    /// the lock is poisoned: the reactor then leaves its loop.
+    fn take(&self) -> Option<Vec<Message>> {
+        self.queue
+            .lock()
+            .ok()
+            .map(|mut queue| std::mem::take(&mut *queue))
+    }
+
+    /// The reactor blocks until an event, a wake-up or `timeout`
+    /// (`ReactorSleep`, `ReactorRecheck`, `ReactorPoll`, `ReactorAwake`):
+    /// it says it sleeps, then looks at the queue once more, and polls at
+    /// once if a message arrived meanwhile. It is awake again before the
+    /// caller looks at the result of the poll.
+    fn sleep(&self, poll: &mut Poll, events: &mut Events, timeout: Duration) -> io::Result<()> {
+        self.sleeping.store(true, Ordering::SeqCst);
+        let pending = self.queue.lock().map_or(true, |queue| !queue.is_empty());
+        let timeout = if pending { Duration::ZERO } else { timeout };
+        let polled = poll.poll(events, Some(timeout));
+        self.sleeping.store(false, Ordering::SeqCst);
+        polled
+    }
+
+    /// A producer will serve many lanes in one pass (`ProducerHold`).
+    fn hold(&self) {
+        self.held.store(true, Ordering::SeqCst);
+    }
+
+    /// The pass is over (`ProducerRelease`): the hold is cleared before
+    /// the debt is read, so the release or a sender pays it.
+    fn release(&self) {
+        self.held.store(false, Ordering::SeqCst);
+        self.kick();
+    }
+
+    /// The thread left its loop: it says so, then finishes what was
+    /// registered with it. A sender checks after its push, so one of the
+    /// two finds the message.
+    fn leave(&self) {
+        self.dead.store(true, Ordering::SeqCst);
+        self.abandon();
+    }
+
+    /// The pool is dropped: the thread is told to stop and woken whatever
+    /// it owes.
+    fn stop(&self) {
+        self.send(Message::Stop);
+        let _ = self.waker.wake();
+    }
 }
 
 /// While it lives, messages to the reactors are queued without a wake-up.
@@ -195,8 +245,7 @@ pub(crate) struct Held<'a>(&'a Reactors);
 impl Drop for Held<'_> {
     fn drop(&mut self) {
         for (shared, _) in &self.0.threads {
-            shared.held.store(false, Ordering::SeqCst);
-            shared.kick();
+            shared.release();
         }
     }
 }
@@ -227,8 +276,7 @@ impl Reactors {
                 .name(format!("mqttiumd-io-{index}"))
                 .spawn(move || {
                     run(poll, &worker);
-                    worker.dead.store(true, Ordering::SeqCst);
-                    worker.abandon();
+                    worker.leave();
                 })?;
             started.push((shared, Some(handle)));
         }
@@ -270,7 +318,7 @@ impl Reactors {
 
     pub(crate) fn hold(&self) -> Held<'_> {
         for (shared, _) in &self.threads {
-            shared.held.store(true, Ordering::SeqCst);
+            shared.hold();
         }
         Held(self)
     }
@@ -283,8 +331,7 @@ impl Reactors {
 impl Drop for Reactors {
     fn drop(&mut self) {
         for (shared, _) in &self.threads {
-            shared.send(Message::Stop);
-            let _ = shared.waker.wake();
+            shared.stop();
         }
         for (_, handle) in &mut self.threads {
             if let Some(handle) = handle.take() {
@@ -316,9 +363,8 @@ fn run(mut poll: Poll, shared: &Shared) {
     let mut waiting = 0usize;
     let mut last_tick = Instant::now();
     loop {
-        let messages = match shared.queue.lock() {
-            Ok(mut queue) => std::mem::take(&mut *queue),
-            Err(_) => return,
+        let Some(messages) = shared.take() else {
+            return;
         };
         for message in messages {
             match message {
@@ -435,11 +481,7 @@ fn run(mut poll: Poll, shared: &Shared) {
         } else {
             REST
         };
-        shared.sleeping.store(true, Ordering::SeqCst);
-        let pending = shared.queue.lock().map_or(true, |queue| !queue.is_empty());
-        let timeout = if pending { Duration::ZERO } else { timeout };
-        let polled = poll.poll(&mut events, Some(timeout));
-        shared.sleeping.store(false, Ordering::SeqCst);
+        let polled = shared.sleep(&mut poll, &mut events, timeout);
         if let Err(error) = polled
             && error.kind() != io::ErrorKind::Interrupted
         {

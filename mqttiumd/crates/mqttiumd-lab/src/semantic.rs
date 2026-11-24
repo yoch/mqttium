@@ -19,10 +19,120 @@ use mqttiumd_contract::receipts::{ReceiptClosure, ReceiptOrigin};
 use serde_json::Value;
 
 use crate::diagnostic::{Diagnostic, MAX_DIAGNOSTICS, Report, code};
+use crate::files::Refusal;
 use crate::manifest::contracts_digest;
-use crate::workspace::{
-    REGISTRY_CATALOG, RESULT_MANIFEST, RESULT_SCENARIO, SCENARIO_FIXTURE, Workspace,
+
+/// One contractual injection point.
+#[derive(Default)]
+pub struct FaultPoint {
+    /// What passes through the point: `command` or `result`.
+    pub carries: String,
+    /// The actions the point offers.
+    pub actions: BTreeSet<String>,
+}
+
+/// The closed catalogues that documents refer to.
+#[derive(Default)]
+pub struct Catalogs {
+    /// Injection point to the actions it offers.
+    pub fault_points: BTreeMap<String, FaultPoint>,
+    /// Command kinds a fault may match.
+    pub command_kinds: BTreeSet<String>,
+    /// Profile identifiers.
+    pub profiles: BTreeSet<String>,
+    /// Assertion names.
+    pub assertions: BTreeSet<String>,
+    /// Assertions every run owes, whether or not its scenario lists them.
+    pub every_run: BTreeSet<String>,
+    /// Requirement, scenario, mutation, model, gate and lot identifiers.
+    pub requirements: BTreeSet<String>,
+}
+
+/// One way a document of a format may refer to a document of another.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Reference {
+    /// Format of the referring document.
+    pub from: &'static str,
+    /// JSON Pointer of the member that holds the path.
+    pub pointer: &'static str,
+    /// Format the referenced document must have.
+    pub to: &'static str,
+}
+
+/// A scenario names the fixture it starts from.
+pub const SCENARIO_FIXTURE: Reference = Reference {
+    from: "mqttiumd.scenario",
+    pointer: "/initial_fixture",
+    to: "mqttiumd.fixture",
 };
+
+/// A transition registry names the catalogue of its vocabulary.
+pub const REGISTRY_CATALOG: Reference = Reference {
+    from: "mqttiumd.transition-registry",
+    pointer: "/catalog",
+    to: "mqttiumd.transition-catalog",
+};
+
+/// A qualifying result names the scenario it ran.
+pub const RESULT_SCENARIO: Reference = Reference {
+    from: "mqttiumd.run-result",
+    pointer: "/scenario/path",
+    to: "mqttiumd.scenario",
+};
+
+/// A qualifying result names the manifest of its run.
+pub const RESULT_MANIFEST: Reference = Reference {
+    from: "mqttiumd.run-result",
+    pointer: "/manifest/path",
+    to: "mqttiumd.run-manifest",
+};
+
+/// Every reference between formats. The format of a referenced document is
+/// checked against this table before the document is validated, and the
+/// table is acyclic, so following references always terminates. The
+/// [`Documents`] that loads them guards the same property at run time.
+pub const REFERENCES: [Reference; 4] = [
+    SCENARIO_FIXTURE,
+    REGISTRY_CATALOG,
+    RESULT_SCENARIO,
+    RESULT_MANIFEST,
+];
+
+/// What the rules read beyond the document they check: the catalogues and
+/// the digest of the contract revision, the documents a document refers
+/// to, and the evidence it cites. The rules know which reference they
+/// follow; where the documents are and how they are read is the
+/// implementation's, which checks a referenced document before handing
+/// it back.
+pub trait Documents {
+    /// The catalogues of the contract revision.
+    fn catalogs(&self) -> &Catalogs;
+
+    /// The identity of the contract revision by exact content.
+    fn contracts_digest(&self) -> &str;
+
+    /// Loads the document that another one refers to through `reference`.
+    ///
+    /// The path must stay below the root. The format of the document is
+    /// checked against `reference.to` before the document is validated, so
+    /// a document of the wrong format is refused without being followed.
+    fn load_reference(&self, reference: &Reference, path: &str) -> Result<Value, Diagnostic> {
+        self.load_cited(reference, path, None)
+    }
+
+    /// Loads a referenced document that is also cited as evidence with a
+    /// digest and a size. The bytes that are hashed are the bytes that are
+    /// validated: the file is read once.
+    fn load_cited(
+        &self,
+        reference: &Reference,
+        path: &str,
+        cited: Option<(&str, Option<u64>)>,
+    ) -> Result<Value, Diagnostic>;
+
+    /// Digest and size of a file that a document cites as evidence.
+    fn hash_evidence(&self, path: &str) -> Result<(String, u64), Refusal>;
+}
 
 /// The first occurrence a fault selects, and whether it selects every
 /// later one (record 0018). An occurrence that is not a 64-bit decimal is
@@ -114,7 +224,7 @@ fn unique(names: &[(String, &str)], what: &str, code: &'static str, out: &mut Ve
 }
 
 fn requirements_known(
-    workspace: &Workspace,
+    documents: &dyn Documents,
     holder: &Value,
     base: &str,
     keys: &[&str],
@@ -122,7 +232,7 @@ fn requirements_known(
 ) {
     for key in keys {
         for (index, id) in names(holder, key).into_iter().enumerate() {
-            if !workspace.catalogs().requirements.contains(id) {
+            if !documents.catalogs().requirements.contains(id) {
                 out.push(Diagnostic::new(
                     code::REQUIREMENT_UNKNOWN,
                     format!("{base}/{key}/{index}"),
@@ -134,7 +244,7 @@ fn requirements_known(
 }
 
 /// Runs the semantic pass that matches the format of `document`.
-pub fn check(workspace: &Workspace, document: &Value, report: &mut Report) {
+pub fn check(documents: &dyn Documents, document: &Value, report: &mut Report) {
     match text(document, "format") {
         "mqttiumd.product-event" => {
             u64_at(document, "/seq", &mut report.diagnostics);
@@ -286,9 +396,9 @@ pub fn check(workspace: &Workspace, document: &Value, report: &mut Report) {
                 }
             }
         }
-        "mqttiumd.scenario" => scenario(workspace, document, &mut report.diagnostics),
-        "mqttiumd.fixture" => fixture(workspace, document, &mut report.diagnostics),
-        "mqttiumd.transition-registry" => registry(workspace, document, report),
+        "mqttiumd.scenario" => scenario(documents, document, &mut report.diagnostics),
+        "mqttiumd.fixture" => fixture(documents, document, &mut report.diagnostics),
+        "mqttiumd.transition-registry" => registry(documents, document, report),
         "mqttiumd.product-transition-registry" => unique(
             &entry_names(document, "rules", "id"),
             "product rule",
@@ -296,7 +406,7 @@ pub fn check(workspace: &Workspace, document: &Value, report: &mut Report) {
             &mut report.diagnostics,
         ),
         "mqttiumd.transition-catalog" => transition_catalog(document, &mut report.diagnostics),
-        "mqttiumd.run-result" => run_result(workspace, document, &mut report.diagnostics),
+        "mqttiumd.run-result" => run_result(documents, document, &mut report.diagnostics),
         "mqttiumd.run-manifest" => run_manifest(document, &mut report.diagnostics),
         "mqttiumd.trace-record" => trace_record(document, &mut report.diagnostics),
         "mqttiumd.store-snapshot" => store_snapshot(document, &mut report.diagnostics),
@@ -319,7 +429,7 @@ pub fn check(workspace: &Workspace, document: &Value, report: &mut Report) {
             );
             for (index, entry) in items(document, "assertions").iter().enumerate() {
                 requirements_known(
-                    workspace,
+                    documents,
                     entry,
                     &format!("/assertions/{index}"),
                     &["requirements"],
@@ -415,8 +525,8 @@ enum Held {
     Destroyed,
 }
 
-fn scenario(workspace: &Workspace, document: &Value, out: &mut Vec<Diagnostic>) {
-    let catalogs = workspace.catalogs();
+fn scenario(documents: &dyn Documents, document: &Value, out: &mut Vec<Diagnostic>) {
+    let catalogs = documents.catalogs();
     let budget = u64_at(document, "/budgets/max_steps", out);
     u64_at(document, "/budgets/max_trace_bytes", out);
 
@@ -430,7 +540,7 @@ fn scenario(workspace: &Workspace, document: &Value, out: &mut Vec<Diagnostic>) 
     }
 
     let clients: Option<BTreeSet<String>> =
-        match workspace.load_reference(&SCENARIO_FIXTURE, text(document, "initial_fixture")) {
+        match documents.load_reference(&SCENARIO_FIXTURE, text(document, "initial_fixture")) {
             Ok(fixture) => Some(
                 items(&fixture, "sessions")
                     .iter()
@@ -773,7 +883,7 @@ fn scenario(workspace: &Workspace, document: &Value, out: &mut Vec<Diagnostic>) 
 
 // ------------------------------------------------------------------- fixture
 
-fn fixture(workspace: &Workspace, document: &Value, out: &mut Vec<Diagnostic>) {
+fn fixture(documents: &dyn Documents, document: &Value, out: &mut Vec<Diagnostic>) {
     u64_at(document, "/store/incarnation", out);
     if let Some(capacities) = document.get("capacities").and_then(Value::as_object) {
         for name in capacities.keys() {
@@ -791,7 +901,7 @@ fn fixture(workspace: &Workspace, document: &Value, out: &mut Vec<Diagnostic>) {
         }
     }
     let profile = text(document, "profile");
-    if !workspace.catalogs().profiles.contains(profile) {
+    if !documents.catalogs().profiles.contains(profile) {
         out.push(Diagnostic::new(
             code::PROFILE_UNKNOWN,
             "/profile",
@@ -1077,8 +1187,8 @@ fn describe(domain: &[(&str, &[&str])], point: &[usize]) -> String {
     format!("{{{}}}", parts.join(", "))
 }
 
-fn registry(workspace: &Workspace, document: &Value, report: &mut Report) {
-    let catalog = match workspace.load_reference(&REGISTRY_CATALOG, text(document, "catalog")) {
+fn registry(documents: &dyn Documents, document: &Value, report: &mut Report) {
+    let catalog = match documents.load_reference(&REGISTRY_CATALOG, text(document, "catalog")) {
         Ok(catalog) => catalog,
         Err(diagnostic) => {
             report.diagnostics.push(diagnostic);
@@ -1107,7 +1217,7 @@ fn registry(workspace: &Workspace, document: &Value, report: &mut Report) {
         let base = format!("/rules/{index}");
         let before = out.len();
         requirements_known(
-            workspace,
+            documents,
             rule,
             &base,
             &["requirements", "witnesses", "mutations"],
@@ -1347,7 +1457,7 @@ fn cited<'a>(
     (text(file, "path"), text(file, "sha256"), bytes)
 }
 
-fn run_result(workspace: &Workspace, document: &Value, out: &mut Vec<Diagnostic>) {
+fn run_result(documents: &dyn Documents, document: &Value, out: &mut Vec<Diagnostic>) {
     unique(
         &entry_names(document, "assertions", "name"),
         "assertion",
@@ -1427,19 +1537,19 @@ fn run_result(workspace: &Workspace, document: &Value, out: &mut Vec<Diagnostic>
     }
 
     // A qualifying result is checked against the exact files it names.
-    if text(document, "contracts_digest") != workspace.contracts_digest() {
+    if text(document, "contracts_digest") != documents.contracts_digest() {
         out.push(Diagnostic::new(
             code::EVIDENCE_MISMATCH,
             "/contracts_digest",
             format!(
                 "the result names other contracts than the ones in use ({})",
-                workspace.contracts_digest()
+                documents.contracts_digest()
             ),
         ));
     }
     // The trace may be large: it is hashed as a stream, never loaded.
     let (path, sha256, bytes) = cited(document, "trace", out);
-    match workspace.hash_evidence(path) {
+    match documents.hash_evidence(path) {
         Err((code, message)) => out.push(Diagnostic::new(code, "/trace", message)),
         Ok((digest, length)) => {
             if digest != sha256 || bytes != Some(length) {
@@ -1454,7 +1564,7 @@ fn run_result(workspace: &Workspace, document: &Value, out: &mut Vec<Diagnostic>
     // The manifest and the scenario are documents: each is read once, and
     // the bytes that are hashed are the bytes that are validated.
     let (path, sha256, bytes) = cited(document, "manifest", out);
-    match workspace.load_cited(&RESULT_MANIFEST, path, Some((sha256, bytes))) {
+    match documents.load_cited(&RESULT_MANIFEST, path, Some((sha256, bytes))) {
         Err(diagnostic) => out.push(diagnostic),
         Ok(manifest) => {
             if text(&manifest, "contracts_digest") != text(document, "contracts_digest") {
@@ -1467,7 +1577,7 @@ fn run_result(workspace: &Workspace, document: &Value, out: &mut Vec<Diagnostic>
         }
     }
     let (path, sha256, bytes) = cited(document, "scenario", out);
-    let scenario = match workspace.load_cited(&RESULT_SCENARIO, path, Some((sha256, bytes))) {
+    let scenario = match documents.load_cited(&RESULT_SCENARIO, path, Some((sha256, bytes))) {
         Ok(scenario) => scenario,
         Err(diagnostic) => {
             out.push(diagnostic);
@@ -1480,7 +1590,7 @@ fn run_result(workspace: &Workspace, document: &Value, out: &mut Vec<Diagnostic>
     // or declared out of scope.
     let required: BTreeSet<&str> = names(&scenario, "assertions")
         .into_iter()
-        .chain(workspace.catalogs().every_run.iter().map(String::as_str))
+        .chain(documents.catalogs().every_run.iter().map(String::as_str))
         .collect();
     let reported: BTreeSet<&str> = items(document, "assertions")
         .iter()
@@ -2064,6 +2174,7 @@ mod tests {
     use std::path::Path;
 
     use super::*;
+    use crate::workspace::Workspace;
 
     #[test]
     fn message_deadline_overflow_is_not_freshness_or_expiration() {

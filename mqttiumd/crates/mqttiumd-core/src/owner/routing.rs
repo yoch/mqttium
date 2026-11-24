@@ -520,8 +520,7 @@ impl Owner {
         // Historical S0 exact/default fixtures retain their one-transition
         // work abstraction. Product registration or hierarchical options opt
         // into the additional bounded selection work, as for pub/sub work.
-        if !self.lifecycle_enabled
-            && self.pubsub.connections.is_empty()
+        if !self.serves_connections()
             && !self.route_index.has_wildcards()
             && self
                 .routes
@@ -773,7 +772,7 @@ mod tests {
         taking.0.into_iter().map(OwnedEffect::into_parts).collect()
     }
     fn apply(owner: &mut Owner, input: Input) -> Vec<(EffectId, Effect)> {
-        let outcome = owner.step(input, TURN);
+        let outcome = owner.step_checked(input, TURN);
         assert!(
             matches!(outcome, StepOutcome::Applied { .. }),
             "{outcome:?}"
@@ -913,7 +912,7 @@ mod tests {
             let effects = apply(&mut owner, publish(qos, 1, 1));
             if qos == Qos::AtMostOnce {
                 assert_eq!(
-                    owner.pubsub.volatile.len(),
+                    owner.volatile.len(),
                     16,
                     "routing_budget_counted_filters_instead_of_destinations"
                 );
@@ -998,10 +997,7 @@ mod tests {
                     "wildcard_fanout_truncated"
                 );
             }
-            assert!(
-                owner.pubsub.volatile.is_empty(),
-                "wildcard_fanout_truncated"
-            );
+            assert!(owner.volatile.is_empty(), "wildcard_fanout_truncated");
             assert!(owner.slots.is_empty());
             assert_eq!(owner.leases.held(), 0);
         }
@@ -1032,7 +1028,7 @@ mod tests {
         }
     }
     fn answer_control(owner: &mut Owner, reply: StoreOutcome) -> Vec<(EffectId, Effect)> {
-        let flight = owner.pubsub.control.as_ref().unwrap().in_flight;
+        let flight = owner.control.as_ref().unwrap().in_flight;
         apply(
             owner,
             Input::StoreResult {
@@ -1078,7 +1074,7 @@ mod tests {
         for qos in [Qos::AtMostOnce, Qos::AtLeastOnce, Qos::ExactlyOnce] {
             assert!(
                 matches!(
-                    owner.step(publish(qos, 1, 2), TURN),
+                    owner.step_checked(publish(qos, 1, 2), TURN),
                     StepOutcome::NeedCapacity {
                         need: CapacityNeed {
                             resource: Resource::ResultSlots,
@@ -1582,7 +1578,7 @@ mod tests {
         };
         assert!(
             matches!(
-                owner_wild.step(publish_probe, too_small),
+                owner_wild.step_checked(publish_probe, too_small),
                 StepOutcome::NeedCapacity {
                     need: crate::contract::capacity::CapacityNeed {
                         resource: crate::contract::capacity::Resource::Work,
@@ -1597,7 +1593,7 @@ mod tests {
             work_limit: WorkUnits::new(wild_bound + 1_000),
         };
         assert!(matches!(
-            owner_wild.step(make_publish(2), sufficient),
+            owner_wild.step_checked(make_publish(2), sufficient),
             StepOutcome::Applied { .. }
         ));
     }

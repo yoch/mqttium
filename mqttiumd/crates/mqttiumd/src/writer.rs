@@ -996,6 +996,91 @@ impl Writer {
     pub fn is_finished(&self) -> bool {
         self.handle.as_ref().is_none_or(|h| h.is_finished())
     }
+
+    /// Hands an ordinary request to the worker without waiting.
+    #[expect(
+        clippy::result_large_err,
+        reason = "the refused request is handed back by value"
+    )]
+    pub fn try_send(&self, request: Request) -> Result<(), TrySendError<Request>> {
+        self.sender.try_send(request)
+    }
+    /// The next ordinary reply, if one is there.
+    pub fn try_recv(&self) -> Result<Response, TryRecvError> {
+        self.receiver.try_recv()
+    }
+    /// Hands a control request to the worker without waiting.
+    #[expect(
+        clippy::result_large_err,
+        reason = "the refused request is handed back by value"
+    )]
+    pub fn try_send_control(
+        &self,
+        request: ControlRequest,
+    ) -> Result<(), TrySendError<ControlRequest>> {
+        self.control_sender.try_send(request)
+    }
+    /// The next control reply, if one is there.
+    pub fn try_recv_control(&self) -> Result<ControlResponse, TryRecvError> {
+        self.control_receiver.try_recv()
+    }
+    /// Asks the worker for a page of recovery, waiting for room in the lane.
+    pub fn request_recovery(&self, cursor: Option<RecoveryCursor>) -> Result<(), Failure> {
+        self.sender
+            .send(Request::Recovery(cursor))
+            .map_err(|_| Failure::plain("writer_closed"))
+    }
+    /// Asks the worker to collect closed receipts, waiting for room in the
+    /// control lane.
+    pub fn request_closed_collection(
+        &self,
+        collection: ClosedReceiptCollection,
+    ) -> Result<(), Failure> {
+        self.control_sender
+            .send(ControlRequest::Closed(collection))
+            .map_err(|_| Failure::plain("writer_control_disconnected"))
+    }
+    /// The worker's start: its boot, or the failure it reported. A worker
+    /// that says nothing within `timeout`, or is gone, is `startup_deadline`.
+    pub fn await_boot(&self, timeout: Duration) -> Result<Boot, Failure> {
+        self.boot
+            .recv_timeout(timeout)
+            .map_err(|_| Failure::plain("startup_deadline"))?
+    }
+    /// The next ordinary reply during start-up (see `reply_within`).
+    pub fn await_reply(
+        &self,
+        cancel: &AtomicBool,
+        deadline: Instant,
+        code: &'static str,
+    ) -> Result<Response, Failure> {
+        reply_within(&self.receiver, cancel, deadline, code)
+    }
+    /// The next control reply during start-up (see `reply_within`).
+    pub fn await_control_reply(
+        &self,
+        cancel: &AtomicBool,
+        deadline: Instant,
+        code: &'static str,
+    ) -> Result<ControlResponse, Failure> {
+        reply_within(&self.control_receiver, cancel, deadline, code)
+    }
+    /// Stops the worker after the work it accepted: Stop is queued once,
+    /// behind that work, and both reply lanes are drained so that a worker
+    /// blocked on a full lane reaches it. Whether the worker finished by
+    /// `deadline`.
+    pub fn stop_within(&self, deadline: Instant) -> bool {
+        let mut stop_sent = false;
+        while Instant::now() < deadline && !self.is_finished() {
+            if !stop_sent && self.sender.try_send(Request::Stop).is_ok() {
+                stop_sent = true;
+            }
+            while self.receiver.try_recv().is_ok() {}
+            while self.control_receiver.try_recv().is_ok() {}
+            thread::sleep(Duration::from_millis(2));
+        }
+        self.is_finished()
+    }
     pub fn join_finished(&mut self) -> Result<(), Failure> {
         if self.is_finished() {
             if let Some(h) = self.handle.take() {
@@ -1125,6 +1210,39 @@ impl DirectWriter {
     }
 }
 
+/// A reply of the worker during start-up. A reply already produced, failure
+/// included, is read before the stop flag: cancelling an outstanding request
+/// never calls it rejected. Then the flag, then the deadline (`code`), then
+/// a wait of at most 10 ms.
+fn reply_within<T>(
+    receiver: &Receiver<T>,
+    cancel: &AtomicBool,
+    deadline: Instant,
+    code: &'static str,
+) -> Result<T, Failure> {
+    loop {
+        match receiver.try_recv() {
+            Ok(reply) => return Ok(reply),
+            Err(TryRecvError::Disconnected) => return Err(Failure::plain("writer_disconnected")),
+            Err(TryRecvError::Empty) => {}
+        }
+        if cancel.load(Ordering::Relaxed) {
+            return Err(Failure::plain("startup_cancelled"));
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(Failure::plain(code));
+        }
+        match receiver.recv_timeout(remaining.min(Duration::from_millis(10))) {
+            Ok(reply) => return Ok(reply),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(Failure::plain("writer_disconnected"));
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+        }
+    }
+}
+
 /// Abstracts the exclusive store worker between the threaded writer (SQLite
 /// durable, `.mlog` log-first, and test-hook runs) and the zero-hop in-thread
 /// `DirectWriter` used for `--storage-mode volatile`.
@@ -1153,7 +1271,7 @@ impl StoreHandle<'_> {
 
     pub(crate) fn try_send(&mut self, request: Request) -> Result<(), TrySendError<Request>> {
         match self {
-            Self::Threaded(writer) => writer.sender.try_send(request),
+            Self::Threaded(writer) => writer.try_send(request),
             Self::Direct(direct) => {
                 direct.exec_request(request);
                 Ok(())
@@ -1163,7 +1281,7 @@ impl StoreHandle<'_> {
 
     pub(crate) fn try_recv(&mut self) -> Result<Response, TryRecvError> {
         match self {
-            Self::Threaded(writer) => writer.receiver.try_recv(),
+            Self::Threaded(writer) => writer.try_recv(),
             Self::Direct(direct) => direct.try_recv(),
         }
     }
@@ -1173,7 +1291,7 @@ impl StoreHandle<'_> {
         request: ControlRequest,
     ) -> Result<(), TrySendError<ControlRequest>> {
         match self {
-            Self::Threaded(writer) => writer.control_sender.try_send(request),
+            Self::Threaded(writer) => writer.try_send_control(request),
             Self::Direct(direct) => {
                 direct.exec_control(request);
                 Ok(())
@@ -1183,7 +1301,7 @@ impl StoreHandle<'_> {
 
     pub(crate) fn try_recv_control(&mut self) -> Result<ControlResponse, TryRecvError> {
         match self {
-            Self::Threaded(writer) => writer.control_receiver.try_recv(),
+            Self::Threaded(writer) => writer.try_recv_control(),
             Self::Direct(direct) => direct.try_recv_control(),
         }
     }
@@ -1212,15 +1330,12 @@ impl StoreHandle<'_> {
     ) -> Result<Option<Response>, Failure> {
         match self {
             Self::Threaded(writer) => {
-                writer
-                    .sender
-                    .send(Request::Recovery(cursor))
-                    .map_err(|_| Failure::plain("writer_closed"))?;
+                writer.request_recovery(cursor)?;
                 Ok(None)
             }
             Self::Direct(direct) => {
                 direct.exec_request(Request::Recovery(cursor));
-                Ok(direct.responses.pop_front())
+                Ok(direct.try_recv().ok())
             }
         }
     }
@@ -1231,16 +1346,45 @@ impl StoreHandle<'_> {
     ) -> Result<Option<ControlResponse>, Failure> {
         match self {
             Self::Threaded(writer) => {
-                writer
-                    .control_sender
-                    .send(ControlRequest::Closed(collection))
-                    .map_err(|_| Failure::plain("writer_control_disconnected"))?;
+                writer.request_closed_collection(collection)?;
                 Ok(None)
             }
             Self::Direct(direct) => {
                 direct.exec_control(ControlRequest::Closed(collection));
-                Ok(direct.control_responses.pop_front())
+                Ok(direct.try_recv_control().ok())
             }
+        }
+    }
+
+    /// The reply to a recovery request that `exec_recovery` did not answer
+    /// at once. A direct writer answers at once: waiting for it is
+    /// `recovery_protocol`.
+    pub(crate) fn await_recovery_reply(
+        &self,
+        cancel: &AtomicBool,
+        wait: Duration,
+    ) -> Result<Response, Failure> {
+        match self {
+            Self::Threaded(writer) => {
+                writer.await_reply(cancel, Instant::now() + wait, "recovery_deadline")
+            }
+            Self::Direct(_) => Err(Failure::plain("recovery_protocol")),
+        }
+    }
+
+    /// The reply to a collection request that `exec_closed_collection` did
+    /// not answer at once. Waiting for a direct writer is
+    /// `startup_collection_protocol`.
+    pub(crate) fn await_collection_reply(
+        &self,
+        cancel: &AtomicBool,
+        deadline: Instant,
+    ) -> Result<ControlResponse, Failure> {
+        match self {
+            Self::Threaded(writer) => {
+                writer.await_control_reply(cancel, deadline, "startup_collection_deadline")
+            }
+            Self::Direct(_) => Err(Failure::plain("startup_collection_protocol")),
         }
     }
 }
@@ -2413,9 +2557,9 @@ fn bootstrap_bound(
     let collect_closed =
         state.receipt_frontiers.len() >= 32 || state.accounts.receipt_slots.get() >= 4096;
     let sqlite = match &store {
-        StoreBackend::Durable(s) => Some(s.effective_settings().clone()),
-        StoreBackend::Log(s) => s.sqlite_settings().cloned(),
-        StoreBackend::Volatile { handle, .. } => handle.sqlite_settings().cloned(),
+        StoreBackend::Durable(s) => Some(s.effective_settings()),
+        StoreBackend::Log(s) => s.sqlite_settings(),
+        StoreBackend::Volatile { handle, .. } => handle.sqlite_settings(),
     };
     Ok((
         store,

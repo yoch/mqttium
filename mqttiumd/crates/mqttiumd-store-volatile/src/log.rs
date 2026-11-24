@@ -412,8 +412,8 @@ impl LogStore {
 
     /// SQLite settings from initial checkpoint load, if loaded from an existing file.
     #[must_use]
-    pub fn sqlite_settings(&self) -> Option<&Settings> {
-        self.sqlite_settings.as_ref()
+    pub fn sqlite_settings(&self) -> Option<Settings> {
+        self.sqlite_settings.clone()
     }
 
     /// Sets whether the medium accepts durable writes (used by conformance and
@@ -605,9 +605,9 @@ impl DurableStore for LogStore {
     ) -> Result<MessageExpirySweep, ReadError> {
         // Dry-run with Failing durability executes all validation and returns
         // Ok immediately if nothing needs expiration.
-        self.store.durability = Durability::Failing;
-        let probe = self.store.expire_messages(now, after, limit);
-        self.store.durability = Durability::Available;
+        let probe = self
+            .store
+            .dry_run(|store| store.expire_messages(now, after, limit));
         match probe {
             Ok(sweep) => return Ok(sweep),
             Err(ReadError::Unavailable) => {}
@@ -637,10 +637,11 @@ impl DurableStore for LogStore {
         expected: Option<SessionClockAnchor>,
         reading: SessionClockReading,
     ) -> Result<SessionClockAnchor, ReadError> {
-        if self.store.session_clock != expected {
-            return self.store.session_clock.ok_or(ReadError::InvalidData);
+        let anchor = self.store.session_clock();
+        if anchor != expected {
+            return anchor.ok_or(ReadError::InvalidData);
         }
-        let _ = SessionClockAnchor::advance(self.store.session_clock, reading)?;
+        let _ = SessionClockAnchor::advance(anchor, reading)?;
         if self.durability == Durability::Failing {
             return Err(ReadError::Unavailable);
         }
@@ -663,9 +664,9 @@ impl DurableStore for LogStore {
         &mut self,
         collection: ReceiptCollection,
     ) -> Result<ReceiptCollectionReply, ReadError> {
-        self.store.durability = Durability::Failing;
-        let probe = self.store.collect_receipts(collection);
-        self.store.durability = Durability::Available;
+        let probe = self
+            .store
+            .dry_run(|store| store.collect_receipts(collection));
         match probe {
             Ok(ReceiptCollectionReply::PendingOrUnknown) => {}
             other => return other,
@@ -697,9 +698,9 @@ impl DurableStore for LogStore {
         &mut self,
         collection: ClosedReceiptCollection,
     ) -> Result<ClosedReceiptReply, ReadError> {
-        self.store.durability = Durability::Failing;
-        let probe = self.store.collect_closed_receipts(collection);
-        self.store.durability = Durability::Available;
+        let probe = self
+            .store
+            .dry_run(|store| store.collect_closed_receipts(collection));
         match probe {
             Ok(ClosedReceiptReply::PendingOrUnknown) => {}
             other => return other,
@@ -728,12 +729,13 @@ impl DurableStore for LogStore {
     }
 
     fn open_epoch(&mut self, command: &OpenEpoch) -> Result<OpeningOutcome, ReadError> {
-        if !matches!(self.store.ledger.open(command), LedgerOpening::Opens { .. }) {
+        if !matches!(
+            self.store.ledger()?.open(command),
+            LedgerOpening::Opens { .. }
+        ) {
             return self.store.open_epoch(command);
         }
-        self.store.durability = Durability::Failing;
-        let probe = self.store.open_epoch(command);
-        self.store.durability = Durability::Available;
+        let probe = self.store.dry_run(|store| store.open_epoch(command));
         let probe_outcome = probe?;
         if self.durability == Durability::Failing {
             return Ok(probe_outcome);
@@ -742,7 +744,7 @@ impl DurableStore for LogStore {
             encode_open_epoch_record(buf, command);
         });
         let Ok(prev_len) = self.flush_prepared_frame() else {
-            return Ok(OpeningOutcome::read(&self.store.ledger, command));
+            return Ok(OpeningOutcome::read(&self.store.ledger()?, command));
         };
         let rev_before = self.store.revision;
         let res = self.store.open_epoch(command);
@@ -781,9 +783,9 @@ impl DurableStore for LogStore {
     }
 
     fn resolve_and_fence(&mut self, operation: OperationId) -> Resolved {
-        self.store.durability = Durability::Failing;
-        let probe = self.store.resolve_and_fence(operation);
-        self.store.durability = Durability::Available;
+        let probe = self
+            .store
+            .dry_run(|store| store.resolve_and_fence(operation));
         if !matches!(probe.outcome, StoreOutcome::PendingOrUnknown) {
             return probe;
         }
@@ -813,9 +815,7 @@ impl DurableStore for LogStore {
     }
 
     fn admin(&mut self, command: AdminCommand) -> Result<AdminDone, AdminRefused> {
-        self.store.durability = Durability::Failing;
-        let probe = self.store.admin(command.clone());
-        self.store.durability = Durability::Available;
+        let probe = self.store.dry_run(|store| store.admin(command.clone()));
         match probe {
             Err(AdminRefused::WriteFailed) => {}
             other => return other,

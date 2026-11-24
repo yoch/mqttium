@@ -11,33 +11,8 @@ use crate::diagnostic::{Diagnostic, Report, code};
 pub use crate::files::MAX_DOCUMENT_BYTES;
 use crate::files::{self, Loaded, Refusal};
 use crate::schemas::Schemas;
-use crate::{manifest, semantic, strict};
-
-/// One contractual injection point.
-#[derive(Default)]
-pub struct FaultPoint {
-    /// What passes through the point: `command` or `result`.
-    pub carries: String,
-    /// The actions the point offers.
-    pub actions: BTreeSet<String>,
-}
-
-/// The closed catalogues that documents refer to.
-#[derive(Default)]
-pub struct Catalogs {
-    /// Injection point to the actions it offers.
-    pub fault_points: BTreeMap<String, FaultPoint>,
-    /// Command kinds a fault may match.
-    pub command_kinds: BTreeSet<String>,
-    /// Profile identifiers.
-    pub profiles: BTreeSet<String>,
-    /// Assertion names.
-    pub assertions: BTreeSet<String>,
-    /// Assertions every run owes, whether or not its scenario lists them.
-    pub every_run: BTreeSet<String>,
-    /// Requirement, scenario, mutation, model, gate and lot identifiers.
-    pub requirements: BTreeSet<String>,
-}
+use crate::semantic::{self, Catalogs, Documents, FaultPoint, Reference};
+use crate::{manifest, strict};
 
 /// Catalogue files every contract directory must hold.
 const CATALOG_FILES: [(&str, &str); 4] = [
@@ -49,56 +24,6 @@ const CATALOG_FILES: [(&str, &str); 4] = [
 
 /// The longest chain of documents referring to one another.
 pub const MAX_REFERENCE_DEPTH: usize = 4;
-
-/// One way a document of a format may refer to a document of another.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct Reference {
-    /// Format of the referring document.
-    pub from: &'static str,
-    /// JSON Pointer of the member that holds the path.
-    pub pointer: &'static str,
-    /// Format the referenced document must have.
-    pub to: &'static str,
-}
-
-/// A scenario names the fixture it starts from.
-pub const SCENARIO_FIXTURE: Reference = Reference {
-    from: "mqttiumd.scenario",
-    pointer: "/initial_fixture",
-    to: "mqttiumd.fixture",
-};
-
-/// A transition registry names the catalogue of its vocabulary.
-pub const REGISTRY_CATALOG: Reference = Reference {
-    from: "mqttiumd.transition-registry",
-    pointer: "/catalog",
-    to: "mqttiumd.transition-catalog",
-};
-
-/// A qualifying result names the scenario it ran.
-pub const RESULT_SCENARIO: Reference = Reference {
-    from: "mqttiumd.run-result",
-    pointer: "/scenario/path",
-    to: "mqttiumd.scenario",
-};
-
-/// A qualifying result names the manifest of its run.
-pub const RESULT_MANIFEST: Reference = Reference {
-    from: "mqttiumd.run-result",
-    pointer: "/manifest/path",
-    to: "mqttiumd.run-manifest",
-};
-
-/// Every reference between formats. The format of a referenced document is
-/// checked against this table before the document is validated, and the
-/// table is acyclic, so following references always terminates. The stack
-/// of [`Workspace`] guards the same property at run time.
-pub const REFERENCES: [Reference; 4] = [
-    SCENARIO_FIXTURE,
-    REGISTRY_CATALOG,
-    RESULT_SCENARIO,
-    RESULT_MANIFEST,
-];
 
 /// Why a document cannot enter the stack of documents being checked.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -304,11 +229,6 @@ impl Workspace {
         Ok(workspace)
     }
 
-    /// The catalogues of this contract directory.
-    pub fn catalogs(&self) -> &Catalogs {
-        &self.catalogs
-    }
-
     /// The identity of this contract revision by exact content.
     pub fn contracts_digest(&self) -> &str {
         &self.contracts_digest
@@ -384,19 +304,34 @@ impl Workspace {
         report
     }
 
-    /// Loads the document that another one refers to through `reference`.
-    ///
-    /// The path must stay below the root. The format of the document is
-    /// checked against `reference.to` before the document is validated, so
-    /// a document of the wrong format is refused without being followed.
-    pub fn load_reference(&self, reference: &Reference, path: &str) -> Result<Value, Diagnostic> {
-        self.load_cited(reference, path, None)
+    /// Checks every JSON file of the contract directory, in name order.
+    pub fn check_contracts(&self) -> Vec<(PathBuf, Report)> {
+        self.contract_names
+            .iter()
+            .map(|name| {
+                let path = self.contracts.join(name);
+                let report = self.check_path(&path);
+                (path, report)
+            })
+            .collect()
+    }
+}
+
+/// The workspace is where the documents the semantic rules follow are:
+/// below its root, read through the bounded reader, checked in turn.
+impl Documents for Workspace {
+    fn catalogs(&self) -> &Catalogs {
+        &self.catalogs
+    }
+
+    fn contracts_digest(&self) -> &str {
+        Workspace::contracts_digest(self)
     }
 
     /// Loads a referenced document that is also cited as evidence with a
     /// digest and a size. The bytes that are hashed are the bytes that are
     /// validated: the file is read once.
-    pub fn load_cited(
+    fn load_cited(
         &self,
         reference: &Reference,
         path: &str,
@@ -459,7 +394,7 @@ impl Workspace {
 
     /// Digest and size of a file that a document cites as evidence. The
     /// file is hashed as a stream: evidence has no size bound.
-    pub fn hash_evidence(&self, path: &str) -> Result<(String, u64), Refusal> {
+    fn hash_evidence(&self, path: &str) -> Result<(String, u64), Refusal> {
         if !is_contained(path) {
             return Err((
                 code::PATH_ESCAPE,
@@ -468,18 +403,6 @@ impl Workspace {
         }
         files::hash_file(&self.canonical_root, &self.root.join(path))
     }
-
-    /// Checks every JSON file of the contract directory, in name order.
-    pub fn check_contracts(&self) -> Vec<(PathBuf, Report)> {
-        self.contract_names
-            .iter()
-            .map(|name| {
-                let path = self.contracts.join(name);
-                let report = self.check_path(&path);
-                (path, report)
-            })
-            .collect()
-    }
 }
 
 #[cfg(test)]
@@ -487,9 +410,8 @@ mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
 
-    use super::{
-        MAX_REFERENCE_DEPTH, REFERENCES, ReferenceStack, StackRefusal, Workspace, is_contained,
-    };
+    use super::{MAX_REFERENCE_DEPTH, ReferenceStack, StackRefusal, Workspace, is_contained};
+    use crate::semantic::REFERENCES;
 
     /// A copy of the contract directory and its schemas under a root of
     /// its own, so that a test may change the files.

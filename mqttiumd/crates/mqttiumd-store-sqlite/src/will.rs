@@ -273,11 +273,14 @@ pub(super) fn recover(conn: &Connection, meta: &Meta) -> Result<(), Fault> {
     Ok(())
 }
 
-pub(super) fn open(
+/// What an opening with a will checks before its session is opened: no
+/// intent of the client is pending, and the will fits. Returns the plain
+/// opening the session layer then performs.
+pub(super) fn before_open(
     conn: &Connection,
-    meta: &mut Meta,
+    meta: &Meta,
     command: &SessionLifecycle,
-) -> Guard<CommitFacts> {
+) -> Guard<SessionLifecycle> {
     let SessionAction::OpenWillAt {
         client_id,
         expected,
@@ -313,7 +316,7 @@ pub(super) fn open(
             return refused(RejectReason::CapacityExceeded(Resource::PayloadBytes));
         }
     }
-    let legacy = SessionLifecycle {
+    Ok(SessionLifecycle {
         operation: command.operation,
         action: SessionAction::OpenAt {
             client_id: client_id.clone(),
@@ -322,8 +325,17 @@ pub(super) fn open(
             expiry: *expiry,
             now: *now,
         },
+    })
+}
+
+/// Arms the will of an opening once its session is opened (`facts`).
+pub(super) fn arm(conn: &Connection, command: &SessionLifecycle, facts: CommitFacts) -> Guard<()> {
+    let SessionAction::OpenWillAt {
+        client_id, will, ..
+    } = &command.action
+    else {
+        return refused(RejectReason::PreconditionFailed);
     };
-    let facts = sessions::stage(conn, meta, &legacy)?;
     if let (Some(spec), CommitFacts::SessionLifecycle(SessionChange::Opened { session, .. })) =
         (will, facts)
     {
@@ -339,14 +351,12 @@ pub(super) fn open(
             i64::from(spec.retain),
         ])?;
     }
-    Ok(facts)
+    Ok(())
 }
 
-pub(super) fn end(
-    conn: &Connection,
-    meta: &mut Meta,
-    command: &SessionLifecycle,
-) -> Guard<CommitFacts> {
+/// Settles the will of a session that ends: published later or forgotten.
+/// Returns the plain detach the session layer then performs.
+pub(super) fn settle(conn: &Connection, command: &SessionLifecycle) -> Guard<SessionLifecycle> {
     let SessionAction::EndWill {
         guard,
         expiry,
@@ -392,15 +402,14 @@ pub(super) fn end(
                 guard.session.to_be_bytes().as_slice()
             ])?;
     }
-    let detach = SessionLifecycle {
+    Ok(SessionLifecycle {
         operation: command.operation,
         action: SessionAction::Detach {
             guard,
             expiry,
             observed_at,
         },
-    };
-    sessions::stage(conn, meta, &detach)
+    })
 }
 
 pub(super) fn publish(
@@ -475,7 +484,7 @@ pub(super) fn is_open_will_recipe(canonical: &[u8]) -> bool {
 
 const MAX_OPEN_RECEIPT_BYTES: u64 = 8 * 1024 * 1024;
 
-fn receipt_capacity_scan(conn: &Connection) -> Result<(usize, u64), Fault> {
+pub(super) fn receipt_capacity_scan(conn: &Connection) -> Result<(usize, u64), Fault> {
     let mut bytes = 0u64;
     let mut rows_count = 0usize;
     let mut statement = conn.prepare_cached("SELECT length(recipe) FROM operations WHERE substr(recipe,7,1)=x'08' AND substr(recipe,40,1) IN (x'05',x'07') LIMIT 65537")?;
@@ -512,14 +521,7 @@ pub(super) fn receipt_capacity_cached(
     caches: &mut StoreCaches,
     delta: &TxDelta,
 ) -> Result<bool, Fault> {
-    let (base_rows, base_bytes) = match caches.open_receipts {
-        Some(pair) => pair,
-        None => {
-            let pair = receipt_capacity_scan(conn)?;
-            caches.open_receipts = Some(pair);
-            pair
-        }
-    };
+    let (base_rows, base_bytes) = caches.open_receipts(conn)?;
     let rows = base_rows
         .checked_add(delta.open_rows)
         .ok_or(ReadError::LimitExceeded)?;

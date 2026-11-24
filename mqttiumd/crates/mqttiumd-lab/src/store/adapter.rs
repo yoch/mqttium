@@ -41,7 +41,9 @@
 
 use std::collections::{BTreeMap, VecDeque};
 
-use mqttiumd_contract::command::{Command, OpenEpoch, OpeningAttempt, Recipe, StartupNonce};
+use mqttiumd_contract::command::{
+    Command, EpochLedger, OpenEpoch, OpeningAttempt, Recipe, StartupNonce,
+};
 use mqttiumd_contract::effects::{
     Effect, EffectSink, Input, OwnedEffect, RecoveredFact, SubmitBlock, SubmitResult,
 };
@@ -513,6 +515,15 @@ impl GroupEvidence {
     }
 }
 
+/// What the adapter recorded since it was last drained.
+#[derive(Debug, Default)]
+pub struct Recorded {
+    /// The count of what was committed in groups.
+    pub groups: GroupEvidence,
+    /// The events, in the order they happened.
+    pub events: Vec<StoreEvent>,
+}
+
 /// The deterministic store adapter. See the module documentation.
 pub struct SimStore<S> {
     store: S,
@@ -681,8 +692,27 @@ impl<S: DurableStore> SimStore<S> {
         core::mem::take(&mut self.grouped)
     }
 
-    /// The wrapped store, for inspection and for the commands that do
-    /// not travel as effects (administration, recovery pages).
+    /// Takes what the adapter recorded since the last call. `None` once
+    /// an event could not be kept: the run is then inconclusive, and
+    /// nothing of what was kept is handed out.
+    pub fn drain_evidence(&mut self) -> Option<Recorded> {
+        if self.evidence_lost {
+            return None;
+        }
+        Some(Recorded {
+            groups: core::mem::take(&mut self.grouped),
+            events: core::mem::take(&mut self.events),
+        })
+    }
+
+    /// The ledger of the data set behind the adapter. A read: the
+    /// adapter neither records nor faults it.
+    pub fn ledger(&self) -> Result<EpochLedger, ReadError> {
+        self.store.ledger()
+    }
+
+    /// The wrapped store, for the inspector of the backend, which reads
+    /// the durable state beside the adapter, unrecorded and unfaulted.
     #[must_use]
     pub fn store(&self) -> &S {
         &self.store
