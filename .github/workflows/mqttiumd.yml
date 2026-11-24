@@ -145,6 +145,11 @@ jobs:
         run: |
           python tools/test_transactional_negative.py
           tools/run_transactional_reception.sh "$RUNNER_TEMP/campaigns/transactions"
+      # The performance gate of the deslop lots (report 0046): its
+      # arithmetic, its rule and the packets of its QoS 1 measure. No broker
+      # runs here; the gate itself is played by hand on a quiet host.
+      - name: The performance gate computes what its rule says
+        run: python tools/test_perf_gate.py
       - name: Bounded exploratory process kills
         run: tools/run_k2a_sweep.sh "$RUNNER_TEMP/campaigns/k2a"
       - name: Artificial WAL prefix images

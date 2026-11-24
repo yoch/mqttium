@@ -35,9 +35,9 @@
 #   (`of_session`). Written as `&self.rows`, `rows` is reported as a field
 #   leak; its body `self.rows.as_slice()` hides it from the linter. The
 #   read side of `State::deliveries` and `State::deliveries_by_session`,
-#   removed above, is therefore renamed, not narrowed. Narrowing it, or
-#   keeping read-only lending as the interface of the table, is left to
-#   the owner of the repository.
+#   removed above, is therefore renamed, not narrowed. The owner of the
+#   repository chose on 24 November 2026 to keep read-only lending as the
+#   interface of the table (report 0046).
 # - field-leak of the effective settings (SqliteStore::settings,
 #   LogStore::sqlite_settings, VolatileHandle::sqlite_settings): a record of
 #   what the engine read back, which every reader only copies; its main
