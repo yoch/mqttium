@@ -64,7 +64,7 @@ scenario(
         publish_sync("pub", "expr/t", "short-lived", retain=True, level=5, props={"message_expiry_interval": 1}),
         sleep(2.5),
         connect("sub", "x-expr-sub", level=5),
-        subscribe("sub", 1, [("expr/t", 0)], level=5, expect=0), collect("sub", sort=True),
+        subscribe("sub", 1, [("expr/t", 0)], level=5, expect=0), collect("sub", sort=True, suback=1),
     ],
 )
 

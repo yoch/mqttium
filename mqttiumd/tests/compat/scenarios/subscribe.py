@@ -97,7 +97,7 @@ scenario(
     doc="""A subscription that names `$SYS/broker/version`: the reference keeps a retained
     version string there.""",
     steps=[connect("a", "s-sys"), subscribe("a", 1, [("$SYS/broker/version", 0)], expect=0),
-           collect("a", sort=True)],
+           collect("a", sort=True, suback=1)],
 )
 
 scenario(

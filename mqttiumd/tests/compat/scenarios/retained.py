@@ -40,7 +40,7 @@ scenario(
         connect("pub", "r-replace-pub"),
         store("pub", "replace/t", "one", 4), store("pub", "replace/t", "two", 4, packet_id=2),
         connect("sub", "r-replace-sub"),
-        subscribe("sub", 1, [("replace/t", 0)], expect=0), collect("sub", sort=True),
+        subscribe("sub", 1, [("replace/t", 0)], expect=0), collect("sub", sort=True, suback=1),
     ],
 )
 
@@ -52,7 +52,7 @@ scenario(
         connect("pub", "r-clear-pub"),
         store("pub", "clear/t", "kept", 4), store("pub", "clear/t", b"", 4, packet_id=2),
         connect("sub", "r-clear-sub"),
-        subscribe("sub", 1, [("clear/t", 0)], expect=0), collect("sub", sort=True),
+        subscribe("sub", 1, [("clear/t", 0)], expect=0), collect("sub", sort=True, suback=1),
     ],
 )
 
@@ -76,7 +76,7 @@ scenario(
         publish_ack("pub", "tree/c/d", "cd", retain=True, packet_id=3),
         publish_ack("pub", "other/a", "other", retain=True, packet_id=4),
         connect("sub", "r-tree-sub"),
-        subscribe("sub", 1, [("tree/#", 0)], expect=0), collect("sub", sort=True),
+        subscribe("sub", 1, [("tree/#", 0)], expect=0), collect("sub", sort=True, suback=1),
     ],
 )
 
@@ -179,9 +179,9 @@ for handling, doc in (
             connect("pub", "r-rh-pub", level=5), store("pub", "rh/t", "kept", 5),
             connect("sub", "r-rh-sub", level=5),
             subscribe("sub", 1, [("rh/t", sub_options(0, rh=handling))], level=5, expect=0),
-            collect("sub", sort=True),
+            collect("sub", sort=True, suback=1),
             subscribe("sub", 2, [("rh/t", sub_options(0, rh=handling))], level=5, expect=0),
-            collect("sub", sort=True),
+            collect("sub", sort=True, suback=2),
         ],
     )
 

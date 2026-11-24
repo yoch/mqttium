@@ -153,8 +153,13 @@ def recv(conn, count=1, *, timeout=WAIT, sort=False):
     return {"op": "recv", "conn": conn, "count": count, "timeout": timeout, "sort": sort}
 
 
-def quiet(conn, *, window=QUIET, ping=True, timeout=WAIT, sort=False, limit=LIMIT):
+def quiet(conn, *, window=QUIET, ping=True, timeout=WAIT, sort=False, limit=LIMIT, suback=None):
     """State that nothing more arrives; whatever does is recorded.
+
+    With `suback`, the step first reads up to the SUBACK of that Packet
+    Identifier, within `timeout`: a broker may answer PINGREQ before a
+    SUBACK that waits for a durable commit. A SUBACK that does not come
+    ends the step as `no-suback`.
 
     The step sends PINGREQ, reads up to the PINGRESP and then until
     nothing has come for `window` seconds: the window starts again at each
@@ -167,17 +172,19 @@ def quiet(conn, *, window=QUIET, ping=True, timeout=WAIT, sort=False, limit=LIMI
     if limit < window:
         raise ValueError("the limit of a silent window is at least the window")
     return {"op": "quiet", "conn": conn, "window": window, "ping": ping, "timeout": timeout, "sort": sort,
-            "limit": limit}
+            "limit": limit, "suback": suback}
 
 
-def collect(conn, *, sort=False, window=QUIET, timeout=WAIT, limit=LIMIT):
+def collect(conn, *, sort=False, window=QUIET, timeout=WAIT, limit=LIMIT, suback=None):
     """Read whatever the broker has for `conn`, when how many packets come
     is part of the question: the same round trip and window as `quiet`.
+    After a SUBSCRIBE sent without waiting (`subscribe(..., expect=0)`),
+    give its Packet Identifier as `suback`.
 
     Only where the count cannot depend on timing. What a broker may shed
     (QoS 0) is counted with `measure`; what it owes (QoS 1) is read with
     `drain`."""
-    return quiet(conn, window=window, timeout=timeout, sort=sort, limit=limit)
+    return quiet(conn, window=window, timeout=timeout, sort=sort, limit=limit, suback=suback)
 
 
 def drain(conn, count, *, idle=IDLE, timeout=DRAIN, sort=False):
