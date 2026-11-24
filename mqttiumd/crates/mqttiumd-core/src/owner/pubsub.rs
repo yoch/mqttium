@@ -1,4 +1,5 @@
 //! Hierarchical subscriptions and outgoing QoS 1/2 under the same owner authority.
+use super::connections::{Connection, Connections, Read};
 use super::*;
 use crate::contract::command::{
     ClaimDelivery, ConsumeDelivery, ExpireDelivery, FinishDelivery, MarkDeliveryStarted,
@@ -16,26 +17,6 @@ use alloc::collections::{BTreeSet, VecDeque};
 const MUTANT_EARLY_PI_RELEASE: bool = false;
 const MUTANT_IGNORE_OCCUPIED_PI: bool = false;
 const MUTANT_STALE_OUTGOING_FRAME_RESULT: bool = false;
-
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(super) struct Read {
-    effect: EffectId,
-    session: SessionId,
-    invalidated: bool,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(super) struct Connection {
-    generation: ConnectionGeneration,
-    receive_maximum: u16,
-    maximum_packet_size: u32,
-    after: Option<DeliveryId>,
-    loading: Option<Read>,
-    rescan_needed: bool,
-    caught_up: bool,
-    dirty_during_load: bool,
-    last_qos0_ingress: u64,
-}
 
 #[derive(Debug)]
 pub(super) struct Control {
@@ -524,9 +505,6 @@ impl VolatileQueue {
 
 #[derive(Debug)]
 pub(super) struct State {
-    pub(super) connections: BoundedVec<Connection>,
-    conn_by_gen: FlatMap<ConnectionGeneration, usize>,
-    conn_by_loading_effect: ScopedFlatMap<EffectId, usize>,
     pub(super) deliveries: BoundedVec<Delivery>,
     delivery_by_id: ScopedFlatMap<DeliveryId, usize>,
     delivery_by_op: ScopedFlatMap<OperationId, usize>,
@@ -718,44 +696,6 @@ impl State {
                     && (d.early_pubrec.is_some()
                         || d.early_puback
                         || (d.certain_never_started && d.frame.is_none() && d.expiry.is_some()))))
-    }
-
-    fn index_conn(&mut self, index: usize) {
-        let c = self.connections.as_slice()[index];
-        self.conn_by_gen.insert(c.generation, index);
-        if let Some(read) = c.loading {
-            self.conn_by_loading_effect.insert(read.effect, index);
-        }
-    }
-
-    fn unindex_conn(&mut self, index: usize) {
-        let c = self.connections.as_slice()[index];
-        self.conn_by_gen.remove(&c.generation);
-        if let Some(read) = c.loading {
-            self.conn_by_loading_effect.remove(&read.effect);
-        }
-    }
-
-    fn push_conn(&mut self, value: Connection) -> Result<(), CoreFault> {
-        let index = self.connections.len();
-        self.connections
-            .try_push(value)
-            .map_err(|_| CoreFault::StalePlan)?;
-        self.index_conn(index);
-        Ok(())
-    }
-
-    fn remove_conn_at(&mut self, index: usize) {
-        let last = self.connections.len() - 1;
-        self.unindex_conn(index);
-        if index != last {
-            self.unindex_conn(last);
-            self.connections.as_mut_slice().swap(index, last);
-        }
-        let _ = self.connections.pop();
-        if index != last {
-            self.index_conn(index);
-        }
     }
 
     fn is_pubrec_pending(d: &Delivery) -> bool {
@@ -1217,7 +1157,12 @@ impl State {
         None
     }
 
-    pub(super) fn work_bound(&self, input: &Input, _routes: usize) -> u64 {
+    pub(super) fn work_bound(
+        &self,
+        input: &Input,
+        connections: &Connections,
+        _routes: usize,
+    ) -> u64 {
         if let Input::MessagesExpired { deliveries } = input {
             let count = capacity_of(deliveries.len());
             return count.saturating_mul(16).saturating_add(16);
@@ -1237,7 +1182,7 @@ impl State {
                 }
         );
         if !new
-            && self.connections.is_empty()
+            && connections.is_empty()
             && self.control.is_none()
             && self.volatile.is_empty()
             && self.deliveries.is_empty()
@@ -1245,7 +1190,7 @@ impl State {
             return 0;
         }
         let slots = capacity_of(self.deliveries.capacity()).min(32);
-        let connection_work = capacity_of(self.connections.capacity()).min(16);
+        let connection_work = connections.visit_work();
         if let Input::WorkPage { items, .. } = input {
             let count = capacity_of(items.len());
             return connection_work
@@ -1271,9 +1216,6 @@ impl State {
     }
     pub(super) fn new(config: OwnerConfig) -> Result<Self, AllocationFailed> {
         Ok(Self {
-            connections: table(config.max_sessions)?,
-            conn_by_gen: FlatMap::new(),
-            conn_by_loading_effect: ScopedFlatMap::new(),
             deliveries: table(config.max_exchanges)?,
             delivery_by_id: ScopedFlatMap::new(),
             delivery_by_op: ScopedFlatMap::new(),
@@ -1300,9 +1242,6 @@ impl State {
             continuations_started: false,
             next_pubrec_rank: 1,
         })
-    }
-    fn connection(&self, generation: ConnectionGeneration) -> Option<usize> {
-        self.conn_by_gen.get(&generation).copied()
     }
     fn delivery(&self, id: DeliveryId) -> Option<usize> {
         self.delivery_by_id.get(&id).copied()
@@ -1508,22 +1447,17 @@ impl State {
             .iter()
             .any(|&idx| slice[idx].control_ready(now))
     }
-    pub(super) fn close_work(&self) -> u64 {
-        if self.connections.is_empty() {
+    pub(super) fn close_work(&self, connections: &Connections) -> u64 {
+        if connections.is_empty() {
             0
         } else {
-            capacity_of(self.connections.capacity())
-                .min(16)
+            connections
+                .visit_work()
                 .saturating_add(capacity_of(self.deliveries.capacity()).min(32))
         }
     }
     #[allow(dead_code)]
     pub(super) fn rebuild_indices(&mut self) {
-        self.conn_by_gen.clear();
-        self.conn_by_loading_effect.clear();
-        for index in 0..self.connections.len() {
-            self.index_conn(index);
-        }
         self.delivery_by_id.clear();
         self.delivery_by_op.clear();
         self.delivery_by_deadline.clear();
@@ -1544,10 +1478,8 @@ impl State {
             self.index_delivery(index);
         }
     }
-    pub(super) fn close(&mut self, generation: ConnectionGeneration) {
-        if let Some(index) = self.connection(generation) {
-            self.remove_conn_at(index);
-        }
+    /// Releases the windows the deliveries held on a closed connection.
+    pub(super) fn close_windows(&mut self, generation: ConnectionGeneration) {
         if let Some(indices) = self.deliveries_by_window.remove(&generation) {
             self.active_by_gen.remove(&generation);
             for idx in indices {
@@ -1568,11 +1500,6 @@ impl State {
         self.control.is_some() || self.retained.is_some()
     }
 
-    /// Whether a connection is known to the pub/sub state.
-    pub(super) fn has_connections(&self) -> bool {
-        !self.connections.is_empty()
-    }
-
     pub(super) fn holds_deadline(&self, token: DeadlineToken) -> bool {
         self.retained.is_some_and(|f| f.in_flight.deadline == token)
             || self
@@ -1590,16 +1517,6 @@ impl State {
     }
     pub(super) fn control_pending(&self) -> bool {
         self.control.is_some()
-    }
-    fn invalidate_reads(&mut self, session: SessionId) {
-        for c in self.connections.as_mut_slice() {
-            if let Some(read) = &mut c.loading
-                && read.session == session
-            {
-                read.invalidated = true;
-                c.after = None;
-            }
-        }
     }
 }
 
@@ -1694,10 +1611,10 @@ impl Owner {
         let Some(generation) = self.connection_of(session) else {
             return false;
         };
-        let Some(index) = self.pubsub.connection(generation) else {
+        let Some(index) = self.connections.index_of(generation) else {
             return false;
         };
-        let settings = self.pubsub.connections.as_slice()[index];
+        let settings = self.connections.row(index);
         let room = self.pubsub.active(generation) < usize::from(settings.receive_maximum);
         if let Some((_, delivery)) =
             self.pubsub
@@ -1748,7 +1665,7 @@ impl Owner {
         draft: &mut Draft,
     ) -> Result<super::Change, Stop> {
         let (generation, ingress_order) = origin;
-        let Some(connection) = self.pubsub.connection(generation) else {
+        let Some(connection) = self.connections.index_of(generation) else {
             return Err(IMPOSSIBLE);
         };
         let InboundPacket::Publish {
@@ -1772,7 +1689,7 @@ impl Owner {
             return Err(IMPOSSIBLE);
         }
         self.check_message_expiry(*expiry)?;
-        if ingress_order <= self.pubsub.connections.as_slice()[connection].last_qos0_ingress {
+        if ingress_order <= self.connections.row(connection).last_qos0_ingress {
             return Self::plan_close(generation, Some(session), CloseReason::ProtocolError, draft);
         }
         if self.pubsub.retained.is_some() {
@@ -2008,7 +1925,7 @@ impl Owner {
         draft: &mut Draft,
     ) -> Result<super::Change, Stop> {
         let (generation, ingress_order) = origin;
-        let Some(connection) = self.pubsub.connection(generation) else {
+        let Some(connection) = self.connections.index_of(generation) else {
             return Self::plan_close(generation, Some(session), CloseReason::ProtocolError, draft);
         };
         let InboundPacket::Publish {
@@ -2032,7 +1949,7 @@ impl Owner {
             return Err(IMPOSSIBLE);
         }
         self.check_message_expiry(*expiry)?;
-        if ingress_order <= self.pubsub.connections.as_slice()[connection].last_qos0_ingress {
+        if ingress_order <= self.connections.row(connection).last_qos0_ingress {
             return Self::plan_close(generation, Some(session), CloseReason::ProtocolError, draft);
         }
         let limits = self.limits.ok_or(IMPOSSIBLE)?;
@@ -2134,11 +2051,7 @@ impl Owner {
         expiry: Option<MessageExpiry>,
         properties: Option<&crate::contract::properties::PublishProperties>,
     ) -> bool {
-        let Some(settings) = self
-            .pubsub
-            .connection(connection.generation)
-            .map(|i| self.pubsub.connections.as_slice()[i])
-        else {
+        let Some(settings) = self.connections.of(connection.generation) else {
             return false;
         };
         publish_packet_size(
@@ -2400,8 +2313,8 @@ impl Owner {
         if receive_maximum == 0 || maximum_packet_size == 0 {
             return Err(IMPOSSIBLE);
         }
-        let index = self.pubsub.connection(connection);
-        if index.is_none() && self.pubsub.connections.len() == self.pubsub.connections.capacity() {
+        let index = self.connections.index_of(connection);
+        if index.is_none() && self.connections.is_full() {
             draft.close(connection, CloseReason::CapacityExceeded)?;
             return Ok(super::Change::Nothing);
         }
@@ -2417,7 +2330,7 @@ impl Owner {
             last_qos0_ingress: 0,
         };
         if let Some(index) = index {
-            let current = self.pubsub.connections.as_slice()[index];
+            let current = self.connections.row(index);
             if current.receive_maximum != value.receive_maximum
                 || current.maximum_packet_size != value.maximum_packet_size
             {
@@ -2724,7 +2637,7 @@ impl Owner {
             }
             return Err(blocked());
         }
-        if self.pubsub.connection(connection).is_none() {
+        if self.connections.index_of(connection).is_none() {
             return Self::plan_close(
                 connection,
                 Some(session_index),
@@ -3045,10 +2958,10 @@ impl Owner {
         let Some(generation) = self.connection_of(session) else {
             return Ok(super::Change::Nothing);
         };
-        let Some(connection) = self.pubsub.connection(generation) else {
+        let Some(connection) = self.connections.index_of(generation) else {
             return Ok(super::Change::Nothing);
         };
-        let settings = self.pubsub.connections.as_slice()[connection];
+        let settings = self.connections.row(connection);
         let room = self.pubsub.active(generation) < usize::from(settings.receive_maximum);
         let next = self
             .pubsub
@@ -3211,20 +3124,10 @@ impl Owner {
         items: &[WorkItem],
         next: Option<DeliveryId>,
     ) -> Result<super::Change, Stop> {
-        let Some(connection) = self
-            .pubsub
-            .conn_by_loading_effect
-            .get(&effect)
-            .copied()
-            .filter(|&idx| {
-                self.pubsub.connections.as_slice()[idx]
-                    .loading
-                    .is_some_and(|r| r.effect == effect && r.session == session)
-            })
-        else {
+        let Some(connection) = self.connections.reading(effect, session) else {
             return Ok(super::Change::Nothing);
         };
-        let settings = self.pubsub.connections.as_slice()[connection];
+        let settings = self.connections.row(connection);
         let read = settings.loading.ok_or(IMPOSSIBLE)?;
         if read.invalidated || self.connection_of(session) != Some(settings.generation) {
             return Ok(changed(Change::Page {
@@ -3373,11 +3276,7 @@ impl Owner {
         let Some(generation) = self.connection_of(delivery.target) else {
             return Ok(Emission::Held);
         };
-        let Some(settings) = self
-            .pubsub
-            .connection(generation)
-            .map(|i| self.pubsub.connections.as_slice()[i])
-        else {
+        let Some(settings) = self.connections.of(generation) else {
             return Ok(Emission::Held);
         };
         let Some(claim) = delivery.claim else {
@@ -4139,31 +4038,22 @@ impl Owner {
         matches!(d.phase, Phase::InlineClaimPending(op) if op == operation).then_some(d.target)
     }
 
+    /// Forgets a closed connection and the windows its deliveries held.
+    pub(super) fn close_outgoing(&mut self, generation: ConnectionGeneration) {
+        self.connections.remove(generation);
+        self.pubsub.close_windows(generation);
+    }
+
     pub(super) fn mark_session_dirty(&mut self, session: SessionId, rescan: bool) {
         if let Some(generation) = self.connection_of(session)
-            && let Some(index) = self.pubsub.connection(generation)
+            && let Some(index) = self.connections.index_of(generation)
         {
-            let c = &mut self.pubsub.connections.as_mut_slice()[index];
-            c.caught_up = false;
-            if c.loading.is_some() {
-                c.dirty_during_load = true;
-            }
-            if rescan {
-                c.rescan_needed = true;
-            }
+            self.connections.mark_dirty(index, rescan);
         }
     }
 
     pub(super) fn mark_all_sessions_dirty(&mut self, rescan: bool) {
-        for c in self.pubsub.connections.as_mut_slice() {
-            c.caught_up = false;
-            if c.loading.is_some() {
-                c.dirty_during_load = true;
-            }
-            if rescan {
-                c.rescan_needed = true;
-            }
-        }
+        self.connections.mark_all_dirty(rescan);
     }
 
     pub(super) fn plan_inline_claim(
@@ -4182,8 +4072,8 @@ impl Owner {
             return None;
         }
         let generation = self.connection_of(selected.session)?;
-        let conn_idx = self.pubsub.connection(generation)?;
-        let settings = self.pubsub.connections.as_slice()[conn_idx];
+        let conn_idx = self.connections.index_of(generation)?;
+        let settings = self.connections.row(conn_idx);
         if !settings.caught_up
             || settings.loading.is_some()
             || settings.after.is_some()
@@ -4319,12 +4209,8 @@ impl Owner {
         }
         match change {
             Change::RetainedSubmit { connection, flight } => {
-                self.pubsub
-                    .connections
-                    .as_mut_slice()
-                    .get_mut(connection)
-                    .ok_or(stale)?
-                    .last_qos0_ingress = flight.origin.ingress_order;
+                self.connections
+                    .record_qos0_ingress(connection, flight.origin.ingress_order)?;
                 self.pubsub.retained = Some(flight);
             }
             Change::RetainedDone { finished } => {
@@ -4340,12 +4226,8 @@ impl Owner {
                 records,
                 continuation,
             } => {
-                self.pubsub
-                    .connections
-                    .as_mut_slice()
-                    .get_mut(connection)
-                    .ok_or(stale)?
-                    .last_qos0_ingress = ingress_order;
+                self.connections
+                    .record_qos0_ingress(connection, ingress_order)?;
                 for record in records.as_slice() {
                     self.pubsub.volatile.push_pending(record.clone())?;
                 }
@@ -4419,18 +4301,11 @@ impl Owner {
                         d.frame = emission;
                     });
                 }
-                self.pubsub.invalidate_reads(target);
+                self.connections.invalidate_reads(target);
             }
             Change::Settings { index, value } => match index {
-                Some(i) => {
-                    if i >= self.pubsub.connections.len() {
-                        return Err(stale);
-                    }
-                    self.pubsub.unindex_conn(i);
-                    self.pubsub.connections.as_mut_slice()[i] = value;
-                    self.pubsub.index_conn(i);
-                }
-                None => self.pubsub.push_conn(value)?,
+                Some(i) => self.connections.update(i, |c| *c = value)?,
+                None => self.connections.push(value)?,
             },
             Change::Control(control) => self.pubsub.control = Some(control),
             Change::ControlEnd { revision, finished } => {
@@ -4477,23 +4352,19 @@ impl Owner {
                 self.remember_finished(finished)?;
             }
             Change::Scan { connection, read } => {
-                if connection >= self.pubsub.connections.len() {
-                    return Err(stale);
-                }
-                self.pubsub.unindex_conn(connection);
-                let state = &mut self.pubsub.connections.as_mut_slice()[connection];
-                state.loading = Some(read);
-                state.rescan_needed = false;
-                state.caught_up = false;
-                state.dirty_during_load = false;
-                self.pubsub.index_conn(connection);
+                self.connections.update(connection, |state| {
+                    state.loading = Some(read);
+                    state.rescan_needed = false;
+                    state.caught_up = false;
+                    state.dirty_during_load = false;
+                })?;
             }
             Change::Page {
                 connection,
                 discard,
                 next,
             } => {
-                if connection >= self.pubsub.connections.len() {
+                if self.connections.at(connection).is_none() {
                     return Err(stale);
                 }
                 let page_session = match &input {
@@ -4503,15 +4374,14 @@ impl Owner {
                 let no_pending_non_inline = page_session
                     .is_some_and(|s| !self.pubsub.non_inline_by_session.contains_key(&s))
                     && !self.inline_claims_blocked();
-                self.pubsub.unindex_conn(connection);
-                let c = &mut self.pubsub.connections.as_mut_slice()[connection];
-                c.loading = None;
-                c.after = next;
-                c.rescan_needed = discard;
-                c.caught_up =
-                    !discard && next.is_none() && !c.dirty_during_load && no_pending_non_inline;
-                c.dirty_during_load = false;
-                self.pubsub.index_conn(connection);
+                self.connections.update(connection, |c| {
+                    c.loading = None;
+                    c.after = next;
+                    c.rescan_needed = discard;
+                    c.caught_up =
+                        !discard && next.is_none() && !c.dirty_during_load && no_pending_non_inline;
+                    c.dirty_during_load = false;
+                })?;
                 if !discard {
                     let Input::WorkPage { items, .. } = input else {
                         return Err(stale);
@@ -4553,13 +4423,7 @@ impl Owner {
                 in_flight,
                 connection,
             } => {
-                let generation = self
-                    .pubsub
-                    .connections
-                    .as_slice()
-                    .get(connection)
-                    .ok_or(stale)?
-                    .generation;
+                let generation = self.connections.at(connection).ok_or(stale)?.generation;
                 if slot >= self.pubsub.deliveries.len() {
                     return Err(stale);
                 }
@@ -4679,7 +4543,7 @@ impl Owner {
                 }
                 self.remember_finished(finished)?;
                 self.pubsub.remove_delivery_at(slot);
-                self.pubsub.invalidate_reads(target);
+                self.connections.invalidate_reads(target);
             }
             Change::Refused {
                 slot,
@@ -4894,7 +4758,7 @@ impl Owner {
                     } else {
                         self.pubsub.remove_delivery_at(slot);
                     }
-                    self.pubsub.invalidate_reads(target);
+                    self.connections.invalidate_reads(target);
                 }
             }
             Change::Written { slot, complete } => {
@@ -4924,7 +4788,8 @@ mod tests {
     // at the first index that drifts from its rows.
     impl Owner {
         /// `step`, then the check that every index the pub/sub state
-        /// derives from its rows is what a rebuild gives, on every outcome.
+        /// derives from its rows, and every index of the connections, is what
+        /// a rebuild gives, on every outcome.
         pub(in crate::owner) fn step_checked(
             &mut self,
             input: Input,
@@ -4932,6 +4797,7 @@ mod tests {
         ) -> StepOutcome {
             let outcome = self.step(input, grant);
             self.pubsub.assert_indices_kept();
+            self.connections.assert_indices_kept();
             outcome
         }
     }
@@ -4960,8 +4826,6 @@ mod tests {
                 text
             }
             alloc::vec![
-                all(self.conn_by_gen.iter()),
-                all(self.conn_by_loading_effect.iter()),
                 all(self.delivery_by_id.iter()),
                 all(self.delivery_by_op.iter()),
                 all(self.delivery_by_deadline.iter()),
@@ -5301,7 +5165,7 @@ mod tests {
     #[test]
     fn qos2_keeps_window_and_identifier_until_pubcomp_finish_is_known() {
         let mut owner = world();
-        owner.pubsub.connections.as_mut_slice()[0].receive_maximum = 1;
+        owner.connections.row_mut(0).receive_maximum = 1;
         queued(&mut owner, 0);
         owner.pubsub.deliveries.as_mut_slice()[0].qos = Qos::ExactlyOnce;
         queued(&mut owner, 1);
@@ -5413,7 +5277,7 @@ mod tests {
     fn resumed_qos2_pubrel_is_independent_of_the_reduced_publish_window() {
         for pubrel_index in [1, 0] {
             let mut owner = world();
-            owner.pubsub.connections.as_mut_slice()[0].receive_maximum = 1;
+            owner.connections.row_mut(0).receive_maximum = 1;
             let key = ConnectionKey {
                 session: TARGET,
                 generation: CONNECTION,
@@ -7370,7 +7234,7 @@ mod tests {
     fn message_expiry_property_and_remaining_length_are_counted_at_both_qos_levels() {
         let mut owner = world();
         message_clock(&mut owner, 10);
-        let settings = &mut owner.pubsub.connections.as_mut_slice()[0];
+        let settings = owner.connections.row_mut(0);
         settings.maximum_packet_size = 128;
         let key = ConnectionKey {
             session: TARGET,
@@ -7389,7 +7253,7 @@ mod tests {
         for timed in [false, true] {
             let mut owner = world();
             message_clock(&mut owner, 10);
-            owner.pubsub.connections.as_mut_slice()[0].maximum_packet_size = 128;
+            owner.connections.row_mut(0).maximum_packet_size = 128;
             queued(&mut owner, 0);
             let d = &mut owner.pubsub.deliveries.as_mut_slice()[0];
             d.expiry = timed.then(message_expiry);
@@ -8463,7 +8327,7 @@ mod tests {
     /// `receive_maximum` unacknowledged PUBLISH packets.
     fn limited(maximum: u32, receive_maximum: u16) -> Owner {
         let mut owner = world();
-        let settings = &mut owner.pubsub.connections.as_mut_slice()[0];
+        let settings = owner.connections.row_mut(0);
         settings.maximum_packet_size = maximum;
         settings.receive_maximum = receive_maximum;
         owner

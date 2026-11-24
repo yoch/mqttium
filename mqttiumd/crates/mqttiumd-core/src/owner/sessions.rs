@@ -967,7 +967,7 @@ impl Owner {
     fn retire_session(&mut self, session: SessionId) -> Result<(), CoreFault> {
         if let Some(&index) = self.session_by_id.get(&session) {
             if let Some(generation) = self.sessions.as_slice()[index].connection {
-                self.pubsub.close(generation);
+                self.close_outgoing(generation);
             }
             let _ = self.remove_session_at(index)?;
         }

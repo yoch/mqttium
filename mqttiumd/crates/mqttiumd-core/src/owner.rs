@@ -60,6 +60,7 @@ use crate::contract::message_expiry::{
     ExpiryState, MessageExpiry, MessageExpiryBlock, MessageTime,
 };
 
+mod connections;
 mod pubsub;
 mod receipts;
 mod routing;
@@ -984,6 +985,8 @@ pub struct Owner {
     closed_set: BTreeSet<ConnectionGeneration>,
     resolution_delay: LogicalDuration,
     pubsub: pubsub::State,
+    /// The online connections outgoing deliveries go to.
+    connections: connections::Connections,
     receipts: receipts::State,
     wills: will::State,
     lifecycle: Option<sessions::Flight>,
@@ -1079,6 +1082,7 @@ impl Owner {
                 ring(config.retained_operations)?,
                 ring(config.remembered_connections)?,
                 pubsub::State::new(config)?,
+                connections::Connections::new(config.max_sessions)?,
                 receipts::State::new(crate::contract::receipts::ReceiptOrigin {
                     incarnation: id.incarnation(),
                     epoch: id.epoch(),
@@ -1086,7 +1090,8 @@ impl Owner {
                 })?,
             ))
         })();
-        let Ok((routes, sessions, slots, leases, finished, closed, pubsub, receipts)) = tables
+        let Ok((routes, sessions, slots, leases, finished, closed, pubsub, connections, receipts)) =
+            tables
         else {
             let reason = OwnerRefusal::AllocationFailed;
             return Err(OwnerRefused { outbox, reason });
@@ -1124,6 +1129,7 @@ impl Owner {
             closed_set: BTreeSet::new(),
             resolution_delay: config.resolution_delay,
             pubsub,
+            connections,
             receipts,
             wills: will::State::new(),
             lifecycle: None,
@@ -1291,7 +1297,7 @@ impl Owner {
     /// historical S0 owner does neither, and keeps the one-transition work
     /// abstraction of its fixtures.
     fn serves_connections(&self) -> bool {
-        self.lifecycle_enabled || self.pubsub.has_connections()
+        self.lifecycle_enabled || !self.connections.is_empty()
     }
 
     /// Only a live unresolved command or collector retains its current timer.
@@ -1717,21 +1723,25 @@ impl Owner {
         }
         let Input::Recovery { facts, last } = input else {
             return WorkUnits::new(
-                1u64.saturating_add(self.pubsub.work_bound(input, self.routes.capacity()))
-                    .saturating_add(self.session_work_bound(input))
-                    .saturating_add(self.routing_work_bound(input))
-                    .saturating_add(self.retained_work_bound(input))
-                    .saturating_add(self.receipts.work(input))
-                    .saturating_add(self.will_work_bound(input))
-                    .saturating_add(
-                        if self.receipts.enabled
-                            && matches!(input, Input::MaintainReceipts | Input::Continue { .. })
-                        {
-                            16
-                        } else {
-                            0
-                        },
-                    ),
+                1u64.saturating_add(self.pubsub.work_bound(
+                    input,
+                    &self.connections,
+                    self.routes.capacity(),
+                ))
+                .saturating_add(self.session_work_bound(input))
+                .saturating_add(self.routing_work_bound(input))
+                .saturating_add(self.retained_work_bound(input))
+                .saturating_add(self.receipts.work(input))
+                .saturating_add(self.will_work_bound(input))
+                .saturating_add(
+                    if self.receipts.enabled
+                        && matches!(input, Input::MaintainReceipts | Input::Continue { .. })
+                    {
+                        16
+                    } else {
+                        0
+                    },
+                ),
             );
         };
         let routes = capacity_of(self.routes.capacity());
@@ -1807,7 +1817,7 @@ impl Owner {
                         .min(32)
                         .saturating_mul(3)
                         .saturating_add(capacity_of(self.sessions.capacity()).min(16))
-                        .saturating_add(self.pubsub.close_work())
+                        .saturating_add(self.pubsub.close_work(&self.connections))
                 } else {
                     0
                 };
@@ -3582,7 +3592,7 @@ impl Owner {
             // ACKs, even if the adapter never accepted their Outbox effect.
             // Uncertain admissions are deliberately kept for reconciliation.
             self.finish_closed_acks(connection)?;
-            self.pubsub.close(connection);
+            self.close_outgoing(connection);
             if let Some(session) = self.session_of(connection) {
                 self.set_session_connection(session, None)?;
             }
@@ -4119,7 +4129,7 @@ mod tests {
         routes: Vec<Route>,
         sessions: Vec<Session>,
         slots: Vec<Slot>,
-        outgoing_connections: Vec<pubsub::Connection>,
+        outgoing_connections: Vec<connections::Connection>,
         outgoing_deliveries: Vec<pubsub::Delivery>,
         volatile: Vec<pubsub::Volatile>,
         retained_qos0: Option<pubsub::RetainedFlight>,
@@ -4618,7 +4628,7 @@ mod tests {
                 routes: owner.routes.as_slice().to_vec(),
                 sessions: owner.sessions.as_slice().to_vec(),
                 slots: owner.slots.as_slice().to_vec(),
-                outgoing_connections: owner.pubsub.connections.as_slice().to_vec(),
+                outgoing_connections: owner.connections.to_vec(),
                 outgoing_deliveries: owner.pubsub.deliveries.as_slice().to_vec(),
                 volatile: owner.pubsub.volatile.to_vec(),
                 retained_qos0: owner.pubsub.retained,
