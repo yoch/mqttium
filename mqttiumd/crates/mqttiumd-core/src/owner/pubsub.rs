@@ -1517,53 +1517,6 @@ impl State {
                 .saturating_add(capacity_of(self.deliveries.capacity()).min(32))
         }
     }
-    /// Every index and count of the state that a rebuild derives from the
-    /// rows, in an order that does not depend on how they were filled.
-    #[cfg(test)]
-    fn index_snapshot(&self) -> alloc::vec::Vec<alloc::string::String> {
-        use alloc::format;
-        use alloc::string::String;
-        use alloc::vec::Vec;
-        fn sorted(mut entries: Vec<String>) -> String {
-            entries.sort();
-            entries.join(";")
-        }
-        fn all<T: core::fmt::Debug>(entries: impl Iterator<Item = T>) -> String {
-            sorted(entries.map(|e| format!("{e:?}")).collect())
-        }
-        alloc::vec![
-            all(self.conn_by_gen.iter()),
-            all(self.conn_by_loading_effect.iter()),
-            all(self.delivery_by_id.iter()),
-            all(self.delivery_by_op.iter()),
-            all(self.delivery_by_deadline.iter()),
-            all(self.delivery_by_frame.iter()),
-            all(self.delivery_by_claim_op.iter()),
-            all(self.delivery_by_claim_result_op.iter()),
-            all(self.delivery_by_target_pi.iter()),
-            all(self.deliveries_by_session.iter()),
-            all(self.deliveries_by_window.iter()),
-            all(self.sent_on_gen.iter()),
-            all(self.busy_by_session.iter()),
-            all(self.active_by_gen.iter()),
-            format!("{:?}", self.control_candidates),
-            format!("{:?}", self.expiring_deliveries),
-            format!("{}", self.pubrec_pending_count),
-            format!("{}", self.loaded_payload_bytes),
-        ]
-    }
-    /// The indices kept step by step are those a rebuild from the rows
-    /// gives.
-    #[cfg(test)]
-    pub(super) fn assert_indices_kept(&mut self) {
-        let kept = self.index_snapshot();
-        self.rebuild_indices();
-        assert_eq!(
-            kept,
-            self.index_snapshot(),
-            "an index drifted from its rows"
-        );
-    }
     #[allow(dead_code)]
     pub(super) fn rebuild_indices(&mut self) {
         self.conn_by_gen.clear();
@@ -4966,6 +4919,78 @@ mod tests {
     use crate::contract::outcome::{EpochOpened, EpochOpening, OpeningOutcome, OpeningReply};
     use alloc::vec::Vec;
 
+    // The net lot 5 of `refactor/deslop-layers` moves the tables under: the
+    // tests of the core step the owner through `step_checked`, which fails
+    // at the first index that drifts from its rows.
+    impl Owner {
+        /// `step`, then the check that every index the pub/sub state
+        /// derives from its rows is what a rebuild gives, on every outcome.
+        pub(in crate::owner) fn step_checked(
+            &mut self,
+            input: Input,
+            grant: TurnGrant,
+        ) -> StepOutcome {
+            let outcome = self.step(input, grant);
+            self.pubsub.assert_indices_kept();
+            outcome
+        }
+    }
+
+    impl State {
+        /// Every index and count of the state that a rebuild derives from the
+        /// rows, in an order that does not depend on how they were filled.
+        fn index_snapshot(&self) -> alloc::vec::Vec<alloc::string::String> {
+            use alloc::string::String;
+            use alloc::vec::Vec;
+            use core::fmt::Write;
+            fn all<T: core::fmt::Debug>(entries: impl Iterator<Item = T>) -> String {
+                let mut entries: Vec<String> = entries
+                    .map(|e| {
+                        let mut text = String::new();
+                        write!(text, "{e:?}").unwrap();
+                        text
+                    })
+                    .collect();
+                entries.sort();
+                entries.join(";")
+            }
+            fn one(value: impl core::fmt::Debug) -> String {
+                let mut text = String::new();
+                write!(text, "{value:?}").unwrap();
+                text
+            }
+            alloc::vec![
+                all(self.conn_by_gen.iter()),
+                all(self.conn_by_loading_effect.iter()),
+                all(self.delivery_by_id.iter()),
+                all(self.delivery_by_op.iter()),
+                all(self.delivery_by_deadline.iter()),
+                all(self.delivery_by_frame.iter()),
+                all(self.delivery_by_claim_op.iter()),
+                all(self.delivery_by_claim_result_op.iter()),
+                all(self.delivery_by_target_pi.iter()),
+                all(self.deliveries_by_session.iter()),
+                all(self.deliveries_by_window.iter()),
+                all(self.sent_on_gen.iter()),
+                all(self.busy_by_session.iter()),
+                all(self.active_by_gen.iter()),
+                one(&self.control_candidates),
+                one(&self.expiring_deliveries),
+                one(self.pubrec_pending_count),
+                one(self.loaded_payload_bytes),
+            ]
+        }
+        pub(super) fn assert_indices_kept(&mut self) {
+            let kept = self.index_snapshot();
+            self.rebuild_indices();
+            assert_eq!(
+                kept,
+                self.index_snapshot(),
+                "an index drifted from its rows"
+            );
+        }
+    }
+
     const TARGET: SessionId = SessionId::new(1);
     const CONNECTION: ConnectionGeneration = ConnectionGeneration::new(10);
     const TURN: TurnGrant = TurnGrant {
@@ -4993,7 +5018,7 @@ mod tests {
     }
     fn apply(owner: &mut Owner, input: Input) -> Vec<(EffectId, Effect)> {
         owner.pubsub.rebuild_indices();
-        let result = owner.step(input, TURN);
+        let result = owner.step_checked(input, TURN);
         assert!(matches!(result, StepOutcome::Applied { .. }), "{result:?}");
         drain(owner)
     }
@@ -6416,7 +6441,7 @@ mod tests {
             .is_empty()
         );
         assert!(matches!(
-            owner.step(retained_zero(2), TURN),
+            owner.step_checked(retained_zero(2), TURN),
             StepOutcome::NeedCapacity {
                 need: CapacityNeed {
                     resource: Resource::ResultSlots,
@@ -6745,7 +6770,7 @@ mod tests {
         owner.lifecycle_enabled = true;
         owner.counters.publication = Some(PublicationSeq::new(u64::MAX - 254));
         let before = owner.counters;
-        let result = owner.step(product_subscribe(), TURN);
+        let result = owner.step_checked(product_subscribe(), TURN);
         assert!(
             matches!(result, StepOutcome::Exhausted { .. }),
             "replay_reservation_wrapped_or_submitted_a_partial_range"
@@ -6851,7 +6876,7 @@ mod tests {
             payload: held.payload.clone().unwrap(),
             claim: held.claim,
         };
-        let result = owner.step(
+        let result = owner.step_checked(
             Input::WorkPage {
                 effect,
                 session: TARGET,
@@ -7498,7 +7523,7 @@ mod tests {
         };
         assert!(
             matches!(
-                owner.step(input, TURN),
+                owner.step_checked(input, TURN),
                 StepOutcome::Fatal(CoreFault::ImpossibleInput)
             ),
             "invalid_qos0_expiry_was_admitted"
@@ -7703,7 +7728,7 @@ mod tests {
     fn message_expiry_clock_authority_is_zero_effect_during_recovery_and_regression_is_explicit() {
         let mut owner = world();
         owner.recovery = Some(RecoveryOrder::new());
-        let result = owner.step(
+        let result = owner.step_checked(
             Input::MessageClock {
                 now: message_time(10),
             },
@@ -7722,7 +7747,7 @@ mod tests {
         assert!(drain(&mut owner).is_empty());
         let previous = owner.message_now;
         assert_eq!(
-            owner.step(
+            owner.step_checked(
                 Input::MessageClock {
                     now: message_time(9)
                 },
@@ -7740,7 +7765,7 @@ mod tests {
         let mut owner = world();
         message_clock(&mut owner, 10);
         let counters = owner.counters;
-        let result = owner.step(
+        let result = owner.step_checked(
             product_subscribe(),
             TurnGrant {
                 work_limit: WorkUnits::new(200),
@@ -7864,7 +7889,7 @@ mod tests {
             payload: bytes(b"payload"),
             claim: None,
         };
-        let result = owner.step(
+        let result = owner.step_checked(
             Input::WorkPage {
                 effect,
                 session: TARGET,
@@ -8172,7 +8197,7 @@ mod tests {
                 .outbox
                 .reserve(NonZeroUsize::new(owner.outbox.free_slots() - 1).unwrap())
                 .unwrap();
-            let result = owner.step(
+            let result = owner.step_checked(
                 Input::FrameResult {
                     effect,
                     connection,

@@ -772,7 +772,7 @@ mod tests {
         taking.0.into_iter().map(OwnedEffect::into_parts).collect()
     }
     fn apply(owner: &mut Owner, input: Input) -> Vec<(EffectId, Effect)> {
-        let outcome = owner.step(input, TURN);
+        let outcome = owner.step_checked(input, TURN);
         assert!(
             matches!(outcome, StepOutcome::Applied { .. }),
             "{outcome:?}"
@@ -1077,7 +1077,7 @@ mod tests {
         for qos in [Qos::AtMostOnce, Qos::AtLeastOnce, Qos::ExactlyOnce] {
             assert!(
                 matches!(
-                    owner.step(publish(qos, 1, 2), TURN),
+                    owner.step_checked(publish(qos, 1, 2), TURN),
                     StepOutcome::NeedCapacity {
                         need: CapacityNeed {
                             resource: Resource::ResultSlots,
@@ -1581,7 +1581,7 @@ mod tests {
         };
         assert!(
             matches!(
-                owner_wild.step(publish_probe, too_small),
+                owner_wild.step_checked(publish_probe, too_small),
                 StepOutcome::NeedCapacity {
                     need: crate::contract::capacity::CapacityNeed {
                         resource: crate::contract::capacity::Resource::Work,
@@ -1596,7 +1596,7 @@ mod tests {
             work_limit: WorkUnits::new(wild_bound + 1_000),
         };
         assert!(matches!(
-            owner_wild.step(make_publish(2), sufficient),
+            owner_wild.step_checked(make_publish(2), sufficient),
             StepOutcome::Applied { .. }
         ));
     }

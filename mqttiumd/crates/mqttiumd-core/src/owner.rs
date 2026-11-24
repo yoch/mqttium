@@ -1643,10 +1643,7 @@ impl Owner {
     /// account, the reservations held and the content of the box as they
     /// were.
     pub fn step(&mut self, input: Input, grant: TurnGrant) -> StepOutcome {
-        let outcome = self.step_into(input, grant);
-        #[cfg(test)]
-        self.pubsub.assert_indices_kept();
-        outcome
+        self.step_into(input, grant)
     }
 
     fn step_into(&mut self, input: Input, grant: TurnGrant) -> StepOutcome {
@@ -4470,7 +4467,7 @@ mod tests {
         }
 
         fn step(&mut self, input: Input) -> StepOutcome {
-            self.owner.step(input, GRANT)
+            self.owner.step_checked(input, GRANT)
         }
 
         fn applied(&mut self, input: Input) {
@@ -4664,7 +4661,7 @@ mod tests {
         let short = TurnGrant {
             work_limit: WorkUnits::ZERO,
         };
-        let outcome = world.owner.step(input(&world), short);
+        let outcome = world.owner.step_checked(input(&world), short);
         assert_eq!(
             outcome,
             StepOutcome::NeedCapacity {
@@ -4963,7 +4960,7 @@ mod tests {
             .expect("first box");
         let mut owner = Owner::new(config(), outbox).expect("large enough");
         for input in [page(&fixture(EPOCH), true), connect(CONN, b"p1-producer")] {
-            let outcome = owner.step(input, GRANT);
+            let outcome = owner.step_checked(input, GRANT);
             assert!(
                 matches!(outcome, StepOutcome::Applied { .. }),
                 "{outcome:?}"
@@ -6253,7 +6250,7 @@ mod tests {
             connection: ConnectionGeneration::new(CONN),
         };
         assert_eq!(
-            world.owner.step(
+            world.owner.step_checked(
                 input,
                 TurnGrant {
                     work_limit: WorkUnits::new(1)
@@ -7898,7 +7895,7 @@ mod tests {
             work_limit: WorkUnits::new(FIXTURE_WORK - 1),
         };
         assert_eq!(
-            world.owner.step(page(&fixture(EPOCH), true), short),
+            world.owner.step_checked(page(&fixture(EPOCH), true), short),
             StepOutcome::NeedCapacity {
                 input: page(&fixture(EPOCH), true),
                 need: CapacityNeed {
@@ -7913,7 +7910,7 @@ mod tests {
         let exact = TurnGrant {
             work_limit: WorkUnits::new(FIXTURE_WORK),
         };
-        let outcome = world.owner.step(page(&fixture(EPOCH), true), exact);
+        let outcome = world.owner.step_checked(page(&fixture(EPOCH), true), exact);
         assert!(
             matches!(outcome, StepOutcome::Applied { .. }),
             "{outcome:?}"
@@ -8305,7 +8302,7 @@ mod tests {
                 connect(CONN, b"p1-producer"),
                 publish_with(CONN, 7, Qos::ExactlyOnce, payload),
             ] {
-                let outcome = owner.step(input, GRANT);
+                let outcome = owner.step_checked(input, GRANT);
                 assert!(
                     matches!(outcome, StepOutcome::Applied { .. }),
                     "{outcome:?}"
@@ -8552,7 +8549,7 @@ mod tests {
             publish_with(CONN + 1, 8, Qos::ExactlyOnce, b"xyz"),
         ] {
             assert!(matches!(
-                second.step(input, GRANT),
+                second.step_checked(input, GRANT),
                 StepOutcome::Applied { .. }
             ));
         }
@@ -9459,7 +9456,7 @@ mod tests {
         let wide = TurnGrant {
             work_limit: WorkUnits::new(1 << 16),
         };
-        let outcome = world.owner.step(transport_closed(11), wide);
+        let outcome = world.owner.step_checked(transport_closed(11), wide);
         assert!(
             matches!(outcome, StepOutcome::Applied { .. }),
             "{outcome:?}"
@@ -9898,7 +9895,7 @@ mod tests {
             };
             let StepOutcome::NeedCapacity {
                 input: back, need, ..
-            } = world.owner.step(input, grant)
+            } = world.owner.step_checked(input, grant)
             else {
                 panic!("capacity refusal")
             };
@@ -10805,7 +10802,7 @@ mod tests {
     };
 
     fn gc_apply(world: &mut World, input: Input) {
-        let result = world.owner.step(input, GC_GRANT);
+        let result = world.owner.step_checked(input, GC_GRANT);
         assert!(matches!(result, StepOutcome::Applied { .. }), "{result:?}");
     }
 
@@ -11075,7 +11072,7 @@ mod tests {
         assert_eq!(world.owner.outbox.free_slots(), 2);
         let before = world.snapshot();
         assert!(matches!(
-            world.owner.step(ping(), GC_GRANT),
+            world.owner.step_checked(ping(), GC_GRANT),
             StepOutcome::NeedCapacity { .. }
         ));
         assert_eq!(world.snapshot(), before);
@@ -11095,7 +11092,7 @@ mod tests {
         gc_register(&mut world);
         let flight = gc_admit(&mut world, 7, Qos::AtLeastOnce);
         assert_eq!(
-            world.owner.step(retired(&flight), GC_GRANT),
+            world.owner.step_checked(retired(&flight), GC_GRANT),
             StepOutcome::Fatal(CoreFault::ImpossibleInput)
         );
         assert_eq!(world.owner.receipt_status().unwrap().2, 1);
@@ -11107,7 +11104,7 @@ mod tests {
         gc_register(&mut world);
         let key = world.owner.outbox.reserve(nonzero(CAPACITY - 2)).unwrap();
         let before = world.snapshot();
-        let outcome = world.owner.step(publish(7), GC_GRANT);
+        let outcome = world.owner.step_checked(publish(7), GC_GRANT);
         assert!(
             matches!(outcome, StepOutcome::NeedCapacity { .. }),
             "{outcome:?}"
@@ -11162,7 +11159,7 @@ mod tests {
             &release,
             StoreOutcome::RejectedCertain(RejectReason::Fenced),
         );
-        let outcome = world.owner.step(fenced, GC_GRANT);
+        let outcome = world.owner.step_checked(fenced, GC_GRANT);
         assert!(
             matches!(outcome, StepOutcome::Applied { .. }),
             "terminal consumption must progress at full receipt window: {outcome:?}"
@@ -11427,7 +11424,7 @@ mod tests {
             },
         };
         assert!(matches!(
-            world.owner.step(
+            world.owner.step_checked(
                 input,
                 TurnGrant {
                     work_limit: WorkUnits::new(100000)
@@ -11461,7 +11458,7 @@ mod tests {
             *retain = true;
         }
         assert!(matches!(
-            world.owner.step(first, turn),
+            world.owner.step_checked(first, turn),
             StepOutcome::Applied { .. }
         ));
         let effects = world.drain();
@@ -11505,7 +11502,7 @@ mod tests {
             *retain = true;
         }
         assert!(matches!(
-            world.owner.step(next, turn),
+            world.owner.step_checked(next, turn),
             StepOutcome::Applied { .. }
         ));
         let effects = world.drain();

@@ -414,7 +414,7 @@ mod tests {
         SharedBytes::copy_from(value, 128).unwrap()
     }
     fn apply(owner: &mut Owner, input: Input) -> Vec<(EffectId, Effect)> {
-        let result = owner.step(input, TURN);
+        let result = owner.step_checked(input, TURN);
         assert!(matches!(result, StepOutcome::Applied { .. }), "{result:?}");
         let mut sink = Taking(Vec::new());
         owner.dispatch(&mut sink);
@@ -883,7 +883,7 @@ mod tests {
             .outbox
             .reserve(NonZeroUsize::new(owner.outbox.free_slots() - 1).unwrap())
             .unwrap();
-        let outcome = owner.step(input, TURN);
+        let outcome = owner.step_checked(input, TURN);
         let StepOutcome::NeedCapacity { input, need, .. } = outcome else {
             panic!("{outcome:?}");
         };
@@ -1039,7 +1039,7 @@ mod tests {
             refuse_persist: false,
         };
         assert!(matches!(
-            owner.step(Input::DiscoverWills, TURN),
+            owner.step_checked(Input::DiscoverWills, TURN),
             StepOutcome::Applied { .. }
         ));
         let report = owner.dispatch(&mut sink);
@@ -1051,7 +1051,7 @@ mod tests {
             panic!();
         };
         assert!(matches!(
-            owner.step(
+            owner.step_checked(
                 Input::WillPage {
                     effect: read,
                     items: BoundedVec::from_slice(&[intent(9)], 1).unwrap(),
@@ -1078,7 +1078,7 @@ mod tests {
         let (operation, deadline) = owner.will_dispatch().unwrap();
         sink.taken.clear();
         assert!(matches!(
-            owner.step(
+            owner.step_checked(
                 Input::Deadline {
                     token: deadline,
                     now: LogicalTime::new(100)
