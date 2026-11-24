@@ -29,7 +29,8 @@
 # upward ties): 61; after the connection table of lot 5: 59; after its
 # volatile queue: 56; after its delivery table: 46; after the end of
 # `pubsub::State`: 43. Lot 6 (runtime): 38 after `reactor::Shared`; 37
-# after the cycle `codec`, `net`, `security`.
+# after the cycle `codec`, `net`, `security`; 30 after `Writer` and
+# `DirectWriter`.
 # - The delivery table (`Deliveries`, lot 5) is closed to writes: every
 #   change goes through its transitions. It still lends its rows read only
 #   (`rows`, 26 places in `owner::pubsub`) and the rows of a session
@@ -46,13 +47,6 @@
 field-leak mqttiumd::policy_transition::Plan::body
 field-leak mqttiumd::runtime::Acceptor::accepted
 field-leak mqttiumd::security::Policy::storage
-field-leak mqttiumd::writer::DirectWriter::control_responses
-field-leak mqttiumd::writer::DirectWriter::responses
-field-leak mqttiumd::writer::Writer::boot
-field-leak mqttiumd::writer::Writer::control_receiver
-field-leak mqttiumd::writer::Writer::control_sender
-field-leak mqttiumd::writer::Writer::receiver
-field-leak mqttiumd::writer::Writer::sender
 field-leak mqttiumd_core::owner::Owner::outbox
 field-leak mqttiumd_lab::bench::collector::Collector::lines
 field-leak mqttiumd_lab::store::adapter::SimStore::store

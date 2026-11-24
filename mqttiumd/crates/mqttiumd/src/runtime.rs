@@ -6415,17 +6415,7 @@ pub fn run(config: Config) -> Result<(), Failure> {
     }
     cancel.store(true, Ordering::Relaxed);
     // Stop is queued after already accepted work. No accepted command is called rejected.
-    let deadline = Instant::now() + Duration::from_secs(5);
-    let mut stop_sent = false;
-    while Instant::now() < deadline && !writer.is_finished() {
-        if !stop_sent && writer.sender.try_send(Request::Stop).is_ok() {
-            stop_sent = true;
-        }
-        while writer.receiver.try_recv().is_ok() {}
-        while writer.control_receiver.try_recv().is_ok() {}
-        thread::sleep(Duration::from_millis(2));
-    }
-    if !writer.is_finished() {
+    if !writer.stop_within(Instant::now() + Duration::from_secs(5)) {
         let _ = events.emit(
             "shutdown_incomplete",
             json!({"details":{"code":"writer_deadline","accepted_outcome":"unknown"}}),
@@ -6515,34 +6505,6 @@ fn check_startup_cancel(cancel: &AtomicBool) -> Result<(), Failure> {
         Ok(())
     }
 }
-fn startup_reply<T>(
-    receiver: &std::sync::mpsc::Receiver<T>,
-    cancel: &AtomicBool,
-    deadline: Instant,
-    code: &'static str,
-) -> Result<T, Failure> {
-    loop {
-        // An already produced typed failure is read before observing the stop
-        // flag. Cancelling an outstanding request never calls it rejected.
-        match receiver.try_recv() {
-            Ok(reply) => return Ok(reply),
-            Err(TryRecvError::Disconnected) => return Err(Failure::plain("writer_disconnected")),
-            Err(TryRecvError::Empty) => {}
-        }
-        check_startup_cancel(cancel)?;
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            return Err(Failure::plain(code));
-        }
-        match receiver.recv_timeout(remaining.min(Duration::from_millis(10))) {
-            Ok(reply) => return Ok(reply),
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                return Err(Failure::plain("writer_disconnected"));
-            }
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
-        }
-    }
-}
 #[allow(clippy::too_many_arguments)]
 fn run_inner(
     listen: &SocketAddr,
@@ -6558,11 +6520,7 @@ fn run_inner(
     let (boot, wake) = match (&mut writer, direct_boot) {
         (StoreHandle::Direct(_), Some(boot)) => (boot, crate::wake::Wake::new()),
         (StoreHandle::Threaded(w), None) => {
-            let boot = w
-                .boot
-                .recv_timeout(Duration::from_secs(10))
-                .map_err(|_| Failure::plain("startup_deadline"))??;
-            (boot, w.wake.clone())
+            (w.await_boot(Duration::from_secs(10))?, w.wake.clone())
         }
         _ => return Err(Failure::plain("startup_protocol")),
     };
@@ -6740,17 +6698,9 @@ fn run_inner(
             check_startup_cancel(&cancel)?;
             let response = match runtime.writer.exec_recovery(cursor)? {
                 Some(reply) => reply,
-                None => {
-                    let StoreHandle::Threaded(w) = &runtime.writer else {
-                        return Err(Failure::plain("recovery_protocol"));
-                    };
-                    startup_reply(
-                        &w.receiver,
-                        &cancel,
-                        Instant::now() + Duration::from_secs(10),
-                        "recovery_deadline",
-                    )?
-                }
+                None => runtime
+                    .writer
+                    .await_recovery_reply(&cancel, Duration::from_secs(10))?,
             };
             let Response::Recovery(page) = response else {
                 return Err(Failure::plain("recovery_protocol"));
@@ -6814,17 +6764,7 @@ fn run_inner(
                 }
                 let reply = match runtime.writer.exec_closed_collection(collection)? {
                     Some(reply) => reply,
-                    None => {
-                        let StoreHandle::Threaded(w) = &runtime.writer else {
-                            return Err(Failure::plain("startup_collection_protocol"));
-                        };
-                        startup_reply(
-                            &w.control_receiver,
-                            &cancel,
-                            deadline,
-                            "startup_collection_deadline",
-                        )?
-                    }
+                    None => runtime.writer.await_collection_reply(&cancel, deadline)?,
                 };
                 let ControlResponse::Closed {
                     collection: found,
