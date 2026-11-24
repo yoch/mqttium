@@ -1430,7 +1430,7 @@ impl Runtime<'_> {
                 && self.work_reads.is_empty()
                 && self.frames.is_empty()
                 && self.timers.is_empty()
-                && self.owner.outbox().unwrap().is_empty();
+                && !self.owner.has_pending_effects();
             if complete {
                 self.events.emit("session_shutdown_completed", json!({"details":{"persistent_sessions":self.sessions.len(),"owner_bindings":status.bindings}})).map_err(event_failure)?;
                 return Ok(());
@@ -1810,7 +1810,7 @@ impl Runtime<'_> {
             + self.deferred_retries)
             .min(self.limits.drain_steps);
         let mut steps_taken = 0usize;
-        let mut outbox_len_at_dispatch = self.owner.outbox().map_or(0, |b| b.len());
+        let mut outbox_len_at_dispatch = self.owner.pending_effect_count();
         let mut dispatch_blocked = false;
         loop {
             let progress_before_pass = self.progress;
@@ -2451,14 +2451,16 @@ impl Runtime<'_> {
                 let must_dispatch = !applied
                     || !fast_batch_step
                     || cfg!(feature = "test-hooks")
-                    || self.owner.outbox().is_some_and(|box_| {
-                        box_.free_slots() < 16
-                            || (!dispatch_blocked
-                                && box_.len().saturating_sub(outbox_len_at_dispatch) >= 32)
-                    });
+                    || self.owner.free_effect_slots() < 16
+                    || (!dispatch_blocked
+                        && self
+                            .owner
+                            .pending_effect_count()
+                            .saturating_sub(outbox_len_at_dispatch)
+                            >= 32);
                 if must_dispatch {
                     let accepted = self.dispatch_returning_accepted()?;
-                    outbox_len_at_dispatch = self.owner.outbox().map_or(0, |b| b.len());
+                    outbox_len_at_dispatch = self.owner.pending_effect_count();
                     dispatch_blocked = accepted == 0 && outbox_len_at_dispatch > 0;
                 }
                 if applied
@@ -2517,7 +2519,7 @@ impl Runtime<'_> {
             step_budget = steps_taken
                 .saturating_add(extra)
                 .min(self.limits.drain_steps);
-            outbox_len_at_dispatch = self.owner.outbox().map_or(0, |b| b.len());
+            outbox_len_at_dispatch = self.owner.pending_effect_count();
             dispatch_blocked = false;
         }
         self.schedule_maintenance();
@@ -2638,7 +2640,7 @@ impl Runtime<'_> {
 
     fn dispatch_returning_accepted(&mut self) -> Result<usize, Failure> {
         #[cfg(not(feature = "test-hooks"))]
-        if self.owner.outbox().is_some_and(|box_| box_.is_empty()) {
+        if !self.owner.has_pending_effects() {
             return Ok(0);
         }
         if self.timers_dirty && self.timers.len() >= self.limits.timers.saturating_sub(16) {
@@ -4148,9 +4150,7 @@ impl Runtime<'_> {
                     }
                     let backpressured = self.peers.get_mut(&generation).is_some_and(|peer| {
                         if let Some(effect) = peer.blocked_output
-                            && self.owner.outbox().is_some_and(|outbox| {
-                                outbox.pending().any(|pending| pending.id() == effect)
-                            })
+                            && self.owner.holds_effect(effect)
                         {
                             peer.io.terminal_reason().is_none()
                         } else {

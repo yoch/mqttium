@@ -2613,14 +2613,14 @@ fn finish_retained_durable_publish(close_before_enqueue: bool) {
         );
         runtime.packet(source, 0x32, publish_body(1)).unwrap();
         until(runtime, |r| {
-            !r.peers.contains_key(&target)||r.owner.outbox().unwrap().pending().any(|effect|matches!(effect.effect(),Effect::EmitPublish{connection,..}if connection.generation==target))
+            !r.peers.contains_key(&target)||r.owner.pending_effects().any(|effect|matches!(effect.effect(),Effect::EmitPublish{connection,..}if connection.generation==target))
         });
         assert!(
             runtime.peers.contains_key(&target),
             "temporary_publish_queue_full_closed_generation"
         );
         assert!(runtime.peers[&target].closing.is_none());
-        let retained:Vec<_>=runtime.owner.outbox().unwrap().pending().filter(|effect|matches!(effect.effect(),Effect::EmitPublish{connection,..}if connection.generation==target)).map(|effect|(effect.id(),effect.effect().clone())).collect();
+        let retained:Vec<_>=runtime.owner.pending_effects().filter(|effect|matches!(effect.effect(),Effect::EmitPublish{connection,..}if connection.generation==target)).map(|effect|(effect.id(),effect.effect().clone())).collect();
         assert_eq!(retained.len(), 1);
         let (effect, publication) = &retained[0];
         let Effect::EmitPublish {
@@ -2651,9 +2651,7 @@ fn finish_retained_durable_publish(close_before_enqueue: bool) {
         );
         let pending = runtime
             .owner
-            .outbox()
-            .unwrap()
-            .pending()
+            .pending_effects()
             .find(|pending| pending.id() == *effect)
             .unwrap();
         assert_eq!(
@@ -2675,9 +2673,7 @@ fn finish_retained_durable_publish(close_before_enqueue: bool) {
             until(runtime, |r| {
                 !r.peers.contains_key(&target)
                     && r.owner
-                        .outbox()
-                        .unwrap()
-                        .pending()
+                        .pending_effects()
                         .all(|pending| pending.id() != *effect)
             });
             assert_eq!(queued.try_iter().count(), net::OUTPUT_SLOTS);
@@ -2741,9 +2737,7 @@ fn finish_retained_durable_publish(close_before_enqueue: bool) {
         assert!(
             runtime
                 .owner
-                .outbox()
-                .unwrap()
-                .pending()
+                .pending_effects()
                 .all(|pending| pending.id() != *effect)
         );
         let expected = runtime.outgoing_bindings[&(active, *packet_id)];
@@ -2828,9 +2822,7 @@ fn a_slow_transport_holds_its_acks_while_an_independent_exchange_progresses() {
             }
             let pending = |r: &Runtime<'_>| {
                 r.owner
-                    .outbox()
-                    .unwrap()
-                    .pending()
+                    .pending_effects()
                     .filter_map(|effect| match effect.effect() {
                         Effect::EmitFrame {
                             connection,
@@ -3175,9 +3167,7 @@ fn a_saturated_four_slot_output_retains_the_committed_puback_until_terminal_fail
         runtime.drain_inputs().unwrap();
         let retained: Vec<_> = runtime
             .owner
-            .outbox()
-            .unwrap()
-            .pending()
+            .pending_effects()
             .filter(|e| {
                 matches!(
                     e.effect(),
@@ -3199,7 +3189,7 @@ fn a_saturated_four_slot_output_retains_the_committed_puback_until_terminal_fail
         assert!(!runtime.peers.contains_key(&generation));
         runtime.drain_inputs().unwrap();
         runtime.dispatch().unwrap();
-        assert!(runtime.owner.outbox().unwrap().is_empty());
+        assert!(!runtime.owner.has_pending_effects());
         let events: Vec<serde_json::Value> =
             std::fs::read_to_string(directory.join("events.jsonl"))
                 .unwrap()
@@ -3849,7 +3839,7 @@ fn four_blocked_ordinary_deadlines_cannot_occupy_the_collectors_reserved_reply_l
                 StepOutcome::Applied { .. }
             ));
         }
-        assert_eq!(runtime.owner.outbox().unwrap().len(), 126);
+        assert_eq!(runtime.owner.pending_effect_count(), 126);
         assert!(
             matches!(runtime.owner.step(Input::Deadline {token:ordinary[0],now:LogicalTime::new(10000)},TurnGrant {work_limit:WorkUnits::new(65536)}),StepOutcome::NeedCapacity {need,..} if need.resource==Resource::EffectSlots),
             "ordinary retries demonstrably need the two business slots reserved for maintenance"
@@ -4145,12 +4135,7 @@ fn stale_puback_during_takeover_with_a_blocked_close_cannot_stop_other_connectio
             runtime.inputs,
             runtime.deferred_inputs,
             runtime.control_inputs,
-            runtime
-                .owner
-                .outbox()
-                .unwrap()
-                .pending()
-                .collect::<Vec<_>>(),
+            runtime.owner.pending_effects().collect::<Vec<_>>(),
             runtime
                 .peers
                 .iter()
@@ -4224,14 +4209,12 @@ fn stale_puback_during_takeover_with_a_blocked_close_cannot_stop_other_connectio
         runtime.drain_inputs().unwrap();
         let blocked_persist = runtime
             .owner
-            .outbox()
-            .unwrap()
-            .pending()
+            .pending_effects()
             .next()
             .expect("the seventeenth admission waits for a real store slot")
             .id();
         assert!(matches!(
-            runtime.owner.outbox().unwrap().pending().next().unwrap().effect(),
+            runtime.owner.pending_effects().next().unwrap().effect(),
             Effect::Persist { command } if matches!(command.recipe.get(), Recipe::AdmitPublication(admission) if admission.source.session == runtime.sessions[b"takeover-pressure-c".as_slice()].id)
         ));
         // Observe a real old-generation PUBACK before the takeover cut, then
@@ -4315,14 +4298,7 @@ fn stale_puback_during_takeover_with_a_blocked_close_cannot_stop_other_connectio
                 "session lifecycle did not consume an ordinary writer slot"
             );
             assert_eq!(
-                runtime
-                    .owner
-                    .outbox()
-                    .unwrap()
-                    .pending()
-                    .next()
-                    .unwrap()
-                    .id(),
+                runtime.owner.pending_effects().next().unwrap().id(),
                 blocked_persist,
                 "the same ordinary effect remains retained with its original identity"
             );
@@ -5454,7 +5430,7 @@ fn accepted_frames_reserve_their_terminal_fact_before_reactor_backpressure() {
                 runtime.frames.len(),
                 TERMINAL_INPUTS
             );
-            if runtime.owner.outbox().unwrap().pending().any(|effect| {
+            if runtime.owner.pending_effects().any(|effect| {
                 matches!(
                     effect.effect(),
                     Effect::EmitFrame {
@@ -5484,7 +5460,7 @@ fn accepted_frames_reserve_their_terminal_fact_before_reactor_backpressure() {
             r.inputs.is_empty()
                 && r.terminal_inputs.is_empty()
                 && r.frames.is_empty()
-                && r.owner.outbox().unwrap().is_empty()
+                && !r.owner.has_pending_effects()
         });
         assert_eq!(
             runtime.peers.len(),
@@ -5883,9 +5859,7 @@ fn certain_detach_failure_is_observable_instead_of_losing_offline_expiration() {
         ));
         let (effect, operation) = runtime
             .owner
-            .outbox()
-            .unwrap()
-            .pending()
+            .pending_effects()
             .find_map(|pending| match pending.effect() {
                 Effect::Persist { command } => Some((pending.id(), command.recipe.operation())),
                 _ => None,
@@ -6161,7 +6135,7 @@ fn disconnect_four_before_real_open_reply_survives_source_cleanup_and_admits_onc
             !r.owner.will_status().reading
                 && !r.owner.will_status().admission_pending
                 && r.will_reads.is_none()
-                && r.owner.outbox().unwrap().is_empty()
+                && !r.owner.has_pending_effects()
         });
         let after =
             mqttiumd_store_sqlite::SqliteStore::inspect(&directory.join("store.sqlite")).unwrap();
@@ -6923,9 +6897,7 @@ fn blocked_output_and_full_input_preserve_independent_work_and_reconnect_credit(
             }
             let held_acks = |r: &Runtime<'_>| {
                 r.owner
-                    .outbox()
-                    .unwrap()
-                    .pending()
+                    .pending_effects()
                     .filter_map(|effect| match effect.effect() {
                         Effect::EmitFrame {
                             connection,

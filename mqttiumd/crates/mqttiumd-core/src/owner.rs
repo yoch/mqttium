@@ -1189,13 +1189,35 @@ impl Owner {
         self.inline_claim_enabled = true;
     }
 
-    /// The box of the owner. It is always present: a renewal replaces it
-    /// in place, and a refused renewal keeps it (review R2). The `Option`
-    /// is kept so that the callers written against the earlier form go on
-    /// compiling.
+    /// Whether an effect waits in the box of the owner (record 0064).
     #[must_use]
-    pub fn outbox(&self) -> Option<&Outbox> {
-        Some(&self.outbox)
+    pub fn has_pending_effects(&self) -> bool {
+        !self.outbox.is_empty()
+    }
+
+    /// How many effects wait in the box of the owner.
+    #[must_use]
+    pub fn pending_effect_count(&self) -> usize {
+        self.outbox.len()
+    }
+
+    /// How many slots of the box are neither published nor reserved.
+    #[must_use]
+    pub fn free_effect_slots(&self) -> usize {
+        self.outbox.free_slots()
+    }
+
+    /// Whether the effect `id` still waits in the box: it was published
+    /// and not yet handed to an adapter.
+    #[must_use]
+    pub fn holds_effect(&self, id: EffectId) -> bool {
+        self.outbox.pending().any(|pending| pending.id() == id)
+    }
+
+    /// The effects the owner will hand out, in order, lent read only: an
+    /// `OwnedEffect` is moved, never copied (record 0064).
+    pub fn pending_effects(&self) -> impl Iterator<Item = &OwnedEffect> {
+        self.outbox.pending()
     }
 
     /// Hands effects to `sink` with the receipt and lifecycle control lanes.

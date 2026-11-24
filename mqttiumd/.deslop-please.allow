@@ -31,7 +31,8 @@
 # `pubsub::State`: 43. Lot 6 (runtime): 38 after `reactor::Shared`; 37
 # after the cycle `codec`, `net`, `security`; 30 after `Writer` and
 # `DirectWriter`; 27 after `Acceptor`, `Plan` and `Policy`; 24 after the
-# effective settings, now handed out by copy.
+# effective settings, now handed out by copy. Lot 7 (record 0064): 23 after
+# `Owner::outbox`, replaced by questions on the owner.
 # - The delivery table (`Deliveries`, lot 5) is closed to writes: every
 #   change goes through its transitions. It still lends its rows read only
 #   (`rows`, 26 places in `owner::pubsub`) and the rows of a session
@@ -41,7 +42,14 @@
 #   removed above, is therefore renamed, not narrowed. The owner of the
 #   repository chose on 24 November 2026 to keep read-only lending as the
 #   interface of the table (report 0046).
-field-leak mqttiumd_core::owner::Owner::outbox
+# - The box of the owner (lot 7) is lent to nobody: the owner answers whether
+#   an effect waits, how many, how many slots are free and whether a given
+#   effect still waits. It also lends the effects it will hand out, in order,
+#   read only (`Owner::pending_effects`), because an `OwnedEffect` is moved,
+#   never copied; the bench reads their identities, the tests of the runtime
+#   their content. Its body is a call, so the linter does not report it. The
+#   owner of the repository chose that read view on 24 November 2026
+#   (record 0064).
 field-leak mqttiumd_lab::bench::collector::Collector::lines
 field-leak mqttiumd_lab::store::adapter::SimStore::store
 shallow-module mqttiumd_contract

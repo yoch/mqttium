@@ -28,7 +28,7 @@ use serde_json::{Value, json};
 
 use mqttiumd_contract::capacity::{PayloadBytes, WorkUnits};
 use mqttiumd_contract::effects::{
-    Effect, EffectSink, Input, Outbox, OwnedEffect, OwnerAuthority, RecoveredFact, SubmitBlock,
+    Effect, EffectSink, Input, OwnedEffect, OwnerAuthority, RecoveredFact, SubmitBlock,
     SubmitResult,
 };
 use mqttiumd_contract::ids::{
@@ -978,7 +978,7 @@ impl<S: DurableStore> Process<S> {
                     None => None,
                 };
                 if let Some(cause) = cause {
-                    for effect in self.outbox().pending() {
+                    for effect in self.owner.pending_effects() {
                         books.published_by.entry(effect.id()).or_insert(cause);
                     }
                 }
@@ -1038,20 +1038,10 @@ impl<S: DurableStore> Process<S> {
         self.timer.armed.len()
     }
 
-    /// The box of the owner. Since finding R2 an owner never lives without
-    /// one (`Owner::renew_box` replaces it through the authority); the
-    /// `Option` of `Owner::outbox` is always `Some`, and the bench keeps no
-    /// branch for its absence.
-    fn outbox(&self) -> &Outbox {
-        self.owner
-            .outbox()
-            .expect("an owner always holds its box (finding R2)")
-    }
-
     /// Whether an effect still waits in the box, or an input for room.
     #[must_use]
     pub fn busy(&self) -> bool {
-        !self.outbox().is_empty() || self.parked.is_some()
+        self.owner.has_pending_effects() || self.parked.is_some()
     }
 
     /// After each choice: the parked input again, then the box.
