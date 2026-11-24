@@ -9,7 +9,7 @@ proof of that code, and none replaces its tests.
 | Module | Code | Question |
 | - | - | - |
 | `MWake` | `crates/mqttiumd/src/wake.rs` (`Wake`, `Signalled`), the main loop of `runtime.rs`, the worker loop of `writer.rs` | Can a value published towards a waiting thread stay unseen until the timeout of `Wake::wait`? |
-| `MReactorWake` | `crates/mqttiumd/src/net/reactor.rs` (`Link::notify`, `Shared::send`, `Shared::kick`, `Reactors::hold`, `run`), `Outbound` in `net.rs` | Can a frame the core published stay in its lane until readiness, a tick or the timeout of the poll, once the core's hold is released? |
+| `MReactorWake` | `crates/mqttiumd/src/net/reactor.rs` (`Link::notify`, `Shared::{send, kick, hold, release, take, sleep}`, `Reactors::hold`, `run`), `Outbound` in `net.rs` | Can a frame the core published stay in its lane until readiness, a tick or the timeout of the poll, once the core's hold is released? |
 | `MLaneOwed` | `publish`, `Lanes::deliver`, `Lanes::flush` in `net.rs`; `Link::owe`, `Link::consumed`; `Inbound::try_recv`; record 0046 | Is a value a full lane refused published, and by what? Does input pressure ever end a task? |
 
 ## Running
@@ -188,16 +188,16 @@ tick is then a second way to the same run, not a requirement.
 | `ConsumerClear` | `MWake` | None: only the mutant `ClearAfterPass` reaches it (`Wake::take` exists and is not called by the loops) | No deterministic replay |
 | `ConsumerLock`, `ConsumerCheck` | `MWake` | `lock.lock()` and `pending.swap(false)` in `Wake::wait` | `a_signal_raised_before_the_wait_is_consumed_without_waiting` |
 | `ConsumerRelock` | `MWake` | The return of `ready.wait_timeout` in `Wake::wait` | `a_signal_from_another_thread_ends_the_wait_early` |
-| `ProducerHold` | `MReactorWake` | `Reactors::hold`: `held.store(true)`; `net::hold_wakes` in `Runtime::turn` | `a_held_wake_up_is_given_when_the_hold_ends` (`net/reactor.rs`) |
+| `ProducerHold` | `MReactorWake` | `Reactors::hold` through `Shared::hold`: `held.store(true)`; `net::hold_wakes` in `Runtime::turn` | `a_held_wake_up_is_given_when_the_hold_ends` (`net/reactor.rs`) |
 | `ProducerPreload` | `MReactorWake` | None: only the mutant `CheckBeforePush` reaches it | No deterministic replay |
 | `ProducerPush`, `ProducerOwe`, `ProducerReadHeld` | `MReactorWake` | `Shared::send`: push under the queue lock, `owing.store(true)`, `held.load()` | `a_held_wake_up_is_given_when_the_hold_ends`: a notification under a hold; the lost-message interleavings have no deterministic replay |
-| `ProducerRelease` | `MReactorWake` | `Drop for Held`: `held.store(false)`, then `kick` | `a_held_wake_up_is_given_when_the_hold_ends` |
+| `ProducerRelease` | `MReactorWake` | `Drop for Held` through `Shared::release`: `held.store(false)`, then `kick` | `a_held_wake_up_is_given_when_the_hold_ends` |
 | `ProducerKick`, `ProducerLoad`, `ProducerWake` | `MReactorWake` | `Shared::kick`: `owing.swap(false)`, `sleeping.load()`, `waker.wake()` | `a_notification_runs_the_task_once_and_a_waiting_task_is_ticked`; `a_held_wake_up_is_given_when_the_hold_ends` |
 | `ProducerUnhold` | `MReactorWake` | None: only the mutant `DebtReadBeforeRelease` reaches it | No deterministic replay: it needs a second sending thread |
-| `ReactorTake`, `ReactorHandle` | `MReactorWake` | `std::mem::take(&mut *queue)` and the `Message::Run` arm of `run` | `a_notification_runs_the_task_once_and_a_waiting_task_is_ticked` |
+| `ReactorTake`, `ReactorHandle` | `MReactorWake` | `Shared::take`: `std::mem::take(&mut *queue)`; the `Message::Run` arm of `run` | `a_notification_runs_the_task_once_and_a_waiting_task_is_ticked` |
 | `ReactorRun` | `MReactorWake` | The `ready` loop of `run` and `Driven::turn` | `a_task_runs_on_readiness_and_rests_between_events` |
 | `ReactorLateClear` | `MReactorWake` | None: only the mutant `ClearDirtyAfterRun` reaches it | No deterministic replay |
-| `ReactorSleep`, `ReactorRecheck`, `ReactorPoll`, `ReactorAwake` | `MReactorWake` | `sleeping.store(true)`, `pending`, `poll.poll`, `sleeping.store(false)` in `run` | `a_task_runs_on_readiness_and_rests_between_events` (an idle task is not run); `an_idle_broker_rests` (`tests/reactor_wake.rs`) on the executable |
+| `ReactorSleep`, `ReactorRecheck`, `ReactorPoll`, `ReactorAwake` | `MReactorWake` | `Shared::sleep`, called by `run`: `sleeping.store(true)`, `pending`, `poll.poll`, `sleeping.store(false)` | `a_task_runs_on_readiness_and_rests_between_events` (an idle task is not run); `an_idle_broker_rests` (`tests/reactor_wake.rs`) on the executable |
 | `TaskProduce` | `MLaneOwed` | `Lanes::hold` then `Lanes::deliver` in `input_turn`; `Lanes::report` then `Lanes::flush` | `input_saturation_is_backpressure_and_loses_no_packet` (`net.rs`) |
 | `TaskRun` | `MLaneOwed` | `Message::Run` after `Link::consumed` or `Connection::close`, or the tick of a task that reported `waiting`; `control.is_cancelled()` at the start of `turn` | `a_notification_runs_the_task_once_and_a_waiting_task_is_ticked`: a waiting task is run without an event; `consumed` runs the task only after `owe`. `cancellation_ends_idle_and_partial_socket_tasks` (`net.rs`) |
 | `TaskTry1`, `TaskOwe`, `TaskTry2` | `MLaneOwed` | `publish` in `net.rs` | `input_saturation_is_backpressure_and_loses_no_packet`: the lane is full, one packet is held, and every packet arrives in order once the core takes values; the lost wake-up of `SingleAttempt` has no deterministic replay |
