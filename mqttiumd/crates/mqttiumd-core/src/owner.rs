@@ -4839,6 +4839,58 @@ mod tests {
         assert_eq!(world.outbox().capacity(), MAX_TRANSITION_SLOTS);
     }
 
+    // The owner answers for its box (record 0064): each answer is the one
+    // the box gives, while an effect waits and once it was handed out.
+    #[test]
+    fn the_owner_answers_for_its_box() {
+        let mut world = World::connected();
+        assert!(!world.owner.has_pending_effects());
+        assert_eq!(world.owner.pending_effect_count(), 0);
+        assert_eq!(world.owner.free_effect_slots(), world.held().free_slots());
+        assert_eq!(world.owner.pending_effects().count(), 0);
+
+        world.applied(publish(7));
+        let waiting: Vec<EffectId> = world.held().pending().map(OwnedEffect::id).collect();
+        assert!(!waiting.is_empty());
+        assert!(world.owner.has_pending_effects());
+        assert_eq!(world.owner.pending_effect_count(), waiting.len());
+        assert_eq!(world.owner.free_effect_slots(), world.held().free_slots());
+        assert!(world.owner.free_effect_slots() < world.held().capacity());
+        assert_eq!(
+            world
+                .owner
+                .pending_effects()
+                .map(OwnedEffect::id)
+                .collect::<Vec<_>>(),
+            waiting
+        );
+        assert!(
+            world
+                .owner
+                .pending_effects()
+                .zip(world.held().pending())
+                .all(|(lent, held)| lent == held)
+        );
+        assert!(waiting.iter().all(|&id| world.owner.holds_effect(id)));
+
+        let handed = world.drain();
+        assert_eq!(
+            handed.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            waiting
+        );
+        assert!(!world.owner.has_pending_effects());
+        assert_eq!(world.owner.pending_effect_count(), 0);
+        assert_eq!(world.owner.free_effect_slots(), world.held().free_slots());
+        assert!(waiting.iter().all(|&id| !world.owner.holds_effect(id)));
+
+        // Effects handed out are not held while others wait.
+        world.applied(publish(8));
+        let again: Vec<EffectId> = world.held().pending().map(OwnedEffect::id).collect();
+        assert!(!again.is_empty());
+        assert!(again.iter().all(|&id| world.owner.holds_effect(id)));
+        assert!(waiting.iter().all(|&id| !world.owner.holds_effect(id)));
+    }
+
     #[test]
     fn a_box_is_renewed_only_under_the_authority_of_its_owner_and_with_room() {
         let mut world = World::connected();
