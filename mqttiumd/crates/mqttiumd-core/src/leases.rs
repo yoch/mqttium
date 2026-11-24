@@ -289,6 +289,24 @@ impl LeaseTable {
         Some(lighter)
     }
 
+    /// Restores a held lease of this table's account in `slot`, under the
+    /// generation a durable row names, and returns its key. See
+    /// [`LeaseTable::restore`].
+    pub fn restore_at(
+        &mut self,
+        slot: u32,
+        generation: LeaseGeneration,
+        cost: Credits,
+    ) -> Result<LeaseKey, RestoreRefused> {
+        let key = LeaseKey {
+            account: self.account.id(),
+            slot,
+            generation,
+        };
+        self.restore(key, cost)?;
+        Ok(key)
+    }
+
     /// Restores a held lease read from durable data, once per durable row.
     /// It refuses a slot that already holds one, and charges the account
     /// through `Account::reserve`, under the generation of the row.

@@ -46,7 +46,7 @@ impl State {
             deferred: None,
         }
     }
-    pub(super) fn deadline_is_live(&self, token: DeadlineToken) -> bool {
+    pub(super) fn holds_deadline(&self, token: DeadlineToken) -> bool {
         self.flight
             .is_some_and(|flight| flight.in_flight.deadline == token)
     }

@@ -1563,7 +1563,17 @@ impl State {
             }
         }
     }
-    pub(super) fn deadline_is_live(&self, token: DeadlineToken) -> bool {
+    /// Whether a control or a retained operation is in flight.
+    pub(super) fn control_or_retained_in_flight(&self) -> bool {
+        self.control.is_some() || self.retained.is_some()
+    }
+
+    /// Whether a connection is known to the pub/sub state.
+    pub(super) fn has_connections(&self) -> bool {
+        !self.connections.is_empty()
+    }
+
+    pub(super) fn holds_deadline(&self, token: DeadlineToken) -> bool {
         self.retained.is_some_and(|f| f.in_flight.deadline == token)
             || self
                 .control
@@ -4163,9 +4173,7 @@ impl Owner {
     ) -> Option<(ConnectionGeneration, OutboundPacketId)> {
         if !self.inline_claim_enabled
             || selected.qos == Qos::AtMostOnce
-            || self.pubsub.control.is_some()
-            || self.pubsub.retained.is_some()
-            || self.will_status().admission_pending
+            || self.inline_claims_blocked()
             || self
                 .pubsub
                 .non_inline_by_session
@@ -4494,9 +4502,7 @@ impl Owner {
                 };
                 let no_pending_non_inline = page_session
                     .is_some_and(|s| !self.pubsub.non_inline_by_session.contains_key(&s))
-                    && self.pubsub.control.is_none()
-                    && self.pubsub.retained.is_none()
-                    && !self.will_status().admission_pending;
+                    && !self.inline_claims_blocked();
                 self.pubsub.unindex_conn(connection);
                 let c = &mut self.pubsub.connections.as_mut_slice()[connection];
                 c.loading = None;

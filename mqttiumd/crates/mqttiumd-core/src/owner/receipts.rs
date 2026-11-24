@@ -61,6 +61,39 @@ impl State {
         self.check(ReceiptClass::Control).is_ok()
     }
 
+    /// Whether a collection is in flight.
+    pub(super) fn collecting(&self) -> bool {
+        self.pending.is_some()
+    }
+
+    /// Whether `token` is the deadline of the collection in flight.
+    pub(super) fn holds_deadline(&self, token: DeadlineToken) -> bool {
+        self.pending.is_some_and(|flight| flight.deadline == token)
+    }
+
+    /// The collection in flight, when `token` is its deadline.
+    pub(super) fn pending_at(&self, token: DeadlineToken) -> Option<Flight> {
+        self.pending.filter(|flight| flight.deadline == token)
+    }
+
+    /// The collection in flight, when it is `collection` and `effect` is
+    /// one of its attempts.
+    pub(super) fn answering(
+        &self,
+        effect: EffectId,
+        collection: ReceiptCollection,
+    ) -> Option<Flight> {
+        self.pending
+            .filter(|flight| flight.collection == collection && flight.answers.names(effect))
+    }
+
+    /// The acknowledged frontier, the receipts held and those not consumed
+    /// yet; nothing while receipts are not enabled.
+    pub(super) fn status(&self) -> Option<(ReceiptClosure, usize, usize)> {
+        self.enabled
+            .then_some((self.acknowledged, self.entries.len(), self.unconsumed))
+    }
+
     fn check(&self, class: ReceiptClass) -> Result<(), Stop> {
         if !self.enabled {
             return Ok(());
@@ -224,44 +257,21 @@ impl Owner {
         effect: EffectId,
         collection: ReceiptCollection,
     ) -> bool {
-        self.receipts
-            .pending
-            .is_some_and(|flight| flight.collection == collection && flight.answers.names(effect))
+        self.receipts.answering(effect, collection).is_some()
     }
 
     /// Absolute durable frontier, unconfirmed sequence span and unresolved
     /// holes. Counts are observations, never reusable credit grants.
     #[must_use]
     pub fn receipt_status(&self) -> Option<(ReceiptClosure, usize, usize)> {
-        self.receipts.enabled.then_some((
-            self.receipts.acknowledged,
-            self.receipts.entries.len(),
-            self.receipts.unconsumed,
-        ))
+        self.receipts.status()
     }
 
     /// Whether this token is the current collector deadline, as distinct
     /// from ordinary command timers using the same bounded timer adapter.
     #[must_use]
     pub fn collection_deadline_is_live(&self, token: DeadlineToken) -> bool {
-        self.receipts
-            .pending
-            .is_some_and(|flight| flight.deadline == token)
-    }
-
-    /// Only a live unresolved command or collector retains its current timer.
-    #[must_use]
-    pub fn deadline_is_live(&self, token: DeadlineToken) -> bool {
-        self.receipts
-            .pending
-            .is_some_and(|flight| flight.deadline == token)
-            || self.slot_by_deadline.contains_key(&token)
-            || self.pubsub.deadline_is_live(token)
-            || self.wills.deadline_is_live(token)
-            || self
-                .lifecycle
-                .as_ref()
-                .is_some_and(|flight| flight.in_flight.deadline == token)
+        self.receipts.holds_deadline(token)
     }
 
     fn receipt_flight(
@@ -291,7 +301,7 @@ impl Owner {
         if let Some(change) = self.plan_release_wake(draft)? {
             return Ok(change);
         }
-        if self.receipts.pending.is_some() {
+        if self.receipts.collecting() {
             return Ok(super::Change::Nothing);
         }
         if !self.receipts.enabled {
@@ -327,10 +337,7 @@ impl Owner {
         {
             return Err(IMPOSSIBLE);
         }
-        let Some(flight) = self.receipts.pending else {
-            return Ok(super::Change::Nothing);
-        };
-        if collection != flight.collection || !flight.answers.names(effect) {
+        if self.receipts.answering(effect, collection).is_none() {
             return Ok(super::Change::Nothing);
         }
         match reply {
@@ -350,11 +357,7 @@ impl Owner {
         token: DeadlineToken,
         draft: &mut Draft,
     ) -> Result<Option<super::Change>, Stop> {
-        let Some(previous) = self
-            .receipts
-            .pending
-            .filter(|flight| flight.deadline == token)
-        else {
+        let Some(previous) = self.receipts.pending_at(token) else {
             return Ok(None);
         };
         let flight = self.receipt_flight(previous.collection, Some(previous), draft)?;

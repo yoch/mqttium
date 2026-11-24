@@ -520,8 +520,7 @@ impl Owner {
         // Historical S0 exact/default fixtures retain their one-transition
         // work abstraction. Product registration or hierarchical options opt
         // into the additional bounded selection work, as for pub/sub work.
-        if !self.lifecycle_enabled
-            && self.pubsub.connections.is_empty()
+        if !self.serves_connections()
             && !self.route_index.has_wildcards()
             && self
                 .routes

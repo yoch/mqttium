@@ -1280,6 +1280,33 @@ impl Owner {
     }
 
     /// The owner.
+    /// Whether no delivery may be claimed inline by its admission now: a
+    /// control or retained operation of the pub/sub state, or a will
+    /// admission, is in flight.
+    fn inline_claims_blocked(&self) -> bool {
+        self.pubsub.control_or_retained_in_flight() || self.will_status().admission_pending
+    }
+
+    /// Whether this owner registers sessions or serves connections. A
+    /// historical S0 owner does neither, and keeps the one-transition work
+    /// abstraction of its fixtures.
+    fn serves_connections(&self) -> bool {
+        self.lifecycle_enabled || self.pubsub.has_connections()
+    }
+
+    /// Only a live unresolved command or collector retains its current timer.
+    #[must_use]
+    pub fn deadline_is_live(&self, token: DeadlineToken) -> bool {
+        self.receipts.holds_deadline(token)
+            || self.slot_by_deadline.contains_key(&token)
+            || self.pubsub.holds_deadline(token)
+            || self.wills.holds_deadline(token)
+            || self
+                .lifecycle
+                .as_ref()
+                .is_some_and(|flight| flight.in_flight.deadline == token)
+    }
+
     #[must_use]
     pub fn id(&self) -> LogicalOwnerId {
         self.id
@@ -3985,13 +4012,15 @@ impl Owner {
             } => {
                 // One lease per durable row, in the slot of its rank. The
                 // payload of the exchange never entered this process.
-                let lease = LeaseKey {
-                    account: self.leases.account().id(),
-                    slot: u32::try_from(self.slots.len()).map_err(|_| STALE)?,
-                    generation: LeaseGeneration::new(0),
-                };
                 let cost = Credits::new(PayloadBytes::ZERO, ExchangeSlots::new(1));
-                self.leases.restore(lease, cost).map_err(|_| STALE)?;
+                let lease = self
+                    .leases
+                    .restore_at(
+                        u32::try_from(self.slots.len()).map_err(|_| STALE)?,
+                        LeaseGeneration::new(0),
+                        cost,
+                    )
+                    .map_err(|_| STALE)?;
                 let slot = Slot {
                     session: exchange.session,
                     packet_id: *packet_id,

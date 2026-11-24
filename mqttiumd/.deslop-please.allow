@@ -25,13 +25,13 @@
 #   unfaulted, by design. Every other use goes through the adapter.
 #
 # The other entries are fixed lot by lot. After lot 1 (lab): 78 entries;
-# after lot 2 (contract): 75; after lot 3 (stores): 65.
+# after lot 2 (contract): 75; after lot 3 (stores): 65; after lot 4 (core
+# upward ties): 61.
 # - field-leak of the effective settings (SqliteStore::settings,
 #   LogStore::sqlite_settings, VolatileHandle::sqlite_settings): a record of
 #   what the engine read back, which every reader only copies; its main
 #   reader is the writer of the runtime. Decided with the runtime lot.
 module-cycle mqttiumd::codec,mqttiumd::net,mqttiumd::security
-module-cycle mqttiumd_core::owner::pubsub,mqttiumd_core::owner::receipts,mqttiumd_core::owner::routing,mqttiumd_core::owner::sessions,mqttiumd_core::owner::will
 field-leak mqttiumd::net::reactor::Shared::dead
 field-leak mqttiumd::net::reactor::Shared::held
 field-leak mqttiumd::net::reactor::Shared::queue
@@ -47,7 +47,6 @@ field-leak mqttiumd::writer::Writer::control_receiver
 field-leak mqttiumd::writer::Writer::control_sender
 field-leak mqttiumd::writer::Writer::receiver
 field-leak mqttiumd::writer::Writer::sender
-field-leak mqttiumd_core::leases::LeaseTable::account
 field-leak mqttiumd_core::owner::Owner::outbox
 field-leak mqttiumd_core::owner::pubsub::State::conn_by_loading_effect
 field-leak mqttiumd_core::owner::pubsub::State::connections
@@ -67,8 +66,6 @@ field-leak mqttiumd_core::owner::pubsub::State::next_pubrec_rank
 field-leak mqttiumd_core::owner::pubsub::State::non_inline_by_session
 field-leak mqttiumd_core::owner::pubsub::State::retained
 field-leak mqttiumd_core::owner::pubsub::State::volatile
-field-leak mqttiumd_core::owner::receipts::State::entries
-field-leak mqttiumd_core::owner::receipts::State::pending
 field-leak mqttiumd_lab::bench::collector::Collector::lines
 field-leak mqttiumd_lab::store::adapter::SimStore::store
 field-leak mqttiumd_store_sqlite::SqliteStore::settings
