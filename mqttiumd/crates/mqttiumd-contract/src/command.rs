@@ -79,6 +79,7 @@ const KIND_UPDATE_SUBSCRIPTIONS: u8 = 7;
 const KIND_SUBSCRIPTION_OPTIONS: u8 = 9;
 const KIND_ANNOTATED_PUBLICATION: u8 = 23;
 const KIND_CLAIMED_PUBLICATION: u8 = 24;
+const KIND_MULTI_CLAIMED_PUBLICATION: u8 = 25;
 
 /// Why an obligation exists. The cause stays inspectable by the oracle.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -458,6 +459,69 @@ impl ClaimedPublication {
     }
 }
 
+/// Commits an `AdmitPublication` and claims two or more of its QoS 1/2 targets
+/// in the same durable transaction (recipe kind 25). Single-target inline
+/// claims use [`ClaimedPublication`] (kind 24) so the canonical encoding stays
+/// unique.
+#[derive(Debug)]
+pub struct MultiClaimedPublication {
+    pub admission: AdmitPublication,
+    pub claims: BoundedVec<InlineClaim>,
+}
+
+impl PartialEq for MultiClaimedPublication {
+    fn eq(&self, other: &Self) -> bool {
+        let Self { admission, claims } = self;
+        *admission == other.admission && claims.as_slice() == other.claims.as_slice()
+    }
+}
+
+impl Eq for MultiClaimedPublication {}
+
+impl MultiClaimedPublication {
+    pub(crate) fn check(&self) -> Result<(), RecipeError> {
+        self.admission.check_retained()?;
+        if self.admission.retain {
+            return Err(RecipeError::InvalidField("inline_claim_retain"));
+        }
+        let claims = self.claims.as_slice();
+        let targets = self.admission.targets.as_slice();
+        if claims.len() < 2 || claims.len() > targets.len() {
+            return Err(RecipeError::InvalidField("inline_claim_count"));
+        }
+        let mut prev_index: Option<u16> = None;
+        for (pos, claim) in claims.iter().enumerate() {
+            if prev_index.is_some_and(|prev| claim.target_index <= prev) {
+                return Err(RecipeError::InvalidField("inline_claim_order"));
+            }
+            prev_index = Some(claim.target_index);
+            let Some(target) = targets.get(usize::from(claim.target_index)) else {
+                return Err(RecipeError::InvalidField("inline_claim_target"));
+            };
+            if target.effective_qos == Qos::AtMostOnce {
+                return Err(RecipeError::InvalidField("inline_claim_qos"));
+            }
+            if claims.len() <= 16 {
+                for earlier in &claims[..pos] {
+                    if targets[usize::from(earlier.target_index)].session == target.session {
+                        return Err(RecipeError::InvalidField("inline_claim_duplicate_session"));
+                    }
+                }
+            }
+        }
+        if claims.len() > 16 {
+            let mut seen = alloc::collections::BTreeSet::new();
+            for claim in claims {
+                let session = targets[usize::from(claim.target_index)].session;
+                if !seen.insert(session) {
+                    return Err(RecipeError::InvalidField("inline_claim_duplicate_session"));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Wraps a publication admission recipe with non-empty MQTT 5 PUBLISH
 /// application properties (ADR 0053, recipe kind 23).
 #[derive(PartialEq, Eq, Debug)]
@@ -475,6 +539,7 @@ impl AnnotatedPublication {
         match self.inner.as_ref() {
             Recipe::AdmitPublication(_)
             | Recipe::ClaimedPublication(_)
+            | Recipe::MultiClaimedPublication(_)
             | Recipe::RetainedPublication(_)
             | Recipe::RetainedQos0(_)
             | Recipe::ExpiringPublication(_) => self.inner.check(),
@@ -519,7 +584,7 @@ impl AnnotatedPublication {
         let nested_len = usize::try_from(reader.u32()?)
             .map_err(|_| RecipeError::InvalidField("annotated_publication_nested_length"))?;
         let nested = reader.take(nested_len)?;
-        if nested.len() < 7 || !matches!(nested[6], 1 | 10 | 11 | 13 | 20 | 21 | 24) {
+        if nested.len() < 7 || !matches!(nested[6], 1 | 10 | 11 | 13 | 20 | 21 | 24 | 25) {
             return Err(RecipeError::InvalidField(
                 "annotated_publication_inner_kind",
             ));
@@ -550,6 +615,7 @@ pub enum Recipe {
     SessionLifecycle(crate::session::SessionLifecycle),
     AdmitPublication(AdmitPublication),
     ClaimedPublication(ClaimedPublication),
+    MultiClaimedPublication(MultiClaimedPublication),
     ReleaseInbound(ReleaseInbound),
     ChangeSubscriptions(ChangeSubscriptions),
     ClaimDelivery(ClaimDelivery),
@@ -616,6 +682,7 @@ impl Recipe {
             Self::AnnotatedPublication(value) => value.inner.admission(),
             Self::AdmitPublication(admission) => Some(admission),
             Self::ClaimedPublication(claimed) => Some(&claimed.admission),
+            Self::MultiClaimedPublication(claimed) => Some(&claimed.admission),
             Self::RetainedPublication(value) => Some(&value.admission),
             Self::ExpiringPublication(ExpiringPublication {
                 admission: ExpiringAdmission::Qos12(value),
@@ -681,6 +748,7 @@ impl Recipe {
             Self::SessionLifecycle(change) => change.operation,
             Self::AdmitPublication(admit) => admit.operation,
             Self::ClaimedPublication(claimed) => claimed.admission.operation,
+            Self::MultiClaimedPublication(claimed) => claimed.admission.operation,
             Self::ReleaseInbound(release) => release.operation,
             Self::ChangeSubscriptions(change) => change.operation,
             Self::ClaimDelivery(claim) => claim.operation,
@@ -729,6 +797,7 @@ impl Recipe {
             | Self::ConsumeDelivery(_) => Ok(()),
             Self::AdmitPublication(admit) => admit.check_retained(),
             Self::ClaimedPublication(claimed) => claimed.check(),
+            Self::MultiClaimedPublication(claimed) => claimed.check(),
             Self::ReleaseInbound(release) => {
                 if release.exchange.session != release.source_session {
                     return Err(RecipeError::ForeignExchange);
@@ -846,6 +915,15 @@ impl Recipe {
                 claimed.admission.encode_body(out);
                 out.extend_from_slice(&claimed.claim.target_index.to_be_bytes());
                 out.extend_from_slice(&claimed.claim.packet_id.get().to_be_bytes());
+            }
+            Self::MultiClaimedPublication(claimed) => {
+                out.push(KIND_MULTI_CLAIMED_PUBLICATION);
+                claimed.admission.encode_body(out);
+                out.extend_from_slice(&(claimed.claims.len() as u16).to_be_bytes());
+                for claim in claimed.claims.as_slice() {
+                    out.extend_from_slice(&claim.target_index.to_be_bytes());
+                    out.extend_from_slice(&claim.packet_id.get().to_be_bytes());
+                }
             }
             Self::ReleaseInbound(release) => {
                 out.push(KIND_RELEASE_INBOUND);
@@ -1083,6 +1161,28 @@ impl Recipe {
                         packet_id,
                     },
                 })
+            }
+            KIND_MULTI_CLAIMED_PUBLICATION => {
+                let admission =
+                    AdmitPublication::decode_body(&mut reader, max_targets, max_topic_len)?;
+                let count = usize::from(reader.u16()?);
+                if count < 2 || count > admission.targets.len() {
+                    return Err(RecipeError::InvalidField("inline_claim_count"));
+                }
+                let mut claims =
+                    BoundedVec::with_capacity(count).map_err(|_| RecipeError::AllocationFailed)?;
+                for _ in 0..count {
+                    let target_index = reader.u16()?;
+                    let packet_id = OutboundPacketId::new(reader.u16()?)
+                        .ok_or(RecipeError::InvalidField("outbound_packet_id"))?;
+                    claims
+                        .try_push(InlineClaim {
+                            target_index,
+                            packet_id,
+                        })
+                        .map_err(|_| RecipeError::AllocationFailed)?;
+                }
+                Self::MultiClaimedPublication(MultiClaimedPublication { admission, claims })
             }
             KIND_RELEASE_INBOUND => {
                 let operation = reader.operation()?;
@@ -1332,6 +1432,10 @@ impl FrozenRecipe {
             Recipe::ClaimedPublication(claimed) => (ADMIT_FIXED + 4)
                 .saturating_add(claimed.admission.topic.len())
                 .saturating_add(claimed.admission.targets.len().saturating_mul(TARGET_BYTES)),
+            Recipe::MultiClaimedPublication(claimed) => (ADMIT_FIXED + 2)
+                .saturating_add(claimed.admission.topic.len())
+                .saturating_add(claimed.admission.targets.len().saturating_mul(TARGET_BYTES))
+                .saturating_add(claimed.claims.len().saturating_mul(4)),
             _ => {
                 let mut out = Vec::with_capacity(128);
                 encode_checked_into(&self.0, &mut out);
@@ -1348,7 +1452,7 @@ impl FrozenRecipe {
 }
 
 fn encode_checked_into(recipe: &Recipe, out: &mut Vec<u8>) {
-    const STACK_CAP: usize = 384;
+    const STACK_CAP: usize = 768;
     const ADMIT_FIXED: usize = 215;
     const TARGET_BYTES: usize = 22;
 
@@ -1446,13 +1550,34 @@ fn encode_checked_into(recipe: &Recipe, out: &mut Vec<u8>) {
                 return;
             }
         }
+        Recipe::MultiClaimedPublication(claimed) => {
+            let needed = ADMIT_FIXED
+                .saturating_add(2)
+                .saturating_add(claimed.admission.topic.len())
+                .saturating_add(claimed.admission.targets.len().saturating_mul(TARGET_BYTES))
+                .saturating_add(claimed.claims.len().saturating_mul(4));
+            if needed <= STACK_CAP {
+                let mut buf = StackBuf::<STACK_CAP>::new();
+                buf.extend(MAGIC);
+                buf.extend(&RECIPE_FORMAT.to_be_bytes());
+                buf.push(KIND_MULTI_CLAIMED_PUBLICATION);
+                encode_admit_body_stack(&mut buf, &claimed.admission);
+                buf.extend(&(claimed.claims.len() as u16).to_be_bytes());
+                for claim in claimed.claims.as_slice() {
+                    buf.extend(&claim.target_index.to_be_bytes());
+                    buf.extend(&claim.packet_id.get().to_be_bytes());
+                }
+                out.extend_from_slice(buf.as_slice());
+                return;
+            }
+        }
         _ => {}
     }
     let _ = recipe.encode_canonical(out);
 }
 
 fn encode_checked_arc(recipe: &Recipe) -> Arc<[u8]> {
-    const STACK_CAP: usize = 384;
+    const STACK_CAP: usize = 768;
     const ADMIT_FIXED: usize = 215;
     const TARGET_BYTES: usize = 22;
 
@@ -1541,6 +1666,26 @@ fn encode_checked_arc(recipe: &Recipe) -> Arc<[u8]> {
                 encode_admit_body_stack(&mut out, &claimed.admission);
                 out.extend(&claimed.claim.target_index.to_be_bytes());
                 out.extend(&claimed.claim.packet_id.get().to_be_bytes());
+                return Arc::from(out.as_slice());
+            }
+        }
+        Recipe::MultiClaimedPublication(claimed) => {
+            let needed = ADMIT_FIXED
+                .saturating_add(2)
+                .saturating_add(claimed.admission.topic.len())
+                .saturating_add(claimed.admission.targets.len().saturating_mul(TARGET_BYTES))
+                .saturating_add(claimed.claims.len().saturating_mul(4));
+            if needed <= STACK_CAP {
+                let mut out = StackBuf::<STACK_CAP>::new();
+                out.extend(MAGIC);
+                out.extend(&RECIPE_FORMAT.to_be_bytes());
+                out.push(KIND_MULTI_CLAIMED_PUBLICATION);
+                encode_admit_body_stack(&mut out, &claimed.admission);
+                out.extend(&(claimed.claims.len() as u16).to_be_bytes());
+                for claim in claimed.claims.as_slice() {
+                    out.extend(&claim.target_index.to_be_bytes());
+                    out.extend(&claim.packet_id.get().to_be_bytes());
+                }
                 return Arc::from(out.as_slice());
             }
         }
@@ -2569,5 +2714,142 @@ mod tests {
                 packet_id: OutboundPacketId::new(77).unwrap(),
             },
         }));
+        let Recipe::AdmitPublication(admit) =
+            admission(&[target(11, 0), target(12, 1), target(13, 2)])
+        else {
+            panic!("expected AdmitPublication");
+        };
+        assert_parity(Recipe::MultiClaimedPublication(MultiClaimedPublication {
+            admission: admit,
+            claims: BoundedVec::from_slice(
+                &[
+                    InlineClaim {
+                        target_index: 0,
+                        packet_id: OutboundPacketId::new(11).unwrap(),
+                    },
+                    InlineClaim {
+                        target_index: 2,
+                        packet_id: OutboundPacketId::new(33).unwrap(),
+                    },
+                ],
+                2,
+            )
+            .unwrap(),
+        }));
+    }
+
+    #[test]
+    fn multi_claimed_publication_canonical_roundtrip_and_guards() {
+        let Recipe::AdmitPublication(admit) =
+            admission(&[target(11, 0), target(12, 1), target(13, 2)])
+        else {
+            panic!("expected AdmitPublication");
+        };
+        let multi = Recipe::MultiClaimedPublication(MultiClaimedPublication {
+            admission: admit,
+            claims: BoundedVec::from_slice(
+                &[
+                    InlineClaim {
+                        target_index: 0,
+                        packet_id: OutboundPacketId::new(17).unwrap(),
+                    },
+                    InlineClaim {
+                        target_index: 2,
+                        packet_id: OutboundPacketId::new(29).unwrap(),
+                    },
+                ],
+                2,
+            )
+            .unwrap(),
+        });
+        assert_eq!(multi.operation(), multi.admission().unwrap().operation);
+        let bytes = encode(&multi);
+        assert_eq!(bytes[6], KIND_MULTI_CLAIMED_PUBLICATION);
+        let decoded = Recipe::decode_canonical(&bytes, 4, 64).expect("decode multi claimed");
+        assert_eq!(decoded, multi);
+
+        // AnnotatedPublication wrapping MultiClaimedPublication also round-trips.
+        let props = crate::properties::PublishProperties {
+            content_type: Some(SharedBytes::copy_from(b"application/octet-stream", 64).unwrap()),
+            ..Default::default()
+        };
+        let annotated = Recipe::AnnotatedPublication(AnnotatedPublication {
+            inner: Box::new(decoded),
+            properties: Arc::new(props),
+        });
+        let ann_bytes = encode(&annotated);
+        assert_eq!(
+            Recipe::decode_canonical(&ann_bytes, 4, 64).expect("decode annotated multi"),
+            annotated
+        );
+
+        // Fewer than 2 claims is refused (single claim uses ClaimedPublication).
+        let Recipe::AdmitPublication(admit) = admission(&[target(11, 0), target(12, 1)]) else {
+            panic!("expected AdmitPublication");
+        };
+        assert_eq!(
+            FrozenRecipe::freeze(Recipe::MultiClaimedPublication(MultiClaimedPublication {
+                admission: admit,
+                claims: BoundedVec::from_slice(
+                    &[InlineClaim {
+                        target_index: 0,
+                        packet_id: OutboundPacketId::new(1).unwrap(),
+                    }],
+                    1
+                )
+                .unwrap(),
+            })),
+            Err(RecipeError::InvalidField("inline_claim_count"))
+        );
+
+        // Non-ascending target_index is refused.
+        let Recipe::AdmitPublication(admit) = admission(&[target(11, 0), target(12, 1)]) else {
+            panic!("expected AdmitPublication");
+        };
+        assert_eq!(
+            FrozenRecipe::freeze(Recipe::MultiClaimedPublication(MultiClaimedPublication {
+                admission: admit,
+                claims: BoundedVec::from_slice(
+                    &[
+                        InlineClaim {
+                            target_index: 1,
+                            packet_id: OutboundPacketId::new(1).unwrap(),
+                        },
+                        InlineClaim {
+                            target_index: 0,
+                            packet_id: OutboundPacketId::new(2).unwrap(),
+                        },
+                    ],
+                    2
+                )
+                .unwrap(),
+            })),
+            Err(RecipeError::InvalidField("inline_claim_order"))
+        );
+
+        // Duplicate target session across claims is refused.
+        let Recipe::AdmitPublication(admit) = admission(&[target(11, 0), target(11, 1)]) else {
+            panic!("expected AdmitPublication");
+        };
+        assert_eq!(
+            FrozenRecipe::freeze(Recipe::MultiClaimedPublication(MultiClaimedPublication {
+                admission: admit,
+                claims: BoundedVec::from_slice(
+                    &[
+                        InlineClaim {
+                            target_index: 0,
+                            packet_id: OutboundPacketId::new(1).unwrap(),
+                        },
+                        InlineClaim {
+                            target_index: 1,
+                            packet_id: OutboundPacketId::new(2).unwrap(),
+                        },
+                    ],
+                    2
+                )
+                .unwrap(),
+            })),
+            Err(RecipeError::InvalidField("inline_claim_duplicate_session"))
+        );
     }
 }

@@ -31,7 +31,7 @@ use crate::contract::capacity::{
 };
 use crate::contract::command::{
     AdmitPublication, ClaimedPublication, Command, Costs, DeliveryCause, FrozenRecipe, InlineClaim,
-    PayloadRef, Recipe, RecipeError, ReleaseInbound, Source, Target,
+    MultiClaimedPublication, PayloadRef, Recipe, RecipeError, ReleaseInbound, Source, Target,
 };
 use crate::contract::effects::{
     CloseReason, CreateRefused, DispatchReport, Effect, EffectReservation, EffectSink, FactRank,
@@ -61,6 +61,8 @@ use crate::contract::message_expiry::{
 };
 use crate::slab::{BoundedSlab, SmallIndexSet};
 
+mod connections;
+mod deliveries;
 mod pubsub;
 mod receipts;
 mod routing;
@@ -816,6 +818,7 @@ const IMPOSSIBLE: Stop = Stop::Fatal(CoreFault::ImpossibleInput);
 
 #[derive(Clone, Copy, Debug)]
 struct InlineClaimPlan {
+    target_index: u16,
     target: SessionId,
     target_revision: Revision,
     qos: Qos,
@@ -823,13 +826,32 @@ struct InlineClaimPlan {
     generation: ConnectionGeneration,
 }
 
+#[derive(Debug)]
+enum InlineClaimPlans {
+    None,
+    One(InlineClaimPlan),
+    Many(alloc::vec::Vec<InlineClaimPlan>),
+}
+
+impl InlineClaimPlans {
+    fn is_empty(&self) -> bool {
+        matches!(self, Self::None)
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
-enum InlineOutcome {
+enum InlineSlotOutcome {
     Committed {
         slot: usize,
         emission: Option<(EffectId, ConnectionKey)>,
     },
     Remove(usize),
+}
+
+#[derive(Debug)]
+enum InlineOutcome {
+    One(InlineSlotOutcome),
+    Many(alloc::vec::Vec<InlineSlotOutcome>),
 }
 
 /// The change of state of a transition. Indices name entries of the
@@ -870,7 +892,7 @@ enum Change {
         unmatched: bool,
         cost: Credits,
         in_flight: InFlight,
-        inline_claim: Option<InlineClaimPlan>,
+        inline_claims: InlineClaimPlans,
         dirty_targets: Option<alloc::boxed::Box<[SessionId]>>,
     },
     /// The admission of the exchange is known committed.
@@ -1133,6 +1155,8 @@ pub struct Owner {
     held_answers: usize,
     /// Total slots currently in `AdmissionPending` or `AnswerHeld`.
     unanswered_slots: usize,
+    /// Total slots currently in `AdmissionPending` (depend on `route_revision`).
+    pending_admissions: usize,
     /// Set when the last applied `Input::ObservedPuback` did not match a live
     /// delivery on the connection, so the runtime can emit `puback_ignored`
     /// without a redundant pre-step `puback_target` lookup.
@@ -1141,8 +1165,11 @@ pub struct Owner {
     /// could not make new outbound pub/sub work ready for its target session.
     last_step_may_unblock_work: bool,
     /// If the last applied `PublicationAdmitted` / `RejectedCertain` resolved
-    /// an inline claim that may still have ready work, holds its target session.
+    /// one or more inline claims (or unclaimed targets) that may still have
+    /// ready work, holds the first target inline and any additional targets in
+    /// `last_inline_ready_extra`.
     last_inline_ready_target: Option<SessionId>,
+    last_inline_ready_extra: alloc::vec::Vec<SessionId>,
     /// See `OwnerConfig::session_qos2_exchanges`.
     session_qos2_exchanges: usize,
     release_retry_slots: BTreeSet<usize>,
@@ -1164,7 +1191,8 @@ pub struct Owner {
     lifecycle: Option<sessions::Flight>,
     lifecycle_enabled: bool,
     inline_claim_enabled: bool,
-    non_inline_targets_by_op: ScopedFlatMap<OperationId, alloc::vec::Vec<SessionId>>,
+    non_inline_targets_by_op:
+        ScopedFlatMap<OperationId, (PublicationId, alloc::vec::Vec<SessionId>)>,
     message_now: Option<MessageTime>,
     release_continuation: Option<ContinuationId>,
     release_continuations_started: bool,
@@ -1285,9 +1313,11 @@ impl Owner {
             slots_by_session: FlatMap::new(),
             held_answers: 0,
             unanswered_slots: 0,
+            pending_admissions: 0,
             last_observed_puback_ignored: false,
             last_step_may_unblock_work: true,
             last_inline_ready_target: None,
+            last_inline_ready_extra: alloc::vec::Vec::new(),
             session_qos2_exchanges: usize::try_from(config.session_qos2_exchanges.get())
                 .unwrap_or(usize::MAX),
             release_retry_slots: BTreeSet::new(),
@@ -1357,7 +1387,10 @@ impl Owner {
             }
             Some(report)
         });
-        let lifecycle = if self.lifecycle_enabled {
+        let pending_route_admissions = self.has_pending_route_admissions();
+        let lifecycle = if self.lifecycle_enabled
+            && !(pending_route_admissions && self.lifecycle_mutates_routes())
+        {
             let flight = self.lifecycle_dispatch();
             if !self.outbox.has_session_control()
                 && (flight.is_none() || self.lifecycle_flight_dispatched == flight)
@@ -1373,7 +1406,9 @@ impl Owner {
         } else {
             None
         };
-        let will = if self.will_status().reading || self.will_status().admission_pending {
+        let will = if (self.will_status().reading || self.will_status().admission_pending)
+            && !pending_route_admissions
+        {
             if lifecycle
                 .as_ref()
                 .is_none_or(|control| control.blocked.is_none())
@@ -1671,6 +1706,45 @@ impl Owner {
         Ok(removed)
     }
 
+    /// Whether any pending admission or subscription update depends on the
+    /// current `route_revision` and target session set.
+    fn has_pending_route_admissions(&self) -> bool {
+        self.pending_admissions > 0
+            || self.pubsub.retained.is_some()
+            || self.pubsub.control_pending()
+    }
+
+    /// Whether the active lifecycle command may remove a session or advance
+    /// `route_revision` in the store.
+    fn lifecycle_mutates_routes(&self) -> bool {
+        self.lifecycle.as_ref().is_some_and(|flight| {
+            matches!(
+                &flight.command.action,
+                crate::contract::session::SessionAction::Close { .. }
+                    | crate::contract::session::SessionAction::EndWill {
+                        expiry: crate::contract::session::SessionExpiry::OnDisconnect,
+                        ..
+                    }
+                    | crate::contract::session::SessionAction::Expire { .. }
+                    | crate::contract::session::SessionAction::Open {
+                        expected: Some(_),
+                        clean_start: true,
+                        ..
+                    }
+                    | crate::contract::session::SessionAction::OpenAt {
+                        expected: Some(_),
+                        clean_start: true,
+                        ..
+                    }
+                    | crate::contract::session::SessionAction::OpenWillAt {
+                        expected: Some(_),
+                        clean_start: true,
+                        ..
+                    }
+            )
+        })
+    }
+
     fn index_slot_state(&mut self, index: usize) {
         let slot = &self.slots[index];
         let session = slot.session;
@@ -1686,6 +1760,7 @@ impl Owner {
                 self.slot_by_op.insert(op, index);
                 self.slot_by_deadline.insert(dl, index);
                 self.unanswered_slots += 1;
+                self.pending_admissions += 1;
             }
             SlotState::ReleasePending(f) => {
                 let op = f.operation;
@@ -1725,6 +1800,7 @@ impl Owner {
                 self.slot_by_op.remove(&op);
                 self.slot_by_deadline.remove(&dl);
                 self.unanswered_slots = self.unanswered_slots.saturating_sub(1);
+                self.pending_admissions = self.pending_admissions.saturating_sub(1);
             }
             SlotState::ReleasePending(f) => {
                 let op = f.operation;
@@ -1813,11 +1889,26 @@ impl Owner {
         self.last_step_may_unblock_work
     }
 
-    /// Target session of an inline-claimed admission whose resolution may have
-    /// left ready work to re-arm.
+    /// First target session of an inline-claimed admission whose resolution may
+    /// have left ready work to re-arm.
     #[must_use]
     pub fn last_inline_ready_target(&self) -> Option<SessionId> {
         self.last_inline_ready_target
+    }
+
+    /// Additional target sessions (beyond [`Self::last_inline_ready_target`])
+    /// from a multi-target admission whose resolution may have left ready work.
+    #[must_use]
+    pub fn last_inline_ready_extra(&self) -> &[SessionId] {
+        &self.last_inline_ready_extra
+    }
+
+    fn push_inline_ready_target(&mut self, session: SessionId) {
+        if self.last_inline_ready_target.is_none() {
+            self.last_inline_ready_target = Some(session);
+        } else {
+            self.last_inline_ready_extra.push(session);
+        }
     }
 
     /// Whether the owner's effect outbox is currently empty.
@@ -1864,6 +1955,9 @@ impl Owner {
         self.last_observed_puback_ignored = false;
         self.last_step_may_unblock_work = true;
         self.last_inline_ready_target = None;
+        if !self.last_inline_ready_extra.is_empty() {
+            self.last_inline_ready_extra.clear();
+        }
         let planned_work = self.cost(&input);
         if let Some(missing) = planned_work.checked_sub(grant.work_limit)
             && missing > WorkUnits::ZERO
@@ -2828,7 +2922,7 @@ impl Owner {
             },
             targets: list,
         };
-        let mut inline_claim_plan: Option<InlineClaimPlan> = None;
+        let mut inline_claims = InlineClaimPlans::None;
         let mut dirty_targets: Option<alloc::boxed::Box<[SessionId]>> = None;
         let recipe = if *retain || expiry.is_some() {
             let retain_targets = if *retain {
@@ -2844,6 +2938,13 @@ impl Owner {
                 admission,
                 retain_targets,
             };
+            if targets > 0 {
+                let mut vec = alloc::vec::Vec::with_capacity(targets);
+                for target in selected.iter() {
+                    vec.push(target.session);
+                }
+                dirty_targets = Some(vec.into_boxed_slice());
+            }
             if let Some(expiry) = expiry {
                 Recipe::ExpiringPublication(crate::contract::command::ExpiringPublication {
                     admission: crate::contract::command::ExpiringAdmission::Qos12(retained),
@@ -2856,7 +2957,8 @@ impl Owner {
             && let Some(only) = selected.iter().next().copied()
             && let Some((target_gen, out_packet_id)) = self.plan_inline_claim(only, length)
         {
-            inline_claim_plan = Some(InlineClaimPlan {
+            inline_claims = InlineClaimPlans::One(InlineClaimPlan {
+                target_index: 0,
                 target: only.session,
                 target_revision: only.revision,
                 qos: only.qos,
@@ -2870,16 +2972,78 @@ impl Owner {
                     packet_id: out_packet_id,
                 },
             })
+        } else if selected.len() > 1 && self.inline_claims_globally_allowed() {
+            let mut remaining_slots = self
+                .pubsub
+                .deliveries
+                .capacity()
+                .saturating_sub(self.pubsub.deliveries.len());
+            let mut running_bytes = self.pubsub.deliveries.loaded_bytes();
+            let mut plans = alloc::vec::Vec::with_capacity(selected.len());
+            let mut unclaimed = alloc::vec::Vec::new();
+            for (idx, target) in selected.iter().enumerate() {
+                if let Ok(target_index) = u16::try_from(idx)
+                    && remaining_slots > 0
+                    && running_bytes
+                        .checked_add(length)
+                        .is_some_and(|total| total <= self.pubsub.payload_limit())
+                    && let Some((target_gen, out_packet_id)) =
+                        self.plan_inline_claim_target(*target)
+                {
+                    remaining_slots -= 1;
+                    running_bytes = running_bytes.saturating_add(length);
+                    plans.push(InlineClaimPlan {
+                        target_index,
+                        target: target.session,
+                        target_revision: target.revision,
+                        qos: target.qos,
+                        packet_id: out_packet_id,
+                        generation: target_gen,
+                    });
+                } else {
+                    unclaimed.push(target.session);
+                }
+            }
+            if !unclaimed.is_empty() {
+                dirty_targets = Some(unclaimed.into_boxed_slice());
+            }
+            match plans.len() {
+                0 => Recipe::AdmitPublication(admission),
+                1 => {
+                    let only = plans[0];
+                    inline_claims = InlineClaimPlans::One(only);
+                    Recipe::ClaimedPublication(ClaimedPublication {
+                        admission,
+                        claim: InlineClaim {
+                            target_index: only.target_index,
+                            packet_id: only.packet_id,
+                        },
+                    })
+                }
+                count => {
+                    let mut claims = BoundedVec::with_capacity(count)?;
+                    for plan in &plans {
+                        claims
+                            .try_push(InlineClaim {
+                                target_index: plan.target_index,
+                                packet_id: plan.packet_id,
+                            })
+                            .map_err(|_| IMPOSSIBLE)?;
+                    }
+                    inline_claims = InlineClaimPlans::Many(plans);
+                    Recipe::MultiClaimedPublication(MultiClaimedPublication { admission, claims })
+                }
+            }
         } else {
+            if targets > 0 {
+                let mut vec = alloc::vec::Vec::with_capacity(targets);
+                for target in selected.iter() {
+                    vec.push(target.session);
+                }
+                dirty_targets = Some(vec.into_boxed_slice());
+            }
             Recipe::AdmitPublication(admission)
         };
-        if self.inline_claim_enabled && inline_claim_plan.is_none() && targets > 0 {
-            let mut vec = alloc::vec::Vec::with_capacity(targets);
-            for target in selected.iter() {
-                vec.push(target.session);
-            }
-            dirty_targets = Some(vec.into_boxed_slice());
-        }
         let recipe = if let Some(props) = properties {
             Recipe::AnnotatedPublication(crate::contract::command::AnnotatedPublication {
                 inner: alloc::boxed::Box::new(recipe),
@@ -2899,7 +3063,7 @@ impl Owner {
             unmatched: targets == 0,
             cost,
             in_flight,
-            inline_claim: inline_claim_plan,
+            inline_claims,
             dirty_targets,
         })
     }
@@ -3780,12 +3944,16 @@ impl Owner {
             self.apply_release(released)?;
         }
         self.apply_change(change, input)?;
+        let has_non_inline = non_inline_resolved
+            .as_ref()
+            .is_some_and(|(op, _)| self.non_inline_targets_by_op.contains_key(op));
         if let Some(outcome) = inline_outcome {
-            self.apply_inline_claim_outcome(outcome)?;
+            self.apply_inline_claim_outcome(outcome, has_non_inline)?;
         }
         if let Some((operation, committed)) = non_inline_resolved
-            && let Some(targets) = self.non_inline_targets_by_op.remove(&operation)
+            && let Some((publication, targets)) = self.non_inline_targets_by_op.remove(&operation)
         {
+            self.pubsub.pending_non_inline_pubs.remove(&publication);
             for target in targets {
                 if let Some(count) = self.pubsub.non_inline_by_session.get_mut(&target) {
                     *count = count.saturating_sub(1);
@@ -3795,6 +3963,8 @@ impl Owner {
                 }
                 if committed {
                     self.mark_session_dirty(target, true);
+                    self.push_inline_ready_target(target);
+                    self.last_step_may_unblock_work = true;
                 }
             }
         }
@@ -3889,7 +4059,7 @@ impl Owner {
                 unmatched,
                 cost,
                 in_flight,
-                inline_claim,
+                inline_claims,
                 dirty_targets,
             } => {
                 // The plan checked the account and the table.
@@ -3910,7 +4080,7 @@ impl Owner {
                     retired: false,
                 };
                 self.push_slot(slot)?;
-                if let Some(plan) = inline_claim {
+                if !inline_claims.is_empty() {
                     let Input::Packet {
                         packet:
                             InboundPacket::Publish {
@@ -3924,15 +4094,33 @@ impl Owner {
                     else {
                         return Err(STALE);
                     };
-                    self.apply_inline_claim_insert(
-                        op,
-                        publication,
-                        plan,
-                        topic,
-                        payload,
-                        properties,
-                    )?;
-                } else if let Some(dirty_targets) = dirty_targets {
+                    match inline_claims {
+                        InlineClaimPlans::None => {}
+                        InlineClaimPlans::One(plan) => {
+                            self.apply_inline_claim_insert(
+                                op,
+                                publication,
+                                plan,
+                                topic,
+                                payload,
+                                properties,
+                            )?;
+                        }
+                        InlineClaimPlans::Many(plans) => {
+                            for plan in plans {
+                                self.apply_inline_claim_insert(
+                                    op,
+                                    publication,
+                                    plan,
+                                    topic.clone(),
+                                    payload.clone(),
+                                    properties.clone(),
+                                )?;
+                            }
+                        }
+                    }
+                }
+                if let Some(dirty_targets) = dirty_targets {
                     let dirty_targets = dirty_targets.into_vec();
                     for &target in &dirty_targets {
                         *self
@@ -3941,7 +4129,9 @@ impl Owner {
                             .get_or_insert_default(target) += 1;
                         self.mark_session_dirty(target, false);
                     }
-                    self.non_inline_targets_by_op.insert(op, dirty_targets);
+                    self.pubsub.pending_non_inline_pubs.insert(publication);
+                    self.non_inline_targets_by_op
+                        .insert(op, (publication, dirty_targets));
                 }
             }
             Change::Committed { slot, admission } => {
@@ -4822,7 +5012,7 @@ mod tests {
         }
 
         fn step(&mut self, input: Input) -> StepOutcome {
-            self.owner.step(input, GRANT)
+            self.owner.step_checked(input, GRANT)
         }
 
         fn applied(&mut self, input: Input) {
@@ -4892,6 +5082,13 @@ mod tests {
                     }
                 }
                 Recipe::ClaimedPublication(claimed) => {
+                    assert!(command.payload.is_some());
+                    CommitFacts::PublicationAdmitted {
+                        publication: claimed.admission.publication,
+                        exchange: claimed.admission.source.exchange,
+                    }
+                }
+                Recipe::MultiClaimedPublication(claimed) => {
                     assert!(command.payload.is_some());
                     CommitFacts::PublicationAdmitted {
                         publication: claimed.admission.publication,

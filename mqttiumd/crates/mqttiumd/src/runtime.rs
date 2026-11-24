@@ -775,6 +775,11 @@ struct Runtime<'a> {
     scratch_progress: Vec<net::WireProgress>,
     last_peer_deadline_scan: Instant,
     inputs: VecDeque<Input>,
+    /// FIFO lane for credit-releasing subscriber acknowledgements
+    /// (`ObservedPuback` / `ObservedQos2Ack`), drained ahead of new inbound
+    /// `PUBLISH` packets so fan-in subscribers release Receive Maximum slots
+    /// and store references before new admissions overflow the inline window.
+    ack_inputs: VecDeque<Input>,
     control_inputs: VecDeque<Input>,
     closing_inputs: VecDeque<Input>,
     terminal_inputs: VecDeque<Input>,
@@ -799,6 +804,11 @@ struct Runtime<'a> {
     credit_progress: Instant,
     timers: BTreeMap<DeadlineToken, Instant>,
     inflight: ScopedFlatMap<EffectId, OperationId>,
+    /// Subset of `inflight` ordinary-lane commands that depend on or mutate
+    /// `route_revision` or target session presence; control-lane lifecycle and
+    /// Will admissions wait for this set to drain so they never overtake and
+    /// invalidate in-flight admissions of unrelated clients.
+    inflight_route_ops: ScopedFlatMap<EffectId, ()>,
     lifecycle_inflight: BTreeMap<EffectId, OperationId>,
     last_session_change: Option<OperationId>,
     session_cardinality_dirty: bool,
@@ -956,6 +966,7 @@ impl Runtime<'_> {
             }
             if !cfg!(any(test, feature = "test-hooks"))
                 && now.domain == self.clock_anchor.reading.domain
+                && !self.owner.has_expiring_messages()
                 && self.writer.skip_empty_message_expiry_sweep()
             {
                 self.message_expiry_scan = now_instant;
@@ -1119,6 +1130,9 @@ impl Runtime<'_> {
         let _wakes = net::hold_wakes();
         let now = Instant::now();
         self.writer_results()?;
+        if !self.owner.outbox_is_empty() {
+            self.dispatch()?;
+        }
         self.connections_at(now)?;
         self.discover_work_at(now);
         self.drain_pending_work();
@@ -1319,7 +1333,14 @@ impl Runtime<'_> {
         } else if self.ordinary_room() == 0 {
             return Err(Failure::plain("core_input_budget"));
         }
-        self.inputs.push_back(input);
+        if matches!(
+            input,
+            Input::ObservedPuback { .. } | Input::ObservedQos2Ack { .. }
+        ) {
+            self.ack_inputs.push_back(input);
+        } else {
+            self.inputs.push_back(input);
+        }
         Ok(())
     }
     /// Whether a business packet of this connection must wait with its
@@ -1478,7 +1499,7 @@ impl Runtime<'_> {
     fn ordinary_room(&self) -> usize {
         ordinary_room(
             &self.inputs,
-            self.deferred_inputs.len() + self.will_connects.len(),
+            self.deferred_inputs.len() + self.will_connects.len() + self.ack_inputs.len(),
             self.limits.ordinary_inputs,
         )
     }
@@ -1761,6 +1782,7 @@ impl Runtime<'_> {
                             && session.detached.is_some())
                 })
                 && self.inputs.is_empty()
+                && self.ack_inputs.is_empty()
                 && self.deferred_inputs.is_empty()
                 && self.control_inputs.is_empty()
                 && self.clock_checkpoint.is_none()
@@ -2071,6 +2093,7 @@ impl Runtime<'_> {
         if self
             .inputs
             .iter()
+            .chain(self.ack_inputs.iter())
             .chain(self.deferred_inputs.iter())
             .any(|older| input_connection(older) == Some(generation))
         {
@@ -2112,6 +2135,7 @@ impl Runtime<'_> {
         // Clock observations support actual work; an empty or blocked ready
         // set must not manufacture owner transitions on every reactor poll.
         if !(self.inputs.is_empty()
+            && self.ack_inputs.is_empty()
             && self.control_inputs.is_empty()
             && self.closing_inputs.is_empty()
             && self.terminal_inputs.is_empty()
@@ -2147,6 +2171,7 @@ impl Runtime<'_> {
         let mut terminal_budget = self.terminal_inputs.len().min(self.limits.pass_facts);
         let mut expiry_budget = self.expiry_inputs.len().min(4);
         let mut step_budget = (self.inputs.len()
+            + self.ack_inputs.len()
             + self.control_inputs.len()
             + closing_budget
             + terminal_budget
@@ -2202,6 +2227,7 @@ impl Runtime<'_> {
                         }
                     })
                     .or_else(|| self.message_expiry_input.take())
+                    .or_else(|| self.ack_inputs.pop_front())
                     .or_else(|| {
                         let popped = self.inputs.pop_front()?;
                         if let Input::WorkAvailable { session } = &popped {
@@ -2708,6 +2734,7 @@ impl Runtime<'_> {
                         peers: &mut self.peers,
                         events: &self.events,
                         inflight: &mut self.inflight,
+                        inflight_route_ops: &mut self.inflight_route_ops,
                         lifecycle_inflight: &mut self.lifecycle_inflight,
                         lifecycle_operation: None,
                         will_operation: None,
@@ -2727,7 +2754,9 @@ impl Runtime<'_> {
                         queued_work_sessions: &mut self.queued_work_sessions,
                         terminal_inputs: &mut self.terminal_inputs,
                         terminal_effects: &mut self.terminal_effects,
-                        ordinary_reserved: self.deferred_inputs.len() + self.will_connects.len(),
+                        ordinary_reserved: self.deferred_inputs.len()
+                            + self.will_connects.len()
+                            + self.ack_inputs.len(),
                         queued_writer_replies: None,
                         frames: &mut self.frames,
                         outgoing_bindings: &mut self.outgoing_bindings,
@@ -2903,6 +2932,10 @@ impl Runtime<'_> {
                             other if self.maintenance_input(&other) => {
                                 self.control_inputs.push_back(other)
                             }
+                            other @ (Input::ObservedPuback { .. }
+                            | Input::ObservedQos2Ack { .. }) => {
+                                self.ack_inputs.push_back(other);
+                            }
                             other => {
                                 if let Input::WorkAvailable { session } = &other {
                                     self.queued_work_sessions.insert(*session);
@@ -3042,8 +3075,15 @@ impl Runtime<'_> {
                 if applied && self.owner.last_step_may_unblock_work() {
                     if let Some((session, initial)) = ready_work {
                         self.rearm_ready_work(session, initial);
-                    } else if let Some(target) = self.owner.last_inline_ready_target() {
-                        self.rearm_ready_work(target, false);
+                    } else if let Some(first) = self.owner.last_inline_ready_target() {
+                        self.rearm_ready_work(first, false);
+                        if !self.owner.last_inline_ready_extra().is_empty() {
+                            let extra: Vec<SessionId> =
+                                self.owner.last_inline_ready_extra().to_vec();
+                            for target in extra {
+                                self.rearm_ready_work(target, false);
+                            }
+                        }
                     }
                 }
                 if applied && self.inputs.len() > inputs_before_dispatch {
@@ -3058,11 +3098,13 @@ impl Runtime<'_> {
                     .retain(|token, _| self.owner.deadline_is_live(*token));
             }
             self.dispatch()?;
+            self.drain_pending_work();
             if !self.writer.is_direct() || self.progress == progress_before_pass {
                 break;
             }
             self.writer_results()?;
             let extra = self.inputs.len()
+                + self.ack_inputs.len()
                 + self.control_inputs.len()
                 + self.closing_inputs.len().min(self.limits.pass_facts)
                 + self.terminal_inputs.len().min(self.limits.pass_facts)
@@ -3223,6 +3265,7 @@ impl Runtime<'_> {
             peers: &mut self.peers,
             events: &self.events,
             inflight: &mut self.inflight,
+            inflight_route_ops: &mut self.inflight_route_ops,
             lifecycle_inflight: &mut self.lifecycle_inflight,
             lifecycle_operation: self.owner.lifecycle_dispatch().map(|(op, _)| op),
             will_operation: self.owner.will_dispatch().map(|(op, _)| op),
@@ -3242,7 +3285,9 @@ impl Runtime<'_> {
             queued_work_sessions: &mut self.queued_work_sessions,
             terminal_inputs: &mut self.terminal_inputs,
             terminal_effects: &mut self.terminal_effects,
-            ordinary_reserved: self.deferred_inputs.len() + self.will_connects.len(),
+            ordinary_reserved: self.deferred_inputs.len()
+                + self.will_connects.len()
+                + self.ack_inputs.len(),
             queued_writer_replies: None,
             frames: &mut self.frames,
             outgoing_bindings: &mut self.outgoing_bindings,
@@ -3530,6 +3575,7 @@ impl Runtime<'_> {
                     if self.inflight.remove(&effect) != Some(operation) {
                         return Err(Failure::plain("uncorrelated_store_result"));
                     }
+                    self.inflight_route_ops.remove(&effect);
                     #[cfg(feature = "test-hooks")]
                     if matches!(
                         reply,
@@ -3609,7 +3655,8 @@ impl Runtime<'_> {
                     }
                     #[cfg(feature = "test-hooks")]
                     for item in page.items.as_slice() {
-                        if self.work_cache.len() >= 128
+                        if self.work_cache.len()
+                            >= crate::writer::SESSIONS * crate::receiving::MAXIMUM
                             && !self.work_cache.contains_key(&item.delivery)
                         {
                             return Err(Failure::plain("work_cache_budget"));
@@ -3723,6 +3770,25 @@ impl Runtime<'_> {
         }
         #[cfg(feature = "test-hooks")]
         if MUTANT_NOTIFICATIONS_ONLY {
+            return;
+        }
+        // Work notifications are lossless: `queue_work` retains sessions in
+        // `pending_work` whenever the ordinary input lane is full and
+        // `drain_pending_work` re-enqueues them as soon as space opens. Only
+        // keep the 100 ms full-session rescan when the test hook deliberately
+        // drops work notifications.
+        #[cfg(not(feature = "test-hooks"))]
+        let rescan_all = false;
+        #[cfg(feature = "test-hooks")]
+        let rescan_all = self
+            .hooks
+            .directory
+            .as_ref()
+            .is_some_and(|d| d.join("drop-work-notifications").exists());
+        if !self.pending_work.is_empty() {
+            self.drain_pending_work();
+        }
+        if !rescan_all {
             return;
         }
         if now.saturating_duration_since(self.last_work_scan) < Duration::from_millis(100) {
@@ -4584,13 +4650,21 @@ impl Runtime<'_> {
                 keys.dedup();
             }
         }
+        let active_peer_count = keys.len();
+        let max_non_ack_per_peer = if active_peer_count > 16 {
+            (512 / active_peer_count).clamp(16, 32)
+        } else {
+            32
+        };
+        let mut cursor_start = 0usize;
         if !keys.is_empty() {
-            let start = self.peer_cursor % keys.len();
-            keys.rotate_left(start);
-            self.peer_cursor = start + 1;
+            cursor_start = self.peer_cursor % keys.len();
+            keys.rotate_left(cursor_start);
+            self.peer_cursor = cursor_start + 1;
         }
+        let mut starved_offset: Option<usize> = None;
         let result = (|| -> Result<(), Failure> {
-            for &generation in &keys {
+            for (peer_offset, &generation) in keys.iter().enumerate() {
                 let (
                     active,
                     needs_deadline_check,
@@ -4700,97 +4774,155 @@ impl Runtime<'_> {
                             .get(&generation)
                             .is_some_and(|p| p.connected && !p.pending && p.cold.is_none());
                     if steady_fast {
-                        let max_drain = 32.min(self.ordinary_room().saturating_sub(1));
+                        // Cap non-ACK ingress packets at 32 per peer per turn so
+                        // one publisher cannot monopolize the lane, while allowing
+                        // credit-releasing ACKs (PUBACK/PUBREC/PUBREL/PUBCOMP) to
+                        // drain up to 256 per turn so a fan-in subscriber keeps up
+                        // with many publishers inside one group commit.
                         let mut batch = std::mem::take(&mut self.scratch_incoming);
                         batch.clear();
-                        let status = match self.peers.get(&generation) {
-                            Some(p) if p.io.has_pending_incoming() => {
-                                p.io.drain_incoming(&mut batch, max_drain)
-                            }
-                            Some(_) => net::DrainStatus::Empty,
-                            None => net::DrainStatus::Empty,
-                        };
                         let mut hit_terminal = false;
-                        while let Some(incoming) = batch.pop_front() {
-                            self.progress = self.progress.wrapping_add(1);
-                            if self.ordinary_room() < 2 {
-                                batch.push_front(incoming);
+                        let mut status = net::DrainStatus::Empty;
+                        let mut total_drained = 0usize;
+                        let mut non_ack_drained = 0usize;
+                        let mut saw_ack = false;
+                        let max_non_ack = max_non_ack_per_peer;
+                        const MAX_TOTAL_FAST: usize = 256;
+                        loop {
+                            let room = self.ordinary_room().saturating_sub(1);
+                            if room == 0 {
+                                starved_offset.get_or_insert(peer_offset);
                                 break;
                             }
-                            let business_waits = self.business_waits(generation);
-                            let (stop, peer_pending, has_deferred) =
-                                match self.peers.get(&generation) {
-                                    Some(p) => {
-                                        let c = p.cold.as_deref();
-                                        (
-                                            c.is_some_and(|c| {
-                                                c.closing.is_some() || c.requests.is_some()
-                                            }),
-                                            p.pending,
-                                            c.is_some_and(|c| c.deferred_publish.is_some()),
-                                        )
-                                    }
-                                    None => (true, false, false),
-                                };
-                            if stop {
-                                batch.push_front(incoming);
+                            if total_drained >= MAX_TOTAL_FAST || non_ack_drained >= max_non_ack {
                                 break;
                             }
-                            match incoming {
-                                net::Incoming::Authenticated { elapsed } => {
-                                    self.events.emit("tls_authenticated", json!({"connection":generation.get().to_string(),
-                                        "details":{"version":"TLS1.3","handshake_us":elapsed.as_micros() as u64}}))
-                                        .map_err(event_failure)?;
+                            let cap = if saw_ack {
+                                32
+                            } else {
+                                (max_non_ack - non_ack_drained).min(32)
+                            };
+                            let chunk = cap.min(room).min(MAX_TOTAL_FAST - total_drained);
+                            status = match self.peers.get(&generation) {
+                                Some(p) if p.io.has_pending_incoming() => {
+                                    p.io.drain_incoming(&mut batch, chunk)
                                 }
-                                net::Incoming::Packet {
-                                    first,
-                                    body,
-                                    observed,
-                                } => {
-                                    if first >> 4 != 14 && peer_pending {
-                                        if let Some(peer) = self.peers.get_mut(&generation) {
-                                            peer.cold_mut().held_packet =
-                                                Some((first, body, observed));
+                                Some(_) => net::DrainStatus::Empty,
+                                None => net::DrainStatus::Empty,
+                            };
+                            if batch.is_empty() {
+                                break;
+                            }
+                            let mut stopped_early = false;
+                            while let Some(incoming) = batch.pop_front() {
+                                self.progress = self.progress.wrapping_add(1);
+                                if self.ordinary_room() < 2 {
+                                    starved_offset.get_or_insert(peer_offset);
+                                    batch.push_front(incoming);
+                                    stopped_early = true;
+                                    break;
+                                }
+                                if let net::Incoming::Packet { first, .. } = &incoming
+                                    && !matches!(first >> 4, 4..=7)
+                                    && non_ack_drained >= max_non_ack
+                                {
+                                    batch.push_front(incoming);
+                                    stopped_early = true;
+                                    break;
+                                }
+                                let business_waits = self.business_waits(generation);
+                                let (stop, peer_pending, has_deferred) =
+                                    match self.peers.get(&generation) {
+                                        Some(p) => {
+                                            let c = p.cold.as_deref();
+                                            (
+                                                c.is_some_and(|c| {
+                                                    c.closing.is_some() || c.requests.is_some()
+                                                }),
+                                                p.pending,
+                                                c.is_some_and(|c| c.deferred_publish.is_some()),
+                                            )
                                         }
-                                        break;
+                                        None => (true, false, false),
+                                    };
+                                if stop {
+                                    batch.push_front(incoming);
+                                    stopped_early = true;
+                                    break;
+                                }
+                                total_drained += 1;
+                                match incoming {
+                                    net::Incoming::Authenticated { elapsed } => {
+                                        non_ack_drained += 1;
+                                        self.events.emit("tls_authenticated", json!({"connection":generation.get().to_string(),
+                                            "details":{"version":"TLS1.3","handshake_us":elapsed.as_micros() as u64}}))
+                                            .map_err(event_failure)?;
                                     }
-                                    if has_deferred
-                                        && let Some(peer) = self.peers.get_mut(&generation)
-                                        && !peer.overtakes_deferred(first, &body)
-                                    {
-                                        match peer.keep_behind((first, body, observed)) {
-                                            Ok(()) => continue,
-                                            Err(packet) => {
-                                                peer.cold_mut().held_packet = Some(packet);
-                                                break;
+                                    net::Incoming::Packet {
+                                        first,
+                                        body,
+                                        observed,
+                                    } => {
+                                        if matches!(first >> 4, 4..=7) {
+                                            saw_ack = true;
+                                        } else {
+                                            non_ack_drained += 1;
+                                        }
+                                        if first >> 4 != 14 && peer_pending {
+                                            if let Some(peer) = self.peers.get_mut(&generation) {
+                                                peer.cold_mut().held_packet =
+                                                    Some((first, body, observed));
+                                            }
+                                            stopped_early = true;
+                                            break;
+                                        }
+                                        if has_deferred
+                                            && let Some(peer) = self.peers.get_mut(&generation)
+                                            && !peer.overtakes_deferred(first, &body)
+                                        {
+                                            match peer.keep_behind((first, body, observed)) {
+                                                Ok(()) => continue,
+                                                Err(packet) => {
+                                                    peer.cold_mut().held_packet = Some(packet);
+                                                    stopped_early = true;
+                                                    break;
+                                                }
                                             }
                                         }
+                                        if business_waits
+                                            && business_header(first)
+                                            && let Some(peer) = self.peers.get_mut(&generation)
+                                        {
+                                            peer.cold_mut().held_packet =
+                                                Some((first, body, observed));
+                                            stopped_early = true;
+                                            break;
+                                        }
+                                        self.packet_at(generation, first, body, observed)?;
                                     }
-                                    if business_waits
-                                        && business_header(first)
-                                        && let Some(peer) = self.peers.get_mut(&generation)
-                                    {
-                                        peer.cold_mut().held_packet = Some((first, body, observed));
+                                    net::Incoming::Refused { code } => {
+                                        hit_terminal = true;
+                                        self.header_refused(generation, code)?;
+                                        stopped_early = true;
                                         break;
                                     }
-                                    self.packet_at(generation, first, body, observed)?;
-                                }
-                                net::Incoming::Refused { code } => {
-                                    hit_terminal = true;
-                                    self.header_refused(generation, code)?;
-                                    break;
-                                }
-                                net::Incoming::Closed { code } => {
-                                    hit_terminal = true;
-                                    if tls {
-                                        input_ended = true;
-                                        tls_close = Some(code);
+                                    net::Incoming::Closed { code } => {
+                                        hit_terminal = true;
+                                        if tls {
+                                            input_ended = true;
+                                            tls_close = Some(code);
+                                            stopped_early = true;
+                                            break;
+                                        }
+                                        self.drain_inputs()?;
+                                        self.close(generation, code)?;
+                                        stopped_early = true;
                                         break;
                                     }
-                                    self.drain_inputs()?;
-                                    self.close(generation, code)?;
-                                    break;
                                 }
+                            }
+                            if stopped_early || status != net::DrainStatus::More {
+                                break;
                             }
                         }
                         if !batch.is_empty() {
@@ -4825,10 +4957,14 @@ impl Runtime<'_> {
                     } else {
                         let mut one = std::mem::take(&mut self.scratch_incoming);
                         one.clear();
-                        for _ in 0..32 {
+                        for _ in 0..max_non_ack_per_peer {
                             // A CONNECT can use one slot now and reserve one for Open.
                             // Leave the bytes with their socket reader until both fit.
-                            if backpressured || self.ordinary_room() < 2 {
+                            if backpressured {
+                                break;
+                            }
+                            if self.ordinary_room() < 2 {
+                                starved_offset.get_or_insert(peer_offset);
                                 break;
                             }
                             let business_waits = self.business_waits(generation);
@@ -5125,6 +5261,9 @@ impl Runtime<'_> {
             }
             Ok(())
         })();
+        if let Some(offset) = starved_offset {
+            self.peer_cursor = cursor_start.wrapping_add(offset);
+        }
         self.peer_keys = keys;
         result?;
         // Accepted frames whose socket closed still receive terminal failure; commits are separate.
@@ -5546,7 +5685,8 @@ impl Runtime<'_> {
                     continue;
                 }
                 for item in page.items.as_slice() {
-                    if self.work_cache.len() >= 128 && !self.work_cache.contains_key(&item.delivery)
+                    if self.work_cache.len() >= crate::writer::SESSIONS * crate::receiving::MAXIMUM
+                        && !self.work_cache.contains_key(&item.delivery)
                     {
                         return Err(Failure::plain("work_cache_budget"));
                     }
@@ -5740,6 +5880,7 @@ struct Sink<'a, 'b> {
     peers: &'a mut PeerTable,
     events: &'a Events,
     inflight: &'a mut ScopedFlatMap<EffectId, OperationId>,
+    inflight_route_ops: &'a mut ScopedFlatMap<EffectId, ()>,
     lifecycle_inflight: &'a mut BTreeMap<EffectId, OperationId>,
     lifecycle_operation: Option<OperationId>,
     will_operation: Option<OperationId>,
@@ -5794,6 +5935,22 @@ impl Sink<'_, '_> {
         queued + pending < WRITER_INPUTS
     }
 }
+fn recipe_touches_routes(recipe: &Recipe) -> bool {
+    match recipe {
+        Recipe::AnnotatedPublication(value) => recipe_touches_routes(value.inner.as_ref()),
+        Recipe::AdmitPublication(_)
+        | Recipe::ClaimedPublication(_)
+        | Recipe::MultiClaimedPublication(_)
+        | Recipe::RetainedPublication(_)
+        | Recipe::RetainedQos0(_)
+        | Recipe::ExpiringPublication(_)
+        | Recipe::UpdateSubscriptions(_)
+        | Recipe::ReplaySubscriptions(_)
+        | Recipe::TimedReplaySubscriptions(_) => true,
+        _ => false,
+    }
+}
+
 impl Sink<'_, '_> {
     fn submit_lifecycle(&mut self, effect: OwnedEffect) -> SubmitResult {
         if self.lifecycle_inflight.len() >= LIFECYCLE_IN_FLIGHT {
@@ -6122,6 +6279,37 @@ impl EffectSink for Sink<'_, '_> {
                     Recipe::SessionLifecycle(_) | Recipe::WillPublication(_)
                 ) =>
             {
+                let conflicts_with_route_ops = match command.recipe.get() {
+                    Recipe::WillPublication(_) => true,
+                    Recipe::SessionLifecycle(lifecycle) => matches!(
+                        &lifecycle.action,
+                        SessionAction::Close { .. }
+                            | SessionAction::EndWill {
+                                expiry: SessionExpiry::OnDisconnect,
+                                ..
+                            }
+                            | SessionAction::Expire { .. }
+                            | SessionAction::Open {
+                                expected: Some(_),
+                                clean_start: true,
+                                ..
+                            }
+                            | SessionAction::OpenAt {
+                                expected: Some(_),
+                                clean_start: true,
+                                ..
+                            }
+                            | SessionAction::OpenWillAt {
+                                expected: Some(_),
+                                clean_start: true,
+                                ..
+                            }
+                    ),
+                    _ => false,
+                };
+                if conflicts_with_route_ops && !self.inflight_route_ops.is_empty() {
+                    return refused(effect, SubmitBlock::QueueFull);
+                }
                 if let Recipe::SessionLifecycle(lifecycle) = command.recipe.get()
                     && let SessionAction::Open {
                         expected: Some(guard),
@@ -6290,9 +6478,13 @@ impl EffectSink for Sink<'_, '_> {
                     }
                     return SubmitResult::Accepted;
                 }
+                let touches_routes = recipe_touches_routes(command.recipe.get());
                 match self.writer.try_send(Request::Effect(effect)) {
                     Ok(()) => {
                         self.inflight.insert(id, operation_id);
+                        if touches_routes {
+                            self.inflight_route_ops.insert(id, ());
+                        }
                         #[cfg(feature = "test-hooks")]
                         if let Some(input) = early_finish {
                             self.inputs.push_back(input);
@@ -7436,6 +7628,7 @@ fn run_inner(
         scratch_progress: Vec::new(),
         last_peer_deadline_scan: Instant::now(),
         inputs: VecDeque::new(),
+        ack_inputs: VecDeque::new(),
         control_inputs: VecDeque::new(),
         closing_inputs: VecDeque::new(),
         terminal_inputs: VecDeque::new(),
@@ -7447,6 +7640,7 @@ fn run_inner(
         credit_progress: Instant::now(),
         timers: BTreeMap::new(),
         inflight: ScopedFlatMap::new(),
+        inflight_route_ops: ScopedFlatMap::new(),
         lifecycle_inflight: BTreeMap::new(),
         last_session_change: None,
         session_cardinality_dirty: false,

@@ -159,6 +159,7 @@ pub enum WorkKind {
     ReplaySubscriptions,
     AdmitPublication,
     ClaimedPublication,
+    MultiClaimedPublication,
     ReleaseInbound,
     ChangeSubscriptions,
     ClaimDelivery,
@@ -187,6 +188,7 @@ impl WorkKind {
             Self::ReplaySubscriptions => "ReplaySubscriptions",
             Self::AdmitPublication => "AdmitPublication",
             Self::ClaimedPublication => "ClaimedPublication",
+            Self::MultiClaimedPublication => "MultiClaimedPublication",
             Self::ReleaseInbound => "ReleaseInbound",
             Self::ChangeSubscriptions => "ChangeSubscriptions",
             Self::ClaimDelivery => "ClaimDelivery",
@@ -602,6 +604,14 @@ fn describe(work: &Work) -> (WorkKind, Option<OperationId>, Source) {
             ),
             Recipe::ClaimedPublication(claimed) => (
                 WorkKind::ClaimedPublication,
+                Some(claimed.admission.operation),
+                Some((
+                    claimed.admission.source.session,
+                    claimed.admission.source.packet_id,
+                )),
+            ),
+            Recipe::MultiClaimedPublication(claimed) => (
+                WorkKind::MultiClaimedPublication,
                 Some(claimed.admission.operation),
                 Some((
                     claimed.admission.source.session,

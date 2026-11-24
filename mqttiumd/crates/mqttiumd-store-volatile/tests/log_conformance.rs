@@ -606,6 +606,205 @@ fn claimed_publication_matches_sqlite_and_recovers_after_crash() {
 }
 
 #[test]
+fn multi_claimed_publication_matches_sqlite_and_recovers_after_crash() {
+    use mqttiumd_contract::capacity::{BoundedVec, ExchangeSlots, References};
+    use mqttiumd_contract::command::{
+        ClaimDelivery, FinishDelivery, InlineClaim, MultiClaimedPublication,
+    };
+
+    let dir = temp_dir("multi-claimed-pub");
+    let log_path = dir.join("log.sqlite");
+    let sql_path = dir.join("sql.sqlite");
+    let mut limits = fixture_limits();
+    limits.exchange_slots = ExchangeSlots::new(16);
+    limits.references = References::new(16);
+
+    let mut log_world = World::with_limits(
+        &|incarnation, lim| {
+            let mut s = LogStore::open_or_create(&log_path, incarnation, lim, None, false)
+                .expect("log store");
+            s.set_checkpoint_bytes(64 * 1024 * 1024);
+            s
+        },
+        limits,
+    );
+    let mut sql_world = World::with_limits(
+        &|incarnation, lim| SqliteStore::create(&sql_path, incarnation, lim).expect("sqlite store"),
+        limits,
+    );
+    // Open two extra active subscriber sessions (c and d) on both stores so we test 1:3 fan-out
+    // with partial claiming (claim b and d inline, leave c unclaimed as an ordinary obligation).
+    let open_pair = |log_w: &mut World<LogStore>, sql_w: &mut World<SqliteStore>, name: &[u8]| {
+        let cmd = AdminCommand::CreateSession {
+            client_id: name.to_vec(),
+        };
+        let mqttiumd_store_api::AdminDone::SessionCreated { session: s_log, .. } =
+            log_w.store.admin(cmd.clone()).expect("open log")
+        else {
+            panic!("expected SessionCreated");
+        };
+        let mqttiumd_store_api::AdminDone::SessionCreated { session: s_sql, .. } =
+            sql_w.store.admin(cmd).expect("open sql")
+        else {
+            panic!("expected SessionCreated");
+        };
+        assert_eq!(s_log, s_sql);
+        s_log
+    };
+    let sub_c = open_pair(&mut log_world, &mut sql_world, b"sub-c");
+    let sub_d = open_pair(&mut log_world, &mut sql_world, b"sub-d");
+
+    let make_multi =
+        |world: &World<LogStore>, seq: u64, in_pi: u16, claims: &[(u16, u16)], body: &[u8]| {
+            let base = world.admission(seq, in_pi, body, &[world.b, sub_c, sub_d]);
+            let Recipe::AdmitPublication(admit) =
+                Recipe::decode_canonical(&base.recipe.to_canonical_bytes(), 16, 64).unwrap()
+            else {
+                panic!("expected AdmitPublication");
+            };
+            let mut vec = BoundedVec::with_capacity(claims.len()).unwrap();
+            for &(target_index, pi) in claims {
+                vec.try_push(InlineClaim {
+                    target_index,
+                    packet_id: OutboundPacketId::new(pi).unwrap(),
+                })
+                .unwrap();
+            }
+            Command {
+                recipe: FrozenRecipe::freeze(Recipe::MultiClaimedPublication(
+                    MultiClaimedPublication {
+                        admission: admit,
+                        claims: vec,
+                    },
+                ))
+                .unwrap(),
+                payload: base.payload,
+            }
+        };
+
+    // 1) Partial multi-claim: targets 0 (b, pi=11) and 2 (d, pi=21) claimed inline; target 1 (c) unclaimed.
+    let m1 = make_multi(&log_world, 1, 7, &[(0, 11), (2, 21)], b"fanout-partial");
+    // 2) Full multi-claim colliding on target 2's packet_id 21 MUST be refused atomically (no partial insert for target 0/1!).
+    let m_dup = make_multi(
+        &log_world,
+        2,
+        8,
+        &[(0, 12), (1, 31), (2, 21)],
+        b"fanout-dup-pi",
+    );
+    // 3) Full multi-claim on all 3 targets succeeds atomically.
+    let m2 = make_multi(
+        &log_world,
+        3,
+        9,
+        &[(0, 12), (1, 31), (2, 22)],
+        b"fanout-full",
+    );
+    // 4) Finish target 0 of m1 using claim = op 1.
+    let fin_b = Command {
+        recipe: FrozenRecipe::freeze(Recipe::FinishDelivery(FinishDelivery {
+            operation: operation_id(log_world.epoch, 4),
+            delivery: DeliveryId {
+                publication: publication_id(log_world.epoch, 1),
+                index: 0,
+            },
+            target: log_world.b,
+            target_revision: Revision::new(1),
+            packet_id: OutboundPacketId::new(11).unwrap(),
+            claim: operation_id(log_world.epoch, 1),
+        }))
+        .unwrap(),
+        payload: None,
+    };
+
+    let log_replies = log_world
+        .store
+        .apply_group(&[&m1, &m_dup, &m2, &fin_b])
+        .expect("log group");
+    let sql_replies = sql_world
+        .store
+        .apply_group(&[&m1, &m_dup, &m2, &fin_b])
+        .expect("sql group");
+    assert_eq!(log_replies, sql_replies);
+    assert!(log_replies[0].committed_now);
+    assert!(matches!(
+        log_replies[1].reply,
+        StoreReply::Outcome(StoreOutcome::RejectedCertain(
+            mqttiumd_contract::outcome::RejectReason::PreconditionFailed
+        ))
+    ));
+    assert!(log_replies[2].committed_now);
+    assert!(log_replies[3].committed_now);
+
+    let expected = sql_world.store.snapshot().expect("sql snapshot");
+    assert_eq!(log_world.store.snapshot().expect("log snapshot"), expected);
+    // 1 remaining outbound from m1 (sub_d) + 3 from m2 (b, c, d) = 4 outbound rows;
+    // m1's sub_c remains an unclaimed obligation.
+    assert_eq!(expected.outbound.len(), 4);
+    assert_eq!(expected.obligations.len(), 5);
+    assert_eq!(
+        expected.outbound[&DeliveryId {
+            publication: publication_id(log_world.epoch, 1),
+            index: 2,
+        }]
+            .claim,
+        operation_id(log_world.epoch, 1)
+    );
+
+    // Crash and recover from uncompacted .mlog!
+    let epoch = log_world.epoch;
+    drop(log_world);
+    let mut reopened =
+        LogStore::open_or_create(&log_path, StoreIncarnation::new(999), limits, None, true)
+            .expect("reopen after crash");
+    assert_eq!(reopened.snapshot().unwrap(), expected);
+
+    // Claim the unclaimed m1 target (sub_c, index 1) and finish m1's sub_d (index 2).
+    let claim_c = Command {
+        recipe: FrozenRecipe::freeze(Recipe::ClaimDelivery(ClaimDelivery {
+            operation: operation_id(epoch, 5),
+            delivery: DeliveryId {
+                publication: publication_id(epoch, 1),
+                index: 1,
+            },
+            target: sub_c,
+            target_revision: Revision::new(1),
+            packet_id: OutboundPacketId::new(32).unwrap(),
+        }))
+        .unwrap(),
+        payload: None,
+    };
+    let fin_d = Command {
+        recipe: FrozenRecipe::freeze(Recipe::FinishDelivery(FinishDelivery {
+            operation: operation_id(epoch, 6),
+            delivery: DeliveryId {
+                publication: publication_id(epoch, 1),
+                index: 2,
+            },
+            target: sub_d,
+            target_revision: Revision::new(1),
+            packet_id: OutboundPacketId::new(21).unwrap(),
+            claim: operation_id(epoch, 1),
+        }))
+        .unwrap(),
+        payload: None,
+    };
+    for cmd in [&claim_c, &fin_d] {
+        let r_log = reopened.apply(cmd);
+        let r_sql = sql_world.store.apply(cmd);
+        assert_eq!(r_log, r_sql);
+        assert!(r_log.committed_now);
+    }
+    assert_eq!(
+        reopened.snapshot().unwrap(),
+        sql_world.store.snapshot().unwrap()
+    );
+    drop(reopened);
+    drop(sql_world);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn failed_wal_replacement_suspends_durable_writes_until_repaired() {
     let dir = temp_dir("wal-replace-fail");
     let path = dir.join("broker.sqlite");

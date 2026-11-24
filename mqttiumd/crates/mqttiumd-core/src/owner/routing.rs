@@ -773,7 +773,7 @@ mod tests {
         taking.0.into_iter().map(OwnedEffect::into_parts).collect()
     }
     fn apply(owner: &mut Owner, input: Input) -> Vec<(EffectId, Effect)> {
-        let outcome = owner.step(input, TURN);
+        let outcome = owner.step_checked(input, TURN);
         assert!(
             matches!(outcome, StepOutcome::Applied { .. }),
             "{outcome:?}"

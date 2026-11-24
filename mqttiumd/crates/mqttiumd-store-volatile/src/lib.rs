@@ -1336,7 +1336,7 @@ impl VolatileStore {
         payload: &mut Option<SharedBytes>,
         remove_will: Option<OperationId>,
     ) -> Step<CommitFacts> {
-        self.exec_publication_with_claim(admit, retained_mask, payload, remove_will, None)
+        self.exec_publication_with_claim(admit, retained_mask, payload, remove_will, &[])
     }
 
     fn exec_publication_with_claim(
@@ -1345,7 +1345,7 @@ impl VolatileStore {
         retained_mask: Option<&RetainMask>,
         payload: &mut Option<SharedBytes>,
         remove_will: Option<OperationId>,
-        inline_claim: Option<InlineClaim>,
+        inline_claims: &[InlineClaim],
     ) -> Step<CommitFacts> {
         let failed = CommitErr::Refused(RejectReason::PreconditionFailed);
         let operation = admit.operation;
@@ -1502,24 +1502,44 @@ impl VolatileStore {
                 }
             }
         }
-        let claimed_target = if let Some(claim) = inline_claim {
+        let claimed_count = u64::try_from(inline_claims.len()).map_err(|_| failed)?;
+        if !inline_claims.is_empty() {
             if expired {
                 return Err(failed);
             }
-            let target = targets.get(usize::from(claim.target_index)).ok_or(failed)?;
-            if target.effective_qos == Qos::AtMostOnce
-                || (!(strictly_fresh && target.delivery.publication == admit.publication)
-                    && self.outbound.contains_key(&target.delivery))
-                || self
-                    .outbound_by_target_pi
-                    .contains(&(target.session, claim.packet_id))
-            {
-                return Err(failed);
+            let mut prev_index: Option<u16> = None;
+            for (pos, claim) in inline_claims.iter().enumerate() {
+                if prev_index.is_some_and(|prev| claim.target_index <= prev) {
+                    return Err(failed);
+                }
+                prev_index = Some(claim.target_index);
+                let target = targets.get(usize::from(claim.target_index)).ok_or(failed)?;
+                if target.effective_qos == Qos::AtMostOnce
+                    || (!(strictly_fresh && target.delivery.publication == admit.publication)
+                        && self.outbound.contains_key(&target.delivery))
+                    || self
+                        .outbound_by_target_pi
+                        .contains(&(target.session, claim.packet_id))
+                {
+                    return Err(failed);
+                }
+                if inline_claims.len() <= 16
+                    && inline_claims[..pos].iter().any(|earlier| {
+                        targets[usize::from(earlier.target_index)].session == target.session
+                    })
+                {
+                    return Err(failed);
+                }
             }
-            Some((*target, claim.packet_id))
-        } else {
-            None
-        };
+            if inline_claims.len() > 16 {
+                let mut seen = BTreeSet::new();
+                for claim in inline_claims {
+                    if !seen.insert(targets[usize::from(claim.target_index)].session) {
+                        return Err(failed);
+                    }
+                }
+            }
+        }
         let inbound_slot = if exactly_once {
             let (packet_id, exchange) = admit.inbound.ok_or(failed)?;
             let slot = (admit.source_session, packet_id);
@@ -1536,7 +1556,7 @@ impl VolatileStore {
                 .costs
                 .exchange_slots
                 .get()
-                .checked_add(u64::from(claimed_target.is_some()))
+                .checked_add(claimed_count)
                 .ok_or(failed)?,
         );
         let charged = check_charge(
@@ -1642,19 +1662,20 @@ impl VolatileStore {
                     .get_or_insert_default(target.delivery.publication) += 1;
             }
         }
-        if let Some((target, packet_id)) = claimed_target {
+        for claim in inline_claims {
+            let target = &targets[usize::from(claim.target_index)];
             self.outbound.insert(
                 target.delivery,
                 OutboundRecord {
                     started: false,
                     target: target.session,
                     target_revision: target.session_revision,
-                    packet_id,
+                    packet_id: claim.packet_id,
                     claim: operation,
                 },
             );
             self.outbound_by_target_pi
-                .insert((target.session, packet_id));
+                .insert((target.session, claim.packet_id));
         }
         if let Some((slot, exchange)) = inbound_slot {
             self.inbound.insert(
@@ -2891,7 +2912,18 @@ impl VolatileStore {
                                 None,
                                 &mut payload,
                                 None,
-                                Some(claimed.claim),
+                                core::slice::from_ref(&claimed.claim),
+                            )
+                        }
+                        Recipe::MultiClaimedPublication(claimed) => {
+                            let mut a = Admission::from(&claimed.admission);
+                            a.properties = props;
+                            self.exec_publication_with_claim(
+                                a,
+                                None,
+                                &mut payload,
+                                None,
+                                claimed.claims.as_slice(),
                             )
                         }
                         Recipe::RetainedPublication(value) => {
@@ -2940,7 +2972,14 @@ impl VolatileStore {
                     None,
                     &mut payload,
                     None,
-                    Some(claimed.claim),
+                    core::slice::from_ref(&claimed.claim),
+                ),
+                Recipe::MultiClaimedPublication(claimed) => self.exec_publication_with_claim(
+                    Admission::from(&claimed.admission),
+                    None,
+                    &mut payload,
+                    None,
+                    claimed.claims.as_slice(),
                 ),
                 Recipe::RetainedPublication(value) => self.exec_publication(
                     Admission::from(&value.admission),
@@ -3119,15 +3158,28 @@ impl DurableStore for VolatileStore {
                 .map_err(|_| ReadError::AllocationFailed)?,
             ..MessageExpirySweep::default()
         };
-        let mut ordered_pubs: Vec<(PublicationId, Option<MessageExpiry>)> = self
-            .publications
-            .iter()
-            .filter(|(id, _)| after.is_none_or(|prev| *id > prev))
-            .map(|(id, publication)| (id, publication.expiry()))
-            .collect();
-        ordered_pubs.sort_unstable_by_key(|(id, _)| *id);
-        result.more = ordered_pubs.len() > limit as usize;
-        ordered_pubs.truncate(limit as usize);
+        let cap = limit as usize;
+        let mut ordered_pubs: Vec<(PublicationId, Option<MessageExpiry>)> =
+            Vec::with_capacity(cap + 1);
+        let mut more = false;
+        for (id, publication) in self.publications.iter() {
+            if after.is_some_and(|prev| id <= prev) {
+                continue;
+            }
+            if ordered_pubs.len() == cap {
+                if id >= ordered_pubs[cap - 1].0 {
+                    more = true;
+                    continue;
+                }
+                more = true;
+            }
+            let pos = ordered_pubs.partition_point(|(existing, _)| *existing < id);
+            ordered_pubs.insert(pos, (id, publication.expiry()));
+            if ordered_pubs.len() > cap {
+                ordered_pubs.pop();
+            }
+        }
+        result.more = more;
         let mut candidates = Vec::new();
         candidates
             .try_reserve_exact(ordered_pubs.len())

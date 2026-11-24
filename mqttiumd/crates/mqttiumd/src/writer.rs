@@ -508,7 +508,8 @@ pub fn recipe_kind(recipe: &Recipe) -> &'static str {
         Recipe::ExpireDelivery(_) => "MessageExpire",
         Recipe::RetainedPublication(_)
         | Recipe::AdmitPublication(_)
-        | Recipe::ClaimedPublication(_) => "Admission",
+        | Recipe::ClaimedPublication(_)
+        | Recipe::MultiClaimedPublication(_) => "Admission",
         Recipe::RetainedQos0(_) => "RetainedQoS0",
         Recipe::ReplaySubscriptions(_) => "Subscriptions",
         Recipe::ReleaseInbound(_) => "Release",
@@ -729,6 +730,10 @@ pub struct Writer {
     pub boot: Receiver<Result<Boot, Failure>>,
     /// Signalled after each reply the worker publishes.
     pub wake: crate::wake::Wake,
+    /// Shared mirror of `StoreBackend::has_expiring_publications()` so the
+    /// reactor can skip empty 100 ms `MessageExpiry` sweeps without waking
+    /// the writer thread or starving write batches on the control lane.
+    has_expiring: Arc<AtomicBool>,
     handle: Option<JoinHandle<Result<(), Failure>>>,
 }
 impl Writer {
@@ -813,6 +818,8 @@ impl Writer {
         let (cctx, ccrx) = mpsc::sync_channel(CONTROL_QUEUE);
         let wake = crate::wake::Wake::new();
         let worker_wake = wake.clone();
+        let has_expiring = Arc::new(AtomicBool::new(true));
+        let worker_has_expiring = Arc::clone(&has_expiring);
         let handle = thread::Builder::new()
             .name(match storage_mode {
                 StorageMode::Durable => "sqlite-writer".into(),
@@ -833,6 +840,7 @@ impl Writer {
                         return Ok(());
                     }
                 };
+                worker_has_expiring.store(store.has_expiring_publications(), Ordering::Release);
                 if btx.send(Ok(boot)).is_err() {
                     return Ok(());
                 }
@@ -909,6 +917,8 @@ impl Writer {
                         match crx.try_recv() {
                             Ok(request) => {
                                 let reply = control_response(&mut store, request, &events, &hooks, &cancel, &mut state);
+                                worker_has_expiring
+                                    .store(store.has_expiring_publications(), Ordering::Release);
                                 #[cfg(feature="test-hooks")]
                                 if let ControlResponse::Collected { collection, result:Ok(ReceiptCollectionReply::Applied { .. }),.. } = &reply
                                     && hooks.directory.as_ref().is_some_and(|d| consume_file(&d.join("duplicate-close-result"))) {
@@ -948,7 +958,9 @@ impl Writer {
                                     (effect, Effect::Persist { command }) if group > 1 => {
                                         members.push(Member { effect, command });
                                     }
-                                    (effect, work @ Effect::LoadWork { .. }) if group > 1 => {
+                                    (effect, work @ Effect::LoadWork { .. })
+                                        if group > 1 && !members.is_empty() =>
+                                    {
                                         deferred_reads.push((effect, work));
                                     }
                                     (effect, work) => {
@@ -972,6 +984,8 @@ impl Writer {
                         if !members.is_empty() {
                             group_responses_into(&mut store, &members, &events, &cancel, &mut pending);
                             members.clear();
+                            worker_has_expiring
+                                .store(store.has_expiring_publications(), Ordering::Release);
                         }
                         for (effect, work) in deferred_reads.drain(..) {
                             pending.push_back(effect_response(
@@ -984,12 +998,20 @@ impl Writer {
                                 pending.push_back(Response::Stopped);
                                 stopping = true;
                             }
-                            Some(Err(request)) => pending.push_back(business_response(
-                                &mut store, request, &events, &hooks, &cancel, &mut state,
-                            )),
-                            Some(Ok((effect, work))) => pending.push_back(effect_response(
-                                &mut store, effect, work, &events, &hooks, &cancel, &mut state,
-                            )),
+                            Some(Err(request)) => {
+                                pending.push_back(business_response(
+                                    &mut store, request, &events, &hooks, &cancel, &mut state,
+                                ));
+                                worker_has_expiring
+                                    .store(store.has_expiring_publications(), Ordering::Release);
+                            }
+                            Some(Ok((effect, work))) => {
+                                pending.push_back(effect_response(
+                                    &mut store, effect, work, &events, &hooks, &cancel, &mut state,
+                                ));
+                                worker_has_expiring
+                                    .store(store.has_expiring_publications(), Ordering::Release);
+                            }
                             None => {}
                         }
                         if !stopping {
@@ -1017,6 +1039,7 @@ impl Writer {
             control_receiver: ccrx,
             boot: brx,
             wake,
+            has_expiring,
             handle: Some(handle),
         })
     }
@@ -1094,11 +1117,14 @@ impl DirectWriter {
             command.recipe.get(),
             Recipe::SessionLifecycle(_) | Recipe::WillPublication(_)
         ) || self.events.records("store_result");
-        let is_single_claimed = matches!(
-            command.recipe.get().inner_publication(),
-            Recipe::ClaimedPublication(claimed) if claimed.admission.targets.len() <= 1
-        );
-        let recipe_for_post = if is_will || needs_result_record || !is_single_claimed {
+        let is_all_inline_claimed = match command.recipe.get().inner_publication() {
+            Recipe::ClaimedPublication(claimed) => claimed.admission.targets.len() <= 1,
+            Recipe::MultiClaimedPublication(claimed) => {
+                claimed.claims.len() == claimed.admission.targets.len()
+            }
+            _ => false,
+        };
+        let recipe_for_post = if is_will || needs_result_record || !is_all_inline_claimed {
             Some(command.recipe.clone())
         } else {
             None
@@ -1112,7 +1138,7 @@ impl DirectWriter {
             if needs_result_record {
                 record_result(recipe, &applied, &self.events, &self.cancel);
             }
-            if !is_single_claimed
+            if !is_all_inline_claimed
                 && matches!(
                     applied.reply,
                     StoreReply::Outcome(StoreOutcome::Committed(
@@ -1203,14 +1229,32 @@ impl StoreHandle<'_> {
     #[inline]
     pub(crate) fn skip_empty_message_expiry_sweep(&self) -> bool {
         match self {
-            Self::Threaded(_) => false,
+            Self::Threaded(writer) => !writer.has_expiring.load(Ordering::Acquire),
             Self::Direct(direct) => !direct.store.has_expiring_publications(),
         }
     }
 
     pub(crate) fn try_send(&mut self, request: Request) -> Result<(), TrySendError<Request>> {
         match self {
-            Self::Threaded(writer) => writer.sender.try_send(request),
+            Self::Threaded(writer) => {
+                let maybe_expiring = matches!(
+                    &request,
+                    Request::Effect(effect)
+                        if matches!(
+                            effect.effect(),
+                            Effect::Persist { command }
+                                if matches!(
+                                    command.recipe.get().inner_publication(),
+                                    Recipe::ExpiringPublication(_)
+                                )
+                        )
+                );
+                let res = writer.sender.try_send(request);
+                if res.is_ok() && maybe_expiring {
+                    writer.has_expiring.store(true, Ordering::Release);
+                }
+                res
+            }
             Self::Direct(direct) => {
                 direct.exec_request(request);
                 Ok(())
@@ -1353,17 +1397,36 @@ fn business_response(
 /// The sessions a committed command may have given work to.
 #[inline]
 fn push_targets_of(recipe: &Recipe, out: &mut Vec<SessionId>) {
-    if let Recipe::ClaimedPublication(claimed) = recipe.inner_publication() {
-        if claimed.admission.targets.len() <= 1 {
+    match recipe.inner_publication() {
+        Recipe::ClaimedPublication(claimed) => {
+            if claimed.admission.targets.len() <= 1 {
+                return;
+            }
+            let claimed_idx = usize::from(claimed.claim.target_index);
+            for (i, t) in claimed.admission.targets.as_slice().iter().enumerate() {
+                if i != claimed_idx {
+                    out.push(t.session);
+                }
+            }
             return;
         }
-        let claimed_idx = usize::from(claimed.claim.target_index);
-        for (i, t) in claimed.admission.targets.as_slice().iter().enumerate() {
-            if i != claimed_idx {
-                out.push(t.session);
+        Recipe::MultiClaimedPublication(claimed) => {
+            let targets = claimed.admission.targets.as_slice();
+            let claims = claimed.claims.as_slice();
+            if claims.len() == targets.len() {
+                return;
             }
+            let mut c = 0usize;
+            for (i, t) in targets.iter().enumerate() {
+                if c < claims.len() && usize::from(claims[c].target_index) == i {
+                    c += 1;
+                } else {
+                    out.push(t.session);
+                }
+            }
+            return;
         }
-        return;
+        _ => {}
     }
     if let Recipe::WillPublication(a) = recipe {
         out.extend(a.targets.as_slice().iter().map(|t| t.session));
@@ -1864,6 +1927,7 @@ fn replay_controls(
         let admission = match &mut recipe {
             Recipe::AdmitPublication(a) => a,
             Recipe::ClaimedPublication(a) => &mut a.admission,
+            Recipe::MultiClaimedPublication(a) => &mut a.admission,
             Recipe::RetainedPublication(a) => &mut a.admission,
             _ => return Err(Failure::plain("receipt_replay_kind")),
         };

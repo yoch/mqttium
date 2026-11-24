@@ -706,7 +706,7 @@ trait Staging {
         admit: Admission<'_>,
         retained_mask: Option<&mqttiumd_contract::retained::RetainMask>,
         payload: Option<&SharedBytes>,
-        inline_claim: Option<InlineClaim>,
+        inline_claims: &[InlineClaim],
     ) -> Guard<CommitFacts>;
     fn stage_release(&mut self, release: &ReleaseInbound) -> Guard<CommitFacts>;
     fn stage_subscriptions(&mut self, command: &ChangeSubscriptions) -> Guard<CommitFacts>;
@@ -828,14 +828,14 @@ impl Staging for DurableState {
         retained_mask: Option<&mqttiumd_contract::retained::RetainMask>,
         payload: Option<&SharedBytes>,
     ) -> Guard<CommitFacts> {
-        self.stage_publication_with_claim(admit, retained_mask, payload, None)
+        self.stage_publication_with_claim(admit, retained_mask, payload, &[])
     }
     fn stage_publication_with_claim(
         &mut self,
         admit: Admission<'_>,
         retained_mask: Option<&mqttiumd_contract::retained::RetainMask>,
         payload: Option<&SharedBytes>,
-        inline_claim: Option<InlineClaim>,
+        inline_claims: &[InlineClaim],
     ) -> Guard<CommitFacts> {
         let failed = RejectReason::PreconditionFailed;
         let operation = admit.operation;
@@ -975,34 +975,54 @@ impl Staging for DurableState {
                 return Err(failed);
             }
         }
-        let claimed_target = if let Some(claim) = inline_claim {
+        let mut claimed_count = 0u64;
+        if !inline_claims.is_empty() {
             if expired {
                 return Err(failed);
             }
-            let target = targets.get(usize::from(claim.target_index)).ok_or(failed)?;
-            if target.effective_qos == Qos::AtMostOnce
-                || self.outbound.contains_key(&target.delivery)
-                || self
-                    .outbound
-                    .values()
-                    .any(|slot| slot.target == target.session && slot.packet_id == claim.packet_id)
-            {
-                return Err(failed);
+            let mut prev_index: Option<u16> = None;
+            for (pos, claim) in inline_claims.iter().enumerate() {
+                if prev_index.is_some_and(|prev| claim.target_index <= prev) {
+                    return Err(failed);
+                }
+                prev_index = Some(claim.target_index);
+                let target = targets.get(usize::from(claim.target_index)).ok_or(failed)?;
+                if target.effective_qos == Qos::AtMostOnce
+                    || self.outbound.contains_key(&target.delivery)
+                    || self.outbound.values().any(|slot| {
+                        slot.target == target.session && slot.packet_id == claim.packet_id
+                    })
+                {
+                    return Err(failed);
+                }
+                if inline_claims.len() <= 16
+                    && inline_claims[..pos].iter().any(|earlier| {
+                        targets[usize::from(earlier.target_index)].session == target.session
+                    })
+                {
+                    return Err(failed);
+                }
+                self.outbound.insert(
+                    target.delivery,
+                    OutboundRecord {
+                        started: false,
+                        target: target.session,
+                        target_revision: target.session_revision,
+                        packet_id: claim.packet_id,
+                        claim: operation,
+                    },
+                );
+                claimed_count += 1;
             }
-            self.outbound.insert(
-                target.delivery,
-                OutboundRecord {
-                    started: false,
-                    target: target.session,
-                    target_revision: target.session_revision,
-                    packet_id: claim.packet_id,
-                    claim: operation,
-                },
-            );
-            true
-        } else {
-            false
-        };
+            if inline_claims.len() > 16 {
+                let mut seen = BTreeSet::new();
+                for claim in inline_claims {
+                    if !seen.insert(targets[usize::from(claim.target_index)].session) {
+                        return Err(failed);
+                    }
+                }
+            }
+        }
         if exactly_once {
             let (packet_id, exchange) = admit.inbound.ok_or(failed)?;
             let slot = (admit.source_session, packet_id);
@@ -1022,7 +1042,7 @@ impl Staging for DurableState {
                 .costs
                 .exchange_slots
                 .get()
-                .checked_add(u64::from(claimed_target))
+                .checked_add(claimed_count)
                 .ok_or(failed)?,
         );
         self.charge(Accounts {
@@ -2321,7 +2341,17 @@ impl DurableStore for MemoryStore {
                             a,
                             None,
                             command.payload.as_ref(),
-                            Some(claimed.claim),
+                            core::slice::from_ref(&claimed.claim),
+                        )
+                    }
+                    Recipe::MultiClaimedPublication(claimed) => {
+                        let mut a = Admission::from(&claimed.admission);
+                        a.properties = props;
+                        staged.stage_publication_with_claim(
+                            a,
+                            None,
+                            command.payload.as_ref(),
+                            claimed.claims.as_slice(),
                         )
                     }
                     Recipe::RetainedPublication(value) => {
@@ -2369,7 +2399,13 @@ impl DurableStore for MemoryStore {
                 Admission::from(&claimed.admission),
                 None,
                 command.payload.as_ref(),
-                Some(claimed.claim),
+                core::slice::from_ref(&claimed.claim),
+            ),
+            Recipe::MultiClaimedPublication(claimed) => staged.stage_publication_with_claim(
+                Admission::from(&claimed.admission),
+                None,
+                command.payload.as_ref(),
+                claimed.claims.as_slice(),
             ),
             Recipe::RetainedPublication(value) => staged.stage_publication(
                 Admission::from(&value.admission),

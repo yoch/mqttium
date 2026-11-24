@@ -380,7 +380,7 @@ impl Owner {
                 self.wills.after = flight.next;
                 self.wills.deferred =
                     deferred.then_some((flight.will, WillDeferredReason::StoreRefusal));
-                if !deferred && self.inline_claim_enabled {
+                if !deferred {
                     self.mark_all_sessions_dirty(true);
                 }
                 self.remember_finished(finished)?;
@@ -419,7 +419,7 @@ mod tests {
         SharedBytes::copy_from(value, 128).unwrap()
     }
     fn apply(owner: &mut Owner, input: Input) -> Vec<(EffectId, Effect)> {
-        let result = owner.step(input, TURN);
+        let result = owner.step_checked(input, TURN);
         assert!(matches!(result, StepOutcome::Applied { .. }), "{result:?}");
         let mut sink = Taking(Vec::new());
         owner.dispatch(&mut sink);

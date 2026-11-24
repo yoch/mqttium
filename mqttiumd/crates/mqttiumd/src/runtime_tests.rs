@@ -145,6 +145,7 @@ fn with_runtime_clock_hooks(
         scratch_progress: Vec::new(),
         last_peer_deadline_scan: Instant::now(),
         inputs: VecDeque::new(),
+        ack_inputs: VecDeque::new(),
         control_inputs: VecDeque::new(),
         closing_inputs: VecDeque::new(),
         terminal_inputs: VecDeque::new(),
@@ -156,6 +157,7 @@ fn with_runtime_clock_hooks(
         credit_progress: Instant::now(),
         timers: BTreeMap::new(),
         inflight: ScopedFlatMap::new(),
+        inflight_route_ops: ScopedFlatMap::new(),
         lifecycle_inflight: BTreeMap::new(),
         last_session_change: None,
         session_cardinality_dirty: false,
@@ -2772,7 +2774,9 @@ fn finish_retained_durable_publish(close_before_enqueue: bool) {
         let ack = dequeue_puback(runtime, target, &mut receiver, packet_id.get());
         assert!(matches!(&ack,Input::ObservedPuback{target:Some(target),..}if *target==expected));
         runtime.queue(ack).unwrap();
-        until(runtime, |r| r.inflight.is_empty() && r.inputs.is_empty());
+        until(runtime, |r| {
+            r.inflight.is_empty() && r.inputs.is_empty() && r.ack_inputs.is_empty()
+        });
         let final_state = mqttiumd_store_sqlite::SqliteStore::inspect(&path).unwrap();
         assert!(final_state.outbound.is_empty());
         assert!(final_state.obligations.is_empty());
@@ -4020,6 +4024,18 @@ fn dequeue_puback(
     let deadline = Instant::now() + Duration::from_secs(2);
     loop {
         runtime.connections().unwrap();
+        if let Some(index) = runtime.ack_inputs.iter().position(|input| {
+            matches!(
+                input,
+                Input::ObservedPuback {
+                    connection,
+                    packet_id: observed,
+                    ..
+                } if connection.generation == generation && observed.get() == packet_id
+            )
+        }) {
+            return runtime.ack_inputs.remove(index).unwrap();
+        }
         if let Some(index)=runtime.inputs.iter().position(|input|matches!(input,Input::ObservedPuback {connection,packet_id:observed,..} if connection.generation==generation && observed.get()==packet_id)) {
             return runtime.inputs.remove(index).unwrap();
         }
@@ -4266,8 +4282,9 @@ fn stale_puback_during_takeover_with_a_blocked_close_cannot_stop_other_connectio
             "real reader reached old-generation PUBACK"
         );
         let stale = runtime
-            .inputs
+            .ack_inputs
             .iter()
+            .chain(runtime.inputs.iter())
             .find_map(|input| match input {
                 Input::ObservedPuback {
                     connection,
@@ -7026,7 +7043,7 @@ fn blocked_output_and_full_input_preserve_independent_work_and_reconnect_credit(
             let b_ack = dequeue_puback(runtime, subscriber, &mut receiver_b, b_id);
             runtime.queue(b_ack).unwrap();
             until(runtime, |state| {
-                state.inputs.is_empty() && state.inflight.is_empty()
+                state.inputs.is_empty() && state.ack_inputs.is_empty() && state.inflight.is_empty()
             });
 
             let before = mqttiumd_store_sqlite::SqliteStore::inspect(&sqlite).unwrap();
@@ -7241,6 +7258,7 @@ fn direct_volatile_store_commits_inline_and_saves_snapshot() {
         scratch_progress: Vec::new(),
         last_peer_deadline_scan: Instant::now(),
         inputs: VecDeque::new(),
+        ack_inputs: VecDeque::new(),
         control_inputs: VecDeque::new(),
         closing_inputs: VecDeque::new(),
         terminal_inputs: VecDeque::new(),
@@ -7252,6 +7270,7 @@ fn direct_volatile_store_commits_inline_and_saves_snapshot() {
         credit_progress: Instant::now(),
         timers: BTreeMap::new(),
         inflight: ScopedFlatMap::new(),
+        inflight_route_ops: ScopedFlatMap::new(),
         lifecycle_inflight: BTreeMap::new(),
         last_session_change: None,
         session_cardinality_dirty: false,

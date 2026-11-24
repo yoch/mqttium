@@ -458,7 +458,9 @@ impl<V> OriginOpTable<V> {
                     if let Some(val) = self.ring[offset as usize].as_ref() {
                         return Some(val);
                     }
-                    return None;
+                    if self.cold.is_empty() {
+                        return None;
+                    }
                 }
             }
         }
@@ -513,14 +515,27 @@ impl<V> OriginOpTable<V> {
             if seq >= self.base && seq < end {
                 let slot = &mut self.ring[(seq - self.base) as usize];
                 let prev = slot.replace(value);
-                if prev.is_none() {
-                    self.hot_len += 1;
+                if prev.is_some() {
+                    return prev;
                 }
-                return prev;
+                self.hot_len += 1;
+                return if self.cold.is_empty() {
+                    None
+                } else {
+                    self.cold.remove(&key)
+                };
             }
             if seq > end && seq - end <= Self::MAX_GAP_PAD {
-                let gap = (seq - end) as usize;
-                for _ in 0..gap {
+                for gap_seq in end..seq {
+                    if !self.cold.is_empty() {
+                        let gap_id =
+                            OperationId::new(scope.0, scope.1, scope.2, OperationSeq::new(gap_seq));
+                        if let Some(promoted) = self.cold.remove(&gap_id) {
+                            self.ring.push_back(Some(promoted));
+                            self.hot_len += 1;
+                            continue;
+                        }
+                    }
                     self.ring.push_back(None);
                 }
                 let prev = if self.cold.is_empty() {
@@ -555,7 +570,9 @@ impl<V> OriginOpTable<V> {
                         }
                         return removed;
                     }
-                    return None;
+                    if self.cold.is_empty() {
+                        return None;
+                    }
                 }
             }
         }
@@ -677,4 +694,122 @@ impl<V> OriginOpTable<V> {
 #[inline]
 pub(crate) fn is_open_will(recipe: &Recipe) -> bool {
     witness::is_open_will_recipe_obj(recipe)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn op(epoch: u64, seq: u64) -> OperationId {
+        OperationId::new(
+            StoreIncarnation::new(1),
+            RunEpoch::new(epoch),
+            LogicalOwnerId::new(0),
+            OperationSeq::new(seq),
+        )
+    }
+
+    #[test]
+    fn origin_op_table_cold_entry_not_shadowed_when_ring_pads_across_it() {
+        let mut table = OriginOpTable::new();
+        for s in 1..=559 {
+            assert_eq!(table.insert(op(1, s), s), None);
+        }
+        // Control-lane op arrives > MAX_GAP_PAD (64) ahead of ring end -> spills into cold.
+        assert_eq!(table.insert(op(1, 624), 624), None);
+        assert_eq!(table.get(&op(1, 624)), Some(&624));
+
+        // Ordinary lane catches up to 623, then 625 arrives padding across slot 624.
+        for s in 560..=623 {
+            assert_eq!(table.insert(op(1, s), s), None);
+        }
+        assert_eq!(table.insert(op(1, 625), 625), None);
+
+        // 624 must remain visible, removable, and present in range scans without duplicates.
+        assert_eq!(table.get(&op(1, 624)), Some(&624));
+        assert_eq!(table.len(), 625);
+        let mut range_seqs = Vec::new();
+        let _ = table.for_each_in_scope_range(
+            op(1, 1).scope(),
+            OperationSeq::new(620),
+            OperationSeq::new(625),
+            |id, &v| -> Result<(), ()> {
+                range_seqs.push((id.sequence().get(), v));
+                Ok(())
+            },
+        );
+        assert_eq!(
+            range_seqs,
+            vec![
+                (620, 620),
+                (621, 621),
+                (622, 622),
+                (623, 623),
+                (624, 624),
+                (625, 625)
+            ]
+        );
+        assert_eq!(table.remove(&op(1, 624)), Some(624));
+        assert_eq!(table.get(&op(1, 624)), None);
+        assert_eq!(table.len(), 624);
+    }
+
+    #[test]
+    fn origin_op_table_matches_btreemap_under_out_of_order_gaps() {
+        let mut table = OriginOpTable::new();
+        let mut oracle = BTreeMap::new();
+        let mut rng: u64 = 0x9e37_79b9_7f4a_7c15;
+        let mut next = || {
+            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
+            rng
+        };
+        let mut frontier = 1u64;
+        for step in 0..10_000u64 {
+            let mode = next() % 10;
+            if mode < 6 {
+                // Insert near frontier or with an out-of-order jump up to 160.
+                let jump = if next() % 5 == 0 {
+                    (next() % 160) + 1
+                } else {
+                    next() % 16
+                };
+                let seq = frontier + jump;
+                let k = op(1, seq);
+                assert_eq!(table.insert(k, step), oracle.insert(k, step));
+            } else if mode < 9 {
+                // Remove from frontier or random recent key.
+                let seq = frontier + (next() % 128);
+                let k = op(1, seq);
+                assert_eq!(table.remove(&k), oracle.remove(&k));
+                if next() % 4 == 0 {
+                    for s in frontier..frontier + 8 {
+                        let fk = op(1, s);
+                        assert_eq!(table.remove(&fk), oracle.remove(&fk));
+                    }
+                    frontier += 8;
+                }
+            } else {
+                let seq = frontier + (next() % 180);
+                let k = op(1, seq);
+                assert_eq!(table.get(&k), oracle.get(&k));
+            }
+            assert_eq!(table.len(), oracle.len());
+            if step % 500 == 0 {
+                let ordered: Vec<_> = table
+                    .iter_ordered()
+                    .into_iter()
+                    .map(|(k, &v)| (k, v))
+                    .collect();
+                let expected: Vec<_> = oracle.iter().map(|(&k, &v)| (k, v)).collect();
+                assert_eq!(ordered, expected);
+            }
+        }
+        let ordered: Vec<_> = table
+            .iter_ordered()
+            .into_iter()
+            .map(|(k, &v)| (k, v))
+            .collect();
+        let expected: Vec<_> = oracle.iter().map(|(&k, &v)| (k, v)).collect();
+        assert_eq!(ordered, expected);
+    }
 }

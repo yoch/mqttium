@@ -1047,7 +1047,7 @@ mod tests {
         sink.0.into_iter().map(OwnedEffect::into_parts).collect()
     }
     fn apply(owner: &mut Owner, input: Input) -> Vec<(EffectId, Effect)> {
-        let result = owner.step(input, TURN);
+        let result = owner.step_checked(input, TURN);
         assert!(
             matches!(result, StepOutcome::Applied { .. }),
             "session_lifecycle_not_applied: {result:?}"

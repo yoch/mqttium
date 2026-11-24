@@ -962,6 +962,7 @@ impl<'a> TraceWriter<'a> {
                     | WorkKind::ReplaySubscriptions
                     | WorkKind::AdmitPublication
                     | WorkKind::ClaimedPublication
+                    | WorkKind::MultiClaimedPublication
                     | WorkKind::ReleaseInbound
                     | WorkKind::ChangeSubscriptions
                     | WorkKind::ClaimDelivery

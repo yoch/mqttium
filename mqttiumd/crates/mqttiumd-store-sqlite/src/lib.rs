@@ -954,12 +954,12 @@ fn stage_publication(
         admit,
         retained_mask,
         payload,
-        None,
+        &[],
     )
 }
 #[expect(
     clippy::too_many_arguments,
-    reason = "internal SQLite staging helper carries transaction context and optional inline claim"
+    reason = "internal SQLite staging helper carries transaction context and optional inline claims"
 )]
 fn stage_publication_with_claim(
     conn: &Connection,
@@ -969,7 +969,7 @@ fn stage_publication_with_claim(
     admit: Admission<'_>,
     retained_mask: Option<&mqttiumd_contract::retained::RetainMask>,
     payload: Option<&SharedBytes>,
-    inline_claim: Option<InlineClaim>,
+    inline_claims: &[InlineClaim],
 ) -> Guard<CommitFacts> {
     let failed = RejectReason::PreconditionFailed;
     let operation = admit.operation;
@@ -1154,52 +1154,73 @@ fn stage_publication_with_claim(
             i64::from(retained_mask.is_some_and(|mask| mask.is_set(target_index))),
         ])?;
     }
-    let claimed_target = if let Some(claim) = inline_claim {
+    let mut claimed_count = 0u64;
+    if !inline_claims.is_empty() {
         if expired {
             return refused(failed);
         }
-        let Some(target) = targets.get(usize::from(claim.target_index)) else {
-            return refused(failed);
-        };
-        if target.effective_qos == Qos::AtMostOnce {
-            return refused(failed);
-        }
-        let delivery_pub = target.delivery.publication.to_be_bytes();
-        let delivery_idx = i64::from(target.delivery.index);
-        let target_bytes = target.session.to_be_bytes();
-        let taken = conn
-            .prepare_cached(
-                "SELECT 1 FROM outbound WHERE (publication=?1 AND idx=?2) OR (target=?3 AND packet_id=?4) LIMIT 1",
+        let mut prev_index: Option<u16> = None;
+        for (pos, claim) in inline_claims.iter().enumerate() {
+            if prev_index.is_some_and(|prev| claim.target_index <= prev) {
+                return refused(failed);
+            }
+            prev_index = Some(claim.target_index);
+            let Some(target) = targets.get(usize::from(claim.target_index)) else {
+                return refused(failed);
+            };
+            if target.effective_qos == Qos::AtMostOnce {
+                return refused(failed);
+            }
+            if inline_claims.len() <= 16
+                && inline_claims[..pos].iter().any(|earlier| {
+                    targets[usize::from(earlier.target_index)].session == target.session
+                })
+            {
+                return refused(failed);
+            }
+            let delivery_pub = target.delivery.publication.to_be_bytes();
+            let delivery_idx = i64::from(target.delivery.index);
+            let target_bytes = target.session.to_be_bytes();
+            let taken = conn
+                .prepare_cached(
+                    "SELECT 1 FROM outbound WHERE (publication=?1 AND idx=?2) OR (target=?3 AND packet_id=?4) LIMIT 1",
+                )?
+                .query_row(
+                    params![
+                        delivery_pub.as_slice(),
+                        delivery_idx,
+                        target_bytes.as_slice(),
+                        i64::from(claim.packet_id.get()),
+                    ],
+                    |_| Ok(()),
+                )
+                .optional()?
+                .is_some();
+            if taken {
+                return refused(failed);
+            }
+            conn.prepare_cached(
+                "INSERT INTO outbound(publication,idx,target,target_revision,packet_id,claim) VALUES(?1,?2,?3,?4,?5,?6)",
             )?
-            .query_row(
-                params![
-                    delivery_pub.as_slice(),
-                    delivery_idx,
-                    target_bytes.as_slice(),
-                    i64::from(claim.packet_id.get()),
-                ],
-                |_| Ok(()),
-            )
-            .optional()?
-            .is_some();
-        if taken {
-            return refused(failed);
+            .execute(params![
+                delivery_pub.as_slice(),
+                delivery_idx,
+                target_bytes.as_slice(),
+                target.session_revision.to_be_bytes().as_slice(),
+                i64::from(claim.packet_id.get()),
+                operation.to_be_bytes().as_slice(),
+            ])?;
+            claimed_count += 1;
         }
-        conn.prepare_cached(
-            "INSERT INTO outbound(publication,idx,target,target_revision,packet_id,claim) VALUES(?1,?2,?3,?4,?5,?6)",
-        )?
-        .execute(params![
-            delivery_pub.as_slice(),
-            delivery_idx,
-            target_bytes.as_slice(),
-            target.session_revision.to_be_bytes().as_slice(),
-            i64::from(claim.packet_id.get()),
-            operation.to_be_bytes().as_slice(),
-        ])?;
-        true
-    } else {
-        false
-    };
+        if inline_claims.len() > 16 {
+            let mut seen = BTreeSet::new();
+            for claim in inline_claims {
+                if !seen.insert(targets[usize::from(claim.target_index)].session) {
+                    return refused(failed);
+                }
+            }
+        }
+    }
     if exactly_once {
         // One admission per inbound exchange: an occupied slot is never
         // taken over, whatever generation the newcomer claims.
@@ -1231,7 +1252,7 @@ fn stage_publication_with_claim(
             .costs
             .exchange_slots
             .get()
-            .checked_add(u64::from(claimed_target))
+            .checked_add(claimed_count)
             .ok_or(Abort::Refused(failed))?,
     );
     charge(
@@ -1720,7 +1741,21 @@ fn stage_command(
                         a,
                         None,
                         payload,
-                        Some(claimed.claim),
+                        core::slice::from_ref(&claimed.claim),
+                    )?
+                }
+                Recipe::MultiClaimedPublication(claimed) => {
+                    let mut a = Admission::from(&claimed.admission);
+                    a.properties = props;
+                    stage_publication_with_claim(
+                        conn,
+                        meta,
+                        caches,
+                        group_delta,
+                        a,
+                        None,
+                        payload,
+                        claimed.claims.as_slice(),
                     )?
                 }
                 Recipe::RetainedPublication(value) => {
@@ -1778,7 +1813,17 @@ fn stage_command(
             Admission::from(&claimed.admission),
             None,
             payload,
-            Some(claimed.claim),
+            core::slice::from_ref(&claimed.claim),
+        )?,
+        Recipe::MultiClaimedPublication(claimed) => stage_publication_with_claim(
+            conn,
+            meta,
+            caches,
+            group_delta,
+            Admission::from(&claimed.admission),
+            None,
+            payload,
+            claimed.claims.as_slice(),
         )?,
         Recipe::RetainedPublication(value) => stage_publication(
             conn,

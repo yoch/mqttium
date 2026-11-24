@@ -141,6 +141,7 @@ impl ReceiptClass {
             | Recipe::ReplaySubscriptions(_)
             | Recipe::AdmitPublication(_)
             | Recipe::ClaimedPublication(_)
+            | Recipe::MultiClaimedPublication(_)
             | Recipe::ChangeSubscriptions(_)
             | Recipe::UpdateSubscriptions(_) => Self::Business,
             Recipe::WillPublication(_)
