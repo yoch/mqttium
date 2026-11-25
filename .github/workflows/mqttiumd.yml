@@ -296,6 +296,12 @@ jobs:
           --reference "$RUNNER_TEMP/mosquitto-reference"
           --broker target/release/mqttiumd
           --out "$RUNNER_TEMP/compat"
+      - name: Exercise listener identity, grants and live journal rotation
+        run: >-
+          python3 tests/compat/listener_profiles.py
+          --reference "$RUNNER_TEMP/mosquitto-reference"
+          --broker target/release/mqttiumd
+          --out "$RUNNER_TEMP/compat/listener-profiles.json"
       - name: Keep the matrix and the transcripts
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
