@@ -811,8 +811,7 @@ impl DeliveryShardWorker {
     }
 
     fn notify_coord(&self, notice: ShardToCoord) {
-        let _ = self.notice_tx.try_send(notice);
-        self.notice_wake.wake();
+        publish_notice(&self.notice_tx, &self.notice_wake, notice);
     }
 
     fn register_receipts(&mut self, budget: Duration) -> Result<(), Failure> {
@@ -2393,3 +2392,11 @@ impl EffectSink for ShardSink<'_> {
         }
     }
 }
+
+fn publish_notice(sender: &mpsc::SyncSender<ShardToCoord>, wake: &Wake, notice: ShardToCoord) {
+    let _ = sender.try_send(notice);
+    wake.wake();
+}
+
+#[cfg(test)]
+mod notice_tests;
