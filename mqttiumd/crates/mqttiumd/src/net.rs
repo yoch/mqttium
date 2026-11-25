@@ -1216,13 +1216,7 @@ impl ConnCore {
         if !has_stalled && fresh.is_empty() {
             return Ok(shard_moved);
         }
-        if has_stalled && !fresh.is_empty() {
-            stalled
-                .as_mut()
-                .expect("checked stalled")
-                .reports
-                .extend(fresh.drain(..));
-        }
+        let mut fresh = fresh.drain(..);
         let mut moved = false;
         let mut full_code: Option<&'static str> = None;
         for attempt in 0..2 {
@@ -1233,78 +1227,47 @@ impl ConnCore {
             let mut pushed_written = false;
             let mut pushed_progress = false;
             full_code = None;
-            if let Some(st) = stalled.as_mut() {
-                while let Some(report) = st.reports.pop_front() {
-                    match report {
-                        Report::Written(w) => {
-                            if state.alive & ALIVE_WRITTEN_RX == 0 {
-                                return Err("write_result_queue_full");
-                            }
-                            if state.written.len() >= WRITTEN_SLOTS {
-                                st.reports.push_front(Report::Written(w));
-                                full_code = Some("write_result_queue_full");
-                                break;
-                            }
-                            state.written.push_back(w);
-                            pushed_written = true;
+            // Older receipts lead. A retained input packet is independent of
+            // this stream and must never hide the current write's receipts.
+            while let Some(report) = stalled
+                .as_mut()
+                .and_then(|st| st.reports.pop_front())
+                .or_else(|| fresh.next())
+            {
+                match report {
+                    Report::Written(w) => {
+                        if state.alive & ALIVE_WRITTEN_RX == 0 {
+                            return Err("write_result_queue_full");
                         }
-                        Report::Progress(p) => {
-                            if state.alive & ALIVE_PROG_RX == 0 {
-                                return Err("wire_progress_unavailable");
-                            }
-                            let len = state.wire_progress.as_deref().map_or(0, VecDeque::len);
-                            if len >= WIRE_PROGRESS_SLOTS {
-                                st.reports.push_front(Report::Progress(p));
-                                full_code = Some("wire_progress_unavailable");
-                                break;
-                            }
-                            state
-                                .wire_progress
+                        if state.written.len() >= WRITTEN_SLOTS {
+                            stalled
                                 .get_or_insert_with(Default::default)
-                                .push_back(p);
-                            pushed_progress = true;
+                                .reports
+                                .push_front(Report::Written(w));
+                            full_code = Some("write_result_queue_full");
+                            break;
                         }
+                        state.written.push_back(w);
+                        pushed_written = true;
                     }
-                }
-            } else {
-                let mut idx = 0usize;
-                while idx < fresh.len() {
-                    match &fresh[idx] {
-                        Report::Written(_) => {
-                            if state.alive & ALIVE_WRITTEN_RX == 0 {
-                                return Err("write_result_queue_full");
-                            }
-                            if state.written.len() >= WRITTEN_SLOTS {
-                                full_code = Some("write_result_queue_full");
-                                break;
-                            }
+                    Report::Progress(p) => {
+                        if state.alive & ALIVE_PROG_RX == 0 {
+                            return Err("wire_progress_unavailable");
                         }
-                        Report::Progress(_) => {
-                            if state.alive & ALIVE_PROG_RX == 0 {
-                                return Err("wire_progress_unavailable");
-                            }
-                            let len = state.wire_progress.as_deref().map_or(0, VecDeque::len);
-                            if len >= WIRE_PROGRESS_SLOTS {
-                                full_code = Some("wire_progress_unavailable");
-                                break;
-                            }
-                        }
-                    }
-                    idx += 1;
-                }
-                for report in fresh.drain(..idx) {
-                    match report {
-                        Report::Written(w) => {
-                            state.written.push_back(w);
-                            pushed_written = true;
-                        }
-                        Report::Progress(p) => {
-                            state
-                                .wire_progress
+                        let len = state.wire_progress.as_deref().map_or(0, VecDeque::len);
+                        if len >= WIRE_PROGRESS_SLOTS {
+                            stalled
                                 .get_or_insert_with(Default::default)
-                                .push_back(p);
-                            pushed_progress = true;
+                                .reports
+                                .push_front(Report::Progress(p));
+                            full_code = Some("wire_progress_unavailable");
+                            break;
                         }
+                        state
+                            .wire_progress
+                            .get_or_insert_with(Default::default)
+                            .push_back(p);
+                        pushed_progress = true;
                     }
                 }
             }
@@ -1334,14 +1297,9 @@ impl ConnCore {
                 self.link.owe();
             }
         }
-        if !fresh.is_empty() {
-            stalled
-                .get_or_insert_with(Default::default)
-                .reports
-                .extend(fresh.drain(..));
-        }
         if let Some(code) = full_code {
-            let st = stalled.get_or_insert_with(Default::default);
+            let st = stalled.as_mut().expect("first blocked report retained");
+            st.reports.extend(fresh);
             if st.stalled_since.get_or_insert_with(Instant::now).elapsed() >= RESULT_WAIT {
                 return Err(code);
             }
