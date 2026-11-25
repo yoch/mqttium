@@ -625,7 +625,13 @@ impl Task {
             }
         }
         let avail = self.core.incoming_free_slots();
-        let limit = if avail == 0 { 1 } else { avail.min(BURST) };
+        let limit = avail.clamp(1, BURST);
+        let core = Arc::clone(&self.core);
+        let credit = core.reserve_shard_read(limit);
+        let limit = credit.as_ref().map_or(limit, |batch| batch.remaining);
+        if limit == 0 {
+            return Ok(progressed);
+        }
         scratch.incoming_batch.clear();
         let mut heard_packet = false;
         let mut cached_fixed: Option<FrameObservation> = None;
@@ -680,8 +686,11 @@ impl Task {
             record_heard(&self.core);
         }
         if !scratch.incoming_batch.is_empty() {
-            self.core
-                .push_incoming_batch(&mut scratch.incoming_batch, &mut self.stalled)?;
+            self.core.push_incoming_batch(
+                &mut scratch.incoming_batch,
+                &mut self.stalled,
+                credit,
+            )?;
         }
         if let Some(code) = parse_err {
             return Err(code);

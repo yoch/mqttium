@@ -286,7 +286,7 @@ impl ShardPool {
             let owner_id = outbox.id().owner();
             let shard_wake = store_handle.wake.clone();
             let (coord_tx, coord_rx) = crate::wake::signalled(COORD_CHANNEL_CAP, &shard_wake);
-            let inbox = ShardInbox::new(shard_wake.clone());
+            let inbox = ShardInbox::new(shard_wake.clone(), crate::writer::QUEUE, limits.frames);
             let inbox_worker = Arc::clone(&inbox);
             let (ready_tx, ready_rx) = mpsc::sync_channel(1);
             let worker_notices = Arc::clone(&notices);
@@ -360,11 +360,7 @@ impl ShardPool {
     pub(crate) fn route_for(&self, connection: ConnectionKey) -> ShardIoRoute {
         let idx = self.shard_index(connection.session);
         let shard = &self.shards[idx];
-        ShardIoRoute {
-            owner_id: shard.owner_id,
-            connection,
-            inbox: Arc::clone(&shard.inbox),
-        }
+        ShardIoRoute::new(shard.owner_id, connection, Arc::clone(&shard.inbox))
     }
 
     fn lease_of(&mut self, session: SessionId) -> Arc<InlineClaimLease> {
@@ -737,7 +733,7 @@ struct DeliveryShardWorker {
 
     inputs: VecDeque<Input>,
     store_inputs: VecDeque<Input>,
-    ack_inputs: VecDeque<Input>,
+    ack_inputs: VecDeque<(Input, net::ShardAckCredit)>,
     control_inputs: VecDeque<Input>,
     terminal_inputs: VecDeque<Input>,
     queued_work_sessions: FlatSet<SessionId>,
@@ -1053,6 +1049,7 @@ impl DeliveryShardWorker {
         while let Some(event) = scratch.pop_front() {
             match event {
                 ShardIoEvent::AckPacket {
+                    credit,
                     connection,
                     first,
                     body,
@@ -1080,12 +1077,15 @@ impl DeliveryShardWorker {
                                 .outgoing_bindings
                                 .get(&(connection, packet_id))
                                 .copied();
-                            self.ack_inputs.push_back(Input::ObservedPuback {
-                                connection,
-                                packet_id,
-                                reason,
-                                target,
-                            });
+                            self.ack_inputs.push_back((
+                                Input::ObservedPuback {
+                                    connection,
+                                    packet_id,
+                                    reason,
+                                    target,
+                                },
+                                credit,
+                            ));
                         }
                         Ok(Packet::Core(InboundPacket::Qos2Ack {
                             kind,
@@ -1096,13 +1096,16 @@ impl DeliveryShardWorker {
                                 .outgoing_bindings
                                 .get(&(connection, packet_id))
                                 .copied();
-                            self.ack_inputs.push_back(Input::ObservedQos2Ack {
-                                connection,
-                                kind,
-                                packet_id,
-                                reason,
-                                target,
-                            });
+                            self.ack_inputs.push_back((
+                                Input::ObservedQos2Ack {
+                                    connection,
+                                    kind,
+                                    packet_id,
+                                    reason,
+                                    target,
+                                },
+                                credit,
+                            ));
                         }
                         Ok(_) => {}
                         Err(error) => {
@@ -1118,6 +1121,7 @@ impl DeliveryShardWorker {
                 ShardIoEvent::Written {
                     generation,
                     written,
+                    ..
                 } => {
                     self.handle_written(generation, written);
                 }
@@ -1601,6 +1605,7 @@ impl DeliveryShardWorker {
         let mut inputs_blocked = false;
 
         while steps_taken < step_budget {
+            let mut ack_credit = None;
             let Some(input) = (!control_blocked)
                 .then(|| self.control_inputs.pop_front())
                 .flatten()
@@ -1618,6 +1623,10 @@ impl DeliveryShardWorker {
                     (!ack_blocked)
                         .then(|| self.ack_inputs.pop_front())
                         .flatten()
+                        .map(|(input, credit)| {
+                            ack_credit = Some(credit);
+                            input
+                        })
                 })
                 .or_else(|| {
                     if inputs_blocked {
@@ -1815,7 +1824,10 @@ impl DeliveryShardWorker {
                             store_blocked = true;
                         }
                         Input::ObservedPuback { .. } | Input::ObservedQos2Ack { .. } => {
-                            self.ack_inputs.push_front(input);
+                            self.ack_inputs.push_front((
+                                input,
+                                ack_credit.take().expect("ACK input has credit"),
+                            ));
                             ack_blocked = true;
                         }
                         other => {
@@ -1924,6 +1936,18 @@ impl EffectSink for ShardSink<'_> {
         let refused = |effect, reason| SubmitResult::NotSubmitted { effect, reason };
         if self.error.is_some() {
             return refused(effect, SubmitBlock::Closed);
+        }
+        if matches!(
+            effect.effect(),
+            Effect::EmitPublish { .. } | Effect::EmitFrame { .. } | Effect::EmitQos0 { .. }
+        ) && (self.frames.len() >= self.limits.frames
+            || self
+                .terminal_inputs
+                .len()
+                .saturating_add(2 * self.frames.len())
+                >= self.limits.terminal_inputs)
+        {
+            return refused(effect, SubmitBlock::QueueFull);
         }
         match effect.effect() {
             Effect::Persist { command } => {

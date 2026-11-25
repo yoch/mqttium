@@ -5,17 +5,17 @@
 //! their handles tell the reactor when the core published a frame or took
 //! a value from a lane the task had found full.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::io::{self, IoSlice, Read, Write as _};
 use std::net::{Shutdown, TcpStream};
 use std::os::fd::{AsRawFd, RawFd};
 #[cfg(test)]
 use std::sync::Condvar;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::TrySendError;
 #[cfg(test)]
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SendError, SyncSender, TryRecvError};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
 use mqttiumd_contract::ids::{ConnectionGeneration, ConnectionKey, EffectId, LogicalOwnerId};
@@ -431,14 +431,129 @@ impl OutgoingState {
 #[derive(Debug)]
 pub enum ShardIoEvent {
     AckPacket {
+        credit: ShardAckCredit,
         connection: ConnectionKey,
         first: u8,
         body: FrameBytes,
     },
     Written {
+        _credit: ShardWrittenCredit,
         generation: ConnectionGeneration,
         written: Written,
     },
+}
+
+/// Slots are reserved before parsing a turn. Unused slots are returned together.
+struct ShardAckBudget {
+    available: AtomicUsize,
+    waiting: AtomicBool,
+    readers: Mutex<Vec<Weak<Link>>>,
+}
+
+impl ShardAckBudget {
+    fn take(&self, limit: usize) -> usize {
+        let old = self
+            .available
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+                (free != 0).then(|| free.saturating_sub(limit))
+            });
+        old.map_or(0, |free| free.min(limit))
+    }
+
+    fn reserve(&self, limit: usize, link: &Arc<Link>) -> usize {
+        let n = self.take(limit);
+        if n != 0 {
+            return n;
+        }
+        // Register under the same lock used on release, then recheck. Credit
+        // may have become available before the producer registered its wake.
+        let mut readers = self.readers.lock().expect("shard credit readers");
+        self.waiting.store(true, Ordering::SeqCst);
+        let n = self.take(limit);
+        if n == 0 {
+            let weak = Arc::downgrade(link);
+            if !readers.iter().any(|old| old.ptr_eq(&weak)) {
+                readers.retain(|old| old.strong_count() != 0);
+                readers.push(weak);
+            }
+        } else if readers.is_empty() {
+            self.waiting.store(false, Ordering::SeqCst);
+        }
+        n
+    }
+
+    fn release(&self, slots: usize) {
+        if slots == 0 {
+            return;
+        }
+        self.available.fetch_add(slots, Ordering::SeqCst);
+        if self.waiting.load(Ordering::SeqCst) {
+            let mut readers = self.readers.lock().expect("shard credit readers");
+            self.waiting.store(false, Ordering::SeqCst);
+            for reader in readers.drain(..).filter_map(|weak| weak.upgrade()) {
+                reader.notify();
+            }
+        }
+    }
+}
+
+struct RouteAcks {
+    pending: AtomicUsize,
+    budget: Arc<ShardAckBudget>,
+}
+
+struct ShardAckBatch<'a> {
+    route: &'a ShardIoRoute,
+    remaining: usize,
+}
+
+impl ShardAckBatch<'_> {
+    fn take(&mut self) -> ShardAckCredit {
+        self.remaining = self.remaining.checked_sub(1).expect("reserved shard ACK");
+        self.route.acks.pending.fetch_add(1, Ordering::Release);
+        ShardAckCredit(Arc::clone(&self.route.acks))
+    }
+}
+
+impl Drop for ShardAckBatch<'_> {
+    fn drop(&mut self) {
+        self.route.acks.budget.release(self.remaining);
+    }
+}
+
+/// Follows the packet through the mailbox and the worker's retry queue.
+pub struct ShardAckCredit(Arc<RouteAcks>);
+
+impl std::fmt::Debug for ShardAckCredit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ShardAckCredit")
+    }
+}
+impl Drop for ShardAckCredit {
+    fn drop(&mut self) {
+        self.0.pending.fetch_sub(1, Ordering::Release);
+        self.0.budget.release(1);
+    }
+}
+
+#[derive(Debug)]
+struct WriteSlot(Arc<AtomicUsize>);
+impl Drop for WriteSlot {
+    fn drop(&mut self) {
+        self.0.fetch_add(1, Ordering::Release);
+    }
+}
+
+#[derive(Debug)]
+pub struct ShardWrittenCredit {
+    queued: Arc<AtomicUsize>,
+    // One slot covers a possible Started and the subsequent terminal Written.
+    _terminal_slot: Option<WriteSlot>,
+}
+impl Drop for ShardWrittenCredit {
+    fn drop(&mut self) {
+        self.queued.fetch_sub(1, Ordering::Release);
+    }
 }
 
 /// Shared bounded inbox fed directly by I/O reactor threads for one
@@ -446,14 +561,22 @@ pub enum ShardIoEvent {
 pub struct ShardInbox {
     pending: AtomicBool,
     queue: Mutex<VecDeque<ShardIoEvent>>,
+    acks: Arc<ShardAckBudget>,
+    write_slots: Arc<AtomicUsize>,
     wake: Wake,
 }
 
 impl ShardInbox {
-    pub fn new(wake: Wake) -> Arc<Self> {
+    pub fn new(wake: Wake, ack_slots: usize, write_slots: usize) -> Arc<Self> {
         Arc::new(Self {
             pending: AtomicBool::new(false),
             queue: Mutex::new(VecDeque::new()),
+            acks: Arc::new(ShardAckBudget {
+                available: AtomicUsize::new(ack_slots),
+                waiting: AtomicBool::new(false),
+                readers: Mutex::new(Vec::new()),
+            }),
+            write_slots: Arc::new(AtomicUsize::new(write_slots)),
             wake,
         })
     }
@@ -463,18 +586,15 @@ impl ShardInbox {
         self.pending.load(Ordering::Acquire)
     }
 
-    pub fn push_batch(&self, items: &mut Vec<ShardIoEvent>) {
+    fn push_batch(&self, items: &mut Vec<ShardIoEvent>) {
         if items.is_empty() {
             return;
         }
-        if let Ok(mut queue) = self.queue.lock() {
-            queue.extend(items.drain(..));
-            self.pending.store(true, Ordering::Release);
-            drop(queue);
-            self.wake.wake();
-        } else {
-            items.clear();
-        }
+        let mut queue = self.queue.lock().expect("shard inbox");
+        queue.extend(items.drain(..));
+        self.pending.store(true, Ordering::Release);
+        drop(queue);
+        self.wake.wake();
     }
 
     pub fn drain_into(&self, out: &mut VecDeque<ShardIoEvent>, limit: usize) -> usize {
@@ -503,6 +623,64 @@ pub struct ShardIoRoute {
     pub owner_id: LogicalOwnerId,
     pub connection: ConnectionKey,
     pub inbox: Arc<ShardInbox>,
+    acks: Arc<RouteAcks>,
+    writes: Mutex<HashMap<EffectId, WriteSlot>>,
+    written_pending: Arc<AtomicUsize>,
+}
+
+impl ShardIoRoute {
+    pub(crate) fn new(
+        owner_id: LogicalOwnerId,
+        connection: ConnectionKey,
+        inbox: Arc<ShardInbox>,
+    ) -> Self {
+        Self {
+            owner_id,
+            connection,
+            acks: Arc::new(RouteAcks {
+                pending: AtomicUsize::new(0),
+                budget: Arc::clone(&inbox.acks),
+            }),
+            writes: Mutex::new(HashMap::new()),
+            written_pending: Arc::new(AtomicUsize::new(0)),
+            inbox,
+        }
+    }
+
+    fn reserve_write(&self, effect: EffectId) -> bool {
+        let slots = &self.inbox.write_slots;
+        if slots
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1))
+            .is_err()
+        {
+            return false;
+        }
+        let old = self
+            .writes
+            .lock()
+            .expect("shard writes")
+            .insert(effect, WriteSlot(Arc::clone(slots)));
+        debug_assert!(old.is_none());
+        true
+    }
+
+    fn written_event(&self, written: Written) -> ShardIoEvent {
+        let slot = if matches!(written, Written::Started { .. }) {
+            None
+        } else {
+            let id = written_effect(&written).expect("routed write");
+            self.writes.lock().expect("shard writes").remove(&id)
+        };
+        self.written_pending.fetch_add(1, Ordering::Release);
+        ShardIoEvent::Written {
+            _credit: ShardWrittenCredit {
+                queued: Arc::clone(&self.written_pending),
+                _terminal_slot: slot,
+            },
+            generation: self.connection.generation,
+            written,
+        }
+    }
 }
 
 /// Cloneable write-only handle allowing a resident `DeliveryShard` thread to
@@ -515,7 +693,39 @@ pub struct OutgoingHandle {
 impl OutgoingHandle {
     #[inline]
     pub fn try_send_outgoing(&self, frame: Write) -> Result<(), TrySendError<Write>> {
-        self.core.try_send_outgoing(frame)
+        let tracked = frame.correlation.and_then(|(effect, _)| {
+            self.core
+                .shard_route
+                .get()
+                .filter(|route| effect.owner == route.owner_id)
+                .map(|route| (route, effect))
+        });
+        if let Some((route, effect)) = tracked
+            && !route.reserve_write(effect)
+        {
+            return Err(TrySendError::Full(frame));
+        }
+        let result = self.core.try_send_outgoing(frame);
+        if result.is_err()
+            && let Some((route, effect)) = tracked
+        {
+            route.writes.lock().expect("shard writes").remove(&effect);
+        }
+        result
+    }
+
+    pub(crate) fn pending_shard_acks(&self) -> usize {
+        self.core
+            .shard_route
+            .get()
+            .map_or(0, |route| route.acks.pending.load(Ordering::Acquire))
+    }
+
+    pub(crate) fn pending_shard_written(&self) -> usize {
+        self.core
+            .shard_route
+            .get()
+            .map_or(0, |route| route.written_pending.load(Ordering::Acquire))
     }
 
     #[inline]
@@ -779,18 +989,27 @@ impl ConnCore {
         Ok(Some(value))
     }
 
+    fn reserve_shard_read(&self, limit: usize) -> Option<ShardAckBatch<'_>> {
+        // This reactor is also the sole socket writer. If a route is installed
+        // during an unsharded input turn, its first outbound delivery can
+        // reach the peer only on a subsequent turn with the route installed.
+        let route = self.shard_route.get()?;
+        let remaining = route.acks.budget.reserve(limit, &self.link);
+        Some(ShardAckBatch { route, remaining })
+    }
+
     /// Pushes a batch of newly framed packets (plus any previously held
     /// packets in strict order) under a single mutex acquisition and wake.
     /// When a `ShardIoRoute` is installed, subscriber ACKs
     /// (`PUBACK`/`PUBREC`/`PUBCOMP`) bypass the Coordinator queue and route
     /// directly to the owning `DeliveryShard` inbox.
-    pub(super) fn push_incoming_batch(
+    fn push_incoming_batch(
         &self,
         batch: &mut Vec<Incoming>,
         stalled: &mut Option<Box<StalledState>>,
+        mut reservation: Option<ShardAckBatch<'_>>,
     ) -> Result<bool, &'static str> {
-        if self.shard_route_active.load(Ordering::Acquire)
-            && let Some(route) = self.shard_route.get()
+        if let Some(reservation) = reservation.as_mut()
             && batch.iter().any(|item| {
                 matches!(item, Incoming::Packet { first, .. } if matches!(first >> 4, 4 | 5 | 7))
             })
@@ -800,7 +1019,8 @@ impl ConnCore {
                 match item {
                     Incoming::Packet { first, body, .. } if matches!(first >> 4, 4 | 5 | 7) => {
                         shard_acks.push(ShardIoEvent::AckPacket {
-                            connection: route.connection,
+                            credit: reservation.take(),
+                            connection: reservation.route.connection,
                             first,
                             body,
                         });
@@ -809,7 +1029,7 @@ impl ConnCore {
                 }
             }
             if !shard_acks.is_empty() {
-                route.inbox.push_batch(&mut shard_acks);
+                reservation.route.inbox.push_batch(&mut shard_acks);
             }
         }
         if let Some(st) = stalled.as_mut()
@@ -909,17 +1129,14 @@ impl ConnCore {
         if self.shard_route_active.load(Ordering::Acquire)
             && let Some(route) = self.shard_route.get()
             && fresh.iter().any(
-                |r| matches!(r, Report::Written(w) if written_owner(w) == Some(route.owner_id)),
+                |r| matches!(r, Report::Written(w) if written_effect(w).map(|id| id.owner) == Some(route.owner_id)),
             )
         {
             let mut shard_written = Vec::new();
             for report in std::mem::take(fresh) {
                 match report {
-                    Report::Written(written) if written_owner(&written) == Some(route.owner_id) => {
-                        shard_written.push(ShardIoEvent::Written {
-                            generation: route.connection.generation,
-                            written,
-                        });
+                    Report::Written(written) if written_effect(&written).map(|id| id.owner) == Some(route.owner_id) => {
+                        shard_written.push(route.written_event(written));
                     }
                     other => fresh.push(other),
                 }
@@ -1463,22 +1680,33 @@ impl ConnCore {
                 if let Some(route) = route
                     && correlation.is_some_and(|(eff, _)| eff.owner == route.owner_id)
                 {
-                    shard_failed.push(ShardIoEvent::Written {
-                        generation: route.connection.generation,
-                        written: Written::Failed { correlation, code },
-                    });
+                    shard_failed.push(route.written_event(Written::Failed { correlation, code }));
                     continue;
                 }
                 if state.alive & ALIVE_WRITTEN_RX == 0 || state.written.len() >= WRITTEN_SLOTS {
-                    break;
+                    continue;
                 }
                 state
                     .written
                     .push_back(Written::Failed { correlation, code });
             }
-            if let Some(route) = route
-                && !shard_failed.is_empty()
-            {
+            if let Some(route) = route {
+                let mut remaining = route.writes.lock().expect("shard writes");
+                for (effect, slot) in remaining.drain() {
+                    route.written_pending.fetch_add(1, Ordering::Release);
+                    shard_failed.push(ShardIoEvent::Written {
+                        generation: route.connection.generation,
+                        written: Written::Failed {
+                            correlation: Some((effect, route.connection)),
+                            code,
+                        },
+                        _credit: ShardWrittenCredit {
+                            queued: Arc::clone(&route.written_pending),
+                            _terminal_slot: Some(slot),
+                        },
+                    });
+                }
+                drop(remaining);
                 route.inbox.push_batch(&mut shard_failed);
             }
             if state.alive & ALIVE_IN_RX != 0 && state.incoming.len() < INPUT_SLOTS {
@@ -2152,14 +2380,14 @@ impl Connection {
 }
 
 #[inline]
-fn written_owner(written: &Written) -> Option<LogicalOwnerId> {
+fn written_effect(written: &Written) -> Option<EffectId> {
     let corr = match written {
         Written::Started { correlation }
         | Written::NotStarted { correlation, .. }
         | Written::Complete { correlation, .. }
         | Written::Failed { correlation, .. } => *correlation,
     };
-    corr.map(|(effect, _)| effect.owner)
+    corr.map(|(effect, _)| effect)
 }
 
 impl Drop for Connection {
@@ -3145,7 +3373,12 @@ impl Task {
             }
         }
         let avail = self.core.incoming_free_slots();
-        let limit = if avail == 0 { 1 } else { avail.min(BURST) };
+        let limit = avail.clamp(1, BURST);
+        let credit = self.core.reserve_shard_read(limit);
+        let limit = credit.as_ref().map_or(limit, |batch| batch.remaining);
+        if limit == 0 {
+            return Ok(progressed);
+        }
         scratch.incoming_batch.clear();
         let mut heard_packet = false;
         let mut cached_fixed: Option<FrameObservation> = None;
@@ -3186,8 +3419,11 @@ impl Task {
             record_heard(&self.core);
         }
         if !scratch.incoming_batch.is_empty() {
-            self.core
-                .push_incoming_batch(&mut scratch.incoming_batch, &mut self.stalled)?;
+            self.core.push_incoming_batch(
+                &mut scratch.incoming_batch,
+                &mut self.stalled,
+                credit,
+            )?;
         }
         if let Some(code) = parse_err {
             return Err(code);
@@ -3259,45 +3495,94 @@ mod tests {
     fn sharded_ack_backpressure_preserves_the_unread_suffix_and_write_receipts() {
         let (connection, _peer) = pair();
         let (effect, key) = correlation(9).unwrap();
-        let inbox = ShardInbox::new(Wake::new());
-        connection.install_shard_route(ShardIoRoute {
-            owner_id: effect.owner,
-            connection: key,
-            inbox: Arc::clone(&inbox),
-        });
+        let inbox = ShardInbox::new(Wake::new(), 2, 1);
+        connection.install_shard_route(ShardIoRoute::new(effect.owner, key, Arc::clone(&inbox)));
         let packet = |first, index| Incoming::Packet {
             first,
             body: FrameBytes::from(vec![0, index]),
-            observed: Ok(MessageTime { domain: [1; 32], tick: 1 }),
+            observed: Ok(MessageTime {
+                domain: [1; 32],
+                tick: 1,
+            }),
         };
-        let mut batch = vec![packet(0x40, 1), packet(0x40, 2), packet(0x40, 3), packet(0xe0, 0)];
+        let mut unread = vec![
+            packet(0x40, 1),
+            packet(0x40, 2),
+            packet(0x40, 3),
+            packet(0xe0, 0),
+        ];
         let mut stalled = None;
-        assert!(!connection.core.push_incoming_batch(&mut batch, &mut stalled).unwrap(),
-            "the third ACK and the following DISCONNECT must wait for the shard");
-        assert!(batch.is_empty());
+        let read_turn = |unread: &mut Vec<Incoming>, stalled: &mut Option<Box<StalledState>>| {
+            let reservation = connection.core.reserve_shard_read(unread.len()).unwrap();
+            let mut batch: Vec<_> = unread.drain(..reservation.remaining).collect();
+            connection
+                .core
+                .push_incoming_batch(&mut batch, stalled, Some(reservation))
+                .unwrap();
+        };
+        read_turn(&mut unread, &mut stalled);
+        assert_eq!(
+            unread.len(),
+            2,
+            "the third ACK and the following DISCONNECT must wait for the shard"
+        );
         let mut delivered = VecDeque::new();
         assert_eq!(inbox.drain_into(&mut delivered, 10), 2);
+        assert!(
+            connection
+                .core
+                .shard_route
+                .get()
+                .unwrap()
+                .reserve_write(effect)
+        );
         let mut written = vec![Report::Written(Written::Complete {
-            correlation: Some((effect, key)), bytes: 4,
+            correlation: Some((effect, key)),
+            bytes: 4,
         })];
-        assert!(connection.core.flush_reports(&mut written, &mut stalled).unwrap());
+        assert!(
+            connection
+                .core
+                .flush_reports(&mut written, &mut stalled)
+                .unwrap()
+        );
         assert_eq!(inbox.drain_into(&mut delivered, 10), 1);
-        assert!(matches!(delivered.back(), Some(ShardIoEvent::Written { .. })));
-        assert!(!connection.core.flush_held_incoming(stalled.as_mut().unwrap()).unwrap(),
-            "moving ACKs to the shard's input lane must not free their credits");
+        assert!(matches!(
+            delivered.back(),
+            Some(ShardIoEvent::Written { .. })
+        ));
+        read_turn(&mut unread, &mut stalled);
+        assert_eq!(
+            unread.len(),
+            2,
+            "moving ACKs to the shard's input lane must not free their credits"
+        );
+        assert_eq!(connection.outgoing_handle().pending_shard_acks(), 2);
+        assert_eq!(connection.outgoing_handle().pending_shard_written(), 1);
         let first = delivered.pop_front().unwrap();
-        assert!(matches!(&first, ShardIoEvent::AckPacket { body, .. } if body.as_slice() == [0, 1]));
+        assert!(
+            matches!(&first, ShardIoEvent::AckPacket { body, .. } if body.as_slice() == [0, 1])
+        );
         drop(first);
-        assert!(connection.core.flush_held_incoming(stalled.as_mut().unwrap()).unwrap());
+        read_turn(&mut unread, &mut stalled);
+        assert_eq!(unread.len(), 1);
         assert_eq!(inbox.drain_into(&mut delivered, 10), 1);
-        let ids: Vec<u8> = delivered.into_iter().filter_map(|event| match event {
-            ShardIoEvent::AckPacket { body, .. } => Some(body.as_slice()[1]),
-            ShardIoEvent::Written { .. } => None,
-        }).collect();
+        let ids: Vec<u8> = delivered
+            .into_iter()
+            .filter_map(|event| match event {
+                ShardIoEvent::AckPacket { body, .. } => Some(body.as_slice()[1]),
+                ShardIoEvent::Written { .. } => None,
+            })
+            .collect();
         assert_eq!(ids, [2, 3]);
+        read_turn(&mut unread, &mut stalled);
+        assert!(unread.is_empty());
         let mut coordinator = VecDeque::new();
         connection.core.drain_incoming(&mut coordinator, 10);
-        assert!(matches!(coordinator.pop_front(), Some(Incoming::Packet { first: 0xe0, .. })));
+        assert!(matches!(
+            coordinator.pop_front(),
+            Some(Incoming::Packet { first: 0xe0, .. })
+        ));
     }
 
     fn control() -> AtomicBool {

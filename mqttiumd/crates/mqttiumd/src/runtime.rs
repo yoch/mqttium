@@ -90,11 +90,11 @@ pub struct Limits {
     closing_inputs: usize,
     /// Per transport: the queued frames, one active and eight terminal
     /// receipts.
-    frames: usize,
+    pub(crate) frames: usize,
     /// A close can retire every accepted frame while an outbox-sized set of
     /// synchronously refused volatile effects also awaits its exact owner
     /// fact.
-    terminal_inputs: usize,
+    pub(crate) terminal_inputs: usize,
     /// Packets and facts waiting for the core, the writer's and the
     /// deadlines' reserved shares excluded.
     ordinary_inputs: usize,
