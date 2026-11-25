@@ -7205,6 +7205,12 @@ fn blocked_output_and_full_input_preserve_independent_work_and_reconnect_credit(
                 assert_eq!(held_acks(runtime), pending);
             }
 
+            // The periodic Will scan can run before B, including when the
+            // fixture reaches this point in less than one scan interval.
+            runtime.queue(Input::DiscoverWills).unwrap();
+            runtime.drain_inputs().unwrap();
+            assert!(runtime.will_reads.is_some());
+
             runtime.packet(publisher, 0x32, publish_body(7)).unwrap();
             runtime.drain_inputs().unwrap();
             let reply = runtime
