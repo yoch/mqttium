@@ -5733,6 +5733,17 @@ fn accepted_frames_reserve_their_terminal_fact_before_reactor_backpressure() {
             retained,
             "finite genuine PING traffic reached the terminal reservation, retaining effects in the owner"
         );
+        // These socket receipts are already in the reactor. Each synchronous
+        // pass must apply some of them, irrespective of the OS scheduling
+        // the remaining writes. The initial queue length bounds this loop.
+        while !runtime.terminal_inputs.is_empty() {
+            let before = runtime.terminal_inputs.len();
+            runtime.drain_inputs().unwrap();
+            assert!(
+                runtime.terminal_inputs.len() < before,
+                "the reactor must drain queued PINGRESP write receipts"
+            );
+        }
         until(runtime, |r| {
             r.inputs.is_empty()
                 && r.terminal_inputs.is_empty()
@@ -7210,6 +7221,14 @@ fn blocked_output_and_full_input_preserve_independent_work_and_reconnect_credit(
             runtime.queue(Input::DiscoverWills).unwrap();
             runtime.drain_inputs().unwrap();
             assert!(runtime.will_reads.is_some());
+            // Finish the unrelated read through the normal writer adapter
+            // before intercepting the real admission result on that channel.
+            until_without_socket_receipts(runtime, |state| {
+                state.will_reads.is_none()
+                    && state.work_reads.is_empty()
+                    && state.control_inputs.is_empty()
+                    && state.inputs.is_empty()
+            });
 
             runtime.packet(publisher, 0x32, publish_body(7)).unwrap();
             runtime.drain_inputs().unwrap();
