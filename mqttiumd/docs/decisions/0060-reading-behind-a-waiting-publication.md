@@ -57,19 +57,26 @@ connection.
   behind it are taken first, then the held packet, then the lane. A packet
   kept behind that is a PUBLISH can wait for a slot in its turn.
 
-A 3.1.1 client can therefore have 41 QoS 2 exchanges in flight: the window
-of eight, the publication that waits, and thirty-two packets behind it.
+A 3.1.1 client can therefore have 41 small QoS 2 exchanges in flight:
+the window of eight, the waiting publication and thirty-two packets behind
+it. Large packets can fill the byte budget earlier.
 
 This amends record 0046: the cycle is closed for a client that was
 announced no window, up to the bound above.
 
 ## Consequences
 
-- A 3.1.1 publisher that keeps up to 41 QoS 2 exchanges in flight completes
+- A 3.1.1 publisher that keeps up to 41 QoS 2 exchanges whose prefix fits both budgets completes
   them all, and its subscribers receive the messages once and in order.
 - A connection can hold thirty-two more packets, and the bytes of one
   largest packet, than its lane already could.
 - MQTT 5 retains its Receive Maximum and DISCONNECT 0x93.
+
+When delivery shards are enabled, record 0066 assigns subscriber PUBACK,
+PUBREC and PUBCOMP to the delivery owner for that connection generation.
+These acknowledge traffic in the opposite direction. The coordinator's
+bounded reader still orders incoming publications, their PUBREL and the
+rest of its lane as above. [Delivery owner routing and close fences](0066-lot10-delivery-owners-sharding.md)
 
 ## Amendment for a saturated MQTT 3.1.1 lookahead
 
