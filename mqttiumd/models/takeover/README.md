@@ -18,8 +18,9 @@ python ../tools/formal/run_tlc.py --models-dir models/takeover --list
 python ../tools/formal/run_tlc.py --models-dir models/takeover
 ```
 
-20 configurations, the whole directory in about forty-five seconds; the
-largest explores 208,572 states in about ten.
+The directory contains 20 configurations of `MTakeoverInFlight` and three
+of `MDisconnectQueue`. To check only the ordering of outgoing MQTT packets,
+run `python ../tools/formal/run_tlc.py --models-dir models/takeover MDisconnectQueue`.
 
 ## What is modelled
 
@@ -60,7 +61,7 @@ generation it was submitted on; its receipt and its result carry that
   fix: `inbox` is a set and the owner takes any input. The one order kept
   is that of `pop_closing_input`: `ConnectionClosed` waits for an older
   ordinary input of its generation.
-- The MQTT 5 DISCONNECT sent to the old connection, the 300 ms bound of
+- In `MTakeoverInFlight`, the MQTT 5 DISCONNECT sent to the old connection, the 300 ms bound of
   `closing`, the Will barrier and every store operation. A takeover close
   is a close that is due once `closing` is set.
 - `Lanes::reports`, Started and NotStarted, which `MTransportCredit`
@@ -140,6 +141,9 @@ while another failed.
 | `TaskError` | Any `Err` of `turn` | `noncanonical_header_is_a_malformed_packet_not_clean_eof` (`net.rs`) |
 | `TaskFinish` | `Driven::finish`: `Control::stop`, `Lanes::finish`; `retire`. A TLS task attempts close_notify first: `a_tls_client_reads_close_notify_after_its_disconnect` (`runtime_tests.rs`) | `cancellation_reports_every_accepted_output_frame`; `a_terminal_turn_publishes_its_facts_before_the_link_reads_finished` (`net/reactor.rs`) |
 | `Quiescent` | The end of a run of the model | Not an action of the code |
+| `Admit`, `RejectSealed` | `Runtime::start_takeover` and the shard's `OutgoingHandle` submit to `ConnCore::try_send_outgoing`. Under one mutex, `OutgoingState::enqueue` places DISCONNECT and closes admission to later submissions. | `a_queued_disconnect_is_terminal_for_every_outgoing_handle` submits on both handles. |
+| `TakeBatch`, `WriteOne` | `ConnCore::pop_outgoing_batch` takes a FIFO prefix. The socket task sends its frames in order. | `a_queued_disconnect_is_terminal_for_every_outgoing_handle` reads the admitted PUBLISH followed by DISCONNECT on a TCP socket. |
+| `Finished` | The finite scenario has exhausted both producers and drained the socket queue. | The end of the same test. |
 
 The sidecar lists under `replays` the tests that drive the code through
 the counterexample of a mutant or a trace of the model: the generation
@@ -148,3 +152,23 @@ collected, and the takeover that waits for the old peer. No test replays
 `mut-record-before-shutdown`, `mut-cancel-without-shutdown`,
 `mut-open-without-waiting` or `mut-deferred-without-waiting` with a frame
 in flight: they need a chosen schedule of the core and reactor threads.
+
+## MQTT 5 DISCONNECT on the old connection
+
+`MDisconnectQueue` checks MQTT-3.14.4-1 on one generation during the
+interval between the coordinator queuing DISCONNECT and the socket closing.
+The shard has two PUBLISH packets in order, and the FIFO holds two frames.
+The reader can hold a batch outside the mutex while either producer runs.
+The model observes complete MQTT packets. TCP fragmentation, TLS records,
+transport failures and the subsequent opening of the new generation are
+outside this check.
+
+`TerminalWire` requires DISCONNECT to be the last packet in every wire
+prefix that contains it. The `mut-no-seal` configuration keeps admission
+open as in the original sharded queue. The socket can then transmit the
+shard's PUBLISH after the coordinator's DISCONNECT. The `reach-drained-prefix`
+configuration witnesses an earlier PUBLISH reaching the wire, DISCONNECT
+being written next, and the shard's later submission being refused.
+On the original implementation the deterministic test detects the late
+admission at the shard handle. TLC follows that admitted frame through
+the socket write to exhibit the wire-order violation.

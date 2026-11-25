@@ -1,0 +1,13 @@
+{
+  "module": "MDisconnectQueue.tla",
+  "status": "refinement",
+  "summary": "On the old connection during MQTT 5 takeover, both the coordinator and the delivery shard submit to one FIFO. Admitting DISCONNECT seals the queue under its mutex while the socket task drains earlier frames in order.",
+  "issues": [648],
+  "tests": ["mqttiumd/crates/mqttiumd/src/net.rs"],
+  "replays": [{"file": "mqttiumd/crates/mqttiumd/src/net.rs", "test": "a_queued_disconnect_is_terminal_for_every_outgoing_handle"}],
+  "configs": [
+    {"config": "MDisconnectQueue-safety.cfg", "expect": "pass", "invariants": ["TypeOK", "TerminalWire"]},
+    {"config": "MDisconnectQueue-mut-no-seal.cfg", "expect": "violation", "invariant": "TerminalWire"},
+    {"config": "MDisconnectQueue-reach-drained-prefix.cfg", "expect": "violation", "invariant": "NoDrainedPrefixWitness"}
+  ]
+}
