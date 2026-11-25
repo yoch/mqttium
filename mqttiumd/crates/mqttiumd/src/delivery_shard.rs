@@ -2391,4 +2391,6 @@ impl EffectSink for ShardSink<'_> {
 }
 
 #[cfg(test)]
+mod fence_tests;
+#[cfg(test)]
 mod notice_tests;
