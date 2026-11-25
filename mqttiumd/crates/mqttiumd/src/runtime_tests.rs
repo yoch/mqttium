@@ -1171,6 +1171,118 @@ fn a_deferred_subscription_cannot_be_overtaken_by_its_later_unsubscribe() {
     });
 }
 
+/// Stage an already-read prefix at its exact budget without relying on
+/// network timing or putting an oversized burst on the transport.
+fn mqtt311_lookahead_closure(bytes: bool) {
+    with_runtime(128, |runtime, directory| {
+        let persistent = || codec::Connect {
+            version: codec::Version::V311,
+            keep_alive: 0,
+            ..connect_packet(b"lookahead-source")
+        };
+        let (source, mut client) = peer(runtime);
+        runtime.connect(source, persistent()).unwrap();
+        assert_eq!(served_frame(runtime, &mut client), (0x20, vec![0, 0]));
+        let session = runtime.peers[&source].session.unwrap();
+        let window = crate::receiving::MAXIMUM as u16;
+        let publish = |runtime: &mut Runtime<'_>, source, id: u16| {
+            let [high, low] = id.to_be_bytes();
+            runtime
+                .packet(source, 0x34, vec![0, 1, b't', high, low, b'v'])
+                .unwrap();
+        };
+        for id in 1..=window {
+            publish(runtime, source, id);
+        }
+        for id in 1..=window {
+            assert_eq!(
+                served_frame(runtime, &mut client),
+                (0x50, id.to_be_bytes().to_vec())
+            );
+        }
+        let (other, mut independent) = peer(runtime);
+        runtime
+            .connect(other, connect_packet(b"independent"))
+            .unwrap();
+        assert_eq!(served_frame(runtime, &mut independent).0, 0x20);
+        publish(runtime, source, window + 1);
+        let waiting = runtime.peers.get_mut(&source).unwrap();
+        assert!(waiting.deferred_publish().is_some());
+        let observed = Ok(MessageTime {
+            domain: [1; 32],
+            tick: 0,
+        });
+        if bytes {
+            // Two ordinary QoS 0 bodies, each within the supported payload bound.
+            for size in [BEHIND_BYTES / 2, BEHIND_BYTES - BEHIND_BYTES / 2] {
+                let mut body = vec![b'x'; size];
+                body[..3].copy_from_slice(&[0, 1, b't']);
+                waiting.keep_behind((0x30, body.into(), observed)).unwrap();
+            }
+        } else {
+            for _ in 0..BEHIND_PACKETS {
+                waiting
+                    .keep_behind((0xc0, Vec::new().into(), observed))
+                    .unwrap();
+            }
+        }
+        waiting.cold_mut().held_packet = Some((0x30, vec![0, 1, b't'].into(), observed));
+        until(runtime, |r| !r.peers.contains_key(&source));
+        let events = std::fs::read_to_string(directory.join("events.jsonl")).unwrap();
+        assert!(
+            events
+                .lines()
+                .filter_map(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+                .any(|e| e["kind"] == "connection_closed"
+                    && e["connection"] == source.get().to_string()
+                    && e["details"]["code"] == "receive_lookahead_capacity")
+        );
+
+        independent.write_all(&[0xc0, 0]).unwrap();
+        assert_eq!(served_frame(runtime, &mut independent), (0xd0, Vec::new()));
+        let (resumed, mut client) = peer(runtime);
+        runtime.connect(resumed, persistent()).unwrap();
+        assert_eq!(served_frame(runtime, &mut client), (0x20, vec![1, 0]));
+        assert_eq!(runtime.peers[&resumed].session, Some(session));
+        for id in 1..=window {
+            assert!(
+                runtime
+                    .owner
+                    .exchange(session, InboundPacketId::new(id).unwrap())
+                    .is_some()
+            );
+            runtime
+                .packet(resumed, 0x62, id.to_be_bytes().to_vec())
+                .unwrap();
+            assert_eq!(
+                served_frame(runtime, &mut client),
+                (0x70, id.to_be_bytes().to_vec())
+            );
+        }
+        assert!(
+            runtime
+                .owner
+                .exchange(session, InboundPacketId::new(window + 1).unwrap())
+                .is_none()
+        );
+        publish(runtime, resumed, window + 1);
+        assert_eq!(
+            served_frame(runtime, &mut client),
+            (0x50, (window + 1).to_be_bytes().to_vec())
+        );
+    });
+}
+
+#[test]
+fn mqtt311_packet_lookahead_closes_only_the_blocked_peer() {
+    mqtt311_lookahead_closure(false);
+}
+
+#[test]
+fn mqtt311_byte_lookahead_closes_only_the_blocked_peer() {
+    mqtt311_lookahead_closure(true);
+}
+
 /// MQTT 3.1.1 has no Receive Maximum: a client cannot know the broker's
 /// window, so a burst beyond it is pressure. The publications wait for the
 /// acknowledgements that free the window; every one is acknowledged and
