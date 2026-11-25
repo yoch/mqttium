@@ -607,6 +607,82 @@ fn sharded_bidirectional_fanin_qos2_and_max_packet_discard() {
 }
 
 #[test]
+fn full_retained_inventory_rejects_a_new_topic_and_replays_every_admitted_topic() {
+    for shards in [0, 2] {
+        check_full_retained_inventory(shards);
+    }
+}
+
+fn check_full_retained_inventory(shards: usize) {
+    const TOPICS: u16 = 4_096;
+    let broker = Broker::start("retained-inventory", "volatile", shards);
+    let mut publisher = connect_v5(broker.address, "inventory-writer");
+    for batch in (1..=TOPICS).step_by(8) {
+        let mut packets = Vec::new();
+        for id in batch..batch + 8 {
+            let topic = format!("inventory/{id}");
+            packets.extend(publish_packet(1, true, Some(id), &topic, &id.to_be_bytes()));
+        }
+        publisher.write_all(&packets).unwrap();
+        for id in batch..batch + 8 {
+            let (header, body) = read_packet(&mut publisher).unwrap();
+            assert_eq!(header, 0x40);
+            assert_eq!(&body[..2], &id.to_be_bytes());
+            assert_eq!(body[2], 0x10, "retained admission {id}");
+        }
+    }
+    let overflow = TOPICS + 1;
+    publisher
+        .write_all(&publish_packet(
+            1,
+            true,
+            Some(overflow),
+            "inventory/overflow",
+            b"overflow",
+        ))
+        .unwrap();
+    let (header, body) = read_packet(&mut publisher).unwrap();
+    assert_eq!(header, 0x40);
+    assert_eq!(&body[..2], &overflow.to_be_bytes());
+    assert_eq!(
+        body[2], 0x97,
+        "a new retained topic must be refused at capacity"
+    );
+
+    let mut reader = connect_v5(broker.address, "inventory-reader");
+    subscribe_v5(&mut reader, 1, "inventory/+", 1);
+    let mut seen = BTreeSet::new();
+    for _ in 0..TOPICS {
+        let (header, body) = read_packet(&mut reader).unwrap();
+        let (qos, retain, topic, pid, payload) = decode_v5_publish(header, &body);
+        assert_eq!(qos, 1);
+        assert!(retain);
+        let id = u16::from_be_bytes(payload.try_into().expect("two-byte inventory payload"));
+        assert!((1..=TOPICS).contains(&id));
+        assert_eq!(topic, format!("inventory/{id}"));
+        assert!(seen.insert(id), "duplicate retained topic {id}");
+        send_ack(&mut reader, 0x40, pid.unwrap());
+    }
+
+    publisher
+        .write_all(&publish_packet(
+            1,
+            false,
+            Some(overflow + 1),
+            "inventory/done",
+            b"done",
+        ))
+        .unwrap();
+    let (header, body) = read_packet(&mut reader).unwrap();
+    let (qos, retain, topic, pid, payload) = decode_v5_publish(header, &body);
+    assert_eq!(
+        (qos, retain, topic.as_str(), payload.as_slice()),
+        (1, false, "inventory/done", b"done".as_slice())
+    );
+    send_ack(&mut reader, 0x40, pid.unwrap());
+}
+
+#[test]
 fn sharded_qos0_live_burst_and_retained_replay() {
     const BURST: usize = 150;
     for mode in ["volatile", "log"] {
