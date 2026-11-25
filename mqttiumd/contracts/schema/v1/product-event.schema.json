@@ -759,7 +759,8 @@
               "closing_inputs": {
                 "type": "integer",
                 "minimum": 0,
-                "maximum": 32
+                "maximum": 8192,
+                "description": "Two closing facts per transport and at most 4096 transports (runtime::Limits)."
               }
             }
           }

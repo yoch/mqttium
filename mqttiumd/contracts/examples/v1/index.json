@@ -126,6 +126,7 @@
     "contracts/examples/v1/valid/product-puback-credit.json",
     "contracts/examples/v1/valid/product-session-shutdown-completed.json",
     "contracts/examples/v1/valid/product-session-shutdown-unknown.json",
+    "contracts/examples/v1/valid/product-session-shutdown-closing-input-limit.json",
     "contracts/examples/v1/valid/product-session-shutdown-business-unknown.json",
     "contracts/examples/v1/valid/product-writer-shutdown-deadline.json",
     "contracts/examples/v1/valid/product-session-change-copied.json",

@@ -16,6 +16,6 @@
     "lifecycle_pending": true,
     "retired_flights": 256,
     "in_flight": 17,
-    "closing_inputs": 33
+    "closing_inputs": 8193
   }
 }
