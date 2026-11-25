@@ -129,8 +129,9 @@ def listener(work, binary, pki, reference):
                                    codes=[0x87])
             finish(dashboard)
         if not reference:
-            with peer(port, pki, "sensor") as sensor:
-                connect(sensor, "dashboard", clean=False, reason=0x87)
+            for clean in (False, True):
+                with peer(port, pki, "sensor") as sensor:
+                    connect(sensor, "dashboard", clean=clean, reason=0x87)
         with peer(port, pki, "dashboard") as dashboard, peer(port, pki, "sensor") as sensor:
             connect(dashboard, "dashboard", clean=False, present=True)
             connect(sensor, "capteur-1")
