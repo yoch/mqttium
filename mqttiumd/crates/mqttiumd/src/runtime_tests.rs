@@ -54,24 +54,52 @@ fn with_runtime_clock_hooks(
     hooks: Hooks,
     test: impl FnOnce(&mut Runtime<'_>, &Path),
 ) {
+    with_runtime_layout(max_exchanges, TestWriter::Single(clock), hooks, test);
+}
+
+enum TestWriter {
+    Single(Arc<dyn SessionClock>),
+    Sharded(NonZeroUsize),
+}
+
+fn with_runtime_layout(
+    max_exchanges: u32,
+    writer: TestWriter,
+    hooks: Hooks,
+    test: impl FnOnce(&mut Runtime<'_>, &Path),
+) {
     let directory = Directory::new();
     let events = Events::open(&directory.0.join("events.jsonl")).unwrap();
     let cancel = Arc::new(AtomicBool::new(false));
-    let mut writer = Writer::spawn_with_clock(
-        directory.0.join("store.sqlite"),
-        events.clone(),
-        hooks.clone(),
-        cancel.clone(),
-        clock,
-    )
-    .unwrap();
+    let path = directory.0.join("store.sqlite");
+    let (writer, shards) = match writer {
+        TestWriter::Single(clock) => (
+            Writer::spawn_with_clock(path, events.clone(), hooks.clone(), cancel.clone(), clock),
+            0,
+        ),
+        TestWriter::Sharded(count) => (
+            Writer::spawn_configured_sharded(
+                path,
+                events.clone(),
+                hooks.clone(),
+                cancel.clone(),
+                None,
+                false,
+                crate::writer::StorageMode::Durable,
+                count.get(),
+            ),
+            count.get(),
+        ),
+    };
+    let mut writer = writer.unwrap();
     let boot = writer
         .boot
         .recv_timeout(Duration::from_secs(3))
         .unwrap()
         .unwrap();
     let (incarnation, epoch) = (boot.grant.incarnation(), boot.grant.epoch());
-    let mut authority = OwnerAuthority::from_grant(boot.grant, NonZeroU32::MIN).unwrap();
+    let mut authority =
+        OwnerAuthority::from_grant(boot.grant, nz(1 + u32::try_from(shards).unwrap())).unwrap();
     let outbox = authority
         .create_outbox(
             LogicalOwnerId::new(0),
@@ -79,7 +107,7 @@ fn with_runtime_clock_hooks(
             nz(65536),
         )
         .unwrap();
-    let owner = Owner::new(
+    let mut owner = Owner::new(
         OwnerConfig {
             max_sessions: nz(128),
             max_routes: nz(128),
@@ -94,6 +122,10 @@ fn with_runtime_clock_hooks(
         outbox,
     )
     .unwrap();
+    if shards != 0 {
+        owner.enable_inline_claims();
+        owner.enable_delegated_deliveries();
+    }
     let mut runtime = Runtime {
         progress: 0,
         wake: writer.wake.clone(),
@@ -244,6 +276,34 @@ fn with_runtime_clock_hooks(
             }
         }
         assert!(!runtime.owner.is_recovering());
+        if shards != 0 {
+            let outboxes = (1..=shards)
+                .map(|index| {
+                    runtime
+                        ._authority
+                        .create_outbox(
+                            LogicalOwnerId::new(index as u64),
+                            NonZeroUsize::new(128).unwrap(),
+                            nz(64),
+                        )
+                        .unwrap()
+                })
+                .collect();
+            runtime.shards = Some(
+                crate::delivery_shard::ShardPool::spawn(
+                    outboxes,
+                    runtime.writer.threaded_mut().take_shard_handles(),
+                    runtime.owner.shard_limits().unwrap(),
+                    Limits::BOUNDED,
+                    runtime.events.clone(),
+                    runtime.clock.clone(),
+                    runtime.wake.clone(),
+                    cancel.clone(),
+                )
+                .unwrap(),
+            );
+        }
+
         test(&mut runtime, &directory.0);
     }));
     for (_, peer) in std::mem::take(&mut runtime.peers) {
@@ -261,6 +321,9 @@ fn with_runtime_clock_hooks(
         );
     }
     cancel.store(true, Ordering::Relaxed);
+    if let Some(shards) = runtime.shards.take() {
+        shards.shutdown(Duration::from_secs(3)).unwrap();
+    }
     writer.sender.send(Request::Stop).unwrap();
     while !writer.is_finished() && Instant::now() < deadline {
         while writer.receiver.try_recv().is_ok() {}
@@ -7845,3 +7908,6 @@ fn an_unsuback_owed_while_the_output_is_full_is_delivered_when_room_returns() {
         assert_eq!(served_frame(runtime, &mut client), (0xd0, vec![]));
     });
 }
+
+#[path = "runtime_tests/sharded_retained.rs"]
+mod sharded_retained;

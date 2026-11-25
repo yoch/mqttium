@@ -408,7 +408,15 @@ struct ToCoreState {
     written_seen: u8,
 }
 
+#[cfg(test)]
+#[derive(Default)]
+struct HeldOutput {
+    refused: Option<(u8, LogicalOwnerId)>,
+}
+
 struct OutgoingState {
+    #[cfg(test)]
+    held: Option<HeldOutput>,
     queue: VecDeque<Write>,
     tx_alive: bool,
     accepting_frames: bool,
@@ -848,6 +856,8 @@ impl ConnCore {
                 written_seen: 0,
             }),
             outgoing: Mutex::new(OutgoingState {
+                #[cfg(test)]
+                held: None,
                 queue: VecDeque::new(),
                 tx_alive: true,
                 accepting_frames: true,
@@ -934,6 +944,13 @@ impl ConnCore {
             return Err(TrySendError::Disconnected(frame));
         }
         if state.queue.len() >= OUTPUT_SLOTS {
+            #[cfg(test)]
+            if let Some(held) = state.held.as_mut()
+                && let Some((id, _)) = frame.correlation
+                && let Some(&first) = frame.bytes.first()
+            {
+                held.refused = Some((first, id.owner));
+            }
             return Err(TrySendError::Full(frame));
         }
         // Closing takes this same lock before collecting unfinished writes.
@@ -990,6 +1007,10 @@ impl ConnCore {
             Ok(guard) => guard,
             Err(_) => return Err(()),
         };
+        #[cfg(test)]
+        if state.held.is_some() {
+            return Ok(());
+        }
         let Some(first) = state.queue.pop_front() else {
             if !state.tx_alive {
                 return Err(());
@@ -2311,6 +2332,19 @@ impl Connection {
         {
             ready.push(*id);
         }
+    }
+
+    /// Keep real frames in this connection's output FIFO until the test
+    /// releases them. A blocked reader then does not depend on TCP buffers.
+    #[cfg(test)]
+    pub fn hold_output(&self, hold: bool) {
+        self.core.outgoing.lock().unwrap().held = hold.then(HeldOutput::default);
+        self.core.link.notify();
+    }
+
+    #[cfg(test)]
+    pub fn held_output_refusal(&self) -> Option<(u8, LogicalOwnerId)> {
+        self.core.outgoing.lock().unwrap().held.as_ref()?.refused
     }
 
     #[cfg(test)]
