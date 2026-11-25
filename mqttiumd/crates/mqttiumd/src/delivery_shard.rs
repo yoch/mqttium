@@ -2300,6 +2300,12 @@ impl EffectSink for ShardSink<'_> {
                     .get(&connection.session)
                     .filter(|s| s.generation == connection.generation && !s.outgoing.is_cancelled())
                 {
+                    // A previously closed transport can still own pending
+                    // write receipts. Retain the effect while that shared
+                    // budget drains; only socket pressure is a QoS 0 drop.
+                    if !sess.outgoing.has_write_receipt_credit() {
+                        return refused(effect, SubmitBlock::QueueFull);
+                    }
                     let version = sess.version;
                     let expiry_val = expiry.as_deref().copied();
                     match codec::encode_qos0_segments(

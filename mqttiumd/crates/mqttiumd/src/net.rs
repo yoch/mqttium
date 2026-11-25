@@ -721,6 +721,15 @@ impl OutgoingHandle {
         self.core.try_send_outgoing(frame)
     }
 
+    /// Only the owning shard admits its correlated writes. I/O threads can
+    /// return credit between this check and admission but cannot consume it.
+    pub(crate) fn has_write_receipt_credit(&self) -> bool {
+        self.core
+            .shard_route
+            .get()
+            .is_some_and(|route| route.inbox.write_slots.load(Ordering::Acquire) != 0)
+    }
+
     pub(crate) fn pending_shard_acks(&self) -> usize {
         self.core
             .shard_route
@@ -3612,6 +3621,7 @@ mod tests {
             assert!(route.reserve_write(id));
         }
         assert!(!route.reserve_write(refused));
+        assert!(!connection.outgoing_handle().has_write_receipt_credit());
         let mut reports = vec![Report::Written(Written::Complete {
             correlation: Some((finished, key)),
             bytes: 4,
@@ -3653,6 +3663,7 @@ mod tests {
             .collect();
         assert_eq!(failed, [active, interrupted]);
         assert_eq!(inbox.write_slots.load(Ordering::Acquire), 3);
+        assert!(connection.outgoing_handle().has_write_receipt_credit());
         let late = Write {
             correlation: Some((refused, key)),
             expiry: None,
