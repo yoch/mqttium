@@ -33,6 +33,10 @@ impl Notices {
         }
     }
 
+    pub(super) fn wake_coordinator(&self) {
+        self.wake.wake();
+    }
+
     fn lock(&self) -> MutexGuard<'_, State> {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }

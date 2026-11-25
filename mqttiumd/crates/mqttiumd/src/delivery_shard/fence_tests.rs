@@ -75,7 +75,7 @@ fn submitted_ack_precedes_detach_even_when_the_writer_withholds_credit() {
         owner,
         store,
         coord_rx,
-        ShardInbox::new(wake.clone()),
+        ShardInbox::new(wake.clone(), 8, 8),
         Arc::new(Notices::new(wake)),
         events,
         Arc::new(crate::session_time::SystemClock::new().unwrap()),
@@ -150,11 +150,12 @@ fn submitted_ack_precedes_detach_even_when_the_writer_withholds_credit() {
     assert!(worker.owner.outbox().unwrap().pending().any(is_finish));
 
     worker.limits.in_flight = 0;
+    let completed = Arc::<AtomicBool>::default();
     commands
         .send(CoordToShard::Detach {
-            session,
-            generation,
+            connection: key,
             dirty_seq: 2,
+            completed: Arc::clone(&completed),
         })
         .unwrap();
     let other = SessionId::new(2);
@@ -167,12 +168,16 @@ fn submitted_ack_precedes_detach_even_when_the_writer_withholds_credit() {
         Some(generation),
         "detached while FinishDelivery was still blocked at the writer"
     );
+    assert!(!completed.load(Ordering::Acquire));
     worker.limits.in_flight = 8;
     worker.dispatch().unwrap();
     let Ok(Request::Effect(effect)) = requests.try_recv() else {
         panic!("FinishDelivery was not submitted");
     };
     assert!(is_finish(&effect));
+    worker.drain_coord_messages().unwrap();
+    assert!(worker.owner.connection_of(session).is_some());
+    assert!(!completed.load(Ordering::Acquire));
     let Effect::Persist { command } = effect.effect() else {
         unreachable!()
     };
@@ -197,4 +202,6 @@ fn submitted_ack_precedes_detach_even_when_the_writer_withholds_credit() {
     ));
     worker.drain_coord_messages().unwrap();
     assert_eq!(worker.owner.connection_of(session), None);
+    assert!(completed.load(Ordering::Acquire));
+    socket.close();
 }

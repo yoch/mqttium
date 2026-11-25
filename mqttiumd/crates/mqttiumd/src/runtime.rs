@@ -251,6 +251,7 @@ struct PeerCold {
     behind_bytes: usize,
     blocked_output: Option<EffectId>,
     retire_code: Option<&'static str>,
+    shard_detached: Option<Arc<AtomicBool>>,
 }
 
 impl PeerCold {
@@ -268,6 +269,7 @@ impl PeerCold {
             && self.behind.is_empty()
             && self.blocked_output.is_none()
             && self.retire_code.is_none()
+            && self.shard_detached.is_none()
     }
 
     #[inline]
@@ -1741,6 +1743,28 @@ impl Runtime<'_> {
         generation: ConnectionGeneration,
         code: &'static str,
     ) -> Result<(), Failure> {
+        if let Some(shards) = self.shards.as_mut()
+            && let Some(peer) = self.peers.get_mut(&generation)
+            && let Some(session) = peer.session
+        {
+            // Both TCP and TLS publish their final I/O observations before
+            // marking the task finished. A takeover already waits for this
+            // peer to leave the table before it submits the next Open.
+            if !peer.io.is_finished() {
+                return Ok(());
+            }
+            let cold = peer.cold_mut();
+            let detached = cold.shard_detached.get_or_insert_with(|| {
+                shards.detach_session(
+                    session,
+                    generation,
+                    self.owner.pending_delegated_inline_count(session),
+                )
+            });
+            if !detached.load(Ordering::Acquire) {
+                return Ok(());
+            }
+        }
         let origin = self.origin();
         if let Some(peer) = self.peers.remove(&generation) {
             self.pending_peers.remove(&generation);
@@ -1806,12 +1830,6 @@ impl Runtime<'_> {
                 }
             }
             if let Some(session) = peer.session {
-                if self.shards.is_some() {
-                    let pending = self.owner.pending_delegated_inline_count(session);
-                    if let Some(shards) = self.shards.as_mut() {
-                        shards.detach_session(session, generation, pending);
-                    }
-                }
                 if let Some(input) = Self::closure_input(session, generation, opened_by, intent) {
                     self.queue(input)?;
                 }
@@ -1890,7 +1908,8 @@ impl Runtime<'_> {
             self.drain_inputs()?;
             self.dispatch()?;
             let status = self.owner.session_status();
-            let complete = !status.lifecycle_pending
+            let complete = (self.shards.is_none() || self.peers.is_empty())
+                && !status.lifecycle_pending
                 && status.retired_flights == 0
                 && self.sessions.values().all(|session| {
                     session.expiry == SessionExpiry::Never

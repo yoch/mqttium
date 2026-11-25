@@ -597,6 +597,25 @@ impl ShardInbox {
         self.wake.wake();
     }
 
+    /// Called only on the closing path, after the reactor task has finished.
+    pub(crate) fn has_events_for(&self, generation: ConnectionGeneration) -> bool {
+        self.has_pending()
+            && self
+                .queue
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .iter()
+                .any(|event| match event {
+                    ShardIoEvent::AckPacket { connection, .. } => {
+                        connection.generation == generation
+                    }
+                    ShardIoEvent::Written {
+                        generation: observed,
+                        ..
+                    } => *observed == generation,
+                })
+    }
+
     pub fn drain_into(&self, out: &mut VecDeque<ShardIoEvent>, limit: usize) -> usize {
         if !self.pending.load(Ordering::Acquire) {
             return 0;

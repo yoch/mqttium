@@ -321,6 +321,30 @@ impl Owner {
         Ok(())
     }
 
+    /// Whether an ACK observed on this generation still needs its store
+    /// transition. An early ACK may be waiting for the durable start marker.
+    /// Only the closing path pays for walking the session's delivery index.
+    #[must_use]
+    pub fn shard_ack_pending(&self, connection: ConnectionKey) -> bool {
+        self.connection_of(connection.session) == Some(connection.generation)
+            && self
+                .pubsub
+                .deliveries
+                .session(connection.session)
+                .is_some_and(|session| {
+                    session.all.iter().any(|index| {
+                        let delivery = self.pubsub.deliveries.row(index);
+                        !delivery.retired
+                            && (delivery.early_puback
+                                || delivery.early_pubrec.is_some()
+                                || matches!(
+                                    delivery.phase,
+                                    Phase::FinishPending(_) | Phase::PubrelPending(_)
+                                ))
+                    })
+                })
+    }
+
     /// Detaches `connection` from `session` on a `DeliveryShard` owner while
     /// keeping durable session deliveries ready for a later reconnect.
     pub fn shard_detach_session(

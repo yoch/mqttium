@@ -187,9 +187,9 @@ pub(crate) enum CoordToShard {
         dirty_seq: u64,
     },
     Detach {
-        session: SessionId,
-        generation: ConnectionGeneration,
+        connection: ConnectionKey,
         dirty_seq: u64,
+        completed: Arc<AtomicBool>,
     },
     Retire {
         session: SessionId,
@@ -422,10 +422,10 @@ impl ShardPool {
         session: SessionId,
         generation: ConnectionGeneration,
         pending_inline_count: usize,
-    ) {
-        // The coordinator has already removed this exact peer. Any pending
-        // close is satisfied, and later notices for this generation are stale.
+    ) -> Arc<AtomicBool> {
+        // The transport has finished, so its close request has been satisfied.
         self.notices.detach(generation);
+        let completed = Arc::<AtomicBool>::default();
         let lease = self.lease_of(session);
         let seq = lease.mark_dirty();
         let dirty_seq = if pending_inline_count == 0 {
@@ -439,11 +439,15 @@ impl ShardPool {
         self.send_to(
             idx,
             CoordToShard::Detach {
-                session,
-                generation,
+                connection: ConnectionKey {
+                    session,
+                    generation,
+                },
                 dirty_seq,
+                completed: Arc::clone(&completed),
             },
         );
+        completed
     }
 
     pub(crate) fn retire_session(&mut self, session: SessionId) {
@@ -724,6 +728,9 @@ struct DeliveryShardWorker {
     stopping: bool,
 
     sessions: FlatMap<SessionId, ShardSession>,
+    // The coordinator retains the closing peer until its own receipt is set.
+    // This bounds the number of fences by the process connection limit.
+    pending_detaches: BTreeMap<ConnectionKey, (u64, Arc<AtomicBool>)>,
     outgoing_bindings: FlatMap<(ConnectionKey, OutboundPacketId), PubackTarget>,
     frames: ScopedFlatMap<EffectId, ShardPendingFrame>,
     inflight: ScopedFlatMap<EffectId, OperationId>,
@@ -778,6 +785,7 @@ impl DeliveryShardWorker {
             progress: 0,
             stopping: false,
             sessions: FlatMap::new(),
+            pending_detaches: BTreeMap::new(),
             outgoing_bindings: FlatMap::new(),
             frames: ScopedFlatMap::new(),
             inflight: ScopedFlatMap::new(),
@@ -1211,16 +1219,37 @@ impl DeliveryShardWorker {
         }
     }
 
-    fn flush_pre_detach(&mut self) -> Result<(), Failure> {
-        self.drain_pending_inline()?;
-        for _ in 0..8 {
-            let before = self.progress;
-            self.drain_io_events()?;
-            self.drain_inputs()?;
-            self.dispatch()?;
-            if self.progress == before {
-                break;
+    fn finish_detaches(&mut self) -> Result<(), Failure> {
+        if self.pending_detaches.is_empty() {
+            return Ok(());
+        }
+        // The reactor task has already finished. No later packet or write
+        // report can enter behind this generation's final observation.
+        let ready: Vec<_> = self.pending_detaches.keys().copied().filter(|key| {
+            !self.io_inbox.has_events_for(key.generation)
+                && !self.ack_inputs.iter().any(|(input, _)| matches!(input,
+                    Input::ObservedPuback {connection,..} | Input::ObservedQos2Ack {connection,..} if connection == key))
+                && !self.terminal_inputs.iter().any(|input| matches!(input,
+                    Input::FrameResult {connection,..} | Input::Qos0EmitRefused {connection,..} if connection == key))
+                && !self.owner.shard_ack_pending(*key)
+        }).collect();
+        for key in ready {
+            let (dirty_seq, completed) =
+                self.pending_detaches.remove(&key).expect("selected fence");
+            self.cleanup_generation_state(key.generation);
+            self.owner
+                .shard_detach_session(key.session, key.generation)
+                .map_err(|_| Failure::plain("shard_detach_fault"))?;
+            if let Some(sess) = self.sessions.get_mut(&key.session)
+                && sess.generation == key.generation
+            {
+                sess.lease_published = false;
+                sess.seen_dirty_seq = dirty_seq;
+                sess.in_flight_load = None;
             }
+            completed.store(true, Ordering::Release);
+            self.notices.wake_coordinator();
+            self.progress = self.progress.wrapping_add(1);
         }
         Ok(())
     }
@@ -1246,7 +1275,8 @@ impl DeliveryShardWorker {
                             if let Some(old_gen) = old_gen
                                 && old_gen != generation
                             {
-                                self.flush_pre_detach()?;
+                                // A resumed connection cannot open until the old
+                                // generation's detach receipt releases the peer.
                                 self.cleanup_generation_state(old_gen);
                             }
                             self.owner
@@ -1277,25 +1307,14 @@ impl DeliveryShardWorker {
                             self.queue_work(session);
                         }
                         CoordToShard::Detach {
-                            session,
-                            generation,
+                            connection,
                             dirty_seq,
+                            completed,
                         } => {
-                            self.flush_pre_detach()?;
-                            self.cleanup_generation_state(generation);
-                            self.owner
-                                .shard_detach_session(session, generation)
-                                .map_err(|_| Failure::plain("shard_detach_fault"))?;
-                            if let Some(sess) = self.sessions.get_mut(&session)
-                                && sess.generation == generation
-                            {
-                                sess.lease_published = false;
-                                sess.seen_dirty_seq = dirty_seq;
-                                sess.in_flight_load = None;
-                            }
+                            self.pending_detaches
+                                .insert(connection, (dirty_seq, completed));
                         }
                         CoordToShard::Retire { session } => {
-                            self.flush_pre_detach()?;
                             if let Some(sess) = self.sessions.remove(&session) {
                                 self.cleanup_generation_state(sess.generation);
                             }
@@ -1386,7 +1405,7 @@ impl DeliveryShardWorker {
                 }
             }
         }
-        Ok(())
+        self.finish_detaches()
     }
 
     fn cleanup_generation_state(&mut self, generation: ConnectionGeneration) {
