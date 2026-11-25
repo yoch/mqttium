@@ -626,8 +626,7 @@ impl Task {
         }
         let avail = self.core.incoming_free_slots();
         let limit = avail.clamp(1, BURST);
-        let core = Arc::clone(&self.core);
-        let credit = core.reserve_shard_read(limit);
+        let credit = self.core.reserve_shard_read(limit);
         let limit = credit.as_ref().map_or(limit, |batch| batch.remaining);
         if limit == 0 {
             return Ok(progressed);

@@ -1963,8 +1963,8 @@ impl EffectSink for ShardSink<'_> {
             || self
                 .terminal_inputs
                 .len()
-                .saturating_add(2 * self.frames.len())
-                >= self.limits.terminal_inputs)
+                .saturating_add(2 * (self.frames.len() + 1))
+                > self.limits.terminal_inputs)
         {
             return refused(effect, SubmitBlock::QueueFull);
         }

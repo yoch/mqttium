@@ -502,22 +502,22 @@ struct RouteAcks {
     budget: Arc<ShardAckBudget>,
 }
 
-struct ShardAckBatch<'a> {
-    route: &'a ShardIoRoute,
+struct ShardAckBatch {
+    acks: Arc<RouteAcks>,
     remaining: usize,
 }
 
-impl ShardAckBatch<'_> {
+impl ShardAckBatch {
     fn take(&mut self) -> ShardAckCredit {
         self.remaining = self.remaining.checked_sub(1).expect("reserved shard ACK");
-        self.route.acks.pending.fetch_add(1, Ordering::Release);
-        ShardAckCredit(Arc::clone(&self.route.acks))
+        self.acks.pending.fetch_add(1, Ordering::Release);
+        ShardAckCredit(Arc::clone(&self.acks))
     }
 }
 
-impl Drop for ShardAckBatch<'_> {
+impl Drop for ShardAckBatch {
     fn drop(&mut self) {
-        self.route.acks.budget.release(self.remaining);
+        self.acks.budget.release(self.remaining);
     }
 }
 
@@ -1014,13 +1014,16 @@ impl ConnCore {
         Ok(Some(value))
     }
 
-    fn reserve_shard_read(&self, limit: usize) -> Option<ShardAckBatch<'_>> {
+    fn reserve_shard_read(&self, limit: usize) -> Option<ShardAckBatch> {
         // This reactor is also the sole socket writer. If a route is installed
         // during an unsharded input turn, its first outbound delivery can
         // reach the peer only on a subsequent turn with the route installed.
         let route = self.shard_route.get()?;
         let remaining = route.acks.budget.reserve(limit, &self.link);
-        Some(ShardAckBatch { route, remaining })
+        Some(ShardAckBatch {
+            acks: Arc::clone(&route.acks),
+            remaining,
+        })
     }
 
     /// Pushes a batch of newly framed packets (plus any previously held
@@ -1032,20 +1035,22 @@ impl ConnCore {
         &self,
         batch: &mut Vec<Incoming>,
         stalled: &mut Option<Box<StalledState>>,
-        mut reservation: Option<ShardAckBatch<'_>>,
+        mut reservation: Option<ShardAckBatch>,
     ) -> Result<bool, &'static str> {
         if let Some(reservation) = reservation.as_mut()
             && batch.iter().any(|item| {
                 matches!(item, Incoming::Packet { first, .. } if matches!(first >> 4, 4 | 5 | 7))
             })
         {
+            // Routes are installed once and the reservation belongs to this connection.
+            let route = self.shard_route.get().expect("reserved shard route");
             let mut shard_acks = Vec::new();
             for item in std::mem::take(batch) {
                 match item {
                     Incoming::Packet { first, body, .. } if matches!(first >> 4, 4 | 5 | 7) => {
                         shard_acks.push(ShardIoEvent::AckPacket {
                             credit: reservation.take(),
-                            connection: reservation.route.connection,
+                            connection: route.connection,
                             first,
                             body,
                         });
@@ -1054,7 +1059,7 @@ impl ConnCore {
                 }
             }
             if !shard_acks.is_empty() {
-                reservation.route.inbox.push_batch(&mut shard_acks);
+                route.inbox.push_batch(&mut shard_acks);
             }
         }
         if let Some(st) = stalled.as_mut()
