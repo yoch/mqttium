@@ -147,7 +147,7 @@ struct bench {
 };
 
 static void conn_append(struct conn *c, const uint8_t *data, size_t len) {
-    if (c->wlen - c->woff + len > c->wcap) {
+    if (len > c->wcap - c->wlen) {
         if (c->woff > 0) {
             memmove(c->wbuf, c->wbuf + c->woff, c->wlen - c->woff);
             c->wlen -= c->woff;
