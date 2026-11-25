@@ -3664,6 +3664,56 @@ mod tests {
         assert_eq!(connection.outgoing_handle().pending_shard_written(), 0);
     }
 
+    #[test]
+    fn plain_write_failure_preserves_earlier_completions_in_the_same_turn() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let _peer = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (stream, _) = listener.accept().unwrap();
+        // Drive the task directly so both frames share this exact output turn.
+        let (core, connection) = open(stream, Wake::new(), None, false).unwrap();
+        let mut task = Task {
+            core,
+            clock: Arc::new(FakeClock::new(reading(100))),
+            leftover: None,
+            parser: Parser::default(),
+            stalled: None,
+            active: None,
+            paused: None,
+        };
+        let (first, key) = correlation(1).unwrap();
+        let (second, _) = correlation(2).unwrap();
+        let inbox = ShardInbox::new(Wake::new(), 1, 2);
+        connection.install_shard_route(ShardIoRoute::new(first.owner, key, Arc::clone(&inbox)));
+        let (bytes, mut expiry) = timed_frame();
+        expiry.value_offset = Some(bytes.len());
+        let output = connection.outgoing_handle();
+        for (effect, expiry, bytes) in [
+            (first, None, vec![0xd0, 0]),
+            (second, Some(Box::new(expiry)), bytes),
+        ] {
+            output
+                .try_send_outgoing(Write {
+                    correlation: Some((effect, key)),
+                    expiry,
+                    bytes: FrameBytes::from(bytes),
+                    payload: None,
+                    report: WriteReport::Complete,
+                })
+                .unwrap();
+        }
+        let code = task.turn(&mut ReactorScratch::new()).unwrap_err();
+        assert_eq!(code, "output_expiry_offset");
+        Box::new(task).finish(code);
+        let mut reports = VecDeque::new();
+        assert_eq!(inbox.drain_into(&mut reports, 3), 2);
+        assert!(
+            matches!(reports.pop_front(), Some(ShardIoEvent::Written { written: Written::Complete { correlation: Some((id, _)), bytes: 2 }, .. }) if id == first)
+        );
+        assert!(
+            matches!(reports.pop_front(), Some(ShardIoEvent::Written { written: Written::Failed { correlation: Some((id, _)), .. }, .. }) if id == second)
+        );
+    }
+
     fn control() -> AtomicBool {
         AtomicBool::new(false)
     }
