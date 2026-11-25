@@ -664,18 +664,24 @@ impl ShardIoRoute {
         true
     }
 
-    fn written_event(&self, written: Written) -> ShardIoEvent {
-        let slot = if matches!(written, Written::Started { .. }) {
+    fn written_event(&self, written: Written) -> Option<ShardIoEvent> {
+        let id = written_effect(&written)?;
+        let mut writes = self.writes.lock().expect("shard writes");
+        let terminal_slot = if matches!(written, Written::Started { .. }) {
+            writes.get(&id)?;
             None
         } else {
-            let id = written_effect(&written).expect("routed write");
-            self.writes.lock().expect("shard writes").remove(&id)
+            Some(writes.remove(&id)?)
         };
+        Some(self.count_written(written, terminal_slot))
+    }
+
+    fn count_written(&self, written: Written, terminal_slot: Option<WriteSlot>) -> ShardIoEvent {
         self.written_pending.fetch_add(1, Ordering::Release);
         ShardIoEvent::Written {
             _credit: ShardWrittenCredit {
                 queued: Arc::clone(&self.written_pending),
-                _terminal_slot: slot,
+                _terminal_slot: terminal_slot,
             },
             generation: self.connection.generation,
             written,
@@ -693,25 +699,7 @@ pub struct OutgoingHandle {
 impl OutgoingHandle {
     #[inline]
     pub fn try_send_outgoing(&self, frame: Write) -> Result<(), TrySendError<Write>> {
-        let tracked = frame.correlation.and_then(|(effect, _)| {
-            self.core
-                .shard_route
-                .get()
-                .filter(|route| effect.owner == route.owner_id)
-                .map(|route| (route, effect))
-        });
-        if let Some((route, effect)) = tracked
-            && !route.reserve_write(effect)
-        {
-            return Err(TrySendError::Full(frame));
-        }
-        let result = self.core.try_send_outgoing(frame);
-        if result.is_err()
-            && let Some((route, effect)) = tracked
-        {
-            route.writes.lock().expect("shard writes").remove(&effect);
-        }
-        result
+        self.core.try_send_outgoing(frame)
     }
 
     pub(crate) fn pending_shard_acks(&self) -> usize {
@@ -878,6 +866,15 @@ impl ConnCore {
             return Err(TrySendError::Disconnected(frame));
         }
         if state.queue.len() >= OUTPUT_SLOTS {
+            return Err(TrySendError::Full(frame));
+        }
+        // Closing takes this same lock before collecting unfinished writes.
+        // Only an admitted frame may own a reservation or a terminal receipt.
+        if let Some((effect, _)) = frame.correlation
+            && let Some(route) = self.shard_route.get()
+            && effect.owner == route.owner_id
+            && !route.reserve_write(effect)
+        {
             return Err(TrySendError::Full(frame));
         }
         state.enqueue(frame);
@@ -1136,7 +1133,7 @@ impl ConnCore {
             for report in std::mem::take(fresh) {
                 match report {
                     Report::Written(written) if written_effect(&written).map(|id| id.owner) == Some(route.owner_id) => {
-                        shard_written.push(route.written_event(written));
+                        shard_written.extend(route.written_event(written));
                     }
                     other => fresh.push(other),
                 }
@@ -1680,7 +1677,7 @@ impl ConnCore {
                 if let Some(route) = route
                     && correlation.is_some_and(|(eff, _)| eff.owner == route.owner_id)
                 {
-                    shard_failed.push(route.written_event(Written::Failed { correlation, code }));
+                    shard_failed.extend(route.written_event(Written::Failed { correlation, code }));
                     continue;
                 }
                 if state.alive & ALIVE_WRITTEN_RX == 0 || state.written.len() >= WRITTEN_SLOTS {
@@ -1693,18 +1690,13 @@ impl ConnCore {
             if let Some(route) = route {
                 let mut remaining = route.writes.lock().expect("shard writes");
                 for (effect, slot) in remaining.drain() {
-                    route.written_pending.fetch_add(1, Ordering::Release);
-                    shard_failed.push(ShardIoEvent::Written {
-                        generation: route.connection.generation,
-                        written: Written::Failed {
+                    shard_failed.push(route.count_written(
+                        Written::Failed {
                             correlation: Some((effect, route.connection)),
                             code,
                         },
-                        _credit: ShardWrittenCredit {
-                            queued: Arc::clone(&route.written_pending),
-                            _terminal_slot: Some(slot),
-                        },
-                    });
+                        Some(slot),
+                    ));
                 }
                 drop(remaining);
                 route.inbox.push_batch(&mut shard_failed);
