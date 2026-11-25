@@ -27,21 +27,28 @@ From `mqttiumd/`:
 
 ```bash
 cargo build -p mqttiumd --profile dist --locked
-sh preview/build-mosquitto-reference.sh /tmp/load-reference
+sh tools/build-load-reference.sh /tmp/load-reference
 
 # Full 59-scenario throughput & latency suite on real disk (e.g. /var/tmp on ext4)
 python3 tools/arm64_bench/run_arm64_suite.py \
   --binary target/dist/mqttiumd \
-  --mosquitto /tmp/load-reference/mosquitto-2.0.21 \
+  --mosquitto /tmp/load-reference/mosquitto-2.1.4/src/mosquitto \
   --work-dir /var/tmp \
   --out /tmp/arm64_suite_results.json
 
 # Idle memory footprint per connection (Plain & mTLS)
 python3 tools/arm64_bench/idle_rss_bench.py \
   --binary target/dist/mqttiumd \
-  --mosquitto /tmp/load-reference/mosquitto-2.0.21 \
+  --mosquitto /tmp/load-reference/mosquitto-2.1.4/src/mosquitto \
   --out /tmp/idle_rss_results.json
 ```
+
+The active load reference is Mosquitto 2.1.4. Its builder verifies the source
+archive and builds the broker, client library and publisher. The frozen preview
+uses 2.0.21. To replay that version with `tools/run_broker_load.py` or
+`tools/run_progression_ab.py`, pass `2.0.21` to the builder and
+`--reference-version 2.0.21` to the runner; supply the unpacked source
+directory to `--reference`. The ARM64 tools above take the broker executable.
 
 Generated JSON outputs and compiled binaries must stay outside the repository
 (e.g. `/tmp/`) and are never committed.

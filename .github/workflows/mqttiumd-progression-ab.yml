@@ -47,7 +47,7 @@ jobs:
           base=4793277e3579bcd0716c714b677bc7020a465f91
           git merge-base --is-ancestor "$base" HEAD
           output="$RUNNER_TEMP/progression-ab"
-          python3 mqttiumd/tools/run_progression_ab.py "$RUNNER_TEMP" "$output" --base "$base"
+          python3 mqttiumd/tools/run_progression_ab.py "$RUNNER_TEMP" "$output" --base "$base" --reference-version 2.0.21
           jq -r '"eligible=" + (.eligible|tostring)' "$output/verdict.json" >> "$GITHUB_OUTPUT"
           jq '{eligible,qos0_pairs,recovery,failures}' "$output/verdict.json" >> "$GITHUB_STEP_SUMMARY"
       - name: Publish both build identities and the full receipts

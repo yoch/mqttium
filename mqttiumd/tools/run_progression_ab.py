@@ -416,7 +416,8 @@ def main():
     parser.add_argument("output", type=Path, help="new directory for the receipts and binaries")
     parser.add_argument("--base", required=True, help="full Git SHA of the fixed-polling increment")
     parser.add_argument("--smoke", action="store_true", help="short harness validation with no performance verdict")
-    parser.add_argument("--reference", type=Path, help="reuse the pinned Mosquitto 2.0.21 build")
+    parser.add_argument("--reference", type=Path, help="reuse a pinned Mosquitto load build")
+    parser.add_argument("--reference-version", choices=bench.REFERENCE_DIGESTS, default=bench.DEFAULT_REFERENCE)
     args = parser.parse_args()
     base = subprocess.check_output(["git", "-C", REPO, "rev-parse", f"{args.base}^{{commit}}"], text=True).strip()
     if base != args.base:
@@ -443,10 +444,10 @@ def main():
         if reference is None:
             reference = work / "mosquitto-reference"
             with (output / "reference-build.log").open("xb") as log:
-                subprocess.run(["sh", REPO / "mqttiumd/preview/build-mosquitto-reference.sh", reference],
+                subprocess.run(["sh", REPO / "mqttiumd/tools/build-load-reference.sh", reference, args.reference_version],
                                stdout=log, stderr=subprocess.STDOUT, check=True)
-            reference /= "mosquitto-2.0.21"
-        driver, client = bench.compile_driver(reference.resolve(), work)
+            reference /= f"mosquitto-{args.reference_version}"
+        driver, client = bench.compile_driver(reference.resolve(), work, args.reference_version)
         info = bench.machine(volume) | {"volume": filesystem, "driver": client,
                 "broker_cpus": broker_cpus, "generator_cpus": generator_cpus, "observer_cpus": observer_cpus}
         bench.write_json(output / "manifest.json", binaries | {

@@ -3,7 +3,9 @@
 #include <errno.h>
 #include <inttypes.h>
 #include <mosquitto.h>
+#if LIBMOSQUITTO_VERSION_NUMBER < 2001000
 #include <mqtt_protocol.h>
+#endif
 #include <poll.h>
 #include <signal.h>
 #include <stdbool.h>

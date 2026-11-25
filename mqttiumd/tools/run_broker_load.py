@@ -22,7 +22,11 @@ import time
 
 
 TOOLS = Path(__file__).resolve().parent
-REFERENCE_SHA = "7ad5e84caeb8d2bb6ed0c04614b2a7042def961af82d87f688ba33db857b899d"
+REFERENCE_DIGESTS = {
+    "2.0.21": "7ad5e84caeb8d2bb6ed0c04614b2a7042def961af82d87f688ba33db857b899d",
+    "2.1.4": "ca30b26ccd3041c0e11fc407fe4f2e62bc445e8d8dea94a083cc60c09bd5ea30",
+}
+DEFAULT_REFERENCE = "2.1.4"
 NS = 1_000_000_000
 CGROUP = Path("/sys/fs/cgroup")
 
@@ -77,18 +81,19 @@ def machine(scratch):
     }
 
 
-def compile_driver(reference, out):
+def compile_driver(reference, out, version=DEFAULT_REFERENCE):
     source = TOOLS / "load_client.c"
     library = reference / "lib/libmosquitto.so.1"
-    archive = reference.parent / "mosquitto-2.0.21.tar.gz"
-    if digest(archive) != REFERENCE_SHA:
+    archive = reference.parent / f"mosquitto-{version}.tar.gz"
+    if digest(archive) != REFERENCE_DIGESTS[version]:
         raise ValueError("unexpected Mosquitto source archive digest")
     driver = out / "load-client"
     command = ["cc", "-O2", "-std=c11", "-Wall", "-Wextra", "-Werror",
                "-I", str(reference / "include"), str(source), str(library),
                "-Wl,-rpath," + str(library.parent), "-o", str(driver)]
     subprocess.run(command, check=True)
-    return driver, {"argv": command, "source_sha256": digest(source),
+    return driver, {"reference_version": version, "source_archive_sha256": REFERENCE_DIGESTS[version],
+                    "argv": command, "source_sha256": digest(source),
                     "binary_sha256": digest(driver), "library_sha256": digest(library),
                     "compiler": subprocess.check_output(["cc", "--version"], text=True).splitlines()[0]}
 
@@ -186,7 +191,7 @@ def broker_observations(directory):
     return kinds, dispositions
 
 
-def ready(child, directory, kind):
+def ready(child, directory, kind, version=DEFAULT_REFERENCE):
     deadline = time.monotonic() + 8
     while child.poll() is None and time.monotonic() < deadline:
         if kind != "mosquitto":
@@ -198,8 +203,8 @@ def ready(child, directory, kind):
                         raise ValueError("broker did not report synchronous FULL")
                     return {"pid": rows["ready"]["pid"],
                             **{key: rows[key]["details"] for key in ("ready", "sqlite_configuration", "tls_profile")}}
-        elif "mosquitto version 2.0.21 running" in (directory / "broker.log").read_text():
-            return {"pid": child.pid, "version": "2.0.21", "persistence": True, "autosave_interval_s": 3600}
+        elif f"mosquitto version {version} running" in (directory / "broker.log").read_text():
+            return {"pid": child.pid, "version": version, "persistence": True, "autosave_interval_s": 3600}
         time.sleep(0.01)
     raise RuntimeError((directory / "broker.log").read_text())
 
@@ -376,7 +381,7 @@ def run_case(args, root, pki, driver, kind, binary, cores, pairs, qos, rate, ind
             gen += [50, 500, *args.then]
         samples = []
         with process(broker, directory / "broker.log", broker_cpus) as server:
-            readiness = ready(server, directory, kind)
+            readiness = ready(server, directory, kind, args.reference_version)
             broker_pid = readiness["pid"]
             actual_broker_cpus = sorted(os.sched_getaffinity(broker_pid))
             witness = expiry_probe(args, directory, pki, port, generator_cpus) if args.expiry_witness else None
@@ -458,7 +463,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--mqttiumd", type=Path, required=True, help="release executable")
     parser.add_argument("--source", required=True, help="source SHA of the release executable")
-    parser.add_argument("--reference", type=Path, required=True, help="built Mosquitto 2.0.21 source directory")
+    parser.add_argument("--reference", type=Path, required=True, help="pinned Mosquitto build from tools/build-load-reference.sh")
+    parser.add_argument("--reference-version", choices=REFERENCE_DIGESTS, default=DEFAULT_REFERENCE)
     parser.add_argument("--out", type=Path, required=True, help="new directory for measurements")
     parser.add_argument("--scratch", type=Path, required=True, help="existing filesystem for the temporary stores and logs")
     parser.add_argument("--cores", type=integers, default=[1, 2, 4])
@@ -501,7 +507,7 @@ def main():
             or args.repeats < 1):
         parser.error("invalid matrix for the available CPU budget and 128-connection limit")
     args.out.mkdir(mode=0o700)
-    driver, client = compile_driver(args.reference, args.out)
+    driver, client = compile_driver(args.reference, args.out, args.reference_version)
     binaries = {"mqttiumd": args.mqttiumd}
     if args.candidate:
         binaries["candidate"] = args.candidate.resolve()
@@ -512,7 +518,7 @@ def main():
     if args.candidate:
         broker_info["candidate"]["source"] = args.candidate_source
     else:
-        broker_info["mosquitto"].update(version="2.0.21", source_archive_sha256=REFERENCE_SHA)
+        broker_info["mosquitto"].update(version=args.reference_version, source_archive_sha256=REFERENCE_DIGESTS[args.reference_version])
     choices = {(c, 4 if 4 in args.pairs else args.pairs[0]) for c in effective}
     choices.update((2 if 2 in effective else effective[0], p) for p in args.pairs)
     write_json(args.out / "machine.json", {"machine": host, "cpu_cap_shared": cpu_cap, "tested_affinity_counts": effective,
