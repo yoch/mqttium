@@ -103,20 +103,19 @@
   {
     "id": "session/ninth-exchange-after-reconnection-v4",
     "class": "reference-nonconformant",
-    "difference": "A 3.1.1 session owes the PUBREL of eight exchanges and publishes a ninth QoS 2 message. Mosquitto answers PUBREC, later answers its PUBREL with PUBCOMP, and the subscriber never receives the message (upstream ticket 3809); mqttiumd does not acknowledge the PUBLISH and closes the connection. On both the subscriber ends with the first eight messages.",
+    "difference": "A 3.1.1 session owes the PUBREL of eight exchanges and publishes a ninth QoS 2 message. Mosquitto answers PUBREC, later answers its PUBREL with PUBCOMP, and the subscriber never receives the message (upstream ticket 3809); mqttiumd does not acknowledge the PUBLISH and closes the connection. On both, the connected QoS 1 subscriber acknowledges the first eight messages and receives no ninth before the idle deadline.",
     "statement": "MQTT-4.3.3-2: a PUBREC says the receiver accepted ownership of the message, and MQTT-4.5.0-1 that a message it owns is added to the matching sessions",
     "mqttiumd": "Does not acknowledge the ninth PUBLISH and closes the network connection: the message stays the client's. A PUBREL for its identifier is answered with PUBCOMP, as 3.1.1 answers any PUBREL.",
     "decision": "0061",
-    "fingerprint": "7537924e76ce1ecd"
+    "fingerprint": "43c0e0825bf3cada"
   },
   {
     "id": "session/ninth-exchange-after-reconnection-v5",
-    "class": "reference-nonconformant",
-    "difference": "An MQTT 5 session owes the PUBREL of eight exchanges, the Receive Maximum, and publishes a ninth QoS 2 message. Mosquitto answers PUBREC 0x97 (Quota exceeded), keeps the connection, and later answers the PUBREL of that identifier with PUBCOMP 0x00; mqttiumd sends DISCONNECT 0x97 (Quota exceeded) and closes, and answers that PUBREL with PUBCOMP 0x92 (Packet Identifier not found).",
-    "statement": "MQTT-4.13.1-1, with section 3.3.4: a client that exceeds Receive Maximum (MQTT-3.3.4-7) makes a Protocol Error, so the server must close the connection",
-    "mqttiumd": "Sends DISCONNECT 0x97 (Quota exceeded) and closes the network connection; the bound is the session's, whatever the connection.",
+    "class": "unspecified",
+    "difference": "For the first PUBLISH on a resumed MQTT 5 connection, Mosquitto refuses the ninth session exchange with PUBREC 0x97 and stays open. mqttiumd sends DISCONNECT 0x97 for its session quota. Both deliver the eight earlier messages to the QoS 1 subscriber.",
+    "statement": "MQTT-3.3.4-7 and MQTT-4.9.0-1 apply to one Network Connection. Sections 3.5.2.1 and 3.14.2.1 permit Quota exceeded (0x97) in PUBREC and DISCONNECT.",
     "decision": "0061",
-    "fingerprint": "22887b0faacf88f1"
+    "fingerprint": "48039034f9303d84"
   },
   {
     "id": "session/redelivery-pubrel-after-expiry-v5",

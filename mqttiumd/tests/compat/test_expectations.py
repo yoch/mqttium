@@ -475,25 +475,43 @@ for version in (4, 5):
                    FAIL: [[closed_with("closure", end="still-open")]]}
     RESTART_STATEMENTS[name] = {"MQTT-4.7.3-1", "MQTT-4.8.0-1" if version == 4 else "MQTT-4.13.1-1"}
     resume = record("resume", wire.connack(True, level=version), level=version)
-    eight = [wire.publish("ninth/t", f"m{i}", level=version) for i in range(1, 9)]
-    nine = [*eight, wire.publish("ninth/t", "m9", level=version)]
-    eighth = silent("deliveries", *reversed(eight), level=version)
-    all_nine = silent("deliveries", *nine, level=version)
+    subscription = record("subscription", wire.suback(1, [1], level=version), level=version)
+    eight = [wire.publish("ninth/t", f"m{i}", qos=1, packet_id=i, level=version) for i in range(1, 9)]
+    ninth = wire.publish("ninth/t", "m9", qos=1, packet_id=9, level=version)
+    first_eight = record("deliveries", *reversed(eight), op="drain", end="idle", level=version)
+    all_nine = record("deliveries", *eight, ninth, op="drain", end="idle", level=version)
+    repeated = record("deliveries", *eight, eight[1], op="drain", end="idle", level=version)
+    missing = record("deliveries", *eight[:-1], eight[0], op="drain", end="idle", level=version)
     name = f"session/ninth-exchange-after-reconnection-v{version}#resumed-exchanges"
-    CASES[name] = {PASS: [[resume, eighth], [resume, all_nine]],
-                   FAIL: [[resume, silent("deliveries", *eight[:-1], eight[0], level=version)]]}
+    CASES[name] = {PASS: [[resume, subscription, delivered] for delivered in (first_eight, all_nine, repeated)],
+                   FAIL: [[resume, subscription, missing]]}
     RESTART_STATEMENTS[name] = {"MQTT-4.3.3-2" if version == 4 else "MQTT-4.3.3-8", "MQTT-4.5.0-1"}
     if version == 4:
         name = "session/ninth-exchange-after-reconnection-v4#accepted-ninth"
         received = record("ninth", wire.pubrec(9), op="until_close", end="still-open", level=4)
-        CASES[name] = {PASS: [[received, all_nine]], FAIL: [[received, eighth]],
-                       NOT_APPLICABLE: [[closed_with("ninth"), eighth]]}
+        CASES[name] = {PASS: [[received, all_nine]], FAIL: [[received, first_eight]],
+                       NOT_APPLICABLE: [[closed_with("ninth"), first_eight]]}
         RESTART_STATEMENTS[name] = {"MQTT-4.3.3-2", "MQTT-4.5.0-1"}
-    else:
-        name = "session/ninth-exchange-after-reconnection-v5#quota-closure"
-        CASES[name] = {PASS: [[closed_with("ninth"), eighth]],
-                       FAIL: [[closed_with("ninth", end="still-open"), eighth], [closed_with("ninth"), all_nine]]}
-        RESTART_STATEMENTS[name] = {"MQTT-3.3.4-7", "MQTT-4.13.1-1"}
+
+maximum_eight = wire.connack(True, level=5, props={"receive_maximum": 8})
+wrong_limit = closed_with("ninth", wire.disconnect(level=5, reason=0x93))
+local_quota = closed_with("ninth", wire.disconnect(level=5, reason=0x97))
+refusal = closed_with("ninth", wire.pubrec(9, level=5, reason=0x97), end="still-open")
+name = "session/ninth-exchange-after-reconnection-v5#fresh-window"
+new_connection = record("new-connection", maximum_eight)
+CASES[name] = {PASS: [[new_connection, local_quota], [new_connection, refusal]],
+               FAIL: [[new_connection, wrong_limit]],
+               NOT_APPLICABLE: [[record("new-connection", wire.connack(level=5)), refusal]]}
+RESTART_STATEMENTS[name] = {"MQTT-3.3.4-7", "MQTT-4.9.0-1", "MQTT-4.9.0-2"}
+
+name = "publish/receive-maximum-inbound-v5#connection-receive-maximum"
+one_connection = [record("connection", maximum_eight),
+                  *[record(f"accepted-{i}", wire.pubrec(i, level=5)) for i in range(1, 9)]]
+CASES[name] = {PASS: [[*one_connection, closed_with("ninth", wire.disconnect(level=5, reason=0x93))]],
+               FAIL: [[*one_connection, refusal]],
+               NOT_APPLICABLE: [[*one_connection[:-1], record("accepted-8", wire.pubrec(8, level=5, reason=0x97)),
+                                 refusal]]}
+RESTART_STATEMENTS[name] = {"MQTT-3.3.4-7", "MQTT-4.13.1-1"}
 
 resumed = wire.connack(True, level=5)
 fresh = wire.connack(False, level=5)

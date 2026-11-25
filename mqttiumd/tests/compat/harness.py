@@ -481,7 +481,7 @@ class Player:
         publishes = acknowledged = 0
         end = "ok"
         overall = time.monotonic() + step["timeout"]
-        while publishes < step["count"]:
+        while step["count"] is None or publishes < step["count"]:
             idle_at = time.monotonic() + step["idle"]
             packets, end = self.read(name, count=1, deadline=min(idle_at, overall))
             got += packets

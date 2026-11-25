@@ -190,9 +190,9 @@ def collect(conn, *, sort=False, window=QUIET, timeout=WAIT, limit=LIMIT):
     return quiet(conn, window=window, timeout=timeout, sort=sort, limit=limit)
 
 
-def drain(conn, count, *, idle=IDLE, timeout=DRAIN, sort=False):
+def drain(conn, count=None, *, idle=IDLE, timeout=DRAIN, sort=False):
     """Read until `count` PUBLISH packets came, acknowledging each QoS 1
-    PUBLISH with its PUBACK as it is read.
+    PUBLISH with its PUBACK as it is read. Omit the count to read until idle.
 
     For deliveries the broker owes whatever the timing: a subscriber that
     acknowledges is never the reason why one is missing, and a broker that

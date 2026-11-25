@@ -1,8 +1,13 @@
 """Persistent sessions: offline queueing and redelivery on reconnection."""
 import mqttwire as wire
-from dsl import (ack, close, connect, disconnect, mark, persistent, publish, publish_ack, publish_qos2, publish_sync, quiet,
+from dsl import (ack, close, connect, disconnect, drain, mark, persistent, publish, publish_ack, publish_qos2, publish_sync, quiet,
                  recv, restart, scenario, send, sleep, subscribe, until_close)
-from expectations import CLOSED, at, expectation, in_any_order, one_of
+from expectations import Contains, at, expectation
+
+def delivered(index):
+    return at("deliveries", {"got": Contains({"type": "PUBLISH", "topic": "ninth/t", "qos": 1,
+                                              "payload": f"m{index}"})})
+
 
 for level in (4, 5):
     v = f"v{level}"
@@ -73,49 +78,50 @@ for level in (4, 5):
         ],
     )
 
-    eight = [{"type": "PUBLISH", "topic": "ninth/t", "payload": f"m{i}"} for i in range(1, 9)]
-    nine = [*eight, {"type": "PUBLISH", "topic": "ninth/t", "payload": "m9"}]
     ninth_expectations = [
         expectation("resumed-exchanges", statement=("MQTT-4.3.3-2, MQTT-4.5.0-1" if level == 4 else
-                                                    "MQTT-4.3.3-8, MQTT-4.5.0-1"),
-                    requires="The session resumes and each of its eight accepted messages reaches the subscriber once.",
+                                                   "MQTT-4.3.3-8, MQTT-4.5.0-1"),
+                    requires="The session resumes and the QoS 1 subscriber receives all eight accepted messages.",
                     then=[at("resume", {"got": [{"type": "CONNACK", "session_present": True, "reason": 0}]}),
-                          at("deliveries", {"end": "quiet", "got": one_of(in_any_order(*eight), in_any_order(*nine))})])]
+                          at("subscription", {"got": [{"type": "SUBACK", "codes": [1]}]}),
+                          at("deliveries", {"end": "idle"}), *[delivered(i) for i in range(1, 9)]])]
     if level == 4:
         ninth_expectations.append(expectation(
             "accepted-ninth", statement="MQTT-4.3.3-2, MQTT-4.5.0-1",
-            requires="If the ninth PUBLISH is accepted, the subscriber receives that message as well.",
+            requires="An affirmative PUBREC for the ninth PUBLISH transfers ownership, including onward delivery.",
             when=[at("ninth", {"got": [{"type": "PUBREC", "packet_id": 9}]})],
-            then=[at("deliveries", {"got": in_any_order(*nine), "end": "quiet"})]))
+            then=[delivered(9)]))
     else:
         ninth_expectations.append(expectation(
-            "quota-closure", statement="MQTT-3.3.4-7, MQTT-4.13.1-1",
-            requires="The broker closes the connection after the client exceeds its Receive Maximum.",
-            then=[at("ninth", {"end": CLOSED}), at("deliveries", {"got": in_any_order(*eight), "end": "quiet"})]))
+            "fresh-window", statement="MQTT-3.3.4-7, MQTT-4.9.0-1, MQTT-4.9.0-2",
+            requires="The first QoS 2 PUBLISH on the new connection cannot exceed its Receive Maximum of eight.",
+            when=[at("new-connection", {"got": [{"type": "CONNACK", "properties": {"receive_maximum": 8}}]})],
+            then=[at("ninth", {"got": Contains({"type": "DISCONNECT", "reason": 0x93}, present=False)})]))
 
     scenario(
         f"session/ninth-exchange-after-reconnection-{v}",
-        doc="""Upstream ticket 3809. A session opens eight QoS 2 exchanges, reads each
-        PUBREC, completes none and loses its connection. It comes back, sends no PUBREL and
-        publishes a ninth message: what the broker answers and whether it keeps the
-        connection. The session then comes back once more and sends PUBREL for the nine
-        identifiers: which of the nine messages a subscriber has received in the end. Both
-        brokers have a window of eight (the reference by `max_inflight_messages 8`).""",
+        doc="""Upstream ticket 3809. A session leaves eight QoS 2 exchanges at PUBREC,
+        reconnects, and sends one new PUBLISH before completing them. After another
+        reconnection the client completes the first eight exchanges. In MQTT 3.1.1
+        it also sends PUBREL for identifier nine to observe delivery after an affirmative
+        PUBREC. The subscriber acknowledges each QoS 1 delivery until idle.""",
         reference_config=["max_inflight_messages 8"],
         steps=[
-            connect("sub", "o-ninth-sub", level=level), subscribe("sub", 1, [("ninth/t", 0)], level=level),
+            connect("sub", "o-ninth-sub", level=level), subscribe("sub", 1, [("ninth/t", 1)], level=level),
+            mark("subscription"),
             connect("a", "o-ninth", level=level, **persistent(level)),
             [[publish("a", "ninth/t", f"m{index}", qos=2, packet_id=index, level=level), recv("a")]
              for index in range(1, 9)],
             close("a"),
             connect("a", "o-ninth", level=level, **persistent(level)),
+            mark("new-connection"),
             publish("a", "ninth/t", "m9", qos=2, packet_id=9, level=level),
             until_close("a"), mark("ninth"),
             close("a"),
             connect("a", "o-ninth", level=level, **persistent(level)),
             mark("resume"),
-            [[send("a", wire.pubrel(index, level=level)), recv("a")] for index in range(1, 10)],
-            quiet("sub"), mark("deliveries"),
+            [[send("a", wire.pubrel(index, level=level)), recv("a")] for index in range(1, 10 if level == 4 else 9)],
+            drain("sub"), mark("deliveries"),
         ],
         expectations=ninth_expectations,
     )

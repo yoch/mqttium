@@ -21,6 +21,8 @@ A pattern is matched structurally:
 - a list matches a list of the same length, element by element;
 - `one_of(a, b, ...)` matches what one alternative matches; `CLOSED` is
   `one_of("eof", "reset")`;
+- `Contains(pattern)` requires at least one matching list element. With
+  `present=False` it requires none;
 - `Each(count, allowed)` matches a list of `count` values of `allowed`;
 - `in_any_order(a, b, ...)` matches a list of as many values, each one
   matching a pattern of its own: what a broker may send in any order
@@ -81,6 +83,13 @@ class AnyOrder:
         self.patterns = patterns
 
 
+class Contains:
+    """Whether at least one list element matches the packet pattern."""
+    def __init__(self, pattern, *, present=True):
+        self.pattern = pattern
+        self.present = present
+
+
 class AtMost:
     """Matches an integer no greater than `bound`."""
 
@@ -130,6 +139,8 @@ def paired(patterns, values) -> bool:
 
 
 def matches(pattern, value) -> bool:
+    if isinstance(pattern, Contains):
+        return isinstance(value, list) and any(matches(pattern.pattern, item) for item in value) == pattern.present
     if isinstance(pattern, OneOf):
         return any(matches(alternative, value) for alternative in pattern.alternatives)
     if isinstance(pattern, AnyOrder):
@@ -201,7 +212,9 @@ def mentioned_properties(pattern, out: dict) -> dict:
     """`{packet type: names}` that the patterns read: the properties of a
     packet of that type, and under `(type, "fields")` its other fields
     that are not shown anyway."""
-    if isinstance(pattern, (OneOf, AnyOrder)):
+    if isinstance(pattern, Contains):
+        mentioned_properties(pattern.pattern, out)
+    elif isinstance(pattern, (OneOf, AnyOrder)):
         for inner in (pattern.alternatives if isinstance(pattern, OneOf) else pattern.patterns):
             mentioned_properties(inner, out)
     elif isinstance(pattern, dict):

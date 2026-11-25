@@ -341,6 +341,24 @@ message. Its active evidence is:
   `packet_too_large`, and a store that holds no obligation and no claim
   after the discard.
 
+### Receive Maximum and the session exchange quota
+
+In MQTT 5, Receive Maximum and send quota apply to the current Network
+Connection (§3.3.4 and §4.9). In `publish/receive-maximum-inbound-v5`, eight
+exchanges remain open on the connection that carries the ninth QoS 2 PUBLISH.
+In `session/ninth-exchange-after-reconnection-v5`, that PUBLISH is the first
+one on a new connection. The brokers can still refuse it on a session quota:
+the pinned Mosquitto sends PUBREC 0x97, while mqttiumd sends DISCONNECT 0x97.
+The scenario completes the eight earlier exchanges and checks their onward
+delivery at QoS 1. It does not send PUBREL for the refused ninth PUBLISH.
+
+MQTT 3.1.1 has no negative PUBREC. In the matching v4 scenario, Mosquitto
+accepts packet 9, then sends PUBCOMP for its PUBREL. The connected observer
+acknowledges the first eight QoS 1 deliveries and receives no ninth before
+the idle deadline. mqttiumd closes before acknowledging packet 9. The
+expectation of onward delivery after acceptance therefore applies to
+Mosquitto in this run. (§4.3.3 and §4.5.)
+
 ## What the bench does not show
 
 - **Conformance.** Only the points that carry an expectation are checked

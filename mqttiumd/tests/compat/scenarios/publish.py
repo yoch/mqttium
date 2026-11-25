@@ -2,7 +2,7 @@
 import mqttwire as wire
 from dsl import (ack, collect, connect, disconnect, mark, publish, publish_ack, publish_qos2, publish_sync, quiet, recv,
                  scenario, send, subscribe, tally, until_close)
-from expectations import CLOSED, at, at_most, expectation
+from expectations import CLOSED, at, at_most, expectation, one_of
 
 for level in (4, 5):
     v = f"v{level}"
@@ -171,11 +171,19 @@ scenario(
     sends a ninth PUBLISH.""",
     reference_config=["max_inflight_messages 8"],
     steps=[
-        connect("a", "p-rmax", level=5),
-        [[publish("a", "rmax/t", f"m{index}", qos=2, packet_id=index, level=5), recv("a")] for index in range(1, 9)],
+        connect("a", "p-rmax", level=5), mark("connection"),
+        [[publish("a", "rmax/t", f"m{index}", qos=2, packet_id=index, level=5), recv("a"), mark(f"accepted-{index}")]
+         for index in range(1, 9)],
         publish("a", "rmax/t", "m9", qos=2, packet_id=9, level=5),
-        until_close("a"),
+        until_close("a"), mark("ninth"),
     ],
+    expectations=[expectation(
+        "connection-receive-maximum", statement="MQTT-3.3.4-7, MQTT-4.13.1-1",
+        requires="The ninth outstanding QoS 2 PUBLISH on one connection with Receive Maximum eight requires closure.",
+        when=[at("connection", {"got": [{"type": "CONNACK", "properties": {"receive_maximum": 8}}]}),
+              *[at(f"accepted-{i}", {"got": [{"type": "PUBREC", "packet_id": i, "reason": one_of(0, 0x10)}]})
+                for i in range(1, 9)]],
+        then=[at("ninth", {"end": CLOSED})])],
 )
 
 scenario(
