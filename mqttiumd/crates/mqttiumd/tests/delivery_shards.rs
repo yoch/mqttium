@@ -581,6 +581,7 @@ fn sharded_bidirectional_fanin_qos2_and_max_packet_discard() {
 
 #[test]
 fn sharded_qos0_live_burst_and_retained_replay() {
+    const BURST: usize = 150;
     for mode in ["volatile", "log"] {
         let broker = Broker::start(&format!("qos0-ret-{mode}"), mode, 2);
         let addr = broker.address;
@@ -621,8 +622,7 @@ fn sharded_qos0_live_burst_and_retained_replay() {
             subs.push(sub);
         }
 
-        // Blast 150 live QoS 0 messages followed by 1 QoS 1 sentinel.
-        for seq in 0..150usize {
+        for seq in 0..BURST {
             pub_stream
                 .write_all(&publish_packet(
                     0,
@@ -640,22 +640,33 @@ fn sharded_qos0_live_burst_and_retained_replay() {
         assert_eq!(h, 0x40);
 
         for (i, mut sub) in subs.into_iter().enumerate() {
-            let mut q0_count = 0usize;
-            loop {
-                let (hdr, body) = read_packet(&mut sub).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let mut next_seq = 0usize;
+            let mut saw_sentinel = false;
+            // MQTT orders the QoS 0 stream independently of the QoS 1 sentinel.
+            for _ in 0..=BURST {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                assert!(!remaining.is_zero(), "sub {i} in {mode}: drain deadline");
+                sub.set_read_timeout(Some(remaining)).unwrap();
+                let (hdr, body) = read_packet(&mut sub).unwrap_or_else(|error| {
+                    panic!("sub {i} in {mode}: {next_seq}/{BURST} QoS 0, sentinel={saw_sentinel}: {error}")
+                });
                 assert_eq!(hdr & 0xf0, 0x30);
-                let (qos, _, _, pid, payload) = decode_v5_publish(hdr, &body);
-                if qos == 1 && payload == b"SENTINEL" {
+                let (qos, _, topic, pid, payload) = decode_v5_publish(hdr, &body);
+                assert_eq!(topic, "live/q0");
+                if qos == 1 {
+                    assert_eq!(payload, b"SENTINEL");
+                    assert!(!saw_sentinel, "sub {i} in {mode}: duplicate sentinel");
+                    saw_sentinel = true;
                     send_ack(&mut sub, 0x40, pid.unwrap());
-                    break;
+                } else {
+                    assert_eq!(qos, 0);
+                    assert_eq!(payload, next_seq.to_be_bytes(), "sub {i} in {mode}");
+                    next_seq += 1;
                 }
-                assert_eq!(qos, 0);
-                q0_count += 1;
             }
-            assert!(
-                q0_count >= 50,
-                "sub {i} in {mode} received too few live QoS 0 messages: {q0_count}"
-            );
+            assert!(saw_sentinel, "sub {i} in {mode}: missing sentinel");
+            assert_eq!(next_seq, BURST, "sub {i} in {mode}");
         }
     }
 }
