@@ -4595,6 +4595,42 @@ mod tests {
         );
         owner
     }
+    #[test]
+    fn a_work_notification_during_a_read_survives_the_old_empty_page() {
+        // The coordinator and delivery shards use the same work reader.
+        // Their runtime schedules WorkAvailable after the page only if the
+        // owner still reports ready work.
+        for during in [None, Some(false), Some(true)] {
+            let mut owner = world();
+            owner.mark_session_dirty(TARGET, true);
+            let load = apply(&mut owner, Input::WorkAvailable { session: TARGET });
+            let [(old_read, Effect::LoadWork { after: None, .. })] = load.as_slice() else {
+                panic!("expected the initial read");
+            };
+            if let Some(rescan) = during {
+                owner.mark_session_dirty(TARGET, rescan);
+                assert!(apply(&mut owner, Input::WorkAvailable { session: TARGET }).is_empty());
+            }
+            let page = |effect| Input::WorkPage {
+                effect,
+                session: TARGET,
+                items: BoundedVec::with_capacity(0).unwrap(),
+                next: None,
+            };
+            assert!(apply(&mut owner, page(*old_read)).is_empty());
+            assert_eq!(owner.has_ready_work(TARGET), during == Some(true));
+            if during == Some(true) {
+                let load = apply(&mut owner, Input::WorkAvailable { session: TARGET });
+                let [(fresh_read, Effect::LoadWork { after: None, .. })] = load.as_slice() else {
+                    panic!("the notification must start one fresh read");
+                };
+                assert_ne!(old_read, fresh_read);
+                assert!(apply(&mut owner, page(*fresh_read)).is_empty());
+                assert!(!owner.has_ready_work(TARGET), "a clean empty page goes idle");
+            }
+        }
+    }
+
     fn delivery(index: u32) -> DeliveryId {
         DeliveryId {
             publication: PublicationId::new(
