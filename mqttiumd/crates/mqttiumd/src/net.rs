@@ -3585,6 +3585,77 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn shard_socket_close_reports_only_admitted_unfinished_writes_once() {
+        let (connection, _peer) = pair();
+        let (finished, key) = correlation(1).unwrap();
+        let (active, _) = correlation(2).unwrap();
+        let (interrupted, _) = correlation(3).unwrap();
+        let (refused, _) = correlation(4).unwrap();
+        let inbox = ShardInbox::new(Wake::new(), 1, 3);
+        connection.install_shard_route(ShardIoRoute::new(finished.owner, key, Arc::clone(&inbox)));
+        let route = connection.core.shard_route.get().unwrap();
+        // Reserve precisely the three admitted occurrences. The active list
+        // may still reference a write whose completion was already published.
+        for id in [finished, active, interrupted] {
+            assert!(route.reserve_write(id));
+        }
+        assert!(!route.reserve_write(refused));
+        let mut reports = vec![Report::Written(Written::Complete {
+            correlation: Some((finished, key)),
+            bytes: 4,
+        })];
+        connection
+            .core
+            .flush_reports(&mut reports, &mut None)
+            .unwrap();
+        connection.core.finish_task(
+            None,
+            "eof",
+            [
+                Some((finished, key)),
+                Some((active, key)),
+                Some((refused, key)),
+            ],
+        );
+        let mut delivered = VecDeque::new();
+        assert_eq!(
+            inbox.drain_into(&mut delivered, 10),
+            3,
+            "exactly one terminal receipt per admitted write"
+        );
+        assert!(matches!(delivered.pop_front(), Some(ShardIoEvent::Written {
+            written: Written::Complete { correlation: Some((id, _)), .. }, .. }) if id == finished));
+        let failed: Vec<_> = delivered
+            .into_iter()
+            .map(|event| match event {
+                ShardIoEvent::Written {
+                    written:
+                        Written::Failed {
+                            correlation: Some((id, _)),
+                            ..
+                        },
+                    ..
+                } => id,
+                _ => panic!("missing terminal failure"),
+            })
+            .collect();
+        assert_eq!(failed, [active, interrupted]);
+        assert_eq!(inbox.write_slots.load(Ordering::Acquire), 3);
+        let late = Write {
+            correlation: Some((refused, key)),
+            expiry: None,
+            report: WriteReport::Complete,
+            bytes: FrameBytes::from(vec![0xc0, 0]),
+            payload: None,
+        };
+        assert!(matches!(
+            connection.outgoing_handle().try_send_outgoing(late),
+            Err(TrySendError::Disconnected(_))
+        ));
+        assert_eq!(connection.outgoing_handle().pending_shard_written(), 0);
+    }
+
     fn control() -> AtomicBool {
         AtomicBool::new(false)
     }
