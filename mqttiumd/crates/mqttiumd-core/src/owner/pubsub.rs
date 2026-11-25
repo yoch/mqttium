@@ -6289,6 +6289,72 @@ mod tests {
         }
     }
     #[test]
+    fn a_read_started_before_an_older_obligation_revisits_the_lower_range() {
+        fn id(sequence: u64) -> DeliveryId {
+            DeliveryId {
+                publication: PublicationId::new(
+                    StoreIncarnation::new(1), RunEpoch::new(1),
+                    LogicalOwnerId::new(4), PublicationSeq::new(sequence),
+                ),
+                index: 0,
+            }
+        }
+        fn load(owner: &mut Owner) -> (EffectId, Option<DeliveryId>) {
+            apply(owner, Input::WorkAvailable { session: TARGET })
+                .into_iter()
+                .find_map(|(effect, value)| match value {
+                    Effect::LoadWork { after, .. } => Some((effect, after)),
+                    _ => None,
+                })
+                .expect("work discovery should issue one bounded page read")
+        }
+        for next in [None, Some(id(60))] {
+            let mut owner = world();
+            owner.enable_inline_claims();
+            message_clock(&mut owner, 30);
+            owner.pubsub.connections.advance_known_through(CONNECTION, id(50));
+            let (effect, after) = load(&mut owner);
+            assert_eq!(after, Some(id(50)));
+
+            // The writer took this page's snapshot before an earlier-reserved
+            // publication (40) became an obligation for TARGET.
+            owner.shard_notify_dirty(TARGET, true);
+            assert!(apply(&mut owner, Input::WorkAvailable { session: TARGET }).is_empty());
+            let stale = WorkItem {
+                delivery: id(60), target: TARGET, target_revision: Revision::new(1),
+                qos: Qos::AtLeastOnce, cause: DeliveryCause::LiveExact, retain: false,
+                // The stale higher row needs no claim. Its identifier is still
+                // a page cursor even when expiry skips materializing the row.
+                expiry: Some(message_expiry()), properties: None,
+                topic: bytes(b"t/a"), payload: bytes(b"high"), claim: None,
+            };
+            apply(&mut owner, Input::WorkPage {
+                effect, session: TARGET,
+                items: BoundedVec::from_slice(&[stale], 1).unwrap(), next,
+            });
+
+            let mut found_lower = false;
+            // One page remains at most. A design can finish that chain before
+            // revisiting the start, or rewind immediately.
+            for _ in 0..2 {
+                if !owner.has_ready_work(TARGET) {
+                    break;
+                }
+                let (effect, after) = load(&mut owner);
+                if after.is_none_or(|cursor| cursor < id(40)) {
+                    found_lower = true;
+                    break;
+                }
+                apply(&mut owner, Input::WorkPage {
+                    effect, session: TARGET,
+                    items: BoundedVec::with_capacity(1).unwrap(), next: None,
+                });
+            }
+            assert!(found_lower, "a lower obligation remains invisible after next={next:?}");
+        }
+    }
+
+    #[test]
     fn a_later_work_page_cannot_rewrite_an_already_loaded_retain_flag() {
         let mut owner = world();
         queued(&mut owner, 0);
