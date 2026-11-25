@@ -108,6 +108,33 @@ impl Drop for Broker {
     }
 }
 
+#[test]
+fn startup_reports_the_effective_collection_identifier_and_expiry_bounds() {
+    let broker = Broker::start("limits", "volatile", 2);
+    let text = std::fs::read_to_string(broker.directory.join("events-0.jsonl")).unwrap();
+    let events: Vec<serde_json::Value> = text
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let details = |kind: &str| {
+        &events.iter().find(|event| event["kind"] == kind).unwrap()["details"]
+    };
+    let ready = details("ready");
+    assert_eq!(ready["outgoing_packet_identifier_probe_limit"], 32_769);
+    assert_eq!(ready["outgoing_packet_identifier_bitmap_bits"], 512);
+    assert_eq!(ready["outgoing_packet_identifier_fallback_probes"], 32_257);
+    assert_eq!(ready["qos0_window"], 224);
+    assert_eq!(ready["qos0_output_reserve"], 32);
+    assert_eq!(ready["output_slots"], 256);
+    assert_eq!(ready["session_expiry_timer_slots"], 4096);
+    assert_eq!(ready["session_expiry_per_turn"], 4);
+    assert_eq!(details("message_expiry_clock")["batch"], 4);
+    let policy = details("receipt_policy");
+    assert_eq!(policy["receipt_collection_rows"], 512);
+    assert_eq!(policy["receipt_collection_bytes"], 24 * 1024 * 1024);
+    assert_eq!(policy["receipt_collection_field_bytes"], 2 * 1024 * 1024);
+}
+
 fn push_str(value: &str, out: &mut Vec<u8>) {
     out.extend_from_slice(&u16::try_from(value.len()).unwrap().to_be_bytes());
     out.extend_from_slice(value.as_bytes());
