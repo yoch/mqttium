@@ -21,6 +21,14 @@ async def run(args, port, proc):
     records = {"offered": total, "started": 0, "pubcomp": 0, "delivered": 0, "duplicates": 0,
                "unexpected_pubrel": 0, "sequence_reversals": 0, "max_pacing_lag_ms": 0}
     start = time.monotonic()
+    # The global mean and worst lag cannot show intervals in which pacing bunched.
+    second_counts = {}
+
+    def count_second(field):
+        second = int(time.monotonic() - start)
+        counts = second_counts.setdefault(second, {"offered": 0, "pubcomp": 0, "delivered": 0})
+        counts[field] += 1
+
     done = asyncio.Event()
 
     async def subscriber():
@@ -59,6 +67,7 @@ async def run(args, port, proc):
                     if not received[seq]:
                         received[seq] = 1
                         records["delivered"] += 1
+                        count_second("delivered")
                         records["sequence_reversals"] += int(seq < previous)
                         previous = seq
                 peer.write(mqtt.pubcomp(ident))
@@ -78,10 +87,12 @@ async def run(args, port, proc):
             pid = ident.to_bytes(2, "big")
             writer.write(mqtt.publish(TOPIC, struct.pack("!I", seq), qos=2, packet_id=ident))
             records["started"] += 1
+            count_second("offered")
             await expect(reader, 0x50, pid)
             writer.write(mqtt.pubrel(ident))
             await expect(reader, 0x70, pid)
             records["pubcomp"] += 1
+            count_second("pubcomp")
 
     async def monitor():
         while True:
@@ -104,6 +115,7 @@ async def run(args, port, proc):
                 records["subscriber_error"] = repr(result)
         records["elapsed_seconds"] = time.monotonic() - start
         records["missing"] = total - records["delivered"]
+        write_json(args.out / "per-second.json", second_counts)
         write_json(args.out / "result.json", records)
         writer.close()
         peer.close()

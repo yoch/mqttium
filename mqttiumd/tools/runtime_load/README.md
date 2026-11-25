@@ -24,7 +24,8 @@ taskset -c 3 python tools/runtime_load/profiles.py qos0 --binary "$binary" \
   one hour. A persistent QoS 2 subscriber disconnects at 60 s, resumes at
   about 95 s, and commits each application identity on PUBREL. The broker
   runs in volatile mode. No restart takes place. The monitor records progress,
-  scheduling lag and Linux process memory every minute.
+  scheduling lag and Linux process memory every minute. One-second buckets count
+  the actual submissions, PUBCOMP completions and unique subscriber deliveries.
 * **Journal** checks every retained line including its newline, the product
   event format, a contiguous sequence and clean startup/shutdown markers for
   a single run. A journal whose start has already rotated out cannot meet
