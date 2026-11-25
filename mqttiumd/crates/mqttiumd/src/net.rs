@@ -3513,6 +3513,48 @@ mod tests {
     }
 
     #[test]
+    fn a_borrowed_ingress_batch_keeps_capacity_for_its_unconsumed_suffix() {
+        let (connection, _peer) = pair();
+        let packet = |id: u8| Incoming::Packet {
+            first: 0x30,
+            body: FrameBytes::from_slice(&[id]),
+            observed: Ok(MessageTime {
+                domain: [1; 32],
+                tick: 1,
+            }),
+        };
+        let core = &connection.core;
+        let mut fresh: Vec<_> = (0..INPUT_SLOTS as u8).map(packet).collect();
+        let mut stalled = None;
+        assert!(
+            core.push_incoming_batch(&mut fresh, &mut stalled, None)
+                .unwrap()
+        );
+        let mut batch = VecDeque::new();
+        connection.drain_incoming(&mut batch, 8);
+        assert_eq!(batch.len(), 8);
+        // The producer runs again before the coordinator knows how much of
+        // this batch it can consume. It must retain the new packet itself.
+        assert_eq!(core.incoming_free_slots(), 0);
+        let new = core.push_incoming_one(packet(INPUT_SLOTS as u8)).unwrap();
+        assert!(new.is_some());
+        batch.pop_front().unwrap();
+        connection.push_front_incoming(&mut batch);
+        assert_eq!(core.incoming_free_slots(), 1);
+        assert!(core.push_incoming_one(new.unwrap()).unwrap().is_none());
+        let mut all = VecDeque::new();
+        connection.drain_incoming(&mut all, INPUT_SLOTS);
+        let ids: Vec<_> = all
+            .into_iter()
+            .map(|item| match item {
+                Incoming::Packet { body, .. } => body[0],
+                _ => panic!("expected the ordered input stream"),
+            })
+            .collect();
+        assert_eq!(ids, (1..=INPUT_SLOTS as u8).collect::<Vec<_>>());
+    }
+
+    #[test]
     fn sharded_ack_backpressure_preserves_the_unread_suffix_and_write_receipts() {
         let (connection, _peer) = pair();
         let (effect, key) = correlation(9).unwrap();
