@@ -500,7 +500,9 @@ pub enum Effect {
 }
 
 impl Effect {
-    fn wire_generation(&self) -> Option<ConnectionGeneration> {
+    /// The network generation on which this effect must keep wire order.
+    #[must_use]
+    pub fn wire_generation(&self) -> Option<ConnectionGeneration> {
         match self {
             Self::EmitQos0 { connection, .. }
             | Self::EmitPublish { connection, .. }

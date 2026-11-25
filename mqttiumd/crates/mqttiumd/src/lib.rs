@@ -14,4 +14,5 @@ pub mod wake;
 pub mod writer;
 
 mod receiving;
+mod retained_output;
 pub mod security;

@@ -732,6 +732,7 @@ struct DeliveryShardWorker {
     // This bounds the number of fences by the process connection limit.
     pending_detaches: BTreeMap<ConnectionKey, (u64, Arc<AtomicBool>)>,
     outgoing_bindings: FlatMap<(ConnectionKey, OutboundPacketId), PubackTarget>,
+    retained_output: crate::retained_output::RetainedOutput,
     frames: ScopedFlatMap<EffectId, ShardPendingFrame>,
     inflight: ScopedFlatMap<EffectId, OperationId>,
     work_reads: ScopedFlatMap<EffectId, SessionId>,
@@ -787,6 +788,7 @@ impl DeliveryShardWorker {
             sessions: FlatMap::new(),
             pending_detaches: BTreeMap::new(),
             outgoing_bindings: FlatMap::new(),
+            retained_output: Default::default(),
             frames: ScopedFlatMap::new(),
             inflight: ScopedFlatMap::new(),
             work_reads: ScopedFlatMap::new(),
@@ -861,6 +863,7 @@ impl DeliveryShardWorker {
                     && self.work_reads.is_empty()
                     && self.control_inputs.is_empty()
                     && self.owner.outbox_is_empty()
+                    && self.retained_output.is_empty()
                 {
                     return Ok(());
                 }
@@ -871,6 +874,7 @@ impl DeliveryShardWorker {
 
             if self.progress == before {
                 let wait = if !self.owner.outbox_is_empty()
+                    || !self.retained_output.is_empty()
                     || !self.pending_inline.is_empty()
                     || !self.pending_qos0.is_empty()
                     || self.stopping
@@ -1891,7 +1895,7 @@ impl DeliveryShardWorker {
     }
 
     fn dispatch(&mut self) -> Result<(), Failure> {
-        if self.owner.outbox_is_empty() {
+        if self.owner.outbox_is_empty() && self.retained_output.is_empty() {
             return Ok(());
         }
         let mut close_notices = Vec::new();
@@ -1911,13 +1915,18 @@ impl DeliveryShardWorker {
             close_notices: &mut close_notices,
             error: None,
         };
-        let report = self.owner.dispatch(&mut sink);
+        let retried = self.retained_output.retry(&mut sink);
+        let report = self
+            .owner
+            .dispatch(&mut self.retained_output.sink(&mut sink));
         let sink_err = sink.error.take();
         for notice in close_notices {
             self.notify_coord(notice);
         }
-        if report.accepted > 0 {
-            self.progress = self.progress.wrapping_add(report.accepted as u64);
+        if report.accepted + retried > 0 {
+            self.progress = self
+                .progress
+                .wrapping_add((report.accepted + retried) as u64);
         }
         if let Some(err) = sink_err {
             return Err(err);
@@ -2351,6 +2360,11 @@ impl EffectSink for ShardSink<'_> {
                                 report: WriteReport::Complete,
                             }) {
                                 Ok(()) => Ok(()),
+                                Err(TrySendError::Full(_))
+                                    if *cause == DeliveryCause::RetainedReplay =>
+                                {
+                                    return refused(effect, SubmitBlock::TransportBackpressure);
+                                }
                                 Err(TrySendError::Full(_)) => Err(Qos0DropReason::OutputSaturated),
                                 Err(TrySendError::Disconnected(_)) => {
                                     Err(Qos0DropReason::ConnectionClosed)

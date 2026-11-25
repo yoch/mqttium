@@ -228,6 +228,7 @@ fn with_runtime_layout(
         deferred_ack: None,
         #[cfg(feature = "test-hooks")]
         deferred_ack_used: false,
+        retained_output: Default::default(),
         frames: ScopedFlatMap::new(),
         outgoing_bindings: FlatMap::new(),
         puback_observation: 0,
@@ -676,7 +677,10 @@ fn durable_publications_to_a_qos0_subscription_wait_for_its_output() {
 fn retained_qos0_replay_waits_for_the_subscriber_output() {
     with_runtime(128, |runtime, directory| {
         let (source, mut publisher) = connected(runtime, b"retained-source");
-        for (id, topic) in [(1, b't'), (2, b'u')] {
+        use mqttiumd_core::owner::QOS0_CONSUMED_WINDOW;
+        let topics = b'a'..(b'a' + QOS0_CONSUMED_WINDOW as u8 + 2);
+        for (index, topic) in topics.clone().enumerate() {
+            let id = u16::try_from(index + 1).unwrap();
             let mut body = publish_body(id);
             body[2] = topic;
             runtime.packet(source, 0x33, body).unwrap();
@@ -707,10 +711,14 @@ fn retained_qos0_replay_waits_for_the_subscriber_output() {
         let suback = (0x90, vec![0, 1, 0, 0]);
         let replay = |topic| (0x31, vec![0, 1, topic, 0, b'v']);
         runtime.packet(slow, 0x82, subscribe()).unwrap();
+        until(runtime, |r| {
+            r.retained_output.pending(slow) == QOS0_CONSUMED_WINDOW && r.owner.outbox_is_empty()
+        });
         runtime.packet(fast, 0x82, subscribe()).unwrap();
         assert_eq!(served_frame(runtime, &mut fast_socket), suback);
-        assert_eq!(served_frame(runtime, &mut fast_socket), replay(b't'));
-        assert_eq!(served_frame(runtime, &mut fast_socket), replay(b'u'));
+        for topic in topics.clone() {
+            assert_eq!(served_frame(runtime, &mut fast_socket), replay(topic));
+        }
         assert!(runtime.peers[&slow].closing().is_none());
 
         // Move the actual accepted SUBACK to the real socket before making the
@@ -725,11 +733,14 @@ fn retained_qos0_replay_waits_for_the_subscriber_output() {
         peer.io.try_send_outgoing(ack).unwrap();
         assert_eq!(served_frame(runtime, &mut slow_socket), suback);
         assert_eq!(qos0_drops(directory), 0);
-        assert_eq!(served_frame(runtime, &mut slow_socket), replay(b't'));
-        assert_eq!(served_frame(runtime, &mut slow_socket), replay(b'u'));
+        for topic in topics.clone() {
+            assert_eq!(served_frame(runtime, &mut slow_socket), replay(topic));
+        }
         runtime.packet(slow, 0xc0, vec![]).unwrap();
         assert_eq!(served_frame(runtime, &mut slow_socket), (0xd0, vec![]));
-        until(runtime, |r| r.frames.is_empty() && r.owner.outbox_is_empty());
+        until(runtime, |r| {
+            r.frames.is_empty() && r.owner.outbox_is_empty() && r.retained_output.is_empty()
+        });
     });
 }
 
@@ -7610,6 +7621,7 @@ fn direct_volatile_store_commits_inline_and_saves_snapshot() {
         deferred_ack: None,
         #[cfg(feature = "test-hooks")]
         deferred_ack_used: false,
+        retained_output: Default::default(),
         frames: ScopedFlatMap::new(),
         outgoing_bindings: FlatMap::new(),
         puback_observation: 0,

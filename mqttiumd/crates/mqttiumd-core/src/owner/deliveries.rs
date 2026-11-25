@@ -944,7 +944,14 @@ impl Deliveries {
                     d.retired = true;
                     d.window = None;
                     d.topic = None;
-                    d.payload = None;
+                    // A consumed retained replay can still be held by its
+                    // adapter. Keep its shared payload charged until the
+                    // exact write or refusal removes this retired row.
+                    if d.cause != DeliveryCause::RetainedReplay
+                        || !matches!(d.phase, Phase::Qos0Writing(_))
+                    {
+                        d.payload = None;
+                    }
                     d.properties = None;
                 });
             } else {

@@ -868,6 +868,7 @@ struct Runtime<'a> {
     deferred_ack: Option<(EffectId, ConnectionKey, usize, Instant)>,
     #[cfg(feature = "test-hooks")]
     deferred_ack_used: bool,
+    retained_output: crate::retained_output::RetainedOutput,
     frames: ScopedFlatMap<EffectId, PendingFrame>,
     outgoing_bindings: FlatMap<(ConnectionKey, OutboundPacketId), PubackTarget>,
     puback_observation: u64,
@@ -2942,16 +2943,20 @@ impl Runtime<'_> {
                         session_change: None,
                         error: None,
                     };
+                    let mut replay_sink = self.retained_output.sink(&mut sink);
                     let (outcome, accepted) = if let Some(shards) = self.shards.as_mut() {
                         self.owner.step_and_dispatch_with_oracle(
                             input,
                             TurnGrant { work_limit },
-                            &mut sink,
+                            &mut replay_sink,
                             shards,
                         )
                     } else {
-                        self.owner
-                            .step_and_dispatch(input, TurnGrant { work_limit }, &mut sink)
+                        self.owner.step_and_dispatch(
+                            input,
+                            TurnGrant { work_limit },
+                            &mut replay_sink,
+                        )
                     };
                     inline_accepted = accepted;
                     inline_close = std::mem::take(&mut sink.close);
@@ -3481,7 +3486,7 @@ impl Runtime<'_> {
 
     fn dispatch_returning_accepted(&mut self) -> Result<usize, Failure> {
         #[cfg(not(feature = "test-hooks"))]
-        if self.owner.outbox().is_some_and(|box_| box_.is_empty()) {
+        if self.owner.outbox_is_empty() && self.retained_output.is_empty() {
             return Ok(0);
         }
         if self.timers_dirty && self.timers.len() >= self.limits.timers.saturating_sub(16) {
@@ -3538,7 +3543,10 @@ impl Runtime<'_> {
         };
         #[cfg(feature = "test-hooks")]
         sink.release_qos0();
-        let report = self.owner.dispatch(&mut sink);
+        let retried = self.retained_output.retry(&mut sink);
+        let report = self
+            .owner
+            .dispatch(&mut self.retained_output.sink(&mut sink));
         let close = std::mem::take(&mut sink.close);
         let mark_pending = std::mem::take(&mut sink.mark_pending_peers);
         let work_targets = std::mem::take(&mut sink.pending_work_targets);
@@ -3559,7 +3567,7 @@ impl Runtime<'_> {
         for target in work_targets {
             self.notify_work(target)?;
         }
-        if report.accepted != 0 {
+        if report.accepted + retried != 0 {
             self.progress = self.progress.wrapping_add(1);
             if std::mem::take(&mut self.effects_awaited) {
                 // The packets that found the box full are tried again, the
@@ -3595,7 +3603,7 @@ impl Runtime<'_> {
         }
         self.session_cardinality_dirty = true;
         self.emit_session_cardinality()?;
-        Ok(report.accepted)
+        Ok(report.accepted + retried)
     }
     fn apply_control_response(&mut self, response: ControlResponse) -> Result<(), Failure> {
         match response {
@@ -6564,6 +6572,11 @@ impl EffectSink for Sink<'_, '_> {
                             }
                             match result {
                                 Ok(()) => Ok(()),
+                                Err(TrySendError::Full(_))
+                                    if *cause == DeliveryCause::RetainedReplay =>
+                                {
+                                    return refused(effect, SubmitBlock::TransportBackpressure);
+                                }
                                 Err(TrySendError::Full(_)) => Err(Qos0DropReason::OutputSaturated),
                                 Err(TrySendError::Disconnected(_)) => {
                                     Err(Qos0DropReason::ConnectionClosed)
@@ -8032,6 +8045,7 @@ fn run_inner(
         deferred_ack: None,
         #[cfg(feature = "test-hooks")]
         deferred_ack_used: false,
+        retained_output: Default::default(),
         frames: ScopedFlatMap::new(),
         outgoing_bindings: FlatMap::new(),
         puback_observation: 0,

@@ -79,7 +79,7 @@ pub(super) const QOS0_PARKED: usize = 1_024;
 /// Consumed QoS 0 deliveries one connection may have being written. Each
 /// is consumed in the store before its frame is emitted, so its frame must
 /// find a place in the output queue.
-pub(super) const QOS0_CONSUMED_WINDOW: usize = 16;
+pub const QOS0_CONSUMED_WINDOW: usize = 16;
 
 /// The volatile deliveries of one connection generation: how many are in
 /// flight, and those that wait for the window, oldest first.
