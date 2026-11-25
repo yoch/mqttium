@@ -671,26 +671,38 @@ fn durable_publications_to_a_qos0_subscription_wait_for_its_output() {
     );
 }
 
-/// The SUBACK takes the last slot. The replay must wait for this particular
-/// connection, while the second subscription makes progress on the same owner.
 #[test]
 fn retained_qos0_replay_waits_for_the_subscriber_output() {
+    check_retained_qos0_replay(codec::Version::V5);
+}
+
+#[test]
+fn mqtt311_retained_qos0_replay_waits_for_the_subscriber_output() {
+    check_retained_qos0_replay(codec::Version::V311);
+}
+
+/// The SUBACK takes the last slot. The replay must wait for this particular
+/// connection, while the second subscription makes progress on the same owner.
+fn check_retained_qos0_replay(version: codec::Version) {
+    use mqttiumd_core::owner::QOS0_CONSUMED_WINDOW;
     with_runtime(128, |runtime, directory| {
-        let (source, mut publisher) = connected(runtime, b"retained-source");
-        use mqttiumd_core::owner::QOS0_CONSUMED_WINDOW;
+        let (source, mut publisher) = connected_version(runtime, b"retained-source", version);
         let topics = b'a'..(b'a' + QOS0_CONSUMED_WINDOW as u8 + 2);
         for (index, topic) in topics.clone().enumerate() {
             let id = u16::try_from(index + 1).unwrap();
-            let mut body = publish_body(id);
-            body[2] = topic;
+            let [high, low] = id.to_be_bytes();
+            let mut body = vec![0, 1, topic, high, low];
+            let mut puback = vec![high, low];
+            if version == codec::Version::V5 {
+                body.push(0); // No PUBLISH properties.
+                puback.push(0x10); // No matching subscribers yet.
+            }
+            body.push(b'v');
             runtime.packet(source, 0x33, body).unwrap();
-            assert_eq!(
-                served_frame(runtime, &mut publisher),
-                (0x40, vec![0, id as u8, 0x10])
-            );
+            assert_eq!(served_frame(runtime, &mut publisher), (0x40, puback));
         }
-        let (slow, mut slow_socket) = connected(runtime, b"retained-held");
-        let (fast, mut fast_socket) = connected(runtime, b"retained-reader");
+        let (slow, mut slow_socket) = connected_version(runtime, b"retained-held", version);
+        let (fast, mut fast_socket) = connected_version(runtime, b"retained-reader", version);
         let (sender, held) = std::sync::mpsc::sync_channel(net::OUTPUT_SLOTS);
         for _ in 1..net::OUTPUT_SLOTS {
             sender
@@ -707,14 +719,19 @@ fn retained_qos0_replay_waits_for_the_subscriber_output() {
             &mut runtime.peers.get_mut(&slow).unwrap().io.outgoing,
             sender.into(),
         );
-        let subscribe = || vec![0, 1, 0, 0, 1, b'+', 0];
-        let suback = (0x90, vec![0, 1, 0, 0]);
-        let replay = |topic| (0x31, vec![0, 1, topic, 0, b'v']);
-        runtime.packet(slow, 0x82, subscribe()).unwrap();
+        let (subscribe, suback) = match version {
+            codec::Version::V311 => (vec![0, 1, 0, 1, b'+', 0], (0x90, vec![0, 1, 0])),
+            codec::Version::V5 => (vec![0, 1, 0, 0, 1, b'+', 0], (0x90, vec![0, 1, 0, 0])),
+        };
+        let replay = |topic| match version {
+            codec::Version::V311 => (0x31, vec![0, 1, topic, b'v']),
+            codec::Version::V5 => (0x31, vec![0, 1, topic, 0, b'v']),
+        };
+        runtime.packet(slow, 0x82, subscribe.clone()).unwrap();
         until(runtime, |r| {
             r.retained_output.pending(slow) == QOS0_CONSUMED_WINDOW && r.owner.outbox_is_empty()
         });
-        runtime.packet(fast, 0x82, subscribe()).unwrap();
+        runtime.packet(fast, 0x82, subscribe).unwrap();
         assert_eq!(served_frame(runtime, &mut fast_socket), suback);
         for topic in topics.clone() {
             assert_eq!(served_frame(runtime, &mut fast_socket), replay(topic));
@@ -727,7 +744,8 @@ fn retained_qos0_replay_waits_for_the_subscriber_output() {
             assert_eq!(held.try_recv().unwrap().bytes.as_slice(), &[0xd0, 0]);
         }
         let ack = held.try_recv().expect("SUBACK behind the padding");
-        assert_eq!(ack.bytes.as_slice(), &[0x90, 4, 0, 1, 0, 0]);
+        assert_eq!(ack.bytes[0], suback.0);
+        assert_eq!(ack.bytes[2..], suback.1);
         let peer = runtime.peers.get_mut(&slow).unwrap();
         peer.io.outgoing = original;
         peer.io.try_send_outgoing(ack).unwrap();
@@ -1530,9 +1548,23 @@ fn a_3_1_1_burst_beyond_the_receive_window_is_acknowledged_not_refused() {
 
 /// A connected MQTT 5 peer.
 fn connected(runtime: &mut Runtime<'_>, client_id: &[u8]) -> (ConnectionGeneration, TcpStream) {
+    connected_version(runtime, client_id, codec::Version::V5)
+}
+
+fn connected_version(
+    runtime: &mut Runtime<'_>,
+    client_id: &[u8],
+    version: codec::Version,
+) -> (ConnectionGeneration, TcpStream) {
     let (generation, mut client) = peer(runtime);
     runtime
-        .connect(generation, connect_packet(client_id))
+        .connect(
+            generation,
+            codec::Connect {
+                version,
+                ..connect_packet(client_id)
+            },
+        )
         .unwrap();
     until(runtime, |r| r.session_requests.is_empty());
     assert_eq!(read_frame(&mut client).0, 0x20);
