@@ -123,6 +123,7 @@ async def waiting(args, port, proc):
     completed_ms = []
     unrelated_ms = []
     copies = 0
+    measured_start = time.monotonic()
     for turn in range(args.rounds):
         base = turn * depth
         burst = bytearray()
@@ -157,8 +158,12 @@ async def waiting(args, port, proc):
 
         _, _, delay = await asyncio.gather(finish(), receive(), ping(wr, ww))
         unrelated_ms.append(delay)
+    measured_seconds = time.monotonic() - measured_start
+    write_json(args.out / "timings-ms.json", {"pubcomp_since_burst": completed_ms,
+                                             "separate_client_ping": unrelated_ms})
     await asyncio.gather(close(pw), close(sw), close(ww))
-    return {"pipeline": depth, "rounds": args.rounds, "ordered_unique": copies,
+    return {"measured_seconds": measured_seconds, "completed_per_second": copies / measured_seconds,
+            "pipeline": depth, "rounds": args.rounds, "ordered_unique": copies,
             "pubcomp_since_burst_ms": distribution(completed_ms),
             "separate_client_ping_ms": distribution(unrelated_ms), "process": proc_sample(proc.pid)}
 
