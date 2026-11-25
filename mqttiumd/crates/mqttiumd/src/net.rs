@@ -3255,6 +3255,51 @@ mod tests {
         (spawn_with_clock(server, clock).unwrap(), peer)
     }
 
+    #[test]
+    fn sharded_ack_backpressure_preserves_the_unread_suffix_and_write_receipts() {
+        let (connection, _peer) = pair();
+        let (effect, key) = correlation(9).unwrap();
+        let inbox = ShardInbox::new(Wake::new());
+        connection.install_shard_route(ShardIoRoute {
+            owner_id: effect.owner,
+            connection: key,
+            inbox: Arc::clone(&inbox),
+        });
+        let packet = |first, index| Incoming::Packet {
+            first,
+            body: FrameBytes::from(vec![0, index]),
+            observed: Ok(MessageTime { domain: [1; 32], tick: 1 }),
+        };
+        let mut batch = vec![packet(0x40, 1), packet(0x40, 2), packet(0x40, 3), packet(0xe0, 0)];
+        let mut stalled = None;
+        assert!(!connection.core.push_incoming_batch(&mut batch, &mut stalled).unwrap(),
+            "the third ACK and the following DISCONNECT must wait for the shard");
+        assert!(batch.is_empty());
+        let mut delivered = VecDeque::new();
+        assert_eq!(inbox.drain_into(&mut delivered, 10), 2);
+        let mut written = vec![Report::Written(Written::Complete {
+            correlation: Some((effect, key)), bytes: 4,
+        })];
+        assert!(connection.core.flush_reports(&mut written, &mut stalled).unwrap());
+        assert_eq!(inbox.drain_into(&mut delivered, 10), 1);
+        assert!(matches!(delivered.back(), Some(ShardIoEvent::Written { .. })));
+        assert!(!connection.core.flush_held_incoming(stalled.as_mut().unwrap()).unwrap(),
+            "moving ACKs to the shard's input lane must not free their credits");
+        let first = delivered.pop_front().unwrap();
+        assert!(matches!(&first, ShardIoEvent::AckPacket { body, .. } if body.as_slice() == [0, 1]));
+        drop(first);
+        assert!(connection.core.flush_held_incoming(stalled.as_mut().unwrap()).unwrap());
+        assert_eq!(inbox.drain_into(&mut delivered, 10), 1);
+        let ids: Vec<u8> = delivered.into_iter().filter_map(|event| match event {
+            ShardIoEvent::AckPacket { body, .. } => Some(body.as_slice()[1]),
+            ShardIoEvent::Written { .. } => None,
+        }).collect();
+        assert_eq!(ids, [2, 3]);
+        let mut coordinator = VecDeque::new();
+        connection.core.drain_incoming(&mut coordinator, 10);
+        assert!(matches!(coordinator.pop_front(), Some(Incoming::Packet { first: 0xe0, .. })));
+    }
+
     fn control() -> AtomicBool {
         AtomicBool::new(false)
     }
