@@ -155,6 +155,9 @@
     "contracts/examples/v1/valid/trace-record-recovery-page-hierarchical-options.json",
     "contracts/examples/v1/valid/store-snapshot-subscription-options-receipt.json",
     "contracts/examples/v1/valid/product-hierarchical-capabilities.json",
+    "contracts/examples/v1/valid/product-ready-limits.json",
+    "contracts/examples/v1/valid/product-receipt-policy.json",
+    "contracts/examples/v1/valid/product-ops-counters.json",
     "contracts/examples/v1/valid/product-message-expiry-transitions.json",
     "contracts/examples/v1/valid/store-snapshot-message-expiry.json",
     "contracts/examples/v1/valid/store-snapshot-message-expiry-zero.json",
@@ -200,6 +203,7 @@
     "contracts/examples/v1/valid/product-will-detached-infinite-diagnostic.json",
     "contracts/examples/v1/valid/product-will-detached-finite-diagnostic.json",
     "contracts/examples/v1/valid/product-mtls-profile.json",
+    "contracts/examples/v1/valid/product-mtls-profile-scaled.json",
     "contracts/examples/v1/valid/product-secure-authorization-refused.json",
     "contracts/examples/v1/valid/product-hook-tls-frame-sealed.json",
     "contracts/examples/v1/valid/product-hook-tls-frame-first_bytes.json"
@@ -2540,6 +2544,48 @@
       "why": "Stored nondefault option bytes retain their validated discriminant."
     },
     {
+      "file": "contracts/examples/v1/invalid/product-ready-unknown-field.json",
+      "code": "schema-violation",
+      "pointer": "/details",
+      "why": "Only readiness facts emitted by the product are admitted."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/product-ready-string-window.json",
+      "code": "schema-violation",
+      "pointer": "/details/qos0_window",
+      "why": "The window is a count."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/product-counter-bad-name.json",
+      "code": "schema-violation",
+      "pointer": "/details/counts",
+      "why": "Counter names use the event-kind syntax."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/product-counter-integer.json",
+      "code": "schema-violation",
+      "pointer": "/details/counts/frame_written",
+      "why": "Counts are canonical decimal strings."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/product-counter-overflow.json",
+      "code": "schema-violation",
+      "pointer": "/details/counts/frame_written",
+      "why": "A counter cannot exceed u64."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/product-other-nested-counts.json",
+      "code": "schema-violation",
+      "pointer": "/details/counts",
+      "why": "A counter map belongs to the counters kind."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/product-receipt-policy-type.json",
+      "code": "schema-violation",
+      "pointer": "/details/startup_closed_collection",
+      "why": "The collection flag is boolean."
+    },
+    {
       "file": "contracts/examples/v1/invalid/product-details-over-budget.json",
       "code": "schema-violation",
       "pointer": "/details",
@@ -2778,6 +2824,12 @@
       "code": "schema-violation",
       "pointer": "/details/deadline",
       "why": "Infinite detachment has no finite deadline; legacy null remains readable."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/product-mtls-profile-mixed.json",
+      "code": "schema-violation",
+      "pointer": "/details",
+      "why": "The two TLS capacities belong to one observed profile revision."
     },
     {
       "file": "contracts/examples/v1/invalid/product-secure-denial-leaks-topic.json",

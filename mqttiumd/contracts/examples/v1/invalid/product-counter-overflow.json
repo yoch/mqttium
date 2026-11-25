@@ -1,0 +1,13 @@
+{
+  "format": "mqttiumd.product-event",
+  "schema_version": 1,
+  "seq": "2",
+  "pid": 1,
+  "kind": "counters",
+  "details": {
+    "counts": {
+      "qos0_dropped": "1",
+      "frame_written": "18446744073709551616"
+    }
+  }
+}

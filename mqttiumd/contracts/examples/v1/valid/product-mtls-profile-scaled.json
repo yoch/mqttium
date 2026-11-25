@@ -1,0 +1,21 @@
+{
+  "format": "mqttiumd.product-event",
+  "schema_version": 1,
+  "seq": "2",
+  "pid": 1,
+  "kind": "tls_profile",
+  "details": {
+    "version": "TLS1.3",
+    "client_certificate": "required",
+    "policy_fingerprint": "2222222222222222222222222222222222222222222222222222222222222222",
+    "max_handshakes": 64,
+    "handshake_ms": 2000,
+    "handshake_bytes": 65536,
+    "certificate_bytes": 8192,
+    "chain_bytes": 32768,
+    "chain_certificates": 4,
+    "tls_buffer_bytes": 2097152,
+    "resumption": false,
+    "early_data": false
+  }
+}

@@ -3823,6 +3823,95 @@ capabilities = env("mqttiumd.product-event", seq="1", kind="ready", pid=1, detai
     "retained_available": True, "retained_topics": 32, "retained_bytes": 1048576, "max_replay_candidates": 256,
 })
 ok("product-hierarchical-capabilities.json", capabilities)
+
+# Current diagnostics and historic subsets share the v1 event envelope.
+ready_limits = env("mqttiumd.product-event", seq="1", pid=1, kind="ready", details={'address': '127.0.0.1:1883',
+ 'commands_in_flight': 512,
+ 'connect_ms': 3000,
+ 'delivery_shards': 0,
+ 'durability_guarantee': 'none_in_memory_only',
+ 'epoch': '1',
+ 'incarnation': '1',
+ 'input_slots': 32,
+ 'max_client_id_bytes': 1024,
+ 'max_connections': 4096,
+ 'max_exchange_slots': 32768,
+ 'max_packet_bytes': 1114112,
+ 'max_payload_bytes': 1048576,
+ 'max_replay_candidates': 32768,
+ 'max_sessions': 4096,
+ 'max_subscriptions': 16384,
+ 'max_targets': 1024,
+ 'max_timers': 131072,
+ 'max_topic_bytes': 1024,
+ 'no_local': True,
+ 'outgoing_metadata': 32768,
+ 'outgoing_packet_identifier_bitmap_bits': 512,
+ 'outgoing_packet_identifier_fallback_probes': 32257,
+ 'outgoing_packet_identifier_max': 65535,
+ 'outgoing_packet_identifier_probe_limit': 32769,
+ 'outgoing_payload_bytes': 67108864,
+ 'outgoing_per_connection': 256,
+ 'output_slots': 256,
+ 'partial_packet_ms': 5000,
+ 'profile': 'mtls-will-pubsub-v1',
+ 'qos0_output_reserve': 32,
+ 'qos0_window': 224,
+ 'receipt_slots': 65536,
+ 'receive_maximum': 8,
+ 'remembered_connections': 8,
+ 'retained_available': True,
+ 'retained_bytes': 67108864,
+ 'retained_topics': 4096,
+ 'session_expiry_per_turn': 4,
+ 'session_expiry_timer_slots': 4096,
+ 'shared_subscriptions': False,
+ 'snapshot_interval_secs': 0,
+ 'sqlite_schema': 15,
+ 'storage_mode': 'volatile',
+ 'subscription_identifiers': False,
+ 'wildcard_subscriptions': True,
+ 'work_page_items': 8,
+ 'work_scan_ms': 100,
+ 'write_ms': 250,
+ 'writer_slots': 1024})
+ok("product-ready-limits.json", ready_limits)
+receipt_limits = env("mqttiumd.product-event", seq="1", pid=1, kind="receipt_policy", details={'control_input_slots': 4,
+ 'control_reply_slots': 4,
+ 'control_request_slots': 4,
+ 'max_receipt_origins': 64,
+ 'receipt_collection_bytes': 25165824,
+ 'receipt_collection_field_bytes': 2097152,
+ 'receipt_collection_rows': 512,
+ 'receipt_collection_trigger': 64,
+ 'receipt_control_reserve': 512,
+ 'receipt_data_window': 3584,
+ 'receipt_window': 4096,
+ 'startup_closed_collection': False,
+ 'startup_origins_trigger': 32,
+ 'startup_receipts_trigger': 4096})
+ok("product-receipt-policy.json", receipt_limits)
+ops_counts = env("mqttiumd.product-event", seq="2", pid=1, kind="counters",
+                 details={"counts": {"qos0_dropped": "1", "frame_written": "18446744073709551615"}})
+ok("product-ops-counters.json", ops_counts)
+for name, pointer, message, document in (
+    ("ready-unknown-field", "/details", "Only readiness facts emitted by the product are admitted.",
+     edited(ready_limits, lambda v: v["details"].update(qos0_typo=0))),
+    ("ready-string-window", "/details/qos0_window", "The window is a count.",
+     edited(ready_limits, lambda v: v["details"].update(qos0_window="224"))),
+    ("counter-bad-name", "/details/counts", "Counter names use the event-kind syntax.",
+     edited(ops_counts, lambda v: v["details"]["counts"].update({"not-a-kind": "1"}))),
+    ("counter-integer", "/details/counts/frame_written", "Counts are canonical decimal strings.",
+     edited(ops_counts, lambda v: v["details"]["counts"].update(frame_written=1))),
+    ("counter-overflow", "/details/counts/frame_written", "A counter cannot exceed u64.",
+     edited(ops_counts, lambda v: v["details"]["counts"].update(frame_written="18446744073709551616"))),
+    ("other-nested-counts", "/details/counts", "A counter map belongs to the counters kind.",
+     edited(ops_counts, lambda v: v.update(kind="starting"))),
+    ("receipt-policy-type", "/details/startup_closed_collection", "The collection flag is boolean.",
+     edited(receipt_limits, lambda v: v["details"].update(startup_closed_collection=1))),
+):
+    bad("product-" + name + ".json", "schema-violation", pointer, message, document)
+
 bad("product-details-over-budget.json", "schema-violation", "/details",
     "Product diagnostics remain bounded even with the six new startup capabilities.",
     env("mqttiumd.product-event", seq="1", kind="starting", pid=1,
@@ -4070,6 +4159,14 @@ ok("product-mtls-profile.json", env("mqttiumd.product-event", seq="2", pid=1, ki
     "version":"TLS1.3","client_certificate":"required","policy_fingerprint":"ab" * 32,"max_handshakes":8,
     "handshake_ms":2000,"handshake_bytes":65536,"certificate_bytes":8192,"chain_bytes":32768,
     "chain_certificates":4,"tls_buffer_bytes":98304,"resumption":False,"early_data":False}))
+scaled_tls = env("mqttiumd.product-event", seq="2", pid=1, kind="tls_profile", details={
+    "version":"TLS1.3","client_certificate":"required","policy_fingerprint":"22"*32,"max_handshakes":64,
+    "handshake_ms":2000,"handshake_bytes":65536,"certificate_bytes":8192,"chain_bytes":32768,
+    "chain_certificates":4,"tls_buffer_bytes":2097152,"resumption":False,"early_data":False})
+ok("product-mtls-profile-scaled.json", scaled_tls)
+bad("product-mtls-profile-mixed.json", "schema-violation", "/details",
+    "The two TLS capacities belong to one observed profile revision.",
+    edited(scaled_tls, lambda v: v["details"].update(max_handshakes=8)))
 ok("product-secure-authorization-refused.json", secure_denial)
 bad("product-secure-denial-leaks-topic.json", "schema-violation", "/details",
     "A denied filter is not included in a security diagnostic.",

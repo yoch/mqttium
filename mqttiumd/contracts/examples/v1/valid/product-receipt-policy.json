@@ -1,0 +1,23 @@
+{
+  "format": "mqttiumd.product-event",
+  "schema_version": 1,
+  "seq": "1",
+  "pid": 1,
+  "kind": "receipt_policy",
+  "details": {
+    "control_input_slots": 4,
+    "control_reply_slots": 4,
+    "control_request_slots": 4,
+    "max_receipt_origins": 64,
+    "receipt_collection_bytes": 25165824,
+    "receipt_collection_field_bytes": 2097152,
+    "receipt_collection_rows": 512,
+    "receipt_collection_trigger": 64,
+    "receipt_control_reserve": 512,
+    "receipt_data_window": 3584,
+    "receipt_window": 4096,
+    "startup_closed_collection": false,
+    "startup_origins_trigger": 32,
+    "startup_receipts_trigger": 4096
+  }
+}
