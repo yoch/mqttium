@@ -606,7 +606,6 @@ impl PeerTable {
         self.len
     }
 
-    #[cfg(test)]
     #[inline]
     fn is_empty(&self) -> bool {
         self.len == 0
@@ -1903,6 +1902,9 @@ impl Runtime<'_> {
         }
         loop {
             self.writer_results()?;
+            if self.shards.is_some() {
+                self.drain_shard_notices()?;
+            }
             self.connections()?;
             self.due_deadlines()?;
             self.drain_inputs()?;
