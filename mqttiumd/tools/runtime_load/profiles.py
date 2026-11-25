@@ -123,6 +123,9 @@ async def waiting(args, port, proc):
     completed_ms = []
     unrelated_ms = []
     copies = 0
+    submitted = 0
+    pubrecs = 0
+    pubrels = 0
     measured_start = time.monotonic()
     for turn in range(args.rounds):
         base = turn * depth
@@ -131,6 +134,7 @@ async def waiting(args, port, proc):
             burst.extend(mqtt.publish(TOPIC, struct.pack("!I", base + i), qos=2, packet_id=i + 1))
         start = time.monotonic_ns()
         pw.write(burst)
+        submitted += depth
 
         receipts, releases, completions = set(), set(), set()
 
@@ -179,12 +183,17 @@ async def waiting(args, port, proc):
             })
             raise
         unrelated_ms.append(delay)
+        pubrecs += len(receipts)
+        pubrels += len(releases)
     measured_seconds = time.monotonic() - measured_start
     write_json(args.out / "timings-ms.json", {"pubcomp_since_burst": completed_ms,
                                              "separate_client_ping": unrelated_ms})
     await asyncio.gather(close(pw), close(sw), close(ww))
     return {"measured_seconds": measured_seconds, "completed_per_second": copies / measured_seconds,
             "pipeline": depth, "rounds": args.rounds, "ordered_unique": copies,
+            "wire_totals": {"submitted_publish": submitted, "observed_pubrec": pubrecs,
+                            "submitted_pubrel": pubrels, "observed_pubcomp": len(completed_ms),
+                            "ordered_subscriber_copies": copies, "observed_pingresp": len(unrelated_ms)},
             "pubcomp_since_burst_ms": distribution(completed_ms),
             "separate_client_ping_ms": distribution(unrelated_ms), "process": proc_sample(proc.pid)}
 
