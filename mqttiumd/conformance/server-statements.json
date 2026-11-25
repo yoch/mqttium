@@ -1813,7 +1813,7 @@
         "applies_to_server": false,
         "status": "not-applicable",
         "evidence": [],
-        "note": "Binds the client only. The broker announces Receive Maximum 8 and answers a ninth open exchange with DISCONNECT 0x93."
+        "note": "Binds the client. Receive Maximum 8 applies to the current network connection. The broker signals 0x93 for a ninth open exchange there. ADR 0061 separately defines the session resource limit across reconnects."
       },
       {
         "id": "MQTT-3.3.4-8",
@@ -5241,9 +5241,13 @@
           {
             "file": "mqttiumd/crates/mqttiumd-core/src/owner/pubsub.rs",
             "test": "recovered_qos2_phase_selects_pubrel_even_with_publish_bytes_available"
+          },
+          {
+            "file": "mqttiumd/crates/mqttiumd/tests/reactor_wake.rs",
+            "test": "mqtt311_resumes_after_a_42_publication_pipeline_fills_the_prefix"
           }
         ],
-        "note": "Core level: unacknowledged PUBLISH and PUBREL are replayed with their identifiers after a reconnection. The deciding code is shared by both protocol versions; the test drives it with an MQTT 5 connection or below the wire."
+        "note": "The core replays outstanding PUBLISH and PUBREL after reconnect. The MQTT 3.1.1 wire test resumes the persistent session and completes all eight retransmitted PUBREL with their original packet identifiers."
       },
       {
         "id": "MQTT-4.5.0-1",
@@ -5552,9 +5556,13 @@
           {
             "file": "mqttiumd/crates/mqttiumd-core/src/owner.rs",
             "test": "a_publish_no_credit_can_ever_cover_closes_its_connection"
+          },
+          {
+            "file": "mqttiumd/crates/mqttiumd/tests/reactor_wake.rs",
+            "test": "mqtt311_resumes_after_a_42_publication_pipeline_fills_the_prefix"
           }
         ],
-        "note": "Core level: a PUBLISH that can never be admitted closes its connection. A refusal that 3.1.1 cannot express in an acknowledgement also closes it (`capacity_exceeded`), which is not asserted."
+        "note": "A saturated lookahead that cannot reach the remote PUBREL ends that connection. A second live peer answers a PING and the persistent client completes its eight admitted exchanges after reconnect."
       },
       {
         "id": "MQTT-6.0.0-1",
