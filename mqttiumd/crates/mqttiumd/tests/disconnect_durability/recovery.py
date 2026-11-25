@@ -1,4 +1,6 @@
 """Exercise ADR 0059 with a real TLS 1.3 peer, process death and a fresh reader."""
+import argparse
+import hashlib
 import json
 import sqlite3
 import ssl
@@ -37,7 +39,7 @@ class Broker(ProcessBroker):
 
 @contextmanager
 def server(binary, case, pki, label, mode, shards, pause=None):
-    options = (*tls_args(pki), "--storage-mode", mode, "--io-threads", "4",
+    options = (*(tls_args(pki) if pki else ()), "--storage-mode", mode, "--io-threads", "4",
                "--delivery-shards", str(shards), "--event-level", "audit")
     if mode == "volatile":
         options += ("--snapshot-interval", "2")
@@ -45,7 +47,7 @@ def server(binary, case, pki, label, mode, shards, pause=None):
     try:
         ready = broker.ready()["details"]
         assert (ready["profile"], ready["storage_mode"], ready["delivery_shards"]) == (
-            "mtls-will-pubsub-v1", mode, shards), ready
+            "mtls-will-pubsub-v1" if pki else "tcp-will-pubsub-v1", mode, shards), ready
         yield broker
     except Exception:
         print(f"Broker stderr: {broker.stderr_path.read_text()}", file=sys.stderr)
@@ -57,7 +59,7 @@ def server(binary, case, pki, label, mode, shards, pause=None):
 
 def peer(broker, pki, client_id):
     identity = "sensor" if client_id in (TARGET, PUBLISHER) else "dashboard"
-    return Peer(broker, client_id, client_context(pki, identity))
+    return Peer(broker, client_id, client_context(pki, identity) if pki else None)
 
 
 def wait_fact(broker, kind, after, **details):
@@ -89,17 +91,19 @@ def wait_for_snapshot(broker, after, sessions, wills=None):
             return after
 
 
-def end_and_read_tls(peer, reason):
+def end_and_read(peer, reason):
     # OpenSSL reports an unannounced TCP EOF as SSLEOFError with suppression off.
-    peer.socket.suppress_ragged_eofs = False
+    if peer.tls:
+        peer.socket.suppress_ragged_eofs = False
     peer.send(packet(0xE0, bytes([reason, 5, 0x11, 0, 0, 0, 0])))
-    assert not peer.frames and peer.socket.recv(1) == b"", "expected TLS close_notify"
+    assert not peer.frames and peer.socket.recv(1) == b"", "expected end of stream"
     peer.decoder.finish()
+    return "TLS close_notify" if peer.tls else "TCP EOF"
 
 
 def durability(binary, case, pki, mode, cut, reason, shards, survives):
     with server(binary, case, pki, "cut", mode, shards,
-                None if mode == "volatile" else cut) as broker, ExitStack() as peers:
+                None if cut.endswith("snapshot") else cut) as broker, ExitStack() as peers:
         monitor = peers.enter_context(peer(broker, pki, MONITOR))
         assert not monitor.open(MONITOR, expiry=600)
         monitor.subscribe(1, [(STATUS, 1)])
@@ -111,15 +115,17 @@ def durability(binary, case, pki, mode, cut, reason, shards, survives):
         if mode == "volatile":
             # The previous atomic image actually contains the connected target's Will.
             before = wait_for_snapshot(broker, before, sessions=3, wills=1)
-        end_and_read_tls(target, reason)
-        if mode == "volatile":
-            wait_fact(broker, "session_changed", before, action="Closed")
+        terminal = end_and_read(target, reason)
+        if cut.endswith("snapshot"):
+            closed = wait_fact(broker, "session_changed", before, action="Closed")
+            observed_seq = int(closed["seq"])
             if cut == "next-snapshot":
-                wait_for_snapshot(broker, before, sessions=2)
+                observed_seq = wait_for_snapshot(broker, before, sessions=2)
         else:
             held = broker.wait_event("barrier_hit", point=cut, after=before)
             assert held["command_kind"] == "WillEnd"
-        broker.stop(killed=True)
+            observed_seq = int(held["seq"])
+        status = broker.stop(killed=True)
         if mode == "volatile":
             sessions, wills = snapshot_sessions_and_wills(broker)
             assert sessions == (3 if survives else 2)
@@ -129,7 +135,9 @@ def durability(binary, case, pki, mode, cut, reason, shards, survives):
         monitor = peers.enter_context(peer(broker, pki, MONITOR))
         assert monitor.open(MONITOR, expiry=600)
         witness = peers.enter_context(peer(broker, pki, WITNESS))
-        assert witness.open(WITNESS, expiry=600)
+        witness_present = witness.open(WITNESS, expiry=600)
+        assert witness_present
+        published = retained = None
         if survives or reason == 4:
             published = monitor.message(WILL)
             assert (published.topic, published.qos) == (STATUS, 1)
@@ -144,9 +152,13 @@ def durability(binary, case, pki, mode, cut, reason, shards, survives):
         assert monitor.message(MARKER).qos == 1
         assert witness.message(MARKER).qos == 1
         target = peers.enter_context(peer(broker, pki, TARGET))
-        assert target.open(TARGET, expiry=600) == survives
+        target_present = target.open(TARGET, expiry=600)
+        assert target_present == survives
         witness.ping()
         broker.stop()
+    return dict(transport_end=terminal, exit_status=status, observed_event_seq=observed_seq,
+                session_present=target_present, witness_present=witness_present,
+                received_will=published is not None, received_retained_will=retained is not None)
 
 
 def takeover(binary, case, pki, shards, allow_drain):
@@ -202,33 +214,58 @@ def takeover(binary, case, pki, shards, allow_drain):
         source.publish(STATUS, MARKER, mid=2)
         assert new.message(MARKER).qos == 1
         broker.stop()
+    return dict(ciphertext_prefix=held["details"]["ciphertext_bytes_sent"], old_closed_seq=int(closed["seq"]),
+                new_opened_seq=int(opened["seq"]), replay_dup=replay.dup, packet_id=replay.packet_id,
+                old_stream="DISCONNECT 0x8e, TLS close_notify" if allow_drain else "SSLEOFError")
 
 
 def main():
-    binary, out = map(Path, sys.argv[1:3])
-    suite = sys.argv[3]
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("binary", type=Path)
+    parser.add_argument("out", type=Path)
+    parser.add_argument("suite", choices=("durable", "log", "volatile", "volatile-pre-apply", "takeover"))
+    parser.add_argument("--results", type=Path, help="new JSON-lines file of observed case outcomes")
+    args = parser.parse_args()
+    binary, out, suite = args.binary, args.out, args.suite
+    digest = hashlib.sha256(binary.read_bytes()).hexdigest()
     pki = out / "pki"
     policy = pki_module.generate(pki)
     # An independent sensor can publish a fence without reclaiming the target.
     policy["principals"][0]["client_ids"].append(PUBLISHER)
     (pki / "identities.json").write_text(json.dumps(policy))
-    if suite == "takeover":
-        for shards in (0, 2):
-            for drain in (True, False):
-                takeover(binary, out / f"takeover-k{shards}-{drain}", pki, shards, drain)
-        return
     cuts = {
         "durable": (("will.end.prepared", True), ("will.end.logged", False), ("will.end.committed", False)),
         "log": (("log.will.end.before_append", True), ("log.will.end.before_sync", False),
                 ("log.will.end.after_sync", False)),
         "volatile": (("previous-snapshot", True), ("next-snapshot", False)),
-    }[suite]
-    for cut, survives in cuts:
-        for reason in (0, 4):
+        "volatile-pre-apply": (("volatile.will.end.before_apply", True),),
+    }
+    with ExitStack() as files:
+        result_file = files.enter_context(args.results.open("x")) if args.results else None
+
+        def play(label, action, *parameters, **settings):
+            print(label, flush=True)
+            start = time.monotonic_ns()
+            facts = action(binary, out / label, *parameters)
+            if result_file:
+                row = dict(settings, **facts, verdict="passed", elapsed_ns=time.monotonic_ns() - start,
+                           broker_sha256=digest)
+                print(json.dumps(row, sort_keys=True), file=result_file, flush=True)
+
+        if suite == "takeover":
             for shards in (0, 2):
-                label = f"{cut}-{reason}-k{shards}"
-                print(label, flush=True)
-                durability(binary, out / label, pki, suite, cut, reason, shards, survives)
+                for drain in (True, False):
+                    play(f"takeover-k{shards}-{drain}", takeover, pki, shards, drain,
+                         suite=suite, transport="mtls", shards=shards, drain=drain)
+            return
+        mode = "volatile" if suite == "volatile-pre-apply" else suite
+        for transport, credentials in (("tcp", None), ("mtls", pki)):
+            for cut, survives in cuts[suite]:
+                for reason in (0, 4):
+                    for shards in (0, 2):
+                        label = f"{transport}-{cut}-{reason}-k{shards}"
+                        play(label, durability, credentials, mode, cut, reason, shards, survives,
+                             suite=suite, transport=transport, shards=shards, cut=cut, reason=reason)
 
 
 if __name__ == "__main__":

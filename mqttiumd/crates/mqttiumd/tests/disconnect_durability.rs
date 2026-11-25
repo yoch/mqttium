@@ -662,7 +662,7 @@ mod secure {
         let result = Command::new("python3")
             .args(["-I", "-B"])
             .arg(
-                Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/disconnect_durability/secure.py"),
+                Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/disconnect_durability/recovery.py"),
             )
             .arg(env!("CARGO_BIN_EXE_mqttiumd"))
             .arg(&case.0)
@@ -680,19 +680,25 @@ mod secure {
 
     #[cfg(feature = "test-hooks")]
     #[test]
-    fn sqlite_will_end_recovery_over_mtls() {
+    fn sqlite_will_end_recovery_over_tcp_and_mtls() {
         run("durable");
     }
 
     #[cfg(feature = "test-hooks")]
     #[test]
-    fn log_will_end_recovery_over_mtls() {
+    fn log_will_end_recovery_over_tcp_and_mtls() {
         run("log");
     }
 
     #[test]
-    fn volatile_will_end_recovery_over_mtls() {
+    fn volatile_will_end_recovery_over_tcp_and_mtls() {
         run("volatile");
+    }
+
+    #[cfg(feature = "test-hooks")]
+    #[test]
+    fn volatile_will_end_before_memory_commit_over_tcp_and_mtls() {
+        run("volatile-pre-apply");
     }
 
     #[cfg(feature = "test-hooks")]
