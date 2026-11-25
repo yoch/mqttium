@@ -1828,10 +1828,10 @@ impl Runtime<'_> {
                     pending.close_intent = Some(intent);
                 }
             }
-            if let Some(session) = peer.session {
-                if let Some(input) = Self::closure_input(session, generation, opened_by, intent) {
-                    self.queue(input)?;
-                }
+            if let Some(session) = peer.session
+                && let Some(input) = Self::closure_input(session, generation, opened_by, intent)
+            {
+                self.queue(input)?;
             }
             self.session_requests.retain(|_, pending| {
                 pending.connection != generation || pending.operation.is_some()
