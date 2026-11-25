@@ -3451,7 +3451,20 @@ impl Driven for Task {
         let mut progress = self
             .core
             .flush_reports(&mut scratch.reports_batch, &mut self.stalled)?;
-        progress |= self.output_turn(scratch)?;
+        match self.output_turn(scratch) {
+            Ok(moved) => progress |= moved,
+            Err(code) => {
+                // A successful write or first byte can precede this failure in
+                // the same turn. Publish its evidence before finish_task emits
+                // failures for the remaining correlated writes.
+                if !scratch.reports_batch.is_empty() {
+                    let _ = self
+                        .core
+                        .flush_reports(&mut scratch.reports_batch, &mut self.stalled);
+                }
+                return Err(code);
+            }
+        }
         progress |= self.input_turn(scratch)?;
         Ok(Turn {
             progress,
