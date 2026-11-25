@@ -125,10 +125,11 @@ scenario(
 
 scenario(
     "publish/burst-qos0-v4",
-    doc="""One hundred QoS 0 messages written at once reach an online QoS 0 subscriber;
-    the transcript keeps whether all came and whether those that came are in the order
-    sent, not how many. mqttiumd paces QoS 0 by connection (record 0063): a subscriber
-    that reads receives the burst whole, so the count is compared again.""",
+    doc="""A publisher writes 100 QoS 0 PUBLISH packets with payloads m0 through m99 in one
+    write to exercise per-connection pacing (record 0063). The tally compares the subscriber's
+    count with 100 (fewer, all or more). An ordered subsequence is as-sent, distinct expected
+    payloads out of order are permuted, and repeated or unexpected payloads are other.
+    The counts table reports each broker's exact total.""",
     steps=[
         connect("sub", "p-burst-sub"), subscribe("sub", 1, [("burst/t", 0)]),
         connect("pub", "p-burst-pub"),
