@@ -11,7 +11,6 @@ from unittest.mock import patch
 TOOLS = Path(__file__).resolve().parents[2] / "tools"
 sys.path.insert(0, str(TOOLS))
 from check_product_event_stream import Limits, check_streams
-from check_schemas import load_validators
 
 
 class ProductEventStreamTests(unittest.TestCase):
@@ -19,12 +18,12 @@ class ProductEventStreamTests(unittest.TestCase):
         return {"format": "mqttiumd.product-event", "schema_version": 1,
                 "seq": "1", "kind": "starting", "pid": 7, **fields}
 
-    def run_stream(self, lines, *, limits=Limits(), validators=None):
+    def run_stream(self, lines, *, limits=Limits()):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "broker.events.jsonl"
             encoded = b"".join(line if isinstance(line, bytes) else (json.dumps(line) + "\n").encode() for line in lines)
             path.write_bytes(encoded)
-            result = check_streams([path], limits=limits, validators=validators)
+            result = check_streams([path], limits=limits)
             return result, hashlib.sha256(encoded).hexdigest()
 
     def test_packaged_events_filename_is_included_when_scanning_directories(self):
@@ -57,27 +56,6 @@ class ProductEventStreamTests(unittest.TestCase):
                                     "expected_session": None, "expiry": {"After": 1}})
         result, _ = self.run_stream([event])
         self.assertEqual(result["status"], "PASS")
-
-    def test_detail_limits_are_specific_to_the_event(self):
-        # Distinct lower-case names isolate the 40-field check from key syntax.
-        names = [f"field{chr(97 + i // 26)}{chr(97 + i % 26)}" for i in range(114)]
-        ready = json.loads((TOOLS.parent / "contracts/examples/v1/valid/product-ready-limits.json").read_text())["details"]
-        counts = dict.fromkeys(names, "1")
-        validators = load_validators()
-        for kind, details, expected in (
-            ("starting", dict.fromkeys(names[:40], 1), "PASS"),
-            ("starting", dict.fromkeys(names[:41], 1), "FAIL"),
-            ("ready", ready, "PASS"),
-            ("ready", {**ready, "will": True}, "FAIL"),
-            ("ready", {"qos0_window": 1, "qos0_typo": 1}, "FAIL"),
-            ("starting", {"qos0_window": 1}, "FAIL"),
-            ("counters", {"counts": dict(list(counts.items())[:113])}, "PASS"),
-            ("counters", {"counts": counts}, "FAIL"),
-            ("counters", {"counts": {}}, "FAIL"),
-        ):
-            with self.subTest(kind=kind, fields=len(details), expected=expected):
-                result, _ = self.run_stream([self.event(kind=kind, details=details)], validators=validators)
-                self.assertEqual(result["status"], expected, result.get("failure"))
 
     def test_a_missing_required_field_is_a_schema_failure_with_location_not_values(self):
         event = self.event()

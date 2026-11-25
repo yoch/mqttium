@@ -150,121 +150,6 @@
         "Maintenance"
       ]
     },
-    "details": {
-      "type": "object",
-      "maxProperties": 40,
-      "propertyNames": {
-        "pattern": "^[a-z][a-z_]{0,47}$"
-      },
-      "additionalProperties": {
-        "oneOf": [
-          {
-            "type": "string",
-            "maxLength": 256
-          },
-          {
-            "type": "boolean"
-          },
-          {
-            "type": "integer",
-            "minimum": 0,
-            "maximum": 4294967295
-          }
-        ]
-      },
-      "properties": {
-        "returned_incarnation": {
-          "$ref": "primitives.schema.json#/$defs/u64"
-        },
-        "returned_epoch": {
-          "$ref": "primitives.schema.json#/$defs/u64"
-        },
-        "returned_owner": {
-          "$ref": "primitives.schema.json#/$defs/u64"
-        },
-        "returned_through": {
-          "$ref": "primitives.schema.json#/$defs/u64"
-        },
-        "returned_publication_through": {
-          "$ref": "primitives.schema.json#/$defs/u64"
-        },
-        "returned_payload_through": {
-          "$ref": "primitives.schema.json#/$defs/u64"
-        },
-        "session": {
-          "$ref": "primitives.schema.json#/$defs/u64"
-        },
-        "route_revision": {
-          "$ref": "primitives.schema.json#/$defs/u64"
-        },
-        "revision": {
-          "$ref": "primitives.schema.json#/$defs/u64"
-        },
-        "retired_session": {
-          "oneOf": [
-            {
-              "type": "null"
-            },
-            {
-              "$ref": "primitives.schema.json#/$defs/u64"
-            }
-          ]
-        },
-        "expected_session": {
-          "oneOf": [
-            {
-              "type": "null"
-            },
-            {
-              "$ref": "primitives.schema.json#/$defs/u64"
-            }
-          ]
-        },
-        "expiry": {
-          "oneOf": [
-            {
-              "$ref": "primitives.schema.json#/$defs/session_expiry"
-            },
-            {
-              "type": "integer",
-              "minimum": 0,
-              "maximum": 4294967295
-            }
-          ]
-        },
-        "detached_by": {
-          "oneOf": [
-            {
-              "$ref": "primitives.schema.json#/$defs/operation_id"
-            },
-            {
-              "type": "string",
-              "maxLength": 83,
-              "pattern": "^(0|[1-9][0-9]{0,19})/(0|[1-9][0-9]{0,19})/(0|[1-9][0-9]{0,19})/(0|[1-9][0-9]{0,19})$"
-            }
-          ]
-        },
-        "deadline": {
-          "oneOf": [
-            {
-              "type": "null"
-            },
-            {
-              "$ref": "primitives.schema.json#/$defs/u64"
-            }
-          ]
-        },
-        "logical": {
-          "$ref": "primitives.schema.json#/$defs/u64"
-        },
-        "tick": {
-          "$ref": "primitives.schema.json#/$defs/u64"
-        },
-        "age_ms": {
-          "$ref": "primitives.schema.json#/$defs/u64"
-        }
-      }
-    },
     "puback": {
       "$ref": "#/$defs/puback_observation"
     },
@@ -278,6 +163,9 @@
           "$ref": "primitives.schema.json#/$defs/operation_id"
         }
       ]
+    },
+    "details": {
+      "type": "object"
     }
   },
   "allOf": [
@@ -1263,14 +1151,21 @@
         }
       },
       "then": {
-        "required": ["connection", "details"],
+        "required": [
+          "connection",
+          "details"
+        ],
         "properties": {
           "details": {
             "type": "object",
             "additionalProperties": false,
-            "required": ["authority"],
+            "required": [
+              "authority"
+            ],
             "properties": {
-              "authority": {"const": "durable_will_barrier"}
+              "authority": {
+                "const": "durable_will_barrier"
+              }
             }
           }
         }
@@ -1321,7 +1216,10 @@
                 "pattern": "^[0-9a-f]{64}$"
               },
               "max_handshakes": {
-                "const": 8
+                "enum": [
+                  8,
+                  64
+                ]
               },
               "handshake_ms": {
                 "const": 2000
@@ -1339,7 +1237,10 @@
                 "const": 4
               },
               "tls_buffer_bytes": {
-                "const": 98304
+                "enum": [
+                  98304,
+                  2097152
+                ]
               },
               "resumption": {
                 "const": false
@@ -1347,7 +1248,29 @@
               "early_data": {
                 "const": false
               }
-            }
+            },
+            "oneOf": [
+              {
+                "properties": {
+                  "max_handshakes": {
+                    "const": 8
+                  },
+                  "tls_buffer_bytes": {
+                    "const": 98304
+                  }
+                }
+              },
+              {
+                "properties": {
+                  "max_handshakes": {
+                    "const": 64
+                  },
+                  "tls_buffer_bytes": {
+                    "const": 2097152
+                  }
+                }
+              }
+            ]
           }
         }
       }
@@ -1467,6 +1390,229 @@
           }
         }
       }
+    },
+    {
+      "if": {
+        "properties": {
+          "kind": {
+            "not": {
+              "enum": [
+                "ready",
+                "counters"
+              ]
+            }
+          }
+        },
+        "required": [
+          "kind"
+        ]
+      },
+      "then": {
+        "properties": {
+          "details": {
+            "type": "object",
+            "maxProperties": 40,
+            "propertyNames": {
+              "pattern": "^[a-z][a-z_]{0,47}$"
+            },
+            "additionalProperties": {
+              "oneOf": [
+                {
+                  "type": "string",
+                  "maxLength": 256
+                },
+                {
+                  "type": "boolean"
+                },
+                {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 4294967295
+                }
+              ]
+            },
+            "properties": {
+              "returned_incarnation": {
+                "$ref": "primitives.schema.json#/$defs/u64"
+              },
+              "returned_epoch": {
+                "$ref": "primitives.schema.json#/$defs/u64"
+              },
+              "returned_owner": {
+                "$ref": "primitives.schema.json#/$defs/u64"
+              },
+              "returned_through": {
+                "$ref": "primitives.schema.json#/$defs/u64"
+              },
+              "returned_publication_through": {
+                "$ref": "primitives.schema.json#/$defs/u64"
+              },
+              "returned_payload_through": {
+                "$ref": "primitives.schema.json#/$defs/u64"
+              },
+              "session": {
+                "$ref": "primitives.schema.json#/$defs/u64"
+              },
+              "route_revision": {
+                "$ref": "primitives.schema.json#/$defs/u64"
+              },
+              "revision": {
+                "$ref": "primitives.schema.json#/$defs/u64"
+              },
+              "retired_session": {
+                "oneOf": [
+                  {
+                    "type": "null"
+                  },
+                  {
+                    "$ref": "primitives.schema.json#/$defs/u64"
+                  }
+                ]
+              },
+              "expected_session": {
+                "oneOf": [
+                  {
+                    "type": "null"
+                  },
+                  {
+                    "$ref": "primitives.schema.json#/$defs/u64"
+                  }
+                ]
+              },
+              "expiry": {
+                "oneOf": [
+                  {
+                    "$ref": "primitives.schema.json#/$defs/session_expiry"
+                  },
+                  {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 4294967295
+                  }
+                ]
+              },
+              "detached_by": {
+                "oneOf": [
+                  {
+                    "$ref": "primitives.schema.json#/$defs/operation_id"
+                  },
+                  {
+                    "type": "string",
+                    "maxLength": 83,
+                    "pattern": "^(0|[1-9][0-9]{0,19})/(0|[1-9][0-9]{0,19})/(0|[1-9][0-9]{0,19})/(0|[1-9][0-9]{0,19})$"
+                  }
+                ]
+              },
+              "deadline": {
+                "oneOf": [
+                  {
+                    "type": "null"
+                  },
+                  {
+                    "$ref": "primitives.schema.json#/$defs/u64"
+                  }
+                ]
+              },
+              "logical": {
+                "$ref": "primitives.schema.json#/$defs/u64"
+              },
+              "tick": {
+                "$ref": "primitives.schema.json#/$defs/u64"
+              },
+              "age_ms": {
+                "$ref": "primitives.schema.json#/$defs/u64"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "kind": {
+            "const": "ready"
+          }
+        },
+        "required": [
+          "kind"
+        ]
+      },
+      "then": {
+        "properties": {
+          "details": {
+            "$ref": "#/$defs/ready_details"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "kind": {
+            "const": "receipt_policy"
+          }
+        },
+        "required": [
+          "kind"
+        ]
+      },
+      "then": {
+        "properties": {
+          "details": {
+            "$ref": "#/$defs/receipt_policy_details"
+          }
+        },
+        "required": [
+          "details"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "kind": {
+            "const": "counters"
+          }
+        },
+        "required": [
+          "kind"
+        ]
+      },
+      "then": {
+        "properties": {
+          "details": {
+            "type": "object",
+            "maxProperties": 1,
+            "additionalProperties": false,
+            "properties": {
+              "counts": {
+                "type": "object",
+                "minProperties": 1,
+                "maxProperties": 113,
+                "description": "At most 96 ordinary kinds, the overflow kind other, and 16 independently tallied hot kinds.",
+                "propertyNames": {
+                  "type": "string",
+                  "pattern": "^[a-z][a-z0-9_]{0,47}$",
+                  "maxLength": 48,
+                  "not": {
+                    "pattern": "[\r\n]"
+                  }
+                },
+                "additionalProperties": {
+                  "$ref": "#/$defs/decimal_u64"
+                }
+              }
+            },
+            "required": [
+              "counts"
+            ]
+          }
+        },
+        "required": [
+          "details"
+        ]
+      }
     }
   ],
   "$defs": {
@@ -1534,6 +1680,275 @@
         "source_observation_sequence": {
           "$ref": "primitives.schema.json#/$defs/u64",
           "description": "Optional identifier of the original runtime-dequeue observation within this process, used to link a retained internal copy. This is not event.seq, a wire field, or a causal-order claim."
+        }
+      }
+    },
+    "count_integer": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 4294967295
+    },
+    "decimal_u64": {
+      "$ref": "primitives.schema.json#/$defs/u64",
+      "description": "A decimal u64 also checked at the JSON Schema layer. For 20 digits the first differing digit must compare below 18446744073709551615, or the string must equal it.",
+      "if": {
+        "minLength": 20
+      },
+      "then": {
+        "pattern": "^(1[0-7][0-9]{18}|18[0-3][0-9]{17}|184[0-3][0-9]{16}|1844[0-5][0-9]{15}|18446[0-6][0-9]{14}|184467[0-3][0-9]{13}|1844674[0-3][0-9]{12}|184467440[0-6][0-9]{10}|1844674407[0-2][0-9]{9}|18446744073[0-6][0-9]{8}|1844674407370[0-8][0-9]{6}|18446744073709[0-4][0-9]{5}|184467440737095[0-4][0-9]{4}|18446744073709550[0-9]{3}|18446744073709551[0-5][0-9]{2}|1844674407370955160[0-9]{1}|1844674407370955161[0-4]|18446744073709551615)$"
+      }
+    },
+    "ready_details": {
+      "type": "object",
+      "maxProperties": 50,
+      "additionalProperties": false,
+      "properties": {
+        "address": {
+          "type": "string",
+          "maxLength": 256
+        },
+        "commands_in_flight": {
+          "$ref": "#/$defs/count_integer"
+        },
+        "connect_ms": {
+          "$ref": "#/$defs/count_integer"
+        },
+        "delivery_shards": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 16
+        },
+        "durability_guarantee": {
+          "enum": [
+            "per_commit_fsync_wal_full",
+            "per_commit_fdatasync_append_log",
+            "periodic_atomic_snapshot",
+            "none_in_memory_only"
+          ]
+        },
+        "epoch": {
+          "$ref": "#/$defs/decimal_u64"
+        },
+        "incarnation": {
+          "$ref": "#/$defs/decimal_u64"
+        },
+        "input_slots": {
+          "$ref": "#/$defs/count_integer"
+        },
+        "max_client_id_bytes": {
+          "$ref": "#/$defs/count_integer"
+        },
+        "max_connections": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 4096
+        },
+        "max_exchange_slots": {
+          "$ref": "#/$defs/count_integer"
+        },
+        "max_packet_bytes": {
+          "$ref": "#/$defs/count_integer"
+        },
+        "max_payload_bytes": {
+          "$ref": "#/$defs/count_integer"
+        },
+        "max_replay_candidates": {
+          "$ref": "#/$defs/count_integer"
+        },
+        "max_sessions": {
+          "$ref": "#/$defs/count_integer"
+        },
+        "max_subscriptions": {
+          "$ref": "#/$defs/count_integer"
+        },
+        "max_targets": {
+          "$ref": "#/$defs/count_integer"
+        },
+        "max_timers": {
+          "$ref": "#/$defs/count_integer"
+        },
+        "max_topic_bytes": {
+          "$ref": "#/$defs/count_integer"
+        },
+        "max_will_bytes": {
+          "$ref": "#/$defs/count_integer"
+        },
+        "max_will_intents": {
+          "$ref": "#/$defs/count_integer"
+        },
+        "max_will_receipt_bytes": {
+          "$ref": "#/$defs/count_integer"
+        },
+        "no_local": {
+          "type": "boolean"
+        },
+        "outgoing_metadata": {
+          "$ref": "#/$defs/count_integer"
+        },
+        "outgoing_packet_identifier_bitmap_bits": {
+          "$ref": "#/$defs/count_integer"
+        },
+        "outgoing_packet_identifier_fallback_probes": {
+          "$ref": "#/$defs/count_integer"
+        },
+        "outgoing_packet_identifier_max": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 65535
+        },
+        "outgoing_packet_identifier_probe_limit": {
+          "$ref": "#/$defs/count_integer"
+        },
+        "outgoing_payload_bytes": {
+          "$ref": "#/$defs/count_integer"
+        },
+        "outgoing_per_connection": {
+          "$ref": "#/$defs/count_integer"
+        },
+        "output_slots": {
+          "$ref": "#/$defs/count_integer"
+        },
+        "partial_packet_ms": {
+          "$ref": "#/$defs/count_integer"
+        },
+        "profile": {
+          "type": "string",
+          "maxLength": 256
+        },
+        "qos0_output_reserve": {
+          "$ref": "#/$defs/count_integer"
+        },
+        "qos0_window": {
+          "$ref": "#/$defs/count_integer"
+        },
+        "receipt_slots": {
+          "$ref": "#/$defs/count_integer"
+        },
+        "receive_maximum": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 65535
+        },
+        "remembered_connections": {
+          "$ref": "#/$defs/count_integer"
+        },
+        "retained_available": {
+          "type": "boolean"
+        },
+        "retained_bytes": {
+          "$ref": "#/$defs/count_integer"
+        },
+        "retained_topics": {
+          "$ref": "#/$defs/count_integer"
+        },
+        "session_expiry_per_turn": {
+          "$ref": "#/$defs/count_integer"
+        },
+        "session_expiry_timer_slots": {
+          "$ref": "#/$defs/count_integer"
+        },
+        "shared_subscriptions": {
+          "type": "boolean"
+        },
+        "snapshot_interval_secs": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 86400
+        },
+        "sqlite_schema": {
+          "$ref": "#/$defs/count_integer"
+        },
+        "storage_mode": {
+          "enum": [
+            "durable",
+            "log",
+            "volatile"
+          ]
+        },
+        "subscription_identifiers": {
+          "type": "boolean"
+        },
+        "wildcard_subscriptions": {
+          "type": "boolean"
+        },
+        "will": {
+          "type": "boolean"
+        },
+        "will_delay_interval": {
+          "$ref": "#/$defs/count_integer"
+        },
+        "will_message_expiry": {
+          "type": "boolean"
+        },
+        "will_qos": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 2
+        },
+        "will_retain": {
+          "type": "boolean"
+        },
+        "work_page_items": {
+          "$ref": "#/$defs/count_integer"
+        },
+        "work_scan_ms": {
+          "$ref": "#/$defs/count_integer"
+        },
+        "write_ms": {
+          "$ref": "#/$defs/count_integer"
+        },
+        "writer_slots": {
+          "$ref": "#/$defs/count_integer"
+        }
+      },
+      "description": "Readiness fields from the TCP and mTLS broker, including the earlier inline Will capabilities. Historical producers emitted subsets."
+    },
+    "receipt_policy_details": {
+      "type": "object",
+      "maxProperties": 14,
+      "additionalProperties": false,
+      "properties": {
+        "control_input_slots": {
+          "$ref": "#/$defs/count_integer"
+        },
+        "control_reply_slots": {
+          "$ref": "#/$defs/count_integer"
+        },
+        "control_request_slots": {
+          "$ref": "#/$defs/count_integer"
+        },
+        "max_receipt_origins": {
+          "$ref": "#/$defs/count_integer"
+        },
+        "receipt_collection_bytes": {
+          "$ref": "#/$defs/count_integer"
+        },
+        "receipt_collection_field_bytes": {
+          "$ref": "#/$defs/count_integer"
+        },
+        "receipt_collection_rows": {
+          "$ref": "#/$defs/count_integer"
+        },
+        "receipt_collection_trigger": {
+          "$ref": "#/$defs/count_integer"
+        },
+        "receipt_control_reserve": {
+          "$ref": "#/$defs/count_integer"
+        },
+        "receipt_data_window": {
+          "$ref": "#/$defs/count_integer"
+        },
+        "receipt_window": {
+          "$ref": "#/$defs/count_integer"
+        },
+        "startup_closed_collection": {
+          "type": "boolean"
+        },
+        "startup_origins_trigger": {
+          "$ref": "#/$defs/count_integer"
+        },
+        "startup_receipts_trigger": {
+          "$ref": "#/$defs/count_integer"
         }
       }
     }
