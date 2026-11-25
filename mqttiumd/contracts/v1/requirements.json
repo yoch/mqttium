@@ -302,7 +302,7 @@
     {
       "decision": "0063",
       "path": "docs/decisions/0063-qos0-paced-per-connection.md",
-      "sha256": "7baf5751d6ab40573086e99679ae5473488c247317671d638970981fb43a9a46"
+      "sha256": "28466068ad14541167db64d7f62280f177877380c19509df1d500b97afb108c6"
     }
   ],
   "entries": [

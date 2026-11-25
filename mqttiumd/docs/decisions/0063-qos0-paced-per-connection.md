@@ -137,8 +137,9 @@ that send. [MQTT 3.1.1 §3.3.1.3, MQTT-3.3.1-6](https://docs.oasis-open.org/mqtt
 
 The coordinator and each delivery shard keep a refused retained replay
 on its original connection generation. They retry in FIFO order when
-room becomes available. Later wire effects on that generation wait behind
-it. Each generation gets a turn, so a different subscriber can receive
+room becomes available. Later wire effects from the same owner on that
+generation wait behind it. Coordinator and shard share the socket queue in
+admission order. Each generation gets a turn, so a different subscriber can receive
 its replay while the first output is full. The existing window of 16
 bounds the number held per generation and their shared payload stays
 charged until its write or terminal refusal. Closing an old generation
