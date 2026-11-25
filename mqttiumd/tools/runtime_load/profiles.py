@@ -352,7 +352,14 @@ def main():
                     raise RuntimeError("CPU competitor exited during the trial")
                 competitor_end = proc_sample(competitor.pid)
                 result["competitor_cpu_seconds"] = competitor_end["cpu_seconds"] - competitor_start["cpu_seconds"]
-            write_json(args.out / "result.json", result)
+        if args.profile == "waiting":
+            # The ops journal flushes its final interval at broker shutdown.
+            events = (json.loads(line) for line in (args.out / "events.jsonl").read_text().splitlines())
+            result["publish_waiting_wire"] = sum(
+                int(event["details"]["counts"].get("publish_waiting_wire", 0))
+                for event in events if event["kind"] == "counters"
+            )
+        write_json(args.out / "result.json", result)
 
 
 if __name__ == "__main__":
