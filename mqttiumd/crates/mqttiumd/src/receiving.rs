@@ -22,13 +22,30 @@ impl Terminal {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ReceiveStep {
+    Puback,
+    Pubrec,
+    RemotePubrel,
+    ReleaseObserved,
+}
+
+impl ReceiveStep {
+    fn qos(self) -> Qos {
+        match self {
+            Self::Puback => Qos::AtLeastOnce,
+            Self::Pubrec | Self::RemotePubrel | Self::ReleaseObserved => Qos::ExactlyOnce,
+        }
+    }
+}
+
 /// Inline compact receive-window table (`MAXIMUM = 8`), laid out as a
 /// structure of arrays so `ids` packs into 16 bytes (one SIMD register) and
 /// the entire window fits in 96 bytes instead of 200 bytes.
 pub struct Window {
     serials: [u64; MAXIMUM],
     ids: [u16; MAXIMUM],
-    qos: [Qos; MAXIMUM],
+    steps: [ReceiveStep; MAXIMUM],
     len: u8,
 }
 
@@ -38,7 +55,7 @@ impl Default for Window {
         Self {
             serials: [0; MAXIMUM],
             ids: [0; MAXIMUM],
-            qos: [Qos::AtMostOnce; MAXIMUM],
+            steps: [ReceiveStep::Pubrec; MAXIMUM],
             len: 0,
         }
     }
@@ -61,7 +78,7 @@ impl Window {
         let last = usize::from(self.len) - 1;
         self.serials[idx] = self.serials[last];
         self.ids[idx] = self.ids[last];
-        self.qos[idx] = self.qos[last];
+        self.steps[idx] = self.steps[last];
         self.len = last as u8;
     }
 
@@ -81,12 +98,14 @@ impl Window {
     /// slot. Older accepted frames retain their own frozen occurrence serial.
     #[inline]
     pub fn publish_qos(&mut self, id: u16, serial: u64, qos: Qos) -> Result<(), ()> {
-        if qos == Qos::AtMostOnce {
-            return Err(());
-        }
+        let next = match qos {
+            Qos::AtMostOnce => return Err(()),
+            Qos::AtLeastOnce => ReceiveStep::Puback,
+            Qos::ExactlyOnce => ReceiveStep::Pubrec,
+        };
         if let Some(idx) = self.find(id) {
             self.serials[idx] = serial;
-            self.qos[idx] = qos;
+            self.steps[idx] = next;
             return Ok(());
         }
         let len = usize::from(self.len);
@@ -95,9 +114,36 @@ impl Window {
         }
         self.serials[len] = serial;
         self.ids[len] = id;
-        self.qos[len] = qos;
+        self.steps[len] = next;
         self.len = (len + 1) as u8;
         Ok(())
+    }
+
+    /// The positive PUBREC for this occurrence was written. A PUBREL may
+    /// already have been read before the transport published its receipt.
+    pub fn pubrec_written(&mut self, id: u16, serial: Option<u64>) {
+        if let Some(idx) = self.find(id)
+            && Some(self.serials[idx]) == serial
+            && self.steps[idx] == ReceiveStep::Pubrec
+        {
+            self.steps[idx] = ReceiveStep::RemotePubrel;
+        }
+    }
+
+    pub fn pubrel_observed(&mut self, id: u16) {
+        if let Some(idx) = self.find(id)
+            && self.steps[idx].qos() == Qos::ExactlyOnce
+        {
+            self.steps[idx] = ReceiveStep::ReleaseObserved;
+        }
+    }
+
+    pub fn all_wait_for_remote_pubrel(&self) -> bool {
+        usize::from(self.len) == MAXIMUM
+            && self
+                .steps
+                .iter()
+                .all(|step| *step == ReceiveStep::RemotePubrel)
     }
 
     /// Only a terminal ACK for this QoS and this exact PUBLISH occurrence
@@ -111,7 +157,7 @@ impl Window {
         let Some(idx) = self.find(id) else {
             return false;
         };
-        if self.serials[idx] == serial && self.qos[idx] == terminal.qos() {
+        if self.serials[idx] == serial && self.steps[idx].qos() == terminal.qos() {
             self.remove_at(idx);
             true
         } else {
@@ -122,8 +168,9 @@ impl Window {
     #[inline]
     pub fn can_complete_frame(&self, id: u16, serial: Option<u64>, terminal: Terminal) -> bool {
         serial.is_some_and(|serial| {
-            self.find(id)
-                .is_some_and(|idx| self.serials[idx] == serial && self.qos[idx] == terminal.qos())
+            self.find(id).is_some_and(|idx| {
+                self.serials[idx] == serial && self.steps[idx].qos() == terminal.qos()
+            })
         })
     }
 
@@ -142,6 +189,43 @@ impl Window {
 mod tests {
     use super::{Terminal, Window};
     use mqttiumd_contract::packet::Qos;
+
+    #[test]
+    fn lookahead_requires_written_pubrec_for_every_live_occurrence() {
+        let mut window = Window::default();
+        for id in 1..=super::MAXIMUM as u16 {
+            window
+                .publish_qos(id, u64::from(id), Qos::ExactlyOnce)
+                .unwrap();
+            if id != 1 {
+                window.pubrec_written(id, Some(u64::from(id)));
+            }
+        }
+        assert!(
+            !window.all_wait_for_remote_pubrel(),
+            "one PUBREC still needs the writer"
+        );
+        window.pubrec_written(1, Some(1));
+        assert!(window.all_wait_for_remote_pubrel());
+        window.publish_qos(1, 100, Qos::ExactlyOnce).unwrap();
+        window.pubrec_written(1, Some(1));
+        assert!(
+            !window.all_wait_for_remote_pubrel(),
+            "stale write after a repeated PUBLISH"
+        );
+        window.pubrel_observed(1);
+        window.pubrec_written(1, Some(100));
+        assert!(
+            !window.all_wait_for_remote_pubrel(),
+            "PUBREL preceded the delayed write receipt"
+        );
+        assert!(window.complete_frame(1, Some(100), Terminal::Pubcomp));
+        window.publish_qos(9, 101, Qos::AtLeastOnce).unwrap();
+        assert!(
+            !window.all_wait_for_remote_pubrel(),
+            "PUBACK can free the QoS 1 slot locally"
+        );
+    }
 
     #[test]
     fn a_terminal_frame_must_match_both_occurrence_and_qos() {

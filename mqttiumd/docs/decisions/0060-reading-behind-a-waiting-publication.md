@@ -50,7 +50,9 @@ connection.
   (MQTT-4.6.0-5 in MQTT 5, -6 in 3.1.1).
 - **The wait is bounded.** At most one lane of packets (`INPUT_SLOTS`, 32)
   and the bytes of one packet of the largest size are kept behind. Past
-  the bound the reader stops, as it did before this record.
+  that bound the reader keeps the next packet at the head of the transport
+  work. A packet that brings the prefix exactly to its bound is accepted.
+  An independent PUBREL at the head can still pass.
 - **Order of taking.** When the publication gets its slot, the packets kept
   behind it are taken first, then the held packet, then the lane. A packet
   kept behind that is a PUBLISH can wait for a slot in its turn.
@@ -67,7 +69,22 @@ announced no window, up to the bound above.
   them all, and its subscribers receive the messages once and in order.
 - A connection can hold thirty-two more packets, and the bytes of one
   largest packet, than its lane already could.
-- MQTT 5 is unchanged: a ninth exchange is still DISCONNECT 0x93.
+- MQTT 5 retains its Receive Maximum and DISCONNECT 0x93.
+
+## Amendment for a saturated MQTT 3.1.1 lookahead
+
+When the next non-overtaking packet would exceed either prefix budget, the
+reader waits for local work that can return a slot. A pending admission,
+PUBACK, PUBREC write or an already observed PUBREL keeps that possibility
+open. The reader does not repeatedly dequeue the same held packet as progress.
+
+If all eight exact PUBLISH occurrences have a written successful PUBREC and
+none has an observed PUBREL, only a subsequent client packet can release a
+slot. The reader can no longer reach it. The broker closes this connection
+with local event reason `receive_lookahead_capacity`. MQTT 3.1.1 sends no
+server DISCONNECT. A persistent session retains its admitted exchanges for
+PUBREL after reconnect. The client can repeat a PUBLISH that had received
+no PUBREC once a slot is available. Other connections keep their own budgets.
 
 ## Open: one session can hold every exchange
 
@@ -92,9 +109,7 @@ capacities of record 0048, and is left to a decision.
 
 ## Not done
 
-- A client with more than 41 exchanges in flight, or whose PUBRELs are
-  further behind than the bound, still stalls until Keep Alive.
 - A DISCONNECT kept behind a publication that never gets its slot is not
-  applied; the connection then ends by Keep Alive or by the end of the
-  transport, and the Will follows that end.
+  applied. The Will follows the eventual transport close, including a
+  close at the lookahead bound.
 - No model of the runtime has the waiting publication.

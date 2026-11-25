@@ -959,6 +959,33 @@ fn clients_that_fill_their_announced_window_together_all_complete() {
     }
 }
 
+/// A windowless 3.1.1 publisher may pipeline QoS 1. Every receive credit
+/// here returns through a local PUBACK, even if the reader has staged a full
+/// prefix. The publisher can read its acknowledgements after sending the batch.
+#[test]
+fn mqtt311_qos1_pipeline_waits_for_local_credit() {
+    let broker = Broker::start("lookahead-qos1-311");
+    let mut publisher = Peer::connect(broker.address, "lookahead-qos1", false);
+    let mut batch = Vec::new();
+    const COUNT: u16 = 64;
+    for id in 1..=COUNT {
+        let mut body = Vec::new();
+        text("pipeline/qos1", &mut body);
+        body.extend_from_slice(&id.to_be_bytes());
+        body.extend_from_slice(b"value");
+        batch.extend_from_slice(&packet(0x32, &body));
+    }
+    publisher.stream.write_all(&batch).unwrap();
+    for id in 1..=COUNT {
+        assert_eq!(
+            read_packet(&mut publisher.stream),
+            (0x40, id.to_be_bytes().to_vec())
+        );
+    }
+    publisher.stream.write_all(&[0xc0, 0]).unwrap();
+    assert_eq!(read_packet(&mut publisher.stream), (0xd0, Vec::new()));
+}
+
 /// MQTT 3.1.1 has no Receive Maximum: a client may have more QoS 2
 /// exchanges in flight than the broker's window of eight. The broker holds
 /// the PUBLISH it has no slot for. A slot is freed by a PUBCOMP, which

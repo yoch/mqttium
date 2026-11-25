@@ -255,6 +255,10 @@ struct PeerCold {
 }
 
 impl PeerCold {
+    fn room_behind(&self, bytes: usize) -> bool {
+        self.behind.len() < BEHIND_PACKETS && bytes <= BEHIND_BYTES - self.behind_bytes
+    }
+
     #[inline]
     fn is_empty(&self) -> bool {
         self.opened_by_foreign.is_none()
@@ -479,6 +483,18 @@ impl Peer {
                 .all(|(first, body, _)| raw_publish_id(*first, body) != Some(id))
     }
 
+    /// The retained head cannot be examined again until a receive credit
+    /// returns. An independent PUBREL can still pass a completely full prefix.
+    fn lookahead_blocked(&self) -> bool {
+        self.version == Some(codec::Version::V311)
+            && self.cold.as_deref().is_some_and(|cold| {
+                cold.deferred_publish.is_some()
+                    && cold.held_packet.as_ref().is_some_and(|(first, body, _)| {
+                        !cold.room_behind(body.len()) && !self.overtakes_deferred(*first, body)
+                    })
+            })
+    }
+
     /// Keeps a packet behind the waiting publication, or hands it back
     /// when the bound is reached: it then stays the held packet and the
     /// rest stays with the transport.
@@ -488,7 +504,7 @@ impl Peer {
     ) -> Result<(), (u8, net::FrameBytes, net::FrameObservation)> {
         let bytes = packet.1.len();
         let cold = self.cold_mut();
-        if cold.behind.len() >= BEHIND_PACKETS || cold.behind_bytes + bytes > BEHIND_BYTES {
+        if !cold.room_behind(bytes) {
             return Err(packet);
         }
         cold.behind_bytes += bytes;
@@ -4177,7 +4193,7 @@ impl Runtime<'_> {
     fn start_takeover(&mut self, old: ConnectionGeneration) -> Result<(), Failure> {
         // The old transport closes before the new Will/Open can be accepted.
         if let Some(peer) = self.peers.get_mut(&old) {
-            if peer.version == Some(Version::V311) {
+            if peer.version == Some(codec::Version::V311) {
                 return self.close(old, "session_taken_over");
             }
             let bytes = codec::disconnect_reason(0x8e);
@@ -4772,6 +4788,12 @@ impl Runtime<'_> {
                     }
                     return self.close(generation, "receive_maximum");
                 }
+                if p.version == Some(codec::Version::V311)
+                    && let InboundPacket::Pubrel { packet_id } = &packet
+                    && let Some(window) = p.receiving.as_mut()
+                {
+                    window.pubrel_observed(packet_id.get());
+                }
                 if let InboundPacket::Puback { packet_id, reason } = packet {
                     // The durable identity belongs to this transport's
                     // confirmed CONNECT. A takeover may already have moved
@@ -5032,6 +5054,24 @@ impl Runtime<'_> {
                         }
                         self.serve_requests(generation)?;
                     }
+                    // A held packet that cannot fit keeps its place. Repeated
+                    // polls of the same retained packet are not reader progress.
+                    let blocked_prefix = has_cold
+                        && self
+                            .peers
+                            .get(&generation)
+                            .is_some_and(Peer::lookahead_blocked);
+                    if blocked_prefix
+                        && self
+                            .peers
+                            .get(&generation)
+                            .and_then(|peer| peer.receiving.as_ref())
+                            .is_some_and(|window| window.all_wait_for_remote_pubrel())
+                    {
+                        self.close(generation, "receive_lookahead_capacity")?;
+                        continue;
+                    }
+                    let backpressured = backpressured || blocked_prefix;
                     drained_incoming = false;
                     let steady_fast = !backpressured
                         && self.ordinary_room() >= 2
@@ -5348,8 +5388,8 @@ impl Runtime<'_> {
                                     // A publication waits for a slot of the window.
                                     // The PUBREL of another exchange goes ahead: it
                                     // frees a slot. Every other packet waits behind
-                                    // it, in order, up to a bound; past the bound
-                                    // the reader stops as it did.
+                                    // it, in order. Retain the first packet that
+                                    // does not fit for the local-progress check.
                                     if let Some(peer) = self.peers.get_mut(&generation)
                                         && peer.deferred_publish().is_some()
                                         && !peer.overtakes_deferred(first, &body)
@@ -5833,6 +5873,15 @@ impl Runtime<'_> {
         } else if kind != "PINGRESP" || pending.was_retained {
             let serial = pending.receive_serial;
             self.events.emit_with("frame_written",||json!({"connection":generation.get().to_string(),"details":{"packet_kind":kind,"effect":effect_text(effect),"packet_id":id.unwrap_or(0),"publish_order":serial.map(|v|v.to_string()).unwrap_or_default(),"bytes":bytes}})).map_err(event_failure)?;
+        }
+        if kind == "PUBREC"
+            && pending.terminal.is_none()
+            && let Some(id) = id
+            && let Some(peer) = self.peers.get_mut(&generation)
+            && peer.version == Some(codec::Version::V311)
+            && let Some(window) = peer.receiving.as_mut()
+        {
+            window.pubrec_written(id, pending.receive_serial);
         }
         if let Some(terminal) = pending.terminal
             && let Some(p) = self.peers.get_mut(&generation)

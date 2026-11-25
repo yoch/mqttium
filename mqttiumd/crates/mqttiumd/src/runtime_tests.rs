@@ -1171,9 +1171,15 @@ fn a_deferred_subscription_cannot_be_overtaken_by_its_later_unsubscribe() {
     });
 }
 
+enum LookaheadCase {
+    PacketBound,
+    ByteBound,
+    ReleaseQueued,
+}
+
 /// Stage an already-read prefix at its exact budget without relying on
 /// network timing or putting an oversized burst on the transport.
-fn mqtt311_lookahead_closure(bytes: bool) {
+fn mqtt311_lookahead(case: LookaheadCase) {
     with_runtime(128, |runtime, directory| {
         let persistent = || codec::Connect {
             version: codec::Version::V311,
@@ -1212,7 +1218,7 @@ fn mqtt311_lookahead_closure(bytes: bool) {
             domain: [1; 32],
             tick: 0,
         });
-        if bytes {
+        if matches!(case, LookaheadCase::ByteBound) {
             // Two ordinary QoS 0 bodies, each within the supported payload bound.
             for size in [BEHIND_BYTES / 2, BEHIND_BYTES - BEHIND_BYTES / 2] {
                 let mut body = vec![b'x'; size];
@@ -1227,6 +1233,24 @@ fn mqtt311_lookahead_closure(bytes: bool) {
             }
         }
         waiting.cold_mut().held_packet = Some((0x30, vec![0, 1, b't'].into(), observed));
+        if matches!(case, LookaheadCase::ReleaseQueued) {
+            // The exact PUBREL has been decoded but its store release and
+            // terminal write have yet to run. Pump the reader before either.
+            runtime
+                .packet(source, 0x62, 1u16.to_be_bytes().to_vec())
+                .unwrap();
+            runtime.connections().unwrap();
+            assert!(runtime.peers[&source].deferred_publish().is_some());
+            until(runtime, |r| {
+                r.owner
+                    .exchange(session, InboundPacketId::new(window + 1).unwrap())
+                    .is_some_and(|(_, phase)| {
+                        phase == mqttiumd_core::owner::ExchangePhase::AwaitPubrel
+                    })
+            });
+            assert!(runtime.peers.contains_key(&source));
+            return;
+        }
         until(runtime, |r| !r.peers.contains_key(&source));
         let events = std::fs::read_to_string(directory.join("events.jsonl")).unwrap();
         assert!(
@@ -1275,12 +1299,17 @@ fn mqtt311_lookahead_closure(bytes: bool) {
 
 #[test]
 fn mqtt311_packet_lookahead_closes_only_the_blocked_peer() {
-    mqtt311_lookahead_closure(false);
+    mqtt311_lookahead(LookaheadCase::PacketBound);
 }
 
 #[test]
 fn mqtt311_byte_lookahead_closes_only_the_blocked_peer() {
-    mqtt311_lookahead_closure(true);
+    mqtt311_lookahead(LookaheadCase::ByteBound);
+}
+
+#[test]
+fn mqtt311_saturated_lookahead_waits_for_an_already_observed_release() {
+    mqtt311_lookahead(LookaheadCase::ReleaseQueued);
 }
 
 /// MQTT 3.1.1 has no Receive Maximum: a client cannot know the broker's
