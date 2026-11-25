@@ -3,7 +3,7 @@
 Written by `tests/compat/run.py`: regenerate it with the command in
 `tests/compat/README.md` and copy `matrix.md` here; do not edit it by hand.
 
-- broker: `mqttiumd` built from commit `60dc777152d536ef75b87de8efbd16849372f3cb`, with `--delivery-shards 0`
+- broker: `mqttiumd` built from commit `87823a934006a8787bed3d72153889b56b3c8935`, with `--delivery-shards 0`
 - reference: Mosquitto 2.1.4, the version `tests/compat/build-reference.sh` builds
 - scenarios played: 137
 
@@ -19,19 +19,19 @@ the oracle, the MQTT specification is. Each difference is classified in
 
 ## Summary
 
-137 scenarios: 105 `same`, 15 `profile-refused`, 8 `reference-nonconformant`, 9 `unspecified`.
+137 scenarios: 105 `same`, 15 `profile-refused`, 7 `reference-nonconformant`, 10 `unspecified`.
 
 | Area | same | profile-refused | reference-nonconformant | defect | unspecified | total |
 | - | -: | -: | -: | -: | -: | -: |
 | connect | 19 | 6 | 0 | 0 | 1 | 26 |
-| session | 9 | 0 | 5 | 0 | 0 | 14 |
+| session | 9 | 0 | 4 | 0 | 1 | 14 |
 | subscribe | 18 | 4 | 0 | 0 | 4 | 26 |
 | publish | 22 | 0 | 1 | 0 | 3 | 26 |
 | retained | 14 | 0 | 0 | 0 | 0 | 14 |
 | properties | 8 | 1 | 0 | 0 | 0 | 9 |
 | will | 10 | 4 | 2 | 0 | 0 | 16 |
 | errors | 5 | 0 | 0 | 0 | 1 | 6 |
-| **all** | 105 | 15 | 8 | 0 | 9 | 137 |
+| **all** | 105 | 15 | 7 | 0 | 10 | 137 |
 
 ## Expectations on mqttiumd's transcript
 
@@ -39,7 +39,7 @@ What a normative statement requires of the broker in a scenario, whatever Mosqui
 does there. A `fail` is listed in `expectations-open.json` or fails the run; the
 column of the reference is information.
 
-34 expectations: 33 `pass`, 0 `fail` (0 listed as open), 1 `not-applicable`.
+35 expectations: 34 `pass`, 0 `fail` (0 listed as open), 1 `not-applicable`.
 
 | Expectation | MQTT | Statement | Requires | mqttiumd | Observed on mqttiumd | Mosquitto |
 | - | - | - | - | - | - | - |
@@ -50,12 +50,13 @@ column of the reference is information.
 | `publish/over-maximum-packet-size-qos1-v5#not-redelivered` | 5.0 | MQTT-3.1.2-25, with MQTT-3.2.2-3 for Session Present | The resumed session (Session Present 1), which now accepts 1024 bytes, is sent nothing for the discarded message: the first PUBLISH it reads is a new message, with DUP 0 | pass | resumed: recv [CONNACK reason=0x00 session_present=true] ok; no-redelivery: quiet [] quiet; next: recv [PUBLISH packet_id=1 dup=false payload="next" topic="limit/t"] ok | pass |
 | `publish/over-maximum-packet-size-qos2-v5#discarded` | 5.0 | MQTT-3.1.2-25, with MQTT-3.1.2-24 for the size of what is sent | Nothing is sent for the message that would take 114 bytes and the connection stays open; the next message is delivered in a packet of at most 64 bytes, and nothing follows it | pass | large: quiet [] quiet; small: recv [PUBLISH packet_id=1 dup=false payload="small" topic="limit/t" wire_bytes=19] ok; after-small: quiet [] quiet | pass |
 | `publish/over-maximum-packet-size-qos2-v5#not-redelivered` | 5.0 | MQTT-3.1.2-25, with MQTT-3.2.2-3 for Session Present | The resumed session (Session Present 1), which now accepts 1024 bytes, is sent nothing for the discarded message: the first PUBLISH it reads is a new message, with DUP 0 | pass | resumed: recv [CONNACK reason=0x00 session_present=true] ok; no-redelivery: quiet [] quiet; next: recv [PUBLISH packet_id=1 dup=false payload="next" topic="limit/t"] ok | pass |
+| `publish/receive-maximum-inbound-v5#connection-receive-maximum` | 5.0 | MQTT-3.3.4-7, MQTT-4.13.1-1 | The ninth outstanding QoS 2 PUBLISH on one connection with Receive Maximum eight requires closure. | pass | connection: recv [CONNACK reason=0x00 receive_maximum=8] ok; accepted-1: recv [PUBREC packet_id=1 reason=0x00] ok; accepted-2: recv [PUBREC packet_id=2 reason=0x00] ok; accepted-3: recv [PUBREC packet_id=3 reason=0x00] ok; accepted-4: recv [PUBREC packet_id=4 reason=0x00] ok; accepted-5: recv [PUBREC packet_id=5 reason=0x00] ok; accepted-6: recv [PUBREC packet_id=6 reason=0x00] ok; accepted-7: recv [PUBREC packet_id=7 reason=0x00] ok; accepted-8: recv [PUBREC packet_id=8 reason=0x00] ok; ninth: until_close [DISCONNECT reason=0x93] eof | fail |
 | `retained/forty-topics-qos1-v4#store` | 3.1.1 | MQTT-3.3.1-6, with MQTT-3.3.1-5 for the store and MQTT-3.3.1-8 for the RETAIN flag | The SUBACK and the 40 retained messages, one for each topic, with its payload and RETAIN 1, each once and in any order; then nothing | pass | retained: drain [41 packets: 1 SUBACK, 40 PUBLISH] ok; after: quiet [] quiet | pass |
 | `retained/thirty-two-topics-qos1-v4#store` | 3.1.1 | MQTT-3.3.1-6, with MQTT-3.3.1-5 for the store and MQTT-3.3.1-8 for the RETAIN flag | The SUBACK and the 32 retained messages, one for each topic, with its payload and RETAIN 1, each once and in any order; then nothing | pass | retained: drain [33 packets: 1 SUBACK, 32 PUBLISH] ok; after: quiet [] quiet | pass |
-| `session/ninth-exchange-after-reconnection-v4#resumed-exchanges` | 3.1.1 | MQTT-4.3.3-2, MQTT-4.5.0-1 | The session resumes and each of its eight accepted messages reaches the subscriber once. | pass | resume: recv [CONNACK reason=0x00 session_present=true] ok; deliveries: quiet [PUBLISH payload="m1" topic="ninth/t", PUBLISH payload="m2" topic="ninth/t", PUBLISH payload="m3" topic="ninth/t", PUBLISH payload="m4" topic="ninth/t", PUBLISH payload="m5" topic="ninth/t", PUBLISH payload="m6" topic="ninth/t", PUBLISH payload="m7" topic="ninth/t", PUBLISH payload="m8" topic="ninth/t"] quiet | pass |
-| `session/ninth-exchange-after-reconnection-v4#accepted-ninth` | 3.1.1 | MQTT-4.3.3-2, MQTT-4.5.0-1 | If the ninth PUBLISH is accepted, the subscriber receives that message as well. | not-applicable | ninth: until_close [] eof | fail |
-| `session/ninth-exchange-after-reconnection-v5#resumed-exchanges` | 5.0 | MQTT-4.3.3-8, MQTT-4.5.0-1 | The session resumes and each of its eight accepted messages reaches the subscriber once. | pass | resume: recv [CONNACK reason=0x00 session_present=true] ok; deliveries: quiet [PUBLISH payload="m1" topic="ninth/t", PUBLISH payload="m2" topic="ninth/t", PUBLISH payload="m3" topic="ninth/t", PUBLISH payload="m4" topic="ninth/t", PUBLISH payload="m5" topic="ninth/t", PUBLISH payload="m6" topic="ninth/t", PUBLISH payload="m7" topic="ninth/t", PUBLISH payload="m8" topic="ninth/t"] quiet | pass |
-| `session/ninth-exchange-after-reconnection-v5#quota-closure` | 5.0 | MQTT-3.3.4-7, MQTT-4.13.1-1 | The broker closes the connection after the client exceeds its Receive Maximum. | pass | ninth: until_close [DISCONNECT reason=0x97] eof; deliveries: quiet [PUBLISH payload="m1" topic="ninth/t", PUBLISH payload="m2" topic="ninth/t", PUBLISH payload="m3" topic="ninth/t", PUBLISH payload="m4" topic="ninth/t", PUBLISH payload="m5" topic="ninth/t", PUBLISH payload="m6" topic="ninth/t", PUBLISH payload="m7" topic="ninth/t", PUBLISH payload="m8" topic="ninth/t"] quiet | fail |
+| `session/ninth-exchange-after-reconnection-v4#resumed-exchanges` | 3.1.1 | MQTT-4.3.3-2, MQTT-4.5.0-1 | The session resumes and the QoS 1 subscriber receives all eight accepted messages. | pass | resume: recv [CONNACK reason=0x00 session_present=true] ok; subscription: recv [SUBACK packet_id=1 codes=0x01] ok; deliveries: drain [PUBLISH packet_id=1 payload="m1" qos=1 topic="ninth/t", PUBLISH packet_id=2 payload="m2" qos=1 topic="ninth/t", PUBLISH packet_id=3 payload="m3" qos=1 topic="ninth/t", PUBLISH packet_id=4 payload="m4" qos=1 topic="ninth/t", PUBLISH packet_id=5 payload="m5" qos=1 topic="ninth/t", PUBLISH packet_id=6 payload="m6" qos=1 topic="ninth/t", PUBLISH packet_id=7 payload="m7" qos=1 topic="ninth/t", PUBLISH packet_id=8 payload="m8" qos=1 topic="ninth/t"] idle | pass |
+| `session/ninth-exchange-after-reconnection-v4#accepted-ninth` | 3.1.1 | MQTT-4.3.3-2, MQTT-4.5.0-1 | An affirmative PUBREC for the ninth PUBLISH transfers ownership, including onward delivery. | not-applicable | ninth: until_close [] eof | fail |
+| `session/ninth-exchange-after-reconnection-v5#resumed-exchanges` | 5.0 | MQTT-4.3.3-8, MQTT-4.5.0-1 | The session resumes and the QoS 1 subscriber receives all eight accepted messages. | pass | resume: recv [CONNACK reason=0x00 session_present=true] ok; subscription: recv [SUBACK packet_id=1 codes=0x01] ok; deliveries: drain [PUBLISH packet_id=1 payload="m1" qos=1 topic="ninth/t", PUBLISH packet_id=2 payload="m2" qos=1 topic="ninth/t", PUBLISH packet_id=3 payload="m3" qos=1 topic="ninth/t", PUBLISH packet_id=4 payload="m4" qos=1 topic="ninth/t", PUBLISH packet_id=5 payload="m5" qos=1 topic="ninth/t", PUBLISH packet_id=6 payload="m6" qos=1 topic="ninth/t", PUBLISH packet_id=7 payload="m7" qos=1 topic="ninth/t", PUBLISH packet_id=8 payload="m8" qos=1 topic="ninth/t"] idle | pass |
+| `session/ninth-exchange-after-reconnection-v5#fresh-window` | 5.0 | MQTT-3.3.4-7, MQTT-4.9.0-1, MQTT-4.9.0-2 | The first QoS 2 PUBLISH on the new connection cannot exceed its Receive Maximum of eight. | pass | new-connection: recv [CONNACK reason=0x00 receive_maximum=8] ok; ninth: until_close [DISCONNECT reason=0x97] eof | pass |
 | `session/redelivery-pubrel-after-expiry-v5#resume-pubrel` | 5.0 | MQTT-4.4.0-1, MQTT-4.3.3-7, MQTT-4.3.3-13 | The resumed session resends the outstanding PUBREL with its original identifier. | pass | first-release: recv [PUBREL packet_id=1 reason=0x00] ok; resume: recv [CONNACK reason=0x00 session_present=true, PUBREL packet_id=1 reason=0x00] ok; completed: quiet [] quiet | fail |
 | `session/restart-3759-v5#persistent-delivery` | 5.0 | MQTT-3.1.2-23, MQTT-3.2.2-3, MQTT-4.5.0-1 | The subscriber resumes and receives its queued QoS 1 publication once after the restart. | pass | fresh: recv [CONNACK reason=0x00 session_present=false] ok; subscribed: recv [SUBACK packet_id=1 codes=0x01] ok; accepted: recv [PUBACK packet_id=1 reason=0x00] ok; resumed: recv [CONNACK reason=0x00 session_present=true] ok; delivery: recv [PUBLISH packet_id=1 payload="queued" qos=1 topic="restart/offline"] ok; complete: quiet [] quiet | fail |
 | `session/restart-3760-v5#persistent-delivery` | 5.0 | MQTT-3.1.2-8, MQTT-3.1.2-10, MQTT-3.1.2-23, MQTT-3.2.2-3 | The subscriber resumes and receives its queued QoS 1 publication once after the restart. | pass | fresh: recv [CONNACK reason=0x00 session_present=false] ok; subscribed: recv [SUBACK packet_id=1 codes=0x01] ok; owner: recv [CONNACK reason=0x00 session_present=false] ok; resumed: recv [CONNACK reason=0x00 session_present=true] ok; delivery: recv [PUBLISH packet_id=1 payload="shutdown" qos=1 topic="restart/will"] ok; complete: quiet [] quiet | fail |
@@ -176,8 +177,8 @@ this run and may differ in the next: where a broker may lawfully shed messages
 | `retained/set-and-deliver-v5` | 5.0 | same | A retained message is sent, with RETAIN 1, to a subscription made afterwards. |
 | `retained/thirty-two-topics-qos1-v4` | 3.1.1 | same | The content of the retained store: thirty-two topics each keep a retained message (thirty-two is what the bounded profile of mqttiumd keeps), and a `thirty-two/#` subscription made afterwards at QoS 1 acknowledges every delivery. Each message is owed once, with RETAIN 1, in any order, and nothing after. |
 | `retained/wildcard-subscription-v4` | 3.1.1 | same | `tree/#` receives the retained messages of the parent and of every level below, and no other. |
-| `session/ninth-exchange-after-reconnection-v4` | 3.1.1 | reference-nonconformant | A 3.1.1 session owes the PUBREL of eight exchanges and publishes a ninth QoS 2 message. Mosquitto answers PUBREC, later answers its PUBREL with PUBCOMP, and the subscriber never receives the message (upstream ticket 3809); mqttiumd does not acknowledge the PUBLISH and closes the connection. On both the subscriber ends with the first eight messages. |
-| `session/ninth-exchange-after-reconnection-v5` | 5.0 | reference-nonconformant | An MQTT 5 session owes the PUBREL of eight exchanges, the Receive Maximum, and publishes a ninth QoS 2 message. Mosquitto answers PUBREC 0x97 (Quota exceeded), keeps the connection, and later answers the PUBREL of that identifier with PUBCOMP 0x00; mqttiumd sends DISCONNECT 0x97 (Quota exceeded) and closes, and answers that PUBREL with PUBCOMP 0x92 (Packet Identifier not found). |
+| `session/ninth-exchange-after-reconnection-v4` | 3.1.1 | reference-nonconformant | A 3.1.1 session owes the PUBREL of eight exchanges and publishes a ninth QoS 2 message. Mosquitto answers PUBREC, later answers its PUBREL with PUBCOMP, and the subscriber never receives the message (upstream ticket 3809); mqttiumd does not acknowledge the PUBLISH and closes the connection. On both, the connected QoS 1 subscriber acknowledges the first eight messages and receives no ninth before the idle deadline. |
+| `session/ninth-exchange-after-reconnection-v5` | 5.0 | unspecified | For the first PUBLISH on a resumed MQTT 5 connection, Mosquitto refuses the ninth session exchange with PUBREC 0x97 and stays open. mqttiumd sends DISCONNECT 0x97 for its session quota. Both deliver the eight earlier messages to the QoS 1 subscriber. |
 | `session/offline-qos0-v4` | 3.1.1 | same | A QoS 0 message published while a persistent session with a QoS 1 subscription is offline: whether it is kept for the reconnection. |
 | `session/offline-queue-qos1-v4` | 3.1.1 | same | Two QoS 1 messages published while a persistent session is offline are sent after CONNACK on reconnection, in order and with DUP 0; once acknowledged they are not sent again. |
 | `session/offline-queue-qos1-v5` | 5.0 | same | Two QoS 1 messages published while a persistent session is offline are sent after CONNACK on reconnection, in order and with DUP 0; once acknowledged they are not sent again. |
@@ -273,19 +274,15 @@ this run and may differ in the next: where a broker may lawfully shed messages
 - `will/delay-interval-v5` (MQTT 5.0): Mosquitto accepts Will Delay Interval 1 and publishes the Will after the delay; mqttiumd refuses the CONNECT with CONNACK 0x83 (Implementation specific error).
   - Lot: Will messages beyond QoS 1 without delay: Will QoS 0 and 2, Will Delay Interval
 
-## reference-nonconformant (8)
+## reference-nonconformant (7)
 
 - `publish/receive-maximum-inbound-v5` (MQTT 5.0): On a ninth QoS 2 PUBLISH while eight exchanges are open, Mosquitto answers PUBREC 0x97 (Quota exceeded) and keeps the connection open; mqttiumd sends DISCONNECT 0x93 (Receive Maximum exceeded) and closes.
   - Statement: MQTT-4.13.1-1, with section 3.3.4: a client that exceeds Receive Maximum (MQTT-3.3.4-7) makes a Protocol Error for which the Reason Code 0x93 is given, so the server must close the connection
   - mqttiumd: Sends DISCONNECT 0x93 (Receive Maximum exceeded) and closes the network connection.
   - Decision record: 0049
-- `session/ninth-exchange-after-reconnection-v4` (MQTT 3.1.1): A 3.1.1 session owes the PUBREL of eight exchanges and publishes a ninth QoS 2 message. Mosquitto answers PUBREC, later answers its PUBREL with PUBCOMP, and the subscriber never receives the message (upstream ticket 3809); mqttiumd does not acknowledge the PUBLISH and closes the connection. On both the subscriber ends with the first eight messages.
+- `session/ninth-exchange-after-reconnection-v4` (MQTT 3.1.1): A 3.1.1 session owes the PUBREL of eight exchanges and publishes a ninth QoS 2 message. Mosquitto answers PUBREC, later answers its PUBREL with PUBCOMP, and the subscriber never receives the message (upstream ticket 3809); mqttiumd does not acknowledge the PUBLISH and closes the connection. On both, the connected QoS 1 subscriber acknowledges the first eight messages and receives no ninth before the idle deadline.
   - Statement: MQTT-4.3.3-2: a PUBREC says the receiver accepted ownership of the message, and MQTT-4.5.0-1 that a message it owns is added to the matching sessions
   - mqttiumd: Does not acknowledge the ninth PUBLISH and closes the network connection: the message stays the client's. A PUBREL for its identifier is answered with PUBCOMP, as 3.1.1 answers any PUBREL.
-  - Decision record: 0061
-- `session/ninth-exchange-after-reconnection-v5` (MQTT 5.0): An MQTT 5 session owes the PUBREL of eight exchanges, the Receive Maximum, and publishes a ninth QoS 2 message. Mosquitto answers PUBREC 0x97 (Quota exceeded), keeps the connection, and later answers the PUBREL of that identifier with PUBCOMP 0x00; mqttiumd sends DISCONNECT 0x97 (Quota exceeded) and closes, and answers that PUBREL with PUBCOMP 0x92 (Packet Identifier not found).
-  - Statement: MQTT-4.13.1-1, with section 3.3.4: a client that exceeds Receive Maximum (MQTT-3.3.4-7) makes a Protocol Error, so the server must close the connection
-  - mqttiumd: Sends DISCONNECT 0x97 (Quota exceeded) and closes the network connection; the bound is the session's, whatever the connection.
   - Decision record: 0061
 - `session/redelivery-pubrel-after-expiry-v5` (MQTT 5.0): A QoS 2 delivery with Message Expiry Interval 1 reached PUBREL and lost its connection before PUBCOMP. When the session comes back after the interval, Mosquitto sends nothing after CONNACK (upstream ticket 3744); mqttiumd sends the PUBREL again and completes on PUBCOMP.
   - Statement: MQTT-4.4.0-1: the PUBREL of an exchange in progress is resent on reconnection; the Message Expiry Interval of section 3.3.2.3.3 ends the delivery of a message that has not started, not an exchange that has
@@ -306,7 +303,7 @@ this run and may differ in the next: where a broker may lawfully shed messages
   - mqttiumd: Publishes the Will and ends the session.
   - Decision record: 0058
 
-## unspecified (9)
+## unspecified (10)
 
 - `connect/bad-protocol-level-v4` (MQTT 3.1.1): For a CONNECT with protocol level 6, Mosquitto answers a CONNACK in the MQTT 5 layout with Reason Code 0x84 (Unsupported Protocol Version) and closes; mqttiumd answers the MQTT 3.1.1 CONNACK with return code 1 (unacceptable protocol version) and closes.
   - Statement: MQTT-3.1.2-2 asks for return code 0x01 and a close; MQTT 5.0 section 3.1.2.2 allows CONNACK 0x84 before the close. A level that is neither 4 nor 5 names neither layout
@@ -323,6 +320,9 @@ this run and may differ in the next: where a broker may lawfully shed messages
 - `publish/topic-with-wildcard-v5` (MQTT 5.0): Both close the connection on a Topic Name with a wildcard; Mosquitto with DISCONNECT 0x81 (Malformed Packet), mqttiumd with DISCONNECT 0x90 (Topic Name invalid).
   - Statement: MQTT-3.3.2-2 is what the client violates; the Reason Code is not prescribed
   - Decision record: 0049
+- `session/ninth-exchange-after-reconnection-v5` (MQTT 5.0): For the first PUBLISH on a resumed MQTT 5 connection, Mosquitto refuses the ninth session exchange with PUBREC 0x97 and stays open. mqttiumd sends DISCONNECT 0x97 for its session quota. Both deliver the eight earlier messages to the QoS 1 subscriber.
+  - Statement: MQTT-3.3.4-7 and MQTT-4.9.0-1 apply to one Network Connection. Sections 3.5.2.1 and 3.14.2.1 permit Quota exceeded (0x97) in PUBREC and DISCONNECT.
+  - Decision record: 0061
 - `subscribe/invalid-empty-filter-v5` (MQTT 5.0): Both close the connection on the invalid Topic Filter; Mosquitto with DISCONNECT 0x81 (Malformed Packet), mqttiumd with DISCONNECT 0x82 (Protocol Error).
   - Statement: MQTT-4.13.1-1: both close; the Reason Code is not prescribed
   - Decision record: 0049
