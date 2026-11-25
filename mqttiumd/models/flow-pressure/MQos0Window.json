@@ -1,0 +1,62 @@
+{
+  "module": "MQos0Window.tla",
+  "status": "refinement",
+  "summary": "Per-subscriber volatile output, bounded parking, written receipts, FIFO and service for a fast subscriber while another socket stalls.",
+  "issues": [
+    672
+  ],
+  "tests": [
+    "mqttiumd/crates/mqttiumd-core/src/owner.rs",
+    "mqttiumd/crates/mqttiumd/src/runtime_tests.rs"
+  ],
+  "replays": [
+    {
+      "file": "mqttiumd/crates/mqttiumd-core/src/owner.rs",
+      "test": "product_qos0_past_what_a_connection_keeps_waiting_the_newest_is_dropped"
+    },
+    {
+      "file": "mqttiumd/crates/mqttiumd-core/src/owner.rs",
+      "test": "product_qos0_burst_is_paced_by_the_window_and_resumes_in_order"
+    },
+    {
+      "file": "mqttiumd/crates/mqttiumd/src/runtime_tests.rs",
+      "test": "a_qos0_burst_waits_for_the_output_of_its_subscriber_and_keeps_its_order"
+    }
+  ],
+  "configs": [
+    {
+      "config": "MQos0Window-safety.cfg",
+      "expect": "pass",
+      "invariants": [
+        "WithinWindow",
+        "ControlRoom",
+        "Ordered"
+      ]
+    },
+    {
+      "config": "MQos0Window-progress.cfg",
+      "expect": "pass",
+      "property": "FastCompletes"
+    },
+    {
+      "config": "MQos0Window-mut-stall.cfg",
+      "expect": "liveness",
+      "property": "FastCompletes"
+    },
+    {
+      "config": "MQos0Window-mut-window.cfg",
+      "expect": "violation",
+      "invariant": "ControlRoom"
+    },
+    {
+      "config": "MQos0Window-mut-order.cfg",
+      "expect": "violation",
+      "invariant": "Ordered"
+    },
+    {
+      "config": "MQos0Window-reach-isolation.cfg",
+      "expect": "violation",
+      "invariant": "NoIndependentDrain"
+    }
+  ]
+}

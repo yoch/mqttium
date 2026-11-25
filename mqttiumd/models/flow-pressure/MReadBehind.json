@@ -1,0 +1,85 @@
+{
+  "module": "MReadBehind.tla",
+  "status": "refinement",
+  "summary": "Receiver window pressure with independent PUBREL, bounded lookahead and a terminal decision only when the peer alone can release a slot.",
+  "issues": [
+    672
+  ],
+  "tests": [
+    "mqttiumd/crates/mqttiumd/src/runtime_tests.rs",
+    "mqttiumd/crates/mqttiumd/src/receiving.rs",
+    "mqttiumd/crates/mqttiumd/tests/reactor_wake.rs"
+  ],
+  "replays": [
+    {
+      "file": "mqttiumd/crates/mqttiumd/src/runtime_tests.rs",
+      "test": "mqtt311_saturated_lookahead_waits_for_an_already_observed_release"
+    },
+    {
+      "file": "mqttiumd/crates/mqttiumd/src/receiving.rs",
+      "test": "lookahead_requires_written_pubrec_for_every_live_occurrence"
+    },
+    {
+      "file": "mqttiumd/crates/mqttiumd/src/runtime_tests.rs",
+      "test": "mqtt311_packet_lookahead_closes_only_the_blocked_peer"
+    },
+    {
+      "file": "mqttiumd/crates/mqttiumd/src/runtime_tests.rs",
+      "test": "mqtt311_byte_lookahead_closes_only_the_blocked_peer"
+    },
+    {
+      "file": "mqttiumd/crates/mqttiumd/src/runtime_tests.rs",
+      "test": "only_the_pubrel_of_another_exchange_goes_ahead_of_a_waiting_publication"
+    },
+    {
+      "file": "mqttiumd/crates/mqttiumd/tests/reactor_wake.rs",
+      "test": "a_3_1_1_client_with_more_qos2_exchanges_than_the_window_completes_them_all"
+    }
+  ],
+  "configs": [
+    {
+      "config": "MReadBehind-safety.cfg",
+      "expect": "pass",
+      "invariants": [
+        "Bounded",
+        "IndependentOnly",
+        "CloseOnlyWhenPeerOwes"
+      ]
+    },
+    {
+      "config": "MReadBehind-progress.cfg",
+      "expect": "pass",
+      "property": "Terminates"
+    },
+    {
+      "config": "MReadBehind-mut-wait.cfg",
+      "expect": "liveness",
+      "property": "Terminates"
+    },
+    {
+      "config": "MReadBehind-mut-cross.cfg",
+      "expect": "violation",
+      "invariant": "IndependentOnly"
+    },
+    {
+      "config": "MReadBehind-mut-close.cfg",
+      "expect": "violation",
+      "invariant": "CloseOnlyWhenPeerOwes"
+    },
+    {
+      "config": "MReadBehind-reach-packets.cfg",
+      "expect": "violation",
+      "invariant": "NoPacketClose"
+    },
+    {
+      "config": "MReadBehind-reach-bytes.cfg",
+      "expect": "violation",
+      "invariant": "NoByteClose"
+    },
+    {
+      "config": "MReadBehind-reach-release.cfg",
+      "expect": "violation",
+      "invariant": "NoReleasedSlot"
+    }
+  ]
+}

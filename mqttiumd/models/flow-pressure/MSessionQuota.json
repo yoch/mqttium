@@ -1,0 +1,47 @@
+{
+  "module": "MSessionQuota.tla",
+  "status": "refinement",
+  "summary": "QoS 2 slot ownership across a persistent reconnect, with owner-driven admission and release distinct from a client-owed PUBREL.",
+  "issues": [
+    672
+  ],
+  "tests": [
+    "mqttiumd/crates/mqttiumd-core/src/owner.rs",
+    "mqttiumd/crates/mqttiumd/tests/reactor_wake.rs"
+  ],
+  "replays": [
+    {
+      "file": "mqttiumd/crates/mqttiumd-core/src/owner.rs",
+      "test": "a_session_holds_a_bounded_number_of_exchanges_across_its_connections"
+    },
+    {
+      "file": "mqttiumd/crates/mqttiumd/tests/reactor_wake.rs",
+      "test": "one_session_cannot_hold_the_inbound_exchanges_of_every_client"
+    }
+  ],
+  "configs": [
+    {
+      "config": "MSessionQuota-safety.cfg",
+      "expect": "pass",
+      "invariants": [
+        "PerSession",
+        "NoPrematureRefusal"
+      ]
+    },
+    {
+      "config": "MSessionQuota-mut-reconnect.cfg",
+      "expect": "violation",
+      "invariant": "PerSession"
+    },
+    {
+      "config": "MSessionQuota-mut-refusal.cfg",
+      "expect": "violation",
+      "invariant": "NoPrematureRefusal"
+    },
+    {
+      "config": "MSessionQuota-reach-peer.cfg",
+      "expect": "violation",
+      "invariant": "NoPeerService"
+    }
+  ]
+}
