@@ -679,6 +679,17 @@ mod secure {
         );
     }
 
+    #[test]
+    fn live_journal_reader_uses_complete_records() {
+        let status = Command::new("python3")
+            .args(["-I", "-B", "-m", "unittest", "discover", "-s"])
+            .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/disconnect_durability"))
+            .args(["-p", "test_reader.py"])
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
+
     #[cfg(feature = "test-hooks")]
     #[test]
     fn sqlite_will_end_recovery_over_tcp_and_mtls() {
