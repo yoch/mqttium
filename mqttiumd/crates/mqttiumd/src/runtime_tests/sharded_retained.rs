@@ -47,6 +47,7 @@ fn sharded_retained_qos0_waits_for_its_subscriber_and_stays_with_its_generation(
             let (slow, mut held) = connected(runtime, b"retained-slow");
             let (source, mut publisher) = connected(runtime, b"retained-source");
             let (fast, mut witness) = connected(runtime, b"retained-witness");
+            let slow_session = runtime.peers[&slow].session.unwrap();
             let shards = runtime.shards.as_ref().unwrap();
             let index =
                 |generation| shards.shard_index(runtime.peers[&generation].session.unwrap());
@@ -102,6 +103,20 @@ fn sharded_retained_qos0_waits_for_its_subscriber_and_stays_with_its_generation(
             let marker = live_marker(runtime, source, &mut publisher, 3, b'z');
             assert_eq!(served_frame(runtime, &mut resumed), marker);
             assert_eq!(served_frame(runtime, &mut witness), marker);
+            // The old, consumed replay has one terminal disposition. The
+            // successful replay and the witness produce no refusal.
+            until(runtime, |_| qos0_drops(directory) == 1);
+            let events = std::fs::read_to_string(directory.join("events.jsonl")).unwrap();
+            let drops: Vec<serde_json::Value> = events
+                .split_inclusive('\n')
+                .filter(|line| line.ends_with('\n') && line.contains("\"qos0_dropped\""))
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            assert_eq!(drops.len(), 1);
+            let details = &drops[0]["details"];
+            assert_eq!(details["target"], slow_session.get().to_string());
+            assert_eq!(details["origin_kind"], "consumed");
+            assert_eq!(details["reason"], "connection_closed");
         },
     );
 }
