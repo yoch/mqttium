@@ -3554,11 +3554,23 @@ mod tests {
         pair_with_clock(Arc::new(SystemClock::new().unwrap()))
     }
 
-    fn pair_with_clock(clock: Arc<dyn SessionClock>) -> (Connection, TcpStream) {
+    fn socket_pair() -> (TcpStream, TcpStream) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let peer = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
         let (server, _) = listener.accept().unwrap();
+        (server, peer)
+    }
+
+    fn pair_with_clock(clock: Arc<dyn SessionClock>) -> (Connection, TcpStream) {
+        let (server, peer) = socket_pair();
         (spawn_with_clock(server, clock).unwrap(), peer)
+    }
+
+    fn manual_pair() -> (Connection, TcpStream) {
+        // Only the test drives this connection and reserves its I/O credits.
+        let (server, peer) = socket_pair();
+        let (_, connection) = open(server, Wake::new(), None, false).unwrap();
+        (connection, peer)
     }
 
     #[test]
@@ -3758,7 +3770,7 @@ mod tests {
 
     #[test]
     fn a_shard_can_receive_a_delivery_ack_before_the_coordinator_takes_an_earlier_publish() {
-        let (connection, _peer) = pair();
+        let (connection, _peer) = manual_pair();
         let (effect, key) = correlation(9).unwrap();
         let inbox = ShardInbox::new(Wake::new(), 3, 1);
         connection.install_shard_route(ShardIoRoute::new(effect.owner, key, Arc::clone(&inbox)));
@@ -3802,7 +3814,7 @@ mod tests {
 
     #[test]
     fn sharded_ack_backpressure_preserves_the_unread_suffix_and_write_receipts() {
-        let (connection, _peer) = pair();
+        let (connection, _peer) = manual_pair();
         let (effect, key) = correlation(9).unwrap();
         let inbox = ShardInbox::new(Wake::new(), 2, 1);
         connection.install_shard_route(ShardIoRoute::new(effect.owner, key, Arc::clone(&inbox)));
@@ -3969,13 +3981,10 @@ mod tests {
 
     #[test]
     fn plain_write_failure_preserves_earlier_completions_in_the_same_turn() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let _peer = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
-        let (stream, _) = listener.accept().unwrap();
         // Drive the task directly so both frames share this exact output turn.
-        let (core, connection) = open(stream, Wake::new(), None, false).unwrap();
+        let (connection, _peer) = manual_pair();
         let mut task = Task {
-            core,
+            core: Arc::clone(&connection.core),
             clock: Arc::new(FakeClock::new(reading(100))),
             leftover: None,
             parser: Parser::default(),
