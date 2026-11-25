@@ -4,6 +4,7 @@ import argparse
 from collections import Counter
 from contextlib import contextmanager
 import csv
+import ctypes
 import gzip
 import hashlib
 import json
@@ -87,12 +88,20 @@ def compile_driver(reference, out, version=DEFAULT_REFERENCE):
     archive = reference.parent / f"mosquitto-{version}.tar.gz"
     if digest(archive) != REFERENCE_DIGESTS[version]:
         raise ValueError("unexpected Mosquitto source archive digest")
+    parts = [ctypes.c_int() for _ in range(3)]
+    ctypes.CDLL(str(library.resolve())).mosquitto_lib_version(*(ctypes.byref(part) for part in parts))
+    actual = ".".join(str(part.value) for part in parts)
+    # Mosquitto 2.1.4's published libmosquitto.h declares library version 2.1.0.
+    expected_library = {"2.0.21": "2.0.21", "2.1.4": "2.1.0"}[version]
+    if actual != expected_library:
+        raise ValueError(f"expected libmosquitto {expected_library} from {version}, found {actual}")
     driver = out / "load-client"
     command = ["cc", "-O2", "-std=c11", "-Wall", "-Wextra", "-Werror",
                "-I", str(reference / "include"), str(source), str(library),
                "-Wl,-rpath," + str(library.parent), "-o", str(driver)]
     subprocess.run(command, check=True)
-    return driver, {"reference_version": version, "source_archive_sha256": REFERENCE_DIGESTS[version],
+    return driver, {"reference_version": version, "library_version": actual,
+                    "source_archive_sha256": REFERENCE_DIGESTS[version],
                     "argv": command, "source_sha256": digest(source),
                     "binary_sha256": digest(driver), "library_sha256": digest(library),
                     "compiler": subprocess.check_output(["cc", "--version"], text=True).splitlines()[0]}
