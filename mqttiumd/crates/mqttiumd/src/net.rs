@@ -3704,6 +3704,37 @@ mod tests {
     }
 
     #[test]
+    fn a_queued_disconnect_is_terminal_for_every_outgoing_handle() {
+        let (mut connection, mut peer) = pair();
+        let shard = connection.outgoing_handle();
+        let write = |bytes: &[u8]| Write {
+            bytes: FrameBytes::from_slice(bytes),
+            correlation: None,
+            payload: None,
+            expiry: None,
+            report: WriteReport::Complete,
+        };
+        let publish = [0x30, 4, 0, 1, b't', 0];
+        let disconnect = codec::disconnect_reason(0x8e);
+        shard.try_send_outgoing(write(&publish)).unwrap();
+        connection.try_send_outgoing(write(&disconnect)).unwrap();
+        assert!(matches!(
+            shard.try_send_outgoing(write(&publish)),
+            Err(TrySendError::Disconnected(_))
+        ));
+        assert!(matches!(
+            connection.try_send_outgoing(write(&disconnect)),
+            Err(TrySendError::Disconnected(_))
+        ));
+        let mut received = vec![0; publish.len() + disconnect.len()];
+        peer.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+        peer.read_exact(&mut received).unwrap();
+        assert_eq!(received, [publish.as_slice(), &disconnect].concat());
+        connection.close();
+        finish(&mut connection);
+    }
+
+    #[test]
     fn oversized_header_is_refused_without_waiting_for_its_body() {
         let (mut connection, mut peer) = pair();
         peer.write_all(&[0x34, 0xff, 0xff, 0x7f]).unwrap();
