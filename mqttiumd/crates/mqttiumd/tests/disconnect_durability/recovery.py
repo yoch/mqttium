@@ -32,7 +32,13 @@ class Broker(ProcessBroker):
         if not self.events_path.is_file():
             return []
         with self.events_path.open("rb") as stream:
-            events = [json.loads(line) for line in stream if line.endswith(b"\n")]
+            events = []
+            for line in stream:
+                if not line.endswith(b"\n"):
+                    # A later read on this descriptor could see only the suffix.
+                    # Start the next poll from the beginning of the journal.
+                    break
+                events.append(json.loads(line))
         assert all(event["pid"] == self.process.pid for event in events)
         return events
 
