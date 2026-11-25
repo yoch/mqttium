@@ -209,6 +209,8 @@ jobs:
       # with their witnesses, the coverage and the recorded digests.
       - name: Pilot proof of release_if_current
         run: proofs/credits/run.sh
+      - name: The lease table preserves accounting when a live exchange is lightened
+        run: python3 proofs/lease-lighten/run.py
       - name: Mutants, each caught as aimed
         run: python3 proofs/credits/mutants.py
       # Breaks one thing per case in a copy and expects the scripts above
