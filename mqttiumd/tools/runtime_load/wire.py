@@ -71,7 +71,7 @@ def broker(args, extra=()):
     if any(str(arg) == "--tls-cert" for arg in extra):
         sources.extend((ROOT / "tools/arm64_bench/run_arm64_bench.py", ROOT / "preview/demo-pki.py"))
     cpu_control = Path("/sys/fs/cgroup/cpu.max")
-    manifest = {"command": cmd, "driver_command": sys.argv, "binary_sha256": sha256(binary),
+    manifest = {"command": cmd, "driver_command": sys.argv, "driver_pid": os.getpid(), "binary_sha256": sha256(binary),
                 "revision": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT,
                                                      text=True).strip(),
                 "driver_sources": {p.name: sha256(p) for p in sources},
@@ -83,6 +83,8 @@ def broker(args, extra=()):
     with (args.out / "broker.log").open("wb") as log:
         proc = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT)
         try:
+            manifest["broker_pid"] = proc.pid
+            write_json(args.out / "manifest.json", manifest)
             deadline = time.monotonic() + 15
             while proc.poll() is None and time.monotonic() < deadline:
                 if events.exists() and b'"ready"' in events.read_bytes():

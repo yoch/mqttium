@@ -47,7 +47,9 @@ taskset -c 3 python tools/runtime_load/profiles.py qos0 --binary "$binary" \
   QoS 0 subscriber, and times a PINGRESP on an independent connection.
   Compare depths 1, 8, 12 and 20. Wire timing includes the peer and scheduler;
   the broker's final `publish_waiting_wire` count records how often its wait
-  path ran. It does not time that path in isolation.
+  path ran. If a trial ends before the burst completes, `wire-progress.json`
+  records the PUBLISH/PUBREL submissions, PUBREC/PUBCOMP observations, subscriber
+  copies and PINGRESP state. It does not time the wait path in isolation.
 * **Bounds** holds exactly eight acknowledged QoS 2 exchanges per connection
   by delaying PUBREL; reports the jointly held count and separately measures
   fill, full-table PINGRESP, release, a new exchange and process memory. Use

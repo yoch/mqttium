@@ -132,8 +132,9 @@ async def waiting(args, port, proc):
         start = time.monotonic_ns()
         pw.write(burst)
 
+        receipts, releases, completions = set(), set(), set()
+
         async def finish():
-            receipts, completions = set(), set()
             while len(completions) < depth:
                 head, body = await read_packet(pr)
                 ident = int.from_bytes(body, "big")
@@ -142,6 +143,7 @@ async def waiting(args, port, proc):
                 if head == 0x50 and ident not in receipts:
                     receipts.add(ident)
                     pw.write(mqtt.pubrel(ident))
+                    releases.add(ident)
                 elif head == 0x70 and ident in receipts and ident not in completions:
                     completions.add(ident)
                     completed_ms.append((time.monotonic_ns() - start) / 1e6)
@@ -156,7 +158,26 @@ async def waiting(args, port, proc):
                     raise ValueError("subscriber sequence differs")
                 copies += 1
 
-        _, _, delay = await asyncio.gather(finish(), receive(), ping(wr, ww))
+        publisher_task = asyncio.create_task(finish())
+        subscriber_task = asyncio.create_task(receive())
+        probe = asyncio.create_task(ping(wr, ww))
+        try:
+            _, _, delay = await asyncio.gather(publisher_task, subscriber_task, probe)
+        except (Exception, asyncio.CancelledError):
+            write_json(args.out / "wire-progress.json", {
+                "completed_rounds": turn,
+                "current_round": turn + 1,
+                "submitted_publish_total": base + depth,
+                "observed_pubrec_total": base + len(receipts),
+                "submitted_pubrel_total": base + len(releases),
+                "observed_pubcomp_total": base + len(completions),
+                "ordered_subscriber_copies": copies,
+                "current_pubrec_ids": sorted(receipts),
+                "current_pubrel_ids": sorted(releases),
+                "current_pubcomp_ids": sorted(completions),
+                "current_pingresp_observed": probe.done() and not probe.cancelled() and probe.exception() is None,
+            })
+            raise
         unrelated_ms.append(delay)
     measured_seconds = time.monotonic() - measured_start
     write_json(args.out / "timings-ms.json", {"pubcomp_since_burst": completed_ms,
