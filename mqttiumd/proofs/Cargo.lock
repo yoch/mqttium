@@ -21,6 +21,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "mqttiumd-proof-lease-lighten"
+version = "0.0.0"
+dependencies = [
+ "mqttiumd-core",
+]
+
+[[package]]
 name = "mqttiumd-proof-preflight"
 version = "0.0.0"
 dependencies = [
