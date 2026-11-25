@@ -169,6 +169,8 @@ def main() -> None:
     try:
         pki = bench.make_pki(tmp, max(max(plain_counts), max(mtls_counts), 1024))
         results = {}
+        if not args.only_mqttiumd:
+            results["mosquitto_reference"] = bench.mosquitto_identity(args.mosquitto)
 
         p = bench.free_port()
         ev = tmp / "m_plain.ev"

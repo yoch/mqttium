@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""59-scenario ARM64 benchmark suite: mqttiumd (volatile/log/durable) vs Mosquitto 2.0.21."""
+"""59-scenario ARM64 benchmark suite: mqttiumd (volatile/log/durable) vs the selected Mosquitto executable."""
 import argparse
 import json
 from pathlib import Path
@@ -93,6 +93,7 @@ def main() -> None:
 
     bin_path = Path(args.binary)
     mosq_path = Path(args.mosquitto)
+    reference = bench.mosquitto_identity(mosq_path)
     all_targets = [
         (
             "mqttiumd-volatile-ram",
@@ -118,7 +119,7 @@ def main() -> None:
             bin_path,
             ["--storage-mode", "durable", "--io-threads", "2"],
         ),
-        ("mosquitto-2.0.21-ram", "mosquitto", mosq_path, []),
+        (f"mosquitto-{reference['version']}-ram", "mosquitto", mosq_path, []),
     ]
 
     all_results = []
@@ -194,6 +195,9 @@ def main() -> None:
         work_dir="/dev/shm",
     )
 
+    for row in all_results:
+        if row["label"].startswith("mosquitto-"):
+            row["reference"] = reference
     Path(args.out).write_text(json.dumps(all_results, indent=2) + "\n")
     print(f"\nSaved {len(all_results)} rows to {args.out}", flush=True)
 

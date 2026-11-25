@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """Reproducible ARM64 benchmark runner: mqttiumd vs Mosquitto reference."""
 import argparse
+import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import signal
 import socket
 import subprocess
@@ -13,6 +15,16 @@ import time
 
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parents[1]
+
+
+def mosquitto_identity(binary: Path | str) -> dict:
+    path = Path(binary).resolve()
+    help_text = subprocess.run([str(path), "-h"], capture_output=True, text=True, check=True).stdout
+    version = re.search(r"^mosquitto version (\S+)\s*$", help_text, re.MULTILINE)
+    if version is None:
+        raise ValueError(f"cannot read Mosquitto version from {path}")
+    with path.open("rb") as source:
+        return {"version": version.group(1), "sha256": hashlib.file_digest(source, "sha256").hexdigest()}
 
 
 def free_port() -> int:
@@ -246,6 +258,7 @@ def main() -> None:
         if args.only in ("mqttiumd", "both"):
             brokers.append((args.label, args.binary, args.extra))
         if args.only in ("mosquitto", "both"):
+            reference = mosquitto_identity(args.mosquitto)
             brokers.append(("mosquitto", args.mosquitto, []))
         results = []
         for pairs, qos, rate in cases:
@@ -266,6 +279,8 @@ def main() -> None:
                     args.gen_cpus,
                     work_dir=args.work_dir,
                 )
+                if kind == "mosquitto":
+                    r["reference"] = reference
                 results.append(r)
                 loss = 100.0 * (1.0 - r["delivered_after_drain"] / max(1, r["submitted"]))
                 print(

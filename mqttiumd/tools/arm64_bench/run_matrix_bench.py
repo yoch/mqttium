@@ -14,6 +14,8 @@ import subprocess
 import tempfile
 import time
 
+from run_arm64_bench import mosquitto_identity
+
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parents[1]
 
@@ -146,7 +148,8 @@ def main() -> None:
     if args.only in ("all", "log"):
         targets.append((f"mqttiumd-log{suffix}", "mqttiumd", bin_path, ["--storage-mode", "log", "--io-threads", str(args.io_threads), *shard_args]))
     if args.only in ("all", "mosquitto"):
-        targets.append(("mosquitto-2.1.2", "mosquitto", mosq_path, []))
+        reference = mosquitto_identity(mosq_path)
+        targets.append((f"mosquitto-{reference['version']}", "mosquitto", mosq_path, []))
 
     wanted = {c.strip() for c in args.cases.split(",") if c.strip()}
     rows = []
@@ -159,6 +162,8 @@ def main() -> None:
                 driver, label, kind, binary, extra, case_name, case_args,
                 args.work_dir, args.broker_cpus, args.gen_cpus,
             )
+            if kind == "mosquitto":
+                r["reference"] = reference
             rows.append(r)
             d = r["deliv_fast_ms"]
             print(
