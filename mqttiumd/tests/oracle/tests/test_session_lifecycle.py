@@ -270,7 +270,7 @@ class SessionShutdownObservations(unittest.TestCase):
 
     def incomplete(self):
         value = self.event("shutdown_incomplete", code="pending_or_unknown", phase="Shutdown",
-                           lifecycle_pending=True, retired_flights=256, in_flight=17, closing_inputs=32)
+                           lifecycle_pending=True, retired_flights=256, in_flight=17, closing_inputs=8192)
         value["operation"] = {"incarnation": "1", "epoch": "2", "owner": "0", "sequence": "8"}
         return value
 
@@ -278,7 +278,7 @@ class SessionShutdownObservations(unittest.TestCase):
         valid = self.incomplete()
         self.assertEqual(self.contracts.check_value(valid), [])
         for key, changed in (("phase", "Recovery"), ("retired_flights", 257),
-                             ("in_flight", 18), ("closing_inputs", 33)):
+                             ("in_flight", 18), ("closing_inputs", 8193)):
             invalid = copy.deepcopy(valid)
             invalid["details"][key] = changed
             with self.subTest(key=key):
