@@ -10,10 +10,10 @@
 //!
 //! In durable mode the point is a barrier of the writer, inside the
 //! transaction or right after its COMMIT (executable built with
-//! `test-hooks`). The log and volatile modes refuse the barriers
-//! (`volatile_test_hooks_unsupported`): there the kill follows the
-//! `session_changed` event, which the runtime writes once the store has
-//! answered.
+//! `test-hooks`). The mTLS cases also hold log writes on both sides of
+//! fdatasync and distinguish the previous and next volatile snapshots.
+//! The cleartext cases for these two stores kill after `session_changed`,
+//! which the runtime writes once the store has answered.
 //!
 //! One store, three runs of the executable: `setup` opens the sessions and
 //! stops gracefully, `cut` is killed at the barrier, `restart` is observed.
@@ -651,5 +651,53 @@ mod killed {
         let store = SqliteStore::inspect(&case.store()).unwrap();
         assert!(store.wills.is_empty());
         assert_eq!(published_wills(&case.store()), 0);
+    }
+}
+
+mod secure {
+    use super::*;
+
+    fn run(suite: &str) {
+        let case = Case::new(suite);
+        let result = Command::new("python3")
+            .args(["-I", "-B"])
+            .arg(
+                Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/disconnect_durability/secure.py"),
+            )
+            .arg(env!("CARGO_BIN_EXE_mqttiumd"))
+            .arg(&case.0)
+            .arg(suite)
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{suite} failed: {}\n{}\n{}",
+            result.status,
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr)
+        );
+    }
+
+    #[cfg(feature = "test-hooks")]
+    #[test]
+    fn sqlite_will_end_recovery_over_mtls() {
+        run("durable");
+    }
+
+    #[cfg(feature = "test-hooks")]
+    #[test]
+    fn log_will_end_recovery_over_mtls() {
+        run("log");
+    }
+
+    #[test]
+    fn volatile_will_end_recovery_over_mtls() {
+        run("volatile");
+    }
+
+    #[cfg(feature = "test-hooks")]
+    #[test]
+    fn takeover_with_a_partially_written_tls_record() {
+        run("takeover");
     }
 }
