@@ -1318,12 +1318,13 @@ fn mqtt311_lookahead(case: LookaheadCase) {
         }
         until(runtime, |r| !r.peers.contains_key(&source));
         let events = std::fs::read_to_string(directory.join("events.jsonl")).unwrap();
+        let source_text = source.get().to_string();
         assert!(
             events
                 .lines()
                 .filter_map(|s| serde_json::from_str::<serde_json::Value>(s).ok())
                 .any(|e| e["kind"] == "connection_closed"
-                    && e["connection"] == source.get().to_string()
+                    && e["connection"].as_str() == Some(source_text.as_str())
                     && e["details"]["code"] == "receive_lookahead_capacity")
         );
 
