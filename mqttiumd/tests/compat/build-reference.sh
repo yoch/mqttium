@@ -10,7 +10,7 @@
 # Mosquitto 2.1 requires (Debian and Ubuntu: libssl-dev, libsqlite3-dev, libcjson-dev).
 #
 # `preview/build-mosquitto-reference.sh` builds 2.0.21 for the frozen
-# preview kit and the load tools; it is not the reference of the bench.
+# preview kit and historical comparisons.
 set -eu
 umask 077
 

@@ -164,6 +164,13 @@ This amends records 0046 (the broker no longer holds 128 credits for all),
   until it is under the bound.
 - The wait of a publication for a credit still resumes from the head of
   one queue (record 0046).
-- `lighten` is covered by the unit tests of the lease table, not by the
-  proof of `release_if_current`, whose files are unchanged.
-- No model has the bound.
+
+## Verification of the session bound
+
+`MSessionQuota` exercises admission, release, and reconnect with two
+sessions and a reduced bound. It also checks isolation when one session
+is full. [Model and replay witnesses](../../models/flow-pressure/README.md)
+
+The dedicated Kani proof runs the production lease table, including
+generation checks, both credit totals and a neighbouring live lease.
+[Harness, scoped assumptions and mutant](../../proofs/lease-lighten/README.md)

@@ -93,12 +93,21 @@ The window is measured, not assumed: see the report.
   real executable: a kill inside the transaction, a kill after its commit,
   with and without a Will, and the three storage modes.
 
-## Not shown
+## Process cuts and their limits
 
-- A kill of the process is not a power loss: what was written survives in
-  the page cache. Nothing here is evidence about `fsync`.
-- No kill is placed inside the `COMMIT` itself.
-- The log and volatile modes refuse the barriers of the writer
-  (`volatile_test_hooks_unsupported`): there the kill follows the
-  `session_changed` event, and no kill is placed before their commit.
-- The TLS listener is not replayed at the level of the executable.
+The executable tests in `crates/mqttiumd/tests/disconnect_durability.rs`
+and its companion peer exercise the commit boundary. The SQLite
+instrumentation can stop inside the COMMIT call at the WAL hook. At that
+point the transaction has already committed. The before-commit and
+after-return stops distinguish it from the other two observations.
+
+The instrumented log writer exposes stops before append, after writing a
+whole frame but before `sync_data`, and after `sync_data` returns.
+Restart after a process kill can read a frame already in the kernel page
+cache. In volatile mode the recovery evidence identifies the previous
+or the next complete atomic snapshot. The peer checks session presence
+and the Will independently, including DISCONNECT 0x04. The store hooks
+are excluded from ordinary builds.
+
+A power cut, a torn sector and loss of the kernel page cache require a
+disposable storage target. [Physical power-loss follow-up](https://github.com/yoch/mqttium/issues/682)

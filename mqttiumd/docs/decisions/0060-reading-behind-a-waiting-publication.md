@@ -112,4 +112,4 @@ capacities of record 0048, and is left to a decision.
 - A DISCONNECT kept behind a publication that never gets its slot is not
   applied. The Will follows the eventual transport close, including a
   close at the lookahead bound.
-- No model of the runtime has the waiting publication.
+- `MReadBehind` checks ordering, bounded reads and progress with a local or remote release in [the flow-pressure models](../../models/flow-pressure/README.md).

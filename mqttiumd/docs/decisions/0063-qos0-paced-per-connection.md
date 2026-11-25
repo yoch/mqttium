@@ -120,17 +120,6 @@ the output of a subscriber, up to a bound).
 - **A new input by which the runtime reports room.** The end of a write is
   already reported.
 
-## Not done
-
-- The window is a constant of the core and the size of the output queue a
-  constant of the runtime: nothing ties them at compilation. The runtime
-  test that holds the output of a subscriber is what checks them together.
-- A retained replay to a QoS 0 subscription is a consumed delivery and is
-  paced as one; no test plays it under a full queue.
-- No model has the window.
-- The TLS write path was not read again; the tests of the TLS listener
-  cover it as before.
-
 ## Implementation amendment
 
 The runtime now checks the equality of the core's volatile QoS 0 window
@@ -144,3 +133,7 @@ fills a subscriber's output with control frames, leaving its final slot for
 SUBACK. It checks the resulting consumed QoS 0 replay's `output_saturated`
 drop against that subscriber and observes the complete retained publication
 on an independent subscriber while the first queue remains full.
+
+`MQos0Window` checks the per-generation window, FIFO order and progress
+of the independent subscriber with a reduced queue. The executable load
+profiles measure delivery over TCP and mTLS. [Model, assumptions and witnesses](../../models/flow-pressure/README.md)

@@ -27,12 +27,11 @@ tools the bench does not use.
 - **`tests/compat/build-reference.sh` builds it**: the source archive of
   mosquitto.org, its SHA-256 checked before it is unpacked
   (`ca30b26ccd3041c0e11fc407fe4f2e62bc445e8d8dea94a083cc60c09bd5ea30`),
-  then the common library and the broker alone, with TLS and without the
-  documentation, the WebSocket listener, the HTTP API, the control tools
-  and the plugins. The CI job installs `libcjson-dev`.
+  then the common library, TLS broker and SQLite persistence plugin. The
+  CI build installs the cJSON and SQLite development headers.
 - **`preview/build-mosquitto-reference.sh` is not changed.** It builds
-  2.0.21 for the frozen preview kit, the load tools and the progression
-  tool, which keep their reference.
+  2.0.21 for the frozen preview kit and historical comparisons. Active
+  load comparisons use the pinned 2.1.4 build.
 - **A difference is classified as record 0049 says.** The replay changed
   the classification as follows.
 
@@ -62,29 +61,20 @@ This amends record 0049: the reference is 2.1.4, and of its two standing
 cases of `reference-nonconformant` the second, the packet over the
 announced Maximum Packet Size, no longer stands.
 
-## Consequences
+## Campaigns and limits
 
-- The bench has 135 scenarios: 105 `same`, 15 `profile-refused`, 6
-  `reference-nonconformant`, 9 `unspecified`, no `defect`.
-- The CI job `compat` needs `libcjson-dev` and a few more seconds for the
-  Keep Alive scenario.
-- The load and progression tools and the preview kit still compare with
-  2.0.21. Two versions of the reference are built in the repository.
+Report 0036 preserves the original 135-scenario campaign. The current
+matrix adds two graceful restarts on the same data directory, with
+separate candidate expectations and the reference SQLite plugin for the
+Will case. The nine scenarios introduced in this record also have
+independent wire expectations. [Current matrix](../../tests/compat/MATRIX.md)
 
-## Not done
+The listener-profile run checks mTLS certificate verification, exact and
+subtree subscriptions and delivery on both brokers. It exercises the
+candidate's explicit ClientID grants, and authenticates a password-file
+user on the reference while the candidate reports that directive as
+blocking. [Listener witnesses](../../tests/compat/listener_profiles.py)
 
-- No scenario restarts a broker: the bench cannot. Upstream tickets 3759
-  (a session opened with Clean Start 1 across a restart) and 3760 (a Will
-  published again after a restart, with the `persist-sqlite` plugin) stay
-  outside it; the product's own tests cover its side
-  (`crates/mqttiumd/tests/disconnect_durability.rs`).
-- The bench is plain TCP with the defaults of both brokers: no TLS, no
-  ACL, no password file.
-- The two brokers deliver an incoming QoS 2 message at different moments:
-  mqttiumd when it answers PUBREC, Mosquitto when it receives PUBREL. Both
-  are allowed (MQTT 5 section 4.3.3, figure 4.3) and no scenario compares
-  them; `session/ninth-exchange-after-reconnection-*` reads the subscriber
-  only after every PUBREL.
-- The expectations of the bench are unchanged: the new scenarios carry
-  none, and their classification rests on the reading written in
-  `divergences.json`.
+The two brokers may route an incoming QoS 2 message at different moments.
+The ninth-exchange scenarios observe deliveries after PUBREL. MQTT 5
+section 4.3.3, figure 4.3 permits both routing points.

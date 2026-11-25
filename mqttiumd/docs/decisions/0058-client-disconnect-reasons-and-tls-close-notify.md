@@ -105,12 +105,13 @@ A plain TCP connection is unchanged: its socket is shut on the core thread.
 - A TLS client reads the end of the stream instead of a truncation, and can
   tell the two apart.
 
-## Not done
+## Verification and remaining limit
 
-- The compatibility bench has no scenario for these cases; it is plain TCP
-  and pinned to Mosquitto 2.0.21. Record 0062 moved the pin to 2.1.4 and
-  added the scenarios `will/disconnect-*-expiry-zero-v5` and
-  `publish/empty-topic-name-*`.
-- No test places a TLS takeover with a frame in flight on a chosen schedule
-  of the core and reactor threads; the model does.
-- Keep Alive expiry still closes without a server DISCONNECT 0x8D.
+The differential scenarios `will/disconnect-*-expiry-zero-v5` and
+`publish/empty-topic-name-*` exercise the MQTT cases against Mosquitto
+2.1.4. The executable test in `crates/mqttiumd/tests/disconnect_durability/recovery.py`
+pauses a TLS record after three ciphertext bytes. It exercises both
+drain and truncation at takeover, checks the old connection's terminal
+observations, and verifies the resumed client's CONNACK and DUP replay.
+
+Keep Alive expiry still closes without a server DISCONNECT 0x8D.

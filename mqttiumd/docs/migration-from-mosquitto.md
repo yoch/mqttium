@@ -31,7 +31,7 @@ on another deployment.
 | Plugins, Dynamic Security | Not offered | Deployments that manage identities at run time | An administration surface. None exists |
 | Bridges | Not offered | Deployments that forward between brokers | Out of the profile unless a use is named |
 | `$SYS` topics | A filter on `$SYS` is granted and receives nothing | Monitoring built on `$SYS` | Publish a subset, or point monitoring at the event journal |
-| MQTT 3.1 (`MQIsdp`) | Closed before CONNACK | Old devices | Probably none; say so |
+| MQTT 3.1 (`MQIsdp`) | Closed before CONNACK | Old devices | Product decision [#674](https://github.com/yoch/mqttium/issues/674) |
 
 `mqttiumd check-config FILE` classifies every directive and names in
 `launch_requires` what the command line must still give
@@ -44,7 +44,7 @@ on another deployment.
 | Shared subscriptions | Announced unavailable; `$share/…` is DISCONNECT 0x9E | Consumers that share a load | A delivery policy among members and its durable state |
 | Subscription identifiers | Announced unavailable; DISCONNECT 0xA1 | Clients that route on the identifier | Store and return the identifier per subscription |
 | Topic aliases | Topic Alias Maximum 0; an alias is DISCONNECT 0x94 | Clients that send aliases without reading the CONNACK | Accept inbound aliases. The audit saw Mosquitto announce 10 |
-| Receive Maximum | 8, fixed; the audit saw Mosquitto announce 20 | A 3.1.1 client with many QoS 2 exchanges in flight: 41 complete, more stall until Keep Alive (record 0060) | Raise the window, make it configurable, or keep it. It sizes the exchange table and bounds a session (record 0061) |
+| Receive Maximum | 8, fixed; the audit saw Mosquitto announce 20 | A 3.1.1 client with many QoS 2 exchanges in flight: up to 41 small exchanges can complete in a single burst. At a saturated packet or byte budget, a connection waiting only for an unread PUBREL closes and its persistent session can resume (record 0060) | Raise the window, make it configurable, or keep it. It sizes the exchange table and bounds a session (record 0061) |
 | Maximum Packet Size | 1,048,584 bytes; the audit saw Mosquitto announce 2,000,000 | Publishers of payloads over 1 MiB | Raise `MAX_PAYLOAD` and what is sized from it |
 | Empty ClientID | Refused (CONNACK 2 in 3.1.1, 0x85 in 5); the Mosquitto command-line clients need `-i` | Clients that let the broker name them | Assign an identifier, as MQTT 5 allows |
 
@@ -79,12 +79,24 @@ one can be surprised by the other.
 | A DISCONNECT with reason 0x80 or 0x83 | The Will is published (record 0058) | The Will is not published |
 | A PUBLISH without subscriber | PUBACK 0x10; PUBREC plain | Not compared |
 
-## Not compared
+## Migration decisions and current verification
 
-The compatibility bench is pinned to Mosquitto 2.1.4 since record 0062
-and replays, among its 135 scenarios, the DISCONNECT with an error Reason
-Code, the empty Topic Name, the PUBREL of an expired message (upstream
-ticket 3744) and the ninth exchange of a session (upstream ticket 3809);
-`tests/compat/MATRIX.md` has the result. What is not in a scenario, TLS,
-ACL and everything across a restart among it, is still "as the audit saw
-it": the audit's observation, on its host.
+The integration owner requested a product decision on each of the following
+deployment requirements. The current broker profile applies until the
+corresponding decision changes it.
+
+| Deployment requirement | Current profile | Product decision |
+| - | - | - |
+| Session expiry override | MQTT 5 follows the negotiated interval. No `persistent_client_expiration` directive | [#673](https://github.com/yoch/mqttium/issues/673) |
+| MQTT 3.1 clients | Listeners accept MQTT 3.1.1 and 5.0 | [#674](https://github.com/yoch/mqttium/issues/674) |
+| Per-client byte budgets and retained scale | No `max_queued_bytes` or `max_inflight_bytes`. The retained inventory allows 4,096 topics and 64 MiB | [#675](https://github.com/yoch/mqttium/issues/675) |
+| SIGHUP reload | SIGHUP ends the process | [#676](https://github.com/yoch/mqttium/issues/676) |
+| Configurable TLS suites | TLS 1.3 with the library's suites | [#677](https://github.com/yoch/mqttium/issues/677) |
+| HTTP service and distributed image inventory | No HTTP listener. The release inventory requires an identified image digest | [#678](https://github.com/yoch/mqttium/issues/678) |
+
+The differential bench uses Mosquitto 2.1.4. Its restart cases preserve
+each broker's own data and exercise the reference's SQLite plugin.
+The listener checks use a shared certificate authority, static read/write
+grants and two application identities. Password-file authentication is
+exercised on Mosquitto. The same directive blocks migration to mqttiumd.
+[Compatibility matrix](../tests/compat/MATRIX.md) · [Listener checks](../tests/compat/listener_profiles.py)

@@ -396,3 +396,14 @@ message. Its active evidence is:
 | `MATRIX.md` | Matrix of the last recorded run |
 | `test_bench.py` | Tests of the bench, with a scripted peer in the test process |
 | `test_expectations.py` | Tests of the expectations, and for each one transcripts that conform and that do not |
+
+### Listener profiles
+
+`python3 tests/compat/listener_profiles.py --broker target/release/mqttiumd
+--reference /tmp/mosquitto-reference --out /tmp/listeners.json` exercises
+TLS 1.3 identity and subscriptions on both binaries and compares the
+password-file profile. A separate mqttiumd run resumes a loopback
+anonymous session and verifies uninterrupted MQTT traffic and continuous
+JSONL sequence numbers across a live journal rotation. The report records
+the binary digests and both journal ranges. Temporary credentials are
+removed at exit.
