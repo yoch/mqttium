@@ -152,7 +152,7 @@
     {
       "decision": "0026",
       "path": "docs/decisions/0026-qos0-volatile-and-consumed.md",
-      "sha256": "b74a7f7f4bd6fc3746dd704a45fdb2d9a635db22341085ef72e796f037459f72"
+      "sha256": "c1ce5beaadd040b71e04e0778e91f0de895220341d0c5e2dcc6e29c1fdb751d9"
     },
     {
       "decision": "0027",
@@ -252,7 +252,7 @@
     {
       "decision": "0046",
       "path": "docs/decisions/0046-input-backpressure.md",
-      "sha256": "dfb22491e90c3ba5476e261ebf1f9da1d085ddc4c93babb80abd42d1135ee8ea"
+      "sha256": "2afc967d30620cceba59231e63e24ccb57a6aac51e28d55eb835a14b0ae13d00"
     },
     {
       "decision": "0047",
@@ -298,6 +298,11 @@
       "decision": "0062",
       "path": "docs/decisions/0062-compatibility-reference-mosquitto-2-1-4.md",
       "sha256": "64a06b8e99a8dab440828017a8922e7c171a0c4d14d56b368fe884e36de7cab5"
+    },
+    {
+      "decision": "0063",
+      "path": "docs/decisions/0063-qos0-paced-per-connection.md",
+      "sha256": "7baf5751d6ab40573086e99679ae5473488c247317671d638970981fb43a9a46"
     }
   ],
   "entries": [

@@ -1,17 +1,16 @@
 # 0063 — QoS 0 is paced per connection
 
-Status: **Proposed** (23 November 2026). Applied to `mqttiumd` (core tier,
-ADR 0044). It follows report 0037, which found that a subscriber that
+Status: **Accepted with amendments** (25 November 2026, by the integration owner).
+Applied to the core and runtime (ADR 0044). Proposed on 23 November 2026. It follows report 0037, which found that a subscriber that
 reads could lose the end of a QoS 0 burst, and the decision of the
 repository owner to correct the broker.
 [Report 0038](../reports/0038-qos0-paced-per-connection.md) holds the
 evidence.
 
-No public type, input, effect, drop reason, durable encoding, injection
-point or schema changes. In the runtime one constant changes: the output
-queue of a connection has 256 places instead of 64. The contract digest
-that `validate` prints moves only because the register lists this record
-and the records it amends.
+The core exports the existing consumed-delivery window and the contract
+exposes the wire generation of an effect so the adapters can preserve its
+order. The packet format, durable representation and QoS 0 handshake are
+unchanged. The requirement register includes this decision.
 
 ## Context
 
@@ -77,15 +76,16 @@ be several times what a turn adds.
 - A subscriber that does not read is closed by the write deadline of 250 ms
   of its oldest frame, as before. What waited for it ends with
   `connection_closed`.
-- The runtime still drops a QoS 0 frame that finds the output queue full:
-  it can happen when more than thirty-two frames of other kinds are in it.
+- The runtime may drop an ordinary live QoS 0 frame when other kinds of
+  traffic fill the output queue. The retained replay required on a new
+  subscription follows the rule below.
 
 ### Consumed deliveries
 
 A connection has at most `QOS0_CONSUMED_WINDOW` = 16 consumed QoS 0
 deliveries being written. The next one is not consumed until a write
-ends, which brings the work of the session back. The frame of a consumed
-delivery therefore finds a place.
+ends, which brings the work of the session back. Control traffic can fill
+the socket queue even when the consumed-delivery window has room.
 
 This amends records 0026 (output saturation is no longer met by a burst
 alone) and 0046 (what it says of output: a QoS 0 publication now waits for
@@ -93,8 +93,9 @@ the output of a subscriber, up to a bound).
 
 ## Consequences
 
-- A subscriber that reads receives a QoS 0 burst whole and in order, up to
-  1,248 messages ahead of what it has been written.
+- A connection can have 224 volatile QoS 0 frames outstanding and 1,024
+  waiting. The aggregate fanout and payload budgets still apply. Report
+  0038 records the bursts observed within those limits.
 - In the six shapes report 0038 measured, nothing was lost and the rate is
   that of the broker before this record or higher.
 - A connection that does not read can have 256 frames in its output queue,
@@ -127,12 +128,27 @@ plus its 32 reserved output slots and the 256-slot socket queue at compile
 time. A change to just one limit fails the build. The `ready` event reports
 all three values.
 
-The runtime test
-`retained_qos0_replay_reports_the_full_output_and_reaches_an_independent_subscriber`
-fills a subscriber's output with control frames, leaving its final slot for
-SUBACK. It checks the resulting consumed QoS 0 replay's `output_saturated`
-drop against that subscriber and observes the complete retained publication
-on an independent subscriber while the first queue remains full.
+For a new MQTT 3.1.1 subscription, the server must send each matching
+stored retained message. MQTT 5 applies this obligation with Retain
+Handling 0, and with Retain Handling 1 on a new subscription. Handling 2
+suppresses replay. QoS 0 uses one attempted send with no acknowledgement.
+A full internal socket queue after a successful subscription still owes
+that send. [MQTT 3.1.1 §3.3.1.3, MQTT-3.3.1-6](https://docs.oasis-open.org/mqtt/mqtt/v3.1.1/errata01/os/mqtt-v3.1.1-errata01-os-complete.html) · [MQTT 5 §3.3.1.3, MQTT-3.3.1-9 and -10](https://docs.oasis-open.org/mqtt/mqtt/v5.0/os/mqtt-v5.0-os.html)
+
+The coordinator and each delivery shard keep a refused retained replay
+on its original connection generation. They retry in FIFO order when
+room becomes available. Later wire effects on that generation wait behind
+it. Each generation gets a turn, so a different subscriber can receive
+its replay while the first output is full. The existing window of 16
+bounds the number held per generation and their shared payload stays
+charged until its write or terminal refusal. Closing an old generation
+releases its pending send. A subsequent qualifying subscription obtains
+its own replay from the retained store.
+
+The coordinator test fills the output with control frames, admits SUBACK,
+and checks 18 required replays for both the slow and the independent
+subscriber. The two-shard test also closes and resumes the slow session,
+checking the terminal outcome for the old generation. [Coordinator tests](../../crates/mqttiumd/src/runtime_tests.rs) · [Shard test](../../crates/mqttiumd/src/runtime_tests/sharded_retained.rs)
 
 `MQos0Window` checks the per-generation window, FIFO order and progress
 of the independent subscriber with a reduced queue. The executable load

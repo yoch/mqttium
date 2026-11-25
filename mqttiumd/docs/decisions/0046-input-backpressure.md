@@ -16,9 +16,9 @@ eight entries each, so the broker no longer holds 128 credits for all its
 clients; a session holds at most eight QoS 2 exchanges across its
 connections.
 
-Amended by 0063 (proposed): what this record says of output changes. A
-QoS 0 publication waits for the output of its subscriber, up to a bound,
-before it is dropped.
+Amended by 0063 (accepted). Live QoS 0 deliveries wait up to a bound. A
+required retained replay waits on its own generation when its socket
+queue is full, preserving the independent progress of other subscribers.
 
 Amendment of acceptance (21 November 2026). The record is accepted with
 the rules of the text below, which differ from its first form on three

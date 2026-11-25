@@ -1365,9 +1365,21 @@
           {
             "file": "mqttiumd/crates/mqttiumd-store-sqlite/tests/retained.rs",
             "test": "thirty_two_topics_and_ordered_options"
+          },
+          {
+            "file": "mqttiumd/crates/mqttiumd/src/runtime_tests.rs",
+            "test": "retained_qos0_replay_waits_for_the_subscriber_output"
+          },
+          {
+            "file": "mqttiumd/crates/mqttiumd/src/runtime_tests/sharded_retained.rs",
+            "test": "sharded_retained_qos0_waits_for_its_subscriber_and_stays_with_its_generation"
+          },
+          {
+            "file": "mqttiumd/crates/mqttiumd/tests/session_wire.rs",
+            "test": "a_retained_message_is_sent_again_after_unsubscribe_and_resubscribe"
           }
         ],
-        "note": "Store level: a subscription with Retain Handling 0 is owed every matching retained message."
+        "note": "Wire tests cover Retain Handling 0 on new and repeated subscriptions. The coordinator and shard tests hold a QoS 0 output full and check delivery after the reader resumes."
       },
       {
         "id": "MQTT-3.3.1-10",
@@ -1378,9 +1390,13 @@
           {
             "file": "mqttiumd/crates/mqttiumd-store-sqlite/tests/retained.rs",
             "test": "quota_full_replacement_and_no_local_client_identity"
+          },
+          {
+            "file": "mqttiumd/crates/mqttiumd/tests/session_wire.rs",
+            "test": "a_retained_message_is_sent_again_after_unsubscribe_and_resubscribe"
           }
         ],
-        "note": "Store level: with Retain Handling 1 a new subscription is replayed and a repeated one is not."
+        "note": "The executable replays the stored message for Retain Handling 1 on a new subscription and suppresses replay on the existing filter."
       },
       {
         "id": "MQTT-3.3.1-11",
@@ -4519,9 +4535,13 @@
           {
             "file": "mqttiumd/crates/mqttiumd-store-sqlite/tests/retained.rs",
             "test": "thirty_two_topics_and_ordered_options"
+          },
+          {
+            "file": "mqttiumd/crates/mqttiumd/src/runtime_tests.rs",
+            "test": "mqtt311_retained_qos0_replay_waits_for_the_subscriber_output"
           }
         ],
-        "note": "Store level: a new subscription is owed every matching retained message."
+        "note": "The coordinator grants a wildcard subscription at QoS 0, retains 16 pending sends under socket pressure and delivers all 18 matching retained messages in order when room returns. An independent subscriber receives its own copy of each."
       },
       {
         "id": "MQTT-3.3.1-7",

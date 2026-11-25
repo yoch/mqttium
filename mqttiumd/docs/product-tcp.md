@@ -365,18 +365,17 @@ writes progress. Cancellation closes both socket halves. A started frame
 completes or its transport closes.
 
 The bounded Outbox retains effects with the same identity until acceptance or
-a correlated outcome. QoS 0 output saturation returns a typed refusal to the
-owner for an explicit drop; it does not silently erase an effect. The owner
+a correlated outcome. For ordinary live QoS 0 deliveries, output saturation returns a typed
+refusal to the owner for an explicit drop. The owner
 paces QoS 0 per connection
 ([ADR 0063](decisions/0063-qos0-paced-per-connection.md)): at most 224 QoS 0
 frames are in the output queue of a connection, which has 256 places, and the
 next ones leave as writes complete. Up to 1,024 deliveries wait for a connection,
-in order; past that the newest is dropped with `output_saturated`. A
-subscriber whose output is blocked can still lose a retained replay at QoS 0
-if other traffic fills the queue after its SUBACK. The broker records
-`output_saturated` for that target. Other subscribers can still replay the
-retained message. The write deadline closes a transport that cannot make
-progress. Durable
+in order; past that the newest is dropped with `output_saturated`. For a required retained replay at QoS 0, a full queue
+leaves the send pending on its original connection. Each generation holds
+up to 16 consumed deliveries. They preserve order while other subscribers
+continue to receive theirs. A write or a terminal connection outcome releases
+the charge. The write deadline closes a transport that cannot progress. Durable
 results remain correlated after socket closure. Generations do not repeat,
 and the runtime checks its live map before core delivery even after the core's
 bounded closed-generation memory evicts an old entry. Late store results may
