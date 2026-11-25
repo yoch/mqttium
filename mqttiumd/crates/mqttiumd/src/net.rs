@@ -3613,6 +3613,110 @@ mod tests {
     }
 
     #[test]
+    fn fresh_reports_reach_the_coordinator_while_input_waits() {
+        let (connection, _peer) = pair();
+        let (effect, key) = correlation(1).unwrap();
+        let mut stalled = Some(Box::new(StalledState {
+            held: VecDeque::from([Incoming::Authenticated {
+                elapsed: Duration::ZERO,
+            }]),
+            ..StalledState::default()
+        }));
+        let mut fresh = vec![
+            Report::Progress(WireProgress {
+                effect,
+                connection: key,
+            }),
+            Report::Written(Written::Complete {
+                correlation: Some((effect, key)),
+                bytes: 4,
+            }),
+        ];
+        assert!(
+            connection
+                .core
+                .flush_reports(&mut fresh, &mut stalled)
+                .unwrap()
+        );
+        assert!(
+            fresh.is_empty(),
+            "the reactor reuses its scratch after this call"
+        );
+        assert_eq!(stalled.as_ref().unwrap().held.len(), 1);
+        let mut progress = Vec::new();
+        connection.drain_wire_progress(&mut progress, WIRE_PROGRESS_SLOTS);
+        assert!(matches!(progress.as_slice(), [p] if (p.effect, p.connection) == (effect, key)));
+        let mut written = Vec::new();
+        connection.drain_written(&mut written, WRITTEN_SLOTS);
+        assert!(
+            matches!(written.as_slice(), [Written::Complete { correlation: Some(ids), bytes: 4 }] if *ids == (effect, key))
+        );
+    }
+
+    #[test]
+    fn fresh_reports_preserve_lane_capacity_and_retry_in_order() {
+        let (connection, _peer) = pair();
+        let mut stalled = None;
+        let flush = |fresh: &mut Vec<Report>, stalled: &mut Option<Box<StalledState>>| {
+            connection.core.flush_reports(fresh, stalled).unwrap()
+        };
+        let complete = |n| {
+            Report::Written(Written::Complete {
+                correlation: correlation(n),
+                bytes: 4,
+            })
+        };
+        let progress = |n| {
+            let (effect, connection) = correlation(n).unwrap();
+            Report::Progress(WireProgress { effect, connection })
+        };
+        for count in 1..WRITTEN_SLOTS {
+            flush(&mut vec![complete(count as u64)], &mut stalled);
+        }
+        for count in 1..WIRE_PROGRESS_SLOTS {
+            flush(&mut vec![progress(count as u64)], &mut stalled);
+        }
+
+        // One free slot per lane. The last completion stays behind the first
+        // progress that cannot fit, even when written slots become available.
+        let mut fresh = vec![
+            complete(1101),
+            progress(1102),
+            progress(1103),
+            complete(1104),
+        ];
+        flush(&mut fresh, &mut stalled);
+        assert!(fresh.is_empty());
+        assert_eq!(stalled.as_ref().map(|s| s.reports.len()), Some(2));
+        let mut written = Vec::new();
+        assert_eq!(
+            connection.drain_written(&mut written, WRITTEN_SLOTS),
+            DrainStatus::Empty
+        );
+        assert_eq!(written.len(), WRITTEN_SLOTS);
+        assert!(
+            matches!(written.last(), Some(Written::Complete { correlation: id, .. }) if *id == correlation(1101))
+        );
+        assert!(!flush(&mut fresh, &mut stalled));
+
+        let mut wire = Vec::new();
+        connection.drain_wire_progress(&mut wire, WIRE_PROGRESS_SLOTS);
+        assert_eq!(wire.len(), WIRE_PROGRESS_SLOTS);
+        assert_eq!(wire.last().unwrap().effect, correlation(1102).unwrap().0);
+        fresh.push(complete(1105));
+        assert!(flush(&mut fresh, &mut stalled));
+        assert!(stalled.is_none());
+        wire.clear();
+        connection.drain_wire_progress(&mut wire, WIRE_PROGRESS_SLOTS);
+        assert!(matches!(wire.as_slice(), [p] if p.effect == correlation(1103).unwrap().0));
+        written.clear();
+        connection.drain_written(&mut written, WRITTEN_SLOTS);
+        assert!(matches!(written.as_slice(),
+            [Written::Complete { correlation: a, .. }, Written::Complete { correlation: b, .. }]
+            if *a == correlation(1104) && *b == correlation(1105)));
+    }
+
+    #[test]
     fn a_full_batch_can_return_an_ordered_suffix_after_the_producer_closes() {
         let (connection, _peer) = pair();
         let core = &connection.core;
