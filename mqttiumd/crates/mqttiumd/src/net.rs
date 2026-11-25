@@ -36,6 +36,8 @@ use reactor::{Driven, Link, Reactors, Turn};
 
 pub const INPUT_SLOTS: usize = 32;
 pub const OUTPUT_SLOTS: usize = 256;
+pub const QOS0_OUTPUT_RESERVE: usize = 32;
+const _: () = assert!(mqttiumd_core::owner::QOS0_WINDOW + QOS0_OUTPUT_RESERVE == OUTPUT_SLOTS);
 pub const MAX_PACKET_BYTES: usize = 1_048_576 + 65_536;
 // A correlated frame can publish Started and one terminal result. This is a
 // receipt bound; it grants no additional outgoing-frame admission capacity.

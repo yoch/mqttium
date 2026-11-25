@@ -130,3 +130,17 @@ the output of a subscriber, up to a bound).
 - No model has the window.
 - The TLS write path was not read again; the tests of the TLS listener
   cover it as before.
+
+## Implementation amendment
+
+The runtime now checks the equality of the core's volatile QoS 0 window
+plus its 32 reserved output slots and the 256-slot socket queue at compile
+time. A change to just one limit fails the build. The `ready` event reports
+all three values.
+
+The runtime test
+`retained_qos0_replay_reports_the_full_output_and_reaches_an_independent_subscriber`
+fills a subscriber's output with control frames, leaving its final slot for
+SUBACK. It checks the resulting consumed QoS 0 replay's `output_saturated`
+drop against that subscriber and observes the complete retained publication
+on an independent subscriber while the first queue remains full.

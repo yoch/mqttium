@@ -67,7 +67,10 @@ impl Volatile {
 /// acknowledgements and to QoS 1 and 2 publications. It is several times
 /// what one publisher adds in a turn of the runtime, so a connection that
 /// fell behind catches up.
-pub(super) const QOS0_WINDOW: usize = 224;
+pub const QOS0_WINDOW: usize = 224;
+
+/// Product cap on the outgoing QoS 1/2 PUBLISH window negotiated with each peer.
+pub const MAX_OUTGOING_WINDOW: u16 = 256;
 
 /// Volatile QoS 0 messages kept waiting for the window of one connection.
 /// Past it the newest is dropped with `OutputSaturated`.
@@ -1686,7 +1689,7 @@ impl Owner {
             generation: connection,
             last_qos0_ingress: 0,
             maximum_packet_size,
-            receive_maximum: receive_maximum.min(256),
+            receive_maximum: receive_maximum.min(MAX_OUTGOING_WINDOW),
             rescan_needed: false,
             caught_up: false,
             dirty_during_load: false,
@@ -4603,6 +4606,43 @@ mod tests {
             index,
         }
     }
+    #[test]
+    fn outgoing_pi_fallback_finds_the_lowest_gap_above_the_bitmap() {
+        let mut table = Deliveries::new(nonzero(514)).unwrap();
+        for id in (1u16..=515).filter(|&id| id != 514) {
+            let claim = DeliveryClaim {
+                operation: OperationId::new(
+                    StoreIncarnation::new(1),
+                    RunEpoch::new(1),
+                    LogicalOwnerId::new(4),
+                    OperationSeq::new(u64::from(id)),
+                ),
+                packet_id: OutboundPacketId::new(id).unwrap(),
+                started: false,
+                await_pubcomp: false,
+            };
+            table
+                .push(Delivery::metadata(
+                    delivery(u32::from(id)),
+                    TARGET,
+                    Revision::new(1),
+                    Qos::AtLeastOnce,
+                    Some(claim),
+                ))
+                .unwrap();
+        }
+        assert_eq!(table.free_packet_id(TARGET, 513, false, false), None);
+        assert_eq!(
+            table.free_packet_id(TARGET, u16::MAX, false, false),
+            OutboundPacketId::new(514)
+        );
+        table.remove(table.slot_of(delivery(512)).unwrap());
+        assert_eq!(
+            table.free_packet_id(TARGET, u16::MAX, false, false),
+            OutboundPacketId::new(512)
+        );
+    }
+
     fn queued(owner: &mut Owner, index: u32) {
         let mut item = Delivery::metadata(
             delivery(index),

@@ -57,6 +57,8 @@ use std::time::{Duration, Instant};
 const CONNECTIONS: usize = Limits::BOUNDED.connections;
 const IN_FLIGHT: usize = 16;
 const TIMERS: usize = 512;
+const SESSION_EXPIRY_PER_TURN: usize = 4;
+const MESSAGE_EXPIRY_PAGE_SIZE: u32 = 4;
 // One FIFO with reserved capacity for accepted writer requests and due deadlines.
 const WRITER_INPUTS: usize = crate::writer::QUEUE;
 const DEADLINE_INPUTS: usize = 4;
@@ -946,7 +948,7 @@ impl Runtime<'_> {
                 match self.writer.try_send_control(ControlRequest::MessageExpiry {
                     now,
                     after,
-                    limit: 4,
+                    limit: MESSAGE_EXPIRY_PAGE_SIZE,
                 }) {
                     Ok(()) => {
                         self.message_expiry_retry = false;
@@ -1001,7 +1003,7 @@ impl Runtime<'_> {
         match self.writer.try_send_control(ControlRequest::MessageExpiry {
             now,
             after,
-            limit: 4,
+            limit: MESSAGE_EXPIRY_PAGE_SIZE,
         }) {
             Ok(()) => {
                 self.message_expiry_request = Some((now, after));
@@ -1089,7 +1091,7 @@ impl Runtime<'_> {
     fn expire_sessions(&mut self) -> Result<(), Failure> {
         if !self.expiry_timers.is_empty() {
             let now = self.session_now()?;
-            let mut budget = 4;
+            let mut budget = SESSION_EXPIRY_PER_TURN;
             for timer in self.expiry_timers.values_mut() {
                 if budget == 0 {
                     break;
@@ -8224,11 +8226,11 @@ fn run_inner(
         let now = runtime.message_now()?;
         events.emit("message_expiry_clock", json!({"details":{
             "domain":hex_domain(now.domain),"tick":now.tick.to_string(),"origin_status":runtime.clock.origin_status(),
-            "policy":"quarantine-on-unknown-origin","time_unit":"nanoseconds","scan_ms":100,"batch":4,
+            "policy":"quarantine-on-unknown-origin","time_unit":"nanoseconds","scan_ms":100,"batch":MESSAGE_EXPIRY_PAGE_SIZE,
             "started_proof":"positive-socket-write-then-durable-marker","terminal_input_slots":limits.terminal_inputs,
             "socket_write_receipt_slots":net::WRITTEN_SLOTS
         }})).map_err(event_failure)?;
-        events.emit("receipt_policy",json!({"details":{"receipt_window":mqttiumd_contract::receipts::RECEIPT_WINDOW,"receipt_data_window":mqttiumd_contract::receipts::RECEIPT_DATA_WINDOW,"receipt_control_reserve":mqttiumd_contract::receipts::RECEIPT_CONTROL_RESERVE,"receipt_collection_rows":mqttiumd_contract::receipts::MAX_COLLECTION_ROWS,"receipt_collection_bytes":mqttiumd_store_api::ReadBudget::COLLECTION.max_bytes,"receipt_collection_trigger":mqttiumd_contract::receipts::RECEIPT_COLLECTION_TRIGGER,"max_receipt_origins":mqttiumd_contract::receipts::MAX_RECEIPT_ORIGINS,"startup_origins_trigger":32,"startup_receipts_trigger":4096,"startup_closed_collection":collect_closed,"control_request_slots":crate::writer::CONTROL_QUEUE,"control_reply_slots":crate::writer::CONTROL_QUEUE,"control_input_slots":crate::writer::CONTROL_QUEUE}})).map_err(event_failure)?;
+        events.emit("receipt_policy",json!({"details":{"receipt_window":mqttiumd_contract::receipts::RECEIPT_WINDOW,"receipt_data_window":mqttiumd_contract::receipts::RECEIPT_DATA_WINDOW,"receipt_control_reserve":mqttiumd_contract::receipts::RECEIPT_CONTROL_RESERVE,"receipt_collection_rows":mqttiumd_contract::receipts::MAX_COLLECTION_ROWS,"receipt_collection_bytes":mqttiumd_store_api::ReadBudget::COLLECTION.max_bytes,"receipt_collection_field_bytes":mqttiumd_store_api::ReadBudget::COLLECTION.max_field_bytes,"receipt_collection_trigger":mqttiumd_contract::receipts::RECEIPT_COLLECTION_TRIGGER,"max_receipt_origins":mqttiumd_contract::receipts::MAX_RECEIPT_ORIGINS,"startup_origins_trigger":32,"startup_receipts_trigger":4096,"startup_closed_collection":collect_closed,"control_request_slots":crate::writer::CONTROL_QUEUE,"control_reply_slots":crate::writer::CONTROL_QUEUE,"control_input_slots":crate::writer::CONTROL_QUEUE}})).map_err(event_failure)?;
         if let Some(sqlite) = &sqlite {
             events.emit("sqlite_configuration",json!({"details":{"journal_mode":sqlite.journal_mode,"synchronous":sqlite.synchronous,"wal_autocheckpoint":sqlite.wal_autocheckpoint,"checkpoint_policy":sqlite.checkpoint_policy,"sqlite_version":sqlite.sqlite_version,"user_version":sqlite.user_version,"page_size":sqlite.page_size,"kill_points":sqlite.kill_points,"hooks_active":false,"install_order":"sqlite-autocheckpoint-before-optional-business-hook"}})).map_err(event_failure)?;
         }
@@ -8254,7 +8256,10 @@ fn run_inner(
         } else {
             "tcp-will-pubsub-v1"
         };
-        let mut readiness = json!({"details":{"address":address.to_string(),"epoch":epoch.get().to_string(),"incarnation":incarnation.get().to_string(),"max_connections":limits.connections,"max_sessions":crate::writer::SESSIONS,"max_packet_bytes":net::MAX_PACKET_BYTES,"max_client_id_bytes":crate::writer::MAX_CLIENT,"max_topic_bytes":crate::writer::MAX_TOPIC,"max_payload_bytes":crate::writer::MAX_PAYLOAD,"receive_maximum":crate::receiving::MAXIMUM,"max_exchange_slots":max_exchanges,"input_slots":net::INPUT_SLOTS,"output_slots":net::OUTPUT_SLOTS,"writer_slots":crate::writer::QUEUE,"commands_in_flight":limits.in_flight,"max_timers":limits.timers,"receipt_slots":crate::writer::limits().receipt_slots.get(),"partial_packet_ms":5000,"connect_ms":3000,"write_ms":250,"remembered_connections":8,"max_subscriptions":mqttiumd_contract::pubsub::MAX_SUBSCRIPTIONS,"max_targets":mqttiumd_contract::retained::MAX_RETAIN_MASK_TARGETS,"outgoing_per_connection":8,"outgoing_metadata":limits.outgoing_bindings,"outgoing_packet_identifier_max":65535,"outgoing_packet_identifier_probe_limit":129,"outgoing_payload_bytes":64*1024*1024,"work_page_items":8,"work_scan_ms":100,"wildcard_subscriptions":true,"no_local":true,"shared_subscriptions":false,"subscription_identifiers":false,"sqlite_schema":sqlite_schema,"retained_available":true,"retained_topics":mqttiumd_contract::retained::MAX_RETAINED_TOPICS,"retained_bytes":mqttiumd_contract::retained::MAX_RETAINED_BYTES,"max_replay_candidates":mqttiumd_contract::retained::MAX_REPLAYS,"profile":profile}});
+        let pi_candidate_limit =
+            mqttiumd_core::owner::outgoing_pi_candidate_limit(max_exchanges, u16::MAX);
+        let pi_bitmap_bits = mqttiumd_core::owner::OUTGOING_PI_BITMAP_BITS;
+        let mut readiness = json!({"details":{"address":address.to_string(),"epoch":epoch.get().to_string(),"incarnation":incarnation.get().to_string(),"max_connections":limits.connections,"max_sessions":crate::writer::SESSIONS,"max_packet_bytes":net::MAX_PACKET_BYTES,"max_client_id_bytes":crate::writer::MAX_CLIENT,"max_topic_bytes":crate::writer::MAX_TOPIC,"max_payload_bytes":crate::writer::MAX_PAYLOAD,"receive_maximum":crate::receiving::MAXIMUM,"max_exchange_slots":max_exchanges,"input_slots":net::INPUT_SLOTS,"output_slots":net::OUTPUT_SLOTS,"writer_slots":crate::writer::QUEUE,"commands_in_flight":limits.in_flight,"max_timers":limits.timers,"receipt_slots":crate::writer::limits().receipt_slots.get(),"partial_packet_ms":5000,"connect_ms":3000,"write_ms":250,"remembered_connections":8,"max_subscriptions":mqttiumd_contract::pubsub::MAX_SUBSCRIPTIONS,"max_targets":mqttiumd_contract::retained::MAX_RETAIN_MASK_TARGETS,"outgoing_per_connection":mqttiumd_core::owner::MAX_OUTGOING_WINDOW,"outgoing_metadata":limits.outgoing_bindings,"outgoing_packet_identifier_max":u16::MAX,"outgoing_packet_identifier_probe_limit":pi_candidate_limit,"outgoing_payload_bytes":64*1024*1024,"work_page_items":8,"work_scan_ms":100,"wildcard_subscriptions":true,"no_local":true,"shared_subscriptions":false,"subscription_identifiers":false,"sqlite_schema":sqlite_schema,"retained_available":true,"retained_topics":mqttiumd_contract::retained::MAX_RETAINED_TOPICS,"retained_bytes":mqttiumd_contract::retained::MAX_RETAINED_BYTES,"max_replay_candidates":mqttiumd_contract::retained::MAX_REPLAYS,"profile":profile}});
         if let Some(details) = readiness["details"].as_object_mut() {
             details.insert("storage_mode".into(), json!(storage_mode.mode_name()));
             details.insert(
@@ -8266,6 +8271,30 @@ fn run_inner(
                 json!(storage_mode.snapshot_interval_secs()),
             );
             details.insert("delivery_shards".into(), json!(delivery_shards));
+            details.insert(
+                "outgoing_packet_identifier_bitmap_bits".into(),
+                json!(pi_bitmap_bits),
+            );
+            details.insert(
+                "outgoing_packet_identifier_fallback_probes".into(),
+                json!(pi_candidate_limit.saturating_sub(usize::from(pi_bitmap_bits))),
+            );
+            details.insert(
+                "qos0_window".into(),
+                json!(mqttiumd_core::owner::QOS0_WINDOW),
+            );
+            details.insert(
+                "qos0_output_reserve".into(),
+                json!(net::QOS0_OUTPUT_RESERVE),
+            );
+            details.insert(
+                "session_expiry_timer_slots".into(),
+                json!(crate::writer::SESSIONS),
+            );
+            details.insert(
+                "session_expiry_per_turn".into(),
+                json!(SESSION_EXPIRY_PER_TURN),
+            );
         }
         if let Some(security) = &runtime.security {
             events.emit("tls_profile", json!({"details":{"version":"TLS1.3","client_certificate":"required",

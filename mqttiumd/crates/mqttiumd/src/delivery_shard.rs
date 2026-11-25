@@ -932,8 +932,11 @@ impl DeliveryShardWorker {
             return;
         }
         let generation = sess.generation;
-        let rm = usize::from(sess.receive_maximum.min(256));
-        let preclaim_cap = rm.saturating_add(rm.min(256));
+        let rm = usize::from(
+            sess.receive_maximum
+                .min(mqttiumd_core::owner::MAX_OUTGOING_WINDOW),
+        );
+        let preclaim_cap = 2 * rm;
         if let Some((in_flight, used_pi)) = self.owner.shard_inline_eligibility(session, generation)
         {
             sess.lease.publish_eligible(

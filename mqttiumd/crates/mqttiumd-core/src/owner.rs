@@ -69,6 +69,8 @@ mod routing;
 mod sessions;
 mod shard;
 mod will;
+pub use deliveries::{OUTGOING_PI_BITMAP_BITS, outgoing_pi_candidate_limit};
+pub use pubsub::{MAX_OUTGOING_WINDOW, QOS0_WINDOW};
 pub use sessions::SessionStatus;
 pub use shard::{
     DelegatedClaim, DelegatedInlineBatch, DelegatedQos0Batch, DelegatedQos0Target,

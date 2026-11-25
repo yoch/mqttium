@@ -116,13 +116,13 @@ fn startup_reports_the_effective_collection_identifier_and_expiry_bounds() {
         .lines()
         .map(|line| serde_json::from_str(line).unwrap())
         .collect();
-    let details = |kind: &str| {
-        &events.iter().find(|event| event["kind"] == kind).unwrap()["details"]
-    };
+    let details =
+        |kind: &str| &events.iter().find(|event| event["kind"] == kind).unwrap()["details"];
     let ready = details("ready");
     assert_eq!(ready["outgoing_packet_identifier_probe_limit"], 32_769);
     assert_eq!(ready["outgoing_packet_identifier_bitmap_bits"], 512);
     assert_eq!(ready["outgoing_packet_identifier_fallback_probes"], 32_257);
+    assert_eq!(ready["outgoing_per_connection"], 256);
     assert_eq!(ready["qos0_window"], 224);
     assert_eq!(ready["qos0_output_reserve"], 32);
     assert_eq!(ready["output_slots"], 256);

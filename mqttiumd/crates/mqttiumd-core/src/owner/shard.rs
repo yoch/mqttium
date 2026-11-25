@@ -315,7 +315,7 @@ impl Owner {
             generation: connection,
             last_qos0_ingress: 0,
             maximum_packet_size,
-            receive_maximum: receive_maximum.min(256),
+            receive_maximum: receive_maximum.min(super::MAX_OUTGOING_WINDOW),
             rescan_needed: true,
             caught_up: false,
             dirty_during_load: false,

@@ -607,6 +607,71 @@ fn durable_publications_to_a_qos0_subscription_wait_for_its_output() {
     );
 }
 
+/// The SUBACK occupies the last output slot. A retained replay consumed
+/// at QoS 0 has one explicit terminal refusal while an independent reader
+/// can still subscribe to, and receive, the same retained publication.
+#[test]
+fn retained_qos0_replay_reports_the_full_output_and_reaches_an_independent_subscriber() {
+    with_runtime(128, |runtime, directory| {
+        let (source, mut publisher) = connected(runtime, b"retained-source");
+        runtime.packet(source, 0x33, publish_body(1)).unwrap();
+        assert_eq!(
+            served_frame(runtime, &mut publisher),
+            (0x40, vec![0, 1, 0x10])
+        );
+        let (slow, _slow_socket) = connected(runtime, b"retained-held");
+        let (fast, mut fast_socket) = connected(runtime, b"retained-reader");
+        let slow_session = runtime.peers[&slow].session.unwrap();
+        let (sender, held) = std::sync::mpsc::sync_channel(net::OUTPUT_SLOTS);
+        for _ in 1..net::OUTPUT_SLOTS {
+            sender
+                .try_send(net::Write {
+                    expiry: None,
+                    correlation: None,
+                    bytes: net::FrameBytes::from_slice(&[0xd0, 0]),
+                    payload: None,
+                    report: net::WriteReport::None,
+                })
+                .unwrap();
+        }
+        let _original = std::mem::replace(
+            &mut runtime.peers.get_mut(&slow).unwrap().io.outgoing,
+            sender.into(),
+        );
+        let subscribe = || vec![0, 1, 0, 0, 1, b't', 0];
+        runtime.packet(slow, 0x82, subscribe()).unwrap();
+        until(runtime, |_| qos0_drops(directory) == 1);
+
+        runtime.packet(fast, 0x82, subscribe()).unwrap();
+        assert_eq!(
+            served_frame(runtime, &mut fast_socket),
+            (0x90, vec![0, 1, 0, 0])
+        );
+        assert_eq!(
+            served_frame(runtime, &mut fast_socket),
+            (0x31, vec![0, 1, b't', 0, b'v'])
+        );
+        let frames: Vec<_> = held.try_iter().collect();
+        assert_eq!(frames.len(), net::OUTPUT_SLOTS);
+        assert_eq!(
+            frames.last().unwrap().bytes.as_slice(),
+            &[0x90, 4, 0, 1, 0, 0]
+        );
+        assert!(runtime.peers[&slow].closing().is_none());
+        let events = std::fs::read_to_string(directory.join("events.jsonl")).unwrap();
+        let drops: Vec<serde_json::Value> = events
+            .lines()
+            .filter(|line| line.contains("\"qos0_dropped\""))
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(drops.len(), 1);
+        let details = &drops[0]["details"];
+        assert_eq!(details["target"], slow_session.get().to_string());
+        assert_eq!(details["reason"], "output_saturated");
+        assert!(details["origin"].as_str().unwrap().starts_with("consumed/"));
+    });
+}
+
 fn event_turn_without_scan(runtime: &mut Runtime<'_>) {
     runtime.writer_results().unwrap();
     runtime.connections().unwrap();

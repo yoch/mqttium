@@ -351,8 +351,9 @@ reference, although immutable payload bytes are shared, against a limit of
 64 MiB. A new fanout that does not fit is dropped as a batch with
 `capacity_exceeded`. The frozen profile had 128 entries and 4 MiB for each. The durable
 account has 256 MiB payload, 65,536 references and 32,768 exchange slots shared by
-incoming QoS 2 and claimed outgoing QoS 1. Each connection has at most eight
-active outgoing QoS 1 slots, further bounded by the peer. QoS 0 uses no such slot.
+incoming QoS 2 and claimed outgoing QoS 1. For outgoing QoS 1 and 2 the broker caps the active PUBLISH window at
+256 per connection and honors a smaller Receive Maximum from the peer. The
+eight announced by the broker is the incoming limit. QoS 0 uses no such slot.
 
 Packet bodies are reserved after canonical bounded Remaining Length. Socket
 send buffers keep the size the system gives them; the effective value is
@@ -371,8 +372,11 @@ paces QoS 0 per connection
 frames are in the output queue of a connection, which has 256 places, and the
 next ones leave as writes complete. Up to 1,024 deliveries wait for a connection,
 in order; past that the newest is dropped with `output_saturated`. A
-subscriber that reads receives a burst whole; one that does not is closed by
-the write deadline. Durable
+subscriber whose output is blocked can still lose a retained replay at QoS 0
+if other traffic fills the queue after its SUBACK. The broker records
+`output_saturated` for that target. Other subscribers can still replay the
+retained message. The write deadline closes a transport that cannot make
+progress. Durable
 results remain correlated after socket closure. Generations do not repeat,
 and the runtime checks its live map before core delivery even after the core's
 bounded closed-generation memory evicts an old entry. Late store results may
@@ -580,11 +584,12 @@ creates neither an OperationId nor another receipt. Its reserved paths can
 progress when ordinary result/input queues or network output are blocked.
 
 The owner closes only a contiguous consumed prefix, with the PublicationSeq
-and PayloadSeq issuance boundaries at that exact position. At most 128 new
-positions and 128 physical receipt/fence rows are handled per pass. Prefix
-validation has a separate 2 MiB aggregate/1 MiB field budget, sufficient for
-128 maximum-profile subscription recipes; ordinary work/recovery pages keep
-their original 1 MiB budget. A known absolute closure
+and PayloadSeq issuance boundaries at that exact position. Each pass advances at most 512 new
+positions and collects at most 512 physical receipt or fence rows. Prefix
+validation allows 24 MiB of fields per read and 2 MiB per field. The
+separate ordinary work and recovery page budget allows 10 MiB per read
+and 2 MiB per field. The startup `receipt_policy` event reports the
+collection row, byte and field limits. A known absolute closure
 returns issuance capacity once; repeated/lost replies never grant credits twice.
 The usual trigger is 64 consumed results. Hole-blocked or empty producers do
 not spin. A deferred fenced Release can consume its terminal result at a full
@@ -661,10 +666,17 @@ or universal storage guarantee.
 the cumulative 65535-delivery connection limit. The owner selects the smallest
 free PI in 1..65535 for the target session. Selection consults all live claims,
 including pending/unknown Claim, pending/unknown Finish and recovered metadata
-before payload loading. It tries at most the live claim count plus one
-candidates (129 with this product's unchanged 128-entry metadata budget).
-There is no per-historically-sent-message allocation table or wrapping causal
-counter. QoS 0 does not reserve, release or await an acknowledgement for a PI.
+before payload loading. The common path checks up to eight 64-bit words
+covering identifiers 1 through 512. When the cached bitmap has collisions,
+the owner rebuilds it from live claims. If the low range is full, the
+owner builds a set of distinct occupied identifiers from the session and
+tests candidates from 513 through the smaller of 65,535 and the number
+of occupied identifiers plus one. The owner can hold 32,768 deliveries,
+so at most 32,257 individual set lookups reach candidate 32,769. The
+`ready` field `outgoing_packet_identifier_probe_limit` reports that candidate
+ceiling. `outgoing_packet_identifier_fallback_probes` reports the maximum
+number of individual set lookups. The broker stores no per-historical-message
+allocation table. QoS 0 does not reserve, release or await an acknowledgement for a PI.
 
 A known Finish commit must be applied by the owner before its PI can be
 reused. A writer submission, timeout, PUBACK alone, local Written callback or
@@ -743,11 +755,12 @@ its TTL again. A finite connection lost in a crash gets one persisted initial
 detachment at the first reliable recovery observation.
 
 A singleton anchor coalesces temporal commits and checkpoints otherwise-idle
-finite offline state every30s. The target includes actual scheduling/commit
-delay; an observed age beyond31s emits `session_clock_degraded` rather than
-claiming the target still holds. At most one checkpoint is in flight and at
-most128 keyed timers/facts exist, with four expiration attempts per reactor
-turn. No historical timer heap, per-tick receipt or terminal-session row grows.
+finite offline state every 30 seconds. An observed age beyond 31 seconds
+emits `session_clock_degraded`. At most one checkpoint is in flight. Each
+detached session with a finite deadline has one entry in the session expiry
+timer map, bounded by the 4,096 live sessions. Each reactor turn queues at
+most four due sessions and marks them queued to avoid duplicate expiry
+inputs. The separate message expiry scan is described below.
 Unknown lifecycle commands retain their OperationId. A known certain failure
 of Detach/Expire stops with `session_detach_rejected`/`session_expire_rejected`,
 so unavailable continuation is observable instead of silently losing expiry.
@@ -838,8 +851,7 @@ and retry delay, and patches the remaining property before first-byte admission.
 Once positive bytes are written, the frame completes or its transport closes.
 Temporary socket-queue pressure retains a durable QoS1 PUBLISH effect for
 retry with its original identity and lifetime. The provisional ACK binding is
-removed until actual acceptance. The four output slots and250ms write deadline
-remain; disconnection and a blocked socket's deadline still close the transport.
+removed until actual acceptance. The socket has 256 output slots and a 250 ms write deadline; disconnection and a blocked socket's deadline still close the transport.
 The exact pre-attempt reading is the local decision boundary; physical departure
 and arbitrary host scheduling are not timestamped or bounded by this preview.
 A separate durable Started marker allows the same QoS1 claim to complete after

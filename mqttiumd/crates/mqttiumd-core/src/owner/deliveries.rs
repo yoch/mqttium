@@ -6,6 +6,16 @@ use crate::contract::ids::OutboundPacketId;
 use crate::contract::pubsub::DeliveryClaim;
 use alloc::collections::BTreeSet;
 
+const PI_BITMAP_WORDS: usize = 8;
+/// Number of low outgoing Packet Identifiers indexed in the per-session bitmap.
+pub const OUTGOING_PI_BITMAP_BITS: u16 = (PI_BITMAP_WORDS * u64::BITS as usize) as u16;
+
+/// Highest candidate the fallback needs to examine with this many distinct occupied IDs.
+#[must_use]
+pub fn outgoing_pi_candidate_limit(occupied: usize, maximum: u16) -> usize {
+    occupied.saturating_add(1).min(usize::from(maximum))
+}
+
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub(super) enum Phase {
     Queued,
@@ -219,7 +229,7 @@ pub(super) struct SessionDeliveries {
     sent_gen: Option<ConnectionGeneration>,
     sent_count: u16,
     sent_mixed: u16,
-    used_pi_mask: [u64; 8],
+    used_pi_mask: [u64; PI_BITMAP_WORDS],
     pi_collisions: u16,
 }
 
@@ -232,7 +242,7 @@ impl SessionDeliveries {
         }
     }
 
-    pub(super) fn used_pi_mask(&self) -> [u64; 8] {
+    pub(super) fn used_pi_mask(&self) -> [u64; PI_BITMAP_WORDS] {
         self.used_pi_mask
     }
 
@@ -282,7 +292,7 @@ impl SessionDeliveries {
 
     fn add_pi(&mut self, packet_id: OutboundPacketId) {
         let id = packet_id.get();
-        if id <= 512 {
+        if id <= OUTGOING_PI_BITMAP_BITS {
             let zero_based = usize::from(id - 1);
             let word = zero_based / 64;
             let bit = 1u64 << (zero_based % 64);
@@ -296,17 +306,17 @@ impl SessionDeliveries {
 
     fn sub_pi(&mut self, packet_id: OutboundPacketId, deliveries: &BoundedSlab<Delivery>) {
         let id = packet_id.get();
-        if id <= 512 {
+        if id <= OUTGOING_PI_BITMAP_BITS {
             if self.pi_collisions == 0 {
                 let zero_based = usize::from(id - 1);
                 self.used_pi_mask[zero_based / 64] &= !(1u64 << (zero_based % 64));
             } else {
-                let mut mask = [0u64; 8];
+                let mut mask = [0u64; PI_BITMAP_WORDS];
                 let mut collisions = 0u16;
                 for idx in &self.all {
                     if let Some(claim) = deliveries[idx].claim {
                         let cid = claim.packet_id.get();
-                        if cid <= 512 {
+                        if cid <= OUTGOING_PI_BITMAP_BITS {
                             let zero_based = usize::from(cid - 1);
                             let word = zero_based / 64;
                             let bit = 1u64 << (zero_based % 64);
@@ -987,7 +997,7 @@ impl Deliveries {
                     return None;
                 }
             }
-            if maximum <= 512 {
+            if maximum <= OUTGOING_PI_BITMAP_BITS {
                 return None;
             }
         }
@@ -996,14 +1006,14 @@ impl Deliveries {
                 && delivery.claim.is_some()
                 && !(mutant_early_pi_release && matches!(delivery.phase, Phase::FinishPending(_)))
         };
-        let mut mask = [0u64; 8];
+        let mut mask = [0u64; PI_BITMAP_WORDS];
         for idx in &sd.all {
             let delivery = &self.rows[idx];
             if reserves(delivery)
                 && let Some(claim) = delivery.claim
             {
                 let id = claim.packet_id.get();
-                if id <= 512 {
+                if id <= OUTGOING_PI_BITMAP_BITS {
                     let zero_based = usize::from(id - 1);
                     mask[zero_based / 64] |= 1u64 << (zero_based % 64);
                 }
@@ -1018,7 +1028,7 @@ impl Deliveries {
                 return None;
             }
         }
-        if maximum <= 512 {
+        if maximum <= OUTGOING_PI_BITMAP_BITS {
             return None;
         }
         let mut used = BTreeSet::new();
@@ -1030,8 +1040,8 @@ impl Deliveries {
                 used.insert(claim.packet_id.get());
             }
         }
-        let candidates = used.len().saturating_add(1).min(usize::from(maximum));
-        for raw in 513..=candidates {
+        let candidates = outgoing_pi_candidate_limit(used.len(), maximum);
+        for raw in usize::from(OUTGOING_PI_BITMAP_BITS) + 1..=candidates {
             let id = u16::try_from(raw).ok()?;
             if !used.contains(&id) {
                 return OutboundPacketId::new(id);
@@ -1187,7 +1197,7 @@ mod tests {
         Vec<usize>,
         u16,
         u16,
-        [u64; 8],
+        [u64; PI_BITMAP_WORDS],
         u16,
         Vec<(ConnectionGeneration, usize)>,
     );
@@ -1201,7 +1211,7 @@ mod tests {
                 && self.queued == 0
                 && self.sent_count == 0
                 && self.sent_mixed == 0
-                && self.used_pi_mask == [0u64; 8]
+                && self.used_pi_mask == [0u64; PI_BITMAP_WORDS]
                 && self.pi_collisions == 0
         }
 
