@@ -662,7 +662,8 @@ mod secure {
         let result = Command::new("python3")
             .args(["-I", "-B"])
             .arg(
-                Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/disconnect_durability/recovery.py"),
+                Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("tests/disconnect_durability/recovery.py"),
             )
             .arg(env!("CARGO_BIN_EXE_mqttiumd"))
             .arg(&case.0)

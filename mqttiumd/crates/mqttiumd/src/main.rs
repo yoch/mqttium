@@ -203,6 +203,7 @@ fn parse_arguments(args_iter: impl Iterator<Item = String>) -> Result<Config, St
                         "log.will.end.before_append",
                         "log.will.end.before_sync",
                         "log.will.end.after_sync",
+                        "volatile.will.end.before_apply",
                         "will.end.committed",
                         "session.open.prepared",
                         "session.open.committed",

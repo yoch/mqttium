@@ -7642,8 +7642,7 @@ pub fn run(config: Config) -> Result<(), Failure> {
     let use_direct = matches!(
         config.storage_mode,
         crate::writer::StorageMode::Volatile { .. }
-    ) && config.hooks.directory.is_none()
-        && delivery_shards == 0;
+    ) && delivery_shards == 0;
     if use_direct {
         let (mut direct, boot) = DirectWriter::open(
             config.db,

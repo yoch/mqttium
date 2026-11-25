@@ -672,6 +672,46 @@ pub struct Hooks {
     pub pause: Vec<String>,
 }
 impl Hooks {
+    fn supports_store(&self, mode: StorageMode) -> bool {
+        if self.directory.is_none() || mode == StorageMode::Durable {
+            return true;
+        }
+        !self.pause.is_empty()
+            && self.pause.iter().all(|point| match mode {
+                StorageMode::Log => matches!(
+                    point.as_str(),
+                    "log.will.end.before_append"
+                        | "log.will.end.before_sync"
+                        | "log.will.end.after_sync"
+                ),
+                StorageMode::Volatile { .. } => point == "volatile.will.end.before_apply",
+                StorageMode::Durable => true,
+            })
+    }
+
+    #[cfg(feature = "test-hooks")]
+    fn before_volatile_apply(
+        &self,
+        command: &mqttiumd_contract::command::Command,
+        events: &Events,
+        cancel: &AtomicBool,
+    ) {
+        if self.directory.is_some()
+            && recipe_kind(command.recipe.get()) == "WillEnd"
+            && self
+                .barrier(
+                    "volatile.will.end.before_apply",
+                    "WillEnd",
+                    command.recipe.operation(),
+                    events,
+                    cancel,
+                )
+                .is_err()
+        {
+            cancel.store(true, Ordering::Relaxed);
+        }
+    }
+
     #[cfg(feature = "test-hooks")]
     fn barrier(
         &self,
@@ -835,17 +875,7 @@ impl Writer {
         extra_owners: usize,
     ) -> Result<Self, Failure> {
         let _ = &hooks;
-        let log_cuts = storage_mode == StorageMode::Log
-            && !hooks.pause.is_empty()
-            && hooks.pause.iter().all(|point| {
-                matches!(
-                    point.as_str(),
-                    "log.will.end.before_append"
-                        | "log.will.end.before_sync"
-                        | "log.will.end.after_sync"
-                )
-            });
-        if hooks.directory.is_some() && storage_mode != StorageMode::Durable && !log_cuts {
+        if !hooks.supports_store(storage_mode) {
             return Err(Failure::plain("volatile_test_hooks_unsupported"));
         }
         // The worker waits on `requests` when all request lanes are empty.
@@ -1343,7 +1373,7 @@ impl DirectWriter {
         require_existing: bool,
         storage_mode: StorageMode,
     ) -> Result<(Self, Boot), Failure> {
-        if hooks.directory.is_some() {
+        if !hooks.supports_store(storage_mode) {
             return Err(Failure::plain("volatile_test_hooks_unsupported"));
         }
         let clock = Arc::new(SystemClock::new().map_err(|error| Failure::plain(error.code()))?);
@@ -1387,6 +1417,9 @@ impl DirectWriter {
         } else {
             None
         };
+        #[cfg(feature = "test-hooks")]
+        self.hooks
+            .before_volatile_apply(&command, &self.events, &self.cancel);
         let applied = self.store.apply_owned(command);
         if let Some(frozen) = recipe_for_post {
             let recipe = frozen.get();
@@ -1913,6 +1946,10 @@ fn effect_response(
                         cancel.store(true, Ordering::Relaxed);
                     }
                 })));
+            }
+            #[cfg(feature = "test-hooks")]
+            if matches!(store, StoreBackend::Volatile { .. }) {
+                hooks.before_volatile_apply(&command, events, cancel);
             }
             let applied = store.apply(&command);
             #[cfg(feature = "test-hooks")]
