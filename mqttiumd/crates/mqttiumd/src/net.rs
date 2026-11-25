@@ -409,10 +409,21 @@ struct ToCoreState {
 struct OutgoingState {
     queue: VecDeque<Write>,
     tx_alive: bool,
-    rx_alive: bool,
+    accepting_frames: bool,
     /// Saturating count of popped outgoing frames; while `< 3` (CONNACK
     /// handshake / idle phase) an empty queue frees its backing buffer.
     sent_seen: u8,
+}
+
+impl OutgoingState {
+    fn enqueue(&mut self, frame: Write) {
+        // MQTT-3.14.4-1: admit DISCONNECT and seal the FIFO under the same
+        // lock for every producer. The socket task still drains the queue.
+        if frame.bytes.first() == Some(&0xe0) {
+            self.accepting_frames = false;
+        }
+        self.queue.push_back(frame);
+    }
 }
 
 /// Direct I/O event delivered from an I/O reactor task straight to a resident
@@ -578,7 +589,7 @@ impl ConnCore {
             outgoing: Mutex::new(OutgoingState {
                 queue: VecDeque::new(),
                 tx_alive: true,
-                rx_alive: true,
+                accepting_frames: true,
                 sent_seen: 0,
             }),
             #[cfg(test)]
@@ -653,16 +664,16 @@ impl ConnCore {
             Ok(guard) => guard,
             Err(_) => return Err(TrySendError::Disconnected(frame)),
         };
-        if !state.rx_alive {
+        if !state.accepting_frames {
             return Err(TrySendError::Disconnected(frame));
         }
         if state.queue.len() >= OUTPUT_SLOTS {
             return Err(TrySendError::Full(frame));
         }
-        state.queue.push_back(frame);
+        state.enqueue(frame);
         drop(state);
         #[cfg(test)]
-        self.changed.notify_one();
+        self.changed.notify_all();
         self.link.notify();
         Ok(())
     }
@@ -673,18 +684,18 @@ impl ConnCore {
             Ok(guard) => guard,
             Err(_) => return Err(SendError(frame)),
         };
-        while state.rx_alive && state.queue.len() >= OUTPUT_SLOTS {
+        while state.accepting_frames && state.queue.len() >= OUTPUT_SLOTS {
             state = match self.changed.wait(state) {
                 Ok(guard) => guard,
                 Err(_) => return Err(SendError(frame)),
             };
         }
-        if !state.rx_alive {
+        if !state.accepting_frames {
             return Err(SendError(frame));
         }
-        state.queue.push_back(frame);
+        state.enqueue(frame);
         drop(state);
-        self.changed.notify_one();
+        self.changed.notify_all();
         self.link.notify();
         Ok(())
     }
@@ -1412,7 +1423,7 @@ impl ConnCore {
     ) {
         let queued: Vec<Option<(EffectId, ConnectionKey)>> = match self.outgoing.lock() {
             Ok(mut out) => {
-                out.rx_alive = false;
+                out.accepting_frames = false;
                 out.queue.drain(..).map(|f| f.correlation).collect()
             }
             Err(_) => Vec::new(),
