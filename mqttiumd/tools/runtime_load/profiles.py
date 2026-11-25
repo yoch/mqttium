@@ -205,6 +205,9 @@ def close_cost(args, port, proc, pki):
     if len(closed) != len(trials) or any(e["details"]["code"] != "client_disconnect" for e in closed):
         raise ValueError("close events do not match the trials")
     observed = [int(e["details"]["observed_monotonic_ns"]) for e in closed]
+    write_json(args.out / "timings-ms.json", {"tls_handshake": handshakes, "mqtt_connect": connect_ms,
+                                             "peer_eof": closes, "broker_observed_ns": observed,
+                                             "disconnect_and_eof_ns": trials})
     return {"tls": bool(ctx), "trials": len(trials), "tls_handshake_ms": distribution(handshakes),
             "mqtt_connect_ms": distribution(connect_ms), "disconnect_to_peer_eof_ms": distribution(closes),
             "disconnect_to_broker_observation_ms": distribution(
@@ -227,7 +230,8 @@ async def qos0(args, port, proc, pki):
     total = args.duration * args.rate
     padding = b"p" * (args.payload - 12)
     prefix = mqtt.utf8(TOPIC)
-    latency = []
+    latency = [[] for _ in peers]
+    fenced = [False] * args.fanout
     unique = [0] * args.fanout
     window = [0] * args.fanout
     duplicates = [0] * args.fanout
@@ -235,13 +239,16 @@ async def qos0(args, port, proc, pki):
     end = start + args.duration * 1_000_000_000
     async def receive(i):
         seen = bytearray(total)
-        while unique[i] < total:
+        while True:
             head, body = await read_packet(peers[i][0])
             now = time.monotonic_ns()
             if head != 0x30 or len(body) != len(prefix) + args.payload or not body.startswith(prefix):
                 raise ValueError("unexpected QoS 0 frame")
             seq, stamp = struct.unpack_from("!IQ", body, len(prefix))
-            if seq >= total:
+            if seq == total:
+                fenced[i] = True
+                return
+            if seq > total:
                 raise ValueError("unexpected sequence number")
             if seen[seq]:
                 duplicates[i] += 1
@@ -249,7 +256,7 @@ async def qos0(args, port, proc, pki):
                 seen[seq] = 1
                 unique[i] += 1
                 window[i] += int(now <= end)
-                latency.append((now - stamp) / 1e6)
+                latency[i].append((now - stamp) / 1e6)
     readers = [asyncio.create_task(receive(i)) for i in range(args.fanout)]
     try:
         for i in range(total):
@@ -260,6 +267,9 @@ async def qos0(args, port, proc, pki):
             pw.write(mqtt.publish(TOPIC, payload))
             await pw.drain()
         finished = time.monotonic_ns()
+        pw.write(mqtt.publish(TOPIC, struct.pack("!IQ", total, finished) + padding))
+        pw.write(mqtt.pingreq())
+        await expect(pr, 0xd0, b"")
         pending = await asyncio.wait(readers, timeout=max(0, (end - finished) / 1e9) + 5)
         for task in pending[0]:
             task.result()
@@ -268,12 +278,16 @@ async def qos0(args, port, proc, pki):
             task.cancel()
         await asyncio.gather(*readers, return_exceptions=True)
         await asyncio.gather(close(pw), *(close(w) for _, w in peers))
+    write_json(args.out / "latencies-ms.json", latency)
     return {"payload_bytes": args.payload, "subscribers": len(peers), "transport": "mTLS" if sensor else "TCP",
             "offered": total, "rate": args.rate, "duration_seconds": args.duration,
             "send_window_seconds": (finished - start) / 1e9, "copies_expected": total * args.fanout,
             "in_window_by_subscriber": window, "after_drain_by_subscriber": unique,
-            "duplicates_by_subscriber": duplicates, "delivered_in_window_per_second": sum(window) / args.duration,
-            "delivered_latency_ms": distribution(latency), "process": proc_sample(proc.pid),
+            "duplicates_by_subscriber": duplicates, "end_marker_by_subscriber": fenced,
+            "delivered_in_window_per_second": sum(window) / args.duration,
+            "delivered_latency_ms": distribution([v for subscriber in latency for v in subscriber]),
+            "latency_ms_by_subscriber": [distribution(samples) for samples in latency],
+            "process": proc_sample(proc.pid),
             "competitor_cpu": args.competitor_cpu}
 
 
@@ -326,12 +340,18 @@ def main():
                 competitor = subprocess.Popen(command)
                 stack.callback(competitor.wait)
                 stack.callback(competitor.terminate)
+                competitor_start = proc_sample(competitor.pid)
             if args.profile == "close":
                 result = close_cost(args, port, proc, pki)
             else:
                 coro = (qos0(args, port, proc, pki) if args.profile == "qos0" else
                         bounds(args, port, proc) if args.profile == "bounds" else waiting(args, port, proc))
                 result = asyncio.run(asyncio.wait_for(coro, timeout=600 if args.profile == "bounds" else 90))
+            if args.competitor_cpu is not None:
+                if competitor.poll() is not None:
+                    raise RuntimeError("CPU competitor exited during the trial")
+                competitor_end = proc_sample(competitor.pid)
+                result["competitor_cpu_seconds"] = competitor_end["cpu_seconds"] - competitor_start["cpu_seconds"]
             write_json(args.out / "result.json", result)
 
 

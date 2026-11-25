@@ -53,7 +53,9 @@ taskset -c 3 python tools/runtime_load/profiles.py qos0 --binary "$binary" \
   and at least 4128 file descriptors for each process.
 * **QoS 0** reports offered publications, unique copies received per subscriber
   within the timed window and after up to 5 s of drain, duplicates and
-  publish-to-copy latency for the copies observed. Use `--tls`,
+  publish-to-copy latency for the copies observed. An extra sequence marker on
+  the same ordered topic ends each subscriber's observation; missing markers
+  are recorded. The result includes the individual subscriber latency samples. Use `--tls`,
   `--payload 256|65536`, `--fanout 1|16|64`, `--shards 0|2|3` and an
   optional bounded SHA-256 process on one broker CPU. The producer caps total
   offered copies at 64 MiB/s. Compare at the same offered rate, payload,
