@@ -167,7 +167,7 @@
     {
       "decision": "0029",
       "path": "docs/decisions/0029-explicit-session-lifecycle.md",
-      "sha256": "aa5ee58f341278595e86274b489f695e1b186a304b742d273cd6d8679ca0dc9f"
+      "sha256": "4bcee9bc1e9dbc58f3a662dee25d27f7a1e0d1ff86b5e2febf27c97327811b74"
     },
     {
       "decision": "0030",
@@ -192,12 +192,12 @@
     {
       "decision": "0034",
       "path": "docs/decisions/0034-durable-will.md",
-      "sha256": "4a3b9b0fadba4dfeb1d0356129a7c17c7a13cfb77c9ab7971a15bdaf9f922ce6"
+      "sha256": "1d992312218163f5eec2821fc9280009056b98c48d4050a76a0430629ed3d610"
     },
     {
       "decision": "0035",
       "path": "docs/decisions/0035-private-mtls-profile.md",
-      "sha256": "8d70c14edcc6dbdf60e5cded181e206cdffb525f7eca5d4b549fb536355b11d0"
+      "sha256": "ddca9a6c2a4e756c4f9e2b1e69f51179fb5ffa95c68c8ab94ddeb9e61ea4693e"
     },
     {
       "decision": "0036",
@@ -252,7 +252,7 @@
     {
       "decision": "0046",
       "path": "docs/decisions/0046-input-backpressure.md",
-      "sha256": "c989153843398d98306ad174dca7d8ecc3b206711b064d1bbda88ca50acdcab0"
+      "sha256": "dfb22491e90c3ba5476e261ebf1f9da1d085ddc4c93babb80abd42d1135ee8ea"
     },
     {
       "decision": "0047",
@@ -267,12 +267,37 @@
     {
       "decision": "0049",
       "path": "docs/decisions/0049-functional-compatibility.md",
-      "sha256": "4a4e51113617b864829e699b74bdc14e648f9a9a8d95731f8d198b7b6af9e4b8"
+      "sha256": "a38ff661d439256621975702cd61ddacc7ad8150a78d5df95e2ec9334a190edc"
     },
     {
       "decision": "0050",
       "path": "docs/decisions/0050-acknowledgements-in-order-of-reception.md",
       "sha256": "e9528d104f839803a7abcc3080e797c06805ab2c126ec7307a280c7bdfe784cb"
+    },
+    {
+      "decision": "0058",
+      "path": "docs/decisions/0058-client-disconnect-reasons-and-tls-close-notify.md",
+      "sha256": "551cc01f0ca55e74ff6d6b8caa2222c0ef51237a0dfdba240b3010bdac114f37"
+    },
+    {
+      "decision": "0059",
+      "path": "docs/decisions/0059-disconnect-durability-boundary.md",
+      "sha256": "96c166d2cca592b3a21b5a8de997a4b48ab6edfb5661bb5452192ee5897bee56"
+    },
+    {
+      "decision": "0060",
+      "path": "docs/decisions/0060-reading-behind-a-waiting-publication.md",
+      "sha256": "e71de608678be867e4471a4284754700ecb66198561da16b91d9cfb5f16f97bf"
+    },
+    {
+      "decision": "0061",
+      "path": "docs/decisions/0061-session-exchange-bound.md",
+      "sha256": "96624665c5752237fd5c85c8730f353f939dd713ebc67f88ea38d9863f71c9d6"
+    },
+    {
+      "decision": "0062",
+      "path": "docs/decisions/0062-compatibility-reference-mosquitto-2-1-4.md",
+      "sha256": "64a06b8e99a8dab440828017a8922e7c171a0c4d14d56b368fe884e36de7cab5"
     }
   ],
   "entries": [

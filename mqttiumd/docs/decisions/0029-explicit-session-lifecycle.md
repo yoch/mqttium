@@ -8,7 +8,7 @@ unsupported. It does not accept historical proposals or change the immutable
 chapters.
 
 Amendment of acceptance (21 November 2026).
-Amended by 0058 (proposed): a DISCONNECT of any reason code a client may
+Amended by 0058 (accepted): a DISCONNECT of any reason code a client may
 send carries its Session Expiry Interval, not only reasons 0x00 and 0x04.
 Amended by 0033. At sixteen connections reserve 544 terminal inputs for 208
 frame registrations, including the two facts of an expiring frame. Record

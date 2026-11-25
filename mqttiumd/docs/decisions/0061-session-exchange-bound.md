@@ -1,6 +1,6 @@
 # 0061 — A session holds a bounded number of QoS 2 exchanges, and an exchange that awaits its PUBREL holds no payload
 
-Status: **Proposed** (23 November 2026). Applied to `mqttiumd` (core tier
+Status: **Accepted with amendments** (25 November 2026, by the integration owner). Applied to `mqttiumd` (core tier
 and runtime, ADR 0044). It closes the point record 0060 left open, by the
 decision of the repository owner: a bound per session in the admission of
 the core, and a table sized for the sessions.
@@ -76,14 +76,21 @@ answers, by who can make room.
   from its head: a publication that waits for a PUBREL that never comes
   would hold the waiting packets of other connections behind it.
 
-For MQTT 5 the client was announced Receive Maximum 8, and the
-specification counts against it the publications for which the client has
-not received PUBACK or PUBCOMP, whatever the connection ([MQTT-3.3.4-7]):
-a ninth QoS 2 exchange of the session is beyond it. For MQTT 3.1.1 nothing
-is announced. A client that follows [MQTT-4.4.0-1] sends
-again, when it reconnects, the PUBREL of every exchange acknowledged with
-PUBREC, and never meets the bound: the connection of a 3.1.1 client still
-holds a ninth publication back rather than refuse it (record 0060).
+MQTT 5 sections 3.3.4 and 4.9 apply Receive Maximum to the current network
+connection. A new connection starts with a fresh send quota, including on
+session resumption. Existing QoS 2 exchanges still belong to the resumed
+session and retain their packet identifiers [MQTT-4.4.0-1]. A new PUBLISH
+can fit the connection's advertised window and still exceed the broker's
+session resource limit. In that case mqttiumd can send DISCONNECT 0x97
+(Quota exceeded). MQTT 5 also permits refusing just that publication with
+PUBREC 0x97. Exceeding the advertised window on the current connection
+is a distinct condition handled with DISCONNECT 0x93.
+
+MQTT 3.1.1 has no Receive Maximum or negative PUBREC. If the broker
+cannot process a publication at the bound it closes that connection
+[MQTT-4.8.0-2]. A persistent client can finish its previously admitted
+exchanges by sending PUBREL on reconnect. Record 0060 specifies when the
+broker can continue reading on the existing connection.
 
 ### An exchange that awaits its PUBREL holds no payload
 

@@ -1,6 +1,6 @@
 # 0062 — The reference of the compatibility bench is Mosquitto 2.1.4
 
-Status: **Proposed** (23 November 2026). Applied to the compatibility
+Status: **Accepted** (25 November 2026, by the integration owner). Applied to the compatibility
 bench (`tests/compat/`, runtime tier, ADR 0044) and to its CI job. It
 follows the external audit of `47e1d12`, which compared `mqttiumd` with
 Mosquitto 2.1.4 while the bench was pinned to 2.0.21.
@@ -55,7 +55,7 @@ tools the bench does not use.
 | `publish/empty-topic-name-v5` | `unspecified`: both close; Mosquitto says 0x81, mqttiumd 0x82 (record 0058) |
 | `session/redelivery-pubrel-after-expiry-v5` | `reference-nonconformant` (MQTT-4.4.0-1): upstream ticket 3744. Mosquitto does not send the PUBREL again once the Message Expiry Interval has passed; mqttiumd does |
 | `session/ninth-exchange-after-reconnection-v4` | `reference-nonconformant` (MQTT-4.3.3-2, MQTT-4.5.0-1): upstream ticket 3809. Mosquitto acknowledges the ninth message with PUBREC, then PUBCOMP, and never delivers it; mqttiumd does not acknowledge it and closes (record 0061) |
-| `session/ninth-exchange-after-reconnection-v5` | `reference-nonconformant` (MQTT-3.3.4-7, MQTT-4.13.1-1): Mosquitto answers PUBREC 0x97 and keeps the connection; mqttiumd sends DISCONNECT 0x97 and closes (record 0061) |
+| `session/ninth-exchange-after-reconnection-v5` | `unspecified`. The new connection has a fresh send quota. Mosquitto refuses the new publication with PUBREC 0x97. mqttiumd closes with DISCONNECT 0x97 at its session resource limit (record 0061) |
 
 This amends record 0049: the reference is 2.1.4, and of its two standing
 cases of `reference-nonconformant` the second, the packet over the

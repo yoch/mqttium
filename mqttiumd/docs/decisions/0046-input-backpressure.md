@@ -7,11 +7,11 @@ changes no public type of the core tier, no durable encoding and no
 contract. The contract digest that `validate` prints moves only because
 the register lists the accepted records.
 
-Amended by 0060 (proposed): the reader goes on behind a publication that
+Amended by 0060 (accepted): the reader goes on behind a publication that
 waits for a slot of the window, so the PUBREL of a 3.1.1 client that was
 announced no window is read too, up to a bound.
 
-Amended by 0061 (proposed): the exchange table is sized for the sessions,
+Amended by 0061 (accepted): the exchange table is sized for the sessions,
 eight entries each, so the broker no longer holds 128 credits for all its
 clients; a session holds at most eight QoS 2 exchanges across its
 connections.

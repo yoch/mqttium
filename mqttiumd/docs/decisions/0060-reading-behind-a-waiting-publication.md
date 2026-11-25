@@ -1,6 +1,6 @@
 # 0060 — The reader goes on behind a publication that waits for a slot
 
-Status: **Proposed** (23 November 2026). Applied to `mqttiumd` (runtime
+Status: **Accepted with amendments** (25 November 2026, by the integration owner). Applied to `mqttiumd` (runtime
 tier, ADR 0044). It follows the external audit of `47e1d12`, whose verdict
 on upstream Mosquitto ticket 3809 was partial; the test that completed it
 found the defect this record fixes.
@@ -8,7 +8,7 @@ found the defect this record fixes.
 holds the evidence. No public type of the core tier, durable encoding,
 injection point or schema changes.
 
-Amended by 0061 (proposed), which decides the point this record left
+Amended by 0061 (accepted), which decides the point this record left
 open: a session holds at most eight inbound QoS 2 exchanges and the table
 is sized for the sessions.
 
@@ -92,6 +92,10 @@ with local event reason `receive_lookahead_capacity`. MQTT 3.1.1 sends no
 server DISCONNECT. A persistent session retains its admitted exchanges for
 PUBREL after reconnect. The client can repeat a PUBLISH that had received
 no PUBREC once a slot is available. Other connections keep their own budgets.
+MQTT 3.1.1 §4.8 explicitly names an internal buffer full condition as
+an example of a transient error preventing packet processing. In that
+case [MQTT-4.8.0-2] requires closing the affected network connection.
+Ordinary bursts that fit the budgets continue through the normal path.
 
 ## Open: one session can hold every exchange
 

@@ -2,7 +2,7 @@
 
 Status: **Proposed** (22 November 2026). Applied to contract, core, SQLite store, and runtime.
 
-Amended by 0061 (proposed): `OwnerConfig.max_exchanges` is `SESSIONS × receiving::MAXIMUM`
+Amended by 0061 (accepted): `OwnerConfig.max_exchanges` is `SESSIONS × receiving::MAXIMUM`
 (32,768) whatever the connection limit, and `OwnerConfig.session_qos2_exchanges` bounds the
 QoS 2 exchanges of a session.
 

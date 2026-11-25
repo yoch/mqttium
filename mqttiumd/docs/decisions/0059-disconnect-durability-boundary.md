@@ -1,6 +1,6 @@
 # 0059 — Where the end of a session becomes durable
 
-Status: **Proposed** (23 November 2026). It states an existing behaviour of
+Status: **Accepted** (25 November 2026, by the integration owner). It states an existing behaviour of
 `mqttiumd` (runtime tier, ADR 0044) and changes no code path. It answers the
 point of an external audit of `47e1d12` that upstream Mosquitto ticket 3761
 raised: a session the client had ended was resumed after the process was

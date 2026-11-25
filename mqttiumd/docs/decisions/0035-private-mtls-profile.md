@@ -6,7 +6,7 @@ repository owner's delegation on the advice of the independent audit of
 preserves the existing clear-text loopback profile.
 
 Amendment of acceptance (21 November 2026).
-Amended by 0058 (proposed): the broker sends close_notify on an orderly TLS
+Amended by 0058 (accepted): the broker sends close_notify on an orderly TLS
 close, and the TLS task shuts its own socket.
 Amended by 0039. Authorize each SUBSCRIBE filter independently, encode one
 SUBACK result per position and apply the commit fence to granted changes.

@@ -1,6 +1,6 @@
 # 0058 — Client DISCONNECT reason codes, two decoder classes and TLS close_notify
 
-Status: **Proposed** (23 November 2026). Applied to `mqttiumd` (runtime tier,
+Status: **Accepted** (25 November 2026, by the integration owner). Applied to `mqttiumd` (runtime tier,
 ADR 0044). It answers an external audit of `47e1d12` against Mosquitto 2.1.4;
 [report 0031](../reports/0031-external-audit-47e1d12-wave-1.md) holds the
 evidence. No public type of the core tier, durable encoding, injection point
