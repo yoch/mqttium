@@ -607,21 +607,23 @@ fn durable_publications_to_a_qos0_subscription_wait_for_its_output() {
     );
 }
 
-/// The SUBACK occupies the last output slot. A retained replay consumed
-/// at QoS 0 has one explicit terminal refusal while an independent reader
-/// can still subscribe to, and receive, the same retained publication.
+/// The SUBACK takes the last slot. The replay must wait for this particular
+/// connection, while the second subscription makes progress on the same owner.
 #[test]
-fn retained_qos0_replay_reports_the_full_output_and_reaches_an_independent_subscriber() {
+fn retained_qos0_replay_waits_for_the_subscriber_output() {
     with_runtime(128, |runtime, directory| {
         let (source, mut publisher) = connected(runtime, b"retained-source");
-        runtime.packet(source, 0x33, publish_body(1)).unwrap();
-        assert_eq!(
-            served_frame(runtime, &mut publisher),
-            (0x40, vec![0, 1, 0x10])
-        );
-        let (slow, _slow_socket) = connected(runtime, b"retained-held");
+        for (id, topic) in [(1, b't'), (2, b'u')] {
+            let mut body = publish_body(id);
+            body[2] = topic;
+            runtime.packet(source, 0x33, body).unwrap();
+            assert_eq!(
+                served_frame(runtime, &mut publisher),
+                (0x40, vec![0, id as u8, 0x10])
+            );
+        }
+        let (slow, mut slow_socket) = connected(runtime, b"retained-held");
         let (fast, mut fast_socket) = connected(runtime, b"retained-reader");
-        let slow_session = runtime.peers[&slow].session.unwrap();
         let (sender, held) = std::sync::mpsc::sync_channel(net::OUTPUT_SLOTS);
         for _ in 1..net::OUTPUT_SLOTS {
             sender
@@ -634,41 +636,37 @@ fn retained_qos0_replay_reports_the_full_output_and_reaches_an_independent_subsc
                 })
                 .unwrap();
         }
-        let _original = std::mem::replace(
+        let original = std::mem::replace(
             &mut runtime.peers.get_mut(&slow).unwrap().io.outgoing,
             sender.into(),
         );
-        let subscribe = || vec![0, 1, 0, 0, 1, b't', 0];
+        let subscribe = || vec![0, 1, 0, 0, 1, b'+', 0];
+        let suback = (0x90, vec![0, 1, 0, 0]);
+        let replay = |topic| (0x31, vec![0, 1, topic, 0, b'v']);
         runtime.packet(slow, 0x82, subscribe()).unwrap();
-        until(runtime, |_| qos0_drops(directory) == 1);
-
         runtime.packet(fast, 0x82, subscribe()).unwrap();
-        assert_eq!(
-            served_frame(runtime, &mut fast_socket),
-            (0x90, vec![0, 1, 0, 0])
-        );
-        assert_eq!(
-            served_frame(runtime, &mut fast_socket),
-            (0x31, vec![0, 1, b't', 0, b'v'])
-        );
-        let frames: Vec<_> = held.try_iter().collect();
-        assert_eq!(frames.len(), net::OUTPUT_SLOTS);
-        assert_eq!(
-            frames.last().unwrap().bytes.as_slice(),
-            &[0x90, 4, 0, 1, 0, 0]
-        );
+        assert_eq!(served_frame(runtime, &mut fast_socket), suback);
+        assert_eq!(served_frame(runtime, &mut fast_socket), replay(b't'));
+        assert_eq!(served_frame(runtime, &mut fast_socket), replay(b'u'));
         assert!(runtime.peers[&slow].closing().is_none());
-        let events = std::fs::read_to_string(directory.join("events.jsonl")).unwrap();
-        let drops: Vec<serde_json::Value> = events
-            .lines()
-            .filter(|line| line.contains("\"qos0_dropped\""))
-            .map(|line| serde_json::from_str(line).unwrap())
-            .collect();
-        assert_eq!(drops.len(), 1);
-        let details = &drops[0]["details"];
-        assert_eq!(details["target"], slow_session.get().to_string());
-        assert_eq!(details["reason"], "output_saturated");
-        assert!(details["origin"].as_str().unwrap().starts_with("consumed/"));
+
+        // Move the actual accepted SUBACK to the real socket before making the
+        // outlet available again. Its receipt follows the usual writer path.
+        for _ in 1..net::OUTPUT_SLOTS {
+            assert_eq!(held.try_recv().unwrap().bytes.as_slice(), &[0xd0, 0]);
+        }
+        let ack = held.try_recv().expect("SUBACK behind the padding");
+        assert_eq!(ack.bytes.as_slice(), &[0x90, 4, 0, 1, 0, 0]);
+        let peer = runtime.peers.get_mut(&slow).unwrap();
+        peer.io.outgoing = original;
+        peer.io.try_send_outgoing(ack).unwrap();
+        assert_eq!(served_frame(runtime, &mut slow_socket), suback);
+        assert_eq!(qos0_drops(directory), 0);
+        assert_eq!(served_frame(runtime, &mut slow_socket), replay(b't'));
+        assert_eq!(served_frame(runtime, &mut slow_socket), replay(b'u'));
+        runtime.packet(slow, 0xc0, vec![]).unwrap();
+        assert_eq!(served_frame(runtime, &mut slow_socket), (0xd0, vec![]));
+        until(runtime, |r| r.frames.is_empty() && r.owner.outbox_is_empty());
     });
 }
 
