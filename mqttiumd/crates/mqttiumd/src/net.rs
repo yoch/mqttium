@@ -11,7 +11,7 @@ use std::net::{Shutdown, TcpStream};
 use std::os::fd::{AsRawFd, RawFd};
 #[cfg(test)]
 use std::sync::Condvar;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::TrySendError;
 #[cfg(test)]
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SendError, SyncSender, TryRecvError};
@@ -746,6 +746,8 @@ pub(super) struct ConnCore {
     pub(super) cancelled: AtomicBool,
     activity: AtomicBool,
     in_pending: AtomicBool,
+    // Slots held by the coordinator until it consumes or returns the batch.
+    incoming_borrowed: AtomicU8,
     written_pending: AtomicBool,
     progress_pending: AtomicBool,
     shard_route_active: AtomicBool,
@@ -759,6 +761,55 @@ pub(super) struct ConnCore {
     pause_progress: AtomicBool,
     #[cfg(test)]
     progress_waiting: AtomicBool,
+}
+
+/// One coordinator turn can inspect batches until it encounters backpressure.
+/// The producer counts the inspected packets against its input capacity until
+/// the coordinator returns the ordered suffix and releases consumed slots.
+pub(super) struct IncomingBatch {
+    core: Arc<ConnCore>,
+    taken: usize,
+}
+
+impl IncomingBatch {
+    pub(super) fn take(&mut self, out: &mut VecDeque<Incoming>, limit: usize) -> DrainStatus {
+        debug_assert!(out.is_empty() && self.taken == 0);
+        let status = self.core.drain_incoming(out, limit, true);
+        self.taken = out.len();
+        status
+    }
+
+    pub(super) fn finish(&mut self, remaining: &mut VecDeque<Incoming>) {
+        let restored = remaining.len();
+        if restored != 0 {
+            let mut state = self.core.to_core.lock().expect("input queue lock");
+            while let Some(packet) = remaining.pop_back() {
+                state.incoming.push_front(packet);
+            }
+            self.core.in_pending.store(true, Ordering::Release);
+            // Restored packets and their reservation change together under the
+            // producer's queue lock. A fully consumed batch needs no lock here.
+            self.core.incoming_borrowed.store(0, Ordering::SeqCst);
+        } else if self.taken != 0 {
+            self.core.incoming_borrowed.store(0, Ordering::SeqCst);
+        }
+        // Publishing the new room and testing the wake debt must be ordered
+        // against the producer registering debt and rechecking room.
+        if self.taken > restored {
+            self.core.input_consumed();
+        }
+        self.taken = 0;
+    }
+}
+
+impl Drop for IncomingBatch {
+    fn drop(&mut self) {
+        // An early error ends this coordinator turn and drops its local packets.
+        if self.taken != 0 {
+            self.core.incoming_borrowed.store(0, Ordering::SeqCst);
+            self.core.input_consumed();
+        }
+    }
 }
 
 impl ConnCore {
@@ -781,6 +832,7 @@ impl ConnCore {
             cancelled: AtomicBool::new(false),
             activity: AtomicBool::new(initial_activity),
             in_pending: AtomicBool::new(false),
+            incoming_borrowed: AtomicU8::new(0),
             written_pending: AtomicBool::new(false),
             progress_pending: AtomicBool::new(false),
             shard_route_active: AtomicBool::new(false),
@@ -861,11 +913,16 @@ impl ConnCore {
     #[inline]
     pub(super) fn incoming_free_slots(&self) -> usize {
         if !self.in_pending.load(Ordering::Acquire) {
-            return INPUT_SLOTS;
+            return INPUT_SLOTS - usize::from(self.incoming_borrowed.load(Ordering::Acquire));
         }
-        self.to_core
-            .lock()
-            .map_or(0, |s| INPUT_SLOTS.saturating_sub(s.incoming.len()))
+        self.to_core.lock().map_or(0, |s| self.incoming_room(&s))
+    }
+
+    #[inline]
+    fn incoming_room(&self, state: &ToCoreState) -> usize {
+        INPUT_SLOTS
+            - state.incoming.len()
+            - usize::from(self.incoming_borrowed.load(Ordering::SeqCst))
     }
 
     pub(super) fn try_send_outgoing(&self, frame: Write) -> Result<(), TrySendError<Write>> {
@@ -980,7 +1037,7 @@ impl ConnCore {
             if state.alive & ALIVE_IN_RX == 0 {
                 return Err("input_consumer_closed");
             }
-            if state.incoming.len() < INPUT_SLOTS {
+            if self.incoming_room(&state) > 0 {
                 state.incoming.push_back(value);
                 self.in_pending.store(true, Ordering::Release);
                 drop(state);
@@ -1064,7 +1121,7 @@ impl ConnCore {
             if state.alive & ALIVE_IN_RX == 0 {
                 return Err("input_consumer_closed");
             }
-            let room = INPUT_SLOTS.saturating_sub(state.incoming.len());
+            let room = self.incoming_room(&state);
             let take = room.min(batch.len() - cursor);
             if take > 0 {
                 for item in batch.drain(cursor..cursor + take) {
@@ -1105,13 +1162,9 @@ impl ConnCore {
             if state.alive & ALIVE_IN_RX == 0 {
                 return Err("input_consumer_closed");
             }
-            let mut pushed = false;
-            while state.incoming.len() < INPUT_SLOTS
-                && let Some(item) = st.held.pop_front()
-            {
-                state.incoming.push_back(item);
-                pushed = true;
-            }
+            let take = self.incoming_room(&state).min(st.held.len());
+            state.incoming.extend(st.held.drain(..take));
+            let pushed = take != 0;
             if pushed {
                 self.in_pending.store(true, Ordering::Release);
             }
@@ -1296,7 +1349,12 @@ impl ConnCore {
         Ok(moved || shard_moved)
     }
 
-    pub(super) fn drain_incoming(&self, out: &mut VecDeque<Incoming>, limit: usize) -> DrainStatus {
+    fn drain_incoming(
+        &self,
+        out: &mut VecDeque<Incoming>,
+        limit: usize,
+        borrow: bool,
+    ) -> DrainStatus {
         if !self.in_pending.load(Ordering::Acquire) {
             return DrainStatus::Empty;
         }
@@ -1320,13 +1378,20 @@ impl ConnCore {
             }
         }
         let tx_alive = state.alive & ALIVE_IN_TX != 0;
+        if borrow && taken > 0 {
+            debug_assert_eq!(self.incoming_borrowed.load(Ordering::Relaxed), 0);
+            self.incoming_borrowed.store(
+                u8::try_from(taken).expect("bounded input batch"),
+                Ordering::Release,
+            );
+        }
         let more = !state.incoming.is_empty();
         self.in_pending.store(more || !tx_alive, Ordering::Release);
         drop(state);
         if taken > 0 {
-            #[cfg(test)]
-            self.changed.notify_one();
-            self.link.consumed();
+            if !borrow {
+                self.input_consumed();
+            }
             if more {
                 DrainStatus::More
             } else {
@@ -1339,16 +1404,10 @@ impl ConnCore {
         }
     }
 
-    pub(super) fn push_front_incoming(&self, remaining: &mut VecDeque<Incoming>) {
-        if remaining.is_empty() {
-            return;
-        }
-        if let Ok(mut state) = self.to_core.lock() {
-            while let Some(item) = remaining.pop_back() {
-                state.incoming.push_front(item);
-            }
-            self.in_pending.store(true, Ordering::Release);
-        }
+    fn input_consumed(&self) {
+        #[cfg(test)]
+        self.changed.notify_one();
+        self.link.consumed();
     }
 
     pub(super) fn drain_written(&self, out: &mut Vec<Written>, limit: usize) -> DrainStatus {
@@ -1717,7 +1776,7 @@ impl ConnCore {
                 drop(remaining);
                 route.inbox.push_batch(&mut shard_failed);
             }
-            if state.alive & ALIVE_IN_RX != 0 && state.incoming.len() < INPUT_SLOTS {
+            if state.alive & ALIVE_IN_RX != 0 && self.incoming_room(&state) > 0 {
                 state.incoming.push_back(Incoming::Closed { code });
             }
             state.alive &= !(ALIVE_IN_TX | ALIVE_WRITTEN_TX | ALIVE_PROG_TX);
@@ -2187,7 +2246,7 @@ impl Connection {
         #[cfg(test)]
         {
             match &self.incoming.receiver {
-                InboundRx::Shared(core, _) => core.drain_incoming(out, limit),
+                InboundRx::Shared(core, _) => core.drain_incoming(out, limit, false),
                 InboundRx::Std(rx) => {
                     // For test-injected std channels, drain one item at a time so
                     // backpressure/pending tests never over-read past a barrier.
@@ -2208,22 +2267,20 @@ impl Connection {
         }
         #[cfg(not(test))]
         {
-            self.core.drain_incoming(out, limit)
+            self.core.drain_incoming(out, limit, false)
         }
     }
 
     #[inline]
-    pub fn push_front_incoming(&self, remaining: &mut VecDeque<Incoming>) {
+    pub(super) fn incoming_batch(&self) -> Option<IncomingBatch> {
         #[cfg(test)]
-        {
-            if let InboundRx::Shared(core, _) = &self.incoming.receiver {
-                core.push_front_incoming(remaining);
-            }
+        if matches!(self.incoming.receiver, InboundRx::Std(_)) {
+            return None;
         }
-        #[cfg(not(test))]
-        {
-            self.core.push_front_incoming(remaining);
-        }
+        Some(IncomingBatch {
+            core: Arc::clone(&self.core),
+            taken: 0,
+        })
     }
 
     #[inline]
@@ -3531,7 +3588,8 @@ mod tests {
                 .unwrap()
         );
         let mut batch = VecDeque::new();
-        connection.drain_incoming(&mut batch, 8);
+        let mut loan = connection.incoming_batch().unwrap();
+        loan.take(&mut batch, 8);
         assert_eq!(batch.len(), 8);
         // The producer runs again before the coordinator knows how much of
         // this batch it can consume. It must retain the new packet itself.
@@ -3539,7 +3597,7 @@ mod tests {
         let new = core.push_incoming_one(packet(INPUT_SLOTS as u8)).unwrap();
         assert!(new.is_some());
         batch.pop_front().unwrap();
-        connection.push_front_incoming(&mut batch);
+        loan.finish(&mut batch);
         assert_eq!(core.incoming_free_slots(), 1);
         assert!(core.push_incoming_one(new.unwrap()).unwrap().is_none());
         let mut all = VecDeque::new();
@@ -3552,6 +3610,54 @@ mod tests {
             })
             .collect();
         assert_eq!(ids, (1..=INPUT_SLOTS as u8).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn a_full_batch_can_return_an_ordered_suffix_after_the_producer_closes() {
+        let (connection, _peer) = pair();
+        let core = &connection.core;
+        let mut initial: Vec<_> = (0..INPUT_SLOTS)
+            .map(|_| Incoming::Authenticated {
+                elapsed: Duration::ZERO,
+            })
+            .collect();
+        assert!(
+            core.push_incoming_batch(&mut initial, &mut None, None)
+                .unwrap()
+        );
+
+        let mut items = VecDeque::new();
+        let mut batch = connection.incoming_batch().unwrap();
+        batch.take(&mut items, INPUT_SLOTS);
+        assert_eq!(
+            core.incoming_free_slots(),
+            0,
+            "empty queue with all credits borrowed"
+        );
+        core.finish_task(None, "reader_closed", []);
+        items.pop_front().unwrap();
+        batch.finish(&mut items);
+        assert_eq!(core.incoming_free_slots(), 1);
+
+        // The next turn exits early. Drop retires exactly its currently
+        // borrowed item; the rest of the lane precedes the terminal status.
+        batch.take(&mut items, 1);
+        items.clear();
+        drop(batch);
+        assert_eq!(core.incoming_free_slots(), 2);
+        connection.drain_incoming(&mut items, INPUT_SLOTS);
+        assert_eq!(items.len(), INPUT_SLOTS - 2);
+        assert!(
+            items
+                .iter()
+                .all(|item| matches!(item, Incoming::Authenticated { .. }))
+        );
+        assert_eq!(core.incoming_free_slots(), INPUT_SLOTS);
+        items.clear();
+        assert!(matches!(
+            connection.drain_incoming(&mut items, 1),
+            DrainStatus::Disconnected
+        ));
     }
 
     #[test]
@@ -3641,7 +3747,7 @@ mod tests {
         read_turn(&mut unread, &mut stalled);
         assert!(unread.is_empty());
         let mut coordinator = VecDeque::new();
-        connection.core.drain_incoming(&mut coordinator, 10);
+        connection.drain_incoming(&mut coordinator, 10);
         assert!(matches!(
             coordinator.pop_front(),
             Some(Incoming::Packet { first: 0xe0, .. })

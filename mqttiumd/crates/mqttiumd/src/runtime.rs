@@ -5084,13 +5084,19 @@ impl Runtime<'_> {
                     }
                     let backpressured = backpressured || blocked_prefix;
                     drained_incoming = false;
-                    let steady_fast = !backpressured
+                    if !backpressured
                         && self.ordinary_room() >= 2
-                        && self
+                        && let Some(mut ingress) = self
                             .peers
                             .get(&generation)
-                            .is_some_and(|p| p.connected && !p.pending && p.cold.is_none());
-                    if steady_fast {
+                            .filter(|peer| {
+                                peer.connected
+                                    && !peer.pending
+                                    && peer.cold.is_none()
+                                    && peer.io.has_pending_incoming()
+                            })
+                            .and_then(|peer| peer.io.incoming_batch())
+                    {
                         // Cap non-ACK ingress packets at 32 per peer per turn so
                         // one publisher cannot monopolize the lane, while allowing
                         // credit-releasing ACKs (PUBACK/PUBREC/PUBREL/PUBCOMP) to
@@ -5099,6 +5105,7 @@ impl Runtime<'_> {
                         let mut batch = std::mem::take(&mut self.scratch_incoming);
                         batch.clear();
                         let mut hit_terminal = false;
+                        let mut restored = false;
                         let mut status = net::DrainStatus::Empty;
                         let mut total_drained = 0usize;
                         let mut non_ack_drained = 0usize;
@@ -5120,13 +5127,7 @@ impl Runtime<'_> {
                                 (max_non_ack - non_ack_drained).min(32)
                             };
                             let chunk = cap.min(room).min(MAX_TOTAL_FAST - total_drained);
-                            status = match self.peers.get(&generation) {
-                                Some(p) if p.io.has_pending_incoming() => {
-                                    p.io.drain_incoming(&mut batch, chunk)
-                                }
-                                Some(_) => net::DrainStatus::Empty,
-                                None => net::DrainStatus::Empty,
-                            };
+                            status = ingress.take(&mut batch, chunk);
                             if batch.is_empty() {
                                 break;
                             }
@@ -5238,16 +5239,13 @@ impl Runtime<'_> {
                                     }
                                 }
                             }
+                            restored = !batch.is_empty();
+                            ingress.finish(&mut batch);
                             if stopped_early || status != net::DrainStatus::More {
                                 break;
                             }
                         }
-                        if !batch.is_empty() {
-                            if let Some(peer) = self.peers.get(&generation) {
-                                peer.io.push_front_incoming(&mut batch);
-                            }
-                            batch.clear();
-                        } else if !hit_terminal {
+                        if !restored && !hit_terminal {
                             match status {
                                 net::DrainStatus::Empty => {
                                     drained_incoming = true;
