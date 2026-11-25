@@ -7,13 +7,14 @@ not come is an observation, not a hang.
 """
 from __future__ import annotations
 
-from contextlib import contextmanager
+from contextlib import ExitStack, closing, contextmanager
 import os
 from pathlib import Path
 import re
 import select
 import signal
 import socket
+import sqlite3
 import subprocess
 import time
 
@@ -74,7 +75,7 @@ def stop(child: subprocess.Popen) -> str:
         return "killed"
 
 
-def reference_config(directory: Path, port: int, extra) -> Path:
+def reference_config(directory: Path, port: int, extra, *, persistence="none", data=None, plugin=None) -> Path:
     lines = []
     if os.geteuid() == 0:
         # As root Mosquitto would switch to another account that cannot
@@ -82,6 +83,11 @@ def reference_config(directory: Path, port: int, extra) -> Path:
         lines.append("user root")
     lines += [f"listener {port} {HOST}", "allow_anonymous true", "persistence false", "log_dest stderr",
               "log_timestamp false", *extra]
+    if persistence == "builtin":
+        lines += ["persistence true", f"persistence_location {data}/", "autosave_interval 0"]
+    elif persistence == "sqlite":
+        # The plugin supplies persistence. Leave the built-in snapshot disabled.
+        lines += [f"persistence_location {data}/", f"plugin {plugin}"]
     config = directory / "mosquitto.conf"
     config.write_text("\n".join(lines) + "\n")
     return config
@@ -119,7 +125,8 @@ def tail(path: Path) -> str:
 class Running:
     """One started broker: its port, and after the run how it ended."""
 
-    def __init__(self, port: int):
+    def __init__(self, port: int, pid=None):
+        self.pid = pid
         self.port = port
         self.ended = None       # exited | terminated | killed
         self.returncode = None
@@ -151,7 +158,8 @@ class Running:
 
 
 @contextmanager
-def broker(backend: str, binary: Path, directory: Path, config=()):
+def broker(backend: str, binary: Path, directory: Path, config=(), *, data=None, reopen=False,
+           persistence="none", plugin=None, delivery_shards=0):
     """Run one fresh broker; yields a `Running`.
 
     `binary` is the executable. `directory` must be new: it receives the
@@ -166,12 +174,13 @@ def broker(backend: str, binary: Path, directory: Path, config=()):
         events = work / "events.jsonl"
         if backend == REFERENCE:
             port = free_port()
-            command = [str(binary), "-c", str(reference_config(work, port, config))]
+            command = [str(binary), "-c", str(reference_config(work, port, config, persistence=persistence,
+                                                                data=data, plugin=plugin))]
             marker = r"mosquitto version \S+ running"
         elif backend == BROKER:
             port = None
-            command = [str(binary), "--db", str(work / "broker.sqlite"), "--listen", f"{HOST}:0",
-                       "--events", str(events)]
+            command = [str(binary), "--existing-db" if reopen else "--db", str((data or work) / "broker.sqlite"),
+                       "--listen", f"{HOST}:0", "--events", str(events), "--delivery-shards", str(delivery_shards)]
             marker = r"mqttiumd ready \S+:(\d+)"
         else:
             raise ValueError(backend)
@@ -184,12 +193,15 @@ def broker(backend: str, binary: Path, directory: Path, config=()):
             if found and port is None:
                 port = int(found.group(1))
             if found and accepts(port):
-                running = Running(port)
+                running = Running(port, child.pid)
                 yield running
                 return
             # For the reference, most often the port chosen above was
             # taken in the meantime.
             failure = tail(log)
+            if data is not None:
+                # A failed startup may already have written to the shared store.
+                raise BrokerError(f"{backend} did not become ready: {failure}")
         finally:
             ended = stop(child)
             if running is not None:
@@ -236,8 +248,9 @@ SORT = {False: {}, True: {"sort": True}}
 class Player:
     """Plays the steps of one scenario against one broker."""
 
-    def __init__(self, port: int):
+    def __init__(self, port: int, restart=None):
         self.port = port
+        self.restart = restart
         self.connections: dict[str, Connection] = {}
         # Per connection name, the identifiers of the QoS 1 and QoS 2
         # PUBLISH packets the broker sent, in order of arrival.
@@ -338,6 +351,15 @@ class Player:
                 return got, end
 
     # -- steps --------------------------------------------------------------
+
+    def do_restart(self, step):
+        # Closing clients first would turn a broker-shutdown Will into a
+        # client-disconnection Will and could make a broken restore pass.
+        self.port, witness = self.restart()
+        self.close_all()
+        self.connections.clear()
+        self.deliveries.clear()
+        return {"op": "restart", "reopen": witness}
 
     def do_open(self, step):
         previous = self.connections.pop(step["conn"], None)
@@ -499,7 +521,22 @@ class Player:
         return {"op": "sleep", "seconds": step["seconds"]}
 
 
-def run_scenario(scenario, backend: str, binary: Path, directory: Path):
+def stored_state(backend, persistence, data):
+    """Require the actual backend's store before opening its next generation."""
+    if backend == REFERENCE and persistence == "builtin":
+        database = data / "mosquitto.db"
+        if not database.is_file() or database.stat().st_size == 0:
+            raise BrokerError("Mosquitto did not save its built-in persistence file")
+        return {"file": database.name}
+    database = data / ("broker.sqlite" if backend == BROKER else "mosquitto.sqlite3")
+    with closing(sqlite3.connect(database.as_uri() + "?mode=ro", uri=True)) as db:
+        tables = {name for name, in db.execute("SELECT name FROM sqlite_schema WHERE type='table'")}
+    if not tables or (backend == REFERENCE and not {"clients", "wills", "subscriptions"} <= tables):
+        raise BrokerError(f"missing persistence tables in {database.name}: {sorted(tables)}")
+    return {"file": database.name, "tables": sorted(tables)}
+
+
+def run_scenario(scenario, backend: str, binary: Path, directory: Path, *, delivery_shards=0, plugin=None):
     """Play `scenario` against a fresh broker.
 
     Returns `(transcript, running)`: the raw transcript (every packet
@@ -507,8 +544,33 @@ def run_scenario(scenario, backend: str, binary: Path, directory: Path):
     process, whose `incidents()` say whether it crashed or hung.
     """
     config = scenario.reference_config if backend == REFERENCE else ()
-    with broker(backend, binary, directory, config) as running:
-        transcript = Player(running.port).play(scenario.steps)
+    data = None
+    if scenario.reference_persistence != "none":
+        data = directory / "state"
+        data.mkdir()
+    with ExitStack() as stack:
+        generation = 0
+
+        def start():
+            return stack.enter_context(broker(backend, binary, directory / f"run-{generation}", config,
+                                              data=data, reopen=generation > 0, persistence=scenario.reference_persistence,
+                                              plugin=plugin, delivery_shards=delivery_shards))
+
+        running = start()
+
+        def restart():
+            nonlocal generation, running
+            stack.close()
+            if running.ended != "terminated" or running.returncode != 0 or running.incidents():
+                raise BrokerError(f"{backend} stopped with {running.ended}/{running.returncode}: {running.log_tail}")
+            previous_pid = running.pid
+            store = stored_state(backend, scenario.reference_persistence, data)
+            generation += 1
+            running = start()
+            return running.port, {"previous_pid": previous_pid, "pid": running.pid, "store": store,
+                                  "previous_exit_code": 0, "signal": "SIGTERM"}
+
+        transcript = Player(running.port, restart).play(scenario.steps)
         # A broker that is gone before it is asked to stop did more than
         # answer differently: say so in the transcript too.
         time.sleep(0.02)

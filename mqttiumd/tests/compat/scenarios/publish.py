@@ -2,7 +2,7 @@
 import mqttwire as wire
 from dsl import (ack, collect, connect, disconnect, mark, publish, publish_ack, publish_qos2, publish_sync, quiet, recv,
                  scenario, send, subscribe, tally, until_close)
-from expectations import at, at_most, expectation
+from expectations import CLOSED, at, at_most, expectation
 
 for level in (4, 5):
     v = f"v{level}"
@@ -73,7 +73,12 @@ for level in (4, 5):
         f"publish/empty-topic-name-{v}",
         doc="""A PUBLISH whose Topic Name is empty, with no Topic Alias: it names no topic
         and the connection is closed.""",
-        steps=[connect("a", "p-empty", level=level), publish("a", "", "x", level=level), until_close("a")],
+        steps=[connect("a", "p-empty", level=level), publish("a", "", "x", level=level), until_close("a"),
+               mark("closure")],
+        expectations=[expectation("empty-name-closes", statement=("MQTT-4.7.3-1, MQTT-4.8.0-1" if level == 4
+                                  else "MQTT-4.7.3-1, MQTT-4.13.1-1"),
+                                  requires="The broker closes the connection for an empty Topic Name without an alias.",
+                                  then=[at("closure", {"end": CLOSED})])],
     )
 
 scenario(

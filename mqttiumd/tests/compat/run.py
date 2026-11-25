@@ -83,13 +83,14 @@ def select(names, patterns):
     return sorted(name for name in names if any(fnmatchcase(name, pattern) for pattern in patterns))
 
 
-def play(scenario, binaries: dict, scratch: Path) -> dict:
+def play(scenario, binaries: dict, scratch: Path, *, delivery_shards=0, plugin=None) -> dict:
     """Both normalized transcripts of one scenario, or the error met."""
     out = {"name": scenario.name, "incidents": {}, "fingerprint": None, "raw": {}}
     try:
         for backend in harness.BACKENDS:
             with tempfile.TemporaryDirectory(dir=scratch, prefix="compat-") as directory:
-                raw, running = harness.run_scenario(scenario, backend, binaries[backend], Path(directory))
+                raw, running = harness.run_scenario(scenario, backend, binaries[backend], Path(directory),
+                                                    delivery_shards=delivery_shards, plugin=plugin)
             out["raw"][backend] = raw
             out[backend] = normalize.normalize(raw, scenario)
             kinds = running.incidents()
@@ -265,7 +266,8 @@ def markdown(matrix) -> str:
         f"# Compatibility matrix: mqttiumd against Mosquitto {version}", "",
         "Written by `tests/compat/run.py`: regenerate it with the command in",
         "`tests/compat/README.md` and copy `matrix.md` here; do not edit it by hand.", "",
-        f"- broker: `mqttiumd` built from commit `{matrix['broker']['commit']}`",
+        f"- broker: `mqttiumd` built from commit `{matrix['broker']['commit']}`, "
+        f"with `--delivery-shards {matrix['broker']['delivery_shards']}`",
         f"- reference: Mosquitto {version}, the version `tests/compat/build-reference.sh` builds",
         f"- scenarios played: {len(rows)}" + ("" if matrix["complete"] else " (a partial run)"), "",
         "`same` means equal normalized transcripts on the scenario played, nothing",
@@ -334,6 +336,10 @@ def main(argv=None) -> int:
     parser.add_argument("--reference", type=Path,
                         help="the mosquitto executable, its build directory, or the output directory of "
                              "tests/compat/build-reference.sh")
+    parser.add_argument("--reference-sqlite-plugin", type=Path,
+                        help="built mosquitto_persist_sqlite.so (default: beside the pinned source build)")
+    parser.add_argument("--delivery-shards", type=int, choices=range(17), default=0,
+                        help="mqttiumd delivery shards (default 0)")
     parser.add_argument("--broker", type=Path, help="the mqttiumd executable")
     parser.add_argument("--out", type=Path, default=HERE.parents[1] / "target/compat",
                         help="directory for matrix.md, matrix.json and the transcripts")
@@ -365,6 +371,12 @@ def main(argv=None) -> int:
     if version != harness.MOSQUITTO_VERSION:
         parser.error(f"the reference is Mosquitto {version}; divergences.json is written against "
                      f"{harness.MOSQUITTO_VERSION}")
+    plugin = None
+    if any(registry[name].reference_persistence == "sqlite" for name in names):
+        plugin = (args.reference_sqlite_plugin or reference.parents[1]
+                  / "plugins/persist-sqlite/mosquitto_persist_sqlite.so").resolve()
+        if not plugin.is_file():
+            parser.error(f"missing Mosquitto SQLite persistence plugin: {plugin}")
     binaries = {harness.REFERENCE: reference, harness.BROKER: broker}
     divergences_path = HERE / "divergences.json"
     try:
@@ -381,7 +393,8 @@ def main(argv=None) -> int:
     started = time.monotonic()
     with tempfile.TemporaryDirectory(prefix="mqttiumd-compat-") as scratch:
         with ThreadPoolExecutor(max_workers=max(1, args.jobs)) as pool:
-            results = list(pool.map(lambda name: play(registry[name], binaries, Path(scratch)), names))
+            results = list(pool.map(lambda name: play(registry[name], binaries, Path(scratch),
+                                                      delivery_shards=args.delivery_shards, plugin=plugin), names))
     elapsed = time.monotonic() - started
 
     if args.update_fingerprints:
@@ -431,8 +444,9 @@ def main(argv=None) -> int:
     problems.sort()
     summary = summarize(rows)
     matrix = {"format": FORMAT,
-              "reference": {"version": version, "sha256": sha256(reference)},
-              "broker": {"commit": broker_commit(), "sha256": sha256(broker)},
+              "reference": {"version": version, "sha256": sha256(reference),
+                            "sqlite_plugin_sha256": sha256(plugin) if plugin else None},
+              "broker": {"commit": broker_commit(), "sha256": sha256(broker), "delivery_shards": args.delivery_shards},
               "complete": not args.only, "scenario_count": len(rows), "summary": summary,
               "problems": [list(item) for item in problems], "incidents": incidents,
               "expectations": expected, "expectation_summary": summarize_expectations(expected), "counts": counts,

@@ -190,6 +190,8 @@ def normalize(transcript, scenario) -> list:
     identifiers: dict[str, BrokerIdentifiers] = {}
     for record in out:
         record.pop("mark", None)
+        if record["op"] == "restart":
+            record.pop("reopen")  # backend-specific evidence remains in the raw transcript
         if record.pop("sort", False):
             record["got"].sort(key=packet_order)
         if scenario.closure == "any" and record.get("end") in CLOSED:

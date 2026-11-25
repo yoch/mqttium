@@ -156,10 +156,12 @@ class Expectation:
     then: tuple         # ((mark, pattern), ...): all must hold
     when: tuple = ()    # ((mark, pattern), ...): unless all hold, not applicable
 
+    same_packet_id: tuple = ()  # two (mark, index in got) references, compared on raw packets
+
     @property
     def marks(self) -> tuple:
         """The records it reads, in order, each once."""
-        return tuple(dict.fromkeys(mark for mark, _ in (*self.when, *self.then)))
+        return tuple(dict.fromkeys(mark for mark, _ in (*self.when, *self.then, *self.same_packet_id)))
 
 
 def at(mark: str, pattern) -> tuple:
@@ -167,7 +169,7 @@ def at(mark: str, pattern) -> tuple:
     return mark, pattern
 
 
-def expectation(name, *, statement, requires, then, when=()) -> Expectation:
+def expectation(name, *, statement, requires, then, when=(), same_packet_id=()) -> Expectation:
     """An expectation of a scenario; `dsl.scenario(..., expectations=[...])`."""
     if not isinstance(name, str) or not name or "#" in name:
         raise ValueError(f"{name!r}: an expectation is named without `#`")
@@ -178,7 +180,10 @@ def expectation(name, *, statement, requires, then, when=()) -> Expectation:
         raise ValueError(f"{name}: `statement` cites no statement identifier such as MQTT-3.1.4-2")
     if not then:
         raise ValueError(f"{name}: `then` names at least one record")
-    return Expectation(name=name, statement=statement, requires=requires, then=tuple(then), when=tuple(when))
+    if same_packet_id and (len(same_packet_id) != 2 or any(type(i) is not int or i < 0 for _, i in same_packet_id)):
+        raise ValueError(f"{name}: same_packet_id needs two (mark, nonnegative packet index) pairs")
+    return Expectation(name=name, statement=statement, requires=requires, then=tuple(then), when=tuple(when),
+                       same_packet_id=tuple(same_packet_id))
 
 
 def declared(registry: dict) -> dict:
@@ -262,7 +267,14 @@ def evaluate(item: Expectation, transcript) -> tuple:
     observed = "; ".join(f"{mark}: {show(records.get(mark), properties)}" for mark in marks)
     if not applies:
         return NOT_APPLICABLE, observed
-    return (PASS if hold(item.then) else FAIL), observed
+    passed = hold(item.then)
+    if passed and item.same_packet_id:
+        found = []
+        for mark, index in item.same_packet_id:
+            got = records.get(mark, {}).get("got", [])
+            found.append(got[index].get("packet_id") if index < len(got) else None)
+        passed = type(found[0]) is int and found[0] == found[1]
+    return (PASS if passed else FAIL), observed
 
 
 # -- the list of open expectations and the verdict ------------------------------

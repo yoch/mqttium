@@ -51,13 +51,14 @@ class Scenario:
     closure: str = "exact"
     # What the specification requires of mqttiumd here (expectations.py).
     expectations: tuple = ()
+    reference_persistence: str = "none"
 
 
 REGISTRY: dict[str, Scenario] = {}
 
 
 def scenario(name, *, doc, steps, version=None, reference_config=(), buckets=None, capabilities=False,
-             closure="exact", expectations=()) -> Scenario:
+             closure="exact", expectations=(), reference_persistence="none") -> Scenario:
     """Register a scenario.
 
     `name` is `area/what-vN`: the suffix `-v4` or `-v5` gives the protocol
@@ -95,6 +96,10 @@ def scenario(name, *, doc, steps, version=None, reference_config=(), buckets=Non
                 flat.append(item)
 
     flatten(steps)
+    if reference_persistence not in ("none", "builtin", "sqlite"):
+        raise ValueError(f"{name}: unsupported reference persistence {reference_persistence!r}")
+    if any(step["op"] == "restart" for step in flat) and reference_persistence == "none":
+        raise ValueError(f"{name}: restart requires reference persistence")
     marks = {step["mark"] for step in flat if "mark" in step}
     expectations = tuple(expectations)
     if len({item.name for item in expectations}) != len(expectations):
@@ -105,7 +110,7 @@ def scenario(name, *, doc, steps, version=None, reference_config=(), buckets=Non
                              f"{sorted(set(item.marks) - marks)}")
     entry = Scenario(name=name, area=area, version=version, doc=" ".join(doc.split()), steps=tuple(flat),
                      reference_config=tuple(reference_config), buckets=buckets or {}, capabilities=capabilities,
-                     closure=closure, expectations=expectations)
+                     closure=closure, expectations=expectations, reference_persistence=reference_persistence)
     REGISTRY[name] = entry
     return entry
 
@@ -118,6 +123,11 @@ def persistent(level, expiry=3600) -> dict:
 
 
 # -- primitive steps --------------------------------------------------------
+
+def restart():
+    """Stop the broker with clients still connected and reopen the same data."""
+    return {"op": "restart"}
+
 
 def open_(conn, level=4):
     """Open the TCP connection `conn`; `level` is how its input is decoded."""

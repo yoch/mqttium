@@ -286,7 +286,7 @@ jobs:
       - name: Install the build dependency of the reference
         run: |
           sudo apt-get update
-          sudo apt-get install --yes --no-install-recommends libcjson-dev
+          sudo apt-get install --yes --no-install-recommends libcjson-dev libsqlite3-dev
       # Downloads the pinned source archive, checks its digest and builds it.
       - name: Build the Mosquitto reference
         run: sh tests/compat/build-reference.sh "$RUNNER_TEMP/mosquitto-reference"

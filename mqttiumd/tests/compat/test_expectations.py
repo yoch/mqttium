@@ -467,6 +467,67 @@ CASES[LIMIT] = {
 }
 
 
+# Expected packets are built independently from the scenario definitions.
+RESTART_STATEMENTS = {}
+for version in (4, 5):
+    name = f"publish/empty-topic-name-v{version}#empty-name-closes"
+    CASES[name] = {PASS: [[closed_with("closure")], [closed_with("closure", end="reset")]],
+                   FAIL: [[closed_with("closure", end="still-open")]]}
+    RESTART_STATEMENTS[name] = {"MQTT-4.7.3-1", "MQTT-4.8.0-1" if version == 4 else "MQTT-4.13.1-1"}
+    resume = record("resume", wire.connack(True, level=version), level=version)
+    eight = [wire.publish("ninth/t", f"m{i}", level=version) for i in range(1, 9)]
+    nine = [*eight, wire.publish("ninth/t", "m9", level=version)]
+    eighth = silent("deliveries", *reversed(eight), level=version)
+    all_nine = silent("deliveries", *nine, level=version)
+    name = f"session/ninth-exchange-after-reconnection-v{version}#resumed-exchanges"
+    CASES[name] = {PASS: [[resume, eighth], [resume, all_nine]],
+                   FAIL: [[resume, silent("deliveries", *eight[:-1], eight[0], level=version)]]}
+    RESTART_STATEMENTS[name] = {"MQTT-4.3.3-2" if version == 4 else "MQTT-4.3.3-8", "MQTT-4.5.0-1"}
+    if version == 4:
+        name = "session/ninth-exchange-after-reconnection-v4#accepted-ninth"
+        received = record("ninth", wire.pubrec(9), op="until_close", end="still-open", level=4)
+        CASES[name] = {PASS: [[received, all_nine]], FAIL: [[received, eighth]],
+                       NOT_APPLICABLE: [[closed_with("ninth"), eighth]]}
+        RESTART_STATEMENTS[name] = {"MQTT-4.3.3-2", "MQTT-4.5.0-1"}
+    else:
+        name = "session/ninth-exchange-after-reconnection-v5#quota-closure"
+        CASES[name] = {PASS: [[closed_with("ninth"), eighth]],
+                       FAIL: [[closed_with("ninth", end="still-open"), eighth], [closed_with("ninth"), all_nine]]}
+        RESTART_STATEMENTS[name] = {"MQTT-3.3.4-7", "MQTT-4.13.1-1"}
+
+resumed = wire.connack(True, level=5)
+fresh = wire.connack(False, level=5)
+for code, reason in ((0, "normal"), (4, "with-will"), (128, "unspecified-error"), (131, "implementation-error")):
+    name = f"will/disconnect-{reason}-expiry-zero-v5#will-and-session"
+    sent = silent("will", wire.publish(f"willr{code:02x}/t", "gone", level=5), level=5)
+    suppressed = silent("will", level=5)
+    expected, wrong = (suppressed, sent) if code == 0 else (sent, suppressed)
+    CASES[name] = {PASS: [[expected, record("resume", fresh)]], FAIL: [[wrong, record("resume", fresh)],
+                                                                        [expected, record("resume", resumed)]]}
+    RESTART_STATEMENTS[name] = {"MQTT-3.1.2-8", "MQTT-3.14.4-3", "MQTT-3.2.2-3"}
+
+name = "session/redelivery-pubrel-after-expiry-v5#resume-pubrel"
+first_release = record("first-release", wire.pubrel(17, level=5))
+completed = silent("completed", level=5)
+CASES[name] = {PASS: [[first_release, record("resume", resumed, wire.pubrel(17, level=5)), completed]],
+               FAIL: [[first_release, record("resume", resumed, wire.pubrel(18, level=5)), completed],
+                      [first_release, record("resume", resumed, end="timeout"), completed]]}
+RESTART_STATEMENTS[name] = {"MQTT-4.4.0-1", "MQTT-4.3.3-7", "MQTT-4.3.3-13"}
+
+for ticket, topic, body in ((3759, "restart/offline", "queued"), (3760, "restart/will", "shutdown")):
+    name = f"session/restart-{ticket}-v5#persistent-delivery"
+    setup = [record("fresh", fresh), record("subscribed", wire.suback(1, [1], level=5)),
+             record("accepted", wire.puback(1, level=5)) if ticket == 3759 else record("owner", fresh)]
+    delivery = wire.publish(topic, body, level=5, qos=1, packet_id=7)
+    delivered = record("delivery", delivery)
+    quiet = silent("complete", level=5)
+    CASES[name] = {PASS: [[*setup, record("resumed", resumed), delivered, quiet]],
+                   FAIL: [[*setup, record("resumed", fresh), record("delivery", end="timeout"), quiet],
+                          [*setup, record("resumed", resumed), delivered, silent("complete", delivery, level=5)]]}
+    RESTART_STATEMENTS[name] = {"MQTT-3.1.2-23", "MQTT-3.2.2-3",
+                                "MQTT-4.5.0-1" if ticket == 3759 else "MQTT-3.1.2-10"}
+
+
 class Repository(unittest.TestCase):
     """The expectations checked in, whatever the brokers do."""
 
@@ -488,7 +549,7 @@ class Repository(unittest.TestCase):
                     for version in (4, 5) for name in ("granted", "effective")},
                  **{f"subscribe/unsubscribe-nine-filters-v{version}#{name}": {"MQTT-3.10.4-6"}
                     for version in (4, 5) for name in ("acknowledged", "effective")},
-                 LIMIT: {"MQTT-4.13.1-1"}}
+                 **RESTART_STATEMENTS, LIMIT: {"MQTT-4.13.1-1"}}
         self.assertEqual(sorted(cited), sorted(CASES))
         for name, statements in cited.items():
             found = {match.group(0) for match in classify.STATEMENT.finditer(self.declared[name].statement)}

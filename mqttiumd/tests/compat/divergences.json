@@ -128,6 +128,22 @@
     "fingerprint": "6a35aa4e4020a164"
   },
   {
+    "id": "session/restart-3759-v5",
+    "class": "reference-nonconformant",
+    "difference": "With built-in persistence and a session created with Clean Start 1 and expiry 600, Mosquitto returns Session Present 0 after restart and sends no queued QoS 1 message (upstream ticket 3759).",
+    "statement": "MQTT-3.1.2-23, MQTT-3.2.2-3 and MQTT-4.5.0-1: the unexpired session and its queued message survive the disconnection",
+    "mqttiumd": "Reopens the same store, returns Session Present 1 and delivers the queued message.",
+    "fingerprint": "7a11442e54ee1583"
+  },
+  {
+    "id": "session/restart-3760-v5",
+    "class": "reference-nonconformant",
+    "difference": "With persist-sqlite, Mosquitto delivers the Will of a client connected at broker shutdown twice after restart, with distinct Packet Identifiers and DUP 0 (upstream ticket 3760).",
+    "statement": "MQTT-3.1.2-8 and MQTT-3.1.2-10: the Will is published after the connection closes and removed from stored Session State once published",
+    "mqttiumd": "Delivers one queued Will after the subscriber resumes and receives its PUBACK.",
+    "fingerprint": "73e5e40659b121c8"
+  },
+  {
     "id": "subscribe/invalid-empty-filter-v5",
     "class": "unspecified",
     "difference": "Both close the connection on the invalid Topic Filter; Mosquitto with DISCONNECT 0x81 (Malformed Packet), mqttiumd with DISCONNECT 0x82 (Protocol Error).",

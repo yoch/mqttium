@@ -28,6 +28,26 @@ import run  # noqa: E402
 import scenarios  # noqa: E402,F401  (fills dsl.REGISTRY)
 
 
+class Restart(unittest.TestCase):
+    def test_restart_stops_before_dropping_transport_and_forgets_delivery_ids(self):
+        left, right = socket.socketpair()
+        self.addCleanup(right.close)
+        self.addCleanup(left.close)
+
+        def restart():
+            self.assertGreaterEqual(left.fileno(), 0)
+            return 12345, {"file": "store"}
+
+        player = harness.Player(10, restart=restart)
+        player.connections["old"] = harness.Connection(left, 5)
+        player.deliveries["old"] = [7]
+        self.assertEqual(player.play([dsl.restart()]), [{"op": "restart", "reopen": {"file": "store"}}])
+        self.assertEqual(player.port, 12345)
+        self.assertEqual(left.fileno(), -1)
+        self.assertEqual(player.connections, {})
+        self.assertEqual(player.deliveries, {})
+
+
 class Codec(unittest.TestCase):
     def test_connect_with_will_and_properties_round_trips(self):
         data = wire.connect("c", level=5, clean=False, keepalive=7, username="u", password=b"p",

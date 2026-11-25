@@ -27,7 +27,7 @@ Python 3.11 or later, standard library only.
 
 ```bash
 cd mqttiumd
-sh tests/compat/build-reference.sh /tmp/mosquitto-reference    # once; needs a C toolchain, OpenSSL and cJSON headers
+sh tests/compat/build-reference.sh /tmp/mosquitto-reference    # once; needs a C toolchain, OpenSSL, cJSON and SQLite headers
 cargo build --release -p mqttiumd --locked
 python3 tests/compat/run.py \
     --reference /tmp/mosquitto-reference \
@@ -42,7 +42,12 @@ scenarios whose id matches, `--list` prints them, `-v` prints each
 difference and the result of each expectation, `--jobs N` plays N
 scenarios at once (default 4). The whole bench takes about 40 seconds.
 The reference is the subject of record 0062; on Debian and Ubuntu the
-headers are in `libssl-dev` and `libcjson-dev`.
+headers are in `libssl-dev`, `libcjson-dev` and `libsqlite3-dev`.
+The build includes the bundled SQLite persistence plugin. The runner locates it
+in the build tree or takes an explicit `--reference-sqlite-plugin PATH`. When
+the corpus uses it, `matrix.json` records its SHA-256 alongside the binaries.
+Set `--delivery-shards N` to run the same corpus against another mqttiumd
+configuration. Use a distinct output directory per run.
 
 The output directory receives:
 
@@ -189,11 +194,9 @@ mqttiumd is known to fail:
 ```
 
 sorted by `id`. Fixing the broker makes the entry stale, and the run fails
-until the entry is removed in the change that fixes it. Twenty-one
-expectations are declared: fourteen on SUBSCRIBE and UNSUBSCRIBE, two on
-the content of the retained store, four on a delivery larger than the
-subscriber's Maximum Packet Size, one on a packet larger than the
-announced Maximum Packet Size. None is open on the broker of `MATRIX.md`.
+until the entry is removed in the change that fixes it. The matrix lists the complete set and its results. These checks cover
+subscriptions, retained messages, negotiated packet and flow limits, empty
+topic names, Wills, session resumption and redelivery across a broker restart.
 
 An expectation states what conformance requires, not what Mosquitto does
 and not what mqttiumd does today; write it from the statement, give every
@@ -341,7 +344,7 @@ message. Its active evidence is:
 ## What the bench does not show
 
 - **Conformance.** Only the points that carry an expectation are checked
-  against the specification: twenty-one today. Everywhere else, scenarios on which
+  against the specification. Elsewhere, scenarios on which
   both brokers agree are not checked against it, and a classified
   difference rests on the reading of the person who classified it.
 - **The network below TCP's interface.** `eof` and `reset` are what the
@@ -351,10 +354,14 @@ message. Its active evidence is:
 - **Configuration.** Both brokers run with their defaults: anonymous
   access, no password file, no ACL, no TLS, no WebSocket, plain TCP on
   loopback. Five scenarios set one limit of the reference
-  (`reference_config`).
-- **Durability.** The reference runs with `persistence false` and no
-  broker is restarted or killed during a scenario. Crash recovery belongs
-  to the core tier.
+  (`reference_config`). The restart scenarios configure persistence.
+- **Durability.** Two scenarios perform a graceful restart. Upstream ticket
+  3759 uses Mosquitto's snapshot persistence. Ticket 3760 uses its bundled
+  SQLite plugin, whose schema the runner checks before reopening it. The
+  runner sends SIGTERM with client sockets still open, waits for clean exit
+  and reuses the same data directory. mqttiumd reopens with `--existing-db`
+  and a fresh event file. The other scenarios use isolated fresh stores.
+  A separate crash-recovery campaign exercises abrupt process termination.
 - **A single node, a few clients.** No load, no throughput, no latency, no
   bridge, no cluster.
 - **Timing.** Nothing is timed. Behaviour that is defined by a duration is

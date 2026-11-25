@@ -1,6 +1,7 @@
 """Will messages: QoS 0/1/2, retain, abrupt close, DISCONNECT with and without Will, takeover."""
 import mqttwire as wire
-from dsl import (ack, close, collect, connect, disconnect, publish_sync, quiet, recv, scenario, send, subscribe)
+from dsl import (ack, close, collect, connect, disconnect, mark, publish_sync, quiet, recv, scenario, send, subscribe)
+from expectations import at, expectation
 
 
 def acknowledge(conn, qos):
@@ -89,9 +90,17 @@ for reason, name in ((0x00, "normal"), (0x04, "with-will"), (0x80, "unspecified-
                     will={"topic": f"willr{reason:02x}/t", "payload": "gone", "qos": 1}),
             send("w", wire.disconnect(level=5, reason=reason, props={"session_expiry_interval": 0})),
             close("w", wait_peer=1.0),
-            collect("sub"),
+            collect("sub"), mark("will"),
             connect("w", f"w-dr{reason:02x}", level=5, clean=False, props={"session_expiry_interval": 60}),
+            mark("resume"),
         ],
+        expectations=[expectation(
+            "will-and-session", statement="MQTT-3.1.2-8, MQTT-3.14.4-3, MQTT-3.2.2-3",
+            requires=("Normal DISCONNECT discards the Will and expiry zero ends the session." if reason == 0 else
+                      "The client receives the Will and expiry zero ends the publishing session."),
+            then=[at("will", {"got": [] if reason == 0 else [{"type": "PUBLISH", "topic": f"willr{reason:02x}/t",
+                                                              "payload": "gone", "qos": 0}], "end": "quiet"}),
+                  at("resume", {"got": [{"type": "CONNACK", "session_present": False, "reason": 0}], "end": "ok"})])],
     )
 
 scenario(
