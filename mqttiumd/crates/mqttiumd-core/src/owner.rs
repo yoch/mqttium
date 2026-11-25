@@ -72,7 +72,7 @@ mod will;
 pub use sessions::SessionStatus;
 pub use shard::{
     DelegatedClaim, DelegatedInlineBatch, DelegatedQos0Batch, DelegatedQos0Target,
-    InlineClaimOracle, ShardLimits, ShardStepOutcome,
+    InlineClaimOracle, ShardAckProgress, ShardLimits, ShardStepOutcome,
 };
 pub use will::{WillDeferredReason, WillStatus};
 

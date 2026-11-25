@@ -4118,6 +4118,7 @@ impl Owner {
                     return Err(stale);
                 }
                 self.pubsub.deliveries.mutate(slot, |d| {
+                    d.early_puback = false;
                     d.early_pubrec = None;
                     d.phase = Phase::FinishPending(in_flight);
                 });
@@ -4325,6 +4326,7 @@ impl Owner {
                     match follow_up.map(|b| *b) {
                         None => d.phase = Phase::AwaitPuback,
                         Some(StartFollowUp::Finish(in_flight)) => {
+                            d.early_puback = false;
                             d.early_pubrec = None;
                             d.phase = Phase::FinishPending(in_flight);
                         }
@@ -6425,6 +6427,80 @@ mod tests {
     }
 
     #[test]
+    fn closing_shard_with_early_puback_requires_a_reported_first_byte() {
+        use crate::owner::ShardAckProgress;
+
+        let mut owner = world();
+        message_clock(&mut owner, 10);
+        let (frame, key, pi) = message_frame(&mut owner, 0);
+        assert!(message_puback(&mut owner, key, pi).is_empty());
+        assert!(message_progress(&mut owner, frame, key, FrameProgress::Failed).is_empty());
+        assert_eq!(owner.shard_ack_progress(key), ShardAckProgress::Settled);
+        owner
+            .shard_detach_session(key.session, key.generation)
+            .unwrap();
+        let current = ConnectionKey {
+            session: TARGET,
+            generation: ConnectionGeneration::new(11),
+        };
+        let revision = owner.pubsub.deliveries.row(0).revision;
+        owner
+            .shard_attach_session(TARGET, revision, current.generation, 8, 65536)
+            .unwrap();
+        let replay = apply(&mut owner, Input::WorkAvailable { session: TARGET });
+        let replay = replay
+            .into_iter()
+            .find_map(|(id, e)| {
+                matches!(e, Effect::EmitPublish { packet_id, .. } if packet_id == pi).then_some(id)
+            })
+            .expect("same packet identifier on the resumed session");
+        let (id, started) = message_command(message_progress(
+            &mut owner,
+            replay,
+            current,
+            FrameProgress::Started,
+        ));
+        assert!(
+            known(&mut owner, id, &started).is_empty(),
+            "the new transmission requires its own PUBACK"
+        );
+        let (id, finish) = message_command(message_puback(&mut owner, current, pi));
+        assert!(known(&mut owner, id, &finish).is_empty());
+    }
+
+    #[test]
+    fn closing_shard_settles_a_certainly_rejected_early_finish() {
+        use crate::owner::ShardAckProgress;
+
+        let mut owner = world();
+        message_clock(&mut owner, 10);
+        let (frame, key, pi) = message_frame(&mut owner, 0);
+        assert!(message_puback(&mut owner, key, pi).is_empty());
+        let (start_id, start) = message_command(message_progress(
+            &mut owner,
+            frame,
+            key,
+            FrameProgress::Started,
+        ));
+        let (id, finish) = message_command(known(&mut owner, start_id, &start));
+        assert_eq!(owner.shard_ack_progress(key), ShardAckProgress::Waiting);
+        let effects = apply(
+            &mut owner,
+            Input::StoreResult {
+                effect: id,
+                operation: finish.recipe.operation(),
+                reply: StoreReply::Outcome(StoreOutcome::RejectedCertain(RejectReason::Fenced)),
+            },
+        );
+        assert!(
+            effects
+                .iter()
+                .any(|(_, e)| matches!(e, Effect::CloseConnection { .. }))
+        );
+        assert_eq!(owner.shard_ack_progress(key), ShardAckProgress::Settled);
+    }
+
+    #[test]
     fn message_expiry_puback_before_started_is_held_through_unknown_marker_and_expiration() {
         let mut owner = world();
         message_clock(&mut owner, 10);
@@ -6457,6 +6533,10 @@ mod tests {
         ));
         assert!(
             matches!(started.recipe.get(), Recipe::MarkDeliveryStarted(mark) if mark.claim == target.claim && mark.delivery == target.delivery)
+        );
+        assert_eq!(
+            owner.shard_ack_progress(key),
+            crate::owner::ShardAckProgress::Waiting
         );
         let operation = started.recipe.operation();
         assert!(
@@ -6497,6 +6577,10 @@ mod tests {
             owner.pubsub.free_packet_id(TARGET, 1),
             None,
             "marker_result_freed_pi"
+        );
+        assert_eq!(
+            owner.shard_ack_progress(key),
+            crate::owner::ShardAckProgress::Waiting
         );
         assert!(known(&mut owner, finish_effect, &finish).is_empty());
         assert!(owner.pubsub.deliveries.is_empty());

@@ -41,6 +41,14 @@ pub struct ShardLimits {
     pub max_payload_bytes: PayloadBytes,
 }
 
+/// Progress required for this generation's already observed delivery ACKs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ShardAckProgress {
+    Settled,
+    Waiting,
+    WorkReady,
+}
+
 /// External lease oracle consulted by a Coordinator owner when outgoing
 /// deliveries are delegated to separate resident `DeliveryShard` owners.
 ///
@@ -321,28 +329,44 @@ impl Owner {
         Ok(())
     }
 
-    /// Whether an ACK observed on this generation still needs its store
-    /// transition. An early ACK may be waiting for the durable start marker.
-    /// Only the closing path pays for walking the session's delivery index.
-    #[must_use]
-    pub fn shard_ack_pending(&self, connection: ConnectionKey) -> bool {
-        self.connection_of(connection.session) == Some(connection.generation)
-            && self
-                .pubsub
-                .deliveries
-                .session(connection.session)
-                .is_some_and(|session| {
-                    session.all.iter().any(|index| {
-                        let delivery = self.pubsub.deliveries.row(index);
-                        !delivery.retired
-                            && (delivery.early_puback
-                                || delivery.early_pubrec.is_some()
-                                || matches!(
-                                    delivery.phase,
-                                    Phase::FinishPending(_) | Phase::PubrelPending(_)
-                                ))
-                    })
-                })
+    /// Called only after the stopped transport's observations have been applied.
+    /// An expiring delivery can complete an early PUBACK only if its first
+    /// byte was reported. An unresolved start already has a store command or
+    /// a retry, while no later first-byte report can arrive for this generation.
+    pub fn shard_ack_progress(&self, connection: ConnectionKey) -> ShardAckProgress {
+        if self
+            .connection_of(connection.session)
+            .is_some_and(|live| live != connection.generation)
+        {
+            return ShardAckProgress::Settled;
+        }
+        let Some(session) = self.pubsub.deliveries.session(connection.session) else {
+            return ShardAckProgress::Settled;
+        };
+        let mut progress = ShardAckProgress::Settled;
+        for index in session.all.iter() {
+            let d = self.pubsub.deliveries.row(index);
+            if d.retired {
+                continue;
+            }
+            let early = d.early_puback || d.early_pubrec.is_some();
+            match d.phase {
+                Phase::FinishPending(_) | Phase::PubrelPending(_) => {
+                    progress = ShardAckProgress::Waiting;
+                }
+                Phase::StartPending(_) if early => progress = ShardAckProgress::Waiting,
+                Phase::StartRetry | Phase::AwaitPuback
+                    if early && d.control_ready(self.message_now) =>
+                {
+                    if self.receipts.control_available() {
+                        return ShardAckProgress::WorkReady;
+                    }
+                    progress = ShardAckProgress::Waiting;
+                }
+                _ => {}
+            }
+        }
+        progress
     }
 
     /// Detaches `connection` from `session` on a `DeliveryShard` owner while
@@ -352,6 +376,29 @@ impl Owner {
         session: SessionId,
         connection: ConnectionGeneration,
     ) -> Result<(), CoreFault> {
+        if self
+            .connection_of(session)
+            .is_none_or(|live| live == connection)
+            && let Some(rows) = self.pubsub.deliveries.session(session)
+        {
+            // Without a first byte on the old transport, an early PUBACK
+            // cannot be paired with the first byte of a later retransmission.
+            let stale: Vec<_> = rows
+                .all
+                .iter()
+                .filter(|&index| {
+                    let d = self.pubsub.deliveries.row(index);
+                    d.early_puback
+                        && matches!(d.phase, Phase::AwaitPuback)
+                        && d.claim.is_some_and(|claim| !claim.started)
+                })
+                .collect();
+            for index in stale {
+                self.pubsub
+                    .deliveries
+                    .mutate(index, |d| d.early_puback = false);
+            }
+        }
         self.pubsub.close(connection);
         if let Some(&idx) = self.session_by_id.get(&session)
             && self.sessions.as_slice()[idx].connection == Some(connection)

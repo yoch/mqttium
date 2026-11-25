@@ -37,7 +37,7 @@ use mqttiumd_contract::pubsub::{PubackTarget, Qos0DropReason, Qos0Origin};
 use mqttiumd_contract::step::{StepOutcome, TurnGrant};
 use mqttiumd_core::owner::{
     DelegatedClaim, DelegatedInlineBatch, DelegatedQos0Batch, DelegatedQos0Target,
-    InlineClaimOracle, Owner, OwnerConfig, ShardLimits, ShardStepOutcome,
+    InlineClaimOracle, Owner, OwnerConfig, ShardAckProgress, ShardLimits, ShardStepOutcome,
 };
 use mqttiumd_store_api::ReadPhase;
 use serde_json::json;
@@ -1225,15 +1225,30 @@ impl DeliveryShardWorker {
         }
         // The reactor task has already finished. No later packet or write
         // report can enter behind this generation's final observation.
-        let ready: Vec<_> = self.pending_detaches.keys().copied().filter(|key| {
-            !self.io_inbox.has_events_for(key.generation)
-                && !self.ack_inputs.iter().any(|(input, _)| matches!(input,
-                    Input::ObservedPuback {connection,..} | Input::ObservedQos2Ack {connection,..} if connection == key))
-                && !self.terminal_inputs.iter().any(|input| matches!(input,
-                    Input::FrameResult {connection,..} | Input::Qos0EmitRefused {connection,..} if connection == key))
-                && !self.owner.shard_ack_pending(*key)
-        }).collect();
-        for key in ready {
+        let mut actionable = Vec::new();
+        for &key in self.pending_detaches.keys() {
+            let io_pending = self.sessions.get(&key.session).is_some_and(|session| {
+                session.generation == key.generation
+                    && (session.outgoing.pending_shard_acks() != 0
+                        || session.outgoing.pending_shard_written() != 0)
+            });
+            let terminal_pending = self.terminal_inputs.iter().any(|input| {
+                matches!(input,
+                Input::FrameResult {connection,..} | Input::Qos0EmitRefused {connection,..}
+                    if *connection == key)
+            });
+            if !io_pending && !terminal_pending {
+                let progress = self.owner.shard_ack_progress(key);
+                if progress != ShardAckProgress::Waiting {
+                    actionable.push((key, progress));
+                }
+            }
+        }
+        for (key, progress) in actionable {
+            if progress == ShardAckProgress::WorkReady {
+                self.queue_work(key.session);
+                continue;
+            }
             let (dirty_seq, completed) =
                 self.pending_detaches.remove(&key).expect("selected fence");
             self.cleanup_generation_state(key.generation);
