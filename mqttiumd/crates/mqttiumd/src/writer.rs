@@ -835,7 +835,17 @@ impl Writer {
         extra_owners: usize,
     ) -> Result<Self, Failure> {
         let _ = &hooks;
-        if hooks.directory.is_some() && storage_mode != StorageMode::Durable {
+        let log_cuts = storage_mode == StorageMode::Log
+            && !hooks.pause.is_empty()
+            && hooks.pause.iter().all(|point| {
+                matches!(
+                    point.as_str(),
+                    "log.will.end.before_append"
+                        | "log.will.end.before_sync"
+                        | "log.will.end.after_sync"
+                )
+            });
+        if hooks.directory.is_some() && storage_mode != StorageMode::Durable && !log_cuts {
             return Err(Failure::plain("volatile_test_hooks_unsupported"));
         }
         // The worker waits on `requests` when all request lanes are empty.
@@ -1858,11 +1868,15 @@ fn effect_response(
                     "MessageExpire" => "message.delivery.expire.prepared",
                     _ => "finish.prepared",
                 };
-                // The hook is inside the actual transaction, after all writes and before COMMIT.
                 let hook = Box::new(move |p| {
-                    if p == mqttiumd_store_sqlite::kill_points::KillPoint::CommitPrepared
-                        && hc.barrier(point, kind, id, &ev, &stop).is_err()
-                    {
+                    use mqttiumd_store_sqlite::kill_points::KillPoint;
+                    let point = match p {
+                        KillPoint::CommitPrepared => point,
+                        // SQLite invokes its WAL hook inside COMMIT after the WAL commit.
+                        KillPoint::CommitLogged if kind == "WillEnd" => "will.end.logged",
+                        KillPoint::CommitLogged => return,
+                    };
+                    if hc.barrier(point, kind, id, &ev, &stop).is_err() {
                         stop.store(true, Ordering::Relaxed);
                     }
                 });
@@ -1882,7 +1896,29 @@ fn effect_response(
                     let _ = events.emit("receipt_replay_captured",json!({"command_kind":"Admission","operation":operation(id),"details":{"publication":identity_text(a.publication.incarnation().get(),a.publication.epoch().get(),a.publication.owner().get(),a.publication.sequence().get()),"payload":identity_text(a.payload.id.incarnation().get(),a.payload.id.epoch().get(),a.payload.id.owner().get(),a.payload.id.sequence().get())}}));
                 }
             }
+            #[cfg(feature = "test-hooks")]
+            if let StoreBackend::Log(log) = store
+                && kind == "WillEnd"
+                && hooks.directory.is_some()
+            {
+                let (hooks, events, cancel) = (hooks.clone(), events.clone(), cancel.clone());
+                log.set_write_hook(Some(Box::new(move |point| {
+                    use mqttiumd_store_volatile::log::LogWritePoint;
+                    let name = match point {
+                        LogWritePoint::BeforeAppend => "log.will.end.before_append",
+                        LogWritePoint::BeforeSync => "log.will.end.before_sync",
+                        LogWritePoint::AfterSync => "log.will.end.after_sync",
+                    };
+                    if hooks.barrier(name, kind, id, &events, &cancel).is_err() {
+                        cancel.store(true, Ordering::Relaxed);
+                    }
+                })));
+            }
             let applied = store.apply(&command);
+            #[cfg(feature = "test-hooks")]
+            if let StoreBackend::Log(log) = store {
+                log.set_write_hook(None);
+            }
             record_applied(recipe, &applied, events, cancel);
             #[cfg(feature = "test-hooks")]
             {

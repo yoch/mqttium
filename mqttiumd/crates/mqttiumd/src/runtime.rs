@@ -4212,6 +4212,15 @@ impl Runtime<'_> {
             {
                 peer.set_closing(("session_taken_over", Instant::now()));
                 self.pending_peers.insert(old);
+                #[cfg(feature = "test-hooks")]
+                if self.hooks.directory.is_some() {
+                    self.events
+                        .emit(
+                            "takeover_disconnect_queued",
+                            json!({"connection": old.get().to_string()}),
+                        )
+                        .map_err(event_failure)?;
+                }
             } else {
                 self.close(old, "session_taken_over")?;
             }

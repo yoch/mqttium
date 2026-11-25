@@ -12,6 +12,9 @@ mqttiumd-contract.workspace = true
 mqttiumd-store-api = { path = "../mqttiumd-store-api" }
 mqttiumd-store-sqlite = { path = "../mqttiumd-store-sqlite" }
 
+[features]
+log-write-points = []
+
 [dev-dependencies]
 mqttiumd-lab = { path = "../mqttiumd-lab" }
 

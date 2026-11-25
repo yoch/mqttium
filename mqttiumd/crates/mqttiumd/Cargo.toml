@@ -29,7 +29,7 @@ zeroize = "=1.9.2"
 
 [features]
 default = []
-test-hooks = ["mqttiumd-store-sqlite/kill-points"]
+test-hooks = ["mqttiumd-store-sqlite/kill-points", "mqttiumd-store-volatile/log-write-points"]
 
 [lints]
 workspace = true

@@ -59,6 +59,18 @@ use mqttiumd_store_sqlite::{
 
 use crate::{UNKNOWN, VolatileStore};
 
+/// Exact I/O boundaries of one prepared journal frame in instrumented builds.
+#[cfg(feature = "log-write-points")]
+#[derive(Clone, Copy, Debug)]
+pub enum LogWritePoint {
+    /// Before writing any byte of this frame.
+    BeforeAppend,
+    /// The complete frame is in the kernel page cache; sync_data has not run.
+    BeforeSync,
+    /// sync_data returned successfully, before publishing the frame in memory.
+    AfterSync,
+}
+
 /// Maximum commands committed in one `LogStore::apply_group` frame.
 pub const LOG_MAX_GROUP: usize = 256;
 
@@ -259,6 +271,8 @@ pub struct LogStore {
     /// durable appends fail closed so no commit can be confirmed onto a stale
     /// or unlinked WAL descriptor.
     wal_desynced: bool,
+    #[cfg(feature = "log-write-points")]
+    write_hook: Option<Box<dyn FnMut(LogWritePoint) + Send>>,
     encode_buf: Vec<u8>,
 }
 
@@ -312,6 +326,8 @@ impl LogStore {
                 lease,
                 durability: Durability::Available,
                 wal_desynced: false,
+                #[cfg(feature = "log-write-points")]
+                write_hook: None,
                 encode_buf: Vec::new(),
             });
         }
@@ -402,8 +418,16 @@ impl LogStore {
             lease,
             durability: Durability::Available,
             wal_desynced: false,
+            #[cfg(feature = "log-write-points")]
+            write_hook: None,
             encode_buf: Vec::new(),
         })
+    }
+
+    /// Observes the write stages of frames appended while the hook is installed.
+    #[cfg(feature = "log-write-points")]
+    pub fn set_write_hook(&mut self, hook: Option<Box<dyn FnMut(LogWritePoint) + Send>>) {
+        self.write_hook = hook;
     }
 
     /// Configures the automatic checkpoint compaction threshold in bytes.
@@ -516,10 +540,26 @@ impl LogStore {
         let prev_len = self.wal_len;
         let frame_len = self.encode_buf.len() as u64;
         let needed_end = prev_len.saturating_add(frame_len);
+        #[cfg(feature = "log-write-points")]
+        if let Some(hook) = self.write_hook.as_mut() {
+            hook(LogWritePoint::BeforeAppend);
+        }
         let write_ok = self
             .ensure_preallocated(needed_end)
             .and_then(|()| self.wal.write_all(&self.encode_buf))
-            .and_then(|()| self.wal.sync_data());
+            .and_then(|()| {
+                #[cfg(feature = "log-write-points")]
+                if let Some(hook) = self.write_hook.as_mut() {
+                    hook(LogWritePoint::BeforeSync);
+                }
+                self.wal.sync_data()
+            });
+        #[cfg(feature = "log-write-points")]
+        if write_ok.is_ok()
+            && let Some(hook) = self.write_hook.as_mut()
+        {
+            hook(LogWritePoint::AfterSync);
+        }
         if self.encode_buf.capacity() > ENCODE_BUF_SHRINK_THRESHOLD {
             self.encode_buf = Vec::new();
         } else {
