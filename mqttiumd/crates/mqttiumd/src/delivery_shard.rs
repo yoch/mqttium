@@ -7,6 +7,9 @@
 //! and shard-owned `Written` receipts), and cloneable `OutgoingHandle`s to
 //! enqueue outbound `PUBLISH`/`PUBREL` frames straight onto subscriber sockets.
 
+mod notices;
+
+use notices::Notices;
 use std::collections::{BTreeMap, VecDeque};
 use std::num::NonZeroU32;
 use std::sync::Arc;
@@ -56,7 +59,6 @@ use crate::writer::{
 pub const MAX_DELIVERY_SHARDS: usize = 16;
 
 const COORD_CHANNEL_CAP: usize = 4_096;
-const NOTICE_CHANNEL_CAP: usize = 512;
 const IDLE_TICK: Duration = Duration::from_millis(20);
 const BACKPRESSURE_TICK: Duration = Duration::from_millis(1);
 const BOUNDS: Bounds = Bounds {
@@ -242,7 +244,7 @@ struct ShardClient {
 /// implementing `InlineClaimOracle` for `Owner::step_and_dispatch_with_oracle`.
 pub(crate) struct ShardPool {
     shards: Vec<ShardClient>,
-    notices_rx: Receiver<ShardToCoord>,
+    notices: Arc<Notices>,
     leases: FlatMap<SessionId, Arc<InlineClaimLease>>,
     pending_dirty_barriers: FlatMap<SessionId, u64>,
     last_fatal: Option<Failure>,
@@ -263,7 +265,7 @@ impl ShardPool {
         if outboxes.len() != store_handles.len() || outboxes.is_empty() {
             return Err(Failure::plain("shard_pool_mismatch"));
         }
-        let (notice_tx_raw, notices_rx) = mpsc::sync_channel(NOTICE_CHANNEL_CAP);
+        let notices = Arc::new(Notices::new(coord_wake));
         let mut shards = Vec::with_capacity(outboxes.len());
         let mut ready_rxs = Vec::with_capacity(outboxes.len());
 
@@ -287,8 +289,7 @@ impl ShardPool {
             let inbox = ShardInbox::new(shard_wake.clone());
             let inbox_worker = Arc::clone(&inbox);
             let (ready_tx, ready_rx) = mpsc::sync_channel(1);
-            let notice_tx = notice_tx_raw.clone();
-            let notice_wake = coord_wake.clone();
+            let worker_notices = Arc::clone(&notices);
             let worker_events = events.clone();
             let worker_clock = Arc::clone(&clock);
             let worker_cancel = Arc::clone(&cancel);
@@ -304,8 +305,7 @@ impl ShardPool {
                         store_handle,
                         coord_rx,
                         inbox_worker,
-                        notice_tx,
-                        notice_wake,
+                        worker_notices,
                         worker_events,
                         worker_clock,
                         limits,
@@ -345,7 +345,7 @@ impl ShardPool {
 
         Ok(Self {
             shards,
-            notices_rx,
+            notices,
             leases: FlatMap::new(),
             pending_dirty_barriers: FlatMap::new(),
             last_fatal: None,
@@ -394,6 +394,7 @@ impl ShardPool {
         outgoing: OutgoingHandle,
         pending_inline_count: usize,
     ) {
+        self.notices.attach(generation);
         let lease = self.lease_of(session);
         let seq = lease.mark_dirty();
         let dirty_seq = if pending_inline_count == 0 {
@@ -426,6 +427,9 @@ impl ShardPool {
         generation: ConnectionGeneration,
         pending_inline_count: usize,
     ) {
+        // The coordinator has already removed this exact peer. Any pending
+        // close is satisfied, and later notices for this generation are stale.
+        self.notices.detach(generation);
         let lease = self.lease_of(session);
         let seq = lease.mark_dirty();
         let dirty_seq = if pending_inline_count == 0 {
@@ -603,14 +607,8 @@ impl ShardPool {
     }
 
     pub(crate) fn drain_notices(&mut self, out: &mut Vec<ShardToCoord>) -> Result<(), Failure> {
-        if let Some(err) = self.last_fatal.take() {
+        if let Some(err) = self.notices.drain_into(out).or(self.last_fatal.take()) {
             return Err(err);
-        }
-        while let Ok(notice) = self.notices_rx.try_recv() {
-            match notice {
-                ShardToCoord::Fatal(err) => return Err(err),
-                other => out.push(other),
-            }
         }
         Ok(())
     }
@@ -622,7 +620,7 @@ impl ShardPool {
             let _ = shard.tx.try_send(CoordToShard::Shutdown);
         }
         let deadline = Instant::now() + budget;
-        let mut first_err = self.last_fatal.take();
+        let mut first_err = None;
         for shard in &mut self.shards {
             if let Some(handle) = shard.handle.take() {
                 while !handle.is_finished() && Instant::now() < deadline {
@@ -643,7 +641,9 @@ impl ShardPool {
                 }
             }
         }
-        match first_err {
+        // A joined worker returns the original fault, even if sending to its
+        // closed input lane also failed during shutdown.
+        match first_err.or(self.last_fatal) {
             Some(err) => Err(err),
             None => Ok(()),
         }
@@ -718,8 +718,7 @@ struct DeliveryShardWorker {
     store: ShardStoreHandle,
     coord_rx: Receiver<CoordToShard>,
     io_inbox: Arc<ShardInbox>,
-    notice_tx: mpsc::SyncSender<ShardToCoord>,
-    notice_wake: Wake,
+    notices: Arc<Notices>,
     events: Events,
     clock: Arc<dyn SessionClock>,
     limits: Limits,
@@ -762,8 +761,7 @@ impl DeliveryShardWorker {
         store: ShardStoreHandle,
         coord_rx: Receiver<CoordToShard>,
         io_inbox: Arc<ShardInbox>,
-        notice_tx: mpsc::SyncSender<ShardToCoord>,
-        notice_wake: Wake,
+        notices: Arc<Notices>,
         events: Events,
         clock: Arc<dyn SessionClock>,
         limits: Limits,
@@ -775,8 +773,7 @@ impl DeliveryShardWorker {
             store,
             coord_rx,
             io_inbox,
-            notice_tx,
-            notice_wake,
+            notices,
             events,
             clock,
             limits,
@@ -811,7 +808,7 @@ impl DeliveryShardWorker {
     }
 
     fn notify_coord(&self, notice: ShardToCoord) {
-        publish_notice(&self.notice_tx, &self.notice_wake, notice);
+        self.notices.publish(notice);
     }
 
     fn register_receipts(&mut self, budget: Duration) -> Result<(), Failure> {
@@ -2391,11 +2388,6 @@ impl EffectSink for ShardSink<'_> {
             }
         }
     }
-}
-
-fn publish_notice(sender: &mpsc::SyncSender<ShardToCoord>, wake: &Wake, notice: ShardToCoord) {
-    let _ = sender.try_send(notice);
-    wake.wake();
 }
 
 #[cfg(test)]

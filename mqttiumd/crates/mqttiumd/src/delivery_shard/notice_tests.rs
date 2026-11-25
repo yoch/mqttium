@@ -2,13 +2,20 @@ use super::*;
 
 /// Produce all notices without running the coordinator until the final drain.
 fn while_coordinator_is_busy(generations: &[u64], notices: Vec<ShardToCoord>) -> Vec<ShardToCoord> {
-    let (tx, rx) = mpsc::sync_channel(generations.len());
     let wake = Wake::new();
+    let inbox = Notices::new(wake.clone());
+    for &generation in generations {
+        inbox.attach(ConnectionGeneration::new(generation));
+    }
     for notice in notices {
-        publish_notice(&tx, &wake, notice);
+        inbox.publish(notice);
     }
     assert!(wake.take());
-    rx.try_iter().collect()
+    let mut delivered = Vec::new();
+    if let Some(failure) = inbox.drain_into(&mut delivered) {
+        delivered.push(ShardToCoord::Fatal(failure));
+    }
+    delivered
 }
 
 fn close(generation: u64, code: &'static str) -> ShardToCoord {
@@ -50,4 +57,26 @@ fn fatal_survives_saturated_close_lane() {
     );
     assert!(delivered.iter().any(|notice| matches!(notice, ShardToCoord::Fatal(failure) if failure.code == "shard_core_fault")));
     assert!(delivered.iter().any(|notice| matches!(notice, ShardToCoord::CloseConnection { generation, .. } if generation.get() == 1)));
+}
+
+#[test]
+fn stale_close_cannot_reach_a_reconnected_session() {
+    let inbox = Notices::new(Wake::new());
+    let first = ConnectionGeneration::new(3);
+    let next = ConnectionGeneration::new(4);
+    inbox.attach(first);
+    inbox.publish(close(3, "already_closed"));
+    inbox.detach(first);
+    inbox.attach(next);
+    inbox.publish(close(3, "late"));
+    inbox.publish(close(4, "current"));
+    let mut delivered = Vec::new();
+    assert!(inbox.drain_into(&mut delivered).is_none());
+    assert!(
+        matches!(delivered.as_slice(), [ShardToCoord::CloseConnection { generation, code: "current", .. }] if *generation == next)
+    );
+    delivered.clear();
+    inbox.publish(close(4, "duplicate_after_drain"));
+    assert!(inbox.drain_into(&mut delivered).is_none());
+    assert!(delivered.is_empty());
 }
