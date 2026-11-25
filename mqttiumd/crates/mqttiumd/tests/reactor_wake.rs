@@ -1004,6 +1004,44 @@ fn a_3_1_1_client_with_more_qos2_exchanges_than_the_window_completes_them_all() 
     }
 }
 
+/// The first publication outside the bounded prefix gets no PUBREC. The
+/// publisher can resume the eight admitted exchanges on a new connection.
+#[test]
+fn mqtt311_resumes_after_a_42_publication_pipeline_fills_the_prefix() {
+    let broker = Broker::start("qos2-pipeline-resume");
+    let mut witness = connect(broker.address, "independent");
+    let name = "pipeline-persistent";
+    let (mut publisher, present) = resume_311(broker.address, name);
+    assert!(!present);
+    let mut burst = Vec::new();
+    for id in 1..=42_u16 {
+        let mut body = Vec::new();
+        text("pipeline/t", &mut body);
+        body.extend_from_slice(&id.to_be_bytes());
+        body.push(1);
+        burst.extend_from_slice(&packet(0x34, &body));
+    }
+    publisher.write_all(&burst).unwrap();
+    for id in 1..=8_u16 {
+        assert_eq!(
+            read_packet(&mut publisher),
+            (0x50, id.to_be_bytes().to_vec())
+        );
+    }
+    assert!(read_until_close(&mut publisher).is_empty());
+    witness.write_all(&[0xc0, 0]).unwrap();
+    assert_eq!(read_packet(&mut witness), (0xd0, Vec::new()));
+
+    let (mut resumed, present) = resume_311(broker.address, name);
+    assert!(present);
+    for id in 1..=8_u16 {
+        resumed.write_all(&packet(0x62, &id.to_be_bytes())).unwrap();
+        assert_eq!(read_packet(&mut resumed), (0x70, id.to_be_bytes().to_vec()));
+    }
+    qos2_publish(&mut resumed, false, 9, "after-resume");
+    assert_eq!(read_packet(&mut resumed), (0x50, vec![0, 9]));
+}
+
 fn qos2_pipeline_completes(exchanges: u16) {
     let broker = Broker::start("qos2-pipeline-311");
     let mut subscriber = Peer::connect(broker.address, "pipeline-subscriber", false);
