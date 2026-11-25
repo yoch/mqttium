@@ -3661,6 +3661,50 @@ mod tests {
     }
 
     #[test]
+    fn a_shard_can_receive_a_delivery_ack_before_the_coordinator_takes_an_earlier_publish() {
+        let (connection, _peer) = pair();
+        let (effect, key) = correlation(9).unwrap();
+        let inbox = ShardInbox::new(Wake::new(), 3, 1);
+        connection.install_shard_route(ShardIoRoute::new(effect.owner, key, Arc::clone(&inbox)));
+        let packet = |first, body: &[u8]| Incoming::Packet {
+            first,
+            body: FrameBytes::from_slice(body),
+            observed: Ok(MessageTime {
+                domain: [1; 32],
+                tick: 1,
+            }),
+        };
+        let mut fresh = vec![
+            packet(0x34, &[0, 1, b't', 0, 1, b'x']),
+            packet(0x40, &[0, 9]),
+            packet(0x62, &[0, 1]),
+        ];
+        let reservation = connection.core.reserve_shard_read(fresh.len());
+        assert!(
+            connection
+                .core
+                .push_incoming_batch(&mut fresh, &mut None, reservation)
+                .unwrap()
+        );
+        let mut shard = VecDeque::new();
+        assert_eq!(inbox.drain_into(&mut shard, 3), 1);
+        assert!(matches!(shard.pop_front(), Some(ShardIoEvent::AckPacket {
+            first: 0x40, connection, body, ..
+        }) if connection == key && body.as_slice() == [0,9]));
+        // The receive side still owns both QoS 2 inputs in their wire order.
+        let mut incoming = VecDeque::new();
+        connection.drain_incoming(&mut incoming, 3);
+        let headers: Vec<_> = incoming
+            .into_iter()
+            .map(|packet| match packet {
+                Incoming::Packet { first, .. } => first,
+                _ => panic!("expected a coordinator packet"),
+            })
+            .collect();
+        assert_eq!(headers, [0x34, 0x62]);
+    }
+
+    #[test]
     fn sharded_ack_backpressure_preserves_the_unread_suffix_and_write_receipts() {
         let (connection, _peer) = pair();
         let (effect, key) = correlation(9).unwrap();
