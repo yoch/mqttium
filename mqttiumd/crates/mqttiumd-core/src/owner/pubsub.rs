@@ -4034,7 +4034,10 @@ impl Owner {
                             self.pubsub.deliveries.push(d)?;
                         }
                     }
-                    if self.inline_claim_enabled
+                    // The returned items are valid. Their high-water mark
+                    // cannot cover obligations made visible since the read.
+                    if !self.pubsub.connections.as_slice()[connection].rescan_needed
+                        && self.inline_claim_enabled
                         && self.pubsub.control.is_none()
                         && self.pubsub.retained.is_none()
                         && !self.will_status().admission_pending
@@ -4626,7 +4629,10 @@ mod tests {
                 };
                 assert_ne!(old_read, fresh_read);
                 assert!(apply(&mut owner, page(*fresh_read)).is_empty());
-                assert!(!owner.has_ready_work(TARGET), "a clean empty page goes idle");
+                assert!(
+                    !owner.has_ready_work(TARGET),
+                    "a clean empty page goes idle"
+                );
             }
         }
     }
@@ -6293,8 +6299,10 @@ mod tests {
         fn id(sequence: u64) -> DeliveryId {
             DeliveryId {
                 publication: PublicationId::new(
-                    StoreIncarnation::new(1), RunEpoch::new(1),
-                    LogicalOwnerId::new(4), PublicationSeq::new(sequence),
+                    StoreIncarnation::new(1),
+                    RunEpoch::new(1),
+                    LogicalOwnerId::new(4),
+                    PublicationSeq::new(sequence),
                 ),
                 index: 0,
             }
@@ -6312,7 +6320,10 @@ mod tests {
             let mut owner = world();
             owner.enable_inline_claims();
             message_clock(&mut owner, 30);
-            owner.pubsub.connections.advance_known_through(CONNECTION, id(50));
+            owner
+                .pubsub
+                .connections
+                .advance_known_through(CONNECTION, id(50));
             let (effect, after) = load(&mut owner);
             assert_eq!(after, Some(id(50)));
 
@@ -6321,17 +6332,29 @@ mod tests {
             owner.shard_notify_dirty(TARGET, true);
             assert!(apply(&mut owner, Input::WorkAvailable { session: TARGET }).is_empty());
             let stale = WorkItem {
-                delivery: id(60), target: TARGET, target_revision: Revision::new(1),
-                qos: Qos::AtLeastOnce, cause: DeliveryCause::LiveExact, retain: false,
+                delivery: id(60),
+                target: TARGET,
+                target_revision: Revision::new(1),
+                qos: Qos::AtLeastOnce,
+                cause: DeliveryCause::LiveExact,
+                retain: false,
                 // The stale higher row needs no claim. Its identifier is still
                 // a page cursor even when expiry skips materializing the row.
-                expiry: Some(message_expiry()), properties: None,
-                topic: bytes(b"t/a"), payload: bytes(b"high"), claim: None,
+                expiry: Some(message_expiry()),
+                properties: None,
+                topic: bytes(b"t/a"),
+                payload: bytes(b"high"),
+                claim: None,
             };
-            apply(&mut owner, Input::WorkPage {
-                effect, session: TARGET,
-                items: BoundedVec::from_slice(&[stale], 1).unwrap(), next,
-            });
+            apply(
+                &mut owner,
+                Input::WorkPage {
+                    effect,
+                    session: TARGET,
+                    items: BoundedVec::from_slice(&[stale], 1).unwrap(),
+                    next,
+                },
+            );
 
             let mut found_lower = false;
             // One page remains at most. A design can finish that chain before
@@ -6345,12 +6368,20 @@ mod tests {
                     found_lower = true;
                     break;
                 }
-                apply(&mut owner, Input::WorkPage {
-                    effect, session: TARGET,
-                    items: BoundedVec::with_capacity(1).unwrap(), next: None,
-                });
+                apply(
+                    &mut owner,
+                    Input::WorkPage {
+                        effect,
+                        session: TARGET,
+                        items: BoundedVec::with_capacity(1).unwrap(),
+                        next: None,
+                    },
+                );
             }
-            assert!(found_lower, "a lower obligation remains invisible after next={next:?}");
+            assert!(
+                found_lower,
+                "a lower obligation remains invisible after next={next:?}"
+            );
         }
     }
 

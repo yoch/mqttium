@@ -159,6 +159,8 @@ impl Connections {
     }
 
     pub(super) fn clear_known_through(&mut self, generation: ConnectionGeneration) {
+        // A newly visible obligation can precede either scan frontier.
+        self.set_after(generation, None);
         if !self.known_through_by_gen.is_empty() {
             self.known_through_by_gen.remove(&generation);
         }
@@ -243,14 +245,15 @@ impl Connections {
         if index >= self.rows.len() {
             return Err(CoreFault::StalePlan);
         }
-        let generation = {
-            let c = &mut self.rows.as_mut_slice()[index];
-            c.rescan_needed = discard;
-            c.caught_up =
-                !discard && next.is_none() && !c.dirty_during_load && no_pending_non_inline;
-            c.dirty_during_load = false;
-            c.generation
-        };
+        let c = &mut self.rows.as_mut_slice()[index];
+        // begin_scan consumed the preceding notification. A later rescan
+        // survives this result, even when its WorkAvailable already ran.
+        c.rescan_needed |= discard;
+        c.caught_up =
+            !c.rescan_needed && next.is_none() && !c.dirty_during_load && no_pending_non_inline;
+        c.dirty_during_load = false;
+        let generation = c.generation;
+        let next = if c.rescan_needed { None } else { next };
         self.set_loading(generation, index, None);
         self.set_after(generation, next);
         Ok(generation)
@@ -280,6 +283,9 @@ impl Connections {
             if rescan {
                 c.rescan_needed = true;
             }
+        }
+        if rescan {
+            self.after_by_gen.clear();
         }
         self.clear_all_known_through();
     }
