@@ -67,8 +67,13 @@ mod pubsub;
 mod receipts;
 mod routing;
 mod sessions;
+mod shard;
 mod will;
 pub use sessions::SessionStatus;
+pub use shard::{
+    DelegatedClaim, DelegatedInlineBatch, DelegatedQos0Batch, DelegatedQos0Target,
+    InlineClaimOracle, ShardLimits, ShardStepOutcome,
+};
 pub use will::{WillDeferredReason, WillStatus};
 
 /// The largest reservation of effect slots one transition makes. The
@@ -444,8 +449,10 @@ enum CompactFacts {
         kind: DeliveryFactKind,
         packet_id: OutboundPacketId,
         index: u32,
+        pub_owner: LogicalOwnerId,
         pub_seq: PublicationSeq,
         target: SessionId,
+        claim_owner: LogicalOwnerId,
         claim_seq: OperationSeq,
     },
     InboundReleased {
@@ -456,11 +463,8 @@ enum CompactFacts {
 
 impl CompactFacts {
     fn from_commit(operation: OperationId, facts: CommitFacts) -> Self {
-        let scope = (
-            operation.incarnation(),
-            operation.epoch(),
-            operation.owner(),
-        );
+        let run_scope = (operation.incarnation(), operation.epoch());
+        let scope = (run_scope.0, run_scope.1, operation.owner());
         match facts {
             CommitFacts::PublicationAdmitted {
                 publication,
@@ -509,9 +513,8 @@ impl CompactFacts {
             } if (
                 delivery.publication.incarnation(),
                 delivery.publication.epoch(),
-                delivery.publication.owner(),
-            ) == scope
-                && (claim.incarnation(), claim.epoch(), claim.owner()) == scope =>
+            ) == run_scope
+                && (claim.incarnation(), claim.epoch()) == run_scope =>
             {
                 let kind = match facts {
                     CommitFacts::DeliveryClaimed { .. } => DeliveryFactKind::Claimed,
@@ -525,8 +528,10 @@ impl CompactFacts {
                     kind,
                     packet_id,
                     index: delivery.index,
+                    pub_owner: delivery.publication.owner(),
                     pub_seq: delivery.publication.sequence(),
                     target,
+                    claim_owner: claim.owner(),
                     claim_seq: claim.sequence(),
                 }
             }
@@ -535,11 +540,8 @@ impl CompactFacts {
     }
 
     fn matches(&self, operation: OperationId, facts: CommitFacts) -> bool {
-        let scope = (
-            operation.incarnation(),
-            operation.epoch(),
-            operation.owner(),
-        );
+        let run_scope = (operation.incarnation(), operation.epoch());
+        let scope = (run_scope.0, run_scope.1, operation.owner());
         match (self, facts) {
             (
                 Self::PublicationAdmitted {
@@ -568,8 +570,10 @@ impl CompactFacts {
                     kind,
                     packet_id,
                     index,
+                    pub_owner,
                     pub_seq,
                     target,
+                    claim_owner,
                     claim_seq,
                 },
                 other,
@@ -644,10 +648,11 @@ impl CompactFacts {
                     && (
                         delivery.publication.incarnation(),
                         delivery.publication.epoch(),
-                        delivery.publication.owner(),
-                    ) == scope
+                    ) == run_scope
+                    && delivery.publication.owner() == *pub_owner
                     && delivery.publication.sequence() == *pub_seq
-                    && (claim.incarnation(), claim.epoch(), claim.owner()) == scope
+                    && (claim.incarnation(), claim.epoch()) == run_scope
+                    && claim.owner() == *claim_owner
                     && claim.sequence() == *claim_seq
             }
             (Self::Boxed(stored), other) => **stored == other,
@@ -976,6 +981,7 @@ struct Draft {
     receipt_consumed: Option<OperationId>,
     released: Option<Released>,
     inline_outcome: Option<InlineOutcome>,
+    delegated_inline_resolved: Option<(OperationId, bool)>,
     non_inline_resolved: Option<(OperationId, bool)>,
 }
 
@@ -1191,6 +1197,13 @@ pub struct Owner {
     lifecycle: Option<sessions::Flight>,
     lifecycle_enabled: bool,
     inline_claim_enabled: bool,
+    delegated_deliveries: bool,
+    delegated_inline_by_op: ScopedFlatMap<OperationId, DelegatedInlineBatch>,
+    delegated_inline_by_session: FlatMap<SessionId, usize>,
+    last_delegated_committed: Option<DelegatedInlineBatch>,
+    last_delegated_rejected: Option<DelegatedInlineBatch>,
+    last_delegated_qos0: Option<DelegatedQos0Batch>,
+    last_finished_delivery: Option<(SessionId, Option<OutboundPacketId>)>,
     non_inline_targets_by_op:
         ScopedFlatMap<OperationId, (PublicationId, alloc::vec::Vec<SessionId>)>,
     message_now: Option<MessageTime>,
@@ -1334,6 +1347,17 @@ impl Owner {
             lifecycle: None,
             lifecycle_enabled: false,
             inline_claim_enabled: false,
+            delegated_deliveries: false,
+            delegated_inline_by_op: ScopedFlatMap::with_scope((
+                id.incarnation(),
+                id.epoch(),
+                id.owner(),
+            )),
+            delegated_inline_by_session: FlatMap::new(),
+            last_delegated_committed: None,
+            last_delegated_rejected: None,
+            last_delegated_qos0: None,
+            last_finished_delivery: None,
             non_inline_targets_by_op: ScopedFlatMap::with_scope((
                 id.incarnation(),
                 id.epoch(),
@@ -1930,7 +1954,7 @@ impl Owner {
     /// account, the reservations held and the content of the box as they
     /// were.
     pub fn step(&mut self, input: Input, grant: TurnGrant) -> StepOutcome {
-        self.step_with_sink(input, grant, None).0
+        self.step_with_sink_and_oracle(input, grant, None, None).0
     }
 
     /// Applies `input` and, when the outbox is empty and has no live
@@ -1943,14 +1967,15 @@ impl Owner {
         grant: TurnGrant,
         sink: &mut dyn EffectSink,
     ) -> (StepOutcome, usize) {
-        self.step_with_sink(input, grant, Some(sink))
+        self.step_with_sink_and_oracle(input, grant, Some(sink), None)
     }
 
-    fn step_with_sink(
+    pub(super) fn step_with_sink_and_oracle<'o>(
         &mut self,
         input: Input,
         grant: TurnGrant,
         sink: Option<&mut dyn EffectSink>,
+        mut oracle: Option<&mut (dyn InlineClaimOracle + 'o)>,
     ) -> (StepOutcome, usize) {
         self.last_observed_puback_ignored = false;
         self.last_step_may_unblock_work = true;
@@ -1958,6 +1983,10 @@ impl Owner {
         if !self.last_inline_ready_extra.is_empty() {
             self.last_inline_ready_extra.clear();
         }
+        self.last_delegated_committed = None;
+        self.last_delegated_rejected = None;
+        self.last_delegated_qos0 = None;
+        self.last_finished_delivery = None;
         let planned_work = self.cost(&input);
         if let Some(missing) = planned_work.checked_sub(grant.work_limit)
             && missing > WorkUnits::ZERO
@@ -1989,14 +2018,14 @@ impl Owner {
             receipt_consumed: None,
             released: None,
             inline_outcome: None,
+            delegated_inline_resolved: None,
             non_inline_resolved: None,
         };
-        let change = match self
-            .revision
-            .checked_next()
-            .map_or(Err(Stop::Exhausted(Exhaustion::IdentityCounter)), |_| {
-                self.plan_change(&input, &mut draft)
-            }) {
+        let change = match if self.revision.checked_next().is_ok() {
+            self.plan_change(&input, &mut draft, &mut oracle)
+        } else {
+            Err(Stop::Exhausted(Exhaustion::IdentityCounter))
+        } {
             Ok(change) => change,
             Err(stop) => {
                 return (
@@ -2030,6 +2059,7 @@ impl Owner {
         if let Some(missing) = work_used.checked_sub(grant.work_limit)
             && missing > WorkUnits::ZERO
         {
+            Self::rollback_delegated_change(&change, &mut oracle);
             return (
                 StepOutcome::NeedCapacity {
                     input,
@@ -2048,6 +2078,7 @@ impl Owner {
             && draft.effects.count > 0
             && self.outbox.free_slots() < draft.effects.count.saturating_add(2)
         {
+            Self::rollback_delegated_change(&change, &mut oracle);
             return (
                 StepOutcome::NeedCapacity {
                     input,
@@ -2073,6 +2104,7 @@ impl Owner {
             (None, _) => None,
             (Some(slots), true) => {
                 if let Err(refusal) = self.outbox.check_reserve(slots) {
+                    Self::rollback_delegated_change(&change, &mut oracle);
                     return (
                         StepOutcome::reservation_refused(input, refusal, planned_work),
                         0,
@@ -2083,6 +2115,7 @@ impl Owner {
             (Some(slots), false) => match self.outbox.reserve(slots) {
                 Ok(key) => Some(key),
                 Err(refusal) => {
+                    Self::rollback_delegated_change(&change, &mut oracle);
                     return (
                         StepOutcome::reservation_refused(input, refusal, planned_work),
                         0,
@@ -2096,7 +2129,7 @@ impl Owner {
         {
             self.last_observed_puback_ignored = true;
         }
-        match self.apply_draft(draft, change, input, reservation, direct_sink) {
+        match self.apply_draft(draft, change, input, reservation, direct_sink, &mut oracle) {
             Ok((progress, accepted)) => (
                 StepOutcome::Applied {
                     work_used,
@@ -2105,6 +2138,25 @@ impl Owner {
                 accepted,
             ),
             Err(fault) => (StepOutcome::Fatal(fault), 0),
+        }
+    }
+
+    fn rollback_delegated_change<'o>(
+        change: &Change,
+        oracle: &mut Option<&mut (dyn InlineClaimOracle + 'o)>,
+    ) {
+        if let Some(oracle) = oracle.as_deref_mut()
+            && let Change::Admit { inline_claims, .. } = change
+        {
+            match inline_claims {
+                InlineClaimPlans::None => {}
+                InlineClaimPlans::One(plan) => oracle.rollback(plan.target, plan.packet_id),
+                InlineClaimPlans::Many(plans) => {
+                    for plan in plans {
+                        oracle.rollback(plan.target, plan.packet_id);
+                    }
+                }
+            }
         }
     }
 
@@ -2162,7 +2214,12 @@ impl Owner {
         WorkUnits::new(work)
     }
 
-    fn plan_change(&self, input: &Input, draft: &mut Draft) -> Result<Change, Stop> {
+    fn plan_change<'o>(
+        &self,
+        input: &Input,
+        draft: &mut Draft,
+        oracle: &mut Option<&mut (dyn InlineClaimOracle + 'o)>,
+    ) -> Result<Change, Stop> {
         if let Input::MessageClock { now } = input {
             if self
                 .message_now
@@ -2330,7 +2387,7 @@ impl Owner {
                 connection,
                 ingress_order,
                 packet,
-            } => self.plan_packet(*connection, *ingress_order, packet, draft),
+            } => self.plan_packet(*connection, *ingress_order, packet, draft, oracle),
             Input::StoreResult {
                 effect,
                 operation,
@@ -2478,12 +2535,13 @@ impl Owner {
         Ok(session.map_or(Change::Nothing, |session| Change::Unbind { session }))
     }
 
-    fn plan_packet(
+    fn plan_packet<'o>(
         &self,
         connection: ConnectionGeneration,
         ingress_order: u64,
         packet: &InboundPacket,
         draft: &mut Draft,
+        oracle: &mut Option<&mut (dyn InlineClaimOracle + 'o)>,
     ) -> Result<Change, Stop> {
         // The owner ordered this connection closed, or saw it fail: what
         // it still carries changes nothing and is not answered.
@@ -2586,7 +2644,13 @@ impl Owner {
                     return Err(IMPOSSIBLE);
                 };
                 let Some(slot) = self.slot_of(session.id, packet_id) else {
-                    return self.plan_admission(index, (connection, ingress_order), packet, draft);
+                    return self.plan_admission(
+                        index,
+                        (connection, ingress_order),
+                        packet,
+                        draft,
+                        oracle,
+                    );
                 };
                 let held = &self.slots[slot];
                 if held.qos != *qos {
@@ -2733,12 +2797,13 @@ impl Owner {
         Ok(())
     }
 
-    fn plan_admission(
+    fn plan_admission<'o>(
         &self,
         session: usize,
         publish_origin: (ConnectionGeneration, u64),
         packet: &InboundPacket,
         draft: &mut Draft,
+        oracle: &mut Option<&mut (dyn InlineClaimOracle + 'o)>,
     ) -> Result<Change, Stop> {
         let InboundPacket::Publish {
             qos,
@@ -2953,6 +3018,92 @@ impl Owner {
             } else {
                 Recipe::RetainedPublication(retained)
             }
+        } else if self.delegated_deliveries {
+            if targets > 0
+                && self.inline_claims_globally_allowed()
+                && let Some(oracle_ref) = oracle.as_deref_mut()
+            {
+                let mut plans = alloc::vec::Vec::with_capacity(selected.len());
+                let mut unclaimed = alloc::vec::Vec::new();
+                for (idx, target) in selected.iter().enumerate() {
+                    if target.qos != Qos::AtMostOnce
+                        && !self
+                            .pubsub
+                            .non_inline_by_session
+                            .contains_key(&target.session)
+                        && let Ok(target_index) = u16::try_from(idx)
+                        && let Some((target_gen, out_packet_id)) =
+                            oracle_ref.try_reserve(target.session, target.qos, length)
+                    {
+                        plans.push(InlineClaimPlan {
+                            target_index,
+                            target: target.session,
+                            target_revision: target.revision,
+                            qos: target.qos,
+                            packet_id: out_packet_id,
+                            generation: target_gen,
+                        });
+                    } else {
+                        unclaimed.push(target.session);
+                    }
+                }
+                if !unclaimed.is_empty() {
+                    dirty_targets = Some(unclaimed.into_boxed_slice());
+                }
+                match plans.len() {
+                    0 => Recipe::AdmitPublication(admission),
+                    1 => {
+                        let only = plans[0];
+                        inline_claims = InlineClaimPlans::One(only);
+                        Recipe::ClaimedPublication(ClaimedPublication {
+                            admission,
+                            claim: InlineClaim {
+                                target_index: only.target_index,
+                                packet_id: only.packet_id,
+                            },
+                        })
+                    }
+                    count => {
+                        let mut claims = match BoundedVec::with_capacity(count) {
+                            Ok(v) => v,
+                            Err(err) => {
+                                for plan in &plans {
+                                    oracle_ref.rollback(plan.target, plan.packet_id);
+                                }
+                                return Err(Stop::from(err));
+                            }
+                        };
+                        for plan in &plans {
+                            if claims
+                                .try_push(InlineClaim {
+                                    target_index: plan.target_index,
+                                    packet_id: plan.packet_id,
+                                })
+                                .is_err()
+                            {
+                                for p in &plans {
+                                    oracle_ref.rollback(p.target, p.packet_id);
+                                }
+                                return Err(IMPOSSIBLE);
+                            }
+                        }
+                        inline_claims = InlineClaimPlans::Many(plans);
+                        Recipe::MultiClaimedPublication(MultiClaimedPublication {
+                            admission,
+                            claims,
+                        })
+                    }
+                }
+            } else {
+                if targets > 0 {
+                    let mut vec = alloc::vec::Vec::with_capacity(targets);
+                    for target in selected.iter() {
+                        vec.push(target.session);
+                    }
+                    dirty_targets = Some(vec.into_boxed_slice());
+                }
+                Recipe::AdmitPublication(admission)
+            }
         } else if selected.len() == 1
             && let Some(only) = selected.iter().next().copied()
             && let Some((target_gen, out_packet_id)) = self.plan_inline_claim(only, length)
@@ -3052,7 +3203,26 @@ impl Owner {
         } else {
             recipe
         };
-        let in_flight = self.plan_submission(operation, recipe, Some(payload.clone()), draft)?;
+        let in_flight = match self.plan_submission(operation, recipe, Some(payload.clone()), draft)
+        {
+            Ok(in_flight) => in_flight,
+            Err(stop) => {
+                if let Some(oracle_ref) = oracle.as_deref_mut() {
+                    match &inline_claims {
+                        InlineClaimPlans::None => {}
+                        InlineClaimPlans::One(plan) => {
+                            oracle_ref.rollback(plan.target, plan.packet_id);
+                        }
+                        InlineClaimPlans::Many(plans) => {
+                            for plan in plans {
+                                oracle_ref.rollback(plan.target, plan.packet_id);
+                            }
+                        }
+                    }
+                }
+                return Err(stop);
+            }
+        };
         Ok(Change::Admit {
             session: source.id,
             packet_id,
@@ -3476,6 +3646,11 @@ impl Owner {
                 };
                 if admission {
                     draft.inline_outcome = self.plan_inline_claim_result(operation, true, draft)?;
+                    if self.delegated_deliveries
+                        && self.delegated_inline_by_op.contains_key(&operation)
+                    {
+                        draft.delegated_inline_resolved = Some((operation, true));
+                    }
                     if !self.non_inline_targets_by_op.is_empty() {
                         draft.non_inline_resolved = Some((operation, true));
                     }
@@ -3491,6 +3666,11 @@ impl Owner {
                 if admission {
                     draft.inline_outcome =
                         self.plan_inline_claim_result(operation, false, draft)?;
+                    if self.delegated_deliveries
+                        && self.delegated_inline_by_op.contains_key(&operation)
+                    {
+                        draft.delegated_inline_resolved = Some((operation, false));
+                    }
                     if !self.non_inline_targets_by_op.is_empty() {
                         draft.non_inline_resolved = Some((operation, false));
                     }
@@ -3882,13 +4062,14 @@ impl Owner {
         Ok(Change::Recover)
     }
 
-    fn apply_draft(
+    fn apply_draft<'o>(
         &mut self,
         draft: Draft,
         change: Change,
         input: Input,
         reservation: Option<EffectReservation>,
         direct_sink: Option<&mut dyn EffectSink>,
+        oracle: &mut Option<&mut (dyn InlineClaimOracle + 'o)>,
     ) -> Result<(Progress, usize), CoreFault> {
         let Draft {
             counters,
@@ -3899,6 +4080,7 @@ impl Owner {
             receipt_consumed,
             released,
             inline_outcome,
+            delegated_inline_resolved,
             non_inline_resolved,
             ..
         } = draft;
@@ -3943,12 +4125,37 @@ impl Owner {
         if !after && let Some(released) = released {
             self.apply_release(released)?;
         }
-        self.apply_change(change, input)?;
+        self.apply_change(change, input, oracle)?;
         let has_non_inline = non_inline_resolved
             .as_ref()
             .is_some_and(|(op, _)| self.non_inline_targets_by_op.contains_key(op));
         if let Some(outcome) = inline_outcome {
             self.apply_inline_claim_outcome(outcome, has_non_inline)?;
+        }
+        if let Some((operation, committed)) = delegated_inline_resolved
+            && let Some(batch) = self.delegated_inline_by_op.remove(&operation)
+        {
+            for claim in &batch.claims {
+                if let Some(count) = self.delegated_inline_by_session.get_mut(&claim.target) {
+                    *count = count.saturating_sub(1);
+                    if *count == 0 {
+                        self.delegated_inline_by_session.remove(&claim.target);
+                    }
+                }
+            }
+            if committed {
+                self.last_delegated_committed = Some(batch);
+                if !has_non_inline {
+                    self.last_step_may_unblock_work = false;
+                }
+            } else {
+                if let Some(oracle_ref) = oracle.as_deref_mut() {
+                    for claim in &batch.claims {
+                        oracle_ref.rollback(claim.target, claim.packet_id);
+                    }
+                }
+                self.last_delegated_rejected = Some(batch);
+            }
         }
         if let Some((operation, committed)) = non_inline_resolved
             && let Some((publication, targets)) = self.non_inline_targets_by_op.remove(&operation)
@@ -3962,6 +4169,11 @@ impl Owner {
                     }
                 }
                 if committed {
+                    if self.delegated_deliveries
+                        && let Some(oracle_ref) = oracle.as_deref_mut()
+                    {
+                        oracle_ref.mark_ineligible(target);
+                    }
                     self.mark_session_dirty(target, true);
                     self.push_inline_ready_target(target);
                     self.last_step_may_unblock_work = true;
@@ -4012,7 +4224,12 @@ impl Owner {
         Ok((progress, accepted))
     }
 
-    fn apply_change(&mut self, change: Change, input: Input) -> Result<(), CoreFault> {
+    fn apply_change<'o>(
+        &mut self,
+        change: Change,
+        input: Input,
+        oracle: &mut Option<&mut (dyn InlineClaimOracle + 'o)>,
+    ) -> Result<(), CoreFault> {
         const STALE: CoreFault = CoreFault::StalePlan;
         match change {
             Change::Session(change) => self.apply_session(*change)?,
@@ -4094,28 +4311,72 @@ impl Owner {
                     else {
                         return Err(STALE);
                     };
-                    match inline_claims {
-                        InlineClaimPlans::None => {}
-                        InlineClaimPlans::One(plan) => {
-                            self.apply_inline_claim_insert(
-                                op,
+                    if self.delegated_deliveries {
+                        let mut claims = alloc::vec::Vec::new();
+                        let make_claim = |plan: InlineClaimPlan| DelegatedClaim {
+                            delivery: DeliveryId {
                                 publication,
-                                plan,
+                                index: u32::from(plan.target_index),
+                            },
+                            target: plan.target,
+                            target_revision: plan.target_revision,
+                            qos: plan.qos,
+                            claim_operation: op,
+                            packet_id: plan.packet_id,
+                            generation: plan.generation,
+                        };
+                        match inline_claims {
+                            InlineClaimPlans::None => {}
+                            InlineClaimPlans::One(plan) => {
+                                *self
+                                    .delegated_inline_by_session
+                                    .get_or_insert_default(plan.target) += 1;
+                                claims.push(make_claim(plan));
+                            }
+                            InlineClaimPlans::Many(plans) => {
+                                claims.reserve(plans.len());
+                                for plan in plans {
+                                    *self
+                                        .delegated_inline_by_session
+                                        .get_or_insert_default(plan.target) += 1;
+                                    claims.push(make_claim(plan));
+                                }
+                            }
+                        }
+                        self.delegated_inline_by_op.insert(
+                            op,
+                            DelegatedInlineBatch {
+                                operation: op,
                                 topic,
                                 payload,
                                 properties,
-                            )?;
-                        }
-                        InlineClaimPlans::Many(plans) => {
-                            for plan in plans {
+                                claims,
+                            },
+                        );
+                    } else {
+                        match inline_claims {
+                            InlineClaimPlans::None => {}
+                            InlineClaimPlans::One(plan) => {
                                 self.apply_inline_claim_insert(
                                     op,
                                     publication,
                                     plan,
-                                    topic.clone(),
-                                    payload.clone(),
-                                    properties.clone(),
+                                    topic,
+                                    payload,
+                                    properties,
                                 )?;
+                            }
+                            InlineClaimPlans::Many(plans) => {
+                                for plan in plans {
+                                    self.apply_inline_claim_insert(
+                                        op,
+                                        publication,
+                                        plan,
+                                        topic.clone(),
+                                        payload.clone(),
+                                        properties.clone(),
+                                    )?;
+                                }
                             }
                         }
                     }
@@ -4123,6 +4384,11 @@ impl Owner {
                 if let Some(dirty_targets) = dirty_targets {
                     let dirty_targets = dirty_targets.into_vec();
                     for &target in &dirty_targets {
+                        if self.delegated_deliveries
+                            && let Some(oracle_ref) = oracle.as_deref_mut()
+                        {
+                            oracle_ref.mark_ineligible(target);
+                        }
                         *self
                             .pubsub
                             .non_inline_by_session
@@ -4567,18 +4833,23 @@ mod tests {
                 receipt_consumed: None,
                 released: None,
                 inline_outcome: None,
+                delegated_inline_resolved: None,
                 non_inline_resolved: None,
             };
-            let change = self
-                .revision
-                .checked_next()
-                .map_or(Err(Stop::Exhausted(Exhaustion::IdentityCounter)), |_| {
-                    self.plan_change(input, &mut draft)
-                })
-                .map_err(|stop| Refusal {
-                    stop,
-                    work_used: work,
-                })?;
+            let mut no_oracle: Option<&mut dyn InlineClaimOracle> = None;
+            let change = match if self.revision.checked_next().is_ok() {
+                self.plan_change(input, &mut draft, &mut no_oracle)
+            } else {
+                Err(Stop::Exhausted(Exhaustion::IdentityCounter))
+            } {
+                Ok(change) => change,
+                Err(stop) => {
+                    return Err(Refusal {
+                        stop,
+                        work_used: work,
+                    });
+                }
+            };
             Ok(Plan {
                 stamp: PlanStamp {
                     owner: self.id,
@@ -4596,8 +4867,16 @@ mod tests {
             reservation: Option<EffectReservation>,
         ) -> Result<Progress, CoreFault> {
             plan.stamp.check(self.id, self.revision)?;
-            self.apply_draft(plan.draft, plan.change, input, reservation, None)
-                .map(|(progress, _)| progress)
+            let mut no_oracle: Option<&mut dyn InlineClaimOracle> = None;
+            self.apply_draft(
+                plan.draft,
+                plan.change,
+                input,
+                reservation,
+                None,
+                &mut no_oracle,
+            )
+            .map(|(progress, _)| progress)
         }
     }
 

@@ -413,13 +413,69 @@ impl Iterator for SessionObligationIter<'_> {
     }
 }
 
-/// Active-origin direct-indexed ring table for `VolatileStore::operations`
-/// with a `ScopedMap` fallback for historical or non-contiguous sequences.
+/// One active owner's direct-indexed ring slice inside [`OriginOpTable`].
 #[derive(Debug)]
-pub(crate) struct OriginOpTable<V> {
-    hot_scope: Option<(StoreIncarnation, RunEpoch, LogicalOwnerId)>,
+struct OwnerRing<V> {
+    scope: (StoreIncarnation, RunEpoch, LogicalOwnerId),
     base: u64,
     ring: VecDeque<Option<V>>,
+    len: usize,
+}
+
+impl<V> OwnerRing<V> {
+    #[inline]
+    fn new(scope: (StoreIncarnation, RunEpoch, LogicalOwnerId), seq: u64, value: V) -> Self {
+        let mut ring = VecDeque::new();
+        ring.push_back(Some(value));
+        Self {
+            scope,
+            base: seq,
+            ring,
+            len: 1,
+        }
+    }
+
+    #[inline]
+    fn get(&self, seq: u64) -> Option<&V> {
+        if seq >= self.base {
+            let offset = seq - self.base;
+            if offset < self.ring.len() as u64 {
+                return self.ring[offset as usize].as_ref();
+            }
+        }
+        None
+    }
+
+    #[inline]
+    fn remove(&mut self, seq: u64) -> Option<V> {
+        if seq >= self.base {
+            let offset = seq - self.base;
+            if offset < self.ring.len() as u64 {
+                let removed = self.ring[offset as usize].take();
+                if removed.is_some() {
+                    self.len -= 1;
+                    while self.ring.front().is_some_and(Option::is_none) {
+                        self.ring.pop_front();
+                        self.base = self.base.saturating_add(1);
+                    }
+                    if self.ring.is_empty() {
+                        self.ring.clear();
+                    }
+                    return removed;
+                }
+            }
+        }
+        None
+    }
+}
+
+/// Active-origin direct-indexed ring table for `VolatileStore::operations`
+/// supporting multiple concurrent `LogicalOwnerId` producers (e.g. coordinator
+/// and sharded delivery owners) with a `ScopedMap` fallback for historical or
+/// non-contiguous sequences.
+#[derive(Debug)]
+pub(crate) struct OriginOpTable<V> {
+    hot: Vec<OwnerRing<V>>,
     hot_len: usize,
     cold: ScopedMap<OperationId, V>,
 }
@@ -432,15 +488,20 @@ impl<V> Default for OriginOpTable<V> {
 
 impl<V> OriginOpTable<V> {
     const MAX_GAP_PAD: u64 = 64;
+    const MAX_HOT_OWNERS: usize = 32;
 
     pub(crate) fn new() -> Self {
         Self {
-            hot_scope: None,
-            base: 0,
-            ring: VecDeque::new(),
+            hot: Vec::new(),
             hot_len: 0,
             cold: ScopedMap::new(),
         }
+    }
+
+    #[inline]
+    fn find_hot(&self, scope: (StoreIncarnation, RunEpoch, LogicalOwnerId)) -> Option<usize> {
+        // Common case: small number of owners (1..=16) scanned linearly in L1 cache.
+        self.hot.iter().position(|r| r.scope == scope)
     }
 
     #[inline]
@@ -450,18 +511,13 @@ impl<V> OriginOpTable<V> {
 
     #[inline]
     pub(crate) fn get(&self, key: &OperationId) -> Option<&V> {
-        if self.hot_scope == Some(key.scope()) {
-            let seq = key.sequence().get();
-            if seq >= self.base {
-                let offset = seq - self.base;
-                if offset < self.ring.len() as u64 {
-                    if let Some(val) = self.ring[offset as usize].as_ref() {
-                        return Some(val);
-                    }
-                    if self.cold.is_empty() {
-                        return None;
-                    }
-                }
+        let scope = key.scope();
+        if let Some(idx) = self.find_hot(scope) {
+            if let Some(val) = self.hot[idx].get(key.sequence().get()) {
+                return Some(val);
+            }
+            if self.cold.is_empty() {
+                return None;
             }
         }
         if self.cold.is_empty() {
@@ -480,100 +536,96 @@ impl<V> OriginOpTable<V> {
     pub(crate) fn insert(&mut self, key: OperationId, value: V) -> Option<V> {
         let scope = key.scope();
         let seq = key.sequence().get();
-        if self.hot_scope.is_none() {
-            self.hot_scope = Some(scope);
-            self.base = seq;
-            self.ring.push_back(Some(value));
-            self.hot_len = 1;
-            return None;
+        let idx = if let Some(idx) = self.find_hot(scope) {
+            idx
+        } else if self.hot.len() < Self::MAX_HOT_OWNERS {
+            let prev = if self.cold.is_empty() {
+                None
+            } else {
+                self.cold.remove(&key)
+            };
+            self.hot.push(OwnerRing::new(scope, seq, value));
+            self.hot_len += 1;
+            return prev;
+        } else {
+            return self.cold.insert(key, value);
+        };
+        let owner_ring = &mut self.hot[idx];
+        if owner_ring.ring.is_empty() {
+            let prev = if self.cold.is_empty() {
+                None
+            } else {
+                self.cold.remove(&key)
+            };
+            owner_ring.base = seq;
+            owner_ring.ring.push_back(Some(value));
+            owner_ring.len = 1;
+            self.hot_len += 1;
+            return prev;
         }
-        if self.hot_scope == Some(scope) {
-            if self.ring.is_empty() {
+        let end = owner_ring.base.saturating_add(owner_ring.ring.len() as u64);
+        if seq == end {
+            let prev = if self.cold.is_empty() {
+                None
+            } else {
+                self.cold.remove(&key)
+            };
+            owner_ring.ring.push_back(Some(value));
+            owner_ring.len += 1;
+            self.hot_len += 1;
+            return prev;
+        }
+        if seq >= owner_ring.base && seq < end {
+            let slot = &mut owner_ring.ring[(seq - owner_ring.base) as usize];
+            let prev = slot.replace(value);
+            if prev.is_some() {
+                return prev;
+            }
+            owner_ring.len += 1;
+            self.hot_len += 1;
+            return if self.cold.is_empty() {
+                None
+            } else {
+                self.cold.remove(&key)
+            };
+        }
+        if seq > end && seq - end <= Self::MAX_GAP_PAD {
+            for gap_seq in end..seq {
                 if !self.cold.is_empty() {
-                    let prev = self.cold.remove(&key);
-                    self.base = seq;
-                    self.ring.push_back(Some(value));
-                    self.hot_len = 1;
-                    return prev;
-                }
-                self.base = seq;
-                self.ring.push_back(Some(value));
-                self.hot_len = 1;
-                return None;
-            }
-            let end = self.base.saturating_add(self.ring.len() as u64);
-            if seq == end {
-                let prev = if self.cold.is_empty() {
-                    None
-                } else {
-                    self.cold.remove(&key)
-                };
-                self.ring.push_back(Some(value));
-                self.hot_len += 1;
-                return prev;
-            }
-            if seq >= self.base && seq < end {
-                let slot = &mut self.ring[(seq - self.base) as usize];
-                let prev = slot.replace(value);
-                if prev.is_some() {
-                    return prev;
-                }
-                self.hot_len += 1;
-                return if self.cold.is_empty() {
-                    None
-                } else {
-                    self.cold.remove(&key)
-                };
-            }
-            if seq > end && seq - end <= Self::MAX_GAP_PAD {
-                for gap_seq in end..seq {
-                    if !self.cold.is_empty() {
-                        let gap_id =
-                            OperationId::new(scope.0, scope.1, scope.2, OperationSeq::new(gap_seq));
-                        if let Some(promoted) = self.cold.remove(&gap_id) {
-                            self.ring.push_back(Some(promoted));
-                            self.hot_len += 1;
-                            continue;
-                        }
+                    let gap_id =
+                        OperationId::new(scope.0, scope.1, scope.2, OperationSeq::new(gap_seq));
+                    if let Some(promoted) = self.cold.remove(&gap_id) {
+                        owner_ring.ring.push_back(Some(promoted));
+                        owner_ring.len += 1;
+                        self.hot_len += 1;
+                        continue;
                     }
-                    self.ring.push_back(None);
                 }
-                let prev = if self.cold.is_empty() {
-                    None
-                } else {
-                    self.cold.remove(&key)
-                };
-                self.ring.push_back(Some(value));
-                self.hot_len += 1;
-                return prev;
+                owner_ring.ring.push_back(None);
             }
+            let prev = if self.cold.is_empty() {
+                None
+            } else {
+                self.cold.remove(&key)
+            };
+            owner_ring.ring.push_back(Some(value));
+            owner_ring.len += 1;
+            self.hot_len += 1;
+            return prev;
         }
         self.cold.insert(key, value)
     }
 
     #[inline]
     pub(crate) fn remove(&mut self, key: &OperationId) -> Option<V> {
-        if self.hot_scope == Some(key.scope()) {
-            let seq = key.sequence().get();
-            if seq >= self.base {
-                let offset = seq - self.base;
-                if offset < self.ring.len() as u64 {
-                    let removed = self.ring[offset as usize].take();
-                    if removed.is_some() {
-                        self.hot_len -= 1;
-                        while self.ring.front().is_some_and(Option::is_none) {
-                            self.ring.pop_front();
-                            self.base = self.base.saturating_add(1);
-                        }
-                        if self.ring.is_empty() {
-                            self.ring.clear();
-                        }
-                        return removed;
-                    }
-                    if self.cold.is_empty() {
-                        return None;
-                    }
-                }
+        let scope = key.scope();
+        if let Some(idx) = self.find_hot(scope) {
+            if let Some(removed) = self.hot[idx].remove(key.sequence().get()) {
+                self.hot_len -= 1;
+                return Some(removed);
+            }
+            if self.cold.is_empty() {
+                return None;
             }
         }
         if self.cold.is_empty() {
@@ -595,16 +647,20 @@ impl<V> OriginOpTable<V> {
         if s > e {
             return Ok(());
         }
-        if self.hot_scope != Some(scope) || self.hot_len == 0 {
+        let Some(idx) = self.find_hot(scope) else {
+            return self.cold.for_each_in_scope_range(scope, start, end, f);
+        };
+        let owner_ring = &self.hot[idx];
+        if owner_ring.len == 0 {
             return self.cold.for_each_in_scope_range(scope, start, end, f);
         }
         if self.cold.is_empty() {
-            let ring_end = self.base.saturating_add(self.ring.len() as u64);
-            let lo = s.max(self.base);
+            let ring_end = owner_ring.base.saturating_add(owner_ring.ring.len() as u64);
+            let lo = s.max(owner_ring.base);
             let hi = e.min(ring_end.saturating_sub(1));
-            if lo <= hi && !self.ring.is_empty() {
+            if lo <= hi && !owner_ring.ring.is_empty() {
                 for seq in lo..=hi {
-                    if let Some(val) = self.ring[(seq - self.base) as usize].as_ref() {
+                    if let Some(val) = owner_ring.ring[(seq - owner_ring.base) as usize].as_ref() {
                         let id =
                             OperationId::new(scope.0, scope.1, scope.2, OperationSeq::new(seq));
                         f(id, val)?;
@@ -615,12 +671,12 @@ impl<V> OriginOpTable<V> {
         }
         // General case: merge ring and cold entries in ascending sequence order.
         let mut items: Vec<(OperationId, &V)> = Vec::new();
-        let ring_end = self.base.saturating_add(self.ring.len() as u64);
-        let lo = s.max(self.base);
+        let ring_end = owner_ring.base.saturating_add(owner_ring.ring.len() as u64);
+        let lo = s.max(owner_ring.base);
         let hi = e.min(ring_end.saturating_sub(1));
-        if lo <= hi && !self.ring.is_empty() {
+        if lo <= hi && !owner_ring.ring.is_empty() {
             for seq in lo..=hi {
-                if let Some(val) = self.ring[(seq - self.base) as usize].as_ref() {
+                if let Some(val) = owner_ring.ring[(seq - owner_ring.base) as usize].as_ref() {
                     items.push((
                         OperationId::new(scope.0, scope.1, scope.2, OperationSeq::new(seq)),
                         val,
@@ -642,14 +698,15 @@ impl<V> OriginOpTable<V> {
 
     pub(crate) fn keys(&self) -> Vec<OperationId> {
         let mut out = Vec::with_capacity(self.len());
-        if let Some(scope) = self.hot_scope {
-            for (i, slot) in self.ring.iter().enumerate() {
+        for owner_ring in &self.hot {
+            let scope = owner_ring.scope;
+            for (i, slot) in owner_ring.ring.iter().enumerate() {
                 if slot.is_some() {
                     out.push(OperationId::new(
                         scope.0,
                         scope.1,
                         scope.2,
-                        OperationSeq::new(self.base + i as u64),
+                        OperationSeq::new(owner_ring.base + i as u64),
                     ));
                 }
             }
@@ -659,23 +716,24 @@ impl<V> OriginOpTable<V> {
     }
 
     pub(crate) fn values(&self) -> impl Iterator<Item = &V> + '_ {
-        self.ring
+        self.hot
             .iter()
-            .filter_map(Option::as_ref)
+            .flat_map(|r| r.ring.iter().filter_map(Option::as_ref))
             .chain(self.cold.values())
     }
 
     pub(crate) fn iter_ordered(&self) -> Vec<(OperationId, &V)> {
         let mut out = Vec::with_capacity(self.len());
-        if let Some(scope) = self.hot_scope {
-            for (i, slot) in self.ring.iter().enumerate() {
+        for owner_ring in &self.hot {
+            let scope = owner_ring.scope;
+            for (i, slot) in owner_ring.ring.iter().enumerate() {
                 if let Some(val) = slot.as_ref() {
                     out.push((
                         OperationId::new(
                             scope.0,
                             scope.1,
                             scope.2,
-                            OperationSeq::new(self.base + i as u64),
+                            OperationSeq::new(owner_ring.base + i as u64),
                         ),
                         val,
                     ));
@@ -683,7 +741,7 @@ impl<V> OriginOpTable<V> {
             }
         }
         out.extend(self.cold.iter_ordered());
-        if !self.cold.is_empty() {
+        if self.hot.len() > 1 || !self.cold.is_empty() {
             out.sort_unstable_by_key(|(id, _)| *id);
         }
         out
@@ -803,6 +861,82 @@ mod tests {
                 let expected: Vec<_> = oracle.iter().map(|(&k, &v)| (k, v)).collect();
                 assert_eq!(ordered, expected);
             }
+        }
+        let ordered: Vec<_> = table
+            .iter_ordered()
+            .into_iter()
+            .map(|(k, &v)| (k, v))
+            .collect();
+        let expected: Vec<_> = oracle.iter().map(|(&k, &v)| (k, v)).collect();
+        assert_eq!(ordered, expected);
+    }
+
+    #[test]
+    fn origin_op_table_multi_owner_matches_btreemap_under_concurrent_gaps() {
+        let mut table = OriginOpTable::new();
+        let mut oracle = BTreeMap::new();
+        let mut rng: u64 = 0x517c_c1b7_2722_0a95;
+        let mut next = || {
+            rng = rng
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            rng
+        };
+        let make_op = |owner: u64, seq: u64| {
+            OperationId::new(
+                StoreIncarnation::new(1),
+                RunEpoch::new(1),
+                LogicalOwnerId::new(owner),
+                OperationSeq::new(seq),
+            )
+        };
+        let mut frontiers = [1u64; 4];
+        for step in 0..10_000u64 {
+            let owner = (next() % 4) as usize;
+            let mode = next() % 10;
+            if mode < 6 {
+                let jump = if next() % 6 == 0 {
+                    (next() % 140) + 1
+                } else {
+                    next() % 12
+                };
+                let k = make_op(owner as u64, frontiers[owner] + jump);
+                assert_eq!(table.insert(k, step), oracle.insert(k, step));
+            } else if mode < 9 {
+                let k = make_op(owner as u64, frontiers[owner] + (next() % 100));
+                assert_eq!(table.remove(&k), oracle.remove(&k));
+                if next() % 4 == 0 {
+                    for s in frontiers[owner]..frontiers[owner] + 6 {
+                        let fk = make_op(owner as u64, s);
+                        assert_eq!(table.remove(&fk), oracle.remove(&fk));
+                    }
+                    frontiers[owner] += 6;
+                }
+            } else {
+                let lo = frontiers[owner];
+                let hi = lo + 40;
+                let mut got = Vec::new();
+                let _ = table.for_each_in_scope_range(
+                    make_op(owner as u64, 1).scope(),
+                    OperationSeq::new(lo),
+                    OperationSeq::new(hi),
+                    |id, &v| -> Result<(), ()> {
+                        got.push((id, v));
+                        Ok(())
+                    },
+                );
+                let want: Vec<_> = oracle
+                    .iter()
+                    .filter(|(id, _)| {
+                        id.owner() == LogicalOwnerId::new(owner as u64)
+                            && id.sequence().get() >= lo
+                            && id.sequence().get() <= hi
+                    })
+                    .map(|(&id, &v)| (id, v))
+                    .collect();
+                assert_eq!(got, want);
+            }
+            assert_eq!(table.len(), oracle.len());
         }
         let ordered: Vec<_> = table
             .iter_ordered()

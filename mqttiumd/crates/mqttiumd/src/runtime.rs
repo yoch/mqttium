@@ -21,7 +21,7 @@ use mqttiumd_contract::flat_map::{FlatMap, FlatSet, ScopedFlatMap};
 use mqttiumd_contract::ids::{
     AccountId, ConnectionGeneration, ConnectionKey, DeadlineToken, DeliveryId, EffectId,
     LogicalDuration, LogicalOwnerId, LogicalTime, OperationId, OperationSeq, OutboundPacketId,
-    PublicationId, RunEpoch, SessionId, StoreIncarnation,
+    PublicationId, Revision, RunEpoch, SessionId, StoreIncarnation,
 };
 use mqttiumd_contract::message_expiry::{MessageExpiry, MessageTime};
 use mqttiumd_contract::outcome::{CommitFacts, StoreOutcome, StoreReply};
@@ -102,13 +102,13 @@ pub struct Limits {
     effect_box: usize,
     /// Outgoing packet identifiers in flight: eight per connection.
     outgoing_bindings: usize,
-    timers: usize,
+    pub(crate) timers: usize,
     /// Concurrent business commands/work reads allowed in flight to the writer.
-    in_flight: usize,
+    pub(crate) in_flight: usize,
     /// Closing and terminal facts applied by one pass over the inputs.
     pass_facts: usize,
     /// Maximum step transitions applied by one pass over the inputs.
-    drain_steps: usize,
+    pub(crate) drain_steps: usize,
 }
 
 impl Limits {
@@ -224,6 +224,7 @@ pub struct Config {
     pub limits: Limits,
     pub hooks: Hooks,
     pub tls: Option<TlsFiles>,
+    pub delivery_shards: usize,
 }
 /// Cold connection state allocated lazily only when a peer holds backpressure
 /// buffers, multi-part subscribe requests, deferred publishes, or close state.
@@ -299,6 +300,7 @@ struct Peer {
     cold: Option<Box<PeerCold>>,
     connect_expiry: SessionExpiry,
     max_packet: u32,
+    receive_maximum: u16,
     keep_alive: u16,
     version: Option<Version>,
     connected: bool,
@@ -749,6 +751,9 @@ struct Runtime<'a> {
     last_expiry_inventory: Option<(usize, bool)>,
     owner: Owner,
     _authority: OwnerAuthority,
+    shards: Option<crate::delivery_shard::ShardPool>,
+    shard_notices: Vec<crate::delivery_shard::ShardToCoord>,
+    pending_suback_notify: FlatSet<SessionId>,
     incarnation: StoreIncarnation,
     epoch: RunEpoch,
     writer: StoreHandle<'a>,
@@ -762,6 +767,7 @@ struct Runtime<'a> {
     retiring: Vec<net::Connection>,
     sessions: BTreeMap<SharedBytes, Session>,
     session_ids: BTreeSet<SessionId>,
+    session_revisions: FlatMap<SessionId, Revision>,
     session_requests: BTreeMap<u64, PendingSession>,
     will_connects: BTreeMap<ConnectionGeneration, PendingWillConnect>,
     will_reads: Option<EffectId>,
@@ -1130,6 +1136,9 @@ impl Runtime<'_> {
         let _wakes = net::hold_wakes();
         let now = Instant::now();
         self.writer_results()?;
+        if self.shards.is_some() {
+            self.drain_shard_notices()?;
+        }
         if !self.owner.outbox_is_empty() {
             self.dispatch()?;
         }
@@ -1146,6 +1155,99 @@ impl Runtime<'_> {
         self.dispatch()?;
         self.writer.maybe_periodic_snapshot(now);
         Ok(())
+    }
+
+    fn drain_shard_notices(&mut self) -> Result<(), Failure> {
+        let mut notices = std::mem::take(&mut self.shard_notices);
+        notices.clear();
+        let drain_res = if let Some(shards) = self.shards.as_mut() {
+            shards.drain_notices(&mut notices)
+        } else {
+            Ok(())
+        };
+        let apply_res = (|| -> Result<(), Failure> {
+            for notice in notices.drain(..) {
+                match notice {
+                    crate::delivery_shard::ShardToCoord::CloseConnection {
+                        generation,
+                        code,
+                        disconnect_reason,
+                    } => {
+                        self.progress = self.progress.wrapping_add(1);
+                        let mut flushing = false;
+                        if let Some(reason) = disconnect_reason
+                            && let Some(peer) = self.peers.get_mut(&generation)
+                            && peer.connected
+                            && peer.version == Some(Version::V5)
+                            && peer.closing().is_none()
+                        {
+                            let bytes = codec::disconnect_reason(reason);
+                            if bytes.len() <= peer.max_packet_bytes()
+                                && peer
+                                    .io
+                                    .try_send_outgoing(net::Write {
+                                        expiry: None,
+                                        correlation: None,
+                                        bytes: net::FrameBytes::from(bytes),
+                                        payload: None,
+                                        report: net::WriteReport::Complete,
+                                    })
+                                    .is_ok()
+                            {
+                                peer.set_closing((code, Instant::now()));
+                                self.pending_peers.insert(generation);
+                                flushing = true;
+                            }
+                        }
+                        if !flushing {
+                            self.close(generation, code)?;
+                        }
+                    }
+                    crate::delivery_shard::ShardToCoord::Fatal(err) => return Err(err),
+                }
+            }
+            Ok(())
+        })();
+        self.shard_notices = notices;
+        drain_res.and(apply_res)
+    }
+
+    fn attach_ready_shards(&mut self, ready: Vec<ConnectionKey>) {
+        if ready.is_empty() || self.shards.is_none() {
+            return;
+        }
+        for connection in ready {
+            let pending_inline = self
+                .owner
+                .pending_delegated_inline_count(connection.session);
+            let Some(revision) = self.session_revisions.get(&connection.session).copied() else {
+                continue;
+            };
+            let Some(peer) = self.peers.get(&connection.generation) else {
+                continue;
+            };
+            if peer.closing().is_some() {
+                continue;
+            }
+            let version = peer.version.unwrap_or_default();
+            let receive_maximum = peer.receive_maximum;
+            let max_packet = peer.max_packet;
+            let outgoing = peer.io.outgoing_handle();
+            if let Some(shards) = self.shards.as_mut() {
+                let route = shards.route_for(connection);
+                peer.io.install_shard_route(route);
+                shards.attach_session(
+                    connection.session,
+                    revision,
+                    connection.generation,
+                    receive_maximum,
+                    max_packet,
+                    version,
+                    outgoing,
+                    pending_inline,
+                );
+            }
+        }
     }
 
     /// How long an idle reactor may wait for a signal. A due core deadline
@@ -1250,6 +1352,7 @@ impl Runtime<'_> {
                 cold: None,
                 connect_expiry: SessionExpiry::OnDisconnect,
                 max_packet: 268_435_455,
+                receive_maximum: crate::receiving::MAXIMUM as u16,
                 keep_alive: 0,
                 version: None,
                 connected: false,
@@ -1478,9 +1581,16 @@ impl Runtime<'_> {
             })
             .is_ok()
         {
+            let notify_session = (!requests.unsubscribe).then_some(p.session).flatten();
             cold.requests = None;
             p.gc_cold();
             self.progress = self.progress.wrapping_add(1);
+            if let Some(session) = notify_session
+                && self.shards.is_some()
+                && self.pending_suback_notify.remove(&session)
+            {
+                self.notify_work(session)?;
+            }
         }
         Ok(())
     }
@@ -1695,10 +1805,16 @@ impl Runtime<'_> {
                     pending.close_intent = Some(intent);
                 }
             }
-            if let Some(session) = peer.session
-                && let Some(input) = Self::closure_input(session, generation, opened_by, intent)
-            {
-                self.queue(input)?;
+            if let Some(session) = peer.session {
+                if self.shards.is_some() {
+                    let pending = self.owner.pending_delegated_inline_count(session);
+                    if let Some(shards) = self.shards.as_mut() {
+                        shards.detach_session(session, generation, pending);
+                    }
+                }
+                if let Some(input) = Self::closure_input(session, generation, opened_by, intent) {
+                    self.queue(input)?;
+                }
             }
             self.session_requests.retain(|_, pending| {
                 pending.connection != generation || pending.operation.is_some()
@@ -1885,8 +2001,10 @@ impl Runtime<'_> {
                     },
                 ) {
                     self.session_ids.remove(&replaced.id);
+                    self.session_revisions.remove(&replaced.id);
                 }
                 self.session_ids.insert(session);
+                self.session_revisions.insert(session, revision);
                 let origin = self.origin();
                 if let Some(generation) = connection {
                     let close_intent = self
@@ -2112,6 +2230,11 @@ impl Runtime<'_> {
         self.session_cardinality_dirty = true;
         self.sessions.retain(|_, cached| cached.id != retired);
         self.session_ids.remove(&retired);
+        self.session_revisions.remove(&retired);
+        self.pending_suback_notify.remove(&retired);
+        if let Some(shards) = self.shards.as_mut() {
+            shards.retire_session(retired);
+        }
         if self.pending_work_set.remove(&retired) {
             self.pending_work.retain(|s| *s != retired);
         }
@@ -2692,6 +2815,13 @@ impl Runtime<'_> {
                     } => Some((*connection, *packet_id, *reason, *target)),
                     _ => None,
                 };
+                let was_rejected_certain = matches!(
+                    &input,
+                    Input::StoreResult {
+                        reply: StoreReply::Outcome(StoreOutcome::RejectedCertain(_)),
+                        ..
+                    }
+                );
                 let control_refusal =
                     lifecycle_result.and_then(|_| match self.owner.lifecycle_action() {
                         Some(SessionAction::Detach { .. }) => Some("session_detach_rejected"),
@@ -2712,6 +2842,8 @@ impl Runtime<'_> {
                 let mut inline_close: Vec<(ConnectionGeneration, &'static str)> = Vec::new();
                 let mut inline_mark_pending: Vec<ConnectionGeneration> = Vec::new();
                 let mut inline_work_targets: Vec<SessionId> = Vec::new();
+                let mut inline_attach_ready: Vec<ConnectionKey> = Vec::new();
+                let mut inline_suback_ready: Vec<SessionId> = Vec::new();
                 let mut inline_changed: Option<AppliedSessionChange> = None;
                 let mut inline_error: Option<Failure> = None;
                 let step_outcome = if !cfg!(feature = "test-hooks")
@@ -2728,6 +2860,7 @@ impl Runtime<'_> {
                     && self.owner.will_dispatch().is_none()
                 {
                     dispatched_inline = true;
+                    let shards_active = self.shards.is_some();
                     let mut sink = Sink {
                         writer: &mut self.writer,
                         limits: self.limits,
@@ -2760,6 +2893,9 @@ impl Runtime<'_> {
                         queued_writer_replies: None,
                         frames: &mut self.frames,
                         outgoing_bindings: &mut self.outgoing_bindings,
+                        shards_active,
+                        shard_attach_ready: Vec::new(),
+                        shard_suback_ready: Vec::new(),
                         close: Vec::new(),
                         mark_pending_peers: Vec::new(),
                         pending_work_targets: Vec::new(),
@@ -2767,16 +2903,29 @@ impl Runtime<'_> {
                         session_change: None,
                         error: None,
                     };
-                    let (outcome, accepted) =
+                    let (outcome, accepted) = if let Some(shards) = self.shards.as_mut() {
+                        self.owner.step_and_dispatch_with_oracle(
+                            input,
+                            TurnGrant { work_limit },
+                            &mut sink,
+                            shards,
+                        )
+                    } else {
                         self.owner
-                            .step_and_dispatch(input, TurnGrant { work_limit }, &mut sink);
+                            .step_and_dispatch(input, TurnGrant { work_limit }, &mut sink)
+                    };
                     inline_accepted = accepted;
                     inline_close = std::mem::take(&mut sink.close);
                     inline_mark_pending = std::mem::take(&mut sink.mark_pending_peers);
                     inline_work_targets = std::mem::take(&mut sink.pending_work_targets);
+                    inline_attach_ready = std::mem::take(&mut sink.shard_attach_ready);
+                    inline_suback_ready = std::mem::take(&mut sink.shard_suback_ready);
                     inline_changed = sink.session_change.take();
                     inline_error = sink.error.take();
                     outcome
+                } else if let Some(shards) = self.shards.as_mut() {
+                    self.owner
+                        .step_with_oracle(input, TurnGrant { work_limit }, shards)
                 } else {
                     self.owner.step(input, TurnGrant { work_limit })
                 };
@@ -2956,6 +3105,46 @@ impl Runtime<'_> {
                     }
                 }
                 if applied {
+                    if self.shards.is_some() {
+                        if let Some(batch) = self.owner.take_last_delegated_committed() {
+                            let mut targets_to_check: Vec<SessionId> =
+                                batch.claims.iter().map(|c| c.target).collect();
+                            targets_to_check.sort_unstable();
+                            targets_to_check.dedup();
+                            if let Some(shards) = self.shards.as_mut() {
+                                shards.send_inline_committed(batch);
+                                for session in targets_to_check {
+                                    if self.owner.pending_delegated_inline_count(session) == 0 {
+                                        shards.flush_dirty_barrier_if_pending(session);
+                                    }
+                                }
+                            }
+                        }
+                        if let Some(batch) = self.owner.take_last_delegated_rejected() {
+                            let mut targets_to_check: Vec<SessionId> =
+                                batch.claims.iter().map(|c| c.target).collect();
+                            targets_to_check.sort_unstable();
+                            targets_to_check.dedup();
+                            if let Some(shards) = self.shards.as_mut() {
+                                for session in targets_to_check {
+                                    if self.owner.pending_delegated_inline_count(session) == 0 {
+                                        shards.flush_dirty_barrier_if_pending(session);
+                                    }
+                                }
+                            }
+                        }
+                        if was_rejected_certain && let Some(shards) = self.shards.as_mut() {
+                            let owner = &self.owner;
+                            shards.flush_idle_dirty_barriers(|s| {
+                                owner.pending_delegated_inline_count(s)
+                            });
+                        }
+                        if let Some(batch) = self.owner.take_last_delegated_qos0()
+                            && let Some(shards) = self.shards.as_mut()
+                        {
+                            shards.send_qos0(batch);
+                        }
+                    }
                     if let Some((connection, packet_id, reason, target)) = observed_puback_meta
                         && self.owner.last_observed_puback_ignored()
                     {
@@ -2995,6 +3184,12 @@ impl Runtime<'_> {
                 if dispatched_inline {
                     for generation in inline_mark_pending {
                         self.pending_peers.insert(generation);
+                    }
+                    self.attach_ready_shards(inline_attach_ready);
+                    for session in inline_suback_ready {
+                        if self.pending_suback_notify.remove(&session) {
+                            self.notify_work(session)?;
+                        }
                     }
                     for target in inline_work_targets {
                         self.notify_work(target)?;
@@ -3259,6 +3454,7 @@ impl Runtime<'_> {
             self.refresh_bindings();
             self.bindings_dirty = false;
         }
+        let shards_active = self.shards.is_some();
         let mut sink = Sink {
             writer: &mut self.writer,
             limits: self.limits,
@@ -3291,6 +3487,9 @@ impl Runtime<'_> {
             queued_writer_replies: None,
             frames: &mut self.frames,
             outgoing_bindings: &mut self.outgoing_bindings,
+            shards_active,
+            shard_attach_ready: Vec::new(),
+            shard_suback_ready: Vec::new(),
             close: Vec::new(),
             mark_pending_peers: Vec::new(),
             pending_work_targets: Vec::new(),
@@ -3304,11 +3503,19 @@ impl Runtime<'_> {
         let close = std::mem::take(&mut sink.close);
         let mark_pending = std::mem::take(&mut sink.mark_pending_peers);
         let work_targets = std::mem::take(&mut sink.pending_work_targets);
+        let attach_ready = std::mem::take(&mut sink.shard_attach_ready);
+        let suback_ready = std::mem::take(&mut sink.shard_suback_ready);
         let changed = sink.session_change.take();
         let error = sink.error.take();
         drop(sink);
         for generation in mark_pending {
             self.pending_peers.insert(generation);
+        }
+        self.attach_ready_shards(attach_ready);
+        for session in suback_ready {
+            if self.pending_suback_notify.remove(&session) {
+                self.notify_work(session)?;
+            }
         }
         for target in work_targets {
             self.notify_work(target)?;
@@ -3476,6 +3683,9 @@ impl Runtime<'_> {
                 self.message_expiry_retry = false;
                 self.message_expiry_retry_attempts = 0;
                 if !removed.is_empty() {
+                    if let Some(shards) = self.shards.as_mut() {
+                        shards.send_messages_expired(removed.as_slice());
+                    }
                     self.message_expiry_input = Some(Input::MessagesExpired {
                         deliveries: removed,
                     });
@@ -3612,11 +3822,28 @@ impl Runtime<'_> {
                         StoreReply::Outcome(StoreOutcome::Committed(
                             CommitFacts::PublicationAdmitted { .. }
                                 | CommitFacts::RetainedQos0Stored { .. }
-                                | CommitFacts::SubscriptionsChanged { .. }
                         ))
                     ) {
                         for target in targets {
                             self.notify_work(target)?;
+                        }
+                    } else if matches!(
+                        reply,
+                        StoreReply::Outcome(StoreOutcome::Committed(
+                            CommitFacts::SubscriptionsChanged { .. }
+                        ))
+                    ) {
+                        if self.shards.is_some() {
+                            // Defer shard work notification until SUBACK enters
+                            // ConnCore::outgoing so retained replays never
+                            // overtake SUBACK on the wire (MQTT-3.8.4-1).
+                            for target in targets {
+                                self.pending_suback_notify.insert(target);
+                            }
+                        } else {
+                            for target in targets {
+                                self.notify_work(target)?;
+                            }
                         }
                     }
                 }
@@ -3702,6 +3929,9 @@ impl Runtime<'_> {
     }
     #[inline]
     fn rearm_ready_work(&mut self, session: SessionId, initial: bool) {
+        if self.shards.is_some() {
+            return;
+        }
         if self.queued_work_sessions.contains(&session) {
             return;
         }
@@ -3720,6 +3950,13 @@ impl Runtime<'_> {
         }
     }
     fn queue_work_front(&mut self, session: SessionId) {
+        if self.shards.is_some() {
+            let pending = self.owner.pending_delegated_inline_count(session);
+            if let Some(shards) = self.shards.as_mut() {
+                shards.notify_dirty(session, true, pending);
+            }
+            return;
+        }
         if self.ordinary_room() != 0 {
             if self.queued_work_sessions.insert(session) {
                 self.inputs.push_front(Input::WorkAvailable { session });
@@ -3731,6 +3968,13 @@ impl Runtime<'_> {
         }
     }
     fn queue_work(&mut self, session: SessionId) {
+        if self.shards.is_some() {
+            let pending = self.owner.pending_delegated_inline_count(session);
+            if let Some(shards) = self.shards.as_mut() {
+                shards.notify_dirty(session, true, pending);
+            }
+            return;
+        }
         if self.ordinary_room() != 0 {
             if self.queued_work_sessions.insert(session) {
                 self.inputs.push_back(Input::WorkAvailable { session });
@@ -3854,6 +4098,7 @@ impl Runtime<'_> {
             }
             p.keep_alive = connect.keep_alive;
             p.max_packet = connect.max_packet_size;
+            p.receive_maximum = connect.receive_maximum;
             p.last_packet_ns = now_ns;
         }
         #[cfg(feature = "test-hooks")]
@@ -5904,6 +6149,9 @@ struct Sink<'a, 'b> {
     queued_writer_replies: Option<usize>,
     frames: &'a mut ScopedFlatMap<EffectId, PendingFrame>,
     outgoing_bindings: &'a mut FlatMap<(ConnectionKey, OutboundPacketId), PubackTarget>,
+    shards_active: bool,
+    shard_attach_ready: Vec<ConnectionKey>,
+    shard_suback_ready: Vec<SessionId>,
     limits: Limits,
     close: Vec<(ConnectionGeneration, &'static str)>,
     mark_pending_peers: Vec<ConnectionGeneration>,
@@ -6588,7 +6836,8 @@ impl EffectSink for Sink<'_, '_> {
                     .checked_add(2 * self.frames.len())
                     .is_none_or(|used| used >= self.limits.terminal_inputs)
                     || self.frames.len() >= self.limits.frames
-                    || (kind == "CONNACK"
+                    || (!self.shards_active
+                        && kind == "CONNACK"
                         && ordinary_room(
                             self.inputs,
                             self.ordinary_reserved,
@@ -6692,11 +6941,15 @@ impl EffectSink for Sink<'_, '_> {
                             // CONNACK enters the bounded writer queue. The
                             // earlier cache-install fence deliberately kept
                             // this destination ineligible for discovery.
-                            if self.queued_work_sessions.insert(connection.session) {
+                            if self.shards_active {
+                                self.shard_attach_ready.push(connection);
+                            } else if self.queued_work_sessions.insert(connection.session) {
                                 self.inputs.push_back(Input::WorkAvailable {
                                     session: connection.session,
                                 });
                             }
+                        } else if self.shards_active && kind == "SUBACK" {
+                            self.shard_suback_ready.push(connection.session);
                         }
                         self.frames.insert(
                             id,
@@ -7302,10 +7555,14 @@ pub fn run(config: Config) -> Result<(), Failure> {
     let policy = security
         .as_ref()
         .map(|security| security.policy.storage().clone());
+    let delivery_shards = config
+        .delivery_shards
+        .min(crate::delivery_shard::MAX_DELIVERY_SHARDS);
     let use_direct = matches!(
         config.storage_mode,
         crate::writer::StorageMode::Volatile { .. }
-    ) && config.hooks.directory.is_none();
+    ) && config.hooks.directory.is_none()
+        && delivery_shards == 0;
     if use_direct {
         let (mut direct, boot) = DirectWriter::open(
             config.db,
@@ -7325,6 +7582,7 @@ pub fn run(config: Config) -> Result<(), Failure> {
             Some(boot),
             security,
             config.limits,
+            0,
         );
         if let Err(failure) = &result {
             let _ = events.emit("startup_or_runtime_refused", failure.fields());
@@ -7338,7 +7596,7 @@ pub fn run(config: Config) -> Result<(), Failure> {
         }
         return result.and(writer_result);
     }
-    let mut writer = Writer::spawn_configured(
+    let mut writer = Writer::spawn_configured_sharded(
         config.db,
         events.clone(),
         config.hooks.clone(),
@@ -7346,6 +7604,7 @@ pub fn run(config: Config) -> Result<(), Failure> {
         policy,
         config.require_existing_db,
         config.storage_mode,
+        delivery_shards,
     )?;
     let result = run_inner(
         &config.listen,
@@ -7356,6 +7615,7 @@ pub fn run(config: Config) -> Result<(), Failure> {
         None,
         security,
         config.limits,
+        delivery_shards,
     );
     if let Err(failure) = &result {
         let _ = events.emit("startup_or_runtime_refused", failure.fields());
@@ -7500,6 +7760,7 @@ fn run_inner(
     direct_boot: Option<Boot>,
     security: Option<Security>,
     limits: Limits,
+    delivery_shards: usize,
 ) -> Result<(), Failure> {
     let _ = &hooks;
     let (boot, wake) = match (&mut writer, direct_boot) {
@@ -7518,7 +7779,14 @@ fn run_inner(
     let collect_closed = boot.collect_closed;
     let sqlite = boot.sqlite.clone();
     let storage_mode = boot.storage_mode;
-    let mut authority = OwnerAuthority::from_grant(boot.grant, NonZeroU32::MIN)
+    let total_owners = NonZeroU32::new(
+        u32::try_from(delivery_shards)
+            .ok()
+            .and_then(|n| n.checked_add(1))
+            .ok_or_else(|| Failure::plain("authority_allocation"))?,
+    )
+    .ok_or_else(|| Failure::plain("authority_allocation"))?;
+    let mut authority = OwnerAuthority::from_grant(boot.grant, total_owners)
         .map_err(|_| Failure::plain("authority_allocation"))?;
     let outbox = authority
         .create_outbox(
@@ -7552,6 +7820,13 @@ fn run_inner(
     let enable_inline_claims = true;
     if enable_inline_claims {
         owner.enable_inline_claims();
+    }
+    if delivery_shards > 0 {
+        owner.enable_delegated_deliveries();
+    }
+    let mut session_revisions = FlatMap::new();
+    for s in boot.sessions.values() {
+        session_revisions.insert(s.id, s.revision);
     }
     // The worker handle stays in outer run for cleanup even if recovery fails.
     let expiry_timers = boot
@@ -7602,6 +7877,9 @@ fn run_inner(
         last_expiry_inventory: None,
         owner,
         _authority: authority,
+        shards: None,
+        shard_notices: Vec::new(),
+        pending_suback_notify: FlatSet::new(),
         incarnation,
         epoch,
         writer,
@@ -7614,6 +7892,7 @@ fn run_inner(
         capacity_waiters: 0,
         retiring: Vec::new(),
         session_ids: boot.sessions.values().map(|s| s.id).collect(),
+        session_revisions,
         sessions: boot.sessions,
         session_requests: BTreeMap::new(),
         will_connects: BTreeMap::new(),
@@ -7835,6 +8114,42 @@ fn run_inner(
             runtime.dispatch()?;
             thread::sleep(Duration::from_millis(1));
         }
+        if delivery_shards > 0 {
+            check_startup_cancel(&cancel)?;
+            let shard_limits = runtime
+                .owner
+                .shard_limits()
+                .ok_or_else(|| Failure::plain("shard_limits_missing"))?;
+            let mut outboxes = Vec::with_capacity(delivery_shards);
+            for i in 1..=delivery_shards {
+                let ob = runtime
+                    ._authority
+                    .create_outbox(
+                        LogicalOwnerId::new(i as u64),
+                        NonZeroUsize::new(limits.effect_box).expect("nonzero"),
+                        nz(64),
+                    )
+                    .map_err(|_| Failure::plain("shard_outbox_creation"))?;
+                outboxes.push(ob);
+            }
+            let store_handles = match &mut runtime.writer {
+                StoreHandle::Threaded(w) => w.take_shard_handles(),
+                StoreHandle::Direct(_) => {
+                    return Err(Failure::plain("shard_requires_threaded_writer"));
+                }
+            };
+            let pool = crate::delivery_shard::ShardPool::spawn(
+                outboxes,
+                store_handles,
+                shard_limits,
+                limits,
+                events.clone(),
+                runtime.clock.clone(),
+                runtime.wake.clone(),
+                cancel.clone(),
+            )?;
+            runtime.shards = Some(pool);
+        }
         runtime.emit_session_clock_anchor()?;
         let now = runtime.message_now()?;
         events.emit("message_expiry_clock", json!({"details":{
@@ -7880,6 +8195,7 @@ fn run_inner(
                 "snapshot_interval_secs".into(),
                 json!(storage_mode.snapshot_interval_secs()),
             );
+            details.insert("delivery_shards".into(), json!(delivery_shards));
         }
         if let Some(security) = &runtime.security {
             events.emit("tls_profile", json!({"details":{"version":"TLS1.3","client_certificate":"required",
@@ -7971,7 +8287,15 @@ fn run_inner(
             socket_result = Err(Failure::plain("socket_shutdown_deadline"));
         }
     }
-    result.and(session_result).and(socket_result)
+    let shard_result = if let Some(pool) = runtime.shards.take() {
+        pool.shutdown(Duration::from_secs(3))
+    } else {
+        Ok(())
+    };
+    result
+        .and(session_result)
+        .and(shard_result)
+        .and(socket_result)
 }
 
 #[cfg(test)]

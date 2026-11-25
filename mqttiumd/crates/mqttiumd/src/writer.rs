@@ -722,6 +722,30 @@ impl Hooks {
         Ok(())
     }
 }
+/// Dedicated SPSC request/reply store handle for one `DeliveryShard` owner
+/// (`LogicalOwnerId(1 + shard_index)`). Shares the writer thread's single
+/// request `Wake` so commands from all owners coalesce into one group commit
+/// while replies return on each owner's independent bounded channel.
+pub struct ShardStoreHandle {
+    pub sender: crate::wake::Signalled<Request>,
+    pub receiver: Receiver<Response>,
+    pub control_sender: crate::wake::Signalled<ControlRequest>,
+    pub control_receiver: Receiver<ControlResponse>,
+    pub wake: crate::wake::Wake,
+    pub has_expiring: Arc<AtomicBool>,
+}
+
+struct OwnerLane {
+    rx: Receiver<Request>,
+    rtx: mpsc::SyncSender<Response>,
+    crx: Receiver<ControlRequest>,
+    cctx: mpsc::SyncSender<ControlResponse>,
+    wake: crate::wake::Wake,
+    pending: VecDeque<Response>,
+    pending_control: Option<ControlResponse>,
+    closed: bool,
+}
+
 pub struct Writer {
     pub sender: crate::wake::Signalled<Request>,
     pub receiver: Receiver<Response>,
@@ -734,6 +758,7 @@ pub struct Writer {
     /// reactor can skip empty 100 ms `MessageExpiry` sweeps without waking
     /// the writer thread or starving write batches on the control lane.
     has_expiring: Arc<AtomicBool>,
+    shard_handles: Vec<ShardStoreHandle>,
     handle: Option<JoinHandle<Result<(), Failure>>>,
 }
 impl Writer {
@@ -763,10 +788,12 @@ impl Writer {
             None,
             false,
             StorageMode::Durable,
+            0,
         )
     }
 
-    pub(crate) fn spawn_configured(
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn spawn_configured_sharded(
         path: PathBuf,
         events: Events,
         hooks: Hooks,
@@ -774,6 +801,7 @@ impl Writer {
         policy: Option<mqttiumd_store_sqlite::StoragePolicy>,
         require_existing: bool,
         storage_mode: StorageMode,
+        extra_owners: usize,
     ) -> Result<Self, Failure> {
         let clock = Arc::new(SystemClock::new().map_err(|error| Failure::plain(error.code()))?);
         Self::spawn_bound(
@@ -785,7 +813,13 @@ impl Writer {
             policy,
             require_existing,
             storage_mode,
+            extra_owners,
         )
+    }
+
+    /// Takes the dedicated `ShardStoreHandle`s created for `extra_owners`.
+    pub(crate) fn take_shard_handles(&mut self) -> Vec<ShardStoreHandle> {
+        std::mem::take(&mut self.shard_handles)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -798,12 +832,13 @@ impl Writer {
         policy: Option<mqttiumd_store_sqlite::StoragePolicy>,
         require_existing: bool,
         storage_mode: StorageMode,
+        extra_owners: usize,
     ) -> Result<Self, Failure> {
         let _ = &hooks;
         if hooks.directory.is_some() && storage_mode != StorageMode::Durable {
             return Err(Failure::plain("volatile_test_hooks_unsupported"));
         }
-        // The worker waits on `requests` when both request lanes are empty.
+        // The worker waits on `requests` when all request lanes are empty.
         let requests = crate::wake::Wake::new();
         let (tx, rx) = crate::wake::signalled(QUEUE, &requests);
         let (rtx, rrx) = mpsc::sync_channel(QUEUE * 2);
@@ -817,9 +852,47 @@ impl Writer {
         };
         let (cctx, ccrx) = mpsc::sync_channel(CONTROL_QUEUE);
         let wake = crate::wake::Wake::new();
-        let worker_wake = wake.clone();
         let has_expiring = Arc::new(AtomicBool::new(true));
         let worker_has_expiring = Arc::clone(&has_expiring);
+
+        let mut lanes = Vec::with_capacity(1 + extra_owners);
+        lanes.push(OwnerLane {
+            rx,
+            rtx,
+            crx,
+            cctx,
+            wake: wake.clone(),
+            pending: VecDeque::new(),
+            pending_control: None,
+            closed: false,
+        });
+        let mut shard_handles = Vec::with_capacity(extra_owners);
+        for _ in 0..extra_owners {
+            let (stx, srx) = crate::wake::signalled(QUEUE, &requests);
+            let (srtx, srrx) = mpsc::sync_channel(QUEUE * 2);
+            let (sctx, scrx) = crate::wake::signalled(CONTROL_QUEUE, &requests);
+            let (scctx, sccrx) = mpsc::sync_channel(CONTROL_QUEUE);
+            let swake = crate::wake::Wake::new();
+            lanes.push(OwnerLane {
+                rx: srx,
+                rtx: srtx,
+                crx: scrx,
+                cctx: scctx,
+                wake: swake.clone(),
+                pending: VecDeque::new(),
+                pending_control: None,
+                closed: false,
+            });
+            shard_handles.push(ShardStoreHandle {
+                sender: stx,
+                receiver: srrx,
+                control_sender: sctx,
+                control_receiver: sccrx,
+                wake: swake,
+                has_expiring: Arc::clone(&has_expiring),
+            });
+        }
+
         let handle = thread::Builder::new()
             .name(match storage_mode {
                 StorageMode::Durable => "sqlite-writer".into(),
@@ -844,13 +917,14 @@ impl Writer {
                 if btx.send(Ok(boot)).is_err() {
                     return Ok(());
                 }
-                let mut pending: VecDeque<Response> = VecDeque::new();
-                let mut pending_control = None;
                 // Barriers and one-shot controls of a test run address one
                 // command at a time: no group is formed while they exist.
                 let group = if hooks.directory.is_some() {
                     1
-                } else if storage_mode == StorageMode::Log {
+                } else if matches!(
+                    storage_mode,
+                    StorageMode::Log | StorageMode::Volatile { .. }
+                ) {
                     QUEUE.min(mqttiumd_store_volatile::LOG_MAX_GROUP)
                 } else {
                     GROUP
@@ -859,156 +933,329 @@ impl Writer {
                 let mut stop_result: Result<(), Failure> = Ok(());
                 let mut state = BusinessState::default();
                 let mut members: Vec<Member> = Vec::with_capacity(group);
-                let mut deferred_reads: Vec<(EffectId, Effect)> = Vec::new();
+                let mut deferred_reads: Vec<(usize, EffectId, Effect)> = Vec::new();
+                let mut shard_rr: usize = 0;
                 #[cfg(feature="test-hooks")]
                 let mut duplicate_control: Option<ControlResponse> = None;
                 loop {
                     #[cfg(feature="test-hooks")]
                     if replay_controls(&mut store,&state,&hooks,&events).is_err() { cancel.store(true,Ordering::Relaxed); }
-                    // A reply lane the core has not drained is retried on a
+                    // A reply lane an owner has not drained is retried on a
                     // short timer; nothing else in this loop waits on a timer.
                     let mut stalled = false;
-                    if let Some(reply) = pending_control.take() {
-                        match cctx.try_send(reply) {
-                            Ok(()) => worker_wake.wake(),
-                            Err(TrySendError::Full(reply)) => {
-                                stalled = true;
-                                pending_control = Some(reply);
-                            }
-                            Err(TrySendError::Disconnected(_)) => {
-                                return if stopping {
-                                    stop_result
-                                } else {
-                                    store.maybe_snapshot(&events, true)
-                                };
-                            }
-                        }
-                    }
-                    // Replies leave in the order of their requests.
-                    let mut sent_reply = false;
-                    while let Some(reply) = pending.pop_front() {
-                        match rtx.try_send(reply) {
-                            Ok(()) => sent_reply = true,
-                            Err(TrySendError::Full(reply)) => {
-                                stalled = true;
-                                pending.push_front(reply);
-                                break;
-                            }
-                            Err(TrySendError::Disconnected(_)) => {
-                                return if stopping {
-                                    stop_result
-                                } else {
-                                    store.maybe_snapshot(&events, true)
-                                };
+                    let mut any_pending = false;
+                    let mut any_control_pending = false;
+                    for (idx, lane) in lanes.iter_mut().enumerate() {
+                        let mut woke = false;
+                        if let Some(reply) = lane.pending_control.take() {
+                            match lane.cctx.try_send(reply) {
+                                Ok(()) => woke = true,
+                                Err(TrySendError::Full(reply)) => {
+                                    stalled = true;
+                                    lane.pending_control = Some(reply);
+                                }
+                                Err(TrySendError::Disconnected(_)) => {
+                                    if idx == 0 {
+                                        return if stopping {
+                                            stop_result
+                                        } else {
+                                            store.maybe_snapshot(&events, true)
+                                        };
+                                    }
+                                    lane.closed = true;
+                                }
                             }
                         }
+                        // Replies leave in the order of their owner's requests.
+                        while let Some(reply) = lane.pending.pop_front() {
+                            match lane.rtx.try_send(reply) {
+                                Ok(()) => woke = true,
+                                Err(TrySendError::Full(reply)) => {
+                                    stalled = true;
+                                    lane.pending.push_front(reply);
+                                    break;
+                                }
+                                Err(TrySendError::Disconnected(_)) => {
+                                    if idx == 0 {
+                                        return if stopping {
+                                            stop_result
+                                        } else {
+                                            store.maybe_snapshot(&events, true)
+                                        };
+                                    }
+                                    lane.closed = true;
+                                    lane.pending.clear();
+                                    break;
+                                }
+                            }
+                        }
+                        if woke {
+                            lane.wake.wake();
+                        }
+                        if !lane.pending.is_empty() {
+                            any_pending = true;
+                        }
+                        if lane.pending_control.is_some() {
+                            any_control_pending = true;
+                        }
                     }
-                    if sent_reply {
-                        worker_wake.wake();
-                    }
-                    if stopping && pending.is_empty() {
+                    if stopping && lanes[0].pending.is_empty() {
                         return stop_result;
                     }
                     // Even a completely unread ordinary result lane cannot prevent
                     // a reserved receipt closure from committing and replying.
                     #[cfg(feature="test-hooks")]
-                    if pending_control.is_none() { pending_control = duplicate_control.take(); }
-                    if pending_control.is_none() {
-                        match crx.try_recv() {
+                    if lanes[0].pending_control.is_none() {
+                        lanes[0].pending_control = duplicate_control.take();
+                    }
+                    for (idx, lane) in lanes.iter_mut().enumerate() {
+                        if lane.closed || lane.pending_control.is_some() {
+                            continue;
+                        }
+                        match lane.crx.try_recv() {
                             Ok(request) => {
-                                let reply = control_response(&mut store, request, &events, &hooks, &cancel, &mut state);
-                                worker_has_expiring
-                                    .store(store.has_expiring_publications(), Ordering::Release);
+                                let reply = control_response(
+                                    &mut store, request, &events, &hooks, &cancel, &mut state,
+                                );
+                                worker_has_expiring.store(
+                                    store.has_expiring_publications(),
+                                    Ordering::Release,
+                                );
                                 #[cfg(feature="test-hooks")]
-                                if let ControlResponse::Collected { collection, result:Ok(ReceiptCollectionReply::Applied { .. }),.. } = &reply
-                                    && hooks.directory.as_ref().is_some_and(|d| consume_file(&d.join("duplicate-close-result"))) {
-                                    let _ = events.emit("receipt_collection_result_duplicated",json!({"command_kind":"ReceiptCollection","details":collection_details(*collection)}));
-                                    duplicate_control = Some(reply.clone());
+                                if idx == 0 {
+                                    if let ControlResponse::Collected { collection, result:Ok(ReceiptCollectionReply::Applied { .. }),.. } = &reply
+                                        && hooks.directory.as_ref().is_some_and(|d| consume_file(&d.join("duplicate-close-result"))) {
+                                        let _ = events.emit("receipt_collection_result_duplicated",json!({"command_kind":"ReceiptCollection","details":collection_details(*collection)}));
+                                        duplicate_control = Some(reply.clone());
+                                    }
+                                    if let ControlResponse::MessageExpiry { now, after, result:Ok(_),.. } = &reply
+                                        && hooks.directory.as_ref().is_some_and(|d| consume_file(&d.join("duplicate-next-message-expire-result"))) {
+                                        let _ = events.emit("message_expiry_result_duplicated",json!({"details":message_expiry_details(*now,*after)}));
+                                        duplicate_control = Some(reply.clone());
+                                    }
                                 }
-                                #[cfg(feature="test-hooks")]
-                                if let ControlResponse::MessageExpiry { now, after, result:Ok(_),.. } = &reply
-                                    && hooks.directory.as_ref().is_some_and(|d| consume_file(&d.join("duplicate-next-message-expire-result"))) {
-                                    let _ = events.emit("message_expiry_result_duplicated",json!({"details":message_expiry_details(*now,*after)}));
-                                    duplicate_control = Some(reply.clone());
-                                }
-                                pending_control = Some(reply);
+                                lane.pending_control = Some(reply);
+                                any_control_pending = true;
                             }
                             Err(TryRecvError::Empty) => {}
                             Err(TryRecvError::Disconnected) => {
-                                return if stopping {
-                                    stop_result
-                                } else {
-                                    store.maybe_snapshot(&events, true)
-                                };
+                                if idx == 0 {
+                                    return if stopping {
+                                        stop_result
+                                    } else {
+                                        store.maybe_snapshot(&events, true)
+                                    };
+                                }
+                                lane.closed = true;
                             }
                         }
                     }
-                    if pending.is_empty() && !stopping {
-                        // Consecutive commands waiting in the lane commit as
-                        // one group. Interleaved read-only LoadWork requests do
-                        // not shatter the write group: they run immediately
-                        // after the group commit so they see the committed rows.
+                    if !any_pending && !stopping {
+                        // Consecutive Persist commands across all owners commit
+                        // as one group transaction. Read-only LoadWork requests
+                        // run immediately after the group commit so they see all
+                        // newly committed rows without shattering the batch.
                         members.clear();
                         deferred_reads.clear();
-                        let mut other = None;
-                        let mut closed = false;
-                        while members.len() < group && deferred_reads.len() < group {
-                            match rx.try_recv() {
-                                Ok(Request::Effect(effect)) => match effect.into_parts() {
-                                    (effect, Effect::Persist { command }) if group > 1 => {
-                                        members.push(Member { effect, command });
-                                    }
-                                    (effect, work @ Effect::LoadWork { .. })
-                                        if group > 1 && !members.is_empty() =>
-                                    {
-                                        deferred_reads.push((effect, work));
-                                    }
-                                    (effect, work) => {
-                                        other = Some(Ok((effect, work)));
+                        type NonGroupItem = (usize, Result<(EffectId, Effect), Request>);
+                        let mut other: Option<NonGroupItem> = None;
+                        let mut coord_closed = false;
+                        let lane_count = lanes.len();
+                        if lane_count == 1 {
+                            while members.len() < group && deferred_reads.len() < group {
+                                match lanes[0].rx.try_recv() {
+                                    Ok(Request::Effect(effect)) => match effect.into_parts() {
+                                        (effect, Effect::Persist { command }) if group > 1 => {
+                                            members.push(Member {
+                                                owner_idx: 0,
+                                                effect,
+                                                command,
+                                            });
+                                        }
+                                        (effect, work @ Effect::LoadWork { .. })
+                                            if group > 1 && !members.is_empty() =>
+                                        {
+                                            deferred_reads.push((0, effect, work));
+                                        }
+                                        (effect, work) => {
+                                            other = Some((0, Ok((effect, work))));
+                                            break;
+                                        }
+                                    },
+                                    Ok(request) => {
+                                        other = Some((0, Err(request)));
                                         break;
                                     }
-                                },
-                                Ok(request) => {
-                                    other = Some(Err(request));
-                                    break;
-                                }
-                                Err(TryRecvError::Empty) => break,
-                                Err(TryRecvError::Disconnected) => {
-                                    closed = true;
-                                    break;
+                                    Err(TryRecvError::Empty) => break,
+                                    Err(TryRecvError::Disconnected) => {
+                                        coord_closed = true;
+                                        break;
+                                    }
                                 }
                             }
+                        } else {
+                            // Drain-first multi-owner scheduling: delivery shards
+                            // (`1..lane_count`) release store references and
+                            // Receive Maximum slots (`FinishDelivery`), whereas
+                            // Coordinator (`0`) allocates `1..N` references per
+                            // admission. Drain shards first up to `shard_budget`,
+                            // reserve `coord_reserve` slots for Coordinator so
+                            // publishers never starve, then backfill any unused
+                            // slots from shards.
+                            let shard_count = lane_count - 1;
+                            let coord_reserve = (group / 8).clamp(8, 64).min(group);
+                            let shard_budget = group.saturating_sub(coord_reserve);
+                            let drain_shards = |lanes: &mut [OwnerLane],
+                                                members: &mut Vec<Member>,
+                                                deferred_reads: &mut Vec<(usize, EffectId, Effect)>,
+                                                other: &mut Option<NonGroupItem>,
+                                                limit: usize,
+                                                start: usize| {
+                                while members.len() < limit
+                                    && deferred_reads.len() < group
+                                    && other.is_none()
+                                {
+                                    let mut made_progress = false;
+                                    for step in 0..shard_count {
+                                        if members.len() >= limit
+                                            || deferred_reads.len() >= group
+                                            || other.is_some()
+                                        {
+                                            break;
+                                        }
+                                        let idx = 1 + ((start + step) % shard_count);
+                                        if lanes[idx].closed {
+                                            continue;
+                                        }
+                                        match lanes[idx].rx.try_recv() {
+                                            Ok(Request::Effect(effect)) => {
+                                                made_progress = true;
+                                                match effect.into_parts() {
+                                                    (effect, Effect::Persist { command })
+                                                        if group > 1 =>
+                                                    {
+                                                        members.push(Member {
+                                                            owner_idx: idx,
+                                                            effect,
+                                                            command,
+                                                        });
+                                                    }
+                                                    (effect, work @ Effect::LoadWork { .. })
+                                                        if group > 1 =>
+                                                    {
+                                                        deferred_reads.push((idx, effect, work));
+                                                    }
+                                                    (effect, work) => {
+                                                        *other = Some((idx, Ok((effect, work))));
+                                                        break;
+                                                    }
+                                                }
+                                            }
+                                            Ok(request) => {
+                                                made_progress = true;
+                                                *other = Some((idx, Err(request)));
+                                                break;
+                                            }
+                                            Err(TryRecvError::Empty) => {}
+                                            Err(TryRecvError::Disconnected) => {
+                                                lanes[idx].closed = true;
+                                            }
+                                        }
+                                    }
+                                    if !made_progress {
+                                        break;
+                                    }
+                                }
+                            };
+                            drain_shards(
+                                &mut lanes,
+                                &mut members,
+                                &mut deferred_reads,
+                                &mut other,
+                                shard_budget,
+                                shard_rr,
+                            );
+                            while members.len() < group
+                                && deferred_reads.len() < group
+                                && other.is_none()
+                            {
+                                match lanes[0].rx.try_recv() {
+                                    Ok(Request::Effect(effect)) => match effect.into_parts() {
+                                        (effect, Effect::Persist { command }) if group > 1 => {
+                                            members.push(Member {
+                                                owner_idx: 0,
+                                                effect,
+                                                command,
+                                            });
+                                        }
+                                        (effect, work @ Effect::LoadWork { .. }) if group > 1 => {
+                                            deferred_reads.push((0, effect, work));
+                                        }
+                                        (effect, work) => {
+                                            other = Some((0, Ok((effect, work))));
+                                            break;
+                                        }
+                                    },
+                                    Ok(request) => {
+                                        other = Some((0, Err(request)));
+                                        break;
+                                    }
+                                    Err(TryRecvError::Empty) => break,
+                                    Err(TryRecvError::Disconnected) => {
+                                        coord_closed = true;
+                                        break;
+                                    }
+                                }
+                            }
+                            if !coord_closed && members.len() < group && other.is_none() {
+                                drain_shards(
+                                    &mut lanes,
+                                    &mut members,
+                                    &mut deferred_reads,
+                                    &mut other,
+                                    group,
+                                    shard_rr,
+                                );
+                            }
+                            shard_rr = (shard_rr + 1) % shard_count;
                         }
                         let idle_turn =
                             members.is_empty() && deferred_reads.is_empty() && other.is_none();
                         if !members.is_empty() {
-                            group_responses_into(&mut store, &members, &events, &cancel, &mut pending);
+                            group_responses_into(&mut store, &members, &events, &cancel, &mut lanes);
                             members.clear();
                             worker_has_expiring
                                 .store(store.has_expiring_publications(), Ordering::Release);
                         }
-                        for (effect, work) in deferred_reads.drain(..) {
-                            pending.push_back(effect_response(
+                        for (owner_idx, effect, work) in deferred_reads.drain(..) {
+                            let resp = effect_response(
                                 &mut store, effect, work, &events, &hooks, &cancel, &mut state,
-                            ));
+                            );
+                            lanes[owner_idx].pending.push_back(resp);
                         }
                         match other {
-                            Some(Err(Request::Stop)) => {
-                                stop_result = store.maybe_snapshot(&events, true);
-                                pending.push_back(Response::Stopped);
-                                stopping = true;
+                            Some((owner_idx, Err(Request::Stop))) => {
+                                if owner_idx == 0 {
+                                    stop_result = store.maybe_snapshot(&events, true);
+                                    lanes[0].pending.push_back(Response::Stopped);
+                                    stopping = true;
+                                } else {
+                                    lanes[owner_idx].pending.push_back(Response::Stopped);
+                                }
                             }
-                            Some(Err(request)) => {
-                                pending.push_back(business_response(
+                            Some((owner_idx, Err(request))) => {
+                                let resp = business_response(
                                     &mut store, request, &events, &hooks, &cancel, &mut state,
-                                ));
+                                );
+                                lanes[owner_idx].pending.push_back(resp);
                                 worker_has_expiring
                                     .store(store.has_expiring_publications(), Ordering::Release);
                             }
-                            Some(Ok((effect, work))) => {
-                                pending.push_back(effect_response(
+                            Some((owner_idx, Ok((effect, work)))) => {
+                                let resp = effect_response(
                                     &mut store, effect, work, &events, &hooks, &cancel, &mut state,
-                                ));
+                                );
+                                lanes[owner_idx].pending.push_back(resp);
                                 worker_has_expiring
                                     .store(store.has_expiring_publications(), Ordering::Release);
                             }
@@ -1017,12 +1264,12 @@ impl Writer {
                         if !stopping {
                             let _ = store.maybe_snapshot(&events, false);
                         }
-                        if closed && pending.is_empty() {
+                        if coord_closed && lanes[0].pending.is_empty() {
                             return store.maybe_snapshot(&events, true);
                         }
-                        // Both request lanes signal `requests`. A reply
-                        // produced in this turn is published before waiting.
-                        if idle_turn && !closed && pending_control.is_none() && !stalled {
+                        // All request lanes signal `requests`. Any reply produced
+                        // in this turn is published on the next loop pass before waiting.
+                        if idle_turn && !coord_closed && !any_control_pending && !stalled {
                             requests.wait(idle);
                         }
                     }
@@ -1040,6 +1287,7 @@ impl Writer {
             boot: brx,
             wake,
             has_expiring,
+            shard_handles,
             handle: Some(handle),
         })
     }
@@ -1525,20 +1773,23 @@ fn record_result(
     if events.emit_with("store_result",||json!({"operation":operation(id),"command_kind":kind,"details":{"committed_now":applied.committed_now,"wrote":applied.wrote,"outcome":outcome_name(applied.reply)}})).is_err(){cancel.store(true,Ordering::Relaxed);}
 }
 
-/// One command of a group and the effect that carries it.
+/// One command of a group, the owner lane that submitted it, and the effect
+/// carrying it.
 struct Member {
+    owner_idx: usize,
     effect: EffectId,
     command: mqttiumd_contract::command::Command,
 }
 
-/// Applies the commands in one transaction (record 0045) and appends each
-/// answer in order into `out`. No answer exists before the commit returned.
+/// Applies the commands in one transaction (record 0045) and routes each
+/// answer in order into its submitting owner's pending reply queue. No answer
+/// exists before the commit returned.
 fn group_responses_into(
     store: &mut StoreBackend,
     members: &[Member],
     events: &Events,
     cancel: &AtomicBool,
-    out: &mut VecDeque<Response>,
+    lanes: &mut [OwnerLane],
 ) {
     let commands: Vec<_> = members.iter().map(|member| &member.command).collect();
     let count = commands.len();
@@ -1555,12 +1806,11 @@ fn group_responses_into(
             .map(|command| store.apply(command))
             .collect()
     });
-    out.reserve(members.len());
     for (member, applied) in members.iter().zip(applied) {
         let recipe = member.command.recipe.get();
         record_applied(recipe, &applied, events, cancel);
         record_result(recipe, &applied, events, cancel);
-        out.push_back(Response::Store {
+        lanes[member.owner_idx].pending.push_back(Response::Store {
             effect: member.effect,
             operation: recipe.operation(),
             reply: applied.reply,
@@ -3437,5 +3687,373 @@ mod tests {
         );
         drop(store);
         let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn multi_owner_writer_routes_replies_and_collects_receipts_independently() {
+        use mqttiumd_contract::capacity::BoundedVec;
+        use mqttiumd_contract::command::{
+            AdmitPublication, Command, Costs, DeliveryCause, FinishDelivery, FrozenRecipe,
+            InlineClaim, MultiClaimedPublication, PayloadRef, Source, Target, TargetVec,
+        };
+        use mqttiumd_contract::ids::{
+            DeliveryId, ExchangeGeneration, ExchangeId, InboundPacketId, OperationSeq,
+            OutboundPacketId, PayloadId, PayloadSeq, PublicationId, PublicationSeq, RequestId,
+            RequestSeq,
+        };
+        use mqttiumd_contract::outcome::{CommitFacts, StoreOutcome};
+        use mqttiumd_contract::packet::Qos;
+        use mqttiumd_contract::pubsub::WORK_PAGE_LIMIT;
+        use std::num::{NonZeroU32, NonZeroUsize};
+
+        for mode in [
+            StorageMode::Volatile {
+                snapshot_interval: None,
+            },
+            StorageMode::Log,
+            StorageMode::Durable,
+        ] {
+            let path = std::env::temp_dir().join(format!(
+                "mqttiumd-multi-owner-writer-{}-{}-{}",
+                mode.mode_name(),
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::create_dir(&path).unwrap();
+            let events = Events::open(&path.join("events.jsonl")).unwrap();
+            let cancel = Arc::new(AtomicBool::new(false));
+            let mut writer = Writer::spawn_configured_sharded(
+                path.join("store.sqlite"),
+                events,
+                Hooks::default(),
+                cancel,
+                None,
+                false,
+                mode,
+                2,
+            )
+            .unwrap();
+            let boot = writer
+                .boot
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap()
+                .unwrap();
+            let mut shards = writer.take_shard_handles();
+            assert_eq!(shards.len(), 2);
+            let s1 = shards.remove(0);
+            let s2 = shards.remove(0);
+
+            let inc = boot.grant.incarnation();
+            let epoch = boot.grant.epoch();
+            let mut authority = mqttiumd_contract::effects::OwnerAuthority::from_grant(
+                boot.grant,
+                NonZeroU32::new(3).unwrap(),
+            )
+            .unwrap();
+            let slots = NonZeroUsize::new(16).unwrap();
+            let one = NonZeroU32::new(1).unwrap();
+            let mut b0 = authority
+                .create_outbox(LogicalOwnerId::new(0), slots, one)
+                .unwrap();
+            let mut b1 = authority
+                .create_outbox(LogicalOwnerId::new(1), slots, one)
+                .unwrap();
+            let mut b2 = authority
+                .create_outbox(LogicalOwnerId::new(2), slots, one)
+                .unwrap();
+
+            // Create 3 sessions via owner 0.
+            let mut sids = Vec::new();
+            for (req, name) in [(1u64, b"pub" as &[u8]), (2, b"sub1"), (3, b"sub2")] {
+                writer
+                    .sender
+                    .send(Request::Session {
+                        request: req,
+                        client: SharedBytes::copy_from(name, 64).unwrap(),
+                    })
+                    .unwrap();
+                match writer
+                    .receiver
+                    .recv_timeout(Duration::from_secs(5))
+                    .unwrap()
+                {
+                    Response::Session {
+                        result: Ok(sess), ..
+                    } => sids.push(sess),
+                    _ => panic!("expected session"),
+                }
+            }
+
+            // Register ReceiptOrigins for all 3 owners on their independent control lanes.
+            for (owner_id, ctx, crx) in [
+                (
+                    LogicalOwnerId::new(0),
+                    &writer.control_sender,
+                    &writer.control_receiver,
+                ),
+                (
+                    LogicalOwnerId::new(1),
+                    &s1.control_sender,
+                    &s1.control_receiver,
+                ),
+                (
+                    LogicalOwnerId::new(2),
+                    &s2.control_sender,
+                    &s2.control_receiver,
+                ),
+            ] {
+                let origin = ReceiptOrigin {
+                    incarnation: inc,
+                    epoch,
+                    owner: owner_id,
+                };
+                ctx.send(ControlRequest::Collect {
+                    effect: EffectId {
+                        epoch,
+                        owner: owner_id,
+                        sequence: EffectSeq::new(1),
+                    },
+                    collection: ReceiptCollection {
+                        closure: ReceiptClosure::empty(origin),
+                        limit: 64,
+                    },
+                })
+                .unwrap();
+                let resp = crx.recv_timeout(Duration::from_secs(5)).unwrap();
+                assert!(matches!(
+                    resp,
+                    ControlResponse::Collected {
+                        result: Ok(ReceiptCollectionReply::Applied { .. }),
+                        ..
+                    }
+                ));
+            }
+
+            // Owner 0 submits MultiClaimedPublication targeting sub1 & sub2.
+            let op0 = OperationId::new(inc, epoch, LogicalOwnerId::new(0), OperationSeq::new(1));
+            let pub_id =
+                PublicationId::new(inc, epoch, LogicalOwnerId::new(0), PublicationSeq::new(1));
+            let mut targets = TargetVec::with_capacity(2).unwrap();
+            targets
+                .try_push(Target {
+                    session: sids[1].id,
+                    session_revision: sids[1].revision,
+                    delivery: DeliveryId {
+                        publication: pub_id,
+                        index: 0,
+                    },
+                    effective_qos: Qos::AtLeastOnce,
+                    cause: DeliveryCause::LiveExact,
+                })
+                .unwrap();
+            targets
+                .try_push(Target {
+                    session: sids[2].id,
+                    session_revision: sids[2].revision,
+                    delivery: DeliveryId {
+                        publication: pub_id,
+                        index: 1,
+                    },
+                    effective_qos: Qos::AtLeastOnce,
+                    cause: DeliveryCause::LiveExact,
+                })
+                .unwrap();
+            let mut claims = BoundedVec::with_capacity(2).unwrap();
+            claims
+                .try_push(InlineClaim {
+                    target_index: 0,
+                    packet_id: OutboundPacketId::new(1).unwrap(),
+                })
+                .unwrap();
+            claims
+                .try_push(InlineClaim {
+                    target_index: 1,
+                    packet_id: OutboundPacketId::new(1).unwrap(),
+                })
+                .unwrap();
+            let admit = MultiClaimedPublication {
+                admission: AdmitPublication {
+                    operation: op0,
+                    request: RequestId::new(inc, epoch, LogicalOwnerId::new(0), RequestSeq::new(1)),
+                    publication: pub_id,
+                    source: Source {
+                        session: sids[0].id,
+                        session_revision: sids[0].revision,
+                        packet_id: InboundPacketId::new(1).unwrap(),
+                        exchange: ExchangeId {
+                            session: sids[0].id,
+                            generation: ExchangeGeneration::new(1),
+                        },
+                    },
+                    route_revision: Revision::new(0),
+                    qos: Qos::AtLeastOnce,
+                    retain: false,
+                    topic: SharedBytes::copy_from(b"t/sharded", 64).unwrap(),
+                    payload: PayloadRef {
+                        id: PayloadId::new(inc, epoch, LogicalOwnerId::new(0), PayloadSeq::new(1)),
+                        length: PayloadBytes::new(5),
+                    },
+                    costs: Costs {
+                        payload_bytes: PayloadBytes::new(5),
+                        references: References::new(2),
+                        exchange_slots: ExchangeSlots::new(0),
+                        receipt_slots: ReceiptSlots::new(1),
+                    },
+                    targets,
+                },
+                claims,
+            };
+            let take_one = |outbox: &mut mqttiumd_contract::effects::Outbox, eff: Effect| {
+                let id = EffectId {
+                    epoch,
+                    owner: outbox.id().owner(),
+                    sequence: EffectSeq::new(10),
+                };
+                let key = outbox.reserve(NonZeroUsize::new(1).unwrap()).unwrap();
+                outbox.publish(key, OwnedEffect::new(id, eff)).unwrap();
+                let mut sink = Vec::new();
+                struct VecSink<'a>(&'a mut Vec<OwnedEffect>);
+                impl mqttiumd_contract::effects::EffectSink for VecSink<'_> {
+                    fn try_submit(
+                        &mut self,
+                        effect: OwnedEffect,
+                    ) -> mqttiumd_contract::effects::SubmitResult {
+                        self.0.push(effect);
+                        mqttiumd_contract::effects::SubmitResult::Accepted
+                    }
+                }
+                let _ = outbox.dispatch(&mut VecSink(&mut sink));
+                sink.pop().unwrap()
+            };
+            let eff0 = take_one(
+                &mut b0,
+                Effect::Persist {
+                    command: Command {
+                        recipe: FrozenRecipe::freeze(Recipe::MultiClaimedPublication(admit))
+                            .unwrap(),
+                        payload: Some(SharedBytes::copy_from(b"hello", 64).unwrap()),
+                    },
+                },
+            );
+            writer.sender.send(Request::Effect(eff0)).unwrap();
+            match writer
+                .receiver
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap()
+            {
+                Response::Store {
+                    operation,
+                    reply:
+                        StoreReply::Outcome(StoreOutcome::Committed(CommitFacts::PublicationAdmitted {
+                            ..
+                        })),
+                    ..
+                } => assert_eq!(operation, op0),
+                _ => panic!("expected PublicationAdmitted"),
+            }
+
+            // Shards 1 and 2 concurrently send FinishDelivery + LoadWork on their own SPSC lanes!
+            let eff1 = take_one(
+                &mut b1,
+                Effect::Persist {
+                    command: Command {
+                        recipe: FrozenRecipe::freeze(Recipe::FinishDelivery(FinishDelivery {
+                            operation: OperationId::new(
+                                inc,
+                                epoch,
+                                LogicalOwnerId::new(1),
+                                OperationSeq::new(1),
+                            ),
+                            delivery: DeliveryId {
+                                publication: pub_id,
+                                index: 0,
+                            },
+                            target: sids[1].id,
+                            target_revision: sids[1].revision,
+                            packet_id: OutboundPacketId::new(1).unwrap(),
+                            claim: op0,
+                        }))
+                        .unwrap(),
+                        payload: None,
+                    },
+                },
+            );
+            let eff2 = take_one(
+                &mut b2,
+                Effect::Persist {
+                    command: Command {
+                        recipe: FrozenRecipe::freeze(Recipe::FinishDelivery(FinishDelivery {
+                            operation: OperationId::new(
+                                inc,
+                                epoch,
+                                LogicalOwnerId::new(2),
+                                OperationSeq::new(1),
+                            ),
+                            delivery: DeliveryId {
+                                publication: pub_id,
+                                index: 1,
+                            },
+                            target: sids[2].id,
+                            target_revision: sids[2].revision,
+                            packet_id: OutboundPacketId::new(1).unwrap(),
+                            claim: op0,
+                        }))
+                        .unwrap(),
+                        payload: None,
+                    },
+                },
+            );
+            s1.sender.send(Request::Effect(eff1)).unwrap();
+            s2.sender.send(Request::Effect(eff2)).unwrap();
+
+            for (shard_id, rx) in [(1u64, &s1.receiver), (2u64, &s2.receiver)] {
+                match rx.recv_timeout(Duration::from_secs(5)).unwrap() {
+                    Response::Store {
+                        operation,
+                        reply:
+                            StoreReply::Outcome(StoreOutcome::Committed(
+                                CommitFacts::DeliveryFinished { .. },
+                            )),
+                        ..
+                    } => assert_eq!(operation.owner(), LogicalOwnerId::new(shard_id)),
+                    _ => panic!("shard {shard_id} expected DeliveryFinished"),
+                }
+            }
+
+            // LoadWork on Shard 1 must now see 0 remaining deliveries.
+            let load1 = take_one(
+                &mut b1,
+                Effect::LoadWork {
+                    session: sids[1].id,
+                    after: None,
+                    limit: WORK_PAGE_LIMIT,
+                },
+            );
+            s1.sender.send(Request::Effect(load1)).unwrap();
+            match s1.receiver.recv_timeout(Duration::from_secs(5)).unwrap() {
+                Response::Work {
+                    result: Ok(page), ..
+                } => assert!(page.items.is_empty()),
+                _ => panic!("expected empty WorkPage"),
+            }
+
+            // Drop shards first (simulating ordered shutdown), then cleanly stop Coordinator writer!
+            drop(s1);
+            drop(s2);
+            writer.sender.send(Request::Stop).unwrap();
+            assert!(matches!(
+                writer
+                    .receiver
+                    .recv_timeout(Duration::from_secs(5))
+                    .unwrap(),
+                Response::Stopped
+            ));
+            let start = Instant::now();
+            while !writer.is_finished() && start.elapsed() < Duration::from_secs(5) {
+                thread::sleep(Duration::from_millis(5));
+            }
+            writer.join_finished().unwrap();
+            let _ = std::fs::remove_dir_all(path);
+        }
     }
 }

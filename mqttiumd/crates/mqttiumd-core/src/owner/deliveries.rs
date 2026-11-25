@@ -232,6 +232,10 @@ impl SessionDeliveries {
         }
     }
 
+    pub(super) fn used_pi_mask(&self) -> [u64; 8] {
+        self.used_pi_mask
+    }
+
     fn add_sent(&mut self, generation: ConnectionGeneration) {
         if self.sent_gen == Some(generation) {
             self.sent_count = self.sent_count.saturating_add(1);

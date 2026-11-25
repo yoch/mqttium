@@ -43,14 +43,14 @@ pub(super) struct RetainedFlight {
 
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub(super) struct Volatile {
-    origin: Qos0Origin,
-    target: SessionId,
-    connection: Option<ConnectionKey>,
-    topic: SharedBytes,
-    payload: SharedBytes,
-    expiry: Option<alloc::boxed::Box<MessageExpiry>>,
-    properties: Option<alloc::sync::Arc<crate::contract::properties::PublishProperties>>,
-    frame: Option<EffectId>,
+    pub(super) origin: Qos0Origin,
+    pub(super) target: SessionId,
+    pub(super) connection: Option<ConnectionKey>,
+    pub(super) topic: SharedBytes,
+    pub(super) payload: SharedBytes,
+    pub(super) expiry: Option<alloc::boxed::Box<MessageExpiry>>,
+    pub(super) properties: Option<alloc::sync::Arc<crate::contract::properties::PublishProperties>>,
+    pub(super) frame: Option<EffectId>,
 }
 
 impl Volatile {
@@ -131,11 +131,11 @@ impl VolatileQueue {
         self.len() == 0
     }
 
-    fn payload_bytes(&self) -> u64 {
+    pub(super) fn payload_bytes(&self) -> u64 {
         self.payload_bytes
     }
 
-    fn push_pending(&mut self, item: Volatile) -> Result<(), CoreFault> {
+    pub(super) fn push_pending(&mut self, item: Volatile) -> Result<(), CoreFault> {
         if self.len() >= self.capacity {
             return Err(CoreFault::StalePlan);
         }
@@ -375,6 +375,11 @@ pub(super) enum Change {
         records: BoundedVec<Volatile>,
         continuation: Option<ContinuationId>,
     },
+    Qos0Delegated {
+        connection: usize,
+        ingress_order: u64,
+        batch: alloc::boxed::Box<super::DelegatedQos0Batch>,
+    },
     Qos0Send {
         effect: EffectId,
         continuation: Option<ContinuationId>,
@@ -582,11 +587,11 @@ impl State {
             .saturating_add(filters.saturating_mul(8))
     }
 
-    fn connection(&self, generation: ConnectionGeneration) -> Option<usize> {
+    pub(super) fn connection(&self, generation: ConnectionGeneration) -> Option<usize> {
         self.connections.index_of(generation)
     }
 
-    fn delivery(&self, id: DeliveryId) -> Option<usize> {
+    pub(super) fn delivery(&self, id: DeliveryId) -> Option<usize> {
         self.deliveries.slot_of(id)
     }
 
@@ -706,7 +711,7 @@ impl State {
 }
 
 /// What the owner may do now with a claimed delivery.
-enum Emission {
+pub(super) enum Emission {
     /// The frame was published in the draft.
     Frame(EffectId, ConnectionKey),
     /// A gate holds the delivery; nothing was decided about it.
@@ -1199,6 +1204,50 @@ impl Owner {
             Err(super::routing::Refusal::Revision) => return Err(IMPOSSIBLE),
         };
         let count = selected.as_ref().map_or(0, super::routing::Selection::len);
+        if self.delegated_deliveries {
+            if count == 0 || selected.is_none() {
+                draft.emit(Effect::Qos0Dropped {
+                    origin,
+                    target: None,
+                    reason: if count == 0 && selected.is_some() {
+                        Qos0DropReason::NoSubscribers
+                    } else {
+                        Qos0DropReason::CapacityExceeded
+                    },
+                })?;
+                return Ok(changed(Change::Qos0Admit {
+                    connection,
+                    ingress_order,
+                    records: BoundedVec::with_capacity(0)?,
+                    continuation: None,
+                }));
+            }
+            let mut targets = alloc::vec::Vec::with_capacity(count);
+            for target in selected.ok_or(IMPOSSIBLE)?.iter() {
+                let target_conn =
+                    self.connection_of(target.session)
+                        .map(|generation| ConnectionKey {
+                            session: target.session,
+                            generation,
+                        });
+                targets.push(super::DelegatedQos0Target {
+                    target: target.session,
+                    connection: target_conn,
+                });
+            }
+            return Ok(changed(Change::Qos0Delegated {
+                connection,
+                ingress_order,
+                batch: alloc::boxed::Box::new(super::DelegatedQos0Batch {
+                    origin,
+                    topic: topic.clone(),
+                    payload: payload.clone(),
+                    expiry: *expiry,
+                    properties: properties.clone(),
+                    targets,
+                }),
+            }));
+        }
         let used = self.pubsub.volatile.payload_bytes();
         let fits = selected.is_some()
             && count <= self.pubsub.volatile.capacity() - self.pubsub.volatile.len()
@@ -2700,7 +2749,11 @@ impl Owner {
     /// Every gate that holds a delivery stands ahead of the size test, so a
     /// delivery is found too large exactly where its PUBLISH would have been
     /// emitted, in delivery order and on the connection of that moment.
-    fn plan_delivery_emit(&self, delivery: &Delivery, draft: &mut Draft) -> Result<Emission, Stop> {
+    pub(super) fn plan_delivery_emit(
+        &self,
+        delivery: &Delivery,
+        draft: &mut Draft,
+    ) -> Result<Emission, Stop> {
         if !delivery.expiry_allows_send(self.message_now) {
             return Ok(Emission::Held);
         }
@@ -3673,7 +3726,7 @@ impl Owner {
     /// Fast O(1) check whether `session` definitely has no ready outbound work
     /// right now (no control candidates, no rescan/after cursor, and all
     /// deliveries already sent, busy, or inline-pending).
-    fn session_provably_idle_work(&self, session: SessionId) -> bool {
+    pub(super) fn session_provably_idle_work(&self, session: SessionId) -> bool {
         if !self.pubsub.deliveries.control_candidates().is_empty() {
             return false;
         }
@@ -3793,6 +3846,17 @@ impl Owner {
                     self.pubsub.continuation = Some(c);
                     self.pubsub.continuations_started = true;
                 }
+            }
+            Change::Qos0Delegated {
+                connection,
+                ingress_order,
+                batch,
+            } => {
+                self.pubsub
+                    .connections
+                    .record_qos0_ingress(connection, ingress_order)?;
+                self.last_delegated_qos0 = Some(*batch);
+                self.last_step_may_unblock_work = false;
             }
             Change::Qos0Send {
                 effect,
@@ -4114,10 +4178,10 @@ impl Owner {
                 if self.pubsub.deliveries.get(slot).is_none() {
                     return Err(stale);
                 }
-                let (target, delivery_id) = (
-                    self.pubsub.deliveries.row(slot).target,
-                    self.pubsub.deliveries.row(slot).id,
-                );
+                let (target, delivery_id, finished_pi) = {
+                    let row = self.pubsub.deliveries.row(slot);
+                    (row.target, row.id, row.claim.map(|c| c.packet_id))
+                };
                 let claim_result = self.pubsub.deliveries.row(slot).claim_result.clone();
                 if let Some(known) = claim_result
                     && known.operation != finished.operation
@@ -4126,6 +4190,7 @@ impl Owner {
                 }
                 self.remember_finished(finished)?;
                 self.pubsub.deliveries.remove(slot);
+                self.last_finished_delivery = Some((target, finished_pi));
                 self.pubsub
                     .connections
                     .invalidate_reads_for(target, delivery_id);

@@ -113,6 +113,7 @@ pub struct ParsedConfig {
     pub limits: Limits,
     pub tls: Option<TlsFiles>,
     pub io_threads: Option<usize>,
+    pub delivery_shards: Option<usize>,
     pub reports: Vec<DirectiveReport>,
 }
 
@@ -169,6 +170,7 @@ impl ParsedConfig {
             limits: self.limits,
             hooks,
             tls: self.tls,
+            delivery_shards: self.delivery_shards.unwrap_or(0),
         })
     }
 }
@@ -197,6 +199,7 @@ struct Accumulator {
     events: Option<PathBuf>,
     event_level: Option<Level>,
     io_threads: Option<usize>,
+    delivery_shards: Option<usize>,
     reports: Vec<DirectiveReport>,
     errors: Vec<String>,
     total_lines: usize,
@@ -1089,6 +1092,28 @@ fn parse_file(acc: &mut Accumulator, path: &Path, depth: usize) -> Result<(), St
                     "mqttiumd_io_threads expects 1..=32",
                 ),
             },
+            "mqttiumd_delivery_shards" => match rest.parse::<usize>() {
+                Ok(n) if n <= crate::delivery_shard::MAX_DELIVERY_SHARDS => {
+                    acc.delivery_shards = Some(n);
+                    acc.record(
+                        path,
+                        line_no,
+                        directive,
+                        DirectiveStatus::Equivalent,
+                        format!("resident delivery shards = {n}"),
+                    );
+                }
+                _ => acc.record(
+                    path,
+                    line_no,
+                    directive,
+                    DirectiveStatus::Blocking,
+                    format!(
+                        "mqttiumd_delivery_shards expects 0..={}",
+                        crate::delivery_shard::MAX_DELIVERY_SHARDS
+                    ),
+                ),
+            },
             // Explicitly diagnosed security/routing/bridge directives (CFG-002 / SEC-005):
             "password_file" | "acl_file" | "psk_file" | "psk_hint" | "plugin" | "auth_plugin" => {
                 acc.record(
@@ -1320,6 +1345,7 @@ pub fn check_file(path: &Path) -> Result<(ConfigReport, Option<ParsedConfig>), S
             limits,
             tls,
             io_threads: acc.io_threads,
+            delivery_shards: acc.delivery_shards,
             reports: acc.reports,
         })
     } else {
@@ -1367,6 +1393,7 @@ autosave_interval 30
 log_dest file ./events.jsonl
 log_type notice
 mqttiumd_io_threads 4
+mqttiumd_delivery_shards 2
 ",
         )
         .unwrap();
@@ -1380,6 +1407,7 @@ mqttiumd_io_threads 4
         assert_eq!(parsed.events.unwrap(), dir.join("./events.jsonl"));
         assert_eq!(parsed.event_level, Level::Ops);
         assert_eq!(parsed.io_threads, Some(4));
+        assert_eq!(parsed.delivery_shards, Some(2));
         assert!(
             report
                 .reports

@@ -119,6 +119,9 @@ fn with_runtime_clock_hooks(
         last_expiry_inventory: None,
         owner,
         _authority: authority,
+        shards: None,
+        shard_notices: Vec::new(),
+        pending_suback_notify: FlatSet::new(),
         incarnation,
         epoch,
         writer: StoreHandle::Threaded(&mut writer),
@@ -131,6 +134,7 @@ fn with_runtime_clock_hooks(
         capacity_waiters: 0,
         retiring: Vec::new(),
         session_ids: boot.sessions.values().map(|s| s.id).collect(),
+        session_revisions: FlatMap::new(),
         sessions: boot.sessions,
         session_requests: BTreeMap::new(),
         will_connects: BTreeMap::new(),
@@ -294,6 +298,7 @@ fn peer(runtime: &mut Runtime<'_>) -> (ConnectionGeneration, TcpStream) {
             cold: None,
             connect_expiry: SessionExpiry::OnDisconnect,
             max_packet: 268_435_455,
+            receive_maximum: crate::receiving::MAXIMUM as u16,
             keep_alive: 0,
             version: None,
             connected: false,
@@ -3641,6 +3646,7 @@ fn cancelled_startup_never_announces_ready_and_releases_its_opened_epoch() {
         None,
         None,
         Limits::BOUNDED,
+        0,
     );
     finish_startup_writer(&mut writer);
     let store = mqttiumd_store_sqlite::SqliteStore::open(&path)
@@ -3696,6 +3702,7 @@ fn established_typed_startup_failure_takes_precedence_over_cancellation() {
         None,
         None,
         Limits::BOUNDED,
+        0,
     );
     finish_startup_writer(&mut writer);
     assert!(
@@ -3761,6 +3768,7 @@ fn cancellation_during_unacknowledged_registration_never_announces_ready() {
             None,
             None,
             Limits::BOUNDED,
+            0,
         );
         (result, watcher.join().unwrap())
     });
@@ -7232,6 +7240,9 @@ fn direct_volatile_store_commits_inline_and_saves_snapshot() {
         last_expiry_inventory: None,
         owner,
         _authority: authority,
+        shards: None,
+        shard_notices: Vec::new(),
+        pending_suback_notify: FlatSet::new(),
         incarnation,
         epoch,
         writer: StoreHandle::Direct(&mut direct),
@@ -7244,6 +7255,7 @@ fn direct_volatile_store_commits_inline_and_saves_snapshot() {
         capacity_waiters: 0,
         retiring: Vec::new(),
         session_ids: boot.sessions.values().map(|s| s.id).collect(),
+        session_revisions: FlatMap::new(),
         sessions: boot.sessions,
         session_requests: BTreeMap::new(),
         will_connects: BTreeMap::new(),

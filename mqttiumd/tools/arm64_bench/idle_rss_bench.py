@@ -158,10 +158,13 @@ def main() -> None:
     ap.add_argument("--out", default="/tmp/idle_rss_results.json")
     ap.add_argument("--plain-counts", default="128,256,400,512,768")
     ap.add_argument("--mtls-counts", default="128,256,400")
+    ap.add_argument("--delivery-shards", type=int, default=0)
+    ap.add_argument("--only-mqttiumd", action="store_true")
     args = ap.parse_args()
 
     plain_counts = [int(x) for x in args.plain_counts.split(",")]
     mtls_counts = [int(x) for x in args.mtls_counts.split(",")]
+    shard_args = ["--delivery-shards", str(args.delivery_shards)] if args.delivery_shards > 0 else []
     tmp = Path(tempfile.mkdtemp(prefix="mqttiumd-idle-rss-"))
     try:
         pki = bench.make_pki(tmp, max(max(plain_counts), max(mtls_counts), 1024))
@@ -185,6 +188,7 @@ def main() -> None:
                 "1024",
                 "--io-threads",
                 "2",
+                *shard_args,
             ],
             p,
             plain_counts,
@@ -193,20 +197,21 @@ def main() -> None:
             tmp / "m_plain.log",
         )
 
-        p = bench.free_port()
-        mconf = tmp / "mosq_plain.conf"
-        mconf.write_text(
-            f"listener {p} 127.0.0.1\nallow_anonymous true\npersistence false\nmax_connections -1\nlog_type error\n"
-        )
-        results["mosquitto_plain"] = run_idle_test(
-            "mosquitto_plain",
-            [args.mosquitto, "-c", str(mconf)],
-            p,
-            plain_counts,
-            None,
-            None,
-            tmp / "mosq_plain.log",
-        )
+        if not args.only_mqttiumd:
+            p = bench.free_port()
+            mconf = tmp / "mosq_plain.conf"
+            mconf.write_text(
+                f"listener {p} 127.0.0.1\nallow_anonymous true\npersistence false\nmax_connections -1\nlog_type error\n"
+            )
+            results["mosquitto_plain"] = run_idle_test(
+                "mosquitto_plain",
+                [args.mosquitto, "-c", str(mconf)],
+                p,
+                plain_counts,
+                None,
+                None,
+                tmp / "mosq_plain.log",
+            )
 
         p = bench.free_port()
         ev2 = tmp / "m_mtls.ev"
@@ -226,6 +231,7 @@ def main() -> None:
                 "1024",
                 "--io-threads",
                 "2",
+                *shard_args,
                 "--tls-cert",
                 str(pki / "server.crt"),
                 "--tls-key",
@@ -242,22 +248,23 @@ def main() -> None:
             tmp / "m_mtls.log",
         )
 
-        p = bench.free_port()
-        mconf2 = tmp / "mosq_mtls.conf"
-        mconf2.write_text(
-            f"listener {p} 127.0.0.1\nallow_anonymous true\npersistence false\nmax_connections -1\n"
-            f"cafile {pki / 'ca.crt'}\ncertfile {pki / 'server.crt'}\nkeyfile {pki / 'server.key'}\n"
-            f"require_certificate true\ntls_version tlsv1.3\nlog_type error\n"
-        )
-        results["mosquitto_mtls"] = run_idle_test(
-            "mosquitto_mtls",
-            [args.mosquitto, "-c", str(mconf2)],
-            p,
-            mtls_counts,
-            pki,
-            None,
-            tmp / "mosq_mtls.log",
-        )
+        if not args.only_mqttiumd:
+            p = bench.free_port()
+            mconf2 = tmp / "mosq_mtls.conf"
+            mconf2.write_text(
+                f"listener {p} 127.0.0.1\nallow_anonymous true\npersistence false\nmax_connections -1\n"
+                f"cafile {pki / 'ca.crt'}\ncertfile {pki / 'server.crt'}\nkeyfile {pki / 'server.key'}\n"
+                f"require_certificate true\ntls_version tlsv1.3\nlog_type error\n"
+            )
+            results["mosquitto_mtls"] = run_idle_test(
+                "mosquitto_mtls",
+                [args.mosquitto, "-c", str(mconf2)],
+                p,
+                mtls_counts,
+                pki,
+                None,
+                tmp / "mosq_mtls.log",
+            )
 
         out = Path(args.out)
         out.write_text(json.dumps(results, indent=2) + "\n")

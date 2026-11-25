@@ -129,22 +129,30 @@ def main() -> None:
     ap.add_argument("--broker-cpus", default="0,1,2")
     ap.add_argument("--gen-cpus", default="3")
     ap.add_argument("--only", choices=["all", "volatile", "log", "mosquitto"], default="all")
+    ap.add_argument("--delivery-shards", type=int, default=0)
+    ap.add_argument("--io-threads", type=int, default=2)
+    ap.add_argument("--cases", default="")
     ap.add_argument("--out", default="")
     args = ap.parse_args()
 
     driver = ensure_driver()
     bin_path = Path(args.binary)
     mosq_path = Path(args.mosquitto)
+    shard_args = ["--delivery-shards", str(args.delivery_shards)] if args.delivery_shards > 0 else []
+    suffix = f"-s{args.delivery_shards}" if args.delivery_shards > 0 else ""
     targets = []
     if args.only in ("all", "volatile"):
-        targets.append(("mqttiumd-vol", "mqttiumd", bin_path, ["--storage-mode", "volatile", "--no-db", "--io-threads", "2"]))
+        targets.append((f"mqttiumd-vol{suffix}", "mqttiumd", bin_path, ["--storage-mode", "volatile", "--no-db", "--io-threads", str(args.io_threads), *shard_args]))
     if args.only in ("all", "log"):
-        targets.append(("mqttiumd-log", "mqttiumd", bin_path, ["--storage-mode", "log", "--io-threads", "2"]))
+        targets.append((f"mqttiumd-log{suffix}", "mqttiumd", bin_path, ["--storage-mode", "log", "--io-threads", str(args.io_threads), *shard_args]))
     if args.only in ("all", "mosquitto"):
         targets.append(("mosquitto-2.1.2", "mosquitto", mosq_path, []))
 
+    wanted = {c.strip() for c in args.cases.split(",") if c.strip()}
     rows = []
     for case_name, case_args in SCENARIOS:
+        if wanted and case_name not in wanted:
+            continue
         print(f"\n=== {case_name} ===", flush=True)
         for label, kind, binary, extra in targets:
             r = run_case(

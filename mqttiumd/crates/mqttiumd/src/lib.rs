@@ -3,6 +3,7 @@
 
 pub mod codec;
 pub mod config;
+pub mod delivery_shard;
 
 pub mod events;
 pub mod net;

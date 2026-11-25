@@ -861,3 +861,195 @@ fn failed_wal_replacement_suspends_durable_writes_until_repaired() {
     drop(reopened);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn multi_owner_admission_and_shard_finish_collect_and_recover_identically_in_log_and_sqlite() {
+    use mqttiumd_contract::capacity::BoundedVec;
+    use mqttiumd_contract::command::{InlineClaim, MultiClaimedPublication};
+    use mqttiumd_contract::ids::{
+        LogicalOwnerId, OperationId, OperationSeq, PayloadSeq, PublicationSeq, SessionId,
+    };
+    use mqttiumd_contract::packet::SharedBytes;
+    use mqttiumd_contract::receipts::{
+        ReceiptClosure, ReceiptCollection, ReceiptCollectionReply, ReceiptOrigin,
+    };
+    use mqttiumd_contract::session::{SessionAction, SessionExpiry, SessionLifecycle};
+
+    let dir = temp_dir("multi-owner-sharding");
+    let log_path = dir.join("log.sqlite");
+    let sql_path = dir.join("sql.sqlite");
+    let limits = fixture_limits();
+
+    let mut log_world = World::with_limits(
+        &|incarnation, lim| {
+            LogStore::open_or_create(&log_path, incarnation, lim, None, false).expect("log store")
+        },
+        limits,
+    );
+    let mut sql_world = World::with_limits(
+        &|incarnation, lim| SqliteStore::create(&sql_path, incarnation, lim).expect("sqlite store"),
+        limits,
+    );
+    let sub_c = SessionId::new(3);
+    let sub_d = SessionId::new(4);
+    for (seq, name) in [(100u64, b"sub-c".as_slice()), (101u64, b"sub-d".as_slice())] {
+        let open = Command {
+            recipe: FrozenRecipe::freeze(Recipe::SessionLifecycle(SessionLifecycle {
+                operation: operation_id(log_world.epoch, seq),
+                action: SessionAction::Open {
+                    client_id: SharedBytes::copy_from(name, 64).unwrap(),
+                    expected: None,
+                    clean_start: true,
+                    expiry: SessionExpiry::Never,
+                },
+            }))
+            .unwrap(),
+            payload: None,
+        };
+        assert_eq!(log_world.store.apply(&open), sql_world.store.apply(&open));
+    }
+
+    let owner_op = |owner: u64, seq: u64| {
+        OperationId::new(
+            StoreIncarnation::new(1),
+            log_world.epoch,
+            LogicalOwnerId::new(owner),
+            OperationSeq::new(seq),
+        )
+    };
+
+    // Owner 0 admits MultiClaimedPublication targeting (b, c, d), claiming b & c inline.
+    let base = log_world.admission(1, 1, b"multi-owner-payload", &[log_world.b, sub_c, sub_d]);
+    let Recipe::AdmitPublication(admit) =
+        Recipe::decode_canonical(&base.recipe.to_canonical_bytes(), 16, 64).unwrap()
+    else {
+        panic!("expected AdmitPublication");
+    };
+    let mut claims = BoundedVec::with_capacity(2).unwrap();
+    claims
+        .try_push(InlineClaim {
+            target_index: 0,
+            packet_id: OutboundPacketId::new(1).unwrap(),
+        })
+        .unwrap();
+    claims
+        .try_push(InlineClaim {
+            target_index: 1,
+            packet_id: OutboundPacketId::new(1).unwrap(),
+        })
+        .unwrap();
+    let multi = Command {
+        recipe: FrozenRecipe::freeze(Recipe::MultiClaimedPublication(MultiClaimedPublication {
+            admission: admit,
+            claims,
+        }))
+        .unwrap(),
+        payload: base.payload,
+    };
+    assert_eq!(log_world.store.apply(&multi), sql_world.store.apply(&multi));
+
+    // Delivery Shard 1 (LogicalOwnerId(1)) finishes delivery index 0 (b, claimed by Owner 0 op 1)
+    // and claims+finishes unclaimed delivery index 2 (d) using its own OperationIds.
+    let fin_b = Command {
+        recipe: FrozenRecipe::freeze(Recipe::FinishDelivery(FinishDelivery {
+            operation: owner_op(1, 1),
+            delivery: DeliveryId {
+                publication: publication_id(log_world.epoch, 1),
+                index: 0,
+            },
+            target: log_world.b,
+            target_revision: Revision::new(1),
+            packet_id: OutboundPacketId::new(1).unwrap(),
+            claim: owner_op(0, 1),
+        }))
+        .unwrap(),
+        payload: None,
+    };
+    // Delivery Shard 2 (LogicalOwnerId(2)) finishes delivery index 1 (c, claimed by Owner 0 op 1)
+    // and claims unclaimed delivery index 2 (d) under Owner 2 op 2.
+    let fin_c = Command {
+        recipe: FrozenRecipe::freeze(Recipe::FinishDelivery(FinishDelivery {
+            operation: owner_op(2, 1),
+            delivery: DeliveryId {
+                publication: publication_id(log_world.epoch, 1),
+                index: 1,
+            },
+            target: sub_c,
+            target_revision: Revision::new(1),
+            packet_id: OutboundPacketId::new(1).unwrap(),
+            claim: owner_op(0, 1),
+        }))
+        .unwrap(),
+        payload: None,
+    };
+    let claim_d = Command {
+        recipe: FrozenRecipe::freeze(Recipe::ClaimDelivery(ClaimDelivery {
+            operation: owner_op(2, 2),
+            delivery: DeliveryId {
+                publication: publication_id(log_world.epoch, 1),
+                index: 2,
+            },
+            target: sub_d,
+            target_revision: Revision::new(1),
+            packet_id: OutboundPacketId::new(7).unwrap(),
+        }))
+        .unwrap(),
+        payload: None,
+    };
+    for cmd in [&fin_b, &fin_c, &claim_d] {
+        let r_log = log_world.store.apply(cmd);
+        let r_sql = sql_world.store.apply(cmd);
+        assert_eq!(r_log, r_sql);
+        assert!(r_log.committed_now);
+    }
+
+    // Independent ReceiptCollection per owner (Owner 1 & Owner 2) while Owner 0 keeps its frontier.
+    for (owner_id, through) in [(1u64, 1u64), (2u64, 2u64)] {
+        let col = ReceiptCollection {
+            closure: ReceiptClosure {
+                origin: ReceiptOrigin {
+                    incarnation: StoreIncarnation::new(1),
+                    epoch: log_world.epoch,
+                    owner: LogicalOwnerId::new(owner_id),
+                },
+                through: OperationSeq::new(through),
+                publication_through: PublicationSeq::new(0),
+                payload_through: PayloadSeq::new(0),
+            },
+            limit: 64,
+        };
+        let r_log = log_world.store.collect_receipts(col).expect("log collect");
+        let r_sql = sql_world.store.collect_receipts(col).expect("sql collect");
+        assert_eq!(r_log, r_sql);
+        assert!(matches!(r_log, ReceiptCollectionReply::Applied { .. }));
+    }
+
+    let expected = sql_world.store.snapshot().expect("sql snapshot");
+    assert_eq!(log_world.store.snapshot().expect("log snapshot"), expected);
+    assert_eq!(expected.outbound.len(), 1);
+    assert_eq!(
+        expected.outbound[&DeliveryId {
+            publication: publication_id(log_world.epoch, 1),
+            index: 2,
+        }]
+            .claim,
+        owner_op(2, 2)
+    );
+
+    // Crash & recover uncompacted .mlog, then compact and re-verify against SQLite.
+    drop(log_world);
+    let mut reopened =
+        LogStore::open_or_create(&log_path, StoreIncarnation::new(999), limits, None, true)
+            .expect("reopen uncompacted");
+    assert_eq!(reopened.snapshot().expect("reopened snapshot"), expected);
+    reopened.compact().expect("compact multi-owner log");
+    drop(reopened);
+    let reopened2 =
+        LogStore::open_or_create(&log_path, StoreIncarnation::new(999), limits, None, true)
+            .expect("reopen compacted");
+    assert_eq!(reopened2.snapshot().expect("compacted snapshot"), expected);
+
+    drop(reopened2);
+    drop(sql_world);
+    let _ = std::fs::remove_dir_all(&dir);
+}

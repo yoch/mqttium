@@ -18,7 +18,7 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError, SendError, SyncSender, TryRecv
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use mqttiumd_contract::ids::{ConnectionKey, EffectId};
+use mqttiumd_contract::ids::{ConnectionGeneration, ConnectionKey, EffectId, LogicalOwnerId};
 use mqttiumd_contract::message_expiry::{
     ExpiryState, MessageExpiry, MessageExpiryBlock, MessageTime,
 };
@@ -415,6 +415,104 @@ struct OutgoingState {
     sent_seen: u8,
 }
 
+/// Direct I/O event delivered from an I/O reactor task straight to a resident
+/// `DeliveryShard` worker, bypassing the Coordinator thread completely.
+#[derive(Debug)]
+pub enum ShardIoEvent {
+    AckPacket {
+        connection: ConnectionKey,
+        first: u8,
+        body: FrameBytes,
+    },
+    Written {
+        generation: ConnectionGeneration,
+        written: Written,
+    },
+}
+
+/// Shared bounded inbox fed directly by I/O reactor threads for one
+/// `DeliveryShard` worker.
+pub struct ShardInbox {
+    pending: AtomicBool,
+    queue: Mutex<VecDeque<ShardIoEvent>>,
+    wake: Wake,
+}
+
+impl ShardInbox {
+    pub fn new(wake: Wake) -> Arc<Self> {
+        Arc::new(Self {
+            pending: AtomicBool::new(false),
+            queue: Mutex::new(VecDeque::new()),
+            wake,
+        })
+    }
+
+    #[inline]
+    pub fn has_pending(&self) -> bool {
+        self.pending.load(Ordering::Acquire)
+    }
+
+    pub fn push_batch(&self, items: &mut Vec<ShardIoEvent>) {
+        if items.is_empty() {
+            return;
+        }
+        if let Ok(mut queue) = self.queue.lock() {
+            queue.extend(items.drain(..));
+            self.pending.store(true, Ordering::Release);
+            drop(queue);
+            self.wake.wake();
+        } else {
+            items.clear();
+        }
+    }
+
+    pub fn drain_into(&self, out: &mut VecDeque<ShardIoEvent>, limit: usize) -> usize {
+        if !self.pending.load(Ordering::Acquire) {
+            return 0;
+        }
+        let Ok(mut queue) = self.queue.lock() else {
+            return 0;
+        };
+        let mut taken = 0usize;
+        while taken < limit
+            && let Some(ev) = queue.pop_front()
+        {
+            out.push_back(ev);
+            taken += 1;
+        }
+        self.pending.store(!queue.is_empty(), Ordering::Release);
+        taken
+    }
+}
+
+/// Per-connection direct routing descriptor installed once after CONNACK is
+/// queued, steering subscriber ACKs (`PUBACK`/`PUBREC`/`PUBCOMP`) and
+/// shard-owned `Written` receipts straight to the owning `DeliveryShard`.
+pub struct ShardIoRoute {
+    pub owner_id: LogicalOwnerId,
+    pub connection: ConnectionKey,
+    pub inbox: Arc<ShardInbox>,
+}
+
+/// Cloneable write-only handle allowing a resident `DeliveryShard` thread to
+/// enqueue framed MQTT packets directly onto a subscriber's socket queue.
+#[derive(Clone)]
+pub struct OutgoingHandle {
+    core: Arc<ConnCore>,
+}
+
+impl OutgoingHandle {
+    #[inline]
+    pub fn try_send_outgoing(&self, frame: Write) -> Result<(), TrySendError<Write>> {
+        self.core.try_send_outgoing(frame)
+    }
+
+    #[inline]
+    pub fn is_cancelled(&self) -> bool {
+        self.core.is_cancelled()
+    }
+}
+
 /// Single shared allocation holding all cross-thread connection state: socket,
 /// reactor link, control flags, optional TLS principal, and both directional
 /// bounded queues (replacing 7 separate `Arc` allocations per connection).
@@ -430,6 +528,8 @@ pub(super) struct ConnCore {
     in_pending: AtomicBool,
     written_pending: AtomicBool,
     progress_pending: AtomicBool,
+    shard_route_active: AtomicBool,
+    shard_route: OnceLock<ShardIoRoute>,
     pub(super) principal: Option<Box<OnceLock<Principal>>>,
     to_core: Mutex<ToCoreState>,
     outgoing: Mutex<OutgoingState>,
@@ -463,6 +563,8 @@ impl ConnCore {
             in_pending: AtomicBool::new(false),
             written_pending: AtomicBool::new(false),
             progress_pending: AtomicBool::new(false),
+            shard_route_active: AtomicBool::new(false),
+            shard_route: OnceLock::new(),
             principal: is_tls.then(|| Box::new(OnceLock::new())),
             to_core: Mutex::new(ToCoreState {
                 incoming: VecDeque::new(),
@@ -668,11 +770,37 @@ impl ConnCore {
 
     /// Pushes a batch of newly framed packets (plus any previously held
     /// packets in strict order) under a single mutex acquisition and wake.
+    /// When a `ShardIoRoute` is installed, subscriber ACKs
+    /// (`PUBACK`/`PUBREC`/`PUBCOMP`) bypass the Coordinator queue and route
+    /// directly to the owning `DeliveryShard` inbox.
     pub(super) fn push_incoming_batch(
         &self,
         batch: &mut Vec<Incoming>,
         stalled: &mut Option<Box<StalledState>>,
     ) -> Result<bool, &'static str> {
+        if self.shard_route_active.load(Ordering::Acquire)
+            && let Some(route) = self.shard_route.get()
+            && batch.iter().any(|item| {
+                matches!(item, Incoming::Packet { first, .. } if matches!(first >> 4, 4 | 5 | 7))
+            })
+        {
+            let mut shard_acks = Vec::new();
+            for item in std::mem::take(batch) {
+                match item {
+                    Incoming::Packet { first, body, .. } if matches!(first >> 4, 4 | 5 | 7) => {
+                        shard_acks.push(ShardIoEvent::AckPacket {
+                            connection: route.connection,
+                            first,
+                            body,
+                        });
+                    }
+                    other => batch.push(other),
+                }
+            }
+            if !shard_acks.is_empty() {
+                route.inbox.push_batch(&mut shard_acks);
+            }
+        }
         if let Some(st) = stalled.as_mut()
             && !st.held.is_empty()
         {
@@ -766,9 +894,33 @@ impl ConnCore {
         fresh: &mut Vec<Report>,
         stalled: &mut Option<Box<StalledState>>,
     ) -> Result<bool, &'static str> {
+        let mut shard_moved = false;
+        if self.shard_route_active.load(Ordering::Acquire)
+            && let Some(route) = self.shard_route.get()
+            && fresh.iter().any(
+                |r| matches!(r, Report::Written(w) if written_owner(w) == Some(route.owner_id)),
+            )
+        {
+            let mut shard_written = Vec::new();
+            for report in std::mem::take(fresh) {
+                match report {
+                    Report::Written(written) if written_owner(&written) == Some(route.owner_id) => {
+                        shard_written.push(ShardIoEvent::Written {
+                            generation: route.connection.generation,
+                            written,
+                        });
+                    }
+                    other => fresh.push(other),
+                }
+            }
+            if !shard_written.is_empty() {
+                route.inbox.push_batch(&mut shard_written);
+                shard_moved = true;
+            }
+        }
         let has_stalled = stalled.as_ref().is_some_and(|s| !s.reports.is_empty());
         if !has_stalled && fresh.is_empty() {
-            return Ok(false);
+            return Ok(shard_moved);
         }
         if has_stalled && !fresh.is_empty() {
             stalled
@@ -882,7 +1034,7 @@ impl ConnCore {
                 if stalled.as_ref().is_some_and(|s| s.is_empty()) {
                     *stalled = None;
                 }
-                return Ok(moved);
+                return Ok(moved || shard_moved);
             }
             if attempt == 0 {
                 self.link.owe();
@@ -900,7 +1052,7 @@ impl ConnCore {
                 return Err(code);
             }
         }
-        Ok(moved)
+        Ok(moved || shard_moved)
     }
 
     pub(super) fn drain_incoming(&self, out: &mut VecDeque<Incoming>, limit: usize) -> DrainStatus {
@@ -1290,13 +1442,33 @@ impl ConnCore {
                     }
                 }
             }
+            let route = self
+                .shard_route_active
+                .load(Ordering::Acquire)
+                .then(|| self.shard_route.get())
+                .flatten();
+            let mut shard_failed = Vec::new();
             for correlation in active.into_iter().chain(queued) {
+                if let Some(route) = route
+                    && correlation.is_some_and(|(eff, _)| eff.owner == route.owner_id)
+                {
+                    shard_failed.push(ShardIoEvent::Written {
+                        generation: route.connection.generation,
+                        written: Written::Failed { correlation, code },
+                    });
+                    continue;
+                }
                 if state.alive & ALIVE_WRITTEN_RX == 0 || state.written.len() >= WRITTEN_SLOTS {
                     break;
                 }
                 state
                     .written
                     .push_back(Written::Failed { correlation, code });
+            }
+            if let Some(route) = route
+                && !shard_failed.is_empty()
+            {
+                route.inbox.push_batch(&mut shard_failed);
             }
             if state.alive & ALIVE_IN_RX != 0 && state.incoming.len() < INPUT_SLOTS {
                 state.incoming.push_back(Incoming::Closed { code });
@@ -1950,6 +2122,33 @@ impl Connection {
     pub fn send_buffer_bytes(&self) -> usize {
         self.core.send_buffer as usize
     }
+
+    /// Returns a cloneable write-only handle for a resident `DeliveryShard`.
+    #[inline]
+    pub fn outgoing_handle(&self) -> OutgoingHandle {
+        OutgoingHandle {
+            core: self.core.clone(),
+        }
+    }
+
+    /// Installs the direct I/O route for this connection once `CONNACK` has
+    /// been queued so subscriber ACKs and shard-owned `Written` receipts bypass
+    /// the Coordinator thread.
+    pub fn install_shard_route(&self, route: ShardIoRoute) {
+        let _ = self.core.shard_route.set(route);
+        self.core.shard_route_active.store(true, Ordering::Release);
+    }
+}
+
+#[inline]
+fn written_owner(written: &Written) -> Option<LogicalOwnerId> {
+    let corr = match written {
+        Written::Started { correlation }
+        | Written::NotStarted { correlation, .. }
+        | Written::Complete { correlation, .. }
+        | Written::Failed { correlation, .. } => *correlation,
+    };
+    corr.map(|(effect, _)| effect.owner)
 }
 
 impl Drop for Connection {

@@ -82,6 +82,7 @@ fn parse_arguments(args_iter: impl Iterator<Item = String>) -> Result<Config, St
         }
     });
     let mut io_threads = loaded.as_ref().and_then(|c| c.io_threads);
+    let mut delivery_shards = loaded.as_ref().and_then(|c| c.delivery_shards).unwrap_or(0);
     let mut hooks = Hooks::default();
     let (mut cert, mut key, mut client_ca, mut identities) = match loaded.and_then(|c| c.tls) {
         Some(tls) => (
@@ -150,6 +151,13 @@ fn parse_arguments(args_iter: impl Iterator<Item = String>) -> Result<Config, St
                     .filter(|count| (1..=32).contains(count))
                     .ok_or_else(|| "invalid io thread count".to_owned())?;
                 io_threads = Some(threads);
+            }
+            "--delivery-shards" => {
+                delivery_shards = value
+                    .parse()
+                    .ok()
+                    .filter(|count| *count <= mqttiumd::delivery_shard::MAX_DELIVERY_SHARDS)
+                    .ok_or_else(|| "invalid delivery shard count".to_owned())?;
             }
             "--tls-cert" if cert.is_none() => cert = Some(PathBuf::from(value)),
             "--tls-key" if key.is_none() => key = Some(PathBuf::from(value)),
@@ -302,6 +310,7 @@ fn parse_arguments(args_iter: impl Iterator<Item = String>) -> Result<Config, St
                 );
             }
         },
+        delivery_shards,
     })
 }
 
@@ -377,7 +386,7 @@ fn main() {
         Ok(c) => c,
         Err(e) => {
             eprintln!(
-                "mqttiumd: {e}\nusage: mqttiumd [-c CONFIG_PATH] (--db PATH | --existing-db PATH) --listen ADDRESS --events NEW_JSONL_PATH [--storage-mode durable|log|volatile] [--snapshot-interval SECS] [--io-threads N] [--max-connections N] [--event-level audit|ops] [--tls-cert PATH --tls-key PATH --client-ca PATH --identities PATH]"
+                "mqttiumd: {e}\nusage: mqttiumd [-c CONFIG_PATH] (--db PATH | --existing-db PATH) --listen ADDRESS --events NEW_JSONL_PATH [--storage-mode durable|log|volatile] [--snapshot-interval SECS] [--io-threads N] [--delivery-shards N] [--max-connections N] [--event-level audit|ops] [--tls-cert PATH --tls-key PATH --client-ca PATH --identities PATH]"
             );
             std::process::exit(2);
         }
@@ -524,5 +533,19 @@ mod tests {
         let mut bad_mode = base.to_vec();
         bad_mode.extend(["--storage-mode".to_owned(), "memory".to_owned()]);
         assert!(parse_arguments(bad_mode.into_iter()).is_err());
+
+        // Delivery shards 0..=16 accepted, >16 refused.
+        assert_eq!(default_cfg.delivery_shards, 0);
+        let mut sharded = base.to_vec();
+        sharded.extend(["--delivery-shards".to_owned(), "2".to_owned()]);
+        assert_eq!(
+            parse_arguments(sharded.into_iter())
+                .unwrap()
+                .delivery_shards,
+            2
+        );
+        let mut bad_shards = base.to_vec();
+        bad_shards.extend(["--delivery-shards".to_owned(), "17".to_owned()]);
+        assert!(parse_arguments(bad_shards.into_iter()).is_err());
     }
 }

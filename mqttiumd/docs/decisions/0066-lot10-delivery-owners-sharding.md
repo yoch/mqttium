@@ -1,0 +1,82 @@
+# 0066 — Multi-core resident *Delivery Owners* sharding, lock-free inline claim oracle, and drain-first multi-owner group commit (Lot 10)
+
+Status: **Proposed** (25 November 2026). Applied to `mqttiumd-core`, `mqttiumd-store-volatile`, and `mqttiumd`. [Report 0041](../reports/0041-lot10-arm64-delivery-sharding.md) records the ARM64 empirical scaling measurements (`K = 0, 1, 2, 3` vs Mosquitto 2.1.2), per-thread `perf` balance profiles, idle-memory footprint, and full verification ledger.
+
+This record introduces no wire-format changes, no SQLite schema changes (Schema 14/15 unchanged), no `.mlog` record changes, and no new `Recipe` variants (`Recipe` kinds `0..=25` unchanged). `crates/mqttiumd-contract/src/capacity.rs` and all files hashed in `proofs/credits/BODY.sha256` remain byte-for-byte unchanged (`71378725…`), pure crates keep `#![no_std]` + `alloc` and `#![forbid(unsafe_code)]`, the pure-crate boundary suite passes (`17/17`), and the contract digest reported by `mqttiumd-lab validate --contracts contracts/v1` remains unchanged (`sha256:21e96cc81c1f48d59841d8424fee2290102c6782b025222f2d6d2fe72ccf9bb5`).
+
+## Context
+
+In Lot 9 (record [0065](0065-lot9-refusals-fairness-and-atomic-fanout.md), report [0040](../reports/0040-lot9-arm64-fairness-fanout-and-sharding.md)), ARM64 `perf` profiling after atomic `1:N` `Recipe::MultiClaimedPublication` showed that the single `Owner` thread consumed **100 % of 1 core** (`65–92 %` of all broker CPU) on high fan-out (`fanout-1x16`) and high-concurrency (`128p`) workloads, while `log-writer` used only `~22–24 %` and the two I/O reactor threads combined used `~8–20 %`. Roughly `70–75 %` of the single Owner thread's CPU on `1:16` fan-out was pure recipient-side work (`EmitPublish`, `ObservedPuback`, `FinishDelivery`, `Deliveries` index maintenance, and `LoadWork` pagination).
+
+Meanwhile, the broker's multi-owner foundations were already built into the store and authority layers:
+- `OwnerAuthority::from_grant(grant, owner_count)` grants disjoint `Outbox` instances per `LogicalOwnerId(0..=K)` under the same `(StoreIncarnation, RunEpoch)`.
+- Every store (`VolatileStore`, `LogStore`, `SqliteStore`, and `SimStore`) already scopes operation receipts and collection watermarks by `ReceiptOrigin { incarnation, epoch, owner }`.
+
+However, turning resident multi-owner delivery sharding into a zero-regression, linearizable, crash-safe runtime required solving five structural problems:
+1. **Multi-owner `OriginOpTable` contention**: `VolatileStore::operations` kept a single hot `OwnerRing`; interleaving `LogicalOwnerId(0)` and `LogicalOwnerId(1..=K)` evicted the ring into `ScopedMap` cold storage on every turn.
+2. **Pure-core delegation without leaking threads or atomics into `mqttiumd-core`**: Coordinator (`LogicalOwnerId(0)`) still needed to emit atomic `1:N` `Recipe::ClaimedPublication` / `MultiClaimedPublication` inline without blocking on delivery shards, while preserving `#![no_std]` determinism and exact rollback on `NeedCapacity` and `RejectedCertain`.
+3. **Linearizable handoff between inline claims and store catch-up (`LoadWork`)**: A subscriber cannot advertise inline-claim eligibility while Coordinator still has unresolved inline claims or while the shard has not scanned past Coordinator's latest dirty event (attach, detach, unclaimed publish, retained replay, or will).
+4. **TCP stream causal ordering (`PUBACK` before `DISCONNECT`, `CONNACK` before `PUBLISH`)**: Direct routing of subscriber `PUBACK`/`PUBREC`/`PUBCOMP` from I/O reactor threads to shard threads must preserve exact MQTT wire ordering against `CONNACK` and `DISCONNECT` handled on the Coordinator.
+5. **Multi-owner store backpressure and shard scheduler liveness**: Naive 1:1 round-robin in the exclusive `Writer` starves shard `FinishDelivery` commands (`-1` reference each) behind Coordinator `1:N` admissions (`+N` references each), and draining `ack_inputs` ahead of `StoreResult` can livelock under `ReceiptSlots` pressure.
+
+## Decision
+
+### 1. Opt-in `--delivery-shards K` (`0..=16`, default `0`) and `mqttiumd_delivery_shards`
+- Add CLI flag `--delivery-shards K` (`0..=16`, default `0`) and native config directive `mqttiumd_delivery_shards K` (`DirectiveStatus::Equivalent` for `0..=16`, `Blocking` otherwise). Report `delivery_shards` in the `ready` event payload.
+- **`K = 0` (default)** preserves the exact Lot 9 single-owner path, including synchronous `DirectWriter` in volatile mode, identical `2,965 B/conn` plain idle RSS, lowest 1:1 latency (`0.03 ms` p50), and maximal 1:1 real-disk `ext4` `fdatasync` coalescing.
+- **`K >= 1`** allocates `OwnerAuthority::from_grant(boot.grant, 1 + K)`:
+  - `LogicalOwnerId(0)` is the **Coordinator** (ingress, routing, sessions, wills, publication admission, expiry sweeps).
+  - `LogicalOwnerId(1..=K)` are `K` resident **`DeliveryShard`** worker threads (`mqtt-deliv-0..K-1`), deterministically partitioning sessions by `session.get() % K`.
+  - Each shard owns an independent deterministic `Owner` constructed via `Owner::new_delivery_shard`, its own disjoint `Outbox` and `ReceiptOrigin`, its own SPSC `ShardStoreHandle` to the single exclusive `Writer`, and its own `ShardInbox`.
+
+### 2. Multi-owner `OriginOpTable` hot rings (`mqttiumd-store-volatile`)
+- Extend `OriginOpTable<V>` in `crates/mqttiumd-store-volatile/src/tables.rs` to hold up to `MAX_HOT_OWNERS = 32` concurrent hot `OwnerRing<V>` instances indexed by `(StoreIncarnation, RunEpoch, LogicalOwnerId)`.
+- Coordinator (`owner 0`) and every `DeliveryShard` (`owner 1..=K`) stay on O(1) direct-indexed ring buffers simultaneously with zero cold-map spillover, while preserving gap-promotion semantics and 10,000-step multi-owner differential equivalence against `BTreeMap`.
+
+### 3. Pure-core `DeliveryShard` hooks and `InlineClaimOracle` (`mqttiumd-core`)
+- Add `crates/mqttiumd-core/src/owner/shard.rs` (strict `#![no_std]` + `alloc`):
+  - `InlineClaimOracle` trait (`try_reserve`, `mark_ineligible`, `rollback`) passed to `Owner::step_with_oracle` and `Owner::step_and_dispatch_with_oracle`.
+  - When `Owner::enable_delegated_deliveries()` is active on the Coordinator:
+    - Live QoS 1/2 admissions consult the oracle per target to build `ClaimedPublication` / `MultiClaimedPublication`, rolling back every provisional reservation atomically if the plan is refused (`NeedCapacity` / `Exhausted`) or later receives `StoreOutcome::RejectedCertain`.
+    - Committed inline batches are handed out via `take_last_delegated_committed()`; rejected batches via `take_last_delegated_rejected()`; live volatile QoS 0 publications via `take_last_delegated_qos0()`.
+    - `pending_delegated_inline_count(session)` tracks in-flight delegated inline admissions per session to fence dirty barriers cleanly.
+  - On each `DeliveryShard` `Owner`:
+    - `Owner::new_delivery_shard` initializes a recovery-closed delivery owner from Coordinator's `ShardLimits`.
+    - `shard_attach_session`, `shard_detach_session`, `shard_retire_session`, `shard_notify_dirty`, `shard_inline_eligibility`, `step_shard_inline_committed`, and `step_shard_qos0` execute delivery state transitions, `Receive Maximum` enforcement, `Maximum Packet Size` discard, QoS 2 `PUBREC -> PUBREL -> PUBCOMP`, and volatile QoS 0 pacing using the exact same core `Deliveries` and `Connections` state machine.
+    - `CompactFacts::DeliveryLocal` records explicit `pub_owner` and `claim_owner` so cross-owner deliveries (`owner 0` publication claimed/finished by `owner 1..=K`) remain zero-allocation.
+
+### 4. Lock-free `InlineClaimLease`, direct `ShardIoRoute`, and strict wire ordering (`mqttiumd`)
+- **`InlineClaimLease` (`crates/mqttiumd/src/delivery_shard.rs`)**: Cache-line-aligned (`#[repr(align(64))]`) per-session lease holding `dirty_seq`, `acked_dirty_seq`, `eligible_gen`, `in_flight`, `preclaim_cap`, and `used_pi: [AtomicU64; 8]` (512 packet identifiers).
+  - Coordinator owns `dirty_seq`; any dirty event (`Attach`, `Detach`, `NotifyDirty`, `mark_ineligible`) clears `eligible_gen = 0` and increments `dirty_seq`. If `pending_delegated_inline_count(session) > 0`, Coordinator defers sending `DirtyBarrier { session, dirty_seq }` until the last pending inline admission resolves (strictly after `InlineCommitted`), ensuring the shard never resets `used_pi` while Coordinator holds an in-flight claim.
+  - Shard tracks `scan_started_dirty_seq` on `LoadWork` completion (`next: None`) and only publishes `eligible_gen` and `acked_dirty_seq = seen_dirty_seq` when `scan_started_dirty_seq >= seen_dirty_seq` and `owner.shard_inline_eligibility` confirms `caught_up == true`, zero queued deliveries, and all PIs `<= 512`.
+  - While published, Coordinator exclusively sets bits (`fetch_or` + `fetch_add`) and Shard exclusively clears bits (`fetch_and` + `fetch_sub`) upon `last_finished_delivery()`.
+- **Direct I/O steering (`crates/mqttiumd/src/net.rs`)**:
+  - `Connection::outgoing_handle()` exposes a cloneable `OutgoingHandle` so shards write `PUBLISH` / `PUBREL` frames straight into the subscriber's bounded `ConnCore::outgoing` queue without touching the Coordinator.
+  - `Connection::install_shard_route(ShardIoRoute)` steers subscriber `PUBACK`/`PUBREC`/`PUBCOMP` (`first >> 4` in `{4, 5, 7}`) and shard-owned `Written` receipts (`effect.owner == route.owner_id`) directly from I/O reactor threads into the owning shard's `ShardInbox`. Both plain TCP and TLS 1.3 I/O tasks still call `record_heard()` before routing so Keep Alive remains exact.
+  - **Strict TCP wire ordering**:
+    - `CONNACK` before `PUBLISH`: `install_shard_route` and `CoordToShard::Attach` execute only after `CONNACK` is accepted into `ConnCore::outgoing`.
+    - `SUBACK` before retained replay (MQTT-3.8.4-1): for `SubscriptionsChanged` with retained replays, Coordinator records `pending_suback_notify` and defers `CoordToShard::NotifyDirty` until `SUBACK` is accepted into `ConnCore::outgoing` (both single-filter `Sink::try_submit` and multi-filter `serve_requests`).
+    - `PUBACK` before `DISCONNECT`: `ConnCore::push_incoming_batch` always publishes shard ACKs into `ShardInbox` before pushing `DISCONNECT` / `Closed` to Coordinator; upon receiving `CoordToShard::Detach`, `Retire`, or generation takeover `Attach`, `DeliveryShardWorker::flush_pre_detach` drains `pending_inline`, `io_inbox`, `drain_inputs`, and `dispatch` before detaching the generation so `FinishDelivery` enters the store FIFO ahead of any reconnect `LoadWork`.
+
+### 5. Drain-first multi-owner `Writer` and starvation-free shard scheduler (`writer.rs`, `delivery_shard.rs`)
+- **Multi-owner SPSC `Writer` (`crates/mqttiumd/src/writer.rs`)**: `Writer::spawn_configured_sharded(..., extra_owners)` allocates `1 + K` independent SPSC request/reply/control lanes (`lanes[0]` Coordinator, `lanes[1..=K]` shards) sharing the single exclusive durable store and coalescing consecutive `Persist` commands across all owners into one group commit (`group = 1024` for `Log` and sharded `Volatile`, `128` for `Sqlite`).
+- **Drain-first scheduling**: When `K >= 1`, `Writer` drains shard lanes (`1..=K`, credit-releasing `FinishDelivery`/`ClaimDelivery`/`ConsumeDelivery`) round-robin first up to `group - coord_reserve` (`coord_reserve = (group / 8).clamp(8, 64)`), then drains Coordinator (`lanes[0]`, credit-allocating `AdmitPublication`) up to `group`, then backfills remaining slots from shards. This maintains `1:N` steady-state equilibrium without overflowing store `References` (`0x97 QuotaExceeded`) while never starving publishers.
+- **Starvation-free shard lanes & O(1) timer check (`delivery_shard.rs`)**: Separate `store_inputs` (`StoreResult`, `WorkPage`, `MessagesExpired`) and drain in strict credit-releasing order (`control_inputs` -> `terminal_inputs` -> `store_inputs` -> `ack_inputs` -> `inputs`) with per-lane blocking on `NeedCapacity`, immediate `schedule_maintenance()` on `ReceiptSlots` pressure, and an O(1) `next_timer_due: Option<Instant>` fast check avoiding per-turn `BTreeMap` scans in `due_deadlines` and `idle_wait`.
+- **Ordered shutdown**: `run_inner` shuts down Coordinator sessions (`Detach` sent to shards), closes/joins sockets, and drains + joins all shard threads (`ShardPool::shutdown`) before outer `run()` sends `Request::Stop` to `Writer`.
+
+## Consequences
+
+- **Zero regression at default `K = 0` (report [0041](../reports/0041-lot10-arm64-delivery-sharding.md))**:
+  - Plain TCP idle RSS at 768 connections remains **2,965 B/conn** (byte-identical to Lot 9); mTLS at 400 connections is **12,575 B/conn**.
+  - `DirectWriter` volatile latency (`0.03 ms` p50) and real `ext4` 1:1 `log` throughput (`40,787 deliv/s`) are unchanged.
+- **Multi-core ARM64 throughput, tail latency, and per-thread balance (`K = 2, 3`, 3 broker cores)**:
+  - `fanout-1x16-q1`: `volatile` scales from `171,864 -> 239,920 deliv/s` (**+39.6 %**, `K = 2`, 99.97 % of Mosquitto 2.1.2 `240,000/s`, `p50` `1.49 -> 1.16 ms`); durable `log` scales from `153,544 -> 229,360 deliv/s` (**+49.4 %**, `K = 3`, `p50 = 1.31 ms`, `0` refusals, `0.00 %` loss).
+  - `fanout-1x4-q1` (`log`): `143,976 -> 160,000 deliv/s` (**+11.1 %**, 100 % offered rate, `p50` `0.84 -> 0.36 ms`).
+  - `fanin-32x1-q1` (`log`, `K = 3`): `p50 / p99` drops from `547.58 / 772.78 ms` to **`0.21 / 8.74 ms`** (**2,600× lower p50**, **88× lower p99**, `0` refusals).
+  - `128p QoS 1 @ 120k/s` (`log`, `K = 2`): `54,970 -> 70,728 deliv/s` (**+28.7 %**, `p50` `16.57 -> 13.11 ms`).
+  - `32p QoS 0 @ 300k/s` (`volatile`, `K = 2`): `p50` drops **66×** (`308.15 -> 4.65 ms`, `wire` `+18.2 %`).
+  - All 8/8 adversarial scenarios achieve **0 refusals and 0.00 % loss** on `K = 2` and `K = 3` in both `volatile` and `log` modes, and ARM64 `perf` confirms balanced multi-core execution (`fanout-1x16-q1` `log` `K = 3`: `log-writer` 23.6 %, three shards 16.7 % / 15.0 % / 14.6 %, Coordinator 10.0 %, two I/O reactors 10.0 % / 10.0 %).
+- **Trade-offs and operational guidance**:
+  - `K = 2` adds ~7.9 MiB fixed base RSS and ~1.2 KiB/conn (`4,224 B/conn` plain at 768 connections) for the resident shard `Owner` tables and thread stacks, and adds a cross-thread hop on low-concurrency or real-disk 1:1 `fdatasync` workloads where `K = 0` remains faster.
+  - Under extreme single-shard saturation (`K = 1` facing 240k deliv/s `1:16` fan-out), Coordinator can still outrun a single shard thread and fill store `References` (`0x97`); operators enabling sharding should set `K >= 2` (or `K = 3` on ≥4-core hosts with heavy durable fan-out).
+- **Crash-recovery equivalence**: Multi-owner `SIGKILL` tests confirm exact persistence and cross-mode recovery (`--delivery-shards 2` -> `SIGKILL` -> `--delivery-shards 2` -> `SIGKILL` -> `--delivery-shards 0`) across both `LogStore` and `SqliteStore`.
