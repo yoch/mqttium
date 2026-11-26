@@ -97,12 +97,29 @@ fn an_idle_shard_waits_without_holding_the_reactors_wake_ups() {
     });
 }
 
-fn closing_code(runtime: &Runtime<'_>, generation: ConnectionGeneration) -> Option<&'static str> {
-    runtime
-        .peers
-        .get(&generation)
-        .and_then(|peer| peer.closing())
-        .map(|(code, _)| code)
+/// Why `generation` is closing, or was closed: a peer whose transport has
+/// finished and whose shard has detached leaves the table at once, and its
+/// close is then read from the journal.
+fn closing_code(
+    runtime: &Runtime<'_>,
+    directory: &Path,
+    generation: ConnectionGeneration,
+) -> Option<String> {
+    if let Some(peer) = runtime.peers.get(&generation) {
+        return peer.closing().map(|(code, _)| code.to_owned());
+    }
+    let journal = std::fs::read_to_string(directory.join("events.jsonl")).unwrap();
+    journal
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter(|event| {
+            event["kind"] == "connection_closed"
+                && event["connection"]
+                    .as_str()
+                    .and_then(|text| text.parse::<u64>().ok())
+                    == Some(generation.get())
+        })
+        .find_map(|event| event["details"]["code"].as_str().map(str::to_owned))
 }
 
 /// A connection whose session revision the coordinator does not know
@@ -110,7 +127,7 @@ fn closing_code(runtime: &Runtime<'_>, generation: ConnectionGeneration) -> Opti
 /// left open with no shard to deliver to it.
 #[test]
 fn a_connection_whose_revision_is_unknown_is_closed_at_attach() {
-    sharded(|runtime, _| {
+    sharded(|runtime, directory| {
         let (generation, _client) = connected(runtime, b"attach-unknown");
         let session = runtime.peers[&generation].session.unwrap();
         runtime.session_revisions.remove(&session);
@@ -119,7 +136,7 @@ fn a_connection_whose_revision_is_unknown_is_closed_at_attach() {
             generation,
         }]);
         assert_eq!(
-            closing_code(runtime, generation),
+            closing_code(runtime, directory, generation).as_deref(),
             Some("shard_attach_without_revision")
         );
     });
@@ -130,7 +147,7 @@ fn a_connection_whose_revision_is_unknown_is_closed_at_attach() {
 /// connection is closed instead.
 #[test]
 fn a_connection_attached_twice_is_closed() {
-    sharded(|runtime, _| {
+    sharded(|runtime, directory| {
         let (generation, _client) = connected(runtime, b"attach-twice");
         let session = runtime.peers[&generation].session.unwrap();
         let _ = runtime.attach_ready_shards(vec![ConnectionKey {
@@ -138,7 +155,7 @@ fn a_connection_attached_twice_is_closed() {
             generation,
         }]);
         assert_eq!(
-            closing_code(runtime, generation),
+            closing_code(runtime, directory, generation).as_deref(),
             Some("shard_attached_twice")
         );
     });
