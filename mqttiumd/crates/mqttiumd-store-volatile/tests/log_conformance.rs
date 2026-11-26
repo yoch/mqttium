@@ -373,6 +373,56 @@ fn log_reopens_after_a_group_larger_than_one_frame() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// One command that no frame can hold is not written at all: it is answered
+/// unknown, as a write that failed, and the log stays readable. The product
+/// cannot form such a command (its payload limit is one mebibyte); a store
+/// opened with wider limits must still never write what it refuses to read.
+#[test]
+fn log_does_not_write_a_command_larger_than_one_frame() {
+    const PAYLOAD: usize = 65 * 1024 * 1024;
+    let dir = temp_dir("large-command");
+    let path = dir.join("store.sqlite");
+    let limits = Limits {
+        payload_bytes: mqttiumd_contract::capacity::PayloadBytes::new(128 * 1024 * 1024),
+        max_payload_bytes: PAYLOAD,
+        ..fixture_limits()
+    };
+    let mut world = World::with_limits(
+        &|incarnation, lim| {
+            LogStore::open_or_create(&path, incarnation, lim, None, false).expect("log")
+        },
+        limits,
+    );
+    let before = world.admission(1, 1, b"before", &[world.b]);
+    assert!(world.store.apply(&before).committed_now);
+    let expected = world.store.snapshot().expect("the state before");
+
+    let length = mqttiumd_contract::capacity::PayloadBytes::new(PAYLOAD as u64);
+    let small = world.admission(2, 2, b"x", &[world.b]);
+    let mut large = conformance::altered(&small, |admit| {
+        admit.payload.length = length;
+        admit.costs.payload_bytes = length;
+    });
+    large.payload = Some(
+        mqttiumd_contract::packet::SharedBytes::copy_from(&vec![0x5a_u8; PAYLOAD], PAYLOAD)
+            .expect("within the limit"),
+    );
+    let refused = world.store.apply(&large);
+    assert_eq!(
+        refused.reply,
+        StoreReply::Outcome(StoreOutcome::PendingOrUnknown)
+    );
+    assert!(!refused.committed_now && !refused.wrote);
+    assert_eq!(world.store.snapshot().expect("unchanged"), expected);
+    drop(world);
+
+    let reopened = LogStore::open_or_create(&path, StoreIncarnation::new(9), limits, None, true)
+        .expect("the log holds only frames the store reads back");
+    assert_eq!(reopened.snapshot().unwrap(), expected);
+    drop(reopened);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn log_recovers_from_torn_tail_and_refuses_midfile_corruption() {
     let dir = temp_dir("torn-tail");
