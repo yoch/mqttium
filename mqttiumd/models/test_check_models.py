@@ -200,6 +200,23 @@ class CheckModels(unittest.TestCase):
             "M1Answers: a refinement model names the test functions that replay it",
         )
 
+    def test_a_readme_that_names_code_which_does_not_exist_is_refused(self) -> None:
+        self.refused(
+            append("README.md", "\nSee `Owner::no_such_member_anywhere`.\n"),
+            "m1/README.md: names Owner::no_such_member_anywhere; "
+            "nothing under crates/ declares no_such_member_anywhere",
+        )
+        self.refused(
+            append("README.md", "\nSee `NoSuchTypeAnywhere::step`.\n"),
+            "m1/README.md: names NoSuchTypeAnywhere::step; no type NoSuchTypeAnywhere under crates/",
+        )
+
+    def test_a_readme_may_name_real_code_and_types_of_other_crates(self) -> None:
+        code, defects = run_on(
+            append("README.md", "\n`Owner::step`, `Shutdown::Both`, and prose Not::code.\n")
+        )
+        self.assertEqual(code, 0, defects)
+
     def test_a_sidecar_that_is_not_an_object_is_refused(self) -> None:
         def change(root: Path) -> None:
             (root / "m1" / "Stray.json").write_text("[]", encoding="utf-8")
