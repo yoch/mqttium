@@ -363,5 +363,98 @@ class Recipes20To23(unittest.TestCase):
             self.assertIn(expected, unmet(snapshot=snap))
 
 
+def claimed_publication(claims, *, targets=((2, 1), (3, 1)), retain=0, kind=None):
+    """An admission to ``targets`` (session, effective QoS) with the inline
+    claims ``claims`` (index of the target, Packet Identifier): kind 24 for
+    one claim, kind 25 for several, unless ``kind`` says otherwise."""
+    topic = b"atelier/temperature"
+    body = (scoped(20) + scoped(30) + scoped(40)
+            + be(1) + be(1) + be(7, 2) + be(1) + be(2)
+            + bytes([1, retain]) + be(len(topic), 2) + topic
+            + scoped(50) + be(4) + be(4) + be(len(targets)) + be(0) + be(1)
+            + be(len(targets), 2)
+            + b"".join(be(session) + be(1) + be(index, 4) + bytes([qos, 1])
+                       for index, (session, qos) in enumerate(targets)))
+    pairs = b"".join(be(index, 2) + be(packet_id, 2) for index, packet_id in claims)
+    if kind is None:
+        kind = 24 if len(claims) == 1 else 25
+    if kind == 0:
+        return header(1) + body
+    return header(kind) + body + (pairs if kind == 24 else be(len(claims), 2) + pairs)
+
+
+class Recipes24And25(unittest.TestCase):
+    """An admission that claims its QoS 1/2 targets in the same commit
+    (``ClaimedPublication``, ``MultiClaimedPublication``): the hot path of
+    the product since lots 6 and 9. The oracle reads them, attributes them
+    to the exchange of their admission, and keeps their delivery semantics
+    outside the P1 fixture scope, as it does for ``ClaimDelivery``."""
+
+    def test_a_claimed_publication_is_its_admission_and_its_claims(self):
+        admission_alone = recipe.decode(claimed_publication((), kind=0))
+        one = recipe.decode(claimed_publication([(1, 5)]))
+        self.assertEqual(one.kind, "ClaimedPublication")
+        self.assertEqual(one.admission, admission_alone)
+        self.assertEqual(one.claims, (recipe.InlineClaim(1, 5),))
+        self.assertEqual(one.operation, admission_alone.operation)
+
+        several = recipe.decode(claimed_publication([(0, 5), (1, 6)]))
+        self.assertEqual(several.kind, "MultiClaimedPublication")
+        self.assertEqual(several.admission, admission_alone)
+        self.assertEqual(several.claims, (recipe.InlineClaim(0, 5), recipe.InlineClaim(1, 6)))
+
+        for inner in (claimed_publication([(0, 5)]), claimed_publication([(0, 5), (1, 6)])):
+            wrapped = recipe.decode(annotated_publication(inner=inner))
+            self.assertEqual(wrapped.kind, "AnnotatedPublication")
+            self.assertEqual(wrapped.inner, recipe.decode(inner))
+
+    def test_noncanonical_claims_are_refused(self):
+        invalid = [
+            claimed_publication([(2, 5)]),                               # no such target
+            claimed_publication([(0, 0)]),                               # Packet Identifier 0
+            claimed_publication([(0, 5)], targets=((2, 0), (3, 1))),     # a QoS 0 target
+            claimed_publication([(0, 5)], retain=1),                     # a retained admission
+            claimed_publication([(0, 5)]) + b"\x00",                     # trailing bytes
+            claimed_publication([(0, 5)])[:-1],                          # truncated
+            claimed_publication([(0, 5)], kind=25),                      # one claim is kind 24
+            claimed_publication([(0, 5), (1, 6)], kind=24),              # two claims are kind 25
+            claimed_publication([(0, 5), (1, 6), (1, 7)]),               # more claims than targets
+            claimed_publication([(1, 5), (0, 6)]),                       # not ascending
+            claimed_publication([(0, 5), (0, 6)]),                       # the same target twice
+            claimed_publication([(0, 5), (1, 6)], targets=((2, 1), (2, 1))),  # one session twice
+            claimed_publication([(0, 5), (1, 0)]),                       # Packet Identifier 0
+            claimed_publication([(0, 5), (1, 6)], retain=1),
+        ]
+        for raw in invalid:
+            with self.subTest(raw=raw.hex()), self.assertRaises(recipe.RecipeError):
+                recipe.decode(raw)
+
+    def test_a_claimed_admission_is_attributed_to_its_exchange(self):
+        from mqttiumd_oracle import judge
+
+        for raw in (claimed_publication([(0, 5)]), claimed_publication([(0, 5), (1, 6)]),
+                    annotated_publication(inner=claimed_publication([(0, 5)]))):
+            run = judge.Run.__new__(judge.Run)
+            operation = "an-operation"
+            with mock.patch.object(judge.Run, "recipes", return_value={operation: {raw.hex()}}):
+                self.assertEqual(run.slots(), {operation: ("AdmitPublication", 1, 7)})
+
+    def test_claimed_publications_stay_outside_the_fixture_scope(self):
+        def unmet(snapshot=None, records=()):
+            run = SimpleNamespace(
+                snapshots={"first": (None, snapshot)} if snapshot is not None else {},
+                trace=SimpleNamespace(records=records),
+            )
+            with mock.patch.object(results.judge.Run, "load", return_value=run):
+                return results._scope_unmet(None, None, None)
+
+        for raw in (claimed_publication([(0, 5)]), claimed_publication([(0, 5), (1, 6)])):
+            snap = {"outbound": [], "operations": [{"recipe_hex": raw.hex(), "decision": {}}]}
+            self.assertIn(results.FIXTURE_PUBSUB_SCOPE, unmet(snapshot=snap))
+        for name in ("ClaimedPublication", "MultiClaimedPublication"):
+            record = SimpleNamespace(kind="StoreCommandSubmitted", payload={"command_kind": name})
+            self.assertIn(results.FIXTURE_PUBSUB_SCOPE, unmet(records=[record]))
+
+
 if __name__ == "__main__":
     unittest.main()
