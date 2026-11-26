@@ -512,6 +512,11 @@ impl<K: FlatKey> FlatSet<K> {
 /// Active-scope keys live in a compact `FlatMap<K::Local, V>` (8-byte keys,
 /// zero steady-state allocations, backward-shift deletion), while keys from
 /// recovered prior epochs fall back to a cold `BTreeMap<K, V>`.
+///
+/// The active scope is that of the first key received, until a key of a
+/// later run arrives: its scope then becomes the active one, and what the
+/// compact map held moves to the fallback. A table rebuilt after a restart
+/// receives what earlier runs left before the keys of its own run.
 #[derive(Clone, Debug)]
 pub struct ScopedFlatMap<K: ScopedKey, V>
 where
@@ -599,11 +604,22 @@ where
         let scope = key.scope();
         match self.hot_scope {
             Some(hot) if hot == scope => self.hot.insert(key.local(), value),
-            None => {
-                self.hot_scope = Some(scope);
+            Some(hot) if !K::later_run(scope, hot) => self.cold.insert(key, value),
+            _ => {
+                self.activate(scope);
                 self.hot.insert(key.local(), value)
             }
-            Some(_) => self.cold.insert(key, value),
+        }
+    }
+
+    /// Makes `scope` the active one: none was, or `scope` is of a later
+    /// run. No key of `scope` is in the fallback, since the first of them
+    /// comes here.
+    fn activate(&mut self, scope: K::Scope) {
+        if let Some(earlier) = self.hot_scope.replace(scope) {
+            for (local, value) in core::mem::take(&mut self.hot).into_entries() {
+                self.cold.insert(K::from_parts(earlier, local), value);
+            }
         }
     }
 
@@ -622,11 +638,11 @@ where
         let scope = key.scope();
         match self.hot_scope {
             Some(hot) if hot == scope => self.hot.get_or_insert_default(key.local()),
-            None => {
-                self.hot_scope = Some(scope);
+            Some(hot) if !K::later_run(scope, hot) => self.cold.entry(key).or_default(),
+            _ => {
+                self.activate(scope);
                 self.hot.get_or_insert_default(key.local())
             }
-            Some(_) => self.cold.entry(key).or_default(),
         }
     }
 
