@@ -3324,7 +3324,17 @@ impl Runtime<'_> {
                     self.queue(Input::DiscoverWills)?;
                 }
                 if applied && self.owner.last_step_may_unblock_work() {
-                    if let Some((session, initial)) = ready_work {
+                    if self.shards.is_some() {
+                        // The stored targets of a commit: their shards read
+                        // them after the lease's last mark.
+                        if let Some(first) = self.owner.last_inline_ready_target() {
+                            self.queue_work(first);
+                            for index in 0..self.owner.last_inline_ready_extra().len() {
+                                let target = self.owner.last_inline_ready_extra()[index];
+                                self.queue_work(target);
+                            }
+                        }
+                    } else if let Some((session, initial)) = ready_work {
                         self.rearm_ready_work(session, initial);
                     } else if let Some(first) = self.owner.last_inline_ready_target() {
                         self.rearm_ready_work(first, false);
@@ -3871,18 +3881,26 @@ impl Runtime<'_> {
                     ) {
                         self.last_finish_result = Some((effect, operation, reply));
                     }
+                    // With shards, the step of an admission's commit names its
+                    // stored targets, and they are notified after it: the step
+                    // marks their leases dirty, and the shard must see that
+                    // mark. A resolution names no target here either.
+                    let named_by_step = self.shards.is_some()
+                        && self.owner.names_stored_targets_at_commit(operation);
                     self.queue(Input::StoreResult {
                         effect,
                         operation,
                         reply,
                     })?;
-                    if matches!(
-                        reply,
-                        StoreReply::Outcome(StoreOutcome::Committed(
-                            CommitFacts::PublicationAdmitted { .. }
-                                | CommitFacts::RetainedQos0Stored { .. }
-                        ))
-                    ) {
+                    if !named_by_step
+                        && matches!(
+                            reply,
+                            StoreReply::Outcome(StoreOutcome::Committed(
+                                CommitFacts::PublicationAdmitted { .. }
+                                    | CommitFacts::RetainedQos0Stored { .. }
+                            ))
+                        )
+                    {
                         for target in targets {
                             self.notify_work(target)?;
                         }

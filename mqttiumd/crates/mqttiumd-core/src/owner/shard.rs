@@ -234,6 +234,14 @@ impl Owner {
         self.last_finished_delivery
     }
 
+    /// Whether the step of the commit of `operation` names the stored
+    /// targets of its publication (`Self::last_inline_ready_target`): an
+    /// admission whose targets were not all claimed inline.
+    #[must_use]
+    pub fn names_stored_targets_at_commit(&self, operation: OperationId) -> bool {
+        self.non_inline_targets_by_op.contains_key(&operation)
+    }
+
     /// Number of in-flight delegated inline-claimed admissions currently
     /// targeting `session` on this Coordinator.
     #[must_use]
