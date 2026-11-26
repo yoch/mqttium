@@ -2141,7 +2141,14 @@ impl Owner {
         {
             self.last_observed_puback_ignored = true;
         }
-        match self.apply_draft(draft, change, input, reservation, direct_sink, &mut oracle) {
+        match self.apply_draft(
+            &mut draft,
+            change,
+            input,
+            reservation,
+            direct_sink,
+            &mut oracle,
+        ) {
             Ok((progress, accepted)) => (
                 StepOutcome::Applied {
                     work_used,
@@ -4074,9 +4081,12 @@ impl Owner {
         Ok(Change::Recover)
     }
 
+    /// Applies a planned transition. The draft is taken by reference: it is
+    /// the largest value of a step, and a move of it costs a copy that the
+    /// optimiser does not always elide.
     fn apply_draft<'o>(
         &mut self,
-        draft: Draft,
+        draft: &mut Draft,
         change: Change,
         input: Input,
         reservation: Option<EffectReservation>,
@@ -4085,17 +4095,17 @@ impl Owner {
     ) -> Result<(Progress, usize), CoreFault> {
         let Draft {
             counters,
-            mut effects,
+            ref mut effects,
             progress,
             closed,
             receipt_issued,
             receipt_consumed,
             released,
-            inline_outcome,
+            ref mut inline_outcome,
             delegated_inline_resolved,
             non_inline_resolved,
             ..
-        } = draft;
+        } = *draft;
         if direct_sink.is_none() {
             let reserved = match reservation {
                 Some(key) => self
@@ -4141,7 +4151,7 @@ impl Owner {
         let has_non_inline = non_inline_resolved
             .as_ref()
             .is_some_and(|(op, _)| self.non_inline_targets_by_op.contains_key(op));
-        if let Some(outcome) = inline_outcome {
+        if let Some(outcome) = inline_outcome.take() {
             self.apply_inline_claim_outcome(outcome, has_non_inline)?;
         }
         if let Some((operation, committed)) = delegated_inline_resolved
@@ -4889,8 +4899,9 @@ mod tests {
         ) -> Result<Progress, CoreFault> {
             plan.stamp.check(self.id, self.revision)?;
             let mut no_oracle: Option<&mut dyn InlineClaimOracle> = None;
+            let mut draft = plan.draft;
             self.apply_draft(
-                plan.draft,
+                &mut draft,
                 plan.change,
                 input,
                 reservation,
