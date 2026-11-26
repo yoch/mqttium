@@ -34,7 +34,9 @@ Init == /\ stream \in Streams /\ cursor = 1 /\ behind = <<>>
         /\ state = "Waiting" /\ passed = {}
 RECURSIVE ByteCount(_)
 ByteCount(q) == IF q = <<>> THEN 0 ELSE Head(q).bytes + ByteCount(Tail(q))
-CanKeep(p) == Len(behind) < 2 /\ ByteCount(behind) + p.bytes <= 2
+\* NoByteBound keeps a packet whatever the bytes already kept.
+CanKeep(p) == Len(behind) < 2 /\
+              (ByteCount(behind) + p.bytes <= 2 \/ Mutation = "NoByteBound")
 Independent(p) == p.kind = "R" /\ p.id # WaitingId /\
                   \A i \in 1..Len(behind) : behind[i].kind # "P" \/ behind[i].id # p.id
 AllOwed == \A i \in 1..2 : slots[i] = "RecWritten"

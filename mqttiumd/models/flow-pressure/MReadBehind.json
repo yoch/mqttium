@@ -58,6 +58,11 @@
       "property": "Terminates"
     },
     {
+      "config": "MReadBehind-mut-bytes.cfg",
+      "expect": "violation",
+      "invariant": "Bounded"
+    },
+    {
       "config": "MReadBehind-mut-cross.cfg",
       "expect": "violation",
       "invariant": "NoPublishOvertaken"

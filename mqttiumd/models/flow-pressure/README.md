@@ -39,7 +39,7 @@ python ../tools/formal/run_tlc.py --models-dir models/flow-pressure --list
 python ../tools/formal/run_tlc.py --models-dir models/flow-pressure
 ```
 
-19 configurations, the whole directory in about twenty seconds; the
+21 configurations, the whole directory in about twenty seconds; the
 largest explores 1,230 states.
 
 ## MReadBehind
@@ -69,7 +69,7 @@ back is in the socket tests, not here.
 
 | Property | Statement | How it can fail |
 | - | - | - |
-| `Bounded` | At most two packets and two byte units are kept behind. | By a `CanKeep` that admits more. No mutant configuration: the bound is the guard of the branch that keeps a packet. |
+| `Bounded` | At most two packets and two byte units are kept behind. | `mut-bytes` (`NoByteBound`: a packet is kept whatever the bytes already kept). The bound is the guard of the branch that keeps a packet, read back on what was kept: it guards a regression of `PeerCold::room_behind`. |
 | `NoPublishOvertaken` | A packet handed to the core ahead of the waiting PUBLISH is not preceded, in what was read, by a PUBLISH of its own identifier that is still waiting or kept behind. It is stated on the stream and on the positions that went ahead; it names neither `behind` nor `Independent`. | `mut-cross` (`AnyRel`: any PUBREL passes). A scratch run with `Independent` forgetting the packets kept behind violates it too. |
 | `CloseOnlyWhenPeerOwes` | A closed connection has every slot at `RecWritten`. | `mut-close` (`CloseEarly`). **This is the closing guard written a second time**, on the state the close leaves, and nothing moves after a close: it guards a regression of that guard or of `AllOwed`, and shows nothing about whether the guard is the right one. |
 | `Terminates` | Under weak fairness of the reader, of the writes and of the releases already submitted, the wait ends: admission or close. | `mut-wait` (`WaitForever`: the reader never closes). |
@@ -132,7 +132,7 @@ ever.
 
 | Property | Statement | How it can fail |
 | - | - | - |
-| `WithinWindow` | Frames in flight, parked deliveries and queued frames stay within their bounds. | `NoWindow` violates it (checked in a scratch run; the configuration `mut-window` declares `ControlRoom`). |
+| `WithinWindow` | Frames in flight, parked deliveries and queued frames stay within their bounds. | `mut-window-flight` (`NoWindow`). It reads back the bounds the guards of `Arrive` and `Serve` test: a regression guard of those tests. |
 | `ControlRoom` | Until the control frame is admitted, the queue of the slow subscriber has a place for it. | `mut-window` (`NoWindow`: data is emitted whatever the window). |
 | `Ordered` | On the wire, the publications a connection is sent keep the order of their arrival. It is stated on `sent`, the wire history, which no guard reads. | `mut-order` (`NewestFirst`: the lane serves its newest waiting delivery) and `mut-pass-parked` (`PassParked`: a pending delivery is emitted without regard to those waiting in its lane). **It holds only because of those two rules**: `VolatileQueue::serve_ready` pops the front of the lane, and `Owner::plan_qos0_continue` parks a delivery whose lane is not empty. It is their regression guard, not a property the queues have by themselves. |
 | `FastCompletes` | Under weak fairness of the fast lane, its socket and its receipts, the fast subscriber is sent everything. | `mut-stall` (`WaitForSlow`: nothing is taken for the fast lane while the slow window is full). |

@@ -50,6 +50,11 @@
       "invariant": "ControlRoom"
     },
     {
+      "config": "MQos0Window-mut-window-flight.cfg",
+      "expect": "violation",
+      "invariant": "WithinWindow"
+    },
+    {
       "config": "MQos0Window-mut-order.cfg",
       "expect": "violation",
       "invariant": "Ordered"
