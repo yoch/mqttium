@@ -876,7 +876,6 @@ impl Owner {
     /// or the delivery shard that owns the session fences it
     /// (`Owner::shard_fence_scans`). A held session waits as during a read,
     /// and is not ready work.
-    #[inline]
     fn read_held(&self, session: SessionId, generation: ConnectionGeneration) -> bool {
         self.pubsub.connections.is_loading(generation)
             || (!self.scan_fences.is_empty() && self.scan_fences.contains(&session))
