@@ -668,6 +668,18 @@ impl ShardPool {
         }
     }
 
+    /// Whether the coordinator may reserve for `session` now: the predicate
+    /// of `InlineClaimLease::try_reserve`, without its room check.
+    #[cfg(test)]
+    pub(crate) fn lease_is_eligible(&self, session: SessionId) -> bool {
+        self.leases.get(&session).is_some_and(|lease| {
+            let dirty = lease.dirty_seq.load(Ordering::Acquire);
+            dirty != 0
+                && lease.acked_dirty_seq.load(Ordering::Acquire) == dirty
+                && lease.eligible_gen.load(Ordering::Acquire) != 0
+        })
+    }
+
     #[cfg(test)]
     pub(crate) fn send_for_test(&mut self, shard_idx: usize, test: ShardTest) {
         self.send_to(shard_idx, CoordToShard::Test(test));
