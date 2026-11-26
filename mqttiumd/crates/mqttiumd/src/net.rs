@@ -4026,6 +4026,275 @@ mod tests {
         );
     }
 
+    // The tests below drive one plain task by hand, with no route to a
+    // shard: the coordinator is the only producer of frames and the only
+    // consumer of receipts (models/transport-credit, models/takeover).
+
+    fn manual_task(connection: &Connection) -> Task {
+        Task {
+            core: Arc::clone(&connection.core),
+            clock: Arc::new(FakeClock::new(reading(100))),
+            leftover: None,
+            parser: Parser::default(),
+            stalled: None,
+            active: None,
+            paused: None,
+        }
+    }
+
+    fn pingresp(sequence: u64) -> Write {
+        Write {
+            correlation: correlation(sequence),
+            bytes: FrameBytes::from_slice(&[0xd0, 0]),
+            payload: None,
+            expiry: None,
+            report: WriteReport::Complete,
+        }
+    }
+
+    /// Leaves no room in the receipt lane, as a core that collects nothing.
+    fn fill_written_lane(connection: &Connection) {
+        for filler in 0..WRITTEN_SLOTS as u64 {
+            let mut fresh = vec![Report::Written(Written::Complete {
+                correlation: correlation(10_000 + filler),
+                bytes: 2,
+            })];
+            assert!(
+                connection
+                    .core
+                    .flush_reports(&mut fresh, &mut None)
+                    .unwrap()
+            );
+        }
+    }
+
+    fn completed(written: &[Written]) -> Vec<Option<(EffectId, ConnectionKey)>> {
+        written
+            .iter()
+            .map(|receipt| match receipt {
+                Written::Complete { correlation, .. } => *correlation,
+                other => panic!("expected a completion, got {other:?}"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_full_output_queue_refuses_a_frame_until_the_task_takes_one() {
+        // No reactor drives this connection: the queue keeps what it accepts.
+        let (connection, _peer) = manual_pair();
+        for sequence in 0..OUTPUT_SLOTS as u64 {
+            connection.try_send_outgoing(pingresp(sequence)).unwrap();
+        }
+        let refused = match connection.try_send_outgoing(pingresp(1000)) {
+            Err(TrySendError::Full(frame)) => frame,
+            other => panic!("a full queue accepted a frame or was closed: {other:?}"),
+        };
+        assert_eq!(
+            refused.correlation,
+            correlation(1000),
+            "the refused frame comes back intact"
+        );
+        let mut taken = Vec::new();
+        connection
+            .core
+            .pop_outgoing_batch(&mut taken, false, COALESCE_BYTES, MAX_COALESCE_FRAMES)
+            .unwrap();
+        assert_eq!(taken.len(), 1);
+        connection.try_send_outgoing(refused).unwrap();
+        assert!(matches!(
+            connection.try_send_outgoing(pingresp(1001)),
+            Err(TrySendError::Full(_))
+        ));
+    }
+
+    #[test]
+    fn a_finished_task_seals_its_queue_and_fails_each_admitted_frame_once() {
+        let (connection, mut peer) = manual_pair();
+        let task = manual_task(&connection);
+        connection.try_send_outgoing(pingresp(1)).unwrap();
+        connection.try_send_outgoing(pingresp(2)).unwrap();
+        // The task ends before it took either frame.
+        Box::new(task).finish("eof");
+        // A frame submitted afterwards is refused. Accepted, it would wait
+        // in a queue nothing reads and get no receipt.
+        assert!(matches!(
+            connection.try_send_outgoing(pingresp(3)),
+            Err(TrySendError::Disconnected(frame)) if frame.correlation == correlation(3)
+        ));
+        let mut written = Vec::new();
+        assert_eq!(
+            connection.drain_written(&mut written, WRITTEN_SLOTS),
+            DrainStatus::Empty
+        );
+        let failed: Vec<_> = written
+            .iter()
+            .map(|receipt| match receipt {
+                Written::Failed {
+                    correlation,
+                    code: "eof",
+                } => *correlation,
+                other => panic!("expected a failure, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(failed, [correlation(1), correlation(2)]);
+        written.clear();
+        assert_eq!(
+            connection.drain_written(&mut written, WRITTEN_SLOTS),
+            DrainStatus::Disconnected
+        );
+        assert!(written.is_empty());
+        // The socket was shut before the queue was emptied: no queued frame left.
+        peer.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+        assert_eq!(peer.read(&mut [0u8; 2]).unwrap(), 0);
+    }
+
+    #[test]
+    fn a_turn_offers_its_receipts_together_and_takes_no_frame_while_one_is_refused() {
+        let (connection, mut peer) = manual_pair();
+        let mut task = manual_task(&connection);
+        fill_written_lane(&connection);
+        // Two frames one write can carry, then two that are written alone.
+        let large = |sequence: u64| Write {
+            payload: Some(
+                SharedBytes::copy_from(
+                    &[7; SEGMENTED_PAYLOAD_THRESHOLD + 1],
+                    SEGMENTED_PAYLOAD_THRESHOLD + 1,
+                )
+                .unwrap(),
+            ),
+            ..pingresp(sequence)
+        };
+        for frame in [pingresp(1), pingresp(2), large(3), large(4)] {
+            connection.try_send_outgoing(frame).unwrap();
+        }
+        let turn = task.turn(&mut ReactorScratch::new()).unwrap();
+        assert!(turn.progress && turn.waiting);
+        // Every frame left in this one turn, before any receipt was offered.
+        let mut bytes = vec![0; 2 * 2 + 2 * (2 + SEGMENTED_PAYLOAD_THRESHOLD + 1)];
+        peer.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+        peer.read_exact(&mut bytes).unwrap();
+        // The lane had no room: the task keeps the receipts of four frames.
+        assert_eq!(task.stalled.as_ref().map(|s| s.reports.len()), Some(4));
+        // A fifth frame stays in the queue while those receipts wait.
+        connection.try_send_outgoing(pingresp(5)).unwrap();
+        // The wait of the refused receipts is not what this test measures.
+        task.stalled.as_mut().unwrap().stalled_since = None;
+        let turn = task.turn(&mut ReactorScratch::new()).unwrap();
+        assert!(!turn.progress && turn.waiting);
+        assert_eq!(connection.core.outgoing.lock().unwrap().queue.len(), 1);
+        assert_eq!(task.stalled.as_ref().map(|s| s.reports.len()), Some(4));
+        // The core collects: the receipts leave in order, then the frame.
+        let mut written = Vec::new();
+        connection.drain_written(&mut written, WRITTEN_SLOTS);
+        assert_eq!(written.len(), WRITTEN_SLOTS);
+        assert!(task.turn(&mut ReactorScratch::new()).unwrap().progress);
+        assert!(task.stalled.is_none());
+        written.clear();
+        connection.drain_written(&mut written, WRITTEN_SLOTS);
+        assert_eq!(
+            completed(&written),
+            [1, 2, 3, 4, 5].map(correlation),
+            "receipts in the order of their frames"
+        );
+        let mut last = [0u8; 2];
+        peer.read_exact(&mut last).unwrap();
+        assert_eq!(last, [0xd0, 0]);
+    }
+
+    #[test]
+    fn a_receipt_refused_for_the_whole_wait_ends_the_task_and_a_full_lane_drops_its_facts() {
+        let (connection, _peer) = manual_pair();
+        let mut task = manual_task(&connection);
+        fill_written_lane(&connection);
+        connection.try_send_outgoing(pingresp(1)).unwrap();
+        assert!(task.turn(&mut ReactorScratch::new()).unwrap().progress);
+        // The completion of the first frame is refused; a second frame waits.
+        assert_eq!(task.stalled.as_ref().map(|s| s.reports.len()), Some(1));
+        connection.try_send_outgoing(pingresp(2)).unwrap();
+        // The core has collected nothing for the whole wait.
+        task.stalled.as_mut().unwrap().stalled_since = Some(
+            Instant::now()
+                .checked_sub(RESULT_WAIT)
+                .expect("a monotonic clock older than the wait"),
+        );
+        let code = task.turn(&mut ReactorScratch::new()).unwrap_err();
+        assert_eq!(code, "write_result_queue_full");
+        Box::new(task).finish(code);
+        // The terminal facts were offered once to a lane that had no room:
+        // neither the completion of the first frame nor the failure of the
+        // second is there. The owner of the frames fails them at its close.
+        let mut written = Vec::new();
+        assert_eq!(
+            connection.drain_written(&mut written, WRITTEN_SLOTS + 2),
+            DrainStatus::Empty
+        );
+        assert_eq!(
+            completed(&written),
+            (0..WRITTEN_SLOTS as u64)
+                .map(|filler| correlation(10_000 + filler))
+                .collect::<Vec<_>>()
+        );
+        written.clear();
+        assert_eq!(
+            connection.drain_written(&mut written, WRITTEN_SLOTS),
+            DrainStatus::Disconnected
+        );
+        assert!(written.is_empty());
+    }
+
+    #[test]
+    fn a_frame_that_cannot_start_fails_once_and_the_frame_before_it_keeps_its_completion() {
+        let (connection, _peer) = manual_pair();
+        let mut task = manual_task(&connection);
+        let (bytes, mut expiry) = timed_frame();
+        expiry.value_offset = Some(bytes.len());
+        connection.try_send_outgoing(pingresp(1)).unwrap();
+        connection
+            .try_send_outgoing(Write {
+                correlation: correlation(2),
+                bytes: FrameBytes::from(bytes),
+                payload: None,
+                expiry: Some(Box::new(expiry)),
+                report: WriteReport::Complete,
+            })
+            .unwrap();
+        let code = task.turn(&mut ReactorScratch::new()).unwrap_err();
+        assert_eq!(code, "output_expiry_offset");
+        Box::new(task).finish(code);
+        let mut written = Vec::new();
+        connection.drain_written(&mut written, WRITTEN_SLOTS);
+        assert!(
+            matches!(written.as_slice(), [
+                Written::Complete { correlation: first, bytes: 2 },
+                Written::Failed { correlation: second, code: "output_expiry_offset" },
+            ] if *first == correlation(1) && *second == correlation(2)),
+            "one terminal receipt per frame, in order: {written:?}"
+        );
+    }
+
+    #[test]
+    fn a_closed_plain_connection_is_shut_when_its_reason_reads_and_writes_nothing_more() {
+        let (connection, mut peer) = manual_pair();
+        let mut task = manual_task(&connection);
+        connection.try_send_outgoing(pingresp(1)).unwrap();
+        // The owner closes while the frame is still queued.
+        connection.close();
+        assert_eq!(connection.terminal_reason(), Some("cancelled"));
+        // The reason reads: the socket is already shut, whatever the task does.
+        peer.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+        assert_eq!(peer.read(&mut [0u8; 2]).unwrap(), 0);
+        let code = task.turn(&mut ReactorScratch::new()).unwrap_err();
+        assert_eq!(code, "cancelled");
+        Box::new(task).finish(code);
+        let mut written = Vec::new();
+        connection.drain_written(&mut written, WRITTEN_SLOTS);
+        assert!(
+            matches!(written.as_slice(), [Written::Failed { correlation: queued, code: "cancelled" }]
+                if *queued == correlation(1)),
+            "the queued frame fails once: {written:?}"
+        );
+    }
+
     fn control() -> AtomicBool {
         AtomicBool::new(false)
     }

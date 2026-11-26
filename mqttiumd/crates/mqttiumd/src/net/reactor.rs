@@ -720,6 +720,63 @@ mod tests {
         fixture.link.notify();
     }
 
+    /// Ends at its first turn. Its `finish` tells the test it began and
+    /// returns when the test lets it: the terminal facts are being published.
+    struct SlowEnd {
+        stream: TcpStream,
+        began: mpsc::Sender<()>,
+        release: mpsc::Receiver<()>,
+    }
+
+    impl Driven for SlowEnd {
+        fn descriptor(&self) -> RawFd {
+            self.stream.as_raw_fd()
+        }
+        fn turn(
+            &mut self,
+            _scratch: &mut super::super::ReactorScratch,
+        ) -> Result<Turn, &'static str> {
+            Err("eof")
+        }
+        fn finish(self: Box<Self>, _code: &'static str) {
+            let _ = self.began.send(());
+            let _ = self.release.recv();
+        }
+    }
+
+    #[test]
+    fn a_link_does_not_read_finished_while_its_task_publishes_its_terminal_facts() {
+        let pool = Reactors::new(1).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let _peer = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (stream, _) = listener.accept().unwrap();
+        stream.set_nonblocking(true).unwrap();
+        let (began, in_finish) = mpsc::channel();
+        let (release, released) = mpsc::channel();
+        let link = pool.link(Wake::new());
+        pool.register(
+            &link,
+            Box::new(SlowEnd {
+                stream,
+                began,
+                release: released,
+            }),
+        );
+        in_finish.recv_timeout(Duration::from_secs(5)).unwrap();
+        // `finish` has not returned: a core that read the flag now would
+        // take the lanes as complete before the terminal facts are in them.
+        assert!(
+            !link.is_finished(),
+            "finished was set before the terminal facts were published"
+        );
+        release.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !link.is_finished() {
+            assert!(Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+
     #[test]
     fn dropping_the_pool_finishes_every_task_as_cancelled() {
         let pool = Reactors::new(2).unwrap();
