@@ -81,6 +81,7 @@ fn submitted_ack_precedes_detach_even_when_the_writer_withholds_credit() {
         Arc::new(crate::session_time::SystemClock::new().unwrap()),
         Limits::BOUNDED,
         Arc::default(),
+        Arc::default(),
     );
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let _client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();

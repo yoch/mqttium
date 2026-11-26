@@ -223,7 +223,6 @@ pub(crate) enum CoordToShard {
     MessagesExpired {
         deliveries: Vec<ExpiredDelivery>,
     },
-    Shutdown,
 }
 
 /// What a test asks of a shard, at the place of its message in the lane.
@@ -264,6 +263,11 @@ struct ShardClient {
     owner_id: LogicalOwnerId,
     tx: Signalled<CoordToShard>,
     inbox: Arc<ShardInbox>,
+    /// Asked for by `ShardPool::shutdown`. A flag rather than a message of
+    /// the lane, so that a full lane cannot lose it; the shard reads it
+    /// when its lane is empty, after every message sent before it.
+    stop: Arc<AtomicBool>,
+    wake: crate::wake::Wake,
     handle: Option<JoinHandle<Result<(), Failure>>>,
 }
 
@@ -321,6 +325,8 @@ impl ShardPool {
             let worker_events = events.clone();
             let worker_clock = Arc::clone(&clock);
             let worker_cancel = Arc::clone(&cancel);
+            let stop = Arc::new(AtomicBool::new(false));
+            let worker_stop = Arc::clone(&stop);
 
             let owner = Owner::new_delivery_shard(shard_owner_config, outbox, shard_limits)
                 .map_err(|_| Failure::plain("shard_owner_creation"))?;
@@ -338,6 +344,7 @@ impl ShardPool {
                         worker_clock,
                         limits,
                         worker_cancel,
+                        worker_stop,
                     );
                     match worker.register_receipts(Duration::from_secs(30)) {
                         Ok(()) => {
@@ -367,6 +374,8 @@ impl ShardPool {
                 owner_id,
                 tx: coord_tx,
                 inbox,
+                stop,
+                wake: shard_wake,
                 handle: Some(handle),
             });
         }
@@ -665,7 +674,8 @@ impl ShardPool {
     /// so all in-flight shard store commands drain before the `Writer` stops.
     pub(crate) fn shutdown(mut self, budget: Duration) -> Result<(), Failure> {
         for shard in &self.shards {
-            let _ = shard.tx.try_send(CoordToShard::Shutdown);
+            shard.stop.store(true, Ordering::Release);
+            shard.wake.wake();
         }
         let deadline = Instant::now() + budget;
         let mut first_err = None;
@@ -774,6 +784,7 @@ struct DeliveryShardWorker {
     started: Instant,
     progress: u64,
     stopping: bool,
+    stop: Arc<AtomicBool>,
 
     sessions: FlatMap<SessionId, ShardSession>,
     // The coordinator retains the closing peer until its own receipt is set.
@@ -818,9 +829,11 @@ impl DeliveryShardWorker {
         clock: Arc<dyn SessionClock>,
         limits: Limits,
         cancel: Arc<AtomicBool>,
+        stop: Arc<AtomicBool>,
     ) -> Self {
         let now = Instant::now();
         Self {
+            stop,
             owner,
             store,
             coord_rx,
@@ -1463,14 +1476,18 @@ impl DeliveryShardWorker {
                                     .push_back(Input::MessagesExpired { deliveries: bv });
                             }
                         }
-                        CoordToShard::Shutdown => {
-                            self.stopping = true;
-                        }
                         #[cfg(test)]
                         CoordToShard::Test(test) => test.run(),
                     }
                 }
-                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Empty) => {
+                    // Stored after the coordinator's last message: seen
+                    // here, nothing it sent before the stop is still queued.
+                    if self.stop.load(Ordering::Acquire) {
+                        self.stopping = true;
+                    }
+                    break;
+                }
                 Err(TryRecvError::Disconnected) => {
                     self.stopping = true;
                     break;
