@@ -1031,6 +1031,15 @@ impl DeliveryShardWorker {
         if sess.scan_started_dirty_seq < sess.seen_dirty_seq {
             return;
         }
+        // A committed inline claim not yet applied is no row of the core:
+        // published now, the lease would not count its identifier.
+        if self
+            .pending_inline
+            .iter()
+            .any(|item| item.claim.target == session)
+        {
+            return;
+        }
         let generation = sess.generation;
         let rm = usize::from(
             sess.receive_maximum
@@ -1609,6 +1618,9 @@ impl DeliveryShardWorker {
                     {
                         self.queue_work_front(item.claim.target);
                     }
+                    // The claim is a row now: the lease it held back may be
+                    // published, with its identifier.
+                    self.try_publish_lease(item.claim.target);
                 }
                 ShardStepOutcome::NeedCapacity(_) => {
                     self.pending_inline.push_front(item);
