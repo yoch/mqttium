@@ -59,6 +59,9 @@ use crate::writer::{
 pub const MAX_DELIVERY_SHARDS: usize = 16;
 
 const COORD_CHANNEL_CAP: usize = 4_096;
+/// Deliveries of delegated QoS 0 a shard keeps while its core cannot take
+/// them: what one full lane of the coordinator brings.
+const PENDING_QOS0_LIMIT: usize = COORD_CHANNEL_CAP;
 const IDLE_TICK: Duration = Duration::from_millis(20);
 const BACKPRESSURE_TICK: Duration = Duration::from_millis(1);
 const BOUNDS: Bounds = Bounds {

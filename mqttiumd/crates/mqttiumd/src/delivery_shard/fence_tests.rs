@@ -9,8 +9,23 @@ use mqttiumd_contract::packet::Qos;
 use std::net::{TcpListener, TcpStream};
 use std::num::NonZeroUsize;
 
-#[test]
-fn submitted_ack_precedes_detach_even_when_the_writer_withholds_credit() {
+/// A delivery shard worker built by hand, driven by the test: nothing runs
+/// its loop. The ends of its lanes are kept so that none reads as closed.
+struct Harness {
+    incarnation: StoreIncarnation,
+    epoch: RunEpoch,
+    worker: DeliveryShardWorker,
+    commands: Signalled<CoordToShard>,
+    events: std::path::PathBuf,
+    _lanes: (
+        mpsc::Receiver<Request>,
+        mpsc::SyncSender<Response>,
+        mpsc::Receiver<ControlRequest>,
+        mpsc::SyncSender<ControlResponse>,
+    ),
+}
+
+fn harness(name: &str) -> Harness {
     let incarnation = StoreIncarnation::new(1);
     let epoch = RunEpoch::new(2);
     let mut opening = EpochOpening::new(incarnation, StartupNonce::new([7; 16]));
@@ -53,9 +68,9 @@ fn submitted_ack_precedes_detach_even_when_the_writer_withholds_credit() {
 
     let wake = Wake::new();
     let (store_tx, requests) = crate::wake::signalled(8, &wake);
-    let (_reply, receiver) = mpsc::sync_channel(8);
-    let (control_sender, _control) = crate::wake::signalled(8, &wake);
-    let (_control_reply, control_receiver) = mpsc::sync_channel(8);
+    let (reply, receiver) = mpsc::sync_channel(8);
+    let (control_sender, control) = crate::wake::signalled(8, &wake);
+    let (control_reply, control_receiver) = mpsc::sync_channel(8);
     let store = ShardStoreHandle {
         sender: store_tx,
         receiver,
@@ -66,12 +81,11 @@ fn submitted_ack_precedes_detach_even_when_the_writer_withholds_credit() {
     };
     let (commands, coord_rx) = crate::wake::signalled(8, &wake);
     let path = std::env::temp_dir().join(format!(
-        "mqttiumd-shard-ack-fence-{}.jsonl",
+        "mqttiumd-shard-{name}-{}.jsonl",
         std::process::id()
     ));
     let events = Events::open(&path).unwrap();
-    std::fs::remove_file(&path).unwrap();
-    let mut worker = DeliveryShardWorker::new(
+    let worker = DeliveryShardWorker::new(
         owner,
         store,
         coord_rx,
@@ -83,6 +97,27 @@ fn submitted_ack_precedes_detach_even_when_the_writer_withholds_credit() {
         Arc::default(),
         Arc::default(),
     );
+    Harness {
+        incarnation,
+        epoch,
+        worker,
+        commands,
+        events: path,
+        _lanes: (requests, reply, control, control_reply),
+    }
+}
+
+#[test]
+fn submitted_ack_precedes_detach_even_when_the_writer_withholds_credit() {
+    let Harness {
+        incarnation,
+        epoch,
+        mut worker,
+        commands,
+        events,
+        _lanes: (requests, _reply, _control, _control_reply),
+    } = harness("ack-fence");
+    std::fs::remove_file(&events).unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let _client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
     let socket = net::spawn(listener.accept().unwrap().0).unwrap();
@@ -205,4 +240,57 @@ fn submitted_ack_precedes_detach_even_when_the_writer_withholds_credit() {
     assert_eq!(worker.owner.connection_of(session), None);
     assert!(completed.load(Ordering::Acquire));
     socket.close();
+}
+
+/// What the coordinator delegates to a shard whose core cannot take it yet
+/// waits in `pending_qos0`. That queue has a bound: beyond it a QoS 0
+/// delivery is shed, as the single owner sheds one its volatile queue
+/// cannot hold, and the drop is journaled.
+#[test]
+fn delegated_qos0_waiting_for_the_core_is_bounded() {
+    let Harness {
+        mut worker,
+        commands,
+        events,
+        _lanes,
+        ..
+    } = harness("qos0-intake");
+    let source = ConnectionKey {
+        session: SessionId::new(9),
+        generation: ConnectionGeneration::new(90),
+    };
+    let targets = (0..=PENDING_QOS0_LIMIT as u64)
+        .map(|index| DelegatedQos0Target {
+            target: SessionId::new(100 + index),
+            connection: None,
+        })
+        .collect();
+    commands
+        .send(CoordToShard::Qos0Deliver {
+            origin: Qos0Origin::Volatile {
+                publication: mqttiumd_contract::pubsub::VolatilePublicationId {
+                    source,
+                    ingress_order: 1,
+                },
+            },
+            topic: SharedBytes::copy_from(b"t", 8).unwrap(),
+            payload: SharedBytes::copy_from(b"p", 8).unwrap(),
+            expiry: None,
+            properties: None,
+            targets,
+        })
+        .unwrap();
+    worker.drain_coord_messages().unwrap();
+    assert!(
+        worker.pending_qos0.len() <= PENDING_QOS0_LIMIT,
+        "{} deliveries wait for the core",
+        worker.pending_qos0.len()
+    );
+    let journal = std::fs::read_to_string(&events).unwrap();
+    let drops = journal
+        .lines()
+        .filter(|line| line.contains("\"qos0_dropped\"") && line.contains("capacity_exceeded"))
+        .count();
+    assert_eq!(drops, 1);
+    std::fs::remove_file(&events).unwrap();
 }
