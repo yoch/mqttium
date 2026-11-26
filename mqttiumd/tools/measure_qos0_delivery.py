@@ -17,6 +17,10 @@ Each subscriber is read by its own thread. The script measures the broker
 with the Python client beside it on the same host: the figures compare two
 executables on one machine and are no capacity claim.
 
+`broker_cpu_us_per_delivery` is the CPU time of the broker (user and
+system, read in /proc before it stops) over the deliveries received, the
+statistic of `tools/run_perf_gate.py` (report 0043).
+
     python3 tools/measure_qos0_delivery.py --binary target/release/mqttiumd \
         --shape bursts --messages 100000 --burst 100 --subscribers 1
 
@@ -37,6 +41,14 @@ import time
 from pathlib import Path
 
 TOPIC = b"measure/qos0"
+
+
+def cpu_seconds(pid: int) -> float:
+    """User plus system CPU time of a process, from /proc (Linux)."""
+    import os
+
+    fields = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()
+    return (int(fields[11]) + int(fields[12])) / os.sysconf("SC_CLK_TCK")
 
 
 def text(value: bytes) -> bytes:
@@ -151,6 +163,7 @@ def measure(args: argparse.Namespace) -> dict:
             subscriber.start()
         publisher = connect(address, b"measure-pub")
 
+        cpu_start = cpu_seconds(broker.pid)
         start = time.monotonic()
         if args.shape == "blast":
             publisher.sendall(frame * args.messages)
@@ -172,6 +185,7 @@ def measure(args: argparse.Namespace) -> dict:
             if all(s.received >= args.messages or now - s.last > 1.0 or s.closed for s in subscribers):
                 break
             time.sleep(0.01)
+        cpu = cpu_seconds(broker.pid) - cpu_start
         received = [s.received for s in subscribers]
         ends = [max(s.last, published) for s in subscribers]
         elapsed = max(ends) - start
@@ -188,6 +202,7 @@ def measure(args: argparse.Namespace) -> dict:
             "publish_seconds": round(published - start, 4),
             "elapsed_seconds": round(elapsed, 4),
             "delivered_per_second": round(sum(received) / elapsed) if elapsed > 0 else None,
+            "broker_cpu_us_per_delivery": round(cpu * 1e6 / sum(received), 3) if sum(received) else None,
         }
     finally:
         broker.terminate()
