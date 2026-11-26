@@ -779,7 +779,8 @@ pub(super) struct ConnCore {
     written_pending: AtomicBool,
     progress_pending: AtomicBool,
     shard_route_active: AtomicBool,
-    shard_route: OnceLock<ShardIoRoute>,
+    /// Boxed: a connection without shards pays a pointer, not the route.
+    shard_route: OnceLock<Box<ShardIoRoute>>,
     pub(super) principal: Option<Box<OnceLock<Principal>>>,
     to_core: Mutex<ToCoreState>,
     outgoing: Mutex<OutgoingState>,
@@ -2500,7 +2501,7 @@ impl Connection {
     /// has one route: false when one was installed already, which is kept.
     #[must_use]
     pub fn install_shard_route(&self, route: ShardIoRoute) -> bool {
-        if self.core.shard_route.set(route).is_err() {
+        if self.core.shard_route.set(Box::new(route)).is_err() {
             return false;
         }
         self.core.shard_route_active.store(true, Ordering::Release);
