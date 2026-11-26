@@ -700,6 +700,93 @@ fn a_session_is_read_only_after_the_claims_that_came_before_its_barrier() {
     socket.close();
 }
 
+/// A session the shard does not read now does not keep the shard busy: the
+/// read it waits for is not taken for ready work, so no pass of the shard
+/// queues its work again only to find nothing to do.
+#[test]
+fn a_fenced_session_does_not_keep_its_shard_busy() {
+    let Harness {
+        incarnation: _,
+        epoch: _,
+        mut worker,
+        commands,
+        events,
+        _lanes: (requests, reply, _control, _control_reply),
+    } = harness("fenced-idle");
+    std::fs::remove_file(&events).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let _client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+    let socket = net::spawn(listener.accept().unwrap().0).unwrap();
+    let session = SessionId::new(1);
+    let generation = ConnectionGeneration::new(10);
+    let lease = InlineClaimLease::new();
+    let dirty_seq = lease.mark_dirty();
+    commands
+        .send(CoordToShard::Attach {
+            session,
+            revision: Revision::new(1),
+            generation,
+            receive_maximum: 8,
+            maximum_packet_size: 1024,
+            version: Version::V5,
+            outgoing: socket.outgoing_handle(),
+            lease: Arc::clone(&lease),
+            dirty_seq,
+        })
+        .unwrap();
+    worker.drain_coord_messages().unwrap();
+    worker.drain_inputs().unwrap();
+    worker.dispatch().unwrap();
+    let Some(load) = requests.try_iter().find_map(|request| match request {
+        Request::Effect(effect) if matches!(effect.effect(), Effect::LoadWork { .. }) => {
+            Some(effect.id())
+        }
+        _ => None,
+    }) else {
+        panic!("the attach read no work");
+    };
+    reply
+        .send(Response::Work {
+            effect: load,
+            session,
+            result: Ok(mqttiumd_store_api::WorkPage {
+                items: BoundedVec::with_capacity(0).unwrap(),
+                next: None,
+            }),
+        })
+        .unwrap();
+    worker.drain_store_replies().unwrap();
+    worker.drain_inputs().unwrap();
+    assert!(lease.try_reserve().is_some(), "the lease was not published");
+
+    // A dirty message while the claim is pending: the session waits for its
+    // barrier, and nothing of it is ready work meanwhile.
+    let _ = lease.mark_dirty();
+    commands
+        .send(CoordToShard::NotifyDirty {
+            session,
+            dirty_seq: 0,
+            clear_known_through: true,
+        })
+        .unwrap();
+    worker.drain_coord_messages().unwrap();
+    worker.drain_pending_inline().unwrap();
+    worker.drain_inputs().unwrap();
+    worker.dispatch().unwrap();
+    assert!(
+        !worker.owner.has_ready_work(session),
+        "a fenced session was taken for ready work"
+    );
+    assert!(
+        !worker
+            .inputs
+            .iter()
+            .any(|input| matches!(input, Input::WorkAvailable { session: s } if *s == session)),
+        "the shard queued the work of a fenced session again"
+    );
+    socket.close();
+}
+
 /// The shard's sink binds a PUBREL's identifier as the coordinator's does:
 /// an identifier already bound is a fault, not a binding silently
 /// replaced, and the table of bindings is bounded.
