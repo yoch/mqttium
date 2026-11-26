@@ -357,27 +357,32 @@ impl<K: FlatKey, V> FlatMap<K, V> {
         }
     }
 
+    /// Keeps the entries `f` accepts. `f` sees every entry once.
     pub fn retain(&mut self, mut f: impl FnMut(&K, &mut V) -> bool) {
-        let cap = self.slots.len();
-        if cap == 0 || self.len == 0 {
+        if self.len == 0 {
             return;
         }
-        let mut i = 0;
-        while i < cap {
+        // The scan starts after an empty slot, and the table always has
+        // one: no run of entries then goes round the place it started, so
+        // a removal only moves entries the scan has not reached yet.
+        let Some(start) = self.slots.iter().position(Option::is_none) else {
+            return;
+        };
+        let mask = self.slots.len() - 1;
+        let mut offset = 1;
+        while offset <= mask {
+            let i = (start + offset) & mask;
             let keep = match &mut self.slots[i] {
                 Some((k, v)) => f(k, v),
-                None => {
-                    i += 1;
-                    continue;
-                }
+                None => true,
             };
-            if !keep {
+            if keep {
+                offset += 1;
+            } else {
                 self.slots[i] = None;
                 self.len -= 1;
+                // The entry that takes this place, if any, is seen next.
                 self.backward_shift_from(i);
-                // Re-check `i` because a later entry may have shifted into `i`.
-            } else {
-                i += 1;
             }
         }
     }
