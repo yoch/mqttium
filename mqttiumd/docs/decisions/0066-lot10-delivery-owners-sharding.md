@@ -25,9 +25,17 @@ Statements of this record the code does not meet, kept below as written:
 
 - "Coordinator emits ... without blocking on delivery shards" (Context,
   item 2): see the blocking send above.
-- "`SUBACK` before retained replay": the deferral covers the store path
-  only. A retained QoS 0 replay delegated to a shard can reach the wire
-  before the SUBACK; `delivery_shards.rs` shows it intermittently.
+- "`SUBACK` before retained replay": the deferral of `NotifyDirty` did
+  not cover a read the shard had already started, the one it makes when
+  a session attaches. The store could answer it after the commit of the
+  SUBSCRIBE that follows the CONNACK, and the shard then queued the
+  retained replay before the coordinator queued the SUBACK
+  (`tests/delivery_shards.rs` failed about once in 25 runs). Fixed the
+  same day: a shard's frames wait for every SUBACK owed to their
+  connection (`a_shard_frame_does_not_overtake_the_suback_of_its_connection`).
+  MQTT 3.8.4 lets a server send matching PUBLISH packets before the
+  SUBACK; this order is the product's, kept equal to that of `K = 0` and
+  of the reference broker.
 - "`K = 0` preserves the exact Lot 9 path": reports 0040 and 0041 give
   different `K = 0` figures, and `ConnCore` carries the shard route of
   every connection whatever `K`.

@@ -107,6 +107,17 @@ conditions lost two false lines and gained a section.
 | `Deliveries::mutate` counted a packet identifier collision that does not exist | `f3019ca` | `62afa31` |
 | A known option refused by an earlier one was reported as "unknown or unavailable option" | `db9f992` | `6b367b4` |
 
+One defect of the sharded mode is fixed in this push, because it made the
+CI of the first push fail:
+
+| Defect | Failing test | Fix |
+| - | - | - |
+| With `--delivery-shards K >= 1`, a retained replay could reach the wire before the SUBACK of its subscription. The read a shard makes when a session attaches travels on a lane of its own, and the store could answer it after the commit of the SUBSCRIBE that follows the CONNACK; `tests/delivery_shards.rs` failed about once in 25 runs | `f94075b`, deterministic: ten failures in ten | `7126deb`: each connection counts the SUBACKs the coordinator owes it, and a shard queues nothing there until they are queued; 25 runs of `tests/delivery_shards.rs` in 25 then pass |
+
+MQTT 3.8.4 lets a server send matching PUBLISH packets before the SUBACK, so
+the defect broke a promise of record 0066 and the order of `K = 0` and of the
+reference broker, not the standard.
+
 Examined and not changed:
 
 - A log group decides which members need its frame on the state before the
@@ -145,6 +156,24 @@ A is `9dfd568` (sha256 `1f1219d7d13a54c5...`), B is `6b367b4`
 No shape costs more. The two lower ratios on one subscriber are not claimed as
 a gain: the gate resolves about 4 % on that shape and nothing in the change
 touches the QoS 0 path.
+
+The fix of the sharded ordering (`7126deb`) changes the path by which every
+frame is queued, so the gate was played again, B being `7126deb`
+(`d290b9e029097abf...`):
+
+| Shape | Median of B/A, 6 passes | 12 passes | Verdict |
+| - | - | - | - |
+| QoS 0 bursts, 1 subscriber | 1.025 | | pass |
+| QoS 0 bursts, 8 subscribers | 1.089 | 0.937 | pass |
+| QoS 1 pairs, 1 pair | 1.067 | 0.971 | pass |
+| QoS 1 pairs, 8 pairs | 0.985 | | pass |
+| QoS 0 blast, 1 subscriber | 1.047 | | reported |
+| QoS 0 blast, 8 subscribers | 0.914 | | reported |
+
+Two shapes went over the threshold on six passes and under it on twelve, as
+the rule provides. Between the two runs the same shapes moved by up to 9 %:
+that is the noise this VM shows, and the reason the rule plays again rather
+than deciding on six passes.
 
 The gate's QoS 1 shapes run on the volatile store, and the log store is where
 most of the changes are. Six alternating passes of 8 QoS 1 pairs in `log`
@@ -201,32 +230,35 @@ about each:
 
 The section "Validation of the lot 10 head" of
 `docs/reception/open-conditions.md`. In short: the sharded mode (no model,
-defects found by reading, one intermittent ordering failure), the records
+defects found by reading), the records
 above, the figures of lots 8 to 10, one log image, one takeover path the
 model does not contain, two scans of the volatile store, and the oracle's
 scope.
 
 ## Commands
 
-From `mqttiumd/`, on `6b367b4` for the crates and on the head of this push
-for the rest, with `env -u CARGO_TARGET_DIR -u CARGO_ENCODED_RUSTFLAGS`:
+From `mqttiumd/`, on `7126deb` for the crates and on the head of this push for
+the rest, with `env -u CARGO_TARGET_DIR -u CARGO_ENCODED_RUSTFLAGS`. The
+mutation campaigns of the core and the stores were run on `6b367b4`; no file
+they mutate or build has changed since.
 
 | Command | Result |
 | - | - |
 | `cargo fmt --check`; `cargo clippy --workspace --all-targets --locked -- -D warnings` | pass |
-| `cargo test --workspace --locked --no-fail-fast` | 87 binaries, 1,459 tests pass |
+| `cargo test --workspace --locked --no-fail-fast` | 87 binaries, 1,460 tests pass |
+| `cargo test -p mqttiumd --test delivery_shards`, 25 times | 25 of 25 pass (about one in 25 failed before `7126deb`) |
 | `cargo test --workspace --features mqttiumd-lab/kill-points --locked --no-fail-fast` | pass |
 | `cargo test -p mqttiumd --features test-hooks --locked --no-fail-fast` | pass |
 | `cargo run -q -p mqttiumd-lab -- validate --contracts contracts/v1 --scenario tests/scenarios/p1/P1-02.json` | pass; digest unchanged, `sha256:cdd2b28f45ffa66c22ff3c556dab4d20396814cb0693fe4f3805c1307b65a300` |
 | `python3 tools/build_corpus.py --check`; `python3 tools/check_schemas.py` | pass |
 | `python3 tests/oracle/build_traces.py --check`; `python3 -m unittest discover -t tests/oracle -s tests/oracle/tests` | pass |
 | `python3 conformance/check.py --check` | pass |
-| `python3 models/check_models.py`; `python3 models/test_check_models.py` | 14 directories consistent; 18 tests pass |
+| `python3 models/check_models.py`; `python3 -B models/test_check_models.py` | 14 directories consistent; 18 tests pass |
 | `python3 ../tools/formal/run_tlc.py --models-dir models/<dir>` for the seven directories changed | 201 configurations as declared: flow-pressure 21, reactor-wake 49, group-commit 20, pi-reuse 12, transport-credit 23, takeover 24, m1 52 |
 | `python3 tools/test_perf_gate.py`; `python3 -m unittest discover -s tests/compat -p "test_*.py"` | pass |
 | `python3 tools/run_wildcard_mutants.py <out>` | 4 of 4 detected, each for its reason |
 | `python3 tools/run_outgoing_qos2_mutants.py --target <dir> <out>` | 2 of 2 detected, each for its reason |
-| `tools/run_loop_mutants.sh`; `tools/run_loop_mutants.sh --backend sqlite` | every mutant rejected for its reason on both stores |
+| `tools/run_loop_mutants.sh`; `tools/run_loop_mutants.sh --backend sqlite` (on `6b367b4`) | every mutant rejected for its reason on both stores |
 | `python3 tests/compat/run.py --reference <mosquitto-2.1.4> --broker <dist> --delivery-shards 0`, then `2` | as at the baseline: 137 scenarios, 105 same, 0 defect; 34 of 35 expectations pass, 1 not applicable |
 
 Not run on this push: Kani (no file it analyses changed; CI runs it), the
