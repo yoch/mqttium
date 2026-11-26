@@ -25,10 +25,10 @@ the models were not extended to them:
 - `MWake`: each shard worker waits on a `Wake` of its own
   (`DeliveryShardWorker::run_loop`, the `wake` of its `ShardStoreHandle`).
   It is one waiter per signal, its loop waits only after a pass without
-  progress, and its producers publish before they signal
+  progress, and the producers that were read publish before they signal
   (`ShardInbox::push_batch`, the `Signalled` lane of the Coordinator, the
-  reply lanes of the store worker). That was read in the code; no test
-  replays it.
+  reply lanes of the store worker). That was read in the code, not
+  searched exhaustively; no test replays it.
 - `MReactorWake`: the shard workers send to the reactors and hold as well,
   and a shard keeps its hold while it waits. The section "A hold kept
   through a wait" below says what the model still shows and what it does
