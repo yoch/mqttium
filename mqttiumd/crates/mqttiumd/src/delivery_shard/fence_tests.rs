@@ -700,6 +700,127 @@ fn a_session_is_read_only_after_the_claims_that_came_before_its_barrier() {
     socket.close();
 }
 
+/// The shard's sink binds a PUBREL's identifier as the coordinator's does:
+/// an identifier already bound is a fault, not a binding silently
+/// replaced, and the table of bindings is bounded.
+#[test]
+fn a_pubrel_binding_is_checked_and_bounded_as_the_coordinator_does() {
+    let Harness {
+        incarnation,
+        epoch,
+        mut worker,
+        commands,
+        events,
+        _lanes: (_requests, _reply, _control, _control_reply),
+    } = harness("pubrel-binding");
+    std::fs::remove_file(&events).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let _client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+    let socket = net::spawn(listener.accept().unwrap().0).unwrap();
+    let session = SessionId::new(1);
+    let generation = ConnectionGeneration::new(10);
+    let lease = InlineClaimLease::new();
+    let dirty_seq = lease.mark_dirty();
+    commands
+        .send(CoordToShard::Attach {
+            session,
+            revision: Revision::new(1),
+            generation,
+            receive_maximum: 8,
+            maximum_packet_size: 1024,
+            version: Version::V5,
+            outgoing: socket.outgoing_handle(),
+            lease,
+            dirty_seq,
+        })
+        .unwrap();
+    worker.drain_coord_messages().unwrap();
+    let connection = ConnectionKey {
+        session,
+        generation,
+    };
+    let source = LogicalOwnerId::new(1);
+    let delivery = DeliveryId {
+        publication: PublicationId::new(incarnation, epoch, source, PublicationSeq::new(1)),
+        index: 0,
+    };
+    let claim = OperationId::new(incarnation, epoch, source, OperationSeq::new(1));
+    let bound = OutboundPacketId::new(3).unwrap();
+    worker.outgoing_bindings.insert(
+        (connection, bound),
+        PubackTarget {
+            delivery,
+            claim,
+            frame: EffectId {
+                epoch,
+                owner: source,
+                sequence: mqttiumd_contract::ids::EffectSeq::new(1),
+            },
+        },
+    );
+    let pubrel = |sequence, packet_id| {
+        OwnedEffect::new(
+            EffectId {
+                epoch,
+                owner: source,
+                sequence: mqttiumd_contract::ids::EffectSeq::new(sequence),
+            },
+            Effect::EmitFrame {
+                connection,
+                frame: OutboundFrame::Pubrel { packet_id },
+                publish_order: None,
+                pubrel: Some((delivery, claim)),
+            },
+        )
+    };
+    let submit = |worker: &mut DeliveryShardWorker, effect| {
+        let mut close_notices = Vec::new();
+        let mut sink = ShardSink {
+            store: &mut worker.store,
+            sessions: &mut worker.sessions,
+            outgoing_bindings: &mut worker.outgoing_bindings,
+            frames: &mut worker.frames,
+            inflight: &mut worker.inflight,
+            work_reads: &mut worker.work_reads,
+            timers: &mut worker.timers,
+            next_timer_due: &mut worker.next_timer_due,
+            inputs: &mut worker.inputs,
+            terminal_inputs: &mut worker.terminal_inputs,
+            events: &worker.events,
+            limits: worker.limits,
+            close_notices: &mut close_notices,
+            error: None,
+        };
+        let result = sink.try_submit(effect);
+        (result, sink.error.map(|failure| failure.code))
+    };
+
+    // The table is full: a PUBREL of another identifier waits.
+    worker.limits.outgoing_bindings = 1;
+    let (result, error) = submit(&mut worker, pubrel(2, OutboundPacketId::new(4).unwrap()));
+    assert!(
+        matches!(
+            result,
+            SubmitResult::NotSubmitted {
+                reason: SubmitBlock::InFlightLimit,
+                ..
+            }
+        ),
+        "a PUBREL was bound beyond the table's bound"
+    );
+    assert_eq!(error, None);
+
+    // An identifier already bound is a fault.
+    worker.limits.outgoing_bindings = 8;
+    let (result, error) = submit(&mut worker, pubrel(3, bound));
+    assert!(
+        matches!(result, SubmitResult::NotSubmitted { .. }),
+        "a bound identifier was rebound"
+    );
+    assert_eq!(error, Some("shard_pubrel_binding_conflict"));
+    socket.close();
+}
+
 /// The coordinator may send a committed inline claim for a generation and,
 /// right after, the detach of that generation. The shard reads both in one
 /// pass and completes the detach before it applies the claim. The claim is

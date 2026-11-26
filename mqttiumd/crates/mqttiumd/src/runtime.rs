@@ -103,7 +103,7 @@ pub struct Limits {
     /// Effects the core may hold between two dispatches.
     effect_box: usize,
     /// Outgoing packet identifiers in flight: eight per connection.
-    outgoing_bindings: usize,
+    pub(crate) outgoing_bindings: usize,
     pub(crate) timers: usize,
     /// Concurrent business commands/work reads allowed in flight to the writer.
     pub(crate) in_flight: usize,

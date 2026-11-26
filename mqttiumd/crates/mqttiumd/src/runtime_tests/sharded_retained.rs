@@ -199,7 +199,15 @@ fn sharded_retained_qos0_waits_for_its_subscriber_and_stays_with_its_generation(
             assert_eq!(drops.len(), 1);
             let details = &drops[0]["details"];
             assert_eq!(details["target"], slow_session.get().to_string());
-            assert_eq!(details["origin_kind"], "consumed");
+            // The entry the coordinator writes for a QoS 0 drop: its origin
+            // named in full.
+            assert!(
+                details["origin"]
+                    .as_str()
+                    .is_some_and(|origin| origin.starts_with("consumed/")),
+                "{details}"
+            );
+            assert!(details.get("origin_kind").is_none(), "{details}");
             assert_eq!(details["reason"], "connection_closed");
         },
     );
