@@ -158,12 +158,13 @@ allocate at a given time is settled by the eligibility handshake of that
 record. The handshake did not keep the two apart: a shard could claim an
 identifier the Coordinator had reserved, and its publication of the lease
 could drop the identifier of a committed claim not yet applied. Since the
-validation of the lot 10 head the shard gives its core the lease's bits at
-each dirty mark (`Owner::shard_set_foreign_packet_ids`), and
-`Deliveries::free_packet_id` avoids them; it publishes no lease while such
-a claim waits (report 0045). Neither the lease nor the handshake is in this
-model, and no configuration here says anything about an identifier taken
-through them.
+validation of the lot 10 head a shard does not read a session from the
+store while the Coordinator may still owe it a claim
+(`Owner::shard_fence_scans`), so that it claims nothing while an
+identifier is reserved, and it publishes no lease while a committed claim
+waits (reports 0045 and 0046). The lease and the handshake are the subject
+of `models/inline-lease`; no configuration here says anything about an
+identifier taken through them.
 
 ## Correspondence
 

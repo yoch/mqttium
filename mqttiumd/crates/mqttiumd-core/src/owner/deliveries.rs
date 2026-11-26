@@ -353,10 +353,6 @@ pub(super) struct Deliveries {
     by_target_pi: FlatMap<(SessionId, OutboundPacketId), usize>,
     by_session: FlatMap<SessionId, SessionDeliveries>,
     by_window: FlatMap<ConnectionGeneration, SmallIndexSet>,
-    /// Packet identifiers another owner may hold for a session, which no
-    /// row of this table shows: those a coordinator reserved for inline
-    /// claims, as a delivery shard last read them. Empty without shards.
-    foreign_pi: FlatMap<SessionId, [u64; PI_BITMAP_WORDS]>,
     control_candidates: BTreeSet<usize>,
     expiring: BTreeSet<usize>,
     pubrec_pending_count: usize,
@@ -376,7 +372,6 @@ impl Deliveries {
             by_target_pi: FlatMap::new(),
             by_session: FlatMap::new(),
             by_window: FlatMap::new(),
-            foreign_pi: FlatMap::new(),
             control_candidates: BTreeSet::new(),
             expiring: BTreeSet::new(),
             pubrec_pending_count: 0,
@@ -992,20 +987,6 @@ impl Deliveries {
         }
     }
 
-    /// Replaces the identifiers of `session` another owner may hold; all
-    /// zero forgets them.
-    pub(super) fn set_foreign_packet_ids(
-        &mut self,
-        session: SessionId,
-        mask: [u64; PI_BITMAP_WORDS],
-    ) {
-        if mask == [0; PI_BITMAP_WORDS] {
-            let _ = self.foreign_pi.remove(&session);
-        } else {
-            let _ = self.foreign_pi.insert(session, mask);
-        }
-    }
-
     pub(super) fn free_packet_id(
         &self,
         session: SessionId,
@@ -1013,35 +994,14 @@ impl Deliveries {
         mutant_early_pi_release: bool,
         mutant_ignore_occupied_pi: bool,
     ) -> Option<OutboundPacketId> {
-        let foreign = if self.foreign_pi.is_empty() {
-            [0; PI_BITMAP_WORDS]
-        } else {
-            self.foreign_pi
-                .get(&session)
-                .copied()
-                .unwrap_or([0; PI_BITMAP_WORDS])
-        };
-        let lowest_beside_foreign = || {
-            for (word_idx, &word) in foreign.iter().enumerate() {
-                if word != u64::MAX {
-                    let candidate = (word_idx * 64 + word.trailing_ones() as usize + 1) as u16;
-                    return OutboundPacketId::new(candidate).filter(|id| id.get() <= maximum);
-                }
-            }
-            OutboundPacketId::new(OUTGOING_PI_BITMAP_BITS + 1).filter(|id| id.get() <= maximum)
-        };
         let Some(sd) = self.by_session.get(&session) else {
-            return lowest_beside_foreign();
+            return OutboundPacketId::new(1).filter(|id| id.get() <= maximum);
         };
-        if mutant_ignore_occupied_pi {
+        if sd.all.is_empty() || mutant_ignore_occupied_pi {
             return OutboundPacketId::new(1).filter(|id| id.get() <= maximum);
         }
-        if sd.all.is_empty() {
-            return lowest_beside_foreign();
-        }
         if !mutant_early_pi_release && sd.pi_collisions == 0 {
-            for (word_idx, &rows) in sd.used_pi_mask.iter().enumerate() {
-                let word = rows | foreign[word_idx];
+            for (word_idx, &word) in sd.used_pi_mask.iter().enumerate() {
                 if word != u64::MAX {
                     let candidate = (word_idx * 64 + word.trailing_ones() as usize + 1) as u16;
                     if candidate <= maximum {
@@ -1059,7 +1019,7 @@ impl Deliveries {
                 && delivery.claim.is_some()
                 && !(mutant_early_pi_release && matches!(delivery.phase, Phase::FinishPending(_)))
         };
-        let mut mask = foreign;
+        let mut mask = [0u64; PI_BITMAP_WORDS];
         for idx in &sd.all {
             let delivery = &self.rows[idx];
             if reserves(delivery)
@@ -1093,11 +1053,7 @@ impl Deliveries {
                 used.insert(claim.packet_id.get());
             }
         }
-        // The foreign identifiers occupy places of the bitmap the rows may
-        // not: counted too, possibly twice, which only widens the search.
-        let foreign_count: usize = foreign.iter().map(|word| word.count_ones() as usize).sum();
-        let candidates =
-            outgoing_pi_candidate_limit(used.len().saturating_add(foreign_count), maximum);
+        let candidates = outgoing_pi_candidate_limit(used.len(), maximum);
         for raw in usize::from(OUTGOING_PI_BITMAP_BITS) + 1..=candidates {
             let id = u16::try_from(raw).ok()?;
             if !used.contains(&id) {
