@@ -626,7 +626,8 @@
             "test": "pubsub_reasons_frames_and_filter_counts_have_packet_specific_bounds"
           }
         ],
-        "note": "The broker never sends a Topic Alias: `encode_publication` writes no property or the Message Expiry Interval only, and the encoder tests compare whole packets."
+        "note": "The broker never sends a Topic Alias. A delivered PUBLISH carries the Message Expiry Interval and the properties record 0053 forwards (Payload Format Indicator, Content Type, Response Topic, Correlation Data, User Properties): the type that holds them has no Topic Alias, and an incoming one is refused before admission (Topic Alias Maximum 0). The cited tests compare whole packets without forwarded properties; `publish_properties_traverse_qos0_qos1_qos2_and_strip_for_v311` (`crates/mqttiumd/tests/publish_properties.rs`) reads the forwarded ones on a socket.",
+        "evidence_kind": "partial"
       },
       {
         "id": "MQTT-3.1.2-27",
@@ -3190,7 +3191,7 @@
           "mqttiumd/crates/mqttiumd-core/src/owner/pubsub.rs:plan_work",
           "mqttiumd/crates/mqttiumd-core/src/owner.rs:plan_admission"
         ],
-        "note": "With the committed result of a first admission kept unknown to the core by a test barrier, a second publication of the same client is admitted and acknowledged, and the subscriber still reads the first then the second: asserted on real sockets for both protocol versions at QoS 1 and 2 (instrumented build). Partial: one publisher and one subscriber, two messages; the order at a takeover, across a crash inside a group commit and when the write itself is late is not asserted. A session that was offline reads twelve messages in order across the two pages its window cuts them into, in both versions at QoS 1 and 2 (`a_resumed_session_reads_its_backlog_in_the_order_of_reception`). The compatibility scenario `publish/burst-qos0-v4` compares the order of the QoS 0 messages of a burst."
+        "note": "With the committed result of a first admission kept unknown to the core by a test barrier, a second publication of the same client is admitted and acknowledged, and the subscriber still reads the first then the second: asserted on real sockets for both protocol versions at QoS 1 and 2 (instrumented build). Partial: one publisher and one subscriber, two messages; the order at a takeover, across a crash inside a group commit and when the write itself is late is not asserted. A session that was offline reads twelve messages in order across the two pages its window cuts them into, in both versions at QoS 1 and 2 (`a_resumed_session_reads_its_backlog_in_the_order_of_reception`). The compatibility scenario `publish/burst-qos0-v4` compares the order of the QoS 0 messages of a burst. This evidence is from the default single-owner runtime. With delivery shards (`--delivery-shards` of 1 or more, record 0066) a delivery reaches its subscriber through an inline claim of the coordinator or through the store path of its shard, and no test asserts the order across the two."
       },
       {
         "id": "MQTT-4.6.0-6",
@@ -3212,7 +3213,7 @@
           "mqttiumd/crates/mqttiumd-core/src/owner/pubsub.rs:plan_work",
           "mqttiumd/crates/mqttiumd-core/src/owner.rs:plan_admission"
         ],
-        "note": "Every topic takes one path and there is no unordered mode. That the path keeps the order of reception is the evidence of MQTT-4.6.0-5, with its limits."
+        "note": "Every topic takes one path and there is no unordered mode. That the path keeps the order of reception is the evidence of MQTT-4.6.0-5, with its limits. This evidence is from the default single-owner runtime. With delivery shards (`--delivery-shards` of 1 or more, record 0066) a delivery reaches its subscriber through an inline claim of the coordinator or through the store path of its shard, and no test asserts the order across the two."
       },
       {
         "id": "MQTT-4.7.0-1",
@@ -5397,7 +5398,7 @@
           "mqttiumd/crates/mqttiumd-core/src/owner/pubsub.rs:plan_work",
           "mqttiumd/crates/mqttiumd-core/src/owner.rs:plan_admission"
         ],
-        "note": "Every topic takes one path and there is no unordered mode. That the path keeps the order of reception is the evidence described under MQTT-4.6.0-6, with its limits."
+        "note": "Every topic takes one path and there is no unordered mode. That the path keeps the order of reception is the evidence described under MQTT-4.6.0-6, with its limits. This evidence is from the default single-owner runtime. With delivery shards (`--delivery-shards` of 1 or more, record 0066) a delivery reaches its subscriber through an inline claim of the coordinator or through the store path of its shard, and no test asserts the order across the two."
       },
       {
         "id": "MQTT-4.6.0-6",
@@ -5427,7 +5428,7 @@
           "mqttiumd/crates/mqttiumd-core/src/owner/pubsub.rs:plan_work",
           "mqttiumd/crates/mqttiumd-core/src/owner.rs:plan_admission"
         ],
-        "note": "Both requirements have a witness, each partial. The order of deliveries: with the committed result of a first admission kept unknown to the core by a test barrier, a second publication of the same client is admitted and acknowledged, and the subscriber still reads the first then the second: asserted on real sockets for both protocol versions at QoS 1 and 2 (instrumented build). Partial: one publisher and one subscriber, two messages; the order at a takeover, across a crash inside a group commit and when the write itself is late is not asserted. A session that was offline reads twelve messages in order across the two pages its window cuts them into, in both versions at QoS 1 and 2 (`a_resumed_session_reads_its_backlog_in_the_order_of_reception`). The compatibility scenario `publish/burst-qos0-v4` compares the order of the QoS 0 messages of a burst. The other requirement, 'the rules listed above when delivering messages to each of its subscribers', covers the order of PUBREL after PUBREC on a delivery: see MQTT-4.6.0-4."
+        "note": "Both requirements have a witness, each partial. The order of deliveries: with the committed result of a first admission kept unknown to the core by a test barrier, a second publication of the same client is admitted and acknowledged, and the subscriber still reads the first then the second: asserted on real sockets for both protocol versions at QoS 1 and 2 (instrumented build). Partial: one publisher and one subscriber, two messages; the order at a takeover, across a crash inside a group commit and when the write itself is late is not asserted. A session that was offline reads twelve messages in order across the two pages its window cuts them into, in both versions at QoS 1 and 2 (`a_resumed_session_reads_its_backlog_in_the_order_of_reception`). The compatibility scenario `publish/burst-qos0-v4` compares the order of the QoS 0 messages of a burst. The other requirement, 'the rules listed above when delivering messages to each of its subscribers', covers the order of PUBREL after PUBREC on a delivery: see MQTT-4.6.0-4. This evidence is from the default single-owner runtime. With delivery shards (`--delivery-shards` of 1 or more, record 0066) a delivery reaches its subscriber through an inline claim of the coordinator or through the store path of its shard, and no test asserts the order across the two."
       },
       {
         "id": "MQTT-4.7.1-1",

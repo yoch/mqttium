@@ -15,8 +15,8 @@ is inferred from. The others are not reviewed, which is not a third kind.
 | - | -: | -: |
 | `covered` | 149 | 84 |
 | of which `direct` | 14 | 6 |
-| of which `partial` | 8 | 15 |
-| not reviewed | 127 | 63 |
+| of which `partial` | 9 | 15 |
+| not reviewed | 126 | 63 |
 | `implemented-untested` | 41 | 30 |
 | `profile-refused` | 28 | 8 |
 | `open` | 0 | 0 |
