@@ -785,6 +785,8 @@ struct DeliveryShardWorker {
     progress: u64,
     stopping: bool,
     stop: Arc<AtomicBool>,
+    #[cfg(test)]
+    wakes_held: bool,
 
     sessions: FlatMap<SessionId, ShardSession>,
     // The coordinator retains the closing peer until its own receipt is set.
@@ -834,6 +836,8 @@ impl DeliveryShardWorker {
         let now = Instant::now();
         Self {
             stop,
+            #[cfg(test)]
+            wakes_held: false,
             owner,
             store,
             coord_rx,
@@ -903,6 +907,10 @@ impl DeliveryShardWorker {
         loop {
             let before = self.progress;
             let _wakes = net::hold_wakes();
+            #[cfg(test)]
+            {
+                self.wakes_held = true;
+            }
             let now = Instant::now();
 
             self.drain_store_replies()?;
@@ -944,6 +952,14 @@ impl DeliveryShardWorker {
                 } else {
                     self.idle_wait(now)
                 };
+                // A hold kept through the wait would suppress the kicks of
+                // every producer that holds nothing (record 0044, model
+                // reactor-wake).
+                #[cfg(test)]
+                assert!(
+                    !self.wakes_held,
+                    "a delivery shard waits while it holds the reactors' wake-ups"
+                );
                 self.store.wake.wait(wait);
             }
         }

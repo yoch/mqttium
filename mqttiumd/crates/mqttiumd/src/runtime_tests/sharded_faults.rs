@@ -78,3 +78,21 @@ fn a_shard_whose_lane_is_full_still_stops() {
         );
     });
 }
+
+/// A shard with nothing to do waits, at most `IDLE_TICK`, without holding
+/// the reactors' wake-ups: a hold kept through the wait suppresses the
+/// kick of a producer that holds nothing, such as a reactor thread giving
+/// back acknowledgement credit, until some holder releases or the reactor's
+/// own poll times out. Test builds make a shard panic where it would wait
+/// while holding, and a panic is reported as a fault.
+#[test]
+fn an_idle_shard_waits_without_holding_the_reactors_wake_ups() {
+    sharded(|runtime, _| {
+        let fault = reported_failure(runtime, Duration::from_millis(200));
+        assert!(
+            fault.is_none(),
+            "an idle shard failed: {:?}",
+            fault.map(|failure| failure.code)
+        );
+    });
+}
