@@ -86,6 +86,8 @@ def running(work, binary, pki=None, reference=False, password_file=None):
     else:
         command = [binary, "--listen", f"{harness.HOST}:0", "--db", work / "data.db",
                    "--events", work / "events.jsonl", "--event-level", "audit"]
+        if DELIVERY_SHARDS:
+            command += ["--delivery-shards", str(DELIVERY_SHARDS)]
         if pki:
             command += ["--tls-cert", pki / "server.crt", "--tls-key", pki / "server.key",
                         "--client-ca", pki / "ca.crt", "--identities", pki / "identities.json"]
@@ -225,12 +227,20 @@ def digest(path):
         return hashlib.file_digest(source, "sha256").hexdigest()
 
 
+# Delivery shards of mqttiumd for every profile; 0 is the default runtime.
+DELIVERY_SHARDS = 0
+
+
 def main():
+    global DELIVERY_SHARDS
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--broker", type=Path, required=True)
     parser.add_argument("--reference", type=Path, required=True)
     parser.add_argument("--out", type=Path, required=True)
+    parser.add_argument("--delivery-shards", type=int, default=0,
+                        help="delivery shards of mqttiumd (0 to 16)")
     args = parser.parse_args()
+    DELIVERY_SHARDS = args.delivery_shards
     broker = args.broker.resolve()
     reference = harness.reference_binary(args.reference)
     version = harness.reference_version(reference)
