@@ -3905,6 +3905,71 @@ mod tests {
         assert_eq!(headers, [0x34, 0x62]);
     }
 
+    /// A connection routed to a shard whose acknowledgement credit is spent
+    /// (by other connections of the shard, or its own earlier ACKs) still
+    /// reads what needs no credit: a PINGREQ reaches the core, and keep-alive
+    /// hears the client. Before an ACK can be known as one it is read; it
+    /// waits in the task for credit, and what follows it waits behind it.
+    #[test]
+    fn a_shard_connection_without_ack_credit_still_reads_what_needs_none() {
+        let (connection, mut peer) = manual_pair();
+        let mut task = manual_task(&connection);
+        let (effect, key) = correlation(9).unwrap();
+        let inbox = ShardInbox::new(Wake::new(), 1, 1);
+        assert!(connection.install_shard_route(ShardIoRoute::new(
+            effect.owner,
+            key,
+            Arc::clone(&inbox)
+        )));
+        let spent = connection.core.reserve_shard_read(1).unwrap();
+        assert_eq!(spent.remaining, 1);
+        let mut scratch = ReactorScratch::new();
+        let turns = |task: &mut Task, scratch: &mut ReactorScratch| {
+            for _ in 0..8 {
+                task.turn(scratch).unwrap();
+            }
+        };
+        let firsts = |connection: &Connection| {
+            let mut incoming = VecDeque::new();
+            connection.drain_incoming(&mut incoming, 8);
+            incoming
+                .into_iter()
+                .map(|packet| match packet {
+                    Incoming::Packet { first, .. } => first,
+                    _ => panic!("expected a packet"),
+                })
+                .collect::<Vec<_>>()
+        };
+
+        peer.write_all(&[0xc0, 0]).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut read = Vec::new();
+        while read.is_empty() && Instant::now() < deadline {
+            turns(&mut task, &mut scratch);
+            read = firsts(&connection);
+        }
+        assert_eq!(read, [0xc0], "a PINGREQ was not read without ACK credit");
+
+        // An ACK, then a DISCONNECT: the ACK waits for credit, the DISCONNECT
+        // behind it.
+        peer.write_all(&[0x40, 2, 0, 9, 0xe0, 0]).unwrap();
+        thread::sleep(Duration::from_millis(20));
+        turns(&mut task, &mut scratch);
+        assert!(
+            firsts(&connection).is_empty(),
+            "the DISCONNECT passed the ACK"
+        );
+        let mut shard = VecDeque::new();
+        assert_eq!(inbox.drain_into(&mut shard, 4), 0);
+        drop(spent);
+        turns(&mut task, &mut scratch);
+        assert_eq!(inbox.drain_into(&mut shard, 4), 1);
+        assert!(matches!(shard.pop_front(), Some(ShardIoEvent::AckPacket {
+            first: 0x40, body, ..
+        }) if body.as_slice() == [0, 9]));
+        assert_eq!(firsts(&connection), [0xe0]);
+    }
+
     #[test]
     fn sharded_ack_backpressure_preserves_the_unread_suffix_and_write_receipts() {
         let (connection, _peer) = manual_pair();
