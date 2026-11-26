@@ -217,14 +217,37 @@ pub(crate) enum CoordToShard {
         properties: Option<Arc<PublishProperties>>,
         targets: Vec<DelegatedQos0Target>,
     },
-    /// Makes the shard panic where it reads this message, for the tests of
-    /// what a panic leaves.
+    /// What a test asks of the shard where it reads this message.
     #[cfg(test)]
-    Panic,
+    Test(ShardTest),
     MessagesExpired {
         deliveries: Vec<ExpiredDelivery>,
     },
     Shutdown,
+}
+
+/// What a test asks of a shard, at the place of its message in the lane.
+#[cfg(test)]
+pub(crate) enum ShardTest {
+    /// Panic.
+    Panic,
+    /// Wait until the sender is dropped or sends.
+    Pause(mpsc::Receiver<()>),
+    /// Nothing: a message that only takes a place in the lane.
+    Nothing,
+}
+
+#[cfg(test)]
+impl ShardTest {
+    fn run(self) {
+        match self {
+            Self::Panic => panic!("a test asked this delivery shard to panic"),
+            Self::Pause(release) => {
+                let _ = release.recv();
+            }
+            Self::Nothing => {}
+        }
+    }
 }
 
 /// Rare notices sent from a `DeliveryShard` worker back to the Coordinator.
@@ -618,8 +641,17 @@ impl ShardPool {
     }
 
     #[cfg(test)]
-    pub(crate) fn send_for_test(&mut self, shard_idx: usize, msg: CoordToShard) {
-        self.send_to(shard_idx, msg);
+    pub(crate) fn send_for_test(&mut self, shard_idx: usize, test: ShardTest) {
+        self.send_to(shard_idx, CoordToShard::Test(test));
+    }
+
+    /// Whether the lane of the shard took the message, without waiting.
+    #[cfg(test)]
+    pub(crate) fn try_send_for_test(&mut self, shard_idx: usize, test: ShardTest) -> bool {
+        self.shards[shard_idx]
+            .tx
+            .try_send(CoordToShard::Test(test))
+            .is_ok()
     }
 
     pub(crate) fn drain_notices(&mut self, out: &mut Vec<ShardToCoord>) -> Result<(), Failure> {
@@ -1435,7 +1467,7 @@ impl DeliveryShardWorker {
                             self.stopping = true;
                         }
                         #[cfg(test)]
-                        CoordToShard::Panic => panic!("a test asked this delivery shard to panic"),
+                        CoordToShard::Test(test) => test.run(),
                     }
                 }
                 Err(TryRecvError::Empty) => break,
