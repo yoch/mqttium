@@ -407,11 +407,12 @@ fn a_published_lease_keeps_the_identifier_of_a_waiting_committed_claim() {
 }
 
 /// While the coordinator holds an identifier it reserved in the lease for an
-/// inline claim whose admission is pending, a dirty event still makes the
-/// shard read the session's work (`dirty_seq` 0: the barrier waits for the
-/// pending claim). What the shard claims then must not take that identifier:
-/// the claim would collide, in the shard, with the coordinator's once it
-/// commits.
+/// inline claim whose admission is pending, a dirty event (`dirty_seq` 0:
+/// the barrier waits for the pending claim) does not make the shard read
+/// the session: what it claimed then could take that identifier and
+/// collide, in the shard, with the coordinator's claim once it commits. The
+/// shard reads at the barrier, after the committed claim, and what it
+/// claims then takes another identifier.
 #[test]
 fn a_shard_claim_takes_no_identifier_the_coordinator_reserved() {
     let Harness {
@@ -443,12 +444,22 @@ fn a_shard_claim_takes_no_identifier_the_coordinator_reserved() {
             dirty_seq,
         })
         .unwrap();
-    let answer = |worker: &mut DeliveryShardWorker,
-                  items: Vec<mqttiumd_contract::pubsub::WorkItem>| {
+    // A pass of the shard's loop over its lane, up to the read it makes.
+    let pass = |worker: &mut DeliveryShardWorker| {
         worker.drain_coord_messages().unwrap();
+        worker.drain_pending_inline().unwrap();
         worker.drain_inputs().unwrap();
         worker.dispatch().unwrap();
-        let Ok(Request::Effect(load)) = requests.try_recv() else {
+    };
+    let answer = |worker: &mut DeliveryShardWorker,
+                  items: Vec<mqttiumd_contract::pubsub::WorkItem>| {
+        pass(worker);
+        let Some(load) = requests.try_iter().find_map(|request| match request {
+            Request::Effect(effect) if matches!(effect.effect(), Effect::LoadWork { .. }) => {
+                Some(effect)
+            }
+            _ => None,
+        }) else {
             panic!("no work was read");
         };
         assert!(matches!(load.effect(), Effect::LoadWork { .. }));
@@ -484,9 +495,10 @@ fn a_shard_claim_takes_no_identifier_the_coordinator_reserved() {
     assert_eq!(answer(&mut worker, Vec::new()), None);
 
     // The coordinator reserves an identifier for an inline claim; its
-    // admission is pending when a dirty event marks the lease.
-    let (_, reserved) = lease.try_reserve().expect("the lease was published");
-    let _ = lease.mark_dirty();
+    // admission is pending when a dirty event marks the lease. The shard
+    // does not read the session.
+    let (claim_generation, reserved) = lease.try_reserve().expect("the lease was published");
+    let barrier = lease.mark_dirty();
     commands
         .send(CoordToShard::NotifyDirty {
             session,
@@ -494,7 +506,47 @@ fn a_shard_claim_takes_no_identifier_the_coordinator_reserved() {
             clear_known_through: false,
         })
         .unwrap();
+    pass(&mut worker);
+    assert!(
+        !requests
+            .try_iter()
+            .any(|request| matches!(request, Request::Effect(effect) if matches!(effect.effect(), Effect::LoadWork { .. }))),
+        "the shard read a session the coordinator may still owe a claim"
+    );
+
+    // The claim commits: the coordinator sends it, then the barrier.
     let bytes = |s| SharedBytes::copy_from(s, 1024).unwrap();
+    let source = LogicalOwnerId::new(0);
+    commands
+        .send(CoordToShard::InlineCommitted {
+            topic: bytes(b"t"),
+            payload: bytes(b"c"),
+            properties: None,
+            claims: vec![DelegatedClaim {
+                delivery: DeliveryId {
+                    publication: PublicationId::new(
+                        incarnation,
+                        epoch,
+                        source,
+                        PublicationSeq::new(4),
+                    ),
+                    index: 0,
+                },
+                target: session,
+                target_revision: Revision::new(1),
+                qos: Qos::AtLeastOnce,
+                claim_operation: OperationId::new(incarnation, epoch, source, OperationSeq::new(4)),
+                packet_id: reserved,
+                generation: claim_generation,
+            }],
+        })
+        .unwrap();
+    commands
+        .send(CoordToShard::DirtyBarrier {
+            session,
+            dirty_seq: barrier,
+        })
+        .unwrap();
     let unclaimed = mqttiumd_contract::pubsub::WorkItem {
         delivery: DeliveryId {
             publication: PublicationId::new(
@@ -520,6 +572,130 @@ fn a_shard_claim_takes_no_identifier_the_coordinator_reserved() {
     assert_ne!(
         claimed, reserved,
         "the shard took an identifier the coordinator reserved"
+    );
+    socket.close();
+}
+
+/// A barrier comes after every claim the coordinator committed for the
+/// session, and the claims that wait in `pending_inline` when the shard
+/// reads the barrier are applied before the session is read. Read earlier,
+/// the session's store would hold a claim's committed row the shard does
+/// not hold yet: it would deliver that row, and the claim again once
+/// applied.
+#[test]
+fn a_session_is_read_only_after_the_claims_that_came_before_its_barrier() {
+    let Harness {
+        incarnation,
+        epoch,
+        mut worker,
+        commands,
+        events,
+        _lanes: (requests, reply, _control, _control_reply),
+    } = harness("read-after-claims");
+    std::fs::remove_file(&events).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let _client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+    let socket = net::spawn(listener.accept().unwrap().0).unwrap();
+    let session = SessionId::new(1);
+    let generation = ConnectionGeneration::new(10);
+    let lease = InlineClaimLease::new();
+    let dirty_seq = lease.mark_dirty();
+    commands
+        .send(CoordToShard::Attach {
+            session,
+            revision: Revision::new(1),
+            generation,
+            receive_maximum: 8,
+            maximum_packet_size: 1024,
+            version: Version::V5,
+            outgoing: socket.outgoing_handle(),
+            lease: Arc::clone(&lease),
+            dirty_seq,
+        })
+        .unwrap();
+    let reads = |requests: &mpsc::Receiver<Request>| {
+        requests
+            .try_iter()
+            .filter_map(|request| match request {
+                Request::Effect(effect) if matches!(effect.effect(), Effect::LoadWork { .. }) => {
+                    Some(effect.id())
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+    worker.drain_coord_messages().unwrap();
+    worker.drain_inputs().unwrap();
+    worker.dispatch().unwrap();
+    let [load] = reads(&requests)[..] else {
+        panic!("the attach read no work");
+    };
+    reply
+        .send(Response::Work {
+            effect: load,
+            session,
+            result: Ok(mqttiumd_store_api::WorkPage {
+                items: BoundedVec::with_capacity(0).unwrap(),
+                next: None,
+            }),
+        })
+        .unwrap();
+    worker.drain_store_replies().unwrap();
+    worker.drain_inputs().unwrap();
+    let (claim_generation, reserved) = lease.try_reserve().expect("the lease was published");
+
+    // The claim commits and the coordinator sends it, then the barrier of a
+    // mark made while it was pending. The shard reads both and has not
+    // applied the claim yet.
+    let barrier = lease.mark_dirty();
+    let bytes = |s| SharedBytes::copy_from(s, 1024).unwrap();
+    let source = LogicalOwnerId::new(0);
+    commands
+        .send(CoordToShard::InlineCommitted {
+            topic: bytes(b"t"),
+            payload: bytes(b"c"),
+            properties: None,
+            claims: vec![DelegatedClaim {
+                delivery: DeliveryId {
+                    publication: PublicationId::new(
+                        incarnation,
+                        epoch,
+                        source,
+                        PublicationSeq::new(4),
+                    ),
+                    index: 0,
+                },
+                target: session,
+                target_revision: Revision::new(1),
+                qos: Qos::AtLeastOnce,
+                claim_operation: OperationId::new(incarnation, epoch, source, OperationSeq::new(4)),
+                packet_id: reserved,
+                generation: claim_generation,
+            }],
+        })
+        .unwrap();
+    commands
+        .send(CoordToShard::DirtyBarrier {
+            session,
+            dirty_seq: barrier,
+        })
+        .unwrap();
+    worker.drain_coord_messages().unwrap();
+    worker.drain_inputs().unwrap();
+    worker.dispatch().unwrap();
+    assert!(
+        reads(&requests).is_empty(),
+        "the session was read before a claim that came before its barrier"
+    );
+
+    // Once the claim is applied, the session is read.
+    worker.drain_pending_inline().unwrap();
+    worker.drain_inputs().unwrap();
+    worker.dispatch().unwrap();
+    assert_eq!(
+        reads(&requests).len(),
+        1,
+        "the session was not read after its claims"
     );
     socket.close();
 }

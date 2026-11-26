@@ -1206,6 +1206,10 @@ pub struct Owner {
     /// claims may still commit, and the committed claims of their targets
     /// wait for them (`Self::delegated_inline_unknown`).
     delegated_inline_unknown: FlatSet<OperationId>,
+    /// On a delivery shard, the sessions it does not read from the store
+    /// now: the coordinator may still owe them a committed inline claim
+    /// (`Self::shard_fence_scans`).
+    scan_fences: FlatSet<SessionId>,
     last_delegated_committed: Option<DelegatedInlineBatch>,
     last_delegated_rejected: Option<DelegatedInlineBatch>,
     last_delegated_qos0: Option<DelegatedQos0Batch>,
@@ -1361,6 +1365,7 @@ impl Owner {
             )),
             delegated_inline_by_session: FlatMap::new(),
             delegated_inline_unknown: FlatSet::new(),
+            scan_fences: FlatSet::new(),
             last_delegated_committed: None,
             last_delegated_rejected: None,
             last_delegated_qos0: None,

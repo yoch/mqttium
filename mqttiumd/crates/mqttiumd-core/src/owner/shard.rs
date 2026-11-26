@@ -436,6 +436,7 @@ impl Owner {
     /// Retires `session` and all of its deliveries on a `DeliveryShard` owner
     /// (in-flight store commands stay retired until their result arrives).
     pub fn shard_retire_session(&mut self, session: SessionId) -> Result<(), CoreFault> {
+        self.scan_fences.remove(&session);
         self.pubsub.retire_session(session);
         if let Some(&idx) = self.session_by_id.get(&session) {
             if let Some(conn) = self.sessions.as_slice()[idx].connection {
@@ -458,6 +459,20 @@ impl Owner {
             self.pubsub.connections.clear_known_through(generation);
         }
         self.mark_session_dirty(session, true);
+    }
+
+    /// Whether this delivery shard may read `session` from the store. While
+    /// fenced the session's known deliveries are still sent; no read
+    /// starts, and a read that was asked for waits. A shard fences a
+    /// session the coordinator may still owe a committed inline claim: read
+    /// now, its committed row would be delivered, and the claim, when it
+    /// arrives, delivered again.
+    pub fn shard_fence_scans(&mut self, session: SessionId, fenced: bool) {
+        if fenced {
+            self.scan_fences.insert(session);
+        } else if !self.scan_fences.is_empty() {
+            self.scan_fences.remove(&session);
+        }
     }
 
     /// The packet identifiers another owner may hold for `session`, as the

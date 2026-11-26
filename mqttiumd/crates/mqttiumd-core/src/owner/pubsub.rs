@@ -2397,7 +2397,9 @@ impl Owner {
         let settings = self.pubsub.connections.as_slice()[connection];
         let room = self.pubsub.active(generation) < usize::from(settings.receive_maximum);
         let after = self.pubsub.connections.after_of(generation);
-        let loading = self.pubsub.connections.is_loading(generation);
+        // A fenced session is not read: it waits as during a read.
+        let loading = self.pubsub.connections.is_loading(generation)
+            || (!self.scan_fences.is_empty() && self.scan_fences.contains(&session));
         let needs_scan = settings.rescan_needed || after.is_some();
         if let Some(sd) = self.pubsub.deliveries.session(session)
             && !sd.all.is_empty()

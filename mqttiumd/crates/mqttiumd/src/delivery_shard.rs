@@ -913,6 +913,9 @@ struct DeliveryShardWorker {
     control_inputs: VecDeque<Input>,
     terminal_inputs: VecDeque<Input>,
     queued_work_sessions: FlatSet<SessionId>,
+    /// Sessions not read from the store while a committed inline claim of
+    /// theirs waits in `pending_inline` (`fence_after_message`).
+    inline_fenced: FlatSet<SessionId>,
     pending_inline: VecDeque<PendingInlineItem>,
     pending_qos0: VecDeque<PendingQos0Item>,
     io_scratch: VecDeque<ShardIoEvent>,
@@ -972,6 +975,7 @@ impl DeliveryShardWorker {
             control_inputs: VecDeque::new(),
             terminal_inputs: VecDeque::new(),
             queued_work_sessions: FlatSet::new(),
+            inline_fenced: FlatSet::new(),
             pending_inline: VecDeque::new(),
             pending_qos0: VecDeque::new(),
             io_scratch: VecDeque::new(),
@@ -1123,6 +1127,47 @@ impl DeliveryShardWorker {
         if let Some(sess) = self.sessions.get(&session) {
             let reserved = sess.lease.reserved_snapshot();
             self.owner.shard_set_foreign_packet_ids(session, reserved);
+        }
+    }
+
+    /// Fences `session` from reads of the store, or opens it, after a dirty
+    /// message of the coordinator. A message without sequence means inline
+    /// claims are pending: one may commit, and a read would deliver its
+    /// row before the claim arrives, then again. A message with a sequence
+    /// comes after every claim committed for the session; those still
+    /// waiting in `pending_inline` are applied before the session is read.
+    fn fence_after_message(&mut self, session: SessionId, dirty_seq: u64) {
+        let pending = dirty_seq == 0;
+        let waiting = !pending
+            && self
+                .pending_inline
+                .iter()
+                .any(|item| item.claim.target == session);
+        if waiting {
+            self.inline_fenced.insert(session);
+        } else if !self.inline_fenced.is_empty() {
+            self.inline_fenced.remove(&session);
+        }
+        self.owner.shard_fence_scans(session, pending || waiting);
+    }
+
+    /// Opens the sessions whose waiting claims are all applied.
+    fn open_drained_fences(&mut self) {
+        let drained: Vec<SessionId> = self
+            .inline_fenced
+            .iter()
+            .copied()
+            .filter(|&session| {
+                !self
+                    .pending_inline
+                    .iter()
+                    .any(|item| item.claim.target == session)
+            })
+            .collect();
+        for session in drained {
+            self.inline_fenced.remove(&session);
+            self.owner.shard_fence_scans(session, false);
+            self.queue_work(session);
         }
     }
 
@@ -1540,6 +1585,7 @@ impl DeliveryShardWorker {
                                 },
                             );
                             self.refresh_foreign_packet_ids(session);
+                            self.fence_after_message(session, dirty_seq);
                             self.queue_work(session);
                         }
                         CoordToShard::Detach {
@@ -1560,6 +1606,7 @@ impl DeliveryShardWorker {
                                 .shard_retire_session(session)
                                 .map_err(|_| Failure::plain("shard_retire_fault"))?;
                             self.owner.shard_set_foreign_packet_ids(session, [0; 8]);
+                            self.inline_fenced.remove(&session);
                         }
                         CoordToShard::NotifyDirty {
                             session,
@@ -1576,6 +1623,7 @@ impl DeliveryShardWorker {
                             }
                             self.owner.shard_notify_dirty(session, clear_known_through);
                             self.refresh_foreign_packet_ids(session);
+                            self.fence_after_message(session, dirty_seq);
                             self.queue_work(session);
                         }
                         CoordToShard::DirtyBarrier { session, dirty_seq } => {
@@ -1585,6 +1633,7 @@ impl DeliveryShardWorker {
                             }
                             self.owner.shard_notify_dirty(session, false);
                             self.refresh_foreign_packet_ids(session);
+                            self.fence_after_message(session, dirty_seq);
                             self.queue_work(session);
                         }
                         CoordToShard::InlineCommitted {
@@ -1741,6 +1790,9 @@ impl DeliveryShardWorker {
                 ShardStepOutcome::Exhausted(_) => return Err(Failure::plain("shard_exhausted")),
                 ShardStepOutcome::Fatal(_) => return Err(Failure::plain("shard_core_fault")),
             }
+        }
+        if !self.inline_fenced.is_empty() {
+            self.open_drained_fences();
         }
         Ok(())
     }
