@@ -217,6 +217,10 @@ pub(crate) enum CoordToShard {
         properties: Option<Arc<PublishProperties>>,
         targets: Vec<DelegatedQos0Target>,
     },
+    /// Makes the shard panic where it reads this message, for the tests of
+    /// what a panic leaves.
+    #[cfg(test)]
+    Panic,
     MessagesExpired {
         deliveries: Vec<ExpiredDelivery>,
     },
@@ -604,6 +608,11 @@ impl ShardPool {
                 self.send_to(idx, CoordToShard::MessagesExpired { deliveries: items });
             }
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn send_for_test(&mut self, shard_idx: usize, msg: CoordToShard) {
+        self.send_to(shard_idx, msg);
     }
 
     pub(crate) fn drain_notices(&mut self, out: &mut Vec<ShardToCoord>) -> Result<(), Failure> {
@@ -1418,6 +1427,8 @@ impl DeliveryShardWorker {
                         CoordToShard::Shutdown => {
                             self.stopping = true;
                         }
+                        #[cfg(test)]
+                        CoordToShard::Panic => panic!("a test asked this delivery shard to panic"),
                     }
                 }
                 Err(TryRecvError::Empty) => break,

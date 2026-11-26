@@ -7953,5 +7953,7 @@ fn an_unsuback_owed_while_the_output_is_full_is_delivered_when_room_returns() {
     });
 }
 
+#[path = "runtime_tests/sharded_faults.rs"]
+mod sharded_faults;
 #[path = "runtime_tests/sharded_retained.rs"]
 mod sharded_retained;
