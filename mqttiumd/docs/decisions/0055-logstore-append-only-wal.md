@@ -16,6 +16,7 @@ Because `mqttiumd-core` already freezes every irreversible state transition into
    - Binary `.mlog` format (`v1`):
      - 24-byte file header: magic `b"MQLG"`, version `u16` (`1`), reserved `u16` (`0`), store incarnation `u64`, checkpoint `base_revision: u64` (big-endian).
      - Each committed transaction/group appends a single framed record: `[body_len: u32][record_count: u16][records...][crc32c: u32]` written via sequential `pwrite`/`write_all` followed by a single `fdatasync` before returning outcomes to callers.
+     - A frame body holds at most 64 MiB (`MAX_FRAME_BYTES`), the bound recovery applies. A group whose frame would exceed it is committed as two groups, the first half before the second, each all-or-nothing; one command that would exceed it is not written and is answered `PendingOrUnknown`. The product cannot form such a command (payloads are limited to one mebibyte).
      - Integrity checksums use Castagnoli CRC32C implemented in `#![forbid(unsafe_code)]` Rust with a compile-time Slice-by-8 lookup table (`CRC32C_TABLES`).
      - Supported record tags cover the complete `DurableStore` mutation surface: `Command` (canonical recipe + payload bytes), `ResolveAndFence`, `OpenEpoch`, `AdminCommand`, `CollectReceipts`, `CollectClosedReceipts`, and `CheckpointClock`.
 2. **Crash recovery, torn-tail handling, and automatic compaction**:

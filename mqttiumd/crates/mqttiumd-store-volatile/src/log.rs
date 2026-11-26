@@ -530,11 +530,21 @@ impl LogStore {
         self.encode_buf.extend_from_slice(&crc.to_be_bytes());
     }
 
+    /// Whether recovery accepts the prepared frame: `replay_wal` reads no
+    /// body longer than `MAX_FRAME_BYTES`.
+    fn prepared_frame_is_readable(&self) -> bool {
+        self.encode_buf.len() - 8 <= MAX_FRAME_BYTES
+    }
+
     /// Appends the prepared frame to `.mlog` and calls `sync_data()`.
     /// On any I/O failure (or `Durability::Failing`), truncates `.mlog` back
-    /// to `prev_len` and returns `Err(())`.
+    /// to `prev_len` and returns `Err(())`. A frame recovery would refuse is
+    /// never written.
     fn flush_prepared_frame(&mut self) -> Result<u64, ()> {
-        if self.durability == Durability::Failing || self.wal_desynced {
+        if self.durability == Durability::Failing
+            || self.wal_desynced
+            || !self.prepared_frame_is_readable()
+        {
             return Err(());
         }
         let prev_len = self.wal_len;
@@ -594,6 +604,9 @@ impl LogStore {
     /// without disk I/O (even under `Durability::Failing`); groups that need a
     /// write either commit durably as one atomic frame or leave state untouched
     /// and answer `PendingOrUnknown` for every member.
+    ///
+    /// One exception: a group whose frame would exceed `MAX_FRAME_BYTES` is
+    /// committed as two groups, the first half before the second.
     pub fn apply_group(&mut self, commands: &[&Command]) -> Result<Vec<Applied>, GroupRefused> {
         if commands.len() > LOG_MAX_GROUP {
             return Err(GroupRefused::TooLarge {
@@ -624,6 +637,18 @@ impl LogStore {
                 encode_command_record(buf, cmd);
             }
         });
+        if !self.prepared_frame_is_readable() {
+            // The group is committed as two, in order, each half a frame
+            // of its own: what the caller would have seen had it presented
+            // two groups. A half reduced to one command that still does
+            // not fit is answered unknown by `apply`.
+            self.encode_buf.clear();
+            drop(to_log);
+            let (first, second) = commands.split_at(commands.len() / 2);
+            let mut replies = self.apply_group(first)?;
+            replies.extend(self.apply_group(second)?);
+            return Ok(replies);
+        }
         let Ok(prev_len) = self.flush_prepared_frame() else {
             return Ok(vec![UNKNOWN; commands.len()]);
         };
