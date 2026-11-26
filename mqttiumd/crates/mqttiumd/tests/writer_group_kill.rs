@@ -63,11 +63,12 @@ const ANSWER: &str = "writer-group-kill-child: answer ";
 /// first two followed by the release of their inbound exchange.
 const MEMBERS: usize = 5;
 /// The reply lane of the worker holds this many answers (`writer.rs`,
-/// `spawn_bound`). One request more leaves the worker holding a reply it
-/// cannot publish. The size of the group is asserted on the record of the
-/// worker, so a lane of another size fails this test instead of weakening
-/// it.
-const REPLY_LANE: usize = 64;
+/// `spawn_bound`: twice the request lane). One request more leaves the
+/// worker holding a reply it cannot publish. With a smaller number here
+/// the worker is never held: the group then forms only if the commands
+/// happen to be queued before the worker reaches the first, and the size
+/// asserted on the record of the worker is all that would say otherwise.
+const REPLY_LANE: usize = 2 * mqttiumd::writer::QUEUE;
 const PATIENCE: Duration = Duration::from_secs(30);
 const OWNER: LogicalOwnerId = LogicalOwnerId::new(0);
 const CLIENTS: [&[u8]; 3] = [b"producer", b"target-b", b"target-c"];
