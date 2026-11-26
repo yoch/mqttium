@@ -38,7 +38,7 @@ use crate::contract::effects::{
     FrameProgress, Input, Outbox, OwnedEffect, OwnerAuthority, RecoveredFact, RecoveryOrder,
     ReplaceRefusal, RetireRefusal,
 };
-use crate::contract::flat_map::{FlatMap, ScopedFlatMap};
+use crate::contract::flat_map::{FlatMap, FlatSet, ScopedFlatMap};
 use crate::contract::ids::{
     AccountId, ConnectionGeneration, ConnectionKey, ContinuationId, DeadlineToken, DeliveryId,
     EffectId, EffectSeq, ExchangeGeneration, ExchangeId, Exhausted, InboundPacketId,
@@ -1202,6 +1202,10 @@ pub struct Owner {
     delegated_deliveries: bool,
     delegated_inline_by_op: ScopedFlatMap<OperationId, DelegatedInlineBatch>,
     delegated_inline_by_session: FlatMap<SessionId, usize>,
+    /// The delegated inline admissions whose outcome is unknown: their
+    /// claims may still commit, and the committed claims of their targets
+    /// wait for them (`Self::delegated_inline_unknown`).
+    delegated_inline_unknown: FlatSet<OperationId>,
     last_delegated_committed: Option<DelegatedInlineBatch>,
     last_delegated_rejected: Option<DelegatedInlineBatch>,
     last_delegated_qos0: Option<DelegatedQos0Batch>,
@@ -1356,6 +1360,7 @@ impl Owner {
                 id.owner(),
             )),
             delegated_inline_by_session: FlatMap::new(),
+            delegated_inline_unknown: FlatSet::new(),
             last_delegated_committed: None,
             last_delegated_rejected: None,
             last_delegated_qos0: None,
@@ -4137,6 +4142,9 @@ impl Owner {
         if let Some((operation, committed)) = delegated_inline_resolved
             && let Some(batch) = self.delegated_inline_by_op.remove(&operation)
         {
+            if !self.delegated_inline_unknown.is_empty() {
+                self.delegated_inline_unknown.remove(&operation);
+            }
             for claim in &batch.claims {
                 if let Some(count) = self.delegated_inline_by_session.get_mut(&claim.target) {
                     *count = count.saturating_sub(1);
@@ -4506,6 +4514,9 @@ impl Owner {
                 else {
                     return Err(STALE);
                 };
+                let unknown_now = in_flight.phase == CommandPhase::Submitted
+                    && phase == CommandPhase::Indeterminate;
+                let operation = in_flight.operation;
                 in_flight.phase = phase;
                 if let Some((deadline, effect)) = resolution {
                     in_flight.deadline = deadline;
@@ -4513,6 +4524,9 @@ impl Owner {
                     in_flight.answers = prev.with(effect);
                 }
                 self.index_slot_state(slot);
+                if unknown_now && self.delegated_inline_by_op.contains_key(&operation) {
+                    self.delegated_inline_unknown.insert(operation);
+                }
             }
             Change::ReleaseDeferred { slot, refused } => {
                 if self.slots.get(slot).is_none() {

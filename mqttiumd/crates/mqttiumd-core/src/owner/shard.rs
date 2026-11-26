@@ -234,6 +234,20 @@ impl Owner {
         self.last_finished_delivery
     }
 
+    /// Whether an inline admission carrying a claim for `session` has an
+    /// unknown outcome. A claim of the session committed meanwhile is held
+    /// by the caller and handed over once none is: the earlier claim may
+    /// still commit, and its publication comes first.
+    #[must_use]
+    pub fn delegated_inline_unknown(&self, session: SessionId) -> bool {
+        !self.delegated_inline_unknown.is_empty()
+            && self.delegated_inline_unknown.iter().any(|operation| {
+                self.delegated_inline_by_op
+                    .get(operation)
+                    .is_some_and(|batch| batch.claims.iter().any(|claim| claim.target == session))
+            })
+    }
+
     /// Whether the step of the commit of `operation` names the stored
     /// targets of its publication (`Self::last_inline_ready_target`): an
     /// admission whose targets were not all claimed inline.

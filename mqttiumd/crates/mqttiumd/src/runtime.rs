@@ -3168,9 +3168,18 @@ impl Runtime<'_> {
                             targets_to_check.sort_unstable();
                             targets_to_check.dedup();
                             if let Some(shards) = self.shards.as_mut() {
-                                shards.send_inline_committed(batch);
+                                let owner = &self.owner;
+                                shards.send_inline_committed(batch, |session| {
+                                    owner.delegated_inline_unknown(session)
+                                });
+                                // The held claims, then the barrier: the shard
+                                // reads the session after every claim owed.
                                 for session in targets_to_check {
-                                    if self.owner.pending_delegated_inline_count(session) == 0 {
+                                    shards.release_held_claims(
+                                        session,
+                                        owner.delegated_inline_unknown(session),
+                                    );
+                                    if owner.pending_delegated_inline_count(session) == 0 {
                                         shards.flush_dirty_barrier_if_pending(session);
                                     }
                                 }
@@ -3182,8 +3191,13 @@ impl Runtime<'_> {
                             targets_to_check.sort_unstable();
                             targets_to_check.dedup();
                             if let Some(shards) = self.shards.as_mut() {
+                                let owner = &self.owner;
                                 for session in targets_to_check {
-                                    if self.owner.pending_delegated_inline_count(session) == 0 {
+                                    shards.release_held_claims(
+                                        session,
+                                        owner.delegated_inline_unknown(session),
+                                    );
+                                    if owner.pending_delegated_inline_count(session) == 0 {
                                         shards.flush_dirty_barrier_if_pending(session);
                                     }
                                 }

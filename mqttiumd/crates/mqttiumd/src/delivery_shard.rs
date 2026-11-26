@@ -297,7 +297,19 @@ pub(crate) struct ShardPool {
     notices: Arc<Notices>,
     leases: FlatMap<SessionId, Arc<InlineClaimLease>>,
     pending_dirty_barriers: FlatMap<SessionId, u64>,
+    /// Committed inline claims not yet handed to their shard: an inline
+    /// admission of their session has an unknown outcome. In the order of
+    /// their admissions; at most the lease's room per session.
+    held_claims: FlatMap<SessionId, Vec<HeldClaim>>,
     last_fatal: Option<Failure>,
+}
+
+/// A committed inline claim the coordinator holds back.
+struct HeldClaim {
+    claim: DelegatedClaim,
+    topic: SharedBytes,
+    payload: SharedBytes,
+    properties: Option<Arc<PublishProperties>>,
 }
 
 impl ShardPool {
@@ -410,6 +422,7 @@ impl ShardPool {
             notices,
             leases: FlatMap::new(),
             pending_dirty_barriers: FlatMap::new(),
+            held_claims: FlatMap::new(),
             last_fatal: None,
         })
     }
@@ -517,6 +530,7 @@ impl ShardPool {
             let _ = lease.mark_dirty();
         }
         self.pending_dirty_barriers.remove(&session);
+        self.held_claims.remove(&session);
         let idx = self.shard_index(session);
         self.send_to(idx, CoordToShard::Retire { session });
     }
@@ -573,7 +587,69 @@ impl ShardPool {
         }
     }
 
-    pub(crate) fn send_inline_committed(&mut self, batch: DelegatedInlineBatch) {
+    /// Hands the committed inline claims of `batch` to their shards. A
+    /// claim whose session has an inline admission of unknown outcome
+    /// (`unknown`), or claims already held, is held in admission order
+    /// until `release_held_claims`: the earlier publication may still
+    /// commit, and the subscriber receives it first.
+    pub(crate) fn send_inline_committed(
+        &mut self,
+        mut batch: DelegatedInlineBatch,
+        unknown: impl Fn(SessionId) -> bool,
+    ) {
+        if !self.held_claims.is_empty() || batch.claims.iter().any(|claim| unknown(claim.target)) {
+            let held = &mut self.held_claims;
+            batch.claims.retain(|claim| {
+                if !held.contains_key(&claim.target) && !unknown(claim.target) {
+                    return true;
+                }
+                let claims = held.get_or_insert_default(claim.target);
+                let order = |claim: &DelegatedClaim| claim.claim_operation.sequence().get();
+                let at = claims.partition_point(|item| order(&item.claim) < order(claim));
+                claims.insert(
+                    at,
+                    HeldClaim {
+                        claim: *claim,
+                        topic: batch.topic.clone(),
+                        payload: batch.payload.clone(),
+                        properties: batch.properties.clone(),
+                    },
+                );
+                false
+            });
+            if batch.claims.is_empty() {
+                return;
+            }
+        }
+        self.send_claims(batch);
+    }
+
+    /// Hands the held claims of `session` to its shard, in admission order,
+    /// once no inline admission of the session has an unknown outcome. The
+    /// runtime calls it before it flushes the session's barrier: the shard
+    /// reads the session only after these claims.
+    pub(crate) fn release_held_claims(&mut self, session: SessionId, unknown: bool) {
+        if unknown || self.held_claims.is_empty() {
+            return;
+        }
+        let Some(claims) = self.held_claims.remove(&session) else {
+            return;
+        };
+        let idx = self.shard_index(session);
+        for held in claims {
+            self.send_to(
+                idx,
+                CoordToShard::InlineCommitted {
+                    topic: held.topic,
+                    payload: held.payload,
+                    properties: held.properties,
+                    claims: vec![held.claim],
+                },
+            );
+        }
+    }
+
+    fn send_claims(&mut self, batch: DelegatedInlineBatch) {
         let k = self.shards.len();
         if k == 1 || batch.claims.len() <= 1 {
             if let Some(first) = batch.claims.first() {
