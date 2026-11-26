@@ -1323,4 +1323,69 @@ mod tests {
             self.rows.last_mut()
         }
     }
+
+    const TARGET: SessionId = SessionId::new(7);
+
+    fn claimed(index: u32, packet_id: u16) -> Delivery {
+        let publication = PublicationId::new(
+            StoreIncarnation::new(1),
+            RunEpoch::new(1),
+            LogicalOwnerId::new(0),
+            PublicationSeq::new(1),
+        );
+        Delivery {
+            id: DeliveryId { publication, index },
+            target: TARGET,
+            revision: Revision::new(1),
+            qos: Qos::AtLeastOnce,
+            cause: DeliveryCause::LiveExact,
+            retain: false,
+            expiry: None,
+            properties: None,
+            claim: Some(DeliveryClaim {
+                operation: OperationId::new(
+                    StoreIncarnation::new(1),
+                    RunEpoch::new(1),
+                    LogicalOwnerId::new(0),
+                    OperationSeq::new(u64::from(index) + 1),
+                ),
+                packet_id: OutboundPacketId::new(packet_id).unwrap(),
+                started: false,
+                await_pubcomp: false,
+            }),
+            topic: None,
+            payload: None,
+            phase: Phase::AwaitPuback,
+            claim_result: None,
+            window: None,
+            frame: None,
+            local_write_completed: false,
+            may_have_started: false,
+            certain_never_started: false,
+            early_puback: false,
+            early_pubrec: None,
+            pubrec_rank: None,
+            retired: false,
+        }
+    }
+
+    /// A session whose rows hold one identifier twice counts one collision.
+    /// Moving another of its rows to a new identifier does not add one.
+    #[test]
+    fn a_new_identifier_counts_no_collision_it_does_not_make() {
+        let mut deliveries = Deliveries::new(NonZeroU32::new(8).unwrap()).unwrap();
+        for (index, packet_id) in [(0, 1), (1, 1), (2, 2)] {
+            deliveries.push(claimed(index, packet_id)).unwrap();
+        }
+        let moved = *deliveries.by_id.get(&claimed(2, 2).id).unwrap();
+        deliveries.mutate(moved, |row| {
+            if let Some(claim) = row.claim.as_mut() {
+                claim.packet_id = OutboundPacketId::new(3).unwrap();
+            }
+        });
+        assert_eq!(deliveries.by_session[&TARGET].pi_collisions, 1);
+        let kept = deliveries.index_snapshot();
+        deliveries.rebuild_indices();
+        assert_eq!(kept, deliveries.index_snapshot());
+    }
 }
