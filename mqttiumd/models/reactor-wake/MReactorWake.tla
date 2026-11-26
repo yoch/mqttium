@@ -3,9 +3,10 @@
 (* MReactorWake: how the core thread gets a reactor thread to run a        *)
 (* transport task, as written in crates/mqttiumd/src/net/reactor.rs        *)
 (* (ADR 0044). The core publishes a frame into the task's bounded lane     *)
-(* and then notifies its link (`Outbound::try_send`, net.rs):              *)
+(* and then notifies its link (`ConnCore::try_send_outgoing`, net.rs;      *)
+(* `Link::notify`, `Shared::send` and `Shared::kick`, net/reactor.rs):     *)
 (*                                                                         *)
-(*   sender.try_send(frame)                 ProducerPublish                *)
+(*   outgoing.lock().enqueue(frame)         ProducerPublish                *)
 (*   if !link.dirty.swap(true) {            ProducerSwap                   *)
 (*       queue.lock().push(Run(link))       ProducerPush                   *)
 (*       owing.store(true)                  ProducerOwe                    *)
@@ -18,16 +19,27 @@
 (*                                                                         *)
 (* A producer that serves many lanes in one pass holds the wake-ups        *)
 (* (`Reactors::hold`, taken by `Runtime::turn` through `net::hold_wakes`)  *)
-(* and pays one when its guard is dropped:                                 *)
+(* and pays one when its guard is dropped (`Shared::hold`,                 *)
+(* `Shared::release`):                                                     *)
 (*                                                                         *)
 (*   held.store(true)                       ProducerHold                   *)
 (*   ...                                                                   *)
 (*   held.store(false); kick()              ProducerRelease                *)
 (*                                                                         *)
 (* The debt is recorded before the hold is read, and the release clears    *)
-(* the hold before it reads the debt: one of the two pays it.              *)
+(* the hold before it reads the debt: one of the two pays it. `held` is    *)
+(* one flag for every holder, here as in the code: the release of one      *)
+(* holder ends the hold of all.                                            *)
 (*                                                                         *)
-(* The reactor thread loops (`run`):                                       *)
+(* FairSpec releases every hold: in `Runtime::turn` the guard is dropped   *)
+(* at the end of the pass, before the thread waits. With delivery shards   *)
+(* (`--delivery-shards K >= 1`) a shard worker also holds, and keeps its   *)
+(* guard while it waits (`DeliveryShardWorker::run_loop`): its release is  *)
+(* as late as the end of that wait, which a timer bounds and this model    *)
+(* does not contain. FairSpecHoldKept drops the fairness of the release    *)
+(* to show what then depends on it.                                        *)
+(*                                                                         *)
+(* The reactor thread loops (`run`, `Shared::take`, `Shared::sleep`):      *)
 (*                                                                         *)
 (*   messages = take(queue)                 ReactorTake                    *)
 (*   for Run(link) in messages {            ReactorHandle                  *)
@@ -135,8 +147,9 @@ Kicked(p) ==
     ELSE Done(p)
 
 (***************************************************************************)
-(* Producers: `Outbound::try_send`, then `Link::notify`, `Shared::send`    *)
-(* and `Shared::kick`; `Reactors::hold` and the drop of its guard.         *)
+(* Producers: `ConnCore::try_send_outgoing`, then `Link::notify`,          *)
+(* `Shared::send` and `Shared::kick`; `Reactors::hold` and the drop of     *)
+(* its guard.                                                              *)
 (***************************************************************************)
 
 \* `Reactors::hold`: `held.store(true)`.
@@ -407,6 +420,19 @@ FairSpec ==
     /\ Spec
     /\ WF_vars(ReactorStep)
     /\ \A p \in Producers : WF_vars(ProducerFinish(p))
+
+\* The same without the release: a producer that took a hold may keep it,
+\* as a thread does that waits with its guard alive. Every other step a
+\* thread has is still taken.
+ProducerFinishKeepingHold(p) ==
+    \/ ProducerSwap(p) \/ ProducerPreload(p) \/ ProducerPush(p)
+    \/ ProducerOwe(p) \/ ProducerReadHeld(p)
+    \/ ProducerKick(p) \/ ProducerLoad(p) \/ ProducerWake(p) \/ ProducerUnhold(p)
+
+FairSpecHoldKept ==
+    /\ Spec
+    /\ WF_vars(ReactorStep)
+    /\ \A p \in Producers : WF_vars(ProducerFinishKeepingHold(p))
 
 (***************************************************************************)
 (* Safety.                                                                 *)

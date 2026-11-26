@@ -9,8 +9,37 @@ proof of that code, and none replaces its tests.
 | Module | Code | Question |
 | - | - | - |
 | `MWake` | `crates/mqttiumd/src/wake.rs` (`Wake`, `Signalled`), the main loop of `runtime.rs`, the worker loop of `writer.rs` | Can a value published towards a waiting thread stay unseen until the timeout of `Wake::wait`? |
-| `MReactorWake` | `crates/mqttiumd/src/net/reactor.rs` (`Link::notify`, `Shared::send`, `Shared::kick`, `Reactors::hold`, `run`), `Outbound` in `net.rs` | Can a frame the core published stay in its lane until readiness, a tick or the timeout of the poll, once the core's hold is released? |
-| `MLaneOwed` | `publish`, `Lanes::deliver`, `Lanes::flush` in `net.rs`; `Link::owe`, `Link::consumed`; `Inbound::try_recv`; record 0046 | Is a value a full lane refused published, and by what? Does input pressure ever end a task? |
+| `MReactorWake` | `crates/mqttiumd/src/net/reactor.rs` (`Link::notify`, `Shared::send`, `Shared::kick`, `Shared::release`, `Shared::sleep`, `Reactors::hold`, `run`), `ConnCore::try_send_outgoing` in `net.rs` | Can a frame the core published stay in its lane until readiness, a tick or the timeout of the poll, once the core's hold is released? |
+| `MLaneOwed` | `ConnCore::push_incoming_batch`, `ConnCore::flush_held_incoming`, `ConnCore::flush_reports`, `IncomingBatch::finish` in `net.rs`; `Link::owe`, `Link::consumed`; record 0046 | Is a value a full lane refused published, and by what? Does input pressure ever end a task? |
+
+## Scope
+
+The three models describe the default runtime, `--delivery-shards 0`: one
+core thread, which alone publishes frames, notifies links, holds the
+wake-ups and takes what the transport tasks publish; the reactor threads;
+and the store worker where the storage mode has one.
+
+With `--delivery-shards K >= 1` (record 0066) more threads take part, and
+the models were not extended to them:
+
+- `MWake`: each shard worker waits on a `Wake` of its own
+  (`DeliveryShardWorker::run_loop`, the `wake` of its `ShardStoreHandle`).
+  It is one waiter per signal, its loop waits only after a pass without
+  progress, and its producers publish before they signal
+  (`ShardInbox::push_batch`, the `Signalled` lane of the Coordinator, the
+  reply lanes of the store worker). That was read in the code; no test
+  replays it.
+- `MReactorWake`: the shard workers send to the reactors and hold as well,
+  and a shard keeps its hold while it waits. The section "A hold kept
+  through a wait" below says what the model still shows and what it does
+  not.
+- `MLaneOwed`: the acknowledgements of a subscriber (PUBACK, PUBREC,
+  PUBCOMP) and the write receipts of frames a shard emitted do not take
+  the lanes of the model. They go to the `ShardInbox` of the shard, under
+  a budget whose exhaustion stops the task from reading
+  (`ShardAckBudget::reserve`) and whose return notifies it
+  (`ShardAckBudget::release`). That register, re-check and notify protocol
+  is not modelled.
 
 ## Running
 
@@ -22,8 +51,8 @@ python ../tools/formal/run_tlc.py --models-dir models/reactor-wake --list
 python ../tools/formal/run_tlc.py --models-dir models/reactor-wake
 ```
 
-48 configurations, each under a few seconds; the largest explores 52,150
-states.
+49 configurations, the whole directory in about a minute and a half; the
+largest explores 52,150 states.
 
 ## MWake
 
@@ -41,11 +70,11 @@ takes everything published or finds nothing.
 Abstracted away: the timeout of `wait` is absent, so a value that would
 need it is a violation here. Spurious returns of the condition variable
 and lock poisoning are absent. The core's many sources are one lane.
-There is one waiter, as in the runtime, where the core alone waits on
-`runtime.wake` and the store worker alone on `requests`; `notify_one` and
-the single `pending` flag do not serve two. The short timer of the store
-worker for a reply lane the core has not drained (`stalled`) is not a
-wake-up path and is not modelled.
+There is one waiter per signal, as in the runtime, where the core alone
+waits on `runtime.wake` and the store worker alone on `requests`;
+`notify_one` and the single `pending` flag do not serve two. The short
+timer of the store worker for a reply lane its owner has not drained
+(`stalled`) is not a wake-up path and is not modelled.
 
 | Property | Meaning |
 | - | - |
@@ -67,32 +96,37 @@ consumer, and a producer finds `pending` set and skips the lock.
 
 ## MReactorWake
 
-`Outbound::try_send` publishes a frame, then `Link::notify` marks the link
-with `dirty.swap(true)` and, when it was clear, `Shared::send` pushes
-`Message::Run`, records a debt with `owing.store(true)`, and calls `kick`
-unless `held` reads set. `kick` takes the debt with `owing.swap(false)`
-and, if it took one, wakes the mio waker when `sleeping` reads set.
-`Reactors::hold` sets `held`; the drop of its guard clears `held` and then
-calls `kick`. `Runtime::turn` holds for the length of one pass, so each
-reactor thread is woken once per pass. The reactor takes its queue, clears
-`dirty` for each `Run` before it queues the task, runs the tasks, sets
-`sleeping`, looks at its queue again, polls with a zero timeout if a
-message is there, and clears `sleeping`.
+`ConnCore::try_send_outgoing` publishes a frame, then `Link::notify` marks
+the link with `dirty.swap(true)` and, when it was clear, `Shared::send`
+pushes `Message::Run`, records a debt with `owing.store(true)`, and calls
+`kick` unless `held` reads set. `Shared::kick` takes the debt with
+`owing.swap(false)` and, if it took one, wakes the mio waker when
+`sleeping` reads set. `Reactors::hold` sets `held` on every reactor thread
+(`Shared::hold`); the drop of its guard calls `Shared::release`, which
+clears `held` and then calls `kick`. `Runtime::turn` holds for the length
+of one pass, so each reactor thread is woken once per pass. The reactor
+takes its queue (`Shared::take`), clears `dirty` for each `Run` before it
+queues the task, runs the tasks, and in `Shared::sleep` sets `sleeping`,
+looks at its queue again, polls with a zero timeout if a message is
+there, and clears `sleeping`.
 
 Modelled: several links on one reactor thread, several producers of which
 some hold, every producer step from the publication to the wake, the hold
 and its release, the seven reactor steps, the waker as one bit a poll
-consumes.
+consumes. `held` is one flag whoever holds, as in the code: the release of
+one holder ends the hold of all (`safety-two-holders`).
 
 Abstracted away: socket readiness, the tick of a waiting task and the
 timeout of the poll are absent, so a frame that would need one of them is
-a violation here. A hold is released under fairness: it lasts one pass of
-its producer. A message queued under a hold waits for the release or, in
-the code, for the reactor's next timeout if that comes first; only the
-release is in the model. One reactor thread stands for the pool: `hold`
-and its release go over each thread in turn with the same two steps. A
-turn of a task is one step that takes every frame of its lane. `Register`
-and `Stop`, the fairness bound `TURNS` and panics are absent.
+a violation here. A hold is released under fairness: the model assumes it
+lasts one pass of its producer, which is what `Runtime::turn` does. A
+message queued under a hold waits for the release or, in the code, for
+the reactor's next timeout if that comes first; only the release is in
+the model. One reactor thread stands for the pool: `hold` and its release
+go over each thread in turn with the same two steps. A turn of a task is
+one step that takes every frame of its lane. `Register` and `Stop`, the
+fairness bound `TURNS`, panics, and a reactor thread that left its loop
+(`dead`, `Shared::abandon`) are absent.
 
 | Property | Meaning |
 | - | - |
@@ -113,23 +147,83 @@ and `Stop`, the fairness bound `TURNS` and panics are absent.
 Each mutant has a safety and a liveness configuration. The two debt
 mutants lose a message only when a second thread sends while another
 holds: with one sending thread the steps of `send` and of the release
-cannot interleave. In the executable the core thread is the only one that
-sends and holds, so the order the code keeps is a margin there; it is
-needed as soon as two threads share a pool, as the unit tests of the
-crate do through `Reactors::shared`.
+cannot interleave. In the default runtime the core thread is the only one
+that sends and holds, so the order the code keeps is a margin there. It
+is needed as soon as two threads share a pool: the unit tests of the
+crate do through `Reactors::shared`, and so do the shard workers of the
+sharded mode.
 
 The `reach-` configurations show a wake of a blocked reactor, the re-check
 of the queue saving a message whose producer read `sleeping` clear, a
 coalesced notification, a second `Run` sent while the tasks run, and a
 message queued under a hold whose wake-up is given at the release.
 
+### A hold kept through a wait
+
+The assumption "a hold lasts one pass of its producer" is false of one
+caller. `DeliveryShardWorker::run_loop`, which runs only with
+`--delivery-shards K >= 1`, takes `net::hold_wakes()` at the top of each
+iteration and waits at the bottom of the same iteration, when the pass
+made no progress, with the guard still alive: `Wake::wait` for at most
+`IDLE_TICK` (20 ms), or `BACKPRESSURE_TICK` (1 ms) while it has work it
+could not place. The hold ends when that wait returns.
+
+What this does and does not break, in the terms of the model:
+
+- **No invariant.** `DebtHasPayer` and `NoLostWake` count a live hold as
+  a payer and say nothing of how long it lives. `Shared::release` clears
+  the hold before it reads the debt, whoever set the hold, and every
+  release kicks: no wake-up is lost. The safety configurations do not
+  depend on fairness and hold as they are.
+- **The premise of `EveryFrameTaken`.** The property is checked under
+  weak fairness of the release. For the shard that fairness is discharged
+  by the timeout of its wait, a timer the model does not contain. The
+  configuration `hold-kept-liveness` checks the same property without the
+  fairness of the release and is declared violated for the unmutated
+  protocol: a holder takes its hold and keeps it, a message is queued
+  for a blocked reactor under it, and nothing gives the wake-up. In the
+  code this is a delay, bounded by the wait of the holder, and not a
+  loss.
+- **The reading "no frame waits for a timer".** It stands for the default
+  runtime. In the sharded mode it stands only for a sender that releases
+  a hold of its own soon after it sent: the Coordinator, at the end of
+  `Runtime::turn`, and a shard whose pass made progress, which starts its
+  next iteration without waiting. It does not stand for a message sent
+  under the hold of an idle shard by a thread that releases nothing. One
+  such sender exists: a reactor thread that returns unused shard
+  acknowledgement credit (a `ShardAckBatch` dropped when its input turn
+  ends) notifies the links of the readers that waited for credit
+  (`ShardAckBudget::release`), from a thread that holds nothing. If such
+  a reader is on another reactor thread that sleeps, it is run when a
+  holder next releases, when its socket becomes ready or when its own
+  poll times out. The delay the hold adds is at most the wait of the
+  holder: 20 ms.
+
+Whether a pass of a shard can send to a reactor without counting
+progress, and then wait on its own debt, was looked for and not found:
+`DeliveryShardWorker::dispatch` counts each accepted effect and
+`DeliveryShardWorker::drain_io_events` each event taken. That search is
+not exhaustive. No test of the sharded mode measures the delay. The
+product code was not changed.
+
 ## MLaneOwed
 
-`publish` offers a value to a lane, marks `Link::owed` when it is refused
-and offers it once more. A value refused twice is held.
-`Inbound::try_recv` calls `Link::consumed` after it took a value:
-`owed.swap(false)`, then `notify` if it was set. A task that holds a value
-reports `waiting` and is run again every `TICK`.
+A transport task offers what it has for the core to a lane, marks
+`Link::owed` when the lane has no room for all of it, and offers it once
+more; what is refused twice is held in the task (`StalledState`). The
+packets take this loop in `ConnCore::push_incoming_batch` and, for what
+is already held, in `ConnCore::flush_held_incoming`; the write receipts
+and the wire progress take it in `ConnCore::flush_reports`. The consumer
+calls `Link::consumed` after it made room: `owed.swap(false)`, guarded by
+a load, then `notify` if it was set. A task that holds anything reports
+`waiting` and is run again every `TICK`.
+
+For packets the core borrows a batch (`IncomingBatch::take`): the packets
+it took still count against the lane until `IncomingBatch::finish` puts
+back those it did not consume and clears `incoming_borrowed`. That store
+is the step that makes room, `ConsumerTake` in the model, and
+`Link::consumed` follows it. The task reads the count under the lock of
+the lane, after its mark: the order the model needs is kept.
 
 What follows a refusal depends on the value (decision record 0046):
 
@@ -141,15 +235,19 @@ What follows a refusal depends on the value (decision record 0046):
 - a receipt has one: held for `RESULT_WAIT` it ends the task with
   `write_result_queue_full` or `wire_progress_unavailable`.
 
-Modelled: one lane, the three steps of `publish`, the two steps of the
+Modelled: one lane, the three steps of the loop, the two steps of the
 consumer, cancellation by the core, the wait bound of a receipt as a bit
 that time sets, the tick as a constant. `Bounded` selects receipts or
 packets.
 
 Abstracted away: `scheduled` stands for a notification on its way to the
-task; `MReactorWake` is the model that shows it runs the task. One lane
-stands for the three that share the mark, on the argument that a run which
-still finds a lane full marks it again. The runtime's own deadlines are
+task; `MReactorWake` is the model that shows it runs the task. One value
+stands for what a batch still holds after an attempt. One lane stands for
+the three that share the mark, on the argument that a run which still
+finds a lane full marks it again. The wait bound of a receipt runs from
+the first refusal with no receipt published since (`stalled_since`); the
+model lets it elapse at any time a value is in hand, which is more than
+the code allows and changes no invariant. The runtime's own deadlines are
 one step, `CoreCancel`, about which nothing is assumed.
 
 | Property | Meaning |
@@ -165,22 +263,23 @@ nothing else ends its wait:
 
 | Configuration | What it shows |
 | - | - |
-| `packet-stalled-core` | A packet held while the core takes nothing and cancels nothing stays held for ever, tick or not. This is record 0046, not a defect: the property is declared violated for the unmutated protocol. In the runtime the step that ends such a wait is a deadline of the connection; Keep Alive is one, and `last_packet` is refreshed when the core takes a packet, not when its bytes arrive. |
-| `receipt-no-tick-stalled-core` | A receipt held with no tick and a stalled core never reaches its deadline: the tick is what makes `RESULT_WAIT` fire. This is not the implementation, where `Lanes::pending` makes the task report `waiting`. |
+| `packet-stalled-core` | A packet held while the core takes nothing and cancels nothing stays held for ever, tick or not. This is record 0046, not a defect: the property is declared violated for the unmutated protocol. In the runtime the step that ends such a wait is a deadline of the connection. Keep Alive is one when the client asked for it: its clock runs from the last complete packet the transport received (`Connection::last_heard`), and a task that holds a packet reads no other, so the clock is not refreshed while the wait lasts. |
+| `receipt-no-tick-stalled-core` | A receipt held with no tick and a stalled core never reaches its deadline: the tick is what makes `RESULT_WAIT` fire. This is not the implementation, where a task that holds a receipt reports `waiting`. |
 | `mut-input-deadline` | A packet with a wait bound, as before record 0046, ends its task under pressure: `PacketNeverEndsTask` is violated. |
 | `mut-single-attempt`, `mut-single-attempt-liveness` | Without the second attempt and without the tick the wake-up is lost: the consumer empties the lane between the first attempt and the mark, sees no mark, and never takes another value. |
 | `mut-single-attempt-ticked` | The same mutant passes with the tick: a timing test cannot see this defect, only 5 ms of delay. |
 
 `liveness-packet-consumer` passes without the tick. The code still ticks
-a task that holds a packet (`Lanes::pending` reports it as waiting),
-although such a task has no deadline of its own since record 0046: the
-tick is then a second way to the same run, not a requirement.
+a task that holds a packet (it reports `waiting` while its `StalledState`
+holds anything), although such a task has no deadline of its own since
+record 0046: the tick is then a second way to the same run, not a
+requirement.
 
 ## Correspondence
 
 | Model action | Module | Code | Replay |
 | - | - | - | - |
-| `ProducerPublish` | `MWake`, `MReactorWake` | `Signalled::try_send` before its `wake` (`wake.rs`); `Outbound::try_send` before its `notify` (`net.rs`) | `no_published_item_waits_for_the_timeout` (`wake.rs`), a stress run; `a_publication_is_delivered_without_waiting_for_a_timer` (`tests/reactor_wake.rs`) on the executable |
+| `ProducerPublish` | `MWake`, `MReactorWake` | `Signalled::try_send` before its `wake` (`wake.rs`); the enqueue of `ConnCore::try_send_outgoing` before its `notify` (`net.rs`) | `no_published_item_waits_for_the_timeout` (`wake.rs`), a stress run; `a_publication_is_delivered_without_waiting_for_a_timer` (`tests/reactor_wake.rs`) on the executable |
 | `ProducerSwap` | `MWake`, `MReactorWake` | `pending.swap(true)` in `Wake::wake`; `dirty.swap(true)` in `Link::notify` | `a_signal_raised_before_the_wait_is_consumed_without_waiting` (two signals, one consumed); `a_notification_runs_the_task_once_and_a_waiting_task_is_ticked` (two notifications, at most two turns) |
 | `ProducerNotify` | `MWake` | lock, `notify_one`, unlock in `Wake::wake` | `a_signal_from_another_thread_ends_the_wait_early` |
 | `ProducerLate` | `MWake` | None: only the mutant `WakeBeforePublish` reaches it | No deterministic replay: the counterexample needs a chosen thread schedule |
@@ -188,22 +287,22 @@ tick is then a second way to the same run, not a requirement.
 | `ConsumerClear` | `MWake` | None: only the mutant `ClearAfterPass` reaches it (`Wake::take` exists and is not called by the loops) | No deterministic replay |
 | `ConsumerLock`, `ConsumerCheck` | `MWake` | `lock.lock()` and `pending.swap(false)` in `Wake::wait` | `a_signal_raised_before_the_wait_is_consumed_without_waiting` |
 | `ConsumerRelock` | `MWake` | The return of `ready.wait_timeout` in `Wake::wait` | `a_signal_from_another_thread_ends_the_wait_early` |
-| `ProducerHold` | `MReactorWake` | `Reactors::hold`: `held.store(true)`; `net::hold_wakes` in `Runtime::turn` | `a_held_wake_up_is_given_when_the_hold_ends` (`net/reactor.rs`) |
+| `ProducerHold` | `MReactorWake` | `Reactors::hold`: `Shared::hold`, `held.store(true)`; `net::hold_wakes` in `Runtime::turn` | `a_held_wake_up_is_given_when_the_hold_ends` (`net/reactor.rs`) |
 | `ProducerPreload` | `MReactorWake` | None: only the mutant `CheckBeforePush` reaches it | No deterministic replay |
 | `ProducerPush`, `ProducerOwe`, `ProducerReadHeld` | `MReactorWake` | `Shared::send`: push under the queue lock, `owing.store(true)`, `held.load()` | `a_held_wake_up_is_given_when_the_hold_ends`: a notification under a hold; the lost-message interleavings have no deterministic replay |
-| `ProducerRelease` | `MReactorWake` | `Drop for Held`: `held.store(false)`, then `kick` | `a_held_wake_up_is_given_when_the_hold_ends` |
+| `ProducerRelease` | `MReactorWake` | The drop of the guard of `Reactors::hold`: `Shared::release`, `held.store(false)`, then `kick` | `a_held_wake_up_is_given_when_the_hold_ends`; a release that comes only after a wait (`hold-kept-liveness`) has no deterministic replay |
 | `ProducerKick`, `ProducerLoad`, `ProducerWake` | `MReactorWake` | `Shared::kick`: `owing.swap(false)`, `sleeping.load()`, `waker.wake()` | `a_notification_runs_the_task_once_and_a_waiting_task_is_ticked`; `a_held_wake_up_is_given_when_the_hold_ends` |
 | `ProducerUnhold` | `MReactorWake` | None: only the mutant `DebtReadBeforeRelease` reaches it | No deterministic replay: it needs a second sending thread |
-| `ReactorTake`, `ReactorHandle` | `MReactorWake` | `std::mem::take(&mut *queue)` and the `Message::Run` arm of `run` | `a_notification_runs_the_task_once_and_a_waiting_task_is_ticked` |
+| `ReactorTake`, `ReactorHandle` | `MReactorWake` | `Shared::take` and the `Message::Run` arm of `run` | `a_notification_runs_the_task_once_and_a_waiting_task_is_ticked` |
 | `ReactorRun` | `MReactorWake` | The `ready` loop of `run` and `Driven::turn` | `a_task_runs_on_readiness_and_rests_between_events` |
 | `ReactorLateClear` | `MReactorWake` | None: only the mutant `ClearDirtyAfterRun` reaches it | No deterministic replay |
-| `ReactorSleep`, `ReactorRecheck`, `ReactorPoll`, `ReactorAwake` | `MReactorWake` | `sleeping.store(true)`, `pending`, `poll.poll`, `sleeping.store(false)` in `run` | `a_task_runs_on_readiness_and_rests_between_events` (an idle task is not run); `an_idle_broker_rests` (`tests/reactor_wake.rs`) on the executable |
-| `TaskProduce` | `MLaneOwed` | `Lanes::hold` then `Lanes::deliver` in `input_turn`; `Lanes::report` then `Lanes::flush` | `input_saturation_is_backpressure_and_loses_no_packet` (`net.rs`) |
-| `TaskRun` | `MLaneOwed` | `Message::Run` after `Link::consumed` or `Connection::close`, or the tick of a task that reported `waiting`; `control.is_cancelled()` at the start of `turn` | `a_notification_runs_the_task_once_and_a_waiting_task_is_ticked`: a waiting task is run without an event; `consumed` runs the task only after `owe`. `cancellation_ends_idle_and_partial_socket_tasks` (`net.rs`) |
-| `TaskTry1`, `TaskOwe`, `TaskTry2` | `MLaneOwed` | `publish` in `net.rs` | `input_saturation_is_backpressure_and_loses_no_packet`: the lane is full, one packet is held, and every packet arrives in order once the core takes values; the lost wake-up of `SingleAttempt` has no deterministic replay |
-| `DeadlineElapses` | `MLaneOwed` | `stalled` and `RESULT_WAIT` in `Lanes::flush`; nothing in `Lanes::deliver` | `input_saturation_is_backpressure_and_loses_no_packet` shows that a packet has no bound; no test lets a receipt wait for `RESULT_WAIT` |
-| `ConsumerTake`, `ConsumerConsumed` | `MLaneOwed` | `Inbound::try_recv`, `Link::consumed` | `a_notification_runs_the_task_once_and_a_waiting_task_is_ticked` |
-| `CoreCancel` | `MLaneOwed` | `Connection::close`: `Control::stop`, `link.notify()` | `cancellation_ends_idle_and_partial_socket_tasks` |
+| `ReactorSleep`, `ReactorRecheck`, `ReactorPoll`, `ReactorAwake` | `MReactorWake` | `Shared::sleep`: `sleeping.store(true)`, `pending`, `poll.poll`, `sleeping.store(false)` | `a_task_runs_on_readiness_and_rests_between_events` (an idle task is not run); `an_idle_broker_rests` (`tests/reactor_wake.rs`) on the executable |
+| `TaskProduce` | `MLaneOwed` | The packets framed by one input turn, handed to `ConnCore::push_incoming_batch`; the reports of one turn, handed to `ConnCore::flush_reports` | `input_saturation_is_backpressure_and_loses_no_packet` (`net.rs`) |
+| `TaskRun` | `MLaneOwed` | `Message::Run` after `Link::consumed` or `Connection::close`, or the tick of a task that reported `waiting`; `ConnCore::is_cancelled` at the start of the turn | `a_notification_runs_the_task_once_and_a_waiting_task_is_ticked`: a waiting task is run without an event; `consumed` runs the task only after `owe`. `cancellation_ends_idle_and_partial_socket_tasks` (`net.rs`) |
+| `TaskTry1`, `TaskOwe`, `TaskTry2` | `MLaneOwed` | The two attempts around `Link::owe` in `ConnCore::push_incoming_batch`, `ConnCore::flush_held_incoming`, `ConnCore::push_incoming_one` and `ConnCore::flush_reports` | `a_borrowed_ingress_batch_keeps_capacity_for_its_unconsumed_suffix`: a packet refused twice while the core holds a borrowed batch, and taken once the batch is finished; `input_saturation_is_backpressure_and_loses_no_packet`: the lane is full, what was read is held, and every packet arrives in order once the core takes values. The lost wake-up of `SingleAttempt` has no deterministic replay |
+| `DeadlineElapses` | `MLaneOwed` | `stalled_since` and `RESULT_WAIT` in `ConnCore::flush_reports`; nothing in the packet functions | `input_saturation_is_backpressure_and_loses_no_packet` shows that a packet has no bound; no test lets a receipt wait for `RESULT_WAIT` |
+| `ConsumerTake`, `ConsumerConsumed` | `MLaneOwed` | `IncomingBatch::finish` (the room, then `Link::consumed`); `ConnCore::drain_written` and `ConnCore::drain_wire_progress` (the pop, then `Link::consumed`) | `a_borrowed_ingress_batch_keeps_capacity_for_its_unconsumed_suffix` (`net.rs`); `a_notification_runs_the_task_once_and_a_waiting_task_is_ticked` |
+| `CoreCancel` | `MLaneOwed` | `Connection::close`: `cancelled` set (`ConnCore::stop` for a plain task), `link.notify()` | `cancellation_ends_idle_and_partial_socket_tasks` |
 | `Quiescent` | all three | The end of a run of the model | Not an action of the code |
 
 The sidecars list under `replays` only tests that exist in the files they

@@ -1,15 +1,20 @@
 ----------------------------- MODULE MLaneOwed -----------------------------
 (***************************************************************************)
 (* MLaneOwed: a transport task that finds a lane towards the core full,    *)
-(* as written in crates/mqttiumd/src/net.rs (`publish`, `Lanes::deliver`,  *)
-(* `Lanes::flush`) and net/reactor.rs (`Link::owe`, `Link::consumed`).     *)
-(* The task never blocks. It offers its value twice around a mark:         *)
+(* as written in crates/mqttiumd/src/net.rs (for packets,                  *)
+(* `ConnCore::push_incoming_batch`, `ConnCore::flush_held_incoming` and    *)
+(* `ConnCore::push_incoming_one`; for receipts, `ConnCore::flush_reports`) *)
+(* and net/reactor.rs (`Link::owe`, `Link::consumed`). The task never      *)
+(* blocks. Each of those functions is the same loop of two attempts        *)
+(* around a mark:                                                          *)
 (*                                                                         *)
-(*   lane.try_send(value)               TaskTry1                           *)
-(*   link.owe()          owed = true    TaskOwe                            *)
-(*   lane.try_send(value)               TaskTry2                           *)
+(*   lock; push what the lane has room for   TaskTry1                      *)
+(*   link.owe()          owed = true         TaskOwe                       *)
+(*   lock; push what the lane has room for   TaskTry2                      *)
 (*                                                                         *)
-(* A value refused twice is held. The two kinds of value differ in what    *)
+(* The functions move batches; one value here stands for what a batch      *)
+(* still holds after an attempt. What was refused twice is held (in        *)
+(* `StalledState`). The two kinds of value differ in what                  *)
 (* follows (decision record 0046):                                         *)
 (*                                                                         *)
 (*   - a packet for the input lane is held with no bound. The task reads   *)
@@ -20,10 +25,15 @@
 (*     RESULT_WAIT it ends the task ("write_result_queue_full",            *)
 (*     "wire_progress_unavailable").                                       *)
 (*                                                                         *)
-(* The consumer that takes a value runs the task if the mark is set        *)
-(* (`Inbound::try_recv`):                                                  *)
+(* The consumer that makes room in a lane runs the task if the mark is     *)
+(* set. ConsumerTake is the step that makes the room visible to the task:  *)
+(* for packets, the end of the batch the core borrowed                     *)
+(* (`IncomingBatch::finish`, `incoming_borrowed.store(0)`: a borrowed      *)
+(* packet keeps its place until then); for receipts, the pop under the     *)
+(* lock of `ConnCore::drain_written` and `ConnCore::drain_wire_progress`.  *)
+(* `Link::consumed` follows it:                                            *)
 (*                                                                         *)
-(*   receiver.try_recv()                ConsumerTake                       *)
+(*   room appears in the lane           ConsumerTake                       *)
 (*   if link.owed.swap(false) {         ConsumerConsumed                   *)
 (*       link.notify() }                                                   *)
 (*                                                                         *)
@@ -58,7 +68,7 @@ VARIABLES
     expired,   \* the wait bound of the value in hand has elapsed
     owed,      \* Link::owed
     scheduled, \* a notification is on its way to the task
-    cancelled, \* Control::cancelled
+    cancelled, \* ConnCore::cancelled
     ended,     \* how the task ended: "none", "queue_full", "cancelled"
     tpc,       \* where the task is in its turn
     cpc        \* where the consumer is
@@ -121,7 +131,7 @@ TaskRun ==
             /\ UNCHANGED <<hand, ended>>
     /\ UNCHANGED <<made, sent, recv, expired, owed, cancelled, cpc>>
 
-\* The first attempt of `publish`.
+\* The first attempt of the loop.
 TaskTry1 ==
     /\ tpc = "try1"
     /\ IF ~Full
@@ -156,7 +166,8 @@ DeadlineElapses ==
 (* The core.                                                               *)
 (***************************************************************************)
 
-\* `Inbound::try_recv`.
+\* Room appears in the lane: `IncomingBatch::finish`, or the pop of
+\* `ConnCore::drain_written` and `ConnCore::drain_wire_progress`.
 ConsumerTake ==
     /\ cpc = "idle" /\ LaneLen > 0
     /\ recv' = recv + 1
