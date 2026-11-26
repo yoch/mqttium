@@ -305,3 +305,103 @@ fn a_lease_never_counts_fewer_than_no_claim_in_flight() {
     lease.release_pi(OutboundPacketId::new(3).unwrap());
     assert_eq!(lease.in_flight.load(Ordering::Acquire), 0);
 }
+
+/// An inline claim the coordinator committed reaches the shard before the
+/// barrier that lets the shard publish the session's lease again. While it
+/// waits in `pending_inline` it is not a row of the core yet: the lease the
+/// shard publishes must still count its identifier, or the coordinator can
+/// reserve that identifier a second time.
+#[test]
+fn a_published_lease_keeps_the_identifier_of_a_waiting_committed_claim() {
+    let Harness {
+        incarnation,
+        epoch,
+        mut worker,
+        commands,
+        events,
+        _lanes: (requests, reply, _control, _control_reply),
+    } = harness("lease-publication");
+    std::fs::remove_file(&events).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let _client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+    let socket = net::spawn(listener.accept().unwrap().0).unwrap();
+    let session = SessionId::new(1);
+    let generation = ConnectionGeneration::new(10);
+    // As `ShardPool::attach_session` does: the lease is dirty until the
+    // shard has scanned past this mark.
+    let lease = InlineClaimLease::new();
+    let dirty_seq = lease.mark_dirty();
+    commands
+        .send(CoordToShard::Attach {
+            session,
+            revision: Revision::new(1),
+            generation,
+            receive_maximum: 8,
+            maximum_packet_size: 1024,
+            version: Version::V5,
+            outgoing: socket.outgoing_handle(),
+            lease: Arc::clone(&lease),
+            dirty_seq,
+        })
+        .unwrap();
+    worker.drain_coord_messages().unwrap();
+    worker.drain_inputs().unwrap();
+    worker.dispatch().unwrap();
+    let Ok(Request::Effect(load)) = requests.try_recv() else {
+        panic!("the attach read no work");
+    };
+    assert!(matches!(load.effect(), Effect::LoadWork { .. }));
+
+    // The coordinator's committed inline claim, with identifier 1, is
+    // waiting for the shard's core.
+    let source = LogicalOwnerId::new(0);
+    let pi = OutboundPacketId::new(1).unwrap();
+    let bytes = |s| SharedBytes::copy_from(s, 1024).unwrap();
+    worker.pending_inline.push_back(PendingInlineItem {
+        claim: DelegatedClaim {
+            delivery: DeliveryId {
+                publication: PublicationId::new(incarnation, epoch, source, PublicationSeq::new(1)),
+                index: 0,
+            },
+            target: session,
+            target_revision: Revision::new(1),
+            qos: Qos::AtLeastOnce,
+            claim_operation: OperationId::new(incarnation, epoch, source, OperationSeq::new(1)),
+            packet_id: pi,
+            generation,
+        },
+        topic: bytes(b"t"),
+        payload: bytes(b"p"),
+        properties: None,
+    });
+
+    // The scan ends: the session is caught up and its lease may be published.
+    reply
+        .send(Response::Work {
+            effect: load.id(),
+            session,
+            result: Ok(mqttiumd_store_api::WorkPage {
+                items: BoundedVec::with_capacity(0).unwrap(),
+                next: None,
+            }),
+        })
+        .unwrap();
+    worker.drain_store_replies().unwrap();
+    worker.drain_inputs().unwrap();
+    let reserved = lease.try_reserve().map(|(_, id)| id);
+    assert_ne!(
+        reserved,
+        Some(pi),
+        "the lease gave away the identifier of a committed claim"
+    );
+    if let Some(id) = reserved {
+        lease.release_pi(id);
+    }
+
+    // Once the claim is a row, the lease is published with its identifier.
+    worker.drain_pending_inline().unwrap();
+    let reserved = lease.try_reserve().map(|(_, id)| id);
+    assert!(reserved.is_some(), "the lease was not published");
+    assert_ne!(reserved, Some(pi));
+    socket.close();
+}
