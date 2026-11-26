@@ -304,7 +304,10 @@ impl SessionDeliveries {
         }
     }
 
-    fn sub_pi(&mut self, packet_id: OutboundPacketId, deliveries: &BoundedSlab<Delivery>) {
+    /// Clears `packet_id` from the mask. While a collision is counted the
+    /// mask is rebuilt from the rows of `all` instead, and the answer is
+    /// true: it then reflects every identifier those rows hold now.
+    fn sub_pi(&mut self, packet_id: OutboundPacketId, deliveries: &BoundedSlab<Delivery>) -> bool {
         let id = packet_id.get();
         if id <= OUTGOING_PI_BITMAP_BITS {
             if self.pi_collisions == 0 {
@@ -330,8 +333,10 @@ impl SessionDeliveries {
                 }
                 self.used_pi_mask = mask;
                 self.pi_collisions = collisions;
+                return true;
             }
         }
+        false
     }
 }
 
@@ -675,7 +680,7 @@ impl Deliveries {
         if let Some(sd) = self.by_session.get_mut(&target) {
             sd.all.remove(&index);
             if let Some(pi) = removed_pi {
-                sd.sub_pi(pi, &self.rows);
+                let _ = sd.sub_pi(pi, &self.rows);
             }
             if let Some(generation) = sent_gen {
                 sd.sub_sent(generation);
@@ -835,10 +840,11 @@ impl Deliveries {
             && let Some(sd) = self.by_session.get_mut(&target)
         {
             if old_pi != new_pi {
-                if let Some(pi) = old_pi {
-                    sd.sub_pi(pi, &self.rows);
-                }
-                if let Some(pi) = new_pi {
+                // A rebuild already reads the row with its new identifier.
+                let rebuilt = old_pi.is_some_and(|pi| sd.sub_pi(pi, &self.rows));
+                if let Some(pi) = new_pi
+                    && !rebuilt
+                {
                     sd.add_pi(pi);
                 }
             }
