@@ -304,6 +304,75 @@ fn log_apply_group_matches_sqlite_and_recovers_after_uncompacted_crash() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A group the writer may legitimately form must survive a restart whatever
+/// its size on disk. Seventy admissions of one mebibyte each are one group
+/// of the writer (at most `LOG_MAX_GROUP` commands, each within the payload
+/// limit) and more than the 64 MiB a frame may hold when it is read back.
+/// Every member is answered committed, so every member must be found again.
+#[test]
+fn log_reopens_after_a_group_larger_than_one_frame() {
+    const MEMBERS: u64 = 70;
+    const PAYLOAD: usize = 1024 * 1024;
+    let dir = temp_dir("large-group");
+    let path = dir.join("store.sqlite");
+    let limits = Limits {
+        payload_bytes: mqttiumd_contract::capacity::PayloadBytes::new(128 * 1024 * 1024),
+        references: mqttiumd_contract::capacity::References::new(256),
+        exchange_slots: mqttiumd_contract::capacity::ExchangeSlots::new(128),
+        receipt_slots: mqttiumd_contract::capacity::ReceiptSlots::new(256),
+        max_payload_bytes: PAYLOAD,
+        ..fixture_limits()
+    };
+    let mut world = World::with_limits(
+        &|incarnation, lim| {
+            LogStore::open_or_create(&path, incarnation, lim, None, false).expect("log")
+        },
+        limits,
+    );
+    let payload =
+        mqttiumd_contract::packet::SharedBytes::copy_from(&vec![0x5a_u8; PAYLOAD], PAYLOAD)
+            .expect("within the limit");
+    let length = mqttiumd_contract::capacity::PayloadBytes::new(PAYLOAD as u64);
+    let commands: Vec<Command> = (1..=MEMBERS)
+        .map(|sequence| {
+            let packet_id = u16::try_from(sequence).expect("small");
+            // The builder of the fixture copies at most a kibibyte: the
+            // admission is rebuilt around the large payload.
+            let small = world.admission(sequence, packet_id, b"x", &[world.b]);
+            let mut large = conformance::altered(&small, |admit| {
+                admit.payload.length = length;
+                admit.costs.payload_bytes = length;
+            });
+            large.payload = Some(payload.clone());
+            large
+        })
+        .collect();
+    let group: Vec<&Command> = commands.iter().collect();
+    assert!(group.len() <= LOG_MAX_GROUP);
+    let replies = world
+        .store
+        .apply_group(&group)
+        .expect("a group within the bound");
+    for (sequence, reply) in (1..=MEMBERS).zip(&replies) {
+        assert!(
+            matches!(reply.reply, StoreReply::Outcome(StoreOutcome::Committed(_))),
+            "member {sequence}: {:?}",
+            reply.reply
+        );
+    }
+    let expected = world
+        .store
+        .snapshot()
+        .expect("the state that was acknowledged");
+    drop(world);
+
+    let reopened = LogStore::open_or_create(&path, StoreIncarnation::new(9), limits, None, true)
+        .expect("a log the store wrote and acknowledged opens again");
+    assert_eq!(reopened.snapshot().unwrap(), expected);
+    drop(reopened);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn log_recovers_from_torn_tail_and_refuses_midfile_corruption() {
     let dir = temp_dir("torn-tail");
