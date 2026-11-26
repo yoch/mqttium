@@ -155,8 +155,15 @@ takes the identifier of a claim it carries in an admission from
 `InlineClaimLease::try_reserve`, a bitmap of 512 identifiers it shares with
 that shard, which clears a bit when the delivery ends. Which of the two may
 allocate at a given time is settled by the eligibility handshake of that
-record. Neither the lease nor the handshake is in this model, and no
-configuration here says anything about an identifier taken through them.
+record. The handshake did not keep the two apart: a shard could claim an
+identifier the Coordinator had reserved, and its publication of the lease
+could drop the identifier of a committed claim not yet applied. Since the
+validation of the lot 10 head the shard gives its core the lease's bits at
+each dirty mark (`Owner::shard_set_foreign_packet_ids`), and
+`Deliveries::free_packet_id` avoids them; it publishes no lease while such
+a claim waits (report 0045). Neither the lease nor the handshake is in this
+model, and no configuration here says anything about an identifier taken
+through them.
 
 ## Correspondence
 

@@ -76,6 +76,20 @@ Each by a test committed while it failed, then the fix:
   shards pays a pointer for it, not 112 bytes.
 - The readiness line ends with `delivery_shards=K experimental`.
 
+Second part, each by a failing test first:
+
+- A shard's claims avoid the packet identifiers the coordinator reserved
+  in the lease: at each dirty message the shard gives its core the lease's
+  bits, and `Deliveries::free_packet_id` picks beside them. Before, a dirty
+  notification sent while an inline claim was pending made the shard
+  claim with the reserved identifier (suspect S1).
+- A shard publishes no lease while an inline claim committed for the
+  session waits to be applied; its identifier was missing from the bitmap
+  it published, and the coordinator could reserve it again (suspect B2).
+- A claim committed just before the detach of its generation is not
+  written to the closed generation and leaves nothing behind (suspect S2,
+  a witness: no defect).
+
 **The coordinator's send to a shard stays blocking, for a reason.** A
 shard waits only for a bounded time and empties its lane at each pass,
 moving what it cannot serve yet into queues that are now bounded by
