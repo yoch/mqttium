@@ -42,6 +42,7 @@ Following Lot 7 (record [0057](0057-flatmap-direct-volatile-and-zero-alloc-frami
 
 ### 5. Fail-closed `LogStore::compact()` on WAL replacement failure (`mqttiumd-store-volatile`)
 - **`wal_desynced` guard (`crates/mqttiumd-store-volatile/src/log.rs`)**: `LogStore::compact()` sets `self.wal_desynced = true` immediately after `save_state_atomic()` commits the new SQLite checkpoint and clears it only after `write_fresh_wal_atomic()` succeeds. While `self.wal_desynced` is set, `flush_prepared_frame()` refuses every new durable write fail-closed (`StoreError::Io`), preventing acknowledgement of frames that would not survive restart. Covered by OS-level regression test `failed_wal_replacement_suspends_durable_writes_until_repaired` in `crates/mqttiumd-store-volatile/tests/log_conformance.rs`.
+- **Amended on 26 November 2026** (record 0055, validation of the lot 10 head): the flag is now `rotation_due`, which records the checkpoint whose log is due, and each write first tries the replacement again. The guard is unchanged: nothing is appended to the stale log, and a write that cannot replace it answers `PendingOrUnknown`. What changed is that the store writes again as soon as the cause is gone; with the flag alone it stayed unable to write until a forced checkpoint (`log_resumes_a_rotation_that_failed_at_the_next_write`).
 
 ## Consequences
 

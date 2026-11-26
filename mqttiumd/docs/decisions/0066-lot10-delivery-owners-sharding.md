@@ -4,6 +4,46 @@ Status: **Proposed** (25 November 2026). Applied to `mqttiumd-core`, `mqttiumd-s
 
 This record introduces no wire-format changes, no SQLite schema changes (Schema 14/15 unchanged), no `.mlog` record changes, and no new `Recipe` variants (`Recipe` kinds `0..=25` unchanged). `crates/mqttiumd-contract/src/capacity.rs` and all files hashed in `proofs/credits/BODY.sha256` remain byte-for-byte unchanged (`71378725…`), pure crates keep `#![no_std]` + `alloc` and `#![forbid(unsafe_code)]`, the pure-crate boundary suite passes (`17/17`), and the contract digest reported by `mqttiumd-lab validate --contracts contracts/v1` remains unchanged (`sha256:21e96cc81c1f48d59841d8424fee2290102c6782b025222f2d6d2fe72ccf9bb5`).
 
+## Relation to record 0044, and what the code does not meet (added 26 November 2026)
+
+Added by the validation of the lot 10 head (`9dfd568`, report 0043). With
+`K = 0`, the default, the runtime is the one of record 0044 (accepted).
+With `K >= 1` this record departs from it in three places, and it does
+not amend it: the owner decides whether it does.
+
+- 0044 keeps "the single logical owner for version 0.1" and leaves
+  partitioned owners (ARC-001) to a later decision. This record brings
+  them, as an option.
+- 0044 says "no loop polls on a timer for work". A delivery shard waits
+  at most `IDLE_TICK` (20 ms), and 1 ms while its outbox holds an effect
+  its sink refused, and dispatches again at each wake.
+- 0044 keeps "no wait on a full remote queue" from ARC-021. The
+  coordinator sends to a shard with a blocking send (`ShardPool::send_to`):
+  a shard that does not empty its channel stops the ingress plane.
+
+Statements of this record the code does not meet, kept below as written:
+
+- "Coordinator emits ... without blocking on delivery shards" (Context,
+  item 2): see the blocking send above.
+- "`SUBACK` before retained replay": the deferral covers the store path
+  only. A retained QoS 0 replay delegated to a shard can reach the wire
+  before the SUBACK; `delivery_shards.rs` shows it intermittently.
+- "`K = 0` preserves the exact Lot 9 path": reports 0040 and 0041 give
+  different `K = 0` figures, and `ConnCore` carries the shard route of
+  every connection whatever `K`.
+- The contract digest it quotes (`21e96cc8...`) is not the one `validate`
+  printed at `9dfd568` (`cdd2b28f...`).
+- Report 0041, which it cites for its figures, measured a commit 47
+  commits older than `9dfd568` with a load generator that could write
+  past its buffer (fixed by `675128d`), single runs, against an unpinned
+  Mosquitto 2.1.2 holding its state in memory while mqttiumd synchronised
+  a log. Its volatile `fanin-32x1-q1` row goes from 0.04 ms at `K = 0` to
+  365 ms at `K = 2` (p50); this record does not mention it.
+
+The mode stays experimental until the defects and suspects listed in
+`docs/reception/open-conditions.md` are closed and the coordinator and
+shard protocol has a model.
+
 ## Context
 
 In Lot 9 (record [0065](0065-lot9-refusals-fairness-and-atomic-fanout.md), report [0040](../reports/0040-lot9-arm64-fairness-fanout-and-sharding.md)), ARM64 `perf` profiling after atomic `1:N` `Recipe::MultiClaimedPublication` showed that the single `Owner` thread consumed **100 % of 1 core** (`65–92 %` of all broker CPU) on high fan-out (`fanout-1x16`) and high-concurrency (`128p`) workloads, while `log-writer` used only `~22–24 %` and the two I/O reactor threads combined used `~8–20 %`. Roughly `70–75 %` of the single Owner thread's CPU on `1:16` fan-out was pure recipient-side work (`EmitPublish`, `ObservedPuback`, `FinishDelivery`, `Deliveries` index maintenance, and `LoadWork` pagination).
