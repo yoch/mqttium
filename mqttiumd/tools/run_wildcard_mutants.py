@@ -21,18 +21,28 @@ import time
 
 
 SOURCE = 'mqttiumd/crates/mqttiumd-core/src/owner/routing.rs'
+# Each mutation is made in the selector of the product, `RouteIndex::select_client`.
+# The linear selector of `mod reference` exists for the tests only and holds
+# the same lines with four spaces less: the anchors carry their indentation
+# so that each names one site, the one the product runs. The tests named
+# here call a `select` that runs both selectors and compares them.
 MUTANTS = (
     ('no-aggregation', 'wildcard_contributions_aggregate_before_the_destination_budget',
-     'wildcard_routes_not_aggregated', '.find(|held| held.session == route.target)', '.find(|_held| false)'),
+     'wildcard_routes_not_aggregated',
+     '                        .position(|item| item.is_some_and(|h| h.session == route.target))\n',
+     '                        .position(|_item| false)\n'),
     ('maximum-qos-lost', 'eligible_overlap_uses_maximum_qos_before_publish_cap',
-     'wildcard_maximum_qos_lost', 'held.qos = held.qos.max(effective);', 'held.qos = effective;'),
+     'wildcard_maximum_qos_lost',
+     '\n                    held.qos = held.qos.max(effective);\n',
+     '\n                    held.qos = effective;\n'),
     ('fanout-truncated', 'seventeenth_destination_refuses_the_complete_durable_and_volatile_fanout',
      'wildcard_fanout_truncated',
-     'if selected.count == limit {\n                return Err(Refusal::Capacity);\n            }',
-     'if selected.count == limit {\n                return Ok(selected);\n            }'),
+     'if selected.count == limit {\n                        refusal = Some(Refusal::Capacity);\n                        return;\n                    }',
+     'if selected.count == limit {\n                        return;\n                    }'),
     ('no-local-global-self-suppression', 'no_local_excludes_only_its_matching_contribution',
      'no_local_applied_after_aggregation',
-     'if route.options.no_local() && source == Some(target_session.client_id.as_slice()) {', 'if source == Some(target_session.client_id.as_slice()) {'),
+     '\n                if route.options.no_local() && source == Some(target_session.client_id.as_slice()) {',
+     '\n                if source == Some(target_session.client_id.as_slice()) {'),
 )
 
 def digest(path: Path) -> str:

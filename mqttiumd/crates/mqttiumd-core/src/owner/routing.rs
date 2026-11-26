@@ -556,11 +556,40 @@ impl Owner {
 
 #[cfg(test)]
 mod tests {
-    use super::reference::select;
     use super::*;
     use crate::contract::effects::SubmitResult;
     use crate::contract::pubsub::SubscriptionOptions;
     use alloc::vec;
+
+    /// The selection the product makes: the tests of this module state
+    /// their rules of the route index, not of the linear selector of
+    /// `mod reference`, which only
+    /// `route_index_matches_linear_reference_across_wildcards_options_and_revisions`
+    /// reads, to compare the two.
+    fn select(
+        routes: &[Route],
+        sessions: &[Session],
+        source: SessionId,
+        topic: &[u8],
+        qos: Qos,
+        maximum: u32,
+    ) -> Result<Selection, Refusal> {
+        let mut index = RouteIndex::default();
+        index.rebuild(routes);
+        let mut session_by_id = FlatMap::new();
+        for (position, session) in sessions.iter().enumerate() {
+            session_by_id.insert(session.id, position);
+        }
+        index.select(
+            routes,
+            sessions,
+            &session_by_id,
+            source,
+            topic,
+            qos,
+            maximum,
+        )
+    }
     fn bytes(value: &[u8]) -> SharedBytes {
         SharedBytes::copy_from(value, 128).unwrap()
     }
@@ -1409,8 +1438,9 @@ mod tests {
             for qos in [Qos::AtMostOnce, Qos::AtLeastOnce, Qos::ExactlyOnce] {
                 for source in [SessionId::new(1), SessionId::new(2), SessionId::new(19)] {
                     for limit in [1u32, 4, 8, 16, 64] {
-                        let expected = select(&routes, &sessions, source, topic, qos, limit)
-                            .map(|sel| sel.iter().copied().collect::<Vec<_>>());
+                        let expected =
+                            super::reference::select(&routes, &sessions, source, topic, qos, limit)
+                                .map(|sel| sel.iter().copied().collect::<Vec<_>>());
                         let actual = index
                             .select(
                                 &routes,
