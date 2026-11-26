@@ -828,8 +828,7 @@ impl Owner {
                     return None;
                 }
                 if inline_pending == 0 {
-                    return (room && !self.pubsub.connections.is_loading(generation))
-                        .then_some(generation);
+                    return (room && !self.read_held(session, generation)).then_some(generation);
                 }
             }
             if let Some((_, delivery)) =
@@ -870,8 +869,17 @@ impl Owner {
                 }
             }
         }
-        (room && !self.pubsub.connections.is_loading(generation) && needs_scan)
-            .then_some(generation)
+        (room && !self.read_held(session, generation) && needs_scan).then_some(generation)
+    }
+
+    /// Whether no read of `session`'s work may start now: one is in flight,
+    /// or the delivery shard that owns the session fences it
+    /// (`Owner::shard_fence_scans`). A held session waits as during a read,
+    /// and is not ready work.
+    #[inline]
+    fn read_held(&self, session: SessionId, generation: ConnectionGeneration) -> bool {
+        self.pubsub.connections.is_loading(generation)
+            || (!self.scan_fences.is_empty() && self.scan_fences.contains(&session))
     }
 
     fn qos0_continuation(&self, draft: &mut Draft) -> Result<ContinuationId, Stop> {
@@ -2397,9 +2405,7 @@ impl Owner {
         let settings = self.pubsub.connections.as_slice()[connection];
         let room = self.pubsub.active(generation) < usize::from(settings.receive_maximum);
         let after = self.pubsub.connections.after_of(generation);
-        // A fenced session is not read: it waits as during a read.
-        let loading = self.pubsub.connections.is_loading(generation)
-            || (!self.scan_fences.is_empty() && self.scan_fences.contains(&session));
+        let loading = self.read_held(session, generation);
         let needs_scan = settings.rescan_needed || after.is_some();
         if let Some(sd) = self.pubsub.deliveries.session(session)
             && !sd.all.is_empty()
