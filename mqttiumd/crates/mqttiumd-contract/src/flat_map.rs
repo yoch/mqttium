@@ -791,6 +791,37 @@ mod tests {
         assert_eq!(map.len(), 1);
     }
 
+    #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+    struct LastSlotKey(u64);
+
+    impl FlatKey for LastSlotKey {
+        fn flat_hash(self) -> u64 {
+            // Every key belongs in the last slot: the run of entries goes
+            // round the end of the table.
+            u64::MAX
+        }
+    }
+
+    /// `retain` shows every entry to its predicate once, also when removing
+    /// one moves entries from the start of the table to its end.
+    #[test]
+    fn retain_calls_its_predicate_once_for_each_entry() {
+        let mut flat = FlatMap::new();
+        for key in 0..8 {
+            flat.insert(LastSlotKey(key), ());
+        }
+        let mut calls = BTreeMap::new();
+        flat.retain(|key, ()| {
+            *calls.entry(*key).or_insert(0u32) += 1;
+            key.0 % 3 != 0
+        });
+        for key in 0..8 {
+            assert_eq!(calls.get(&LastSlotKey(key)), Some(&1));
+            assert_eq!(flat.contains_key(&LastSlotKey(key)), key % 3 != 0);
+        }
+        assert_eq!(flat.len(), 5);
+    }
+
     fn operation(epoch: u64, owner: u64, sequence: u64) -> OperationId {
         OperationId::new(
             StoreIncarnation::new(1),
