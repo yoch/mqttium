@@ -672,10 +672,16 @@ impl LogStore {
             return Ok(vec![UNKNOWN; commands.len()]);
         };
         let mut any_wrote = false;
+        let mut logged = to_log.iter().peekable();
         let replies: Vec<Applied> = commands
             .iter()
             .map(|c| {
+                let in_frame = logged.next_if(|l| std::ptr::eq(**l, *c)).is_some();
                 let res = self.store.apply(c);
+                // Which members need the frame was decided on the state
+                // before the group: no member may turn a settled one into
+                // a write.
+                debug_assert!(in_frame || !res.wrote, "a write outside its frame");
                 any_wrote |= res.wrote;
                 res
             })
@@ -1234,6 +1240,10 @@ fn replay_wal(
     Ok((pos, true))
 }
 
+/// Applies the records of one frame again. A frame whose call wrote nothing
+/// is cut from the log, but a crash before the cut leaves it: its replay is
+/// refused by the state as the call was, which is why a refusal here is not
+/// an error. A violation is: the state never accepted that record.
 fn replay_frame_body(body: &[u8], store: &mut VolatileStore) -> Result<(), OpenError> {
     let mut cur = Cursor::new(body);
     let count = cur.take_u16()?;
