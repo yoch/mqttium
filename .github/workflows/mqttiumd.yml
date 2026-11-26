@@ -172,8 +172,10 @@ jobs:
           python-version: "3.13"
       # The runner image provides a JDK; run_tlc.py pins and hash-checks TLC.
       - run: java -version
+      # -B: the checker is imported by its tests, and a __pycache__
+      # directory under models/ would be taken for a model directory.
       - name: The checker of the model files refuses what it claims to check
-        run: python models/test_check_models.py
+        run: python -B models/test_check_models.py
       - name: Model files are consistent
         run: python models/check_models.py
       - name: Model-check every directory of models
