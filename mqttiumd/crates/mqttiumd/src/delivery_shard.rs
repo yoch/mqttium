@@ -1481,6 +1481,10 @@ impl DeliveryShardWorker {
                             targets,
                         } => {
                             for target in targets {
+                                if self.pending_qos0.len() >= PENDING_QOS0_LIMIT {
+                                    self.shed_qos0(origin, target.target);
+                                    continue;
+                                }
                                 self.pending_qos0.push_back(PendingQos0Item {
                                     origin,
                                     target: target.target,
@@ -1606,6 +1610,24 @@ impl DeliveryShardWorker {
             }
         }
         Ok(())
+    }
+
+    /// Drops a delegated QoS 0 delivery the shard has no room to keep, as
+    /// the core drops one its volatile queue cannot hold, with the same
+    /// journal entry.
+    fn shed_qos0(&self, origin: Qos0Origin, target: SessionId) {
+        let _ = self.events.emit_with("qos0_dropped", || {
+            json!({
+                "details": {
+                    "target": target.get().to_string(),
+                    "reason": Qos0DropReason::CapacityExceeded.code(),
+                    "origin_kind": match origin {
+                        Qos0Origin::Volatile { .. } => "volatile",
+                        Qos0Origin::Consumed { .. } => "consumed",
+                    }
+                }
+            })
+        });
     }
 
     fn drain_pending_qos0(&mut self) -> Result<(), Failure> {
