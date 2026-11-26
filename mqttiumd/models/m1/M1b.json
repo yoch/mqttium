@@ -1,7 +1,7 @@
 {
   "module": "M1b.tla",
   "status": "specification",
-  "summary": "Admission under connection and session resets, capacity refusals, a fence racing an application and the change of epoch: no stale target, no execution in a closed epoch, a refusal that stays refused, obligations kept.",
+  "summary": "Admission under connection and session resets, capacity refusals, a fence racing an application and the change of epoch: no stale target, no execution in a closed epoch, a refusal that stays refused, obligations kept. A specification of one owner and one store, the shape of the default single-owner runtime; an admission that also carries delivery claims, and with --delivery-shards K >= 1 their reservation with the delivery shards, are outside it.",
   "issues": [647],
   "tests": [],
   "configs": [

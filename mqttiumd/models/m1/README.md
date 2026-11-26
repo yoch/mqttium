@@ -9,6 +9,22 @@ application, and the change of epoch.
 A model is evidence for a design. It is not a proof of the Rust code, of
 SQLite or of the hardware.
 
+## Scope
+
+`M1a` and `M1b` specify the admission of one owner against one store,
+which is the shape of the default runtime (`--delivery-shards 0`). They
+have no delivery claim: an admission that also carries one
+(`Recipe::ClaimedPublication`, `Recipe::MultiClaimedPublication`) is
+outside them in every mode, and so is, with `--delivery-shards K >= 1`
+(record 0066), the reservation of those claims by the Coordinator with
+the delivery shards (`InlineClaimOracle`).
+
+`M1Answers` refines the retention rule of `Answers`, code of the core
+that every owner runs. Its hypothesis I3 is an assumption on the store
+writer and its result channel. It is raised below for a writer with one
+request lane; the writer of the sharded mode, which serves 1 + K lanes
+and takes those of the shards first, was not examined against it.
+
 ## Running
 
 From the repository root, with Java 11 or newer. The runner pins and
@@ -238,17 +254,25 @@ deterministic tests of that file replay its witnesses (listed under
 
 | Core (`owner.rs`) | Model |
 | - | - |
-| `Answers::emitted`, the rank of the latest resolution | `n` |
-| `recent[rank % RECENT_RESOLUTIONS]` | `recent[m % R]` |
-| `landmarks[trailing_zeros(rank) % LANDMARK_RESOLUTIONS]`, for a power of two | `landmarks[Ctz(m) % L]` |
-| `Answers::names`: the Persist, `recent`, `landmarks` | `Held`, plus the Persist |
-| One resolution at each deadline of an unresolved operation | `EmitResolution` |
+| `Resolutions::emitted`, the rank of the latest resolution. `Answers::resolutions` holds the `Resolutions` of an operation, absent until its first resolution | `n` |
+| `Resolutions::recent`, slot `rank % RECENT_RESOLUTIONS` | `recent[m % R]` |
+| `Resolutions::landmarks`, slot `trailing_zeros(rank) % LANDMARK_RESOLUTIONS`, for a power of two | `landmarks[Ctz(m) % L]` |
+| `Resolutions::present`, one bit for each slot that was filled | A slot holds `None` until it is written |
+| `Answers::names`: the Persist (`Answers::persist`), `recent`, `landmarks`, compared by sequence within the epoch and the owner of the Persist | `Held`, plus the Persist |
+| `Answers::with`, called once at each deadline of an unresolved operation | `EmitResolution` |
 | A result applied when its effect is named, absorbed otherwise | `AnswerArrives` |
 
 `RECENT_RESOLUTIONS = 2` and `LANDMARK_RESOLUTIONS = 4` in the core. The
 configurations use those values, and a reduced form (R = 1, L = 2) that
 keeps the shape "powers of two". The window depends on ranks only: the
 model has no time.
+
+`Answers::with` retains nothing of a resolution whose epoch or owner is
+not that of the Persist, and does not count it. The model has no such
+resolution: it takes every resolution of an operation to be emitted by
+the owner that emitted its Persist, in the same epoch. An owner emits
+its effects under the one epoch it was built with, which no code of
+`owner.rs` assigns again.
 
 ### Hypothesis I3
 
@@ -338,7 +362,8 @@ not properties of the core. They are raised as an open condition.
    and `MaxUnknown` are unknown (a refused write of the fence).
 4. **Order.** Answers may arrive in any order and be repeated; nothing is
    assumed of FIFO delivery.
-5. **Not modelled.** The saturation of `emitted` at `u64::MAX`; the
+5. **Not modelled.** The saturation of `emitted` at the largest 64-bit
+   value (`saturating_add` in `Answers::with`); the
    bounded window of terminated operations (`retained_operations`, I4,
    I5): once resolved the model applies nothing more, and a
    contradicting result is the fault M1a checks (`KnowledgeSound`); the
@@ -440,7 +465,7 @@ sidecar lists no test until one does.
 | `FenceEstablish` (M1b) | Store side: second half of `ResolveAndFence` | QABS-A (commit returned), QABS-B (fence established) | Not replayed yet; L4 (L2 for the store alone) |
 | `FenceAbandon` (M1b) | Store side | QABS-C | Not replayed yet; L4 (L2 for the store alone) |
 | `EmitResolution` (M1Answers) | `command.indeterminate.timeout`: a deadline of an unresolved operation emits one resolution and arms the next deadline (`ResolveAndFence`, then `ArmDeadline`); `Answers::with` retains it | `FireDeadline` (record 0015) | `crates/mqttiumd-core/src/owner.rs`: `an_operation_retains_a_bounded_number_of_answers`, `resolutions_whose_answers_arrive_after_four_newer_ones_still_commit` |
-| `AnswerArrives` (M1Answers) | `command.indeterminate.result.committed` and `.rejected` when retained (`Answers::names`); absorbed otherwise; a late answer after the end is `command.committed.result.duplicate` or a fault (I4) | `DeliverHeldResult` (record 0015) | `owner.rs`: `resolutions_progress_when_their_answers_arrive_out_of_order`, `resolutions_progress_under_a_finite_lag_with_losses_and_duplicates`, `a_late_commit_after_a_refusal_of_one_admission_is_a_fault` |
+| `AnswerArrives` (M1Answers) | `command.indeterminate.result.committed` and `.rejected` when retained (`Answers::names`); absorbed otherwise; a late answer after the end is `command.committed.result.duplicate` or a fault (I4) | `DeliverHeldResult` (record 0015) | `owner.rs`: `resolutions_progress_when_their_answers_arrive_out_of_order`, `resolutions_progress_under_a_finite_lag_with_losses_and_duplicates`. The fault of a contradicting late answer is `a_late_commit_after_a_refusal_of_one_admission_is_a_fault`: the model has no contradicting answer, so that test is not one of its replays |
 | `AnswerLost` (M1Answers) | — | Fault `drop_result` at `store.result.ready` | `owner.rs`: `the_next_landmark_progresses_when_the_answer_of_one_is_lost` |
 | `Quiescent` | — | End of the run | Not an action of the product |
 

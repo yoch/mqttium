@@ -140,12 +140,33 @@ their named invariants; a syntax error, timeout or another failure is not a
 detection. Concrete successfully compiled code mutations are independent
 evidence and are not inferred from these finite specification mutations.
 
+## Scope
+
+The model has one owner and one allocator. That is the default runtime,
+`--delivery-shards 0`: every outgoing identifier of a session, for a claim
+made after a work read or carried by an admission
+(`Owner::plan_inline_claim`), comes from `Deliveries::free_packet_id` of
+the one owner.
+
+With `--delivery-shards K >= 1` (record 0066) a session has two
+allocators. The shard that owns the session uses the same
+`Deliveries::free_packet_id` in an `Owner` of its own. The Coordinator
+takes the identifier of a claim it carries in an admission from
+`InlineClaimLease::try_reserve`, a bitmap of 512 identifiers it shares with
+that shard, which clears a bit when the delivery ends. Which of the two may
+allocate at a given time is settled by the eligibility handshake of that
+record. Neither the lease nor the handshake is in this model, and no
+configuration here says anything about an identifier taken through them.
+
 ## Correspondence
 
 The owner predicates and named core tests are in
-[`owner/pubsub.rs`](../../crates/mqttiumd-core/src/owner/pubsub.rs). The TCP
-predicates are `Runtime::packet`, `Runtime::prune_outgoing_bindings` and
-`Sink::submit(EmitPublish)` in
+[`owner/pubsub.rs`](../../crates/mqttiumd-core/src/owner/pubsub.rs); the
+allocator itself is in
+[`owner/deliveries.rs`](../../crates/mqttiumd-core/src/owner/deliveries.rs).
+The TCP predicates are `Runtime::packet_at`,
+`Runtime::prune_outgoing_bindings` and `Sink::try_submit`, for
+`Effect::EmitPublish`, in
 [`runtime.rs`](../../crates/mqttiumd/src/runtime.rs); reader-channel regression
 tests are in [`runtime_tests.rs`](../../crates/mqttiumd/src/runtime_tests.rs).
 The exact finite minimum over PIs models the production allocator's policy;
@@ -154,18 +175,18 @@ not by an unbounded complexity claim from this tiny domain.
 
 | Model action | Implementation predicate | Replay |
 | - | - | - |
-| `Reserve` | `State::free_packet_id` and `State::reserves_packet_id` count all live claims. | `mut-occupied`, `reach-reuse`; `an_applied_finish_reuses_a_free_identifier_after_the_historical_ceiling`, `a_submitted_unknown_claim_reserves_its_identifier_before_any_publish_or_callback`. |
+| `Reserve` | `State::free_packet_id` hands over to `Deliveries::free_packet_id`, which returns the lowest identifier no delivery row of the session holds in a claim, whatever the phase of that row. It reads `SessionDeliveries::used_pi_mask`, kept by `SessionDeliveries::add_pi` and `SessionDeliveries::sub_pi` each time a row is indexed, while no two rows share an identifier; otherwise, and above 512, it scans the rows of the session with its local predicate `reserves`. | `mut-occupied`, `reach-reuse`; `an_applied_finish_reuses_a_free_identifier_after_the_historical_ceiling`, `a_submitted_unknown_claim_reserves_its_identifier_before_any_publish_or_callback`. |
 | `ClaimCommit` | Canonical guarded Claim commits with the original OperationId. | Safety configurations; store test `lost_claim_and_finish_reply_resolve_without_new_identity`. |
 | `ClaimKnown` | Validated direct result or same-operation resolution makes output eligible. | Safety configurations; core test `an_unknown_claim_keeps_its_packet_identifier_unavailable`. |
 | `RecoverClaim` | Complete recovery inventories stored outgoing claims before payload loading. | `reach-recovery-before-payload`; `the_complete_small_domain_counts_unknown_finish_and_unloaded_recovered_claims`. |
 | `RecoveryComplete` | Readiness waits for complete metadata, not only loaded payload pages. | Recovery configurations; store test `recovery_reserves_unloaded_claim_and_failed_finish_cannot_free_its_pi`. |
 | `LoadPayload` | Bounded work read supplies data without granting another PI. | Recovery configurations; `the_complete_small_domain_counts_unknown_finish_and_unloaded_recovered_claims`. |
-| `AcceptPublish` | `Sink::submit` registers accepted target before the outgoing queue transfer, rolling back refusal. | `reach-ack-before-written`; `a_valid_puback_can_precede_the_local_write_callback_and_duplicates_do_not_finish_twice`. |
+| `AcceptPublish` | `Sink::try_submit` registers accepted target before the outgoing queue transfer, rolling back refusal. | `reach-ack-before-written`; `a_valid_puback_can_precede_the_local_write_callback_and_duplicates_do_not_finish_twice`. |
 | `WirePublish` | Peer-visible PUBLISH remains distinct from local Written notification. | ACK-before-Written witness; independent raw-wire product reception. |
 | `CurrentWrittenCallback` | Correlated local frame result does not finish the obligation or free its PI. | Safety configurations; `a_valid_puback_can_precede_the_local_write_callback_and_duplicates_do_not_finish_twice`. |
 | `OldWrittenCallback` | Local callback lookup must match the exact effect and connection generation. | `mut-old-callback`; `old_finish_results_and_frame_callbacks_cannot_change_a_reused_slot`. |
 | `QueueRawAck` | Raw reader-channel input has no causal claim identity yet. | Safety configurations; runtime test `a_no_target_puback_observed_before_the_first_claim_cannot_bind_to_it_later`. |
-| `DequeueAck` | `Runtime::packet` copies an accepted-emission `PubackTarget`/None before enqueueing owner input. | Rebind/None configurations; runtime test `a_no_target_puback_observed_before_the_first_claim_cannot_bind_to_it_later`. |
+| `DequeueAck` | `Runtime::packet_at` copies an accepted-emission `PubackTarget`/None before enqueueing owner input. | Rebind/None configurations; runtime test `a_no_target_puback_observed_before_the_first_claim_cannot_bind_to_it_later`. |
 | `ReplayObservedCopy` | Reinject an authentic associated observation unchanged. | `reach-stale-copy`, `mut-rebind-copy`; `an_observed_puback_target_cannot_be_rebound_after_identifier_reuse`. |
 | `ProcessAck` | `Owner::plan_observed_puback` validates copied delivery/claim/frame/generation. | Both Rebind configurations; `an_immutable_target_requires_every_causal_identity_and_the_current_connection`, `an_observed_puback_without_a_target_cannot_acquire_a_future_claim`. |
 | `FinishCommit` | Guarded durable Finish can precede terminal-result knowledge. | `a_finish_committed_but_not_known_and_its_resolution_keep_the_identifier_reserved`. |
