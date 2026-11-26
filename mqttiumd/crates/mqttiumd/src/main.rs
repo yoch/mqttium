@@ -224,6 +224,18 @@ fn parse_arguments(args_iter: impl Iterator<Item = String>) -> Result<Config, St
                     }
                 }
             }
+            // Reached only when the guard of the option's own arm refused it.
+            "--db" | "--existing-db" => {
+                return Err("--db and --existing-db exclude each other".to_owned());
+            }
+            "--storage-mode"
+            | "--snapshot-interval"
+            | "--tls-cert"
+            | "--tls-key"
+            | "--client-ca"
+            | "--identities" => {
+                return Err(format!("{arg} is given more than once"));
+            }
             _ => return Err("unknown or unavailable option".to_owned()),
         }
     }
