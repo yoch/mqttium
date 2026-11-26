@@ -83,6 +83,9 @@ const WAL_HEADER_LEN: u64 = 24;
 const MIN_PREALLOC_CHUNK: u64 = 256 * 1024;
 const MAX_PREALLOC_CHUNK: u64 = 4 * 1024 * 1024;
 const MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
+/// The smallest unit a medium writes whole. A frame is written over
+/// several of them and a power loss keeps any subset.
+const SECTOR_BYTES: u64 = 512;
 const ENCODE_BUF_SHRINK_THRESHOLD: usize = 256 * 1024;
 
 const TAG_COMMAND: u8 = 1;
@@ -266,11 +269,12 @@ pub struct LogStore {
     sqlite_settings: Option<Settings>,
     lease: WriterLease,
     durability: Durability,
-    /// True after a SQLite checkpoint has replaced `<path>` on disk but the
-    /// matching fresh `.mlog` rotation has not yet completed. While set, all
-    /// durable appends fail closed so no commit can be confirmed onto a stale
-    /// or unlinked WAL descriptor.
-    wal_desynced: bool,
+    /// Log length at which the next checkpoint is attempted.
+    compact_at: u64,
+    /// The incarnation and revision of a checkpoint that replaced `<path>`
+    /// while its `.mlog` is still the log of the checkpoint before. Nothing
+    /// is appended to that log: the next write replaces it first.
+    rotation_due: Option<(StoreIncarnation, u64)>,
     #[cfg(feature = "log-write-points")]
     write_hook: Option<Box<dyn FnMut(LogWritePoint) + Send>>,
     encode_buf: Vec<u8>,
@@ -325,7 +329,8 @@ impl LogStore {
                 sqlite_settings: None,
                 lease,
                 durability: Durability::Available,
-                wal_desynced: false,
+                compact_at: DEFAULT_CHECKPOINT_BYTES,
+                rotation_due: None,
                 #[cfg(feature = "log-write-points")]
                 write_hook: None,
                 encode_buf: Vec::new(),
@@ -399,8 +404,6 @@ impl LogStore {
                 } else {
                     file_len
                 };
-                file.seek(SeekFrom::Start(valid_len))
-                    .map_err(OpenError::WriterLock)?;
                 (file, valid_len, alloc_len)
             }
         };
@@ -417,7 +420,8 @@ impl LogStore {
             sqlite_settings: Some(settings),
             lease,
             durability: Durability::Available,
-            wal_desynced: false,
+            compact_at: DEFAULT_CHECKPOINT_BYTES,
+            rotation_due: None,
             #[cfg(feature = "log-write-points")]
             write_hook: None,
             encode_buf: Vec::new(),
@@ -433,6 +437,7 @@ impl LogStore {
     /// Configures the automatic checkpoint compaction threshold in bytes.
     pub fn set_checkpoint_bytes(&mut self, bytes: u64) {
         self.checkpoint_bytes = bytes.max(WAL_HEADER_LEN);
+        self.compact_at = self.checkpoint_bytes;
     }
 
     /// Current `.mlog` byte length on disk.
@@ -470,18 +475,25 @@ impl LogStore {
     /// rooted at the new revision.
     pub fn compact(&mut self) -> Result<(), OpenError> {
         let state = self.store.snapshot().map_err(OpenError::Read)?;
-        let rev = state.revision;
-        let incarnation = state.ledger.incarnation();
         save_state_atomic(&self.path, &state, self.policy.as_ref(), &self.lease)?;
-        // Once the SQLite checkpoint has advanced on disk, `self.wal` no longer
-        // matches the checkpoint's base revision until replacement succeeds.
-        self.wal_desynced = true;
-        let fresh =
-            write_fresh_wal_atomic(&self.wal_path, incarnation, rev, self.policy.is_some())?;
-        self.wal = fresh;
+        self.rotation_due = Some((state.ledger.incarnation(), state.revision));
+        self.rotate()
+    }
+
+    /// Replaces the log by an empty one rooted at the checkpoint that made
+    /// it stale, if there is one. The state has not moved since that
+    /// checkpoint: no write is applied before its frame is in the log.
+    fn rotate(&mut self) -> Result<(), OpenError> {
+        let Some((incarnation, revision)) = self.rotation_due else {
+            return Ok(());
+        };
+        debug_assert_eq!(self.store.revision, revision);
+        self.wal =
+            write_fresh_wal_atomic(&self.wal_path, incarnation, revision, self.policy.is_some())?;
         self.wal_len = WAL_HEADER_LEN;
         self.wal_alloc_len = WAL_HEADER_LEN;
-        self.wal_desynced = false;
+        self.compact_at = self.checkpoint_bytes;
+        self.rotation_due = None;
         Ok(())
     }
 
@@ -494,7 +506,11 @@ impl LogStore {
             .wal_alloc_len
             .clamp(MIN_PREALLOC_CHUNK, MAX_PREALLOC_CHUNK);
         let cap = self.checkpoint_bytes.max(required);
-        let target = required.max(self.wal_alloc_len.saturating_add(chunk).min(cap));
+        // The file is longer than its allocated length only when a cut
+        // failed: the bytes it left are zero-filled with the rest.
+        let target = required
+            .max(self.wal_alloc_len.saturating_add(chunk).min(cap))
+            .max(self.wal.metadata()?.len());
         self.wal.seek(SeekFrom::Start(self.wal_alloc_len))?;
         let zeros = [0u8; 65_536];
         let mut written = self.wal_alloc_len;
@@ -505,15 +521,15 @@ impl LogStore {
         }
         self.wal.sync_all()?;
         self.wal_alloc_len = target;
-        self.wal.seek(SeekFrom::Start(self.wal_len))?;
         Ok(())
     }
 
     fn maybe_compact(&mut self) {
-        if self.wal_len >= self.checkpoint_bytes {
-            // Compaction failure must never invalidate an already-fdatasynced
-            // commit; the uncompacted `.mlog` stays valid and crash-recoverable.
-            let _ = self.compact();
+        if self.wal_len >= self.compact_at && self.compact().is_err() {
+            // The commit that brought the log here is synchronised and stays
+            // valid. An attempt writes the whole state: the next one waits
+            // for as much log again.
+            self.compact_at = self.wal_len.saturating_add(self.checkpoint_bytes);
         }
     }
 
@@ -537,13 +553,14 @@ impl LogStore {
     }
 
     /// Appends the prepared frame to `.mlog` and calls `sync_data()`.
-    /// On any I/O failure (or `Durability::Failing`), truncates `.mlog` back
-    /// to `prev_len` and returns `Err(())`. A frame recovery would refuse is
-    /// never written.
+    /// On any I/O failure (or `Durability::Failing`), cuts `.mlog` back to
+    /// `prev_len` and returns `Err(())`. A frame recovery would refuse is
+    /// never written, and nothing is written to a log a checkpoint made
+    /// stale until that log is replaced.
     fn flush_prepared_frame(&mut self) -> Result<u64, ()> {
         if self.durability == Durability::Failing
-            || self.wal_desynced
             || !self.prepared_frame_is_readable()
+            || self.rotate().is_err()
         {
             return Err(());
         }
@@ -556,7 +573,8 @@ impl LogStore {
         }
         let write_ok = self
             .ensure_preallocated(needed_end)
-            .and_then(|()| self.wal.write_all(&self.encode_buf))
+            .and_then(|()| self.wal.seek(SeekFrom::Start(prev_len)))
+            .and_then(|_| self.wal.write_all(&self.encode_buf))
             .and_then(|()| {
                 #[cfg(feature = "log-write-points")]
                 if let Some(hook) = self.write_hook.as_mut() {
@@ -581,19 +599,20 @@ impl LogStore {
                 Ok(prev_len)
             }
             Err(_) => {
-                let _ = self.wal.set_len(prev_len);
-                let _ = self.wal.sync_all();
-                let _ = self.wal.seek(SeekFrom::Start(prev_len));
-                self.wal_alloc_len = prev_len;
+                self.rollback_wal_to(prev_len);
                 Err(())
             }
         }
     }
 
+    /// Ends the log at `prev_len`. The cut of the file is an attempt: what
+    /// it leaves is beyond the allocated length, and `ensure_preallocated`
+    /// zero-fills it before another frame is written.
     fn rollback_wal_to(&mut self, prev_len: u64) {
-        let _ = self.wal.set_len(prev_len);
-        let _ = self.wal.sync_all();
-        let _ = self.wal.seek(SeekFrom::Start(prev_len));
+        let _ = self
+            .wal
+            .set_len(prev_len)
+            .and_then(|()| self.wal.sync_all());
         self.wal_len = prev_len;
         self.wal_alloc_len = prev_len;
     }
@@ -1113,6 +1132,7 @@ impl<'a> Cursor<'a> {
     }
 }
 
+/// Whether the file holds only zeros from `from` to `file_len`.
 fn remaining_is_all_zero(file: &mut File, from: u64, file_len: u64) -> Result<bool, OpenError> {
     if from >= file_len {
         return Ok(true);
@@ -1151,9 +1171,20 @@ fn replay_wal(
             .map_err(OpenError::WriterLock)?;
         let body_len = u32::from_be_bytes(len_bytes) as usize;
         if body_len == 0 {
-            // Pre-allocated zero-filled tail sentinel: every remaining byte must be zero.
+            // The zero-filled tail of the allocation.
             if remaining_is_all_zero(file, pos + 4, file_len)? {
                 return Ok((pos, true));
+            }
+            // Or a frame cut by a power loss that kept later sectors and
+            // lost its first. That sector then holds what it held before,
+            // zeros from here to its end, and what was kept lies within
+            // the reach of one frame. Anything else is damage.
+            let sector_end = (pos / SECTOR_BYTES + 1) * SECTOR_BYTES;
+            let frame_end = pos + 8 + MAX_FRAME_BYTES as u64;
+            if remaining_is_all_zero(file, pos + 4, sector_end.min(file_len))?
+                && remaining_is_all_zero(file, frame_end, file_len)?
+            {
+                return Ok((pos, false));
             }
             return Err(OpenError::Corrupt);
         }
