@@ -162,7 +162,7 @@ message queued under a hold whose wake-up is given at the release.
 
 The assumption "a hold lasts one pass of its producer" is false of one
 caller. `DeliveryShardWorker::run_loop`, which runs only with
-`--delivery-shards K >= 1`, takes `net::hold_wakes()` at the top of each
+`--delivery-shards K >= 1`, takes `hold_wakes` of `net.rs` at the top of each
 iteration and waits at the bottom of the same iteration, when the pass
 made no progress, with the guard still alive: `Wake::wait` for at most
 `IDLE_TICK` (20 ms), or `BACKPRESSURE_TICK` (1 ms) while it has work it
@@ -287,7 +287,7 @@ requirement.
 | `ConsumerClear` | `MWake` | None: only the mutant `ClearAfterPass` reaches it (`Wake::take` exists and is not called by the loops) | No deterministic replay |
 | `ConsumerLock`, `ConsumerCheck` | `MWake` | `lock.lock()` and `pending.swap(false)` in `Wake::wait` | `a_signal_raised_before_the_wait_is_consumed_without_waiting` |
 | `ConsumerRelock` | `MWake` | The return of `ready.wait_timeout` in `Wake::wait` | `a_signal_from_another_thread_ends_the_wait_early` |
-| `ProducerHold` | `MReactorWake` | `Reactors::hold`: `Shared::hold`, `held.store(true)`; `net::hold_wakes` in `Runtime::turn` | `a_held_wake_up_is_given_when_the_hold_ends` (`net/reactor.rs`) |
+| `ProducerHold` | `MReactorWake` | `Reactors::hold`: `Shared::hold`, `held.store(true)`; `hold_wakes` of `net.rs`, called by `Runtime::turn` | `a_held_wake_up_is_given_when_the_hold_ends` (`net/reactor.rs`) |
 | `ProducerPreload` | `MReactorWake` | None: only the mutant `CheckBeforePush` reaches it | No deterministic replay |
 | `ProducerPush`, `ProducerOwe`, `ProducerReadHeld` | `MReactorWake` | `Shared::send`: push under the queue lock, `owing.store(true)`, `held.load()` | `a_held_wake_up_is_given_when_the_hold_ends`: a notification under a hold; the lost-message interleavings have no deterministic replay |
 | `ProducerRelease` | `MReactorWake` | The drop of the guard of `Reactors::hold`: `Shared::release`, `held.store(false)`, then `kick` | `a_held_wake_up_is_given_when_the_hold_ends`; a release that comes only after a wait (`hold-kept-liveness`) has no deterministic replay |

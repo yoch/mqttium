@@ -26,7 +26,7 @@ With `--delivery-shards K >= 1` (record 0066):
 - `MQos0Window` does not describe that mode. The Coordinator hands a
   volatile QoS 0 publication to the shards (`Change::Qos0Delegated` in
   `Owner::plan_qos0_packet`), each shard paces it in an `Owner` of its own
-  (`Owner::step_shard_qos0`) and gets its write receipts through
+  (`step_shard_qos0` in `owner/shard.rs`) and gets its write receipts through
   `ShardInbox`. None of that is modelled.
 
 ## Running
@@ -51,7 +51,7 @@ work. Two packets or two byte units fit behind the waiting publication.
 
 The product keeps `BEHIND_PACKETS` = 32 packets and `BEHIND_BYTES` = the
 bytes of one largest packet behind it, on a window of
-`receiving::MAXIMUM` = 8 slots. Byte units stand for encoded body sizes;
+`MAXIMUM` = 8 slots (`receiving.rs`). Byte units stand for encoded body sizes;
 the comparison is checked at equality and past it.
 
 A slot is `RecQueued` (the PUBREC is not written yet: `ReceiveStep::Pubrec`),
@@ -80,8 +80,9 @@ bound, a close at the byte bound and an admission after a release.
 ## MSessionQuota
 
 Two sessions, a bound of one QoS 2 exchange each (the product sets
-`OwnerConfig::session_qos2_exchanges` to `receiving::MAXIMUM` = 8), two
-packet identifiers, two connection generations.
+`OwnerConfig::session_qos2_exchanges` to the window of a connection,
+`MAXIMUM` = 8 in `receiving.rs`), two packet identifiers, two connection
+generations.
 
 An exchange is `Admitting` (the result of its admission is awaited, or its
 first PUBREC is held behind an earlier answer), `AwaitRel`
