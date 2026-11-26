@@ -77,10 +77,12 @@ cargo build --locked -p mqttiumd
 python -m pip install -r tests/system/requirements.txt
 ```
 
-Two options size and observe the executable (records 0044 and 0046):
+Three options size and observe the executable (records 0044, 0046 and
+0066):
 
 | Option | Values | Default |
 | - | - | - |
+| `--delivery-shards K` | 0 to 16. With `K >= 1`, deliveries to subscribers are served by `K` more threads, each the owner of the sessions it is given. **Experimental**: the readiness line says so; the protocol between the threads has no model yet, and its open conditions are listed in `docs/reception/open-conditions.md` | 0: one owner, the runtime of record 0044 |
 | `--max-connections N` | 1 to 4,096, the number of durable sessions; another value is refused | 4,096; 16 in a build with `test-hooks`, the profile of the earlier receptions |
 | `--event-level LEVEL` | `ops` writes lifecycle, refusal and fault records and counts every per-message observation in one `counters` record per second; `audit` writes every record | `ops`; `audit` in a build with `test-hooks` |
 

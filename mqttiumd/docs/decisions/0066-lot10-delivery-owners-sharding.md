@@ -52,6 +52,41 @@ The mode stays experimental until the defects and suspects listed in
 `docs/reception/open-conditions.md` are closed and the coordinator and
 shard protocol has a model.
 
+### Corrected since (lot 3 of the validation, first part)
+
+Each by a test committed while it failed, then the fix:
+
+- A shard thread runs its loop under `catch_unwind`; a panic is reported
+  to the coordinator as the fault `delivery_shard_panicked` and the broker
+  stops, instead of leaving the shard's sessions without deliveries.
+- The stop of a shard is a flag, read when its lane is empty, instead of
+  a message a full lane could drop. The shard still ends without applying
+  acknowledgements it received and had not applied; their deliveries are
+  sent again on the next connection.
+- A shard releases the reactors' wake-ups before it waits, as
+  `Runtime::turn` does; the fairness model reactor-wake assumes now holds
+  for every holder.
+- A connection the shards cannot attach (no session revision, or a second
+  attach of one generation) is closed with a reason that names the cause.
+- A shard keeps at most `PENDING_QOS0_LIMIT` (4,096) delegated QoS 0
+  deliveries its core cannot take yet, and sheds the next ones with the
+  journal entry the core gives a QoS 0 its volatile queue cannot hold.
+- The count of claims in flight on a lease never wraps below zero.
+- The route of a connection to its shard is boxed: a connection without
+  shards pays a pointer for it, not 112 bytes.
+- The readiness line ends with `delivery_shards=K experimental`.
+
+**The coordinator's send to a shard stays blocking, for a reason.** A
+shard waits only for a bounded time and empties its lane at each pass,
+moving what it cannot serve yet into queues that are now bounded by
+shedding, not by refusing the lane; a shard that dies is reported (first
+item above), and the send then fails instead of waiting. The send can
+therefore wait only while a live shard is between two passes. Bounding
+the shard by leaving its lane full instead would turn into a cycle: the
+coordinator waits for the shard, the shard for the store worker, and the
+worker, which takes no request while a reply lane is full, for the
+coordinator.
+
 ## Context
 
 In Lot 9 (record [0065](0065-lot9-refusals-fairness-and-atomic-fanout.md), report [0040](../reports/0040-lot9-arm64-fairness-fanout-and-sharding.md)), ARM64 `perf` profiling after atomic `1:N` `Recipe::MultiClaimedPublication` showed that the single `Owner` thread consumed **100 % of 1 core** (`65–92 %` of all broker CPU) on high fan-out (`fanout-1x16`) and high-concurrency (`128p`) workloads, while `log-writer` used only `~22–24 %` and the two I/O reactor threads combined used `~8–20 %`. Roughly `70–75 %` of the single Owner thread's CPU on `1:16` fan-out was pure recipient-side work (`EmitPublish`, `ObservedPuback`, `FinishDelivery`, `Deliveries` index maintenance, and `LoadWork` pagination).
