@@ -264,7 +264,7 @@ class Run:
                 inner = recipe
                 if isinstance(inner, recipes.AnnotatedPublication):
                     inner = inner.inner
-                if isinstance(inner, recipes.RetainedPublication):
+                if isinstance(inner, (recipes.RetainedPublication, recipes.ClaimedPublication)):
                     inner = inner.admission
                 if not isinstance(inner, (recipes.Admit, recipes.Release)):
                     # New product recipes are readable descriptive evidence;
