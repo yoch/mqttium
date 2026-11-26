@@ -1,7 +1,7 @@
 {
   "module": "MQos0Window.tla",
   "status": "refinement",
-  "summary": "Per-subscriber volatile output, bounded parking, written receipts, FIFO and service for a fast subscriber while another socket stalls.",
+  "summary": "The window of volatile live QoS 0 frames of one connection in the owner of the default single-owner runtime (Owner::plan_qos0_continue, VolatileQueue; record 0063): a bounded window released by write receipts, bounded parking that drops the newest, the wire order of each connection, and service of a fast subscriber while another socket stalls. With --delivery-shards K >= 1 volatile QoS 0 is delegated to the delivery shards and is outside the model.",
   "issues": [
     672
   ],
@@ -23,6 +23,7 @@
       "test": "a_qos0_burst_waits_for_the_output_of_its_subscriber_and_keeps_its_order"
     }
   ],
+  "not_replayed": "No test drives a mutant: the tests state the order and the bounds of the unmutated code. The control frame that competes for the output queue (Control, mut-window) has no deterministic replay; the room it needs is the compile-time assertion QOS0_WINDOW + QOS0_OUTPUT_RESERVE == OUTPUT_SLOTS in net.rs.",
   "configs": [
     {
       "config": "MQos0Window-safety.cfg",
@@ -50,6 +51,11 @@
     },
     {
       "config": "MQos0Window-mut-order.cfg",
+      "expect": "violation",
+      "invariant": "Ordered"
+    },
+    {
+      "config": "MQos0Window-mut-pass-parked.cfg",
       "expect": "violation",
       "invariant": "Ordered"
     },

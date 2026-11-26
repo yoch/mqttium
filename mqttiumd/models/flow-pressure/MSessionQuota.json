@@ -1,7 +1,7 @@
 {
   "module": "MSessionQuota.tla",
   "status": "refinement",
-  "summary": "QoS 2 slot ownership across a persistent reconnect, with owner-driven admission and release distinct from a client-owed PUBREL.",
+  "summary": "The bound of inbound QoS 2 exchanges one session holds across its connections (Owner::plan_admission, slots_by_session; record 0061): an exchange counts whatever connection opened it, a publication at the bound waits while the owner is admitting or releasing one of them, and the connection is closed only when every one awaits the PUBREL of the client. The admission of one owner, the single owner of the default runtime; the wait of the runtime (CAPACITY_WAIT) is outside, and with --delivery-shards K >= 1 the same admission runs in the Coordinator and was not examined there.",
   "issues": [
     672
   ],
@@ -16,16 +16,21 @@
     },
     {
       "file": "mqttiumd/crates/mqttiumd/tests/reactor_wake.rs",
+      "test": "stale_qos2_exchanges_of_a_3_1_1_session_are_bounded_and_lose_no_publication"
+    },
+    {
+      "file": "mqttiumd/crates/mqttiumd/tests/reactor_wake.rs",
       "test": "one_session_cannot_hold_the_inbound_exchanges_of_every_client"
     }
   ],
+  "not_replayed": "reach-peer ends with the neighbour releasing an exchange while the first session is full. The tests admit the neighbour (PUBREC) and do not drive its PUBREL: that last step has no deterministic replay.",
   "configs": [
     {
       "config": "MSessionQuota-safety.cfg",
       "expect": "pass",
       "invariants": [
         "PerSession",
-        "NoPrematureRefusal"
+        "RefusedSessionOnlyOwes"
       ]
     },
     {
@@ -36,7 +41,7 @@
     {
       "config": "MSessionQuota-mut-refusal.cfg",
       "expect": "violation",
-      "invariant": "NoPrematureRefusal"
+      "invariant": "RefusedSessionOnlyOwes"
     },
     {
       "config": "MSessionQuota-reach-peer.cfg",
