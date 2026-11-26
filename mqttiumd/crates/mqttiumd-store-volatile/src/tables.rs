@@ -298,7 +298,8 @@ impl SessionTable {
 ///
 /// Monotonic FIFO QoS 1 traffic stays in `Small(VecDeque)` with O(1) push-back
 /// and O(1) pop-front and zero allocations after warm-up, spilling cleanly to
-/// `Large(BTreeSet)` only when a session accumulates more than 32 obligations.
+/// `Large(BTreeSet)` only when a session accumulates more than
+/// `PROMOTE_THRESHOLD` obligations.
 #[derive(Clone, Debug)]
 pub(crate) enum SessionObligations {
     Small(VecDeque<DeliveryId>),
@@ -500,7 +501,7 @@ impl<V> OriginOpTable<V> {
 
     #[inline]
     fn find_hot(&self, scope: (StoreIncarnation, RunEpoch, LogicalOwnerId)) -> Option<usize> {
-        // Common case: small number of owners (1..=16) scanned linearly in L1 cache.
+        // Common case: a few owners, scanned linearly.
         self.hot.iter().position(|r| r.scope == scope)
     }
 

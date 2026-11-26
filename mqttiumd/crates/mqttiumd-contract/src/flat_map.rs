@@ -3,12 +3,14 @@
 //!
 //! Designed strictly for `#![no_std]` + `alloc` + `#![forbid(unsafe_code)]`
 //! point-lookup tables inside the pure core, runtime, and in-memory store:
-//! - Uses a deterministic SplitMix64 bit-mixer (zero randomness, zero `std`).
+//! - Uses a deterministic Fibonacci multiply-shift mixer (zero randomness, zero
+//!   `std`).
 //! - Uses backward-shift deletion instead of tombstones so high-churn steady-
 //!   state tables (in-flight slots, deliveries, frames, obligations) never
 //!   degrade or allocate after warm-up.
-//! - Never used where iteration order determines protocol output or range
-//!   queries are required (those remain in `BTreeMap` / `ScopedMap`).
+//! - Its iteration order is that of the table, not of the keys: a reader
+//!   whose output depends on order sorts what it reads, and a table that
+//!   needs range queries stays in `BTreeMap` / `ScopedMap`.
 
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;

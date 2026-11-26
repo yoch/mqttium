@@ -14,7 +14,7 @@ Because `mqttiumd-core` already freezes every irreversible state transition into
    - `LogStore` pairs the indexed in-memory state machine `VolatileStore` (record 0052) with an append-only binary WAL file `<db>.mlog` alongside the Schema-14 / Schema-15 SQLite checkpoint `<db>`.
    - Exclusive writer ownership is enforced through the same `WriterLease` (`.writer-lock`) used by `SqliteStore` and `VolatileHandle`.
    - Binary `.mlog` format (`v1`):
-     - 24-byte file header: magic `b"MQDL"`, version `u16` (`1`), reserved `u16` (`0`), store incarnation `u64`, checkpoint `base_revision: u64` (big-endian).
+     - 24-byte file header: magic `b"MQLG"`, version `u16` (`1`), reserved `u16` (`0`), store incarnation `u64`, checkpoint `base_revision: u64` (big-endian).
      - Each committed transaction/group appends a single framed record: `[body_len: u32][record_count: u16][records...][crc32c: u32]` written via sequential `pwrite`/`write_all` followed by a single `fdatasync` before returning outcomes to callers.
      - Integrity checksums use Castagnoli CRC32C implemented in `#![forbid(unsafe_code)]` Rust with a compile-time Slice-by-8 lookup table (`CRC32C_TABLES`).
      - Supported record tags cover the complete `DurableStore` mutation surface: `Command` (canonical recipe + payload bytes), `ResolveAndFence`, `OpenEpoch`, `AdminCommand`, `CollectReceipts`, `CollectClosedReceipts`, and `CheckpointClock`.
