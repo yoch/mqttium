@@ -476,6 +476,47 @@ mod tests {
         }
     }
 
+    /// An option the parser knows but refuses here is named in the refusal,
+    /// not reported as unknown.
+    #[test]
+    fn a_known_option_refused_here_is_named() {
+        let refusal = |args: &[&str]| {
+            parse_arguments(args.iter().map(|arg| (*arg).to_owned()))
+                .err()
+                .unwrap_or_default()
+        };
+        assert_eq!(
+            refusal(&["--db", "a.sqlite", "--existing-db", "b.sqlite"]),
+            "--db and --existing-db exclude each other"
+        );
+        assert_eq!(
+            refusal(&["--existing-db", "a.sqlite", "--db", "b.sqlite"]),
+            "--db and --existing-db exclude each other"
+        );
+        for option in [
+            "--storage-mode",
+            "--snapshot-interval",
+            "--tls-cert",
+            "--tls-key",
+            "--client-ca",
+            "--identities",
+        ] {
+            let value = if option == "--snapshot-interval" {
+                "5"
+            } else {
+                "durable"
+            };
+            assert_eq!(
+                refusal(&["--db", "a.sqlite", option, value, option, value]),
+                format!("{option} is given more than once")
+            );
+        }
+        assert_eq!(
+            refusal(&["--db", "a.sqlite", "--no-such-option", "x"]),
+            "unknown or unavailable option"
+        );
+    }
+
     #[test]
     fn storage_mode_cli_is_explicit_and_never_degrades_silently() {
         let base = [
