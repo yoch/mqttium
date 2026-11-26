@@ -423,6 +423,23 @@ struct OutgoingState {
     /// Saturating count of popped outgoing frames; while `< 3` (CONNACK
     /// handshake / idle phase) an empty queue frees its backing buffer.
     sent_seen: u8,
+    /// SUBSCRIBE packets of this connection the coordinator has read and
+    /// whose SUBACK it has not queued yet. A delivery shard queues nothing
+    /// while it is not zero: the store may answer the shard's read of the
+    /// session after the subscription committed, and the frames the single
+    /// owner emits after that commit follow its SUBACK. The input lane of a
+    /// connection bounds it far below its saturation.
+    subacks_owed: u16,
+}
+
+/// Who queues a frame on a connection, for the order of a SUBACK.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Producer {
+    Coordinator,
+    /// The coordinator's SUBACK: queuing it pays one SUBACK owed.
+    CoordinatorSuback,
+    /// A delivery shard, which waits for every SUBACK owed.
+    Shard,
 }
 
 impl OutgoingState {
@@ -707,9 +724,12 @@ pub struct OutgoingHandle {
 }
 
 impl OutgoingHandle {
+    /// Queues a frame of the shard, after every SUBACK the coordinator owes
+    /// this connection: until then the frame is refused as `Full`, and the
+    /// shard keeps it as it keeps any frame refused for want of room.
     #[inline]
     pub fn try_send_outgoing(&self, frame: Write) -> Result<(), TrySendError<Write>> {
-        self.core.try_send_outgoing(frame)
+        self.core.try_send(frame, Producer::Shard)
     }
 
     /// Only the owning shard admits its correlated writes. I/O threads can
@@ -862,6 +882,7 @@ impl ConnCore {
                 tx_alive: true,
                 accepting_frames: true,
                 sent_seen: 0,
+                subacks_owed: 0,
             }),
             #[cfg(test)]
             changed: Condvar::new(),
@@ -936,6 +957,18 @@ impl ConnCore {
     }
 
     pub(super) fn try_send_outgoing(&self, frame: Write) -> Result<(), TrySendError<Write>> {
+        self.try_send(frame, Producer::Coordinator)
+    }
+
+    /// Records a SUBSCRIBE read by the coordinator, whose SUBACK frames of
+    /// a delivery shard will wait for.
+    pub(super) fn owe_suback(&self) {
+        if let Ok(mut state) = self.outgoing.lock() {
+            state.subacks_owed = state.subacks_owed.saturating_add(1);
+        }
+    }
+
+    fn try_send(&self, frame: Write, producer: Producer) -> Result<(), TrySendError<Write>> {
         let mut state = match self.outgoing.lock() {
             Ok(guard) => guard,
             Err(_) => return Err(TrySendError::Disconnected(frame)),
@@ -943,7 +976,9 @@ impl ConnCore {
         if !state.accepting_frames {
             return Err(TrySendError::Disconnected(frame));
         }
-        if state.queue.len() >= OUTPUT_SLOTS {
+        if state.queue.len() >= OUTPUT_SLOTS
+            || (producer == Producer::Shard && state.subacks_owed != 0)
+        {
             #[cfg(test)]
             if let Some(held) = state.held.as_mut()
                 && let Some((id, _)) = frame.correlation
@@ -963,6 +998,11 @@ impl ConnCore {
             return Err(TrySendError::Full(frame));
         }
         state.enqueue(frame);
+        if producer == Producer::CoordinatorSuback {
+            // Queued under the lock a shard takes before it reads the
+            // count: a frame of the shard that sees it paid follows it.
+            state.subacks_owed = state.subacks_owed.saturating_sub(1);
+        }
         drop(state);
         #[cfg(test)]
         self.changed.notify_all();
@@ -2218,6 +2258,21 @@ impl Connection {
         {
             self.core.try_send_outgoing(frame)
         }
+    }
+
+    /// Records a SUBSCRIBE read on this connection: frames of a delivery
+    /// shard wait until its SUBACK is queued by `try_send_suback`.
+    pub fn owe_suback(&self) {
+        self.core.owe_suback();
+    }
+
+    /// Queues the SUBACK of a SUBSCRIBE recorded by `owe_suback`.
+    pub fn try_send_suback(&self, frame: Write) -> Result<(), TrySendError<Write>> {
+        #[cfg(test)]
+        if let OutboundTx::Std(_) = &self.outgoing.sender {
+            return self.outgoing.try_send(frame);
+        }
+        self.core.try_send(frame, Producer::CoordinatorSuback)
     }
 
     #[inline]

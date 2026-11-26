@@ -1537,6 +1537,7 @@ impl Runtime<'_> {
     /// on a later turn.
     fn serve_requests(&mut self, generation: ConnectionGeneration) -> Result<(), Failure> {
         let room = self.ordinary_room();
+        let shards_active = self.shards.is_some();
         let Some(p) = self.peers.get_mut(&generation) else {
             return Ok(());
         };
@@ -1591,16 +1592,19 @@ impl Runtime<'_> {
         if bytes.len() > p.max_packet as usize {
             return self.close(generation, "outgoing_packet_limit");
         }
-        if p.io
-            .try_send_outgoing(net::Write {
-                expiry: None,
-                correlation: None,
-                bytes: net::FrameBytes::from(bytes),
-                payload: None,
-                report: net::WriteReport::None,
-            })
-            .is_ok()
-        {
+        let write = net::Write {
+            expiry: None,
+            correlation: None,
+            bytes: net::FrameBytes::from(bytes),
+            payload: None,
+            report: net::WriteReport::None,
+        };
+        let sent = if shards_active && !requests.unsubscribe {
+            p.io.try_send_suback(write)
+        } else {
+            p.io.try_send_outgoing(write)
+        };
+        if sent.is_ok() {
             let notify_session = (!requests.unsubscribe).then_some(p.session).flatten();
             cold.requests = None;
             p.gc_cold();
@@ -4592,6 +4596,7 @@ impl Runtime<'_> {
             other => other,
         };
         let started = self.started;
+        let shards_active = self.shards.is_some();
         let p = self
             .peers
             .get_mut(&generation)
@@ -4612,6 +4617,9 @@ impl Runtime<'_> {
             } => {
                 if !p.connected {
                     return self.close(generation, "packet_before_connack");
+                }
+                if shards_active && !unsubscribe {
+                    p.io.owe_suback();
                 }
                 let cold = p.cold_mut();
                 if cold.requests.is_some() {
@@ -4688,6 +4696,9 @@ impl Runtime<'_> {
             Packet::Core(packet) => {
                 if !p.connected {
                     return self.close(generation, "packet_before_connack");
+                }
+                if shards_active && matches!(packet, InboundPacket::Subscribe { .. }) {
+                    p.io.owe_suback();
                 }
                 p.ingress = p
                     .ingress
@@ -7013,13 +7024,19 @@ impl EffectSink for Sink<'_, '_> {
                 } else {
                     net::WriteReport::Complete
                 };
-                match peer.io.try_send_outgoing(net::Write {
+                let write = net::Write {
                     expiry: None,
                     correlation: Some((id, connection)),
                     bytes,
                     payload: None,
                     report,
-                }) {
+                };
+                let sent = if self.shards_active && kind == "SUBACK" {
+                    peer.io.try_send_suback(write)
+                } else {
+                    peer.io.try_send_outgoing(write)
+                };
+                match sent {
                     Ok(()) => {
                         if let Some((key, target)) = binding {
                             self.outgoing_bindings.insert(key, target);
