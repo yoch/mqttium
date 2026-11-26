@@ -405,3 +405,121 @@ fn a_published_lease_keeps_the_identifier_of_a_waiting_committed_claim() {
     assert_ne!(reserved, Some(pi));
     socket.close();
 }
+
+/// While the coordinator holds an identifier it reserved in the lease for an
+/// inline claim whose admission is pending, a dirty event still makes the
+/// shard read the session's work (`dirty_seq` 0: the barrier waits for the
+/// pending claim). What the shard claims then must not take that identifier:
+/// the claim would collide, in the shard, with the coordinator's once it
+/// commits.
+#[test]
+fn a_shard_claim_takes_no_identifier_the_coordinator_reserved() {
+    let Harness {
+        incarnation,
+        epoch,
+        mut worker,
+        commands,
+        events,
+        _lanes: (requests, reply, _control, _control_reply),
+    } = harness("shard-claim-identifier");
+    std::fs::remove_file(&events).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let _client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+    let socket = net::spawn(listener.accept().unwrap().0).unwrap();
+    let session = SessionId::new(1);
+    let generation = ConnectionGeneration::new(10);
+    let lease = InlineClaimLease::new();
+    let dirty_seq = lease.mark_dirty();
+    commands
+        .send(CoordToShard::Attach {
+            session,
+            revision: Revision::new(1),
+            generation,
+            receive_maximum: 8,
+            maximum_packet_size: 1024,
+            version: Version::V5,
+            outgoing: socket.outgoing_handle(),
+            lease: Arc::clone(&lease),
+            dirty_seq,
+        })
+        .unwrap();
+    let mut answer = |worker: &mut DeliveryShardWorker,
+                      items: Vec<mqttiumd_contract::pubsub::WorkItem>| {
+        worker.drain_coord_messages().unwrap();
+        worker.drain_inputs().unwrap();
+        worker.dispatch().unwrap();
+        let Ok(Request::Effect(load)) = requests.try_recv() else {
+            panic!("no work was read");
+        };
+        assert!(matches!(load.effect(), Effect::LoadWork { .. }));
+        let count = items.len();
+        let mut page = BoundedVec::with_capacity(count.max(1)).unwrap();
+        for item in items {
+            assert!(page.try_push(item).is_ok());
+        }
+        reply
+            .send(Response::Work {
+                effect: load.id(),
+                session,
+                result: Ok(mqttiumd_store_api::WorkPage {
+                    items: page,
+                    next: None,
+                }),
+            })
+            .unwrap();
+        worker.drain_store_replies().unwrap();
+        worker.drain_inputs().unwrap();
+        worker.dispatch().unwrap();
+        requests.try_iter().find_map(|request| match request {
+            Request::Effect(effect) => match effect.effect() {
+                Effect::Persist { command } => match command.recipe.get() {
+                    Recipe::ClaimDelivery(claim) => Some(claim.packet_id),
+                    _ => None,
+                },
+                _ => None,
+            },
+            _ => None,
+        })
+    };
+    assert_eq!(answer(&mut worker, Vec::new()), None);
+
+    // The coordinator reserves an identifier for an inline claim; its
+    // admission is pending when a dirty event marks the lease.
+    let (_, reserved) = lease.try_reserve().expect("the lease was published");
+    let _ = lease.mark_dirty();
+    commands
+        .send(CoordToShard::NotifyDirty {
+            session,
+            dirty_seq: 0,
+            clear_known_through: false,
+        })
+        .unwrap();
+    let bytes = |s| SharedBytes::copy_from(s, 1024).unwrap();
+    let unclaimed = mqttiumd_contract::pubsub::WorkItem {
+        delivery: DeliveryId {
+            publication: PublicationId::new(
+                incarnation,
+                epoch,
+                LogicalOwnerId::new(0),
+                PublicationSeq::new(5),
+            ),
+            index: 0,
+        },
+        target: session,
+        target_revision: Revision::new(1),
+        qos: Qos::AtLeastOnce,
+        cause: DeliveryCause::LiveExact,
+        retain: false,
+        expiry: None,
+        properties: None,
+        topic: bytes(b"t"),
+        payload: bytes(b"p"),
+        claim: None,
+    };
+    let claimed = answer(&mut worker, vec![unclaimed]).expect("the shard claimed nothing");
+    assert_ne!(
+        claimed, reserved,
+        "the shard took an identifier the coordinator reserved"
+    );
+    socket.close();
+}
