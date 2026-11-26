@@ -2347,6 +2347,17 @@ impl Connection {
         self.core.outgoing.lock().unwrap().held.as_ref()?.refused
     }
 
+    /// The first byte of each frame waiting in the output queue, in order.
+    #[cfg(test)]
+    pub fn queued_first_bytes(&self) -> Vec<u8> {
+        let state = self.core.outgoing.lock().unwrap();
+        state
+            .queue
+            .iter()
+            .filter_map(|frame| frame.bytes.first().copied())
+            .collect()
+    }
+
     #[cfg(test)]
     pub fn pause_wire_progress(&self, pause: bool) {
         self.core.pause_progress.store(pause, Ordering::Release);

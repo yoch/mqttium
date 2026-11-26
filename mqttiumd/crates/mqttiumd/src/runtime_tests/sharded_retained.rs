@@ -37,6 +37,90 @@ fn live_marker(
     (0x30, vec![0, 1, b't', 0, byte])
 }
 
+/// The store may answer a read of the shard after the commit of a
+/// subscription whose SUBACK the coordinator has not queued yet: the read a
+/// shard makes when a session attaches, or any later one, travels on a lane
+/// of its own. No frame of the shard enters the connection's queue before
+/// that SUBACK, as no frame of the single owner does.
+#[test]
+fn a_shard_frame_does_not_overtake_the_suback_of_its_connection() {
+    with_runtime_layout(
+        128,
+        TestWriter::Sharded(NonZeroUsize::new(2).unwrap()),
+        Hooks::default(),
+        |runtime, directory| {
+            let (source, mut publisher) = connected(runtime, b"fence-source");
+            let (reader, mut client) = connected(runtime, b"fence-reader");
+            runtime.packet(source, 0x33, publish_body(1)).unwrap();
+            assert_eq!(
+                served_frame(runtime, &mut publisher),
+                (0x40, vec![0, 1, 0x10])
+            );
+            let session = runtime.peers[&reader].session.unwrap();
+            let index = runtime.shards.as_ref().unwrap().shard_index(session);
+            let owner = LogicalOwnerId::new(index as u64 + 1);
+            runtime.peers[&reader].io.hold_output(true);
+
+            // The coordinator reads the SUBSCRIBE and submits its command,
+            // and does not look at the result.
+            subscribe(runtime, reader, 1);
+            runtime.drain_inputs().unwrap();
+            runtime.dispatch().unwrap();
+            let committed = || {
+                std::fs::read_to_string(directory.join("events.jsonl"))
+                    .unwrap()
+                    .lines()
+                    .any(|line| {
+                        line.contains("\"store_result\"") && line.contains("\"Subscriptions\"")
+                    })
+            };
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !committed() {
+                assert!(
+                    Instant::now() < deadline,
+                    "the subscription was not committed"
+                );
+                thread::sleep(Duration::from_millis(1));
+            }
+
+            // The shard reads the session's work after the commit. Its
+            // replay is either queued, which is the defect, or held back.
+            runtime
+                .shards
+                .as_mut()
+                .unwrap()
+                .notify_dirty(session, false, 0);
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                let queued = runtime.peers[&reader].io.queued_first_bytes();
+                assert!(
+                    queued.is_empty(),
+                    "a frame of the shard entered the queue before the SUBACK: {queued:x?}"
+                );
+                if runtime.peers[&reader].io.held_output_refusal() == Some((0x31, owner)) {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "the shard did not try its replay"
+                );
+                thread::sleep(Duration::from_millis(1));
+            }
+
+            // The coordinator queues the SUBACK; the replay follows it.
+            until(runtime, |r| {
+                r.peers[&reader].io.queued_first_bytes().first() == Some(&0x90)
+            });
+            runtime.peers[&reader].io.hold_output(false);
+            assert_eq!(served_frame(runtime, &mut client), (0x90, vec![0, 1, 0, 0]));
+            assert_eq!(
+                served_frame(runtime, &mut client),
+                (0x31, vec![0, 1, b't', 0, b'v'])
+            );
+        },
+    );
+}
+
 #[test]
 fn sharded_retained_qos0_waits_for_its_subscriber_and_stays_with_its_generation() {
     with_runtime_layout(
