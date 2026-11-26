@@ -294,3 +294,14 @@ fn delegated_qos0_waiting_for_the_core_is_bounded() {
     assert_eq!(drops, 1);
     std::fs::remove_file(&events).unwrap();
 }
+
+/// The count of claims in flight on a lease never wraps: releasing an
+/// identifier the lease does not count, above its bitmap or already
+/// released, leaves it as it is.
+#[test]
+fn a_lease_never_counts_fewer_than_no_claim_in_flight() {
+    let lease = InlineClaimLease::new();
+    lease.release_pi(OutboundPacketId::new(600).unwrap());
+    lease.release_pi(OutboundPacketId::new(3).unwrap());
+    assert_eq!(lease.in_flight.load(Ordering::Acquire), 0);
+}
