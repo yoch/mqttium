@@ -443,8 +443,8 @@ fn a_shard_claim_takes_no_identifier_the_coordinator_reserved() {
             dirty_seq,
         })
         .unwrap();
-    let mut answer = |worker: &mut DeliveryShardWorker,
-                      items: Vec<mqttiumd_contract::pubsub::WorkItem>| {
+    let answer = |worker: &mut DeliveryShardWorker,
+                  items: Vec<mqttiumd_contract::pubsub::WorkItem>| {
         worker.drain_coord_messages().unwrap();
         worker.drain_inputs().unwrap();
         worker.dispatch().unwrap();

@@ -438,6 +438,14 @@ impl Owner {
         self.mark_session_dirty(session, true);
     }
 
+    /// The packet identifiers another owner may hold for `session`, as the
+    /// shared lease shows them: those the coordinator reserved for inline
+    /// claims whose admission is pending. The claims this owner makes for the
+    /// session avoid them. All zero forgets them.
+    pub fn shard_set_foreign_packet_ids(&mut self, session: SessionId, mask: [u64; 8]) {
+        self.pubsub.deliveries.set_foreign_packet_ids(session, mask);
+    }
+
     /// Returns `Some((in_flight_count, used_pi_mask))` when `session` on
     /// `generation` is safe for Coordinator inline-claim leasing: online,
     /// caught up with no pending scan/rescan/cursor, zero queued/unclaimed or

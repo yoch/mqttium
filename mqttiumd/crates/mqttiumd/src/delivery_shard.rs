@@ -157,6 +157,13 @@ impl InlineClaimLease {
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1));
     }
 
+    /// The identifiers the lease holds now. Read after a dirty mark, it holds
+    /// every identifier the coordinator reserved and has not handed over: the
+    /// mark ends its reservations.
+    fn reserved_snapshot(&self) -> [u64; 8] {
+        std::array::from_fn(|word| self.used_pi[word].load(Ordering::Acquire))
+    }
+
     /// Invoked exclusively by the owning `DeliveryShard` when Coordinator has
     /// zero pending inline claims (`dirty_seq` barrier satisfied) and the
     /// session is caught up with zero queued/claiming deliveries.
@@ -1021,6 +1028,16 @@ impl DeliveryShardWorker {
         }
     }
 
+    /// Gives the core the identifiers the coordinator may hold for
+    /// `session`, read from the lease after the dirty mark that came with the
+    /// message just read: the claims the shard makes avoid them.
+    fn refresh_foreign_packet_ids(&mut self, session: SessionId) {
+        if let Some(sess) = self.sessions.get(&session) {
+            let reserved = sess.lease.reserved_snapshot();
+            self.owner.shard_set_foreign_packet_ids(session, reserved);
+        }
+    }
+
     fn try_publish_lease(&mut self, session: SessionId) {
         let Some(sess) = self.sessions.get_mut(&session) else {
             return;
@@ -1057,6 +1074,9 @@ impl DeliveryShardWorker {
             );
             sess.published_dirty_seq = sess.seen_dirty_seq;
             sess.lease_published = true;
+            // The lease now holds the rows' view; the coordinator reserves
+            // from it, and a later dirty mark gives the shard its bits again.
+            self.owner.shard_set_foreign_packet_ids(session, [0; 8]);
         }
     }
 
@@ -1431,6 +1451,7 @@ impl DeliveryShardWorker {
                                     in_flight_load: None,
                                 },
                             );
+                            self.refresh_foreign_packet_ids(session);
                             self.queue_work(session);
                         }
                         CoordToShard::Detach {
@@ -1450,6 +1471,7 @@ impl DeliveryShardWorker {
                             self.owner
                                 .shard_retire_session(session)
                                 .map_err(|_| Failure::plain("shard_retire_fault"))?;
+                            self.owner.shard_set_foreign_packet_ids(session, [0; 8]);
                         }
                         CoordToShard::NotifyDirty {
                             session,
@@ -1465,6 +1487,7 @@ impl DeliveryShardWorker {
                                 }
                             }
                             self.owner.shard_notify_dirty(session, clear_known_through);
+                            self.refresh_foreign_packet_ids(session);
                             self.queue_work(session);
                         }
                         CoordToShard::DirtyBarrier { session, dirty_seq } => {
@@ -1473,6 +1496,7 @@ impl DeliveryShardWorker {
                                 sess.seen_dirty_seq = sess.seen_dirty_seq.max(dirty_seq);
                             }
                             self.owner.shard_notify_dirty(session, false);
+                            self.refresh_foreign_packet_ids(session);
                             self.queue_work(session);
                         }
                         CoordToShard::InlineCommitted {

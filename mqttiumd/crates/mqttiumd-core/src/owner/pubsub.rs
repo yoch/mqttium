@@ -4685,6 +4685,58 @@ mod tests {
         );
     }
 
+    /// The identifiers another owner may hold for a session are avoided as
+    /// the table's own claims are, with or without rows, and forgotten when
+    /// the mask is cleared.
+    #[test]
+    fn a_free_packet_identifier_avoids_those_another_owner_holds() {
+        let mut table = Deliveries::new(nonzero(8)).unwrap();
+        assert_eq!(
+            table.free_packet_id(TARGET, u16::MAX, false, false),
+            OutboundPacketId::new(1)
+        );
+        table.set_foreign_packet_ids(TARGET, [0b11, 0, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(
+            table.free_packet_id(TARGET, u16::MAX, false, false),
+            OutboundPacketId::new(3)
+        );
+        let claim = DeliveryClaim {
+            operation: OperationId::new(
+                StoreIncarnation::new(1),
+                RunEpoch::new(1),
+                LogicalOwnerId::new(4),
+                OperationSeq::new(3),
+            ),
+            packet_id: OutboundPacketId::new(3).unwrap(),
+            started: false,
+            await_pubcomp: false,
+        };
+        table
+            .push(Delivery::metadata(
+                delivery(3),
+                TARGET,
+                Revision::new(1),
+                Qos::AtLeastOnce,
+                Some(claim),
+            ))
+            .unwrap();
+        assert_eq!(
+            table.free_packet_id(TARGET, u16::MAX, false, false),
+            OutboundPacketId::new(4)
+        );
+        assert_eq!(table.free_packet_id(TARGET, 3, false, false), None);
+        table.set_foreign_packet_ids(TARGET, [u64::MAX; 8]);
+        assert_eq!(
+            table.free_packet_id(TARGET, u16::MAX, false, false),
+            OutboundPacketId::new(513)
+        );
+        table.set_foreign_packet_ids(TARGET, [0; 8]);
+        assert_eq!(
+            table.free_packet_id(TARGET, u16::MAX, false, false),
+            OutboundPacketId::new(1)
+        );
+    }
+
     fn queued(owner: &mut Owner, index: u32) {
         let mut item = Delivery::metadata(
             delivery(index),
