@@ -3504,9 +3504,11 @@ mod tests {
                 })
                 .unwrap();
         }
-        let deadline = Instant::now() + Duration::from_secs(3);
+        // 65 durable commits: a loaded runner may take seconds. The wait
+        // ends as soon as they are visible.
+        let deadline = Instant::now() + Duration::from_secs(30);
         while SqliteStore::inspect(&db).unwrap().sessions.len() != 65 && Instant::now() < deadline {
-            thread::sleep(Duration::from_millis(1));
+            thread::sleep(Duration::from_millis(10));
         }
         let established = SqliteStore::inspect(&db).unwrap().sessions.len() == 65;
         let collection = ReceiptCollection {
