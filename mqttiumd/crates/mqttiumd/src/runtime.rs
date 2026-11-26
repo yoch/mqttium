@@ -1232,30 +1232,37 @@ impl Runtime<'_> {
         drain_res.and(apply_res)
     }
 
-    fn attach_ready_shards(&mut self, ready: Vec<ConnectionKey>) {
+    /// Attaches the sessions whose CONNACK is queued to their shards. A
+    /// connection that cannot be attached is closed with the reason: left
+    /// open, it would get no delivery and nothing would say why.
+    fn attach_ready_shards(&mut self, ready: Vec<ConnectionKey>) -> Result<(), Failure> {
         if ready.is_empty() || self.shards.is_none() {
-            return;
+            return Ok(());
         }
         for connection in ready {
             let pending_inline = self
                 .owner
                 .pending_delegated_inline_count(connection.session);
-            let Some(revision) = self.session_revisions.get(&connection.session).copied() else {
-                continue;
-            };
             let Some(peer) = self.peers.get(&connection.generation) else {
                 continue;
             };
             if peer.closing().is_some() {
                 continue;
             }
+            let Some(revision) = self.session_revisions.get(&connection.session).copied() else {
+                self.close(connection.generation, "shard_attach_without_revision")?;
+                continue;
+            };
             let version = peer.version.unwrap_or_default();
             let receive_maximum = peer.receive_maximum;
             let max_packet = peer.max_packet;
             let outgoing = peer.io.outgoing_handle();
             if let Some(shards) = self.shards.as_mut() {
                 let route = shards.route_for(connection);
-                peer.io.install_shard_route(route);
+                if !peer.io.install_shard_route(route) {
+                    self.close(connection.generation, "shard_attached_twice")?;
+                    continue;
+                }
                 shards.attach_session(
                     connection.session,
                     revision,
@@ -1268,6 +1275,7 @@ impl Runtime<'_> {
                 );
             }
         }
+        Ok(())
     }
 
     /// How long an idle reactor may wait for a signal. A due core deadline
@@ -3233,7 +3241,7 @@ impl Runtime<'_> {
                     for generation in inline_mark_pending {
                         self.pending_peers.insert(generation);
                     }
-                    self.attach_ready_shards(inline_attach_ready);
+                    self.attach_ready_shards(inline_attach_ready)?;
                     for session in inline_suback_ready {
                         if self.pending_suback_notify.remove(&session) {
                             self.notify_work(session)?;
@@ -3562,7 +3570,7 @@ impl Runtime<'_> {
         for generation in mark_pending {
             self.pending_peers.insert(generation);
         }
-        self.attach_ready_shards(attach_ready);
+        self.attach_ready_shards(attach_ready)?;
         for session in suback_ready {
             if self.pending_suback_notify.remove(&session) {
                 self.notify_work(session)?;

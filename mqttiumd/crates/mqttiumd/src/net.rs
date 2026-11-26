@@ -2496,9 +2496,15 @@ impl Connection {
     /// Installs the direct I/O route for this connection once `CONNACK` has
     /// been queued so subscriber ACKs and shard-owned `Written` receipts bypass
     /// the Coordinator thread.
-    pub fn install_shard_route(&self, route: ShardIoRoute) {
-        let _ = self.core.shard_route.set(route);
+    /// Installs the route of this connection to its shard. A connection
+    /// has one route: false when one was installed already, which is kept.
+    #[must_use]
+    pub fn install_shard_route(&self, route: ShardIoRoute) -> bool {
+        if self.core.shard_route.set(route).is_err() {
+            return false;
+        }
         self.core.shard_route_active.store(true, Ordering::Release);
+        true
     }
 }
 
@@ -3839,7 +3845,11 @@ mod tests {
         let (connection, _peer) = manual_pair();
         let (effect, key) = correlation(9).unwrap();
         let inbox = ShardInbox::new(Wake::new(), 3, 1);
-        connection.install_shard_route(ShardIoRoute::new(effect.owner, key, Arc::clone(&inbox)));
+        assert!(connection.install_shard_route(ShardIoRoute::new(
+            effect.owner,
+            key,
+            Arc::clone(&inbox)
+        )));
         let packet = |first, body: &[u8]| Incoming::Packet {
             first,
             body: FrameBytes::from_slice(body),
@@ -3883,7 +3893,11 @@ mod tests {
         let (connection, _peer) = manual_pair();
         let (effect, key) = correlation(9).unwrap();
         let inbox = ShardInbox::new(Wake::new(), 2, 1);
-        connection.install_shard_route(ShardIoRoute::new(effect.owner, key, Arc::clone(&inbox)));
+        assert!(connection.install_shard_route(ShardIoRoute::new(
+            effect.owner,
+            key,
+            Arc::clone(&inbox)
+        )));
         let packet = |first, index| Incoming::Packet {
             first,
             body: FrameBytes::from(vec![0, index]),
@@ -3980,7 +3994,11 @@ mod tests {
         let (interrupted, _) = correlation(3).unwrap();
         let (refused, _) = correlation(4).unwrap();
         let inbox = ShardInbox::new(Wake::new(), 1, 3);
-        connection.install_shard_route(ShardIoRoute::new(finished.owner, key, Arc::clone(&inbox)));
+        assert!(connection.install_shard_route(ShardIoRoute::new(
+            finished.owner,
+            key,
+            Arc::clone(&inbox)
+        )));
         let route = connection.core.shard_route.get().unwrap();
         // Reserve precisely the three admitted occurrences. The active list
         // may still reference a write whose completion was already published.
@@ -4061,7 +4079,11 @@ mod tests {
         let (first, key) = correlation(1).unwrap();
         let (second, _) = correlation(2).unwrap();
         let inbox = ShardInbox::new(Wake::new(), 1, 2);
-        connection.install_shard_route(ShardIoRoute::new(first.owner, key, Arc::clone(&inbox)));
+        assert!(connection.install_shard_route(ShardIoRoute::new(
+            first.owner,
+            key,
+            Arc::clone(&inbox)
+        )));
         let (bytes, mut expiry) = timed_frame();
         expiry.value_offset = Some(bytes.len());
         let output = connection.outgoing_handle();
