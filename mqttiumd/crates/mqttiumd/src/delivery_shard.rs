@@ -294,6 +294,7 @@ impl ShardPool {
             let inbox_worker = Arc::clone(&inbox);
             let (ready_tx, ready_rx) = mpsc::sync_channel(1);
             let worker_notices = Arc::clone(&notices);
+            let panic_notices = Arc::clone(&notices);
             let worker_events = events.clone();
             let worker_clock = Arc::clone(&clock);
             let worker_cancel = Arc::clone(&cancel);
@@ -324,9 +325,15 @@ impl ShardPool {
                             return Err(err);
                         }
                     }
-                    let res = worker.run_loop();
+                    // A panic leaves the worker's state unknown: nothing of it
+                    // is used again, and the coordinator stops the broker as
+                    // for any fault of a shard.
+                    let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        worker.run_loop()
+                    }))
+                    .unwrap_or_else(|_| Err(Failure::plain("delivery_shard_panicked")));
                     if let Err(err) = &res {
-                        worker.notify_coord(ShardToCoord::Fatal(err.clone()));
+                        panic_notices.publish(ShardToCoord::Fatal(err.clone()));
                     }
                     res
                 })
