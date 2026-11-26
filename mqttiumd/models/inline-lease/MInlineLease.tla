@@ -16,8 +16,8 @@
 (* command of its own at any time.                                        *)
 (*                                                                         *)
 (* The flags select the behaviour. 9dfd568 had none; 1ccddfb has         *)
-(* ForeignIds; the repair of report 0046 is HoldBehind, ScanGate and      *)
-(* NotifyAfterStep, without ForeignIds.                                   *)
+(* ForeignIds and PublishWaits; the repair of report 0046 adds            *)
+(* HoldBehind, ScanGate and NotifyAfterStep, and drops ForeignIds.        *)
 (***************************************************************************)
 EXTENDS Naturals, Sequences, FiniteSets
 
@@ -27,8 +27,9 @@ CONSTANTS
     Cap,              \* the lease's room (preclaim_cap)
     Unknown,          \* whether an answer of the store may be unknown
     Replay,           \* whether a subscription replay commits a row 0
-    ForeignIds,       \* report 0045: a shard claim avoids the lease's bits, and the
-                      \* lease is not published while a committed claim waits
+    ForeignIds,       \* report 0045: a shard claim avoids the lease's bits
+    PublishWaits,     \* report 0045: the lease is not published while a
+                      \* committed claim of the session waits
     HoldBehind,       \* a committed claim waits while an inline admission of the
                       \* session has an unknown outcome
     ScanGate,         \* no read of the store while an inline claim may be on its way
@@ -313,7 +314,7 @@ Ack ==
 \* DeliveryShardWorker::try_publish_lease, InlineClaimLease::publish_eligible
 TryPublish ==
     /\ ~published /\ seen # 0 /\ scanned >= seen /\ ~coreDirty
-    /\ ForeignIds => pendingInl = << >>
+    /\ PublishWaits => pendingInl = << >>
     /\ used' = {rowPi[r] : r \in rows}
     /\ inflight' = Cardinality(rows)
     /\ elig' = TRUE

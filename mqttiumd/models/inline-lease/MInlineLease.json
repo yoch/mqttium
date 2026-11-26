@@ -1,24 +1,45 @@
 {
   "module": "MInlineLease.tla",
-  "status": "specification",
-  "summary": "The inline-claim lease of one subscriber session with --delivery-shards K >= 1 (record 0066): the coordinator reserves packet identifiers from the InlineClaimLease and carries inline claims in admissions, marks the lease dirty for a stored publication and sends a dirty message or keeps it as a barrier while inline claims are pending; the store answers in order, possibly with an unknown outcome learnt by a resolution; the delivery shard applies committed inline claims, reads the session's committed rows when asked, sends its rows in order and publishes the lease again. Configurations give the behaviour of 9dfd568 (a claim of the shard takes a reserved identifier), of 1ccddfb (order inverted after an unknown outcome, a delivery sent twice, the lease never eligible again after a stored publication, a stored publication committed by a resolution never delivered) and the repair of report 0046 (claims held while an outcome of the session is unknown, no read of the store while a claim may be on its way, the stored targets notified after the step), with a mutant for each part of it. One session, one connection, atomic reads, answers stepped in order.",
+  "status": "refinement",
+  "summary": "The inline-claim lease of one subscriber session with --delivery-shards K >= 1 (record 0066): the coordinator reserves packet identifiers from the InlineClaimLease and carries inline claims in admissions, marks the lease dirty for a stored publication and sends a dirty message or keeps it as a barrier while inline claims are pending; the store answers in order, possibly with an unknown outcome learnt by a resolution; the delivery shard applies committed inline claims, reads the session's committed rows when asked, sends its rows in order and publishes the lease again. Configurations give the behaviour of 9dfd568 (a claim of the shard takes a reserved identifier), of 1ccddfb (order inverted after an unknown outcome, a delivery sent twice, the lease never eligible again after a stored publication, a stored publication committed by a resolution never delivered) and the repair of report 0046 (claims held while an outcome of the session is unknown, ShardPool::release_held_claims; no read of the store while a claim may be on its way, Owner::shard_fence_scans; the stored targets notified after the step, Owner::names_stored_targets_at_commit), which needs no foreign identifiers, with a mutant for each part of it. One session, one connection, atomic reads, answers stepped in order.",
   "issues": [
     648
   ],
   "tests": [
+    "mqttiumd/crates/mqttiumd/src/runtime_tests/sharded_lease.rs",
     "mqttiumd/crates/mqttiumd/src/delivery_shard/fence_tests.rs"
   ],
   "replays": [
+    {
+      "file": "mqttiumd/crates/mqttiumd/src/runtime_tests/sharded_lease.rs",
+      "test": "a_lease_is_eligible_again_after_a_publication_admitted_without_claim"
+    },
+    {
+      "file": "mqttiumd/crates/mqttiumd/src/runtime_tests/sharded_lease.rs",
+      "test": "a_stored_publication_committed_by_a_resolution_is_delivered"
+    },
+    {
+      "file": "mqttiumd/crates/mqttiumd/src/runtime_tests/sharded_lease.rs",
+      "test": "an_inline_claim_does_not_overtake_one_whose_outcome_is_unknown"
+    },
+    {
+      "file": "mqttiumd/crates/mqttiumd/src/runtime_tests/sharded_lease.rs",
+      "test": "a_read_of_the_store_does_not_deliver_a_claim_the_coordinator_still_owes"
+    },
     {
       "file": "mqttiumd/crates/mqttiumd/src/delivery_shard/fence_tests.rs",
       "test": "a_shard_claim_takes_no_identifier_the_coordinator_reserved"
     },
     {
       "file": "mqttiumd/crates/mqttiumd/src/delivery_shard/fence_tests.rs",
+      "test": "a_session_is_read_only_after_the_claims_that_came_before_its_barrier"
+    },
+    {
+      "file": "mqttiumd/crates/mqttiumd/src/delivery_shard/fence_tests.rs",
       "test": "a_published_lease_keeps_the_identifier_of_a_waiting_committed_claim"
     }
   ],
-  "not_replayed": "The counterexamples of 1ccddfb (part2-*) have no deterministic test yet; they are written with the repair. a_shard_claim_takes_no_identifier_the_coordinator_reserved replays the premise of released-ids: a dirty message with sequence 0 while an inline claim is pending makes the shard claim; it fails on 9dfd568. a_published_lease_keeps_the_identifier_of_a_waiting_committed_claim replays a lease published while a committed claim waits, which the model cannot reach because its reads load every committed row.",
+  "not_replayed": "Each counterexample of 1ccddfb is replayed against a sharded runtime by the test of sharded_lease.rs named after it, which fails on 1ccddfb: part2-eligible by a_lease_is_eligible_again_after_a_publication_admitted_without_claim, part2-delivered by a_stored_publication_committed_by_a_resolution_is_delivered, part2-order by an_inline_claim_does_not_overtake_one_whose_outcome_is_unknown, part2-duplicate by a_read_of_the_store_does_not_deliver_a_claim_the_coordinator_still_owes; the mutants of the repair that remove a part of it are replayed by the same tests. The premise of released-ids and mut-no-gate-ids, a read on a dirty message without sequence, is refused by a_shard_claim_takes_no_identifier_the_coordinator_reserved; mut-gate-ignores-waiting-claims by a_session_is_read_only_after_the_claims_that_came_before_its_barrier. mut-barrier-before-release has no test: the runtime flushes the barrier after the held claims in one place, which a test would have to break. a_published_lease_keeps_the_identifier_of_a_waiting_committed_claim plays a lease published while a committed claim waits, a state the fence makes unreachable and the model cannot reach.",
   "configs": [
     {
       "config": "MInlineLease-safety.cfg",

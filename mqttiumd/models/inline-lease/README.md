@@ -9,8 +9,9 @@ the shard publishes it again once it has read the session's work.
 
 It is runtime-tier evidence: a TLA+ model of the message protocol between
 two threads, with configurations for the behaviour of `9dfd568`, the
-behaviour after report 0045, the repair of report 0046 and mutants of that
-repair. It is not a proof of the Rust code and replaces none of its tests.
+behaviour after report 0045 (`1ccddfb`), the repair of report 0046 and
+mutants of that repair. It is not a proof of the Rust code and replaces
+none of its tests.
 
 ## Questions
 
@@ -72,14 +73,18 @@ are done (`TryPublish`, `DeliveryShardWorker::try_publish_lease`,
 
 | Flag | Code |
 | - | - |
-| `ForeignIds` | Report 0045: a claim of the shard avoids the identifiers the lease holds at the last dirty message (`Deliveries::set_foreign_packet_ids`), and the shard does not publish the lease while a committed inline claim of the session waits to be applied. |
+| `ForeignIds` | Report 0045: a claim of the shard avoids the identifiers the lease holds at the last dirty message. |
+| `PublishWaits` | Report 0045: the shard does not publish the lease while a committed inline claim of the session waits to be applied. |
 | `HoldBehind` | A committed inline claim is not sent while an inline admission of the session has an unknown outcome. The held claims are sent in the order of their admission once no outcome of the session is unknown, before any barrier. |
 | `ScanGate` | The shard does not read the session while a dirty message with sequence 0 (claims pending) is its last, nor while a committed inline claim of the session waits to be applied. |
 | `NotifyAfterStep` | A stored target is notified after the coordinator has stepped the commit, on the answer of the store and on a resolution alike, instead of when the answer arrives. |
 
-`9dfd568` has no flag; `1ccddfb` has `ForeignIds`. The repair is
-`HoldBehind`, `ScanGate` and `NotifyAfterStep`; with it `ForeignIds` is not
-needed (`safety`), and does no harm (`safety-with-foreign-ids`).
+`9dfd568` has no flag; `1ccddfb` has `ForeignIds` and `PublishWaits`.
+The repair adds `HoldBehind`, `ScanGate` and `NotifyAfterStep`; with the
+gate `ForeignIds` is not needed (`safety`), and does no harm
+(`safety-with-foreign-ids`). The code keeps `PublishWaits`: it costs one
+look at the waiting claims, and a deterministic test plays the state it
+guards, which the gate makes unreachable.
 
 ## Configurations
 
@@ -132,22 +137,28 @@ python ../tools/formal/run_tlc.py --models-dir models/inline-lease
 
 ## Correspondence
 
-The replays are those of the deterministic tests that exist when the model
-is written: the hand-driven shard of `delivery_shard/fence_tests.rs`. The
-counterexamples of `part2-*` are replayed by the tests written for their
-repair.
+Each counterexample of `1ccddfb` has a test that fails there, against a
+sharded runtime (`runtime_tests/sharded_lease.rs`), with the
+`hold-admission-result` hook for the unknown answer; the fence of the
+shard is also played by hand on a shard worker
+(`delivery_shard/fence_tests.rs`). The repair is
+`Owner::names_stored_targets_at_commit` with the notification after the
+step in `Runtime::drain_inputs`, `Owner::delegated_inline_unknown` with
+`ShardPool::send_inline_committed` and `ShardPool::release_held_claims`,
+and `Owner::shard_fence_scans` with
+`DeliveryShardWorker::fence_after_message`.
 
 | Model action | Code | Replay |
 | - | - | - |
-| `Admit` | `Owner::plan_admission`, delegated branch; `InlineClaimLease::try_reserve`; `InlineClaimOracle::mark_ineligible`; `Owner::apply_change` | not replayed yet |
-| `StoreApply` | the store worker, `writer.rs`; the `hold-admission-result` hook gives an unknown answer | not replayed yet |
+| `Admit` | `Owner::plan_admission`, delegated branch; `InlineClaimLease::try_reserve`; `InlineClaimOracle::mark_ineligible`; `Owner::apply_change` | `a_lease_is_eligible_again_after_a_publication_admitted_without_claim` |
+| `StoreApply` | the store worker, `writer.rs`; the `hold-admission-result` hook gives an unknown answer | `an_inline_claim_does_not_overtake_one_whose_outcome_is_unknown` |
 | `ReplayCommit` | the subscription's commit and its deferred notification, `Runtime::writer_results` | `a_shard_claim_takes_no_identifier_the_coordinator_reserved` sends its dirty message by hand |
-| `Reply` | `Runtime::writer_results`, `Owner::apply_draft`, the shard calls after the step in `Runtime::drain_inputs` | not replayed yet |
-| `Resolve` | `Effect::ResolveAndFence`, `Owner::apply_draft` | not replayed yet |
-| `Recv` | `DeliveryShardWorker::drain_coord_messages` | `a_shard_claim_takes_no_identifier_the_coordinator_reserved`, `a_published_lease_keeps_the_identifier_of_a_waiting_committed_claim` |
-| `ApplyInline` | `DeliveryShardWorker::drain_pending_inline`, `Owner::step_shard_inline_committed` | `a_published_lease_keeps_the_identifier_of_a_waiting_committed_claim` |
-| `Scan` | `Owner::plan_work`, `Deliveries::free_packet_id` | `a_shard_claim_takes_no_identifier_the_coordinator_reserved` |
-| `Emit` | `Owner::plan_delivery_emit` on the shard | `a_shard_claim_takes_no_identifier_the_coordinator_reserved` |
-| `Ack` | the shard's finish of a delivery, `InlineClaimLease::release_pi` | not replayed yet |
+| `Reply` | `Runtime::writer_results`, `Owner::apply_draft`, the shard calls after the step in `Runtime::drain_inputs` | `a_lease_is_eligible_again_after_a_publication_admitted_without_claim` |
+| `Resolve` | `Effect::ResolveAndFence`, `Owner::apply_draft` | `a_stored_publication_committed_by_a_resolution_is_delivered` |
+| `Recv` | `DeliveryShardWorker::drain_coord_messages`, `DeliveryShardWorker::fence_after_message` | `a_shard_claim_takes_no_identifier_the_coordinator_reserved` |
+| `ApplyInline` | `DeliveryShardWorker::drain_pending_inline`, `Owner::step_shard_inline_committed` | `a_session_is_read_only_after_the_claims_that_came_before_its_barrier` |
+| `Scan` | `Owner::plan_work`, `Deliveries::free_packet_id` | `a_read_of_the_store_does_not_deliver_a_claim_the_coordinator_still_owes` |
+| `Emit` | `Owner::plan_delivery_emit` on the shard | `an_inline_claim_does_not_overtake_one_whose_outcome_is_unknown` |
+| `Ack` | the shard's finish of a delivery, `InlineClaimLease::release_pi` | `a_read_of_the_store_does_not_deliver_a_claim_the_coordinator_still_owes` |
 | `TryPublish` | `DeliveryShardWorker::try_publish_lease`, `InlineClaimLease::publish_eligible` | `a_published_lease_keeps_the_identifier_of_a_waiting_committed_claim` |
 | `Done` | none: the run is over | none |
