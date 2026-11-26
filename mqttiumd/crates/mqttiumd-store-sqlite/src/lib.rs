@@ -2289,6 +2289,11 @@ impl SqliteStore {
     /// Snapshots the entire state and closes SQLite while retaining the
     /// exclusive writer lease, allowing another engine (such as the volatile
     /// store) to assume ownership of `path` with no lock gap.
+    ///
+    /// That engine replaces the database file and deletes its write-ahead
+    /// log. The log is therefore emptied into the file first: the close
+    /// does it only when no other connection, a reader, is open. A reader
+    /// that holds the log back makes the hand-over fail as unavailable.
     pub fn into_state_and_lease(self) -> Result<(DurableState, Settings, WriterLease), OpenError> {
         let state = self.snapshot().map_err(OpenError::Read)?;
         let Self {
@@ -2297,6 +2302,11 @@ impl SqliteStore {
             _writer_lock,
             ..
         } = self;
+        let held_back: i64 =
+            conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| row.get(0))?;
+        if held_back != 0 {
+            return Err(OpenError::Read(ReadError::Unavailable));
+        }
         conn.close().map_err(|(_, error)| OpenError::Sql(error))?;
         Ok((state, settings, _writer_lock))
     }
