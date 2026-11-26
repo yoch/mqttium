@@ -30,9 +30,9 @@ the models were not extended to them:
   reply lanes of the store worker). That was read in the code, not
   searched exhaustively; no test replays it.
 - `MReactorWake`: the shard workers send to the reactors and hold as well,
-  and a shard keeps its hold while it waits. The section "A hold kept
-  through a wait" below says what the model still shows and what it does
-  not.
+  and release their hold before they wait. At `9dfd568` a shard kept it
+  through its wait; the section "A hold kept through a wait" below says
+  what that broke and how it is checked now.
 - `MLaneOwed`: the acknowledgements of a subscriber (PUBACK, PUBREC,
   PUBCOMP) and the write receipts of frames a shard emitted do not take
   the lanes of the model. They go to the `ShardInbox` of the shard, under
@@ -160,51 +160,37 @@ message queued under a hold whose wake-up is given at the release.
 
 ### A hold kept through a wait
 
-The assumption "a hold lasts one pass of its producer" is false of one
-caller. `DeliveryShardWorker::run_loop`, which runs only with
-`--delivery-shards K >= 1`, takes `hold_wakes` of `net.rs` at the top of each
-iteration and waits at the bottom of the same iteration, when the pass
+At `9dfd568` the assumption "a hold lasts one pass of its producer" was
+false of one caller. `DeliveryShardWorker::run_loop`, which runs only with
+`--delivery-shards K >= 1`, took `hold_wakes` of `net.rs` at the top of each
+iteration and waited at the bottom of the same iteration, when the pass
 made no progress, with the guard still alive: `Wake::wait` for at most
-`IDLE_TICK` (20 ms), or `BACKPRESSURE_TICK` (1 ms) while it has work it
-could not place. The hold ends when that wait returns.
+`IDLE_TICK` (20 ms), or `BACKPRESSURE_TICK` (1 ms) while it had work it
+could not place. The hold ended when that wait returned.
 
-What this does and does not break, in the terms of the model:
+What this broke, in the terms of the model:
 
 - **No invariant.** `DebtHasPayer` and `NoLostWake` count a live hold as
   a payer and say nothing of how long it lives. `Shared::release` clears
   the hold before it reads the debt, whoever set the hold, and every
-  release kicks: no wake-up is lost. The safety configurations do not
-  depend on fairness and hold as they are.
+  release kicks: no wake-up was lost.
 - **The premise of `EveryFrameTaken`.** The property is checked under
-  weak fairness of the release. For the shard that fairness is discharged
-  by the timeout of its wait, a timer the model does not contain. The
-  configuration `hold-kept-liveness` checks the same property without the
-  fairness of the release and is declared violated for the unmutated
-  protocol: a holder takes its hold and keeps it, a message is queued
-  for a blocked reactor under it, and nothing gives the wake-up. In the
-  code this is a delay, bounded by the wait of the holder, and not a
-  loss.
-- **The reading "no frame waits for a timer".** It stands for the default
-  runtime. In the sharded mode it stands only for a sender that releases
-  a hold of its own soon after it sent: the Coordinator, at the end of
-  `Runtime::turn`, and a shard whose pass made progress, which starts its
-  next iteration without waiting. It does not stand for a message sent
-  under the hold of an idle shard by a thread that releases nothing. One
-  such sender exists: a reactor thread that returns unused shard
-  acknowledgement credit (a `ShardAckBatch` dropped when its input turn
-  ends) notifies the links of the readers that waited for credit
-  (`ShardAckBudget::release`), from a thread that holds nothing. If such
-  a reader is on another reactor thread that sleeps, it is run when a
-  holder next releases, when its socket becomes ready or when its own
-  poll times out. The delay the hold adds is at most the wait of the
-  holder: 20 ms.
+  weak fairness of the release, which the shard discharged only by the
+  timeout of its wait. The configuration `hold-kept-liveness` checks the
+  property without that fairness and is declared violated: a holder takes
+  its hold and keeps it, a message is queued for a blocked reactor under
+  it, and nothing gives the wake-up. In the code it was a delay of at most
+  the wait of the holder, 20 ms, for a sender that holds nothing: a
+  reactor thread that returns unused shard acknowledgement credit
+  (`ShardAckBudget::release`) to a reader on another reactor thread.
 
-Whether a pass of a shard can send to a reactor without counting
-progress, and then wait on its own debt, was looked for and not found:
-`DeliveryShardWorker::dispatch` counts each accepted effect and
-`DeliveryShardWorker::drain_io_events` each event taken. That search is
-not exhaustive. No test of the sharded mode measures the delay. The
-product code was not changed.
+Since the validation of the lot 10 head the guard covers the work of a
+pass and drops before the wait, as in `Runtime::turn`, and the fairness
+of `FairSpec` holds for every holder. Test builds assert, where a shard
+waits, that it holds nothing:
+`an_idle_shard_waits_without_holding_the_reactors_wake_ups` fails on
+`9dfd568` and passes since. `hold-kept-liveness` stays as the
+counterexample of the earlier behaviour.
 
 ## MLaneOwed
 
@@ -290,7 +276,7 @@ requirement.
 | `ProducerHold` | `MReactorWake` | `Reactors::hold`: `Shared::hold`, `held.store(true)`; `hold_wakes` of `net.rs`, called by `Runtime::turn` | `a_held_wake_up_is_given_when_the_hold_ends` (`net/reactor.rs`) |
 | `ProducerPreload` | `MReactorWake` | None: only the mutant `CheckBeforePush` reaches it | No deterministic replay |
 | `ProducerPush`, `ProducerOwe`, `ProducerReadHeld` | `MReactorWake` | `Shared::send`: push under the queue lock, `owing.store(true)`, `held.load()` | `a_held_wake_up_is_given_when_the_hold_ends`: a notification under a hold; the lost-message interleavings have no deterministic replay |
-| `ProducerRelease` | `MReactorWake` | The drop of the guard of `Reactors::hold`: `Shared::release`, `held.store(false)`, then `kick` | `a_held_wake_up_is_given_when_the_hold_ends`; a release that comes only after a wait (`hold-kept-liveness`) has no deterministic replay |
+| `ProducerRelease` | `MReactorWake` | The drop of the guard of `Reactors::hold`: `Shared::release`, `held.store(false)`, then `kick` | `a_held_wake_up_is_given_when_the_hold_ends`; no holder waits before its release: `an_idle_shard_waits_without_holding_the_reactors_wake_ups` (`hold-kept-liveness` is the earlier behaviour) |
 | `ProducerKick`, `ProducerLoad`, `ProducerWake` | `MReactorWake` | `Shared::kick`: `owing.swap(false)`, `sleeping.load()`, `waker.wake()` | `a_notification_runs_the_task_once_and_a_waiting_task_is_ticked`; `a_held_wake_up_is_given_when_the_hold_ends` |
 | `ProducerUnhold` | `MReactorWake` | None: only the mutant `DebtReadBeforeRelease` reaches it | No deterministic replay: it needs a second sending thread |
 | `ReactorTake`, `ReactorHandle` | `MReactorWake` | `Shared::take` and the `Message::Run` arm of `run` | `a_notification_runs_the_task_once_and_a_waiting_task_is_ticked` |

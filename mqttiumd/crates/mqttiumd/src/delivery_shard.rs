@@ -906,26 +906,33 @@ impl DeliveryShardWorker {
     fn run_loop(&mut self) -> Result<(), Failure> {
         loop {
             let before = self.progress;
-            let _wakes = net::hold_wakes();
+            let now = Instant::now();
+            {
+                // The wake-ups this pass gives the reactors are coalesced
+                // and given when the guard drops, before any wait.
+                let _wakes = net::hold_wakes();
+                #[cfg(test)]
+                {
+                    self.wakes_held = true;
+                }
+                self.drain_store_replies()?;
+                if !self.owner.outbox_is_empty() {
+                    self.dispatch()?;
+                }
+                self.drain_io_events()?;
+                self.drain_inputs()?;
+                self.drain_coord_messages()?;
+                self.drain_pending_inline()?;
+                self.drain_pending_qos0()?;
+                self.due_deadlines(now)?;
+                self.drain_inputs()?;
+                self.dispatch()?;
+                self.schedule_maintenance();
+            }
             #[cfg(test)]
             {
-                self.wakes_held = true;
+                self.wakes_held = false;
             }
-            let now = Instant::now();
-
-            self.drain_store_replies()?;
-            if !self.owner.outbox_is_empty() {
-                self.dispatch()?;
-            }
-            self.drain_io_events()?;
-            self.drain_inputs()?;
-            self.drain_coord_messages()?;
-            self.drain_pending_inline()?;
-            self.drain_pending_qos0()?;
-            self.due_deadlines(now)?;
-            self.drain_inputs()?;
-            self.dispatch()?;
-            self.schedule_maintenance();
 
             if self.stopping {
                 if self.inflight.is_empty()
