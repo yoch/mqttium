@@ -1,0 +1,120 @@
+{
+  "module": "MInlineLease.tla",
+  "status": "specification",
+  "summary": "The inline-claim lease of one subscriber session with --delivery-shards K >= 1 (record 0066): the coordinator reserves packet identifiers from the InlineClaimLease and carries inline claims in admissions, marks the lease dirty for a stored publication and sends a dirty message or keeps it as a barrier while inline claims are pending; the store answers in order, possibly with an unknown outcome learnt by a resolution; the delivery shard applies committed inline claims, reads the session's committed rows when asked, sends its rows in order and publishes the lease again. Configurations give the behaviour of 9dfd568 (a claim of the shard takes a reserved identifier), of 1ccddfb (order inverted after an unknown outcome, a delivery sent twice, the lease never eligible again after a stored publication, a stored publication committed by a resolution never delivered) and the repair of report 0046 (claims held while an outcome of the session is unknown, no read of the store while a claim may be on its way, the stored targets notified after the step), with a mutant for each part of it. One session, one connection, atomic reads, answers stepped in order.",
+  "issues": [
+    648
+  ],
+  "tests": [
+    "mqttiumd/crates/mqttiumd/src/delivery_shard/fence_tests.rs"
+  ],
+  "replays": [
+    {
+      "file": "mqttiumd/crates/mqttiumd/src/delivery_shard/fence_tests.rs",
+      "test": "a_shard_claim_takes_no_identifier_the_coordinator_reserved"
+    },
+    {
+      "file": "mqttiumd/crates/mqttiumd/src/delivery_shard/fence_tests.rs",
+      "test": "a_published_lease_keeps_the_identifier_of_a_waiting_committed_claim"
+    }
+  ],
+  "not_replayed": "The counterexamples of 1ccddfb (part2-*) have no deterministic test yet; they are written with the repair. a_shard_claim_takes_no_identifier_the_coordinator_reserved replays the premise of released-ids: a dirty message with sequence 0 while an inline claim is pending makes the shard claim; it fails on 9dfd568. a_published_lease_keeps_the_identifier_of_a_waiting_committed_claim replays a lease published while a committed claim waits, which the model cannot reach because its reads load every committed row.",
+  "configs": [
+    {
+      "config": "MInlineLease-safety.cfg",
+      "expect": "pass",
+      "invariants": [
+        "TypeOK",
+        "UniqueIds",
+        "InOrder",
+        "NoDuplicate",
+        "TerminalDelivered",
+        "TerminalEligible"
+      ]
+    },
+    {
+      "config": "MInlineLease-safety-with-foreign-ids.cfg",
+      "expect": "pass",
+      "invariants": [
+        "TypeOK",
+        "UniqueIds",
+        "InOrder",
+        "NoDuplicate",
+        "TerminalDelivered",
+        "TerminalEligible"
+      ]
+    },
+    {
+      "config": "MInlineLease-safety-three.cfg",
+      "expect": "pass",
+      "invariants": [
+        "TypeOK",
+        "UniqueIds",
+        "InOrder",
+        "NoDuplicate",
+        "TerminalDelivered",
+        "TerminalEligible"
+      ]
+    },
+    {
+      "config": "MInlineLease-released-ids.cfg",
+      "expect": "violation",
+      "invariant": "UniqueIds"
+    },
+    {
+      "config": "MInlineLease-part2-order.cfg",
+      "expect": "violation",
+      "invariant": "InOrder"
+    },
+    {
+      "config": "MInlineLease-part2-duplicate.cfg",
+      "expect": "violation",
+      "invariant": "NoDuplicate"
+    },
+    {
+      "config": "MInlineLease-part2-eligible.cfg",
+      "expect": "violation",
+      "invariant": "TerminalEligible"
+    },
+    {
+      "config": "MInlineLease-part2-delivered.cfg",
+      "expect": "violation",
+      "invariant": "TerminalDelivered"
+    },
+    {
+      "config": "MInlineLease-mut-no-hold.cfg",
+      "expect": "violation",
+      "invariant": "InOrder"
+    },
+    {
+      "config": "MInlineLease-mut-no-gate-ids.cfg",
+      "expect": "violation",
+      "invariant": "UniqueIds"
+    },
+    {
+      "config": "MInlineLease-mut-no-gate-duplicate.cfg",
+      "expect": "violation",
+      "invariant": "NoDuplicate"
+    },
+    {
+      "config": "MInlineLease-mut-gate-ignores-waiting-claims.cfg",
+      "expect": "violation",
+      "invariant": "NoDuplicate"
+    },
+    {
+      "config": "MInlineLease-mut-barrier-before-release.cfg",
+      "expect": "violation",
+      "invariant": "NoDuplicate"
+    },
+    {
+      "config": "MInlineLease-mut-no-notify-eligible.cfg",
+      "expect": "violation",
+      "invariant": "TerminalEligible"
+    },
+    {
+      "config": "MInlineLease-mut-no-notify-delivered.cfg",
+      "expect": "violation",
+      "invariant": "TerminalDelivered"
+    }
+  ]
+}
