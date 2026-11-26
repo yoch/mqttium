@@ -108,9 +108,10 @@ the model `models/inline-lease`:
   receive the later publication first (suspect B1).
 - A shard does not read a session the coordinator may still owe a
   committed claim: not after a dirty message without sequence, and not
-  before the claims that came before a barrier are applied. Before, a
-  read during an unknown outcome took the claim's committed row and the
-  subscriber received it twice.
+  before the claims that came before a barrier are applied; such a
+  session is not ready work meanwhile. Before, a read during an unknown
+  outcome took the claim's committed row and the subscriber received it
+  twice.
 - With that fence the first item of the second part is withdrawn: the
   shard's claims no longer look at the coordinator's reserved
   identifiers, which no longer exist when it claims. The second item
