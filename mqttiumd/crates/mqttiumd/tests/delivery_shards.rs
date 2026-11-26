@@ -1096,3 +1096,42 @@ fn sharded_receipt_collection_under_sustained_fanout() {
         h.join().unwrap();
     }
 }
+
+/// The readiness line tells the operator that the sharded mode is
+/// experimental, and says nothing of shards without them.
+#[test]
+fn the_readiness_line_marks_the_sharded_mode_experimental() {
+    for shards in [0usize, 2] {
+        let directory = std::env::temp_dir().join(format!(
+            "mqttiumd-ready-line-{}-{shards}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).unwrap();
+        let mut child = Command::new(env!("CARGO_BIN_EXE_mqttiumd"))
+            .arg("--db")
+            .arg(directory.join("store.sqlite"))
+            .args(["--listen", "127.0.0.1:0"])
+            .arg("--events")
+            .arg(directory.join("events.jsonl"))
+            .args(["--delivery-shards", &shards.to_string()])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .unwrap();
+        let mut line = String::new();
+        BufReader::new(child.stdout.take().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = std::fs::remove_dir_all(&directory);
+        assert!(line.starts_with("mqttiumd ready "), "{line:?}");
+        assert_eq!(
+            line.contains("delivery_shards=2 experimental"),
+            shards == 2,
+            "{line:?}"
+        );
+        assert_eq!(line.contains("experimental"), shards != 0, "{line:?}");
+    }
+}

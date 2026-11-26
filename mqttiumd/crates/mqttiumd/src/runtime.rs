@@ -8350,19 +8350,26 @@ fn run_inner(
         }
         events.emit("will_capabilities",json!({"details":{"will":true,"will_qos":1,"will_retain":true,"will_delay_interval":0,"will_message_expiry":false,"max_will_intents":mqttiumd_contract::will::MAX_WILL_INTENTS,"max_will_bytes":mqttiumd_contract::will::MAX_WILL_BYTES,"max_will_receipt_bytes":8388608}})).map_err(event_failure)?;
         events.emit("ready", readiness).map_err(event_failure)?;
+        // The sharded mode has no model of its own protocol yet and known
+        // open conditions (record 0066): the operator is told.
+        let shards = if delivery_shards > 0 {
+            format!(", delivery_shards={delivery_shards} experimental")
+        } else {
+            String::new()
+        };
         match storage_mode {
             crate::writer::StorageMode::Durable => {
-                println!("mqttiumd ready {address} ({profile})");
+                println!("mqttiumd ready {address} ({profile}{shards})");
             }
             crate::writer::StorageMode::Log => {
                 println!(
-                    "mqttiumd ready {address} ({profile}, storage=log, durability={})",
+                    "mqttiumd ready {address} ({profile}, storage=log, durability={}{shards})",
                     storage_mode.durability_guarantee()
                 );
             }
             crate::writer::StorageMode::Volatile { .. } => {
                 println!(
-                    "mqttiumd ready {address} ({profile}, storage=volatile, durability={})",
+                    "mqttiumd ready {address} ({profile}, storage=volatile, durability={}{shards})",
                     storage_mode.durability_guarantee()
                 );
             }
