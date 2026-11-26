@@ -529,7 +529,7 @@ struct RouteAcks {
     budget: Arc<ShardAckBudget>,
 }
 
-struct ShardAckBatch {
+pub(super) struct ShardAckBatch {
     acks: Arc<RouteAcks>,
     remaining: usize,
 }
@@ -1128,6 +1128,56 @@ impl ConnCore {
         })
     }
 
+    /// Plans a read turn into `batch`: the shard credit it holds, how many
+    /// packets it parses, and whether it reads without credit. A turn of a
+    /// connection routed to a shard reserves credit first, since a packet's
+    /// kind is known only once parsed. Without credit it still reads one
+    /// packet: one that needs no credit goes on (PINGREQ, DISCONNECT, a
+    /// PUBLISH), an acknowledgement is kept by `park_unpaid_ack` until credit
+    /// returns, and nothing behind it is read meanwhile. `None`: nothing may
+    /// be read now.
+    pub(super) fn plan_read(
+        &self,
+        stalled: &mut Option<Box<StalledState>>,
+        batch: &mut Vec<Incoming>,
+    ) -> Option<(Option<ShardAckBatch>, usize, bool)> {
+        let limit = self.incoming_free_slots().clamp(1, BURST);
+        let Some(credit) = self.reserve_shard_read(limit) else {
+            return Some((None, limit, false));
+        };
+        let remaining = credit.remaining;
+        if let Some(st) = stalled.as_mut()
+            && let Some(ack) = st.unpaid_ack.take()
+        {
+            if remaining == 0 {
+                st.unpaid_ack = Some(ack);
+                return None;
+            }
+            if st.is_empty() {
+                *stalled = None;
+            }
+            batch.push(ack);
+            return Some((Some(credit), remaining - 1, false));
+        }
+        if remaining == 0 {
+            return Some((Some(credit), 1, true));
+        }
+        Some((Some(credit), remaining, false))
+    }
+
+    /// After a read without credit: an acknowledgement it read waits in the
+    /// task for credit, the next `plan_read` sends it.
+    pub(super) fn park_unpaid_ack(
+        stalled: &mut Option<Box<StalledState>>,
+        batch: &mut Vec<Incoming>,
+        without_credit: bool,
+    ) {
+        if without_credit && batch.last().is_some_and(is_shard_ack) {
+            let ack = batch.pop().expect("an acknowledgement was read");
+            stalled.get_or_insert_with(Default::default).unpaid_ack = Some(ack);
+        }
+    }
+
     /// Pushes a batch of newly framed packets (plus any previously held
     /// packets in strict order) under a single mutex acquisition and wake.
     /// When a `ShardIoRoute` is installed, subscriber ACKs
@@ -1140,9 +1190,7 @@ impl ConnCore {
         mut reservation: Option<ShardAckBatch>,
     ) -> Result<bool, &'static str> {
         if let Some(reservation) = reservation.as_mut()
-            && batch.iter().any(|item| {
-                matches!(item, Incoming::Packet { first, .. } if matches!(first >> 4, 4 | 5 | 7))
-            })
+            && batch.iter().any(is_shard_ack)
         {
             // Routes are installed once and the reservation belongs to this connection.
             let route = self.shard_route.get().expect("reserved shard route");
@@ -2561,19 +2609,30 @@ pub(super) enum Report {
 }
 
 /// Cold backpressure state for a transport task, allocated only when a lane
-/// towards the core refuses an item. Idle and steady-state tasks keep `None`.
+/// towards the core refuses an item or an acknowledgement waits for the
+/// shard's credit. Idle and steady-state tasks keep `None`.
 #[derive(Default)]
 pub(super) struct StalledState {
     pub(super) held: VecDeque<Incoming>,
     pub(super) reports: VecDeque<Report>,
     pub(super) stalled_since: Option<Instant>,
+    /// An acknowledgement for the shard read without credit
+    /// (`ConnCore::plan_read`). Nothing is read after it until it is sent.
+    pub(super) unpaid_ack: Option<Incoming>,
 }
 
 impl StalledState {
     #[inline]
     pub(super) fn is_empty(&self) -> bool {
-        self.held.is_empty() && self.reports.is_empty()
+        self.held.is_empty() && self.reports.is_empty() && self.unpaid_ack.is_none()
     }
+}
+
+/// Whether `item` goes to the shard of a routed connection: a subscriber's
+/// PUBACK, PUBREC or PUBCOMP.
+#[inline]
+fn is_shard_ack(item: &Incoming) -> bool {
+    matches!(item, Incoming::Packet { first, .. } if matches!(first >> 4, 4 | 5 | 7))
 }
 
 /// Where a parser takes its bytes. Zero means none is available now; the
@@ -3502,14 +3561,13 @@ impl Task {
                 return Ok(progressed);
             }
         }
-        let avail = self.core.incoming_free_slots();
-        let limit = avail.clamp(1, BURST);
-        let credit = self.core.reserve_shard_read(limit);
-        let limit = credit.as_ref().map_or(limit, |batch| batch.remaining);
-        if limit == 0 {
-            return Ok(progressed);
-        }
         scratch.incoming_batch.clear();
+        let Some((credit, limit, without_credit)) = self
+            .core
+            .plan_read(&mut self.stalled, &mut scratch.incoming_batch)
+        else {
+            return Ok(progressed);
+        };
         let mut heard_packet = false;
         let mut cached_fixed: Option<FrameObservation> = None;
         let mut source = ScratchSource {
@@ -3548,6 +3606,11 @@ impl Task {
         if heard_packet {
             record_heard(&self.core);
         }
+        ConnCore::park_unpaid_ack(
+            &mut self.stalled,
+            &mut scratch.incoming_batch,
+            without_credit,
+        );
         if !scratch.incoming_batch.is_empty() {
             self.core.push_incoming_batch(
                 &mut scratch.incoming_batch,
