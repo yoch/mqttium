@@ -96,3 +96,50 @@ fn an_idle_shard_waits_without_holding_the_reactors_wake_ups() {
         );
     });
 }
+
+fn closing_code(runtime: &Runtime<'_>, generation: ConnectionGeneration) -> Option<&'static str> {
+    runtime
+        .peers
+        .get(&generation)
+        .and_then(|peer| peer.closing())
+        .map(|(code, _)| code)
+}
+
+/// A connection whose session revision the coordinator does not know
+/// cannot be attached to its shard. It is closed and says why, rather than
+/// left open with no shard to deliver to it.
+#[test]
+fn a_connection_whose_revision_is_unknown_is_closed_at_attach() {
+    sharded(|runtime, _| {
+        let (generation, _client) = connected(runtime, b"attach-unknown");
+        let session = runtime.peers[&generation].session.unwrap();
+        runtime.session_revisions.remove(&session);
+        let _ = runtime.attach_ready_shards(vec![ConnectionKey {
+            session,
+            generation,
+        }]);
+        assert_eq!(
+            closing_code(runtime, generation),
+            Some("shard_attach_without_revision")
+        );
+    });
+}
+
+/// One generation is attached once. A second attach would keep the first
+/// route of the connection and send the shard a second `Attach`; the
+/// connection is closed instead.
+#[test]
+fn a_connection_attached_twice_is_closed() {
+    sharded(|runtime, _| {
+        let (generation, _client) = connected(runtime, b"attach-twice");
+        let session = runtime.peers[&generation].session.unwrap();
+        let _ = runtime.attach_ready_shards(vec![ConnectionKey {
+            session,
+            generation,
+        }]);
+        assert_eq!(
+            closing_code(runtime, generation),
+            Some("shard_attached_twice")
+        );
+    });
+}
