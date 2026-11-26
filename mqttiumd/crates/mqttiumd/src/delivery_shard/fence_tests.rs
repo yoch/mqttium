@@ -523,3 +523,98 @@ fn a_shard_claim_takes_no_identifier_the_coordinator_reserved() {
     );
     socket.close();
 }
+
+/// The coordinator may send a committed inline claim for a generation and,
+/// right after, the detach of that generation. The shard reads both in one
+/// pass and completes the detach before it applies the claim. The claim is
+/// durable: it must not be written to the closed generation, and nothing of
+/// it may be left behind in the shard.
+#[test]
+fn a_claim_committed_just_before_its_detach_is_not_written_to_the_closed_generation() {
+    let Harness {
+        incarnation,
+        epoch,
+        mut worker,
+        commands,
+        events,
+        _lanes: (_requests, _reply, _control, _control_reply),
+    } = harness("claim-before-detach");
+    std::fs::remove_file(&events).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let _client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+    let socket = net::spawn(listener.accept().unwrap().0).unwrap();
+    let session = SessionId::new(1);
+    let generation = ConnectionGeneration::new(10);
+    let lease = InlineClaimLease::new();
+    let dirty_seq = lease.mark_dirty();
+    commands
+        .send(CoordToShard::Attach {
+            session,
+            revision: Revision::new(1),
+            generation,
+            receive_maximum: 8,
+            maximum_packet_size: 1024,
+            version: Version::V5,
+            outgoing: socket.outgoing_handle(),
+            lease: Arc::clone(&lease),
+            dirty_seq,
+        })
+        .unwrap();
+    worker.drain_coord_messages().unwrap();
+    let source = LogicalOwnerId::new(0);
+    let bytes = |s| SharedBytes::copy_from(s, 1024).unwrap();
+    commands
+        .send(CoordToShard::InlineCommitted {
+            topic: bytes(b"t"),
+            payload: bytes(b"p"),
+            properties: None,
+            claims: vec![DelegatedClaim {
+                delivery: DeliveryId {
+                    publication: PublicationId::new(
+                        incarnation,
+                        epoch,
+                        source,
+                        PublicationSeq::new(1),
+                    ),
+                    index: 0,
+                },
+                target: session,
+                target_revision: Revision::new(1),
+                qos: Qos::AtLeastOnce,
+                claim_operation: OperationId::new(incarnation, epoch, source, OperationSeq::new(1)),
+                packet_id: OutboundPacketId::new(1).unwrap(),
+                generation,
+            }],
+        })
+        .unwrap();
+    let completed = Arc::<AtomicBool>::default();
+    commands
+        .send(CoordToShard::Detach {
+            connection: ConnectionKey {
+                session,
+                generation,
+            },
+            dirty_seq: lease.mark_dirty(),
+            completed: Arc::clone(&completed),
+        })
+        .unwrap();
+    worker.drain_coord_messages().unwrap();
+    worker.drain_pending_inline().unwrap();
+    worker.drain_inputs().unwrap();
+    worker.dispatch().unwrap();
+    worker.drain_coord_messages().unwrap();
+    assert!(
+        completed.load(Ordering::Acquire),
+        "the detach did not complete"
+    );
+    assert_eq!(
+        socket.queued_first_bytes(),
+        Vec::<u8>::new(),
+        "a frame was queued for the closed generation"
+    );
+    assert!(
+        worker.pending_inline.is_empty(),
+        "the claim was left behind"
+    );
+    socket.close();
+}
