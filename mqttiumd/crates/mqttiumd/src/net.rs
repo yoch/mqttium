@@ -3645,6 +3645,22 @@ mod tests {
         (connection, peer)
     }
 
+    /// Every connection keeps the place of a shard route, whatever the
+    /// number of shards. Without shards it pays a pointer for it, not the
+    /// route itself.
+    #[test]
+    fn a_connection_pays_one_pointer_for_the_place_of_its_shard_route() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let _client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let connection = spawn(listener.accept().unwrap().0).unwrap();
+        let place = std::mem::size_of_val(&connection.core.shard_route);
+        assert!(
+            place <= 2 * std::mem::size_of::<usize>(),
+            "the place of the shard route takes {place} bytes in each connection"
+        );
+        connection.close();
+    }
+
     #[test]
     fn a_borrowed_ingress_batch_keeps_capacity_for_its_unconsumed_suffix() {
         let (connection, _peer) = pair();
