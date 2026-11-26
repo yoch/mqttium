@@ -141,11 +141,20 @@ impl InlineClaimLease {
             let mask = !(1u64 << (zb % 64));
             let prev = self.used_pi[zb / 64].fetch_and(mask, Ordering::Release);
             if prev & (1u64 << (zb % 64)) != 0 {
-                self.in_flight.fetch_sub(1, Ordering::AcqRel);
+                self.release_in_flight();
             }
         } else {
-            self.in_flight.fetch_sub(1, Ordering::AcqRel);
+            // Above the bitmap nothing records whether this identifier was
+            // counted: the count is lowered, never below zero.
+            self.release_in_flight();
         }
+    }
+
+    #[inline]
+    fn release_in_flight(&self) {
+        let _ = self
+            .in_flight
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1));
     }
 
     /// Invoked exclusively by the owning `DeliveryShard` when Coordinator has
