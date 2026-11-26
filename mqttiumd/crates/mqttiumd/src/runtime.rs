@@ -7595,7 +7595,8 @@ fn recipe_details(recipe: &Recipe) -> serde_json::Value {
         _ => json!({}),
     }
 }
-fn qos0_origin(origin: Qos0Origin) -> String {
+/// The origin of a QoS 0 delivery as the journal names it.
+pub(crate) fn qos0_origin(origin: Qos0Origin) -> String {
     match origin {
         Qos0Origin::Volatile { publication } => format!(
             "volatile/{}/{}/{}",

@@ -1637,7 +1637,7 @@ impl DeliveryShardWorker {
                         } => {
                             for target in targets {
                                 if self.pending_qos0.len() >= PENDING_QOS0_LIMIT {
-                                    self.shed_qos0(origin, target.target);
+                                    self.shed_qos0(origin, target.target)?;
                                     continue;
                                 }
                                 self.pending_qos0.push_back(PendingQos0Item {
@@ -1776,19 +1776,18 @@ impl DeliveryShardWorker {
     /// Drops a delegated QoS 0 delivery the shard has no room to keep, as
     /// the core drops one its volatile queue cannot hold, with the same
     /// journal entry.
-    fn shed_qos0(&self, origin: Qos0Origin, target: SessionId) {
-        let _ = self.events.emit_with("qos0_dropped", || {
-            json!({
-                "details": {
-                    "target": target.get().to_string(),
-                    "reason": Qos0DropReason::CapacityExceeded.code(),
-                    "origin_kind": match origin {
-                        Qos0Origin::Volatile { .. } => "volatile",
-                        Qos0Origin::Consumed { .. } => "consumed",
+    fn shed_qos0(&self, origin: Qos0Origin, target: SessionId) -> Result<(), Failure> {
+        self.events
+            .emit_with("qos0_dropped", || {
+                json!({
+                    "details": {
+                        "origin": crate::runtime::qos0_origin(origin),
+                        "target": target.get().to_string(),
+                        "reason": Qos0DropReason::CapacityExceeded.code(),
                     }
-                }
+                })
             })
-        });
+            .map_err(|_| Failure::plain("events_unavailable"))
     }
 
     fn drain_pending_qos0(&mut self) -> Result<(), Failure> {
@@ -2452,6 +2451,9 @@ impl EffectSink for ShardSink<'_> {
                     self.error = Some(Failure::plain("shard_outgoing_binding_conflict"));
                     return refused(effect, SubmitBlock::InFlightLimit);
                 }
+                if self.outgoing_bindings.len() >= self.limits.outgoing_bindings {
+                    return refused(effect, SubmitBlock::InFlightLimit);
+                }
                 self.outgoing_bindings.insert(binding_key, binding);
                 let track_written = write_expiry.is_some() || self.events.records("frame_written");
                 match sess.outgoing.try_send_outgoing(Write {
@@ -2512,6 +2514,18 @@ impl EffectSink for ShardSink<'_> {
                     )),
                     _ => None,
                 };
+                // As the coordinator's sink: a PUBREL binds its identifier to
+                // the delivery; one already bound is a fault, and the table
+                // is bounded.
+                if let Some((key, _)) = binding {
+                    if self.outgoing_bindings.len() >= self.limits.outgoing_bindings {
+                        return refused(effect, SubmitBlock::InFlightLimit);
+                    }
+                    if self.outgoing_bindings.contains_key(&key) {
+                        self.error = Some(Failure::plain("shard_pubrel_binding_conflict"));
+                        return refused(effect, SubmitBlock::InFlightLimit);
+                    }
+                }
                 let Some(sess) = self.sessions.get(&connection.session).filter(|s| {
                     s.generation == connection.generation && !s.outgoing.is_cancelled()
                 }) else {
@@ -2694,18 +2708,21 @@ impl EffectSink for ShardSink<'_> {
                 reason,
             } => {
                 let (origin, target, reason) = (*origin, *target, *reason);
-                let _ = self.events.emit_with("qos0_dropped", || {
-                    json!({
-                        "details": {
-                            "target": target.map(|t| t.get().to_string()).unwrap_or_default(),
-                            "reason": reason.code(),
-                            "origin_kind": match origin {
-                                Qos0Origin::Volatile { .. } => "volatile",
-                                Qos0Origin::Consumed { .. } => "consumed",
+                if self
+                    .events
+                    .emit_with("qos0_dropped", || {
+                        json!({
+                            "details": {
+                                "origin": crate::runtime::qos0_origin(origin),
+                                "target": target.map(|t| t.get().to_string()).unwrap_or_default(),
+                                "reason": reason.code(),
                             }
-                        }
+                        })
                     })
-                });
+                    .is_err()
+                {
+                    self.error = Some(Failure::plain("events_unavailable"));
+                }
                 let _ = effect.into_parts();
                 SubmitResult::Accepted
             }
@@ -2716,7 +2733,7 @@ impl EffectSink for ShardSink<'_> {
                 reason,
             } => {
                 let (delivery, target, finished, reason) = (*delivery, *target, *finished, *reason);
-                let _ = self.events.emit_with("delivery_discarded", || {
+                let journaled = self.events.emit_with("delivery_discarded", || {
                     json!({
                         "operation": crate::events::operation(finished),
                         "command_kind": "Finish",
@@ -2734,6 +2751,9 @@ impl EffectSink for ShardSink<'_> {
                         }
                     })
                 });
+                if journaled.is_err() {
+                    self.error = Some(Failure::plain("events_unavailable"));
+                }
                 let _ = effect.into_parts();
                 SubmitResult::Accepted
             }
