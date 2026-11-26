@@ -50,7 +50,9 @@ Statements of this record the code does not meet, kept below as written:
 
 The mode stays experimental until the defects and suspects listed in
 `docs/reception/open-conditions.md` are closed and the coordinator and
-shard protocol has a model.
+shard protocol has a model. The inline-claim lease and its barrier have
+one since the third part below; the owner decides when the mode leaves
+"experimental".
 
 ### Corrected since (lot 3 of the validation, first part)
 
@@ -89,6 +91,36 @@ Second part, each by a failing test first:
 - A claim committed just before the detach of its generation is not
   written to the closed generation and leaves nothing behind (suspect S2,
   a witness: no defect).
+
+Third part, each by a failing test first (report 0046), and checked by
+the model `models/inline-lease`:
+
+- A stored target of a committed admission is notified after the
+  coordinator's step of the commit, on the store's answer and on a
+  resolution alike. Before, the step marked the lease dirty after the
+  notification and nothing sent that mark: after one publication admitted
+  without an inline claim the coordinator never claimed inline for that
+  subscriber again; and a stored publication committed by a resolution
+  was never delivered.
+- A committed inline claim is held while an inline admission of its
+  session has an unknown outcome, and the held claims are handed over in
+  order before the session's barrier. Before, the subscriber could
+  receive the later publication first (suspect B1).
+- A shard does not read a session the coordinator may still owe a
+  committed claim: not after a dirty message without sequence, and not
+  before the claims that came before a barrier are applied. Before, a
+  read during an unknown outcome took the claim's committed row and the
+  subscriber received it twice.
+- With that fence the first item of the second part is withdrawn: the
+  shard's claims no longer look at the coordinator's reserved
+  identifiers, which no longer exist when it claims. The second item
+  stays.
+- A connection without acknowledgement credit reads one packet: one that
+  needs no credit goes on, an acknowledgement waits in the task for
+  credit and what follows it waits behind it.
+- The shard's QoS 0 drop entry names its origin as the coordinator's
+  does; a journal entry the shard cannot write stops the broker, as at
+  the coordinator; a PUBREL's binding is checked and bounded as there.
 
 **The coordinator's send to a shard stays blocking, for a reason.** A
 shard waits only for a bounded time and empties its lane at each pass,

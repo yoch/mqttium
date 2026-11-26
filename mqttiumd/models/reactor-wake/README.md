@@ -36,10 +36,12 @@ the models were not extended to them:
 - `MLaneOwed`: the acknowledgements of a subscriber (PUBACK, PUBREC,
   PUBCOMP) and the write receipts of frames a shard emitted do not take
   the lanes of the model. They go to the `ShardInbox` of the shard, under
-  a budget whose exhaustion stops the task from reading
-  (`ShardAckBudget::reserve`) and whose return notifies it
-  (`ShardAckBudget::release`). That register, re-check and notify protocol
-  is not modelled.
+  a budget (`ShardAckBudget::reserve`) whose return notifies the task
+  (`ShardAckBudget::release`). Without credit a read turn reads one
+  packet: one that needs no credit goes on, an acknowledgement waits in
+  the task until credit returns, and nothing behind it is read meanwhile
+  (`ConnCore::plan_read`, report 0046). That register, re-check and
+  notify protocol is not modelled.
 
 ## Running
 
