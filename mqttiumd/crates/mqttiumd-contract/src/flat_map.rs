@@ -774,4 +774,91 @@ mod tests {
         assert_eq!(map.get(&k_cold), Some(&200));
         assert_eq!(map.len(), 1);
     }
+
+    fn operation(epoch: u64, owner: u64, sequence: u64) -> OperationId {
+        OperationId::new(
+            StoreIncarnation::new(1),
+            RunEpoch::new(epoch),
+            LogicalOwnerId::new(owner),
+            OperationSeq::new(sequence),
+        )
+    }
+
+    /// A table rebuilt after a restart first receives what earlier runs
+    /// left. The keys the run then creates are the busy ones: they get the
+    /// hot storage, whatever was inserted first.
+    #[test]
+    fn scoped_flat_map_gives_its_hot_storage_to_the_newest_run() {
+        let mut map: ScopedFlatMap<OperationId, u64> = ScopedFlatMap::new();
+        let left = [
+            (operation(1, 0, 7), 17),
+            (operation(1, 0, 8), 18),
+            (operation(2, 0, 7), 27),
+        ];
+        for (key, value) in left {
+            assert_eq!(map.insert(key, value), None);
+        }
+        let first_of_the_run = operation(3, 0, 1);
+        assert_eq!(map.insert(first_of_the_run, 31), None);
+        assert_eq!(map.hot_scope, Some(first_of_the_run.scope()));
+
+        // A key of an earlier run, or of another owner of this run, moves
+        // nothing.
+        let late = operation(2, 0, 9);
+        let other_owner = operation(3, 5, 1);
+        assert_eq!(map.insert(late, 29), None);
+        *map.get_or_insert_default(other_owner) += 35;
+        assert_eq!(map.hot_scope, Some(first_of_the_run.scope()));
+
+        assert_eq!(map.len(), 6);
+        for (key, value) in left {
+            assert_eq!(map.get(&key), Some(&value));
+        }
+        assert_eq!(map.get(&first_of_the_run), Some(&31));
+        assert_eq!(map.get(&late), Some(&29));
+        assert_eq!(map.get(&other_owner), Some(&35));
+
+        // The same through the other way in.
+        let mut counted: ScopedFlatMap<OperationId, u64> = ScopedFlatMap::new();
+        *counted.get_or_insert_default(operation(1, 0, 7)) += 1;
+        *counted.get_or_insert_default(first_of_the_run) += 1;
+        assert_eq!(counted.hot_scope, Some(first_of_the_run.scope()));
+        assert_eq!(counted.get(&operation(1, 0, 7)), Some(&1));
+    }
+
+    #[test]
+    fn scoped_flat_map_matches_an_ordered_map_across_runs_and_owners() {
+        let mut map: ScopedFlatMap<OperationId, u64> = ScopedFlatMap::new();
+        let mut oracle = BTreeMap::new();
+        let mut rng: u64 = 0x0dd0_5eed_cafe_f00d;
+        let mut next = || {
+            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
+            rng >> 33
+        };
+        for step in 0..20_000u64 {
+            // Later steps draw from later runs, as a broker restarted
+            // several times does, with stragglers of the earlier ones.
+            let newest = 1 + step / 5_000;
+            let epoch = 1 + next() % newest;
+            let key = operation(epoch, next() % 2, next() % 48);
+            match next() % 10 {
+                0..=4 => assert_eq!(map.insert(key, step), oracle.insert(key, step)),
+                5 => *map.get_or_insert_default(key) += 1,
+                6..=8 => assert_eq!(map.remove(&key), oracle.remove(&key)),
+                _ => assert_eq!(map.get(&key), oracle.get(&key)),
+            }
+            if let Some(value) = map.get(&key)
+                && oracle.get(&key) != Some(value)
+            {
+                // Only the counted insertion leaves the oracle behind.
+                *oracle.entry(key).or_default() += 1;
+                assert_eq!(oracle.get(&key), Some(value));
+            }
+            assert_eq!(map.len(), oracle.len());
+        }
+        let mut seen: Vec<(OperationId, u64)> = map.iter().map(|(k, v)| (k, *v)).collect();
+        seen.sort();
+        let expected: Vec<(OperationId, u64)> = oracle.into_iter().collect();
+        assert_eq!(seen, expected);
+    }
 }
