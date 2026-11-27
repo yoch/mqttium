@@ -5,6 +5,11 @@ the root covers the Python client and does not apply to this subtree, with
 one exception: maintained content is English. `docs/spec/fr/` is the only
 French content; it is an immutable archive.
 
+**Optimisation work starts at `docs/missions/L11-optimisation.md`**: the
+measured baseline after the validation of lot 10, the owner's performance
+gate, and the reservations left open (R1 to R10), each with its evidence,
+its code and what would close it.
+
 ## Checks
 
 Run from `mqttiumd/`. All four must pass before a change is proposed.

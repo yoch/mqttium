@@ -216,3 +216,10 @@ Each mission lists its criteria. For every lot:
 
 A lot is received on the revision actually proposed. If the content changes
 afterwards, the evidence it touches is run again.
+
+## After the validation of lot 10
+
+[Lot 11, optimisation](L11-optimisation.md) is the hand-over to the next
+optimisation work: where the branches stand, the measured baseline of
+report 0049, the owner's performance gate, and the reservations the
+validation left (reports 0043 to 0049).
