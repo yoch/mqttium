@@ -828,6 +828,15 @@ struct InlineClaimPlan {
     generation: ConnectionGeneration,
 }
 
+impl InlineClaimPlan {
+    fn claim(&self) -> InlineClaim {
+        InlineClaim {
+            target_index: self.target_index,
+            packet_id: self.packet_id,
+        }
+    }
+}
+
 #[derive(Debug)]
 enum InlineClaimPlans {
     None,
@@ -836,8 +845,24 @@ enum InlineClaimPlans {
 }
 
 impl InlineClaimPlans {
+    fn from_vec(plans: alloc::vec::Vec<InlineClaimPlan>) -> Self {
+        match plans.len() {
+            0 => Self::None,
+            1 => Self::One(plans[0]),
+            _ => Self::Many(plans),
+        }
+    }
+
     fn is_empty(&self) -> bool {
         matches!(self, Self::None)
+    }
+
+    fn as_slice(&self) -> &[InlineClaimPlan] {
+        match self {
+            Self::None => &[],
+            Self::One(plan) => core::slice::from_ref(plan),
+            Self::Many(plans) => plans,
+        }
     }
 }
 
@@ -2994,7 +3019,7 @@ impl Owner {
             targets: list,
         };
         let mut inline_claims = InlineClaimPlans::None;
-        let mut dirty_targets: Option<alloc::boxed::Box<[SessionId]>> = None;
+        let dirty_targets;
         let recipe = if *retain || expiry.is_some() {
             let retain_targets = if *retain {
                 let mut iter = selected.iter();
@@ -3009,13 +3034,7 @@ impl Owner {
                 admission,
                 retain_targets,
             };
-            if targets > 0 {
-                let mut vec = alloc::vec::Vec::with_capacity(targets);
-                for target in selected.iter() {
-                    vec.push(target.session);
-                }
-                dirty_targets = Some(vec.into_boxed_slice());
-            }
+            dirty_targets = Self::sessions_of(&selected);
             if let Some(expiry) = expiry {
                 Recipe::ExpiringPublication(crate::contract::command::ExpiringPublication {
                     admission: crate::contract::command::ExpiringAdmission::Qos12(retained),
@@ -3024,182 +3043,36 @@ impl Owner {
             } else {
                 Recipe::RetainedPublication(retained)
             }
-        } else if self.delegated_deliveries {
-            if targets > 0
-                && self.inline_claims_globally_allowed()
-                && let Some(oracle_ref) = oracle.as_deref_mut()
-            {
-                let mut plans = alloc::vec::Vec::with_capacity(selected.len());
-                let mut unclaimed = alloc::vec::Vec::new();
-                for (idx, target) in selected.iter().enumerate() {
-                    if target.qos != Qos::AtMostOnce
-                        && !self
-                            .pubsub
-                            .non_inline_by_session
-                            .contains_key(&target.session)
-                        && let Ok(target_index) = u16::try_from(idx)
-                        && let Some((target_gen, out_packet_id)) =
-                            oracle_ref.try_reserve(target.session, target.qos, length)
-                    {
-                        plans.push(InlineClaimPlan {
-                            target_index,
-                            target: target.session,
-                            target_revision: target.revision,
-                            qos: target.qos,
-                            packet_id: out_packet_id,
-                            generation: target_gen,
-                        });
-                    } else {
-                        unclaimed.push(target.session);
-                    }
-                }
-                if !unclaimed.is_empty() {
-                    dirty_targets = Some(unclaimed.into_boxed_slice());
-                }
-                match plans.len() {
-                    0 => Recipe::AdmitPublication(admission),
-                    1 => {
-                        let only = plans[0];
-                        inline_claims = InlineClaimPlans::One(only);
-                        Recipe::ClaimedPublication(ClaimedPublication {
-                            admission,
-                            claim: InlineClaim {
-                                target_index: only.target_index,
-                                packet_id: only.packet_id,
-                            },
-                        })
-                    }
-                    count => {
-                        let mut claims = match BoundedVec::with_capacity(count) {
-                            Ok(v) => v,
-                            Err(err) => {
-                                for plan in &plans {
-                                    oracle_ref.rollback(plan.target, plan.packet_id);
-                                }
-                                return Err(Stop::from(err));
-                            }
-                        };
-                        for plan in &plans {
-                            if claims
-                                .try_push(InlineClaim {
-                                    target_index: plan.target_index,
-                                    packet_id: plan.packet_id,
-                                })
-                                .is_err()
-                            {
-                                for p in &plans {
-                                    oracle_ref.rollback(p.target, p.packet_id);
-                                }
-                                return Err(IMPOSSIBLE);
-                            }
-                        }
-                        inline_claims = InlineClaimPlans::Many(plans);
-                        Recipe::MultiClaimedPublication(MultiClaimedPublication {
-                            admission,
-                            claims,
-                        })
-                    }
+        } else {
+            (inline_claims, dirty_targets) = if self.delegated_deliveries {
+                if targets > 0
+                    && self.inline_claims_globally_allowed()
+                    && let Some(oracle_ref) = oracle.as_deref_mut()
+                {
+                    self.delegated_claims(&selected, length, oracle_ref)
+                } else {
+                    (InlineClaimPlans::None, Self::sessions_of(&selected))
                 }
             } else {
-                if targets > 0 {
-                    let mut vec = alloc::vec::Vec::with_capacity(targets);
-                    for target in selected.iter() {
-                        vec.push(target.session);
-                    }
-                    dirty_targets = Some(vec.into_boxed_slice());
-                }
-                Recipe::AdmitPublication(admission)
-            }
-        } else if selected.len() == 1
-            && let Some(only) = selected.iter().next().copied()
-            && let Some((target_gen, out_packet_id)) = self.plan_inline_claim(only, length)
-        {
-            inline_claims = InlineClaimPlans::One(InlineClaimPlan {
-                target_index: 0,
-                target: only.session,
-                target_revision: only.revision,
-                qos: only.qos,
-                packet_id: out_packet_id,
-                generation: target_gen,
-            });
-            Recipe::ClaimedPublication(ClaimedPublication {
-                admission,
-                claim: InlineClaim {
-                    target_index: 0,
-                    packet_id: out_packet_id,
-                },
-            })
-        } else if selected.len() > 1 && self.inline_claims_globally_allowed() {
-            let mut remaining_slots = self
-                .pubsub
-                .deliveries
-                .capacity()
-                .saturating_sub(self.pubsub.deliveries.len());
-            let mut running_bytes = self.pubsub.deliveries.loaded_bytes();
-            let mut plans = alloc::vec::Vec::with_capacity(selected.len());
-            let mut unclaimed = alloc::vec::Vec::new();
-            for (idx, target) in selected.iter().enumerate() {
-                if let Ok(target_index) = u16::try_from(idx)
-                    && remaining_slots > 0
-                    && running_bytes
-                        .checked_add(length)
-                        .is_some_and(|total| total <= self.pubsub.payload_limit())
-                    && let Some((target_gen, out_packet_id)) =
-                        self.plan_inline_claim_target(*target)
-                {
-                    remaining_slots -= 1;
-                    running_bytes = running_bytes.saturating_add(length);
-                    plans.push(InlineClaimPlan {
-                        target_index,
-                        target: target.session,
-                        target_revision: target.revision,
-                        qos: target.qos,
-                        packet_id: out_packet_id,
-                        generation: target_gen,
-                    });
-                } else {
-                    unclaimed.push(target.session);
-                }
-            }
-            if !unclaimed.is_empty() {
-                dirty_targets = Some(unclaimed.into_boxed_slice());
-            }
-            match plans.len() {
-                0 => Recipe::AdmitPublication(admission),
-                1 => {
-                    let only = plans[0];
-                    inline_claims = InlineClaimPlans::One(only);
-                    Recipe::ClaimedPublication(ClaimedPublication {
+                self.local_claims(&selected, length)
+            };
+            match &inline_claims {
+                InlineClaimPlans::None => Recipe::AdmitPublication(admission),
+                InlineClaimPlans::One(only) => Recipe::ClaimedPublication(ClaimedPublication {
+                    admission,
+                    claim: only.claim(),
+                }),
+                InlineClaimPlans::Many(plans) => match Self::claims_of(plans) {
+                    Ok(claims) => Recipe::MultiClaimedPublication(MultiClaimedPublication {
                         admission,
-                        claim: InlineClaim {
-                            target_index: only.target_index,
-                            packet_id: only.packet_id,
-                        },
-                    })
-                }
-                count => {
-                    let mut claims = BoundedVec::with_capacity(count)?;
-                    for plan in &plans {
-                        claims
-                            .try_push(InlineClaim {
-                                target_index: plan.target_index,
-                                packet_id: plan.packet_id,
-                            })
-                            .map_err(|_| IMPOSSIBLE)?;
+                        claims,
+                    }),
+                    Err(stop) => {
+                        Self::roll_back_claims(oracle, &inline_claims);
+                        return Err(stop);
                     }
-                    inline_claims = InlineClaimPlans::Many(plans);
-                    Recipe::MultiClaimedPublication(MultiClaimedPublication { admission, claims })
-                }
+                },
             }
-        } else {
-            if targets > 0 {
-                let mut vec = alloc::vec::Vec::with_capacity(targets);
-                for target in selected.iter() {
-                    vec.push(target.session);
-                }
-                dirty_targets = Some(vec.into_boxed_slice());
-            }
-            Recipe::AdmitPublication(admission)
         };
         let recipe = if let Some(props) = properties {
             Recipe::AnnotatedPublication(crate::contract::command::AnnotatedPublication {
@@ -3213,19 +3086,7 @@ impl Owner {
         {
             Ok(in_flight) => in_flight,
             Err(stop) => {
-                if let Some(oracle_ref) = oracle.as_deref_mut() {
-                    match &inline_claims {
-                        InlineClaimPlans::None => {}
-                        InlineClaimPlans::One(plan) => {
-                            oracle_ref.rollback(plan.target, plan.packet_id);
-                        }
-                        InlineClaimPlans::Many(plans) => {
-                            for plan in plans {
-                                oracle_ref.rollback(plan.target, plan.packet_id);
-                            }
-                        }
-                    }
-                }
+                Self::roll_back_claims(oracle, &inline_claims);
                 return Err(stop);
             }
         };
@@ -3242,6 +3103,145 @@ impl Owner {
             inline_claims,
             dirty_targets,
         })
+    }
+
+    /// The inline claims the shards reserve for an admission: one for
+    /// each QoS 1 or 2 target that no unresolved non-inline admission
+    /// names and whose shard grants the reservation. The other targets
+    /// are read from the store after the commit.
+    fn delegated_claims(
+        &self,
+        selected: &routing::Selection,
+        length: u64,
+        oracle: &mut dyn InlineClaimOracle,
+    ) -> (InlineClaimPlans, Option<alloc::boxed::Box<[SessionId]>>) {
+        let mut plans = alloc::vec::Vec::with_capacity(selected.len());
+        let mut unclaimed = alloc::vec::Vec::new();
+        for (idx, target) in selected.iter().enumerate() {
+            if target.qos != Qos::AtMostOnce
+                && !self
+                    .pubsub
+                    .non_inline_by_session
+                    .contains_key(&target.session)
+                && let Ok(target_index) = u16::try_from(idx)
+                && let Some((target_gen, out_packet_id)) =
+                    oracle.try_reserve(target.session, target.qos, length)
+            {
+                plans.push(InlineClaimPlan {
+                    target_index,
+                    target: target.session,
+                    target_revision: target.revision,
+                    qos: target.qos,
+                    packet_id: out_packet_id,
+                    generation: target_gen,
+                });
+            } else {
+                unclaimed.push(target.session);
+            }
+        }
+        (
+            InlineClaimPlans::from_vec(plans),
+            (!unclaimed.is_empty()).then(|| unclaimed.into_boxed_slice()),
+        )
+    }
+
+    /// The inline claims the owner plans when it keeps its deliveries:
+    /// the only target when it can be claimed or, with several targets,
+    /// each one that can while the delivery table has a free row and the
+    /// payload budget room for it. The other targets are read from the
+    /// store after the commit.
+    fn local_claims(
+        &self,
+        selected: &routing::Selection,
+        length: u64,
+    ) -> (InlineClaimPlans, Option<alloc::boxed::Box<[SessionId]>>) {
+        if selected.len() == 1
+            && let Some(only) = selected.iter().next().copied()
+            && let Some((target_gen, out_packet_id)) = self.plan_inline_claim(only, length)
+        {
+            let plan = InlineClaimPlan {
+                target_index: 0,
+                target: only.session,
+                target_revision: only.revision,
+                qos: only.qos,
+                packet_id: out_packet_id,
+                generation: target_gen,
+            };
+            return (InlineClaimPlans::One(plan), None);
+        }
+        if selected.len() <= 1 || !self.inline_claims_globally_allowed() {
+            return (InlineClaimPlans::None, Self::sessions_of(selected));
+        }
+        let mut remaining_slots = self
+            .pubsub
+            .deliveries
+            .capacity()
+            .saturating_sub(self.pubsub.deliveries.len());
+        let mut running_bytes = self.pubsub.deliveries.loaded_bytes();
+        let mut plans = alloc::vec::Vec::with_capacity(selected.len());
+        let mut unclaimed = alloc::vec::Vec::new();
+        for (idx, target) in selected.iter().enumerate() {
+            if let Ok(target_index) = u16::try_from(idx)
+                && remaining_slots > 0
+                && running_bytes
+                    .checked_add(length)
+                    .is_some_and(|total| total <= self.pubsub.payload_limit())
+                && let Some((target_gen, out_packet_id)) = self.plan_inline_claim_target(*target)
+            {
+                remaining_slots -= 1;
+                running_bytes = running_bytes.saturating_add(length);
+                plans.push(InlineClaimPlan {
+                    target_index,
+                    target: target.session,
+                    target_revision: target.revision,
+                    qos: target.qos,
+                    packet_id: out_packet_id,
+                    generation: target_gen,
+                });
+            } else {
+                unclaimed.push(target.session);
+            }
+        }
+        (
+            InlineClaimPlans::from_vec(plans),
+            (!unclaimed.is_empty()).then(|| unclaimed.into_boxed_slice()),
+        )
+    }
+
+    /// The sessions of every selected target, read from the store after
+    /// the commit; none when nothing is selected.
+    fn sessions_of(selected: &routing::Selection) -> Option<alloc::boxed::Box<[SessionId]>> {
+        if selected.len() == 0 {
+            return None;
+        }
+        let mut sessions = alloc::vec::Vec::with_capacity(selected.len());
+        for target in selected.iter() {
+            sessions.push(target.session);
+        }
+        Some(sessions.into_boxed_slice())
+    }
+
+    /// The claims of a recipe that names several inline claims.
+    fn claims_of(plans: &[InlineClaimPlan]) -> Result<BoundedVec<InlineClaim>, Stop> {
+        let mut claims = BoundedVec::with_capacity(plans.len())?;
+        for plan in plans {
+            claims.try_push(plan.claim()).map_err(|_| IMPOSSIBLE)?;
+        }
+        Ok(claims)
+    }
+
+    /// Gives back to the shards the identifiers they reserved for the
+    /// inline claims of a plan that is refused. Without shards nothing
+    /// was reserved.
+    fn roll_back_claims<'o>(
+        oracle: &mut Option<&mut (dyn InlineClaimOracle + 'o)>,
+        plans: &InlineClaimPlans,
+    ) {
+        if let Some(oracle) = oracle.as_deref_mut() {
+            for plan in plans.as_slice() {
+                oracle.rollback(plan.target, plan.packet_id);
+            }
+        }
     }
 
     /// One counted wake represents all deferred known-fenced releases. It
