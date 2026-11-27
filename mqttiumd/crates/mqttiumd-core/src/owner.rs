@@ -355,11 +355,6 @@ impl Answers {
         }
     }
 
-    #[allow(dead_code)]
-    fn persist_id(&self) -> EffectId {
-        self.persist
-    }
-
     fn names(&self, effect: EffectId) -> bool {
         if effect.epoch != self.persist.epoch || effect.owner != self.persist.owner {
             return false;
@@ -4809,6 +4804,13 @@ impl Owner {
 
 #[cfg(test)]
 mod tests {
+    /// Used by the tests only.
+    impl super::Answers {
+        pub(super) fn persist_id(&self) -> EffectId {
+            self.persist
+        }
+    }
+
     use super::*;
     use crate::contract::command::StartupNonce;
     use crate::contract::effects::{EffectSink, InboundPhase, OwnerAuthority, SubmitResult};

@@ -336,18 +336,21 @@ impl Connections {
             self.after_by_gen.remove(&generation);
         }
     }
-
-    pub(super) fn rebuild_indices(&mut self) {
-        self.by_generation.clear();
-        self.by_loading_effect.clear();
-        for index in 0..self.rows.len() {
-            self.index(index);
-        }
-    }
 }
 
 #[cfg(test)]
 mod tests {
+    /// Used by the tests only.
+    impl super::Connections {
+        pub(in crate::owner) fn rebuild_indices(&mut self) {
+            self.by_generation.clear();
+            self.by_loading_effect.clear();
+            for index in 0..self.rows.len() {
+                self.index(index);
+            }
+        }
+    }
+
     use super::*;
     use alloc::string::String;
     use alloc::vec::Vec;

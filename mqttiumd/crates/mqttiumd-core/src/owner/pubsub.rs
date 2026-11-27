@@ -327,19 +327,6 @@ impl VolatileQueue {
             .filter_map(Volatile::expiry)
             .all(|expiry| expiry.state(now).is_ok())
     }
-
-    #[allow(dead_code)]
-    pub(super) fn to_vec(&self) -> alloc::vec::Vec<Volatile> {
-        let mut out = alloc::vec::Vec::with_capacity(self.len());
-        out.extend(self.inflight.values().cloned());
-        out.extend(
-            self.lanes
-                .values()
-                .flat_map(|lane| lane.parked.iter().cloned()),
-        );
-        out.extend(self.pending.iter().cloned());
-        out
-    }
 }
 
 #[derive(Debug)]
@@ -704,12 +691,6 @@ impl State {
 
     pub(super) fn control_pending(&self) -> bool {
         self.control.is_some()
-    }
-
-    #[allow(dead_code)]
-    pub(super) fn rebuild_indices(&mut self) {
-        self.connections.rebuild_indices();
-        self.deliveries.rebuild_indices();
     }
 }
 
@@ -2296,46 +2277,6 @@ impl Owner {
             }
         }
         count
-    }
-
-    #[allow(dead_code)]
-    pub(super) fn project_routes(
-        &self,
-        session: SessionId,
-        revision: Revision,
-        changes: &[GrantedSubscriptionChange],
-    ) -> Result<BoundedVec<Route>, Stop> {
-        let mut routes = BoundedVec::with_capacity(self.routes.capacity())?;
-        for route in self.routes.as_slice() {
-            if !(route.target == session && changes.iter().any(|c| c.topic == route.topic)) {
-                routes.try_push(route.clone()).map_err(|_| IMPOSSIBLE)?;
-            }
-        }
-        for (i, change) in changes.iter().enumerate() {
-            if change.granted.is_none()
-                || changes[i + 1..]
-                    .iter()
-                    .any(|later| later.topic == change.topic)
-            {
-                continue;
-            }
-            routes
-                .try_push(Route {
-                    topic: change.topic.clone(),
-                    target: session,
-                    target_revision: revision,
-                    max_qos: change.granted.ok_or(IMPOSSIBLE)?,
-                    options: change.options,
-                })
-                .map_err(|_| {
-                    Stop::Need(CapacityNeed {
-                        resource: Resource::References,
-                        amount: 1,
-                        wake: WakeCondition::ResourceReleased,
-                    })
-                })?;
-        }
-        Ok(routes)
     }
 
     pub(super) fn plan_pubsub_control_work(
@@ -4447,6 +4388,71 @@ impl Owner {
 
 #[cfg(test)]
 mod tests {
+    /// Used by the tests only.
+    impl super::VolatileQueue {
+        pub(in crate::owner) fn to_vec(&self) -> alloc::vec::Vec<Volatile> {
+            let mut out = alloc::vec::Vec::with_capacity(self.len());
+            out.extend(self.inflight.values().cloned());
+            out.extend(
+                self.lanes
+                    .values()
+                    .flat_map(|lane| lane.parked.iter().cloned()),
+            );
+            out.extend(self.pending.iter().cloned());
+            out
+        }
+    }
+
+    /// Used by the tests only.
+    impl super::State {
+        pub(in crate::owner) fn rebuild_indices(&mut self) {
+            self.connections.rebuild_indices();
+            self.deliveries.rebuild_indices();
+        }
+    }
+
+    /// Used by the tests only.
+    impl super::Owner {
+        pub(in crate::owner) fn project_routes(
+            &self,
+            session: SessionId,
+            revision: Revision,
+            changes: &[GrantedSubscriptionChange],
+        ) -> Result<BoundedVec<Route>, Stop> {
+            let mut routes = BoundedVec::with_capacity(self.routes.capacity())?;
+            for route in self.routes.as_slice() {
+                if !(route.target == session && changes.iter().any(|c| c.topic == route.topic)) {
+                    routes.try_push(route.clone()).map_err(|_| IMPOSSIBLE)?;
+                }
+            }
+            for (i, change) in changes.iter().enumerate() {
+                if change.granted.is_none()
+                    || changes[i + 1..]
+                        .iter()
+                        .any(|later| later.topic == change.topic)
+                {
+                    continue;
+                }
+                routes
+                    .try_push(Route {
+                        topic: change.topic.clone(),
+                        target: session,
+                        target_revision: revision,
+                        max_qos: change.granted.ok_or(IMPOSSIBLE)?,
+                        options: change.options,
+                    })
+                    .map_err(|_| {
+                        Stop::Need(CapacityNeed {
+                            resource: Resource::References,
+                            amount: 1,
+                            wake: WakeCondition::ResourceReleased,
+                        })
+                    })?;
+            }
+            Ok(routes)
+        }
+    }
+
     use super::*;
     use crate::contract::command::StartupNonce;
     use crate::contract::effects::{EffectSink, SubmitResult};

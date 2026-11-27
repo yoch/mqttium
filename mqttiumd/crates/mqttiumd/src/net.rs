@@ -1967,7 +1967,6 @@ impl Inbound<WireProgress> {
         }
     }
 
-    #[allow(dead_code)]
     pub fn recv_timeout(&self, timeout: Duration) -> Result<WireProgress, RecvTimeoutError> {
         match &self.receiver {
             InboundRx::Shared(core, _) => core.recv_timeout_progress(timeout),

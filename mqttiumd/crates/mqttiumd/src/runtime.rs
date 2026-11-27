@@ -702,14 +702,6 @@ impl PeerTable {
 
     #[allow(dead_code)]
     #[inline]
-    fn iter_mut(&mut self) -> impl Iterator<Item = (&ConnectionGeneration, &mut Peer)> + '_ {
-        self.entries
-            .iter_mut()
-            .filter_map(|slot| slot.as_mut().map(|(k, p)| (&*k, p)))
-    }
-
-    #[allow(dead_code)]
-    #[inline]
     fn values_mut(&mut self) -> impl Iterator<Item = &mut Peer> + '_ {
         self.entries
             .iter_mut()

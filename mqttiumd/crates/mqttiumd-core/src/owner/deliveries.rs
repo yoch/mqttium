@@ -464,11 +464,6 @@ impl Deliveries {
         self.rows.values()
     }
 
-    #[allow(dead_code)]
-    pub(super) fn to_vec(&self) -> alloc::vec::Vec<Delivery> {
-        self.rows.values().cloned().collect()
-    }
-
     pub(super) fn slot_of(&self, id: DeliveryId) -> Option<usize> {
         self.by_id.get(&id).copied()
     }
@@ -1175,30 +1170,37 @@ impl Deliveries {
         }
         (None, !blocked_all)
     }
-
-    pub(super) fn rebuild_indices(&mut self) {
-        self.by_id.clear();
-        self.by_op.clear();
-        self.by_deadline.clear();
-        self.by_frame.clear();
-        self.by_claim_op.clear();
-        self.by_claim_result_op.clear();
-        self.by_target_pi.clear();
-        self.by_session.clear();
-        self.by_window.clear();
-        self.control_candidates.clear();
-        self.expiring.clear();
-        self.pubrec_pending_count = 0;
-        self.loaded_payload_bytes = 0;
-        let live: alloc::vec::Vec<usize> = self.rows.iter().map(|(idx, _)| idx).collect();
-        for index in live {
-            self.index(index);
-        }
-    }
 }
 
 #[cfg(test)]
 mod tests {
+    /// Used by the tests only.
+    impl super::Deliveries {
+        pub(in crate::owner) fn to_vec(&self) -> alloc::vec::Vec<Delivery> {
+            self.rows.values().cloned().collect()
+        }
+
+        pub(in crate::owner) fn rebuild_indices(&mut self) {
+            self.by_id.clear();
+            self.by_op.clear();
+            self.by_deadline.clear();
+            self.by_frame.clear();
+            self.by_claim_op.clear();
+            self.by_claim_result_op.clear();
+            self.by_target_pi.clear();
+            self.by_session.clear();
+            self.by_window.clear();
+            self.control_candidates.clear();
+            self.expiring.clear();
+            self.pubrec_pending_count = 0;
+            self.loaded_payload_bytes = 0;
+            let live: alloc::vec::Vec<usize> = self.rows.iter().map(|(idx, _)| idx).collect();
+            for index in live {
+                self.index(index);
+            }
+        }
+    }
+
     use super::*;
     use alloc::string::String;
     use alloc::vec::Vec;
