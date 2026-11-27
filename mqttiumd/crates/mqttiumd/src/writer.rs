@@ -776,18 +776,18 @@ impl Hooks {
 /// while replies return on each owner's independent bounded channel.
 pub struct ShardStoreHandle {
     pub sender: crate::wake::Signalled<Request>,
-    pub receiver: Receiver<Response>,
+    pub receiver: crate::wake::LaneReceiver<Response>,
     pub control_sender: crate::wake::Signalled<ControlRequest>,
-    pub control_receiver: Receiver<ControlResponse>,
+    pub control_receiver: crate::wake::LaneReceiver<ControlResponse>,
     pub wake: crate::wake::Wake,
     pub has_expiring: Arc<AtomicBool>,
 }
 
 struct OwnerLane {
-    rx: Receiver<Request>,
-    rtx: mpsc::SyncSender<Response>,
-    crx: Receiver<ControlRequest>,
-    cctx: mpsc::SyncSender<ControlResponse>,
+    rx: crate::wake::LaneReceiver<Request>,
+    rtx: crate::wake::LaneSender<Response>,
+    crx: crate::wake::LaneReceiver<ControlRequest>,
+    cctx: crate::wake::LaneSender<ControlResponse>,
     wake: crate::wake::Wake,
     pending: VecDeque<Response>,
     pending_control: Option<ControlResponse>,
@@ -796,9 +796,9 @@ struct OwnerLane {
 
 pub struct Writer {
     pub sender: crate::wake::Signalled<Request>,
-    pub receiver: Receiver<Response>,
+    pub receiver: crate::wake::LaneReceiver<Response>,
     pub control_sender: crate::wake::Signalled<ControlRequest>,
-    pub control_receiver: Receiver<ControlResponse>,
+    pub control_receiver: crate::wake::LaneReceiver<ControlResponse>,
     pub boot: Receiver<Result<Boot, Failure>>,
     /// Signalled after each reply the worker publishes.
     pub wake: crate::wake::Wake,
@@ -889,7 +889,7 @@ impl Writer {
         // The worker waits on `requests` when all request lanes are empty.
         let requests = crate::wake::Wake::new();
         let (tx, rx) = crate::wake::signalled(QUEUE, &requests);
-        let (rtx, rrx) = mpsc::sync_channel(QUEUE * 2);
+        let (rtx, rrx) = crate::wake::bounded(QUEUE * 2);
         let (btx, brx) = mpsc::sync_channel(1);
         let (ctx, crx) = crate::wake::signalled(CONTROL_QUEUE, &requests);
         // File-polled test controls have no producer to signal the worker.
@@ -898,7 +898,7 @@ impl Writer {
         } else {
             Duration::from_millis(100)
         };
-        let (cctx, ccrx) = mpsc::sync_channel(CONTROL_QUEUE);
+        let (cctx, ccrx) = crate::wake::bounded(CONTROL_QUEUE);
         let wake = crate::wake::Wake::new();
         let has_expiring = Arc::new(AtomicBool::new(true));
         let worker_has_expiring = Arc::clone(&has_expiring);
@@ -917,9 +917,9 @@ impl Writer {
         let mut shard_handles = Vec::with_capacity(extra_owners);
         for _ in 0..extra_owners {
             let (stx, srx) = crate::wake::signalled(QUEUE, &requests);
-            let (srtx, srrx) = mpsc::sync_channel(QUEUE * 2);
+            let (srtx, srrx) = crate::wake::bounded(QUEUE * 2);
             let (sctx, scrx) = crate::wake::signalled(CONTROL_QUEUE, &requests);
-            let (scctx, sccrx) = mpsc::sync_channel(CONTROL_QUEUE);
+            let (scctx, sccrx) = crate::wake::bounded(CONTROL_QUEUE);
             let swake = crate::wake::Wake::new();
             lanes.push(OwnerLane {
                 rx: srx,
@@ -977,6 +977,7 @@ impl Writer {
                 let mut state = BusinessState::default();
                 let mut members: Vec<Member> = Vec::with_capacity(group);
                 let mut deferred_reads: Vec<(usize, EffectId, Effect)> = Vec::new();
+                let mut rx_buf: VecDeque<Request> = VecDeque::new();
                 let mut shard_rr: usize = 0;
                 #[cfg(feature = "test-hooks")]
                 let mut duplicate_control: Option<ControlResponse> = None;
@@ -1011,16 +1012,19 @@ impl Writer {
                                 }
                             }
                         }
-                        // Replies leave in the order of their owner's requests.
-                        while let Some(reply) = lane.pending.pop_front() {
-                            match lane.rtx.try_send(reply) {
-                                Ok(()) => woke = true,
-                                Err(TrySendError::Full(reply)) => {
-                                    stalled = true;
-                                    lane.pending.push_front(reply);
-                                    break;
+                        // Replies leave in the order of their owner's requests,
+                        // transferred in one batch lock per owner.
+                        if !lane.pending.is_empty() {
+                            match lane.rtx.try_send_drain(&mut lane.pending) {
+                                Some(moved) => {
+                                    if moved > 0 {
+                                        woke = true;
+                                    }
+                                    if !lane.pending.is_empty() {
+                                        stalled = true;
+                                    }
                                 }
-                                Err(TrySendError::Disconnected(_)) => {
+                                None => {
                                     if idx == 0 {
                                         return if stopping {
                                             stop_result
@@ -1030,7 +1034,6 @@ impl Writer {
                                     }
                                     lane.closed = true;
                                     lane.pending.clear();
-                                    break;
                                 }
                             }
                         }
@@ -1157,9 +1160,29 @@ impl Writer {
                         let mut coord_closed = false;
                         let lane_count = lanes.len();
                         if lane_count == 1 {
+                            if rx_buf.len() < group {
+                                let want = group - rx_buf.len();
+                                let (_, disconnected) =
+                                    lanes[0].rx.drain_into_deque(&mut rx_buf, want);
+                                if disconnected && rx_buf.is_empty() {
+                                    coord_closed = true;
+                                }
+                            }
                             while members.len() < group && deferred_reads.len() < group {
-                                match lanes[0].rx.try_recv() {
-                                    Ok(Request::Effect(effect)) => match effect.into_parts() {
+                                let Some(request) = rx_buf.pop_front() else {
+                                    let (taken, disconnected) = lanes[0]
+                                        .rx
+                                        .drain_into_deque(&mut rx_buf, group - members.len());
+                                    if taken == 0 {
+                                        if disconnected {
+                                            coord_closed = true;
+                                        }
+                                        break;
+                                    }
+                                    continue;
+                                };
+                                match request {
+                                    Request::Effect(effect) => match effect.into_parts() {
                                         (effect, Effect::Persist { command }) if group > 1 => {
                                             members.push(Member {
                                                 owner_idx: 0,
@@ -1177,13 +1200,8 @@ impl Writer {
                                             break;
                                         }
                                     },
-                                    Ok(request) => {
+                                    request => {
                                         other = Some((0, Err(request)));
-                                        break;
-                                    }
-                                    Err(TryRecvError::Empty) => break,
-                                    Err(TryRecvError::Disconnected) => {
-                                        coord_closed = true;
                                         break;
                                     }
                                 }
@@ -1534,10 +1552,6 @@ impl DirectWriter {
         self.control_responses.push_back(reply);
     }
 
-    pub(crate) fn try_recv(&mut self) -> Result<Response, TryRecvError> {
-        self.responses.pop_front().ok_or(TryRecvError::Empty)
-    }
-
     pub(crate) fn try_recv_control(&mut self) -> Result<ControlResponse, TryRecvError> {
         self.control_responses
             .pop_front()
@@ -1618,10 +1632,30 @@ impl StoreHandle<'_> {
         }
     }
 
-    pub(crate) fn try_recv(&mut self) -> Result<Response, TryRecvError> {
+    /// Drains up to `max` ordinary store replies in a single lock acquisition
+    /// on the threaded writer lane (or directly from the in-thread queue).
+    pub(crate) fn drain_responses(
+        &mut self,
+        out: &mut Vec<Response>,
+        max: usize,
+    ) -> Result<(), TryRecvError> {
+        if max == 0 {
+            return Ok(());
+        }
         match self {
-            Self::Threaded(writer) => writer.receiver.try_recv(),
-            Self::Direct(direct) => direct.try_recv(),
+            Self::Threaded(writer) => {
+                let (_, disconnected) = writer.receiver.drain_into(out, max);
+                if disconnected {
+                    Err(TryRecvError::Disconnected)
+                } else {
+                    Ok(())
+                }
+            }
+            Self::Direct(direct) => {
+                let take = direct.responses.len().min(max);
+                out.extend(direct.responses.drain(..take));
+                Ok(())
+            }
         }
     }
 

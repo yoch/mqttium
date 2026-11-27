@@ -605,7 +605,7 @@ impl EffectSink for Sink<'_, '_> {
                     };
                     let reply = self
                         .writer
-                        .apply_persist_direct(command, &mut self.pending_work_targets);
+                        .apply_persist_direct(command, self.pending_work_targets);
                     self.inputs.push_back(Input::StoreResult {
                         effect: id,
                         operation: operation_id,

@@ -138,6 +138,7 @@ impl Default for SmallIndexSet {
 }
 
 impl SmallIndexSet {
+    #[inline]
     pub(crate) fn len(&self) -> usize {
         match self {
             Self::Inline { len, .. } => usize::from(*len),
@@ -145,10 +146,12 @@ impl SmallIndexSet {
         }
     }
 
+    #[inline]
     pub(crate) fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
+    #[inline]
     pub(crate) fn insert(&mut self, value: usize) -> bool {
         match self {
             Self::Inline { len, items } => {
@@ -196,6 +199,7 @@ impl SmallIndexSet {
         }
     }
 
+    #[inline]
     pub(crate) fn remove(&mut self, value: &usize) -> bool {
         match self {
             Self::Inline { len, items } => {
@@ -227,6 +231,7 @@ impl SmallIndexSet {
         }
     }
 
+    #[inline]
     pub(crate) fn iter(&self) -> SmallIndexIter<'_> {
         match self {
             Self::Inline { len, items } => SmallIndexIter::Inline {

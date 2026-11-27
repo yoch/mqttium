@@ -778,6 +778,7 @@ pub(super) struct ConnCore {
     incoming_borrowed: AtomicU8,
     written_pending: AtomicBool,
     progress_pending: AtomicBool,
+    outgoing_pending: AtomicBool,
     shard_route_active: AtomicBool,
     /// Boxed: a connection without shards pays a pointer, not the route.
     shard_route: OnceLock<Box<ShardIoRoute>>,
@@ -864,6 +865,7 @@ impl ConnCore {
             incoming_borrowed: AtomicU8::new(0),
             written_pending: AtomicBool::new(false),
             progress_pending: AtomicBool::new(false),
+            outgoing_pending: AtomicBool::new(false),
             shard_route_active: AtomicBool::new(false),
             shard_route: OnceLock::new(),
             principal: is_tls.then(|| Box::new(OnceLock::new())),
@@ -901,7 +903,8 @@ impl ConnCore {
 
     #[inline]
     pub(super) fn mark_active(&self) {
-        if !self.activity.swap(true, Ordering::AcqRel)
+        if !self.activity.load(Ordering::SeqCst)
+            && !self.activity.swap(true, Ordering::SeqCst)
             && let Some((ready, id)) = &self.ready
         {
             ready.push(*id);
@@ -999,6 +1002,7 @@ impl ConnCore {
             return Err(TrySendError::Full(frame));
         }
         state.enqueue(frame);
+        self.outgoing_pending.store(true, Ordering::Release);
         if producer == Producer::CoordinatorSuback {
             // Queued under the lock a shard takes before it reads the
             // count: a frame of the shard that sees it paid follows it.
@@ -1027,6 +1031,7 @@ impl ConnCore {
             return Err(SendError(frame));
         }
         state.enqueue(frame);
+        self.outgoing_pending.store(true, Ordering::Release);
         drop(state);
         self.changed.notify_all();
         self.link.notify();
@@ -1044,6 +1049,9 @@ impl ConnCore {
         max_frames: usize,
     ) -> Result<(), ()> {
         out.clear();
+        if !self.outgoing_pending.load(Ordering::Acquire) {
+            return Ok(());
+        }
         let mut state = match self.outgoing.lock() {
             Ok(guard) => guard,
             Err(_) => return Err(()),
@@ -1056,6 +1064,7 @@ impl ConnCore {
             if !state.tx_alive {
                 return Err(());
             }
+            self.outgoing_pending.store(false, Ordering::Release);
             return Ok(());
         };
         let coalesce = allow_coalesce && first.can_coalesce(max_bytes);
@@ -1084,6 +1093,10 @@ impl ConnCore {
                 state.queue.clear();
             }
         }
+        self.outgoing_pending.store(
+            !state.queue.is_empty() || !state.tx_alive,
+            Ordering::Release,
+        );
         drop(state);
         #[cfg(test)]
         self.changed.notify_one();
@@ -2001,6 +2014,7 @@ impl Drop for Outbound {
         if let OutboundTx::Shared(core) = &self.sender {
             if let Ok(mut out) = core.outgoing.lock() {
                 out.tx_alive = false;
+                core.outgoing_pending.store(true, Ordering::Release);
             }
             core.changed.notify_all();
             core.link.notify();
@@ -2242,7 +2256,8 @@ impl Connection {
     /// the last check.
     #[inline]
     pub fn take_activity(&self) -> bool {
-        let active = self.core.activity.swap(false, Ordering::AcqRel);
+        let active = self.core.activity.load(Ordering::SeqCst)
+            && self.core.activity.swap(false, Ordering::SeqCst);
         active || self.has_pending()
     }
 
@@ -2430,7 +2445,8 @@ impl Connection {
     /// (for example due to ordinary-input backpressure).
     #[inline]
     pub fn mark_activity(&self) {
-        if !self.core.activity.swap(true, Ordering::AcqRel)
+        if !self.core.activity.load(Ordering::SeqCst)
+            && !self.core.activity.swap(true, Ordering::SeqCst)
             && let Some((ready, id)) = &self.core.ready
         {
             ready.push(*id);
@@ -2442,6 +2458,9 @@ impl Connection {
     #[cfg(test)]
     pub fn hold_output(&self, hold: bool) {
         self.core.outgoing.lock().unwrap().held = hold.then(HeldOutput::default);
+        if !hold {
+            self.core.outgoing_pending.store(true, Ordering::Release);
+        }
         self.core.link.notify();
     }
 
@@ -2577,6 +2596,7 @@ impl Drop for Connection {
             }
             if let Ok(mut out) = self.core.outgoing.lock() {
                 out.tx_alive = false;
+                self.core.outgoing_pending.store(true, Ordering::Release);
             }
             self.core.link.notify();
         }

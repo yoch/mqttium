@@ -21,7 +21,7 @@ use std::collections::VecDeque;
 use std::io;
 use std::os::fd::RawFd;
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -38,7 +38,7 @@ const REST: Duration = Duration::from_secs(1);
 /// Consecutive turns one task may take before the others are served.
 const TURNS: usize = 64;
 const WAKER: Token = Token(usize::MAX);
-const UNREGISTERED: u32 = u32::MAX;
+const UNREGISTERED_GEN: u64 = u64::MAX;
 static CONFIGURED_THREADS: AtomicUsize = AtomicUsize::new(0);
 
 /// Sets the reactor thread count used when the shared pool initializes.
@@ -79,7 +79,9 @@ pub(crate) trait Driven: Send {
 pub(crate) struct Link {
     shared: Arc<Shared>,
     wake: Wake,
-    slot: AtomicU32,
+    /// Packed `(generation << 32) | slot`, or `UNREGISTERED_GEN` while not
+    /// registered. Enables zero-`Arc` wake messages on the hot path.
+    slot_gen: AtomicU64,
     dirty: AtomicBool,
     owed: AtomicBool,
     finished: AtomicBool,
@@ -87,9 +89,15 @@ pub(crate) struct Link {
 
 impl Link {
     /// Asks the reactor to run the task. Idempotent until it runs.
+    #[inline]
     pub fn notify(self: &Arc<Self>) {
-        if !self.dirty.swap(true, Ordering::SeqCst) {
-            self.shared.send(Message::Run(self.clone()));
+        if !self.dirty.load(Ordering::SeqCst) && !self.dirty.swap(true, Ordering::SeqCst) {
+            let packed = self.slot_gen.load(Ordering::Acquire);
+            if packed != UNREGISTERED_GEN {
+                self.shared.send(Message::RunSlot(packed));
+            } else {
+                self.shared.send(Message::Run(self.clone()));
+            }
         }
     }
 
@@ -114,6 +122,7 @@ impl Link {
 enum Message {
     Register(Arc<Link>, Box<dyn Driven>),
     Run(Arc<Link>),
+    RunSlot(u64),
     Stop,
     /// Leaves the loop as an unrecoverable poll error does.
     #[cfg(test)]
@@ -185,13 +194,18 @@ impl Shared {
         }
     }
 
-    /// The reactor takes every message queued (`ReactorTake`). `None` when
-    /// the lock is poisoned: the reactor then leaves its loop.
-    fn take(&self) -> Option<Vec<Message>> {
-        self.queue
-            .lock()
-            .ok()
-            .map(|mut queue| std::mem::take(&mut *queue))
+    /// The reactor takes every message queued (`ReactorTake`) into `out`,
+    /// reusing the backing allocation across passes. `false` when the lock is
+    /// poisoned: the reactor then leaves its loop.
+    fn take(&self, out: &mut Vec<Message>) -> bool {
+        out.clear();
+        match self.queue.lock() {
+            Ok(mut queue) => {
+                std::mem::swap(&mut *queue, out);
+                true
+            }
+            Err(_) => false,
+        }
     }
 
     /// The reactor blocks until an event, a wake-up or `timeout`
@@ -247,6 +261,7 @@ struct Entry {
     link: Arc<Link>,
     task: Box<dyn Driven>,
     descriptor: RawFd,
+    generation: u32,
     queued: bool,
     waiting: bool,
 }
@@ -302,7 +317,7 @@ impl Reactors {
         Arc::new(Link {
             shared: self.threads[index].0.clone(),
             wake,
-            slot: AtomicU32::new(UNREGISTERED),
+            slot_gen: AtomicU64::new(UNREGISTERED_GEN),
             dirty: AtomicBool::new(false),
             owed: AtomicBool::new(false),
             finished: AtomicBool::new(false),
@@ -336,7 +351,10 @@ impl Drop for Reactors {
 
 fn retire(poll: &Poll, entry: Entry, code: &'static str) {
     let _ = poll.registry().deregister(&mut SourceFd(&entry.descriptor));
-    entry.link.slot.store(UNREGISTERED, Ordering::SeqCst);
+    entry
+        .link
+        .slot_gen
+        .store(UNREGISTERED_GEN, Ordering::SeqCst);
     let task = entry.task;
     let _ = catch_unwind(AssertUnwindSafe(move || task.finish(code)));
     entry.link.finished.store(true, Ordering::SeqCst);
@@ -350,16 +368,18 @@ fn run(mut poll: Poll, shared: &Shared) {
     let mut slots: Vec<Option<Entry>> = Vec::new();
     let mut free: Vec<usize> = Vec::new();
     let mut ready: VecDeque<usize> = VecDeque::new();
+    let mut messages: Vec<Message> = Vec::with_capacity(64);
+    let mut next_gen: u32 = 1;
     // Reusable scratch read/batch buffers shared across all tasks on this
     // reactor thread so idle connections hold zero I/O buffer RAM.
     let mut scratch = super::ReactorScratch::new();
     let mut waiting = 0usize;
     let mut last_tick = Instant::now();
     loop {
-        let Some(messages) = shared.take() else {
+        if !shared.take(&mut messages) {
             return;
-        };
-        for message in messages {
+        }
+        for message in messages.drain(..) {
             match message {
                 Message::Register(link, task) => {
                     let descriptor = task.descriptor();
@@ -367,10 +387,13 @@ fn run(mut poll: Poll, shared: &Shared) {
                         slots.push(None);
                         slots.len() - 1
                     });
+                    let generation = next_gen;
+                    next_gen = next_gen.wrapping_add(1).max(1);
                     let mut entry = Entry {
                         link,
                         task,
                         descriptor,
+                        generation,
                         queued: true,
                         waiting: false,
                     };
@@ -388,20 +411,36 @@ fn run(mut poll: Poll, shared: &Shared) {
                         retire(&poll, entry, "reactor_registration");
                         continue;
                     }
-                    entry.link.slot.store(slot as u32, Ordering::SeqCst);
+                    let packed = (u64::from(generation) << 32) | (slot as u64);
+                    entry.link.slot_gen.store(packed, Ordering::SeqCst);
                     slots[slot] = Some(entry);
                     ready.push_back(slot);
                 }
                 Message::Run(link) => {
                     link.dirty.store(false, Ordering::SeqCst);
-                    let raw_slot = link.slot.load(Ordering::SeqCst);
-                    if raw_slot != UNREGISTERED
-                        && let Some(Some(entry)) = slots.get_mut(raw_slot as usize)
-                        && Arc::ptr_eq(&entry.link, &link)
-                        && !entry.queued
+                    let packed = link.slot_gen.load(Ordering::SeqCst);
+                    if packed != UNREGISTERED_GEN {
+                        let raw_slot = (packed as u32) as usize;
+                        if let Some(Some(entry)) = slots.get_mut(raw_slot)
+                            && Arc::ptr_eq(&entry.link, &link)
+                            && !entry.queued
+                        {
+                            entry.queued = true;
+                            ready.push_back(raw_slot);
+                        }
+                    }
+                }
+                Message::RunSlot(packed) => {
+                    let generation = (packed >> 32) as u32;
+                    let raw_slot = (packed as u32) as usize;
+                    if let Some(Some(entry)) = slots.get_mut(raw_slot)
+                        && entry.generation == generation
                     {
-                        entry.queued = true;
-                        ready.push_back(raw_slot as usize);
+                        entry.link.dirty.store(false, Ordering::SeqCst);
+                        if !entry.queued {
+                            entry.queued = true;
+                            ready.push_back(raw_slot);
+                        }
                     }
                 }
                 #[cfg(test)]

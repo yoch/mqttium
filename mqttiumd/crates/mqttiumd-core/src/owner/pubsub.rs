@@ -59,6 +59,37 @@ impl Volatile {
     }
 }
 
+/// Compact accounting record for a volatile QoS 0 frame already handed to the
+/// transport (`Effect::EmitQos0`), dropping `topic`, `payload`, and `properties`
+/// references immediately after emission.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub(super) struct InFlightVolatile {
+    pub(super) origin: Qos0Origin,
+    pub(super) target: SessionId,
+    pub(super) connection: ConnectionKey,
+    pub(super) payload_len: u64,
+    pub(super) expiry: Option<alloc::boxed::Box<MessageExpiry>>,
+}
+
+impl InFlightVolatile {
+    #[inline]
+    fn expiry(&self) -> Option<MessageExpiry> {
+        self.expiry.as_deref().copied()
+    }
+
+    #[inline]
+    fn from_volatile(item: Volatile) -> Result<Self, CoreFault> {
+        let connection = item.connection.ok_or(CoreFault::StalePlan)?;
+        Ok(Self {
+            origin: item.origin,
+            target: item.target,
+            connection,
+            payload_len: item.payload.len() as u64,
+            expiry: item.expiry,
+        })
+    }
+}
+
 /// Volatile QoS 0 frames the owner lets one connection have emitted and
 /// not yet written, failed or refused (record 0063). The output queue of a
 /// connection is bounded and drops a QoS 0 frame it cannot hold: the owner
@@ -95,8 +126,8 @@ struct Lane {
 pub(super) struct VolatileQueue {
     capacity: usize,
     pending: VecDeque<Volatile>,
-    inflight: ScopedFlatMap<EffectId, Volatile>,
-    lanes: FlatMap<ConnectionGeneration, Lane>,
+    inflight: ScopedSeqMap<EffectId, InFlightVolatile>,
+    lanes: SeqMap<ConnectionGeneration, Lane>,
     /// The lanes whose oldest waiting delivery can leave or be dropped, in
     /// the order they became so: each is served one delivery in its turn.
     ready: VecDeque<ConnectionGeneration>,
@@ -112,8 +143,8 @@ impl VolatileQueue {
         Ok(Self {
             capacity,
             pending: VecDeque::new(),
-            inflight: ScopedFlatMap::new(),
-            lanes: FlatMap::new(),
+            inflight: ScopedSeqMap::new(),
+            lanes: SeqMap::new(),
             ready: VecDeque::new(),
             parked_len: 0,
             parked_bytes: 0,
@@ -214,6 +245,13 @@ impl VolatileQueue {
         }
     }
 
+    fn forget_inflight(&mut self, item: &InFlightVolatile) {
+        self.payload_bytes = self.payload_bytes.saturating_sub(item.payload_len);
+        if item.expiry.is_some() {
+            self.expiring_count = self.expiring_count.saturating_sub(1);
+        }
+    }
+
     fn lane_done(&mut self, generation: ConnectionGeneration) {
         if self
             .lanes
@@ -224,11 +262,32 @@ impl VolatileQueue {
         }
     }
 
-    fn promote_front_to_inflight(&mut self, effect: EffectId) -> Result<(), CoreFault> {
-        let mut item = self.pending.pop_front().ok_or(CoreFault::StalePlan)?;
-        let generation = Self::generation_of(&item)?;
-        item.frame = Some(effect);
+    fn push_inflight_direct(
+        &mut self,
+        effect: EffectId,
+        item: InFlightVolatile,
+    ) -> Result<(), CoreFault> {
+        if self.len() >= self.capacity {
+            return Err(CoreFault::StalePlan);
+        }
+        self.payload_bytes = self
+            .payload_bytes
+            .checked_add(item.payload_len)
+            .ok_or(CoreFault::StalePlan)?;
+        if item.expiry.is_some() {
+            self.expiring_count += 1;
+        }
+        let generation = item.connection.generation;
         self.inflight.insert(effect, item);
+        self.lanes.get_or_insert_default(generation).window += 1;
+        Ok(())
+    }
+
+    fn promote_front_to_inflight(&mut self, effect: EffectId) -> Result<(), CoreFault> {
+        let item = self.pending.pop_front().ok_or(CoreFault::StalePlan)?;
+        let inflight = InFlightVolatile::from_volatile(item)?;
+        let generation = inflight.connection.generation;
+        self.inflight.insert(effect, inflight);
         self.lanes.get_or_insert_default(generation).window += 1;
         Ok(())
     }
@@ -265,7 +324,7 @@ impl VolatileQueue {
             .lanes
             .get_mut(&generation)
             .ok_or(CoreFault::StalePlan)?;
-        let mut item = lane.parked.pop_front().ok_or(CoreFault::StalePlan)?;
+        let item = lane.parked.pop_front().ok_or(CoreFault::StalePlan)?;
         lane.ready = stays;
         if effect.is_some() {
             lane.window += 1;
@@ -277,8 +336,8 @@ impl VolatileQueue {
         }
         match effect {
             Some(effect) => {
-                item.frame = Some(effect);
-                self.inflight.insert(effect, item);
+                let inflight = InFlightVolatile::from_volatile(item)?;
+                self.inflight.insert(effect, inflight);
             }
             None => self.forget(&item),
         }
@@ -286,7 +345,7 @@ impl VolatileQueue {
         Ok(())
     }
 
-    fn get_inflight(&self, effect: EffectId) -> Option<&Volatile> {
+    fn get_inflight(&self, effect: EffectId) -> Option<&InFlightVolatile> {
         self.inflight.get(&effect)
     }
 
@@ -296,15 +355,14 @@ impl VolatileQueue {
     fn wakes(&self, effect: EffectId) -> bool {
         self.inflight
             .get(&effect)
-            .and_then(|item| item.connection)
-            .and_then(|key| self.lanes.get(&key.generation))
+            .and_then(|item| self.lanes.get(&item.connection.generation))
             .is_some_and(|lane| !lane.parked.is_empty() && !lane.ready)
     }
 
     fn remove_inflight(&mut self, effect: EffectId) -> Result<(), CoreFault> {
         let item = self.inflight.remove(&effect).ok_or(CoreFault::StalePlan)?;
-        self.forget(&item);
-        let generation = Self::generation_of(&item)?;
+        self.forget_inflight(&item);
+        let generation = item.connection.generation;
         if let Some(lane) = self.lanes.get_mut(&generation) {
             lane.window = lane.window.saturating_sub(1);
             if !lane.parked.is_empty() && !lane.ready {
@@ -322,9 +380,13 @@ impl VolatileQueue {
         }
         self.pending
             .iter()
-            .chain(self.inflight.values())
-            .chain(self.lanes.values().flat_map(|lane| lane.parked.iter()))
             .filter_map(Volatile::expiry)
+            .chain(self.inflight.values().filter_map(InFlightVolatile::expiry))
+            .chain(
+                self.lanes
+                    .values()
+                    .flat_map(|lane| lane.parked.iter().filter_map(Volatile::expiry)),
+            )
             .all(|expiry| expiry.state(now).is_ok())
     }
 }
@@ -362,8 +424,14 @@ pub(super) enum Change {
     Qos0Admit {
         connection: usize,
         ingress_order: u64,
-        records: BoundedVec<Volatile>,
+        records: alloc::vec::Vec<Volatile>,
         continuation: Option<ContinuationId>,
+    },
+    Qos0Direct {
+        connection: usize,
+        ingress_order: u64,
+        effect: EffectId,
+        inflight: InFlightVolatile,
     },
     Qos0Delegated {
         connection: usize,
@@ -949,7 +1017,7 @@ impl Owner {
                 return Ok(changed(Change::Qos0Admit {
                     connection,
                     ingress_order,
-                    records: BoundedVec::with_capacity(0)?,
+                    records: alloc::vec::Vec::new(),
                     continuation: None,
                 }));
             }
@@ -1209,7 +1277,7 @@ impl Owner {
                 return Ok(changed(Change::Qos0Admit {
                     connection,
                     ingress_order,
-                    records: BoundedVec::with_capacity(0)?,
+                    records: alloc::vec::Vec::new(),
                     continuation: None,
                 }));
             }
@@ -1259,11 +1327,53 @@ impl Owner {
             return Ok(changed(Change::Qos0Admit {
                 connection,
                 ingress_order,
-                records: BoundedVec::with_capacity(0)?,
+                records: alloc::vec::Vec::new(),
                 continuation: None,
             }));
         }
-        let mut records = BoundedVec::with_capacity(count)?;
+        if self.inline_claim_enabled
+            && count == 1
+            && !self.pubsub.volatile.has_pending()
+            && self.pubsub.volatile.ready.is_empty()
+            && let Some(target) = selected.as_ref().and_then(|s| s.iter().next())
+            && let Some(target_gen) = self.connection_of(target.session)
+            && self.pubsub.volatile.parked(target_gen) == 0
+            && self.pubsub.volatile.window(target_gen) < QOS0_WINDOW
+            && expiry.is_none_or(|exp| {
+                self.message_now
+                    .is_some_and(|now| matches!(exp.state(now), Ok(ExpiryState::Fresh { .. })))
+            })
+        {
+            let target_conn = ConnectionKey {
+                session: target.session,
+                generation: target_gen,
+            };
+            if self.qos0_fits(target_conn, topic, payload, *expiry, properties.as_deref()) {
+                let effect = draft.emit(Effect::EmitQos0 {
+                    connection: target_conn,
+                    origin,
+                    cause: DeliveryCause::LiveExact,
+                    retain: false,
+                    topic: topic.clone(),
+                    payload: payload.clone(),
+                    expiry: expiry.map(alloc::boxed::Box::new),
+                    properties: properties.clone(),
+                })?;
+                return Ok(changed(Change::Qos0Direct {
+                    connection,
+                    ingress_order,
+                    effect,
+                    inflight: InFlightVolatile {
+                        origin,
+                        target: target.session,
+                        connection: target_conn,
+                        payload_len: payload.len() as u64,
+                        expiry: expiry.map(alloc::boxed::Box::new),
+                    },
+                }));
+            }
+        }
+        let mut records = alloc::vec::Vec::with_capacity(count);
         for target in selected.ok_or(IMPOSSIBLE)?.iter() {
             let connection = self
                 .connection_of(target.session)
@@ -1271,18 +1381,16 @@ impl Owner {
                     session: target.session,
                     generation,
                 });
-            records
-                .try_push(Volatile {
-                    origin,
-                    target: target.session,
-                    connection,
-                    topic: topic.clone(),
-                    payload: payload.clone(),
-                    expiry: expiry.map(alloc::boxed::Box::new),
-                    properties: properties.clone(),
-                    frame: None,
-                })
-                .map_err(|_| IMPOSSIBLE)?;
+            records.push(Volatile {
+                origin,
+                target: target.session,
+                connection,
+                topic: topic.clone(),
+                payload: payload.clone(),
+                expiry: expiry.map(alloc::boxed::Box::new),
+                properties: properties.clone(),
+                frame: None,
+            });
         }
         let continuation = if self.pubsub.continuation.is_none() {
             Some(self.qos0_continuation(draft)?)
@@ -1468,7 +1576,7 @@ impl Owner {
                 .pubsub
                 .volatile
                 .get_inflight(effect)
-                .filter(|v| v.connection == Some(connection))
+                .filter(|v| v.connection == connection)
         {
             if let Some(reason) = reason {
                 draft.emit(Effect::Qos0Dropped {
@@ -1550,7 +1658,7 @@ impl Owner {
                 .pubsub
                 .volatile
                 .get_inflight(effect)
-                .filter(|v| v.connection == Some(connection))
+                .filter(|v| v.connection == connection)
         {
             if let Some(reason) = reason {
                 draft.emit(Effect::Qos0Dropped {
@@ -3729,18 +3837,10 @@ impl Owner {
                         return Err(CoreFault::StalePlan);
                     };
                     let target = d.target;
-                    owner.pubsub.deliveries.mutate(slot, |d| {
-                        d.phase = Phase::AwaitPuback;
-                        if let Some((effect, connection)) = emission {
-                            d.window = Some(connection.generation);
-                            if d.frame.is_some() {
-                                d.certain_never_started = false;
-                            }
-                            d.frame = Some((effect, connection));
-                            d.may_have_started = true;
-                            d.local_write_completed = false;
-                        }
-                    });
+                    owner
+                        .pubsub
+                        .deliveries
+                        .commit_inline_emitted(slot, emission);
                     if emission.is_none() || !owner.session_provably_idle_work(target) {
                         *all_idle = false;
                         owner.push_inline_ready_target(target);
@@ -3763,9 +3863,9 @@ impl Owner {
         Ok(())
     }
 
-    pub(super) fn apply_pubsub(&mut self, change: Change, input: Input) -> Result<(), CoreFault> {
+    pub(super) fn apply_pubsub(&mut self, change: Change, input: &Input) -> Result<(), CoreFault> {
         let stale = CoreFault::StalePlan;
-        if matches!(&input, Input::Continue { continuation, .. } if self.release_continuation == Some(*continuation))
+        if matches!(input, Input::Continue { continuation, .. } if self.release_continuation == Some(*continuation))
         {
             self.release_continuation = None;
         }
@@ -3790,13 +3890,27 @@ impl Owner {
                 self.pubsub
                     .connections
                     .record_qos0_ingress(connection, ingress_order)?;
-                for record in records.as_slice() {
-                    self.pubsub.volatile.push_pending(record.clone())?;
+                for record in records {
+                    self.pubsub.volatile.push_pending(record)?;
                 }
                 if let Some(c) = continuation {
                     self.pubsub.continuation = Some(c);
                     self.pubsub.continuations_started = true;
                 }
+            }
+            Change::Qos0Direct {
+                connection,
+                ingress_order,
+                effect,
+                inflight,
+            } => {
+                self.pubsub
+                    .connections
+                    .record_qos0_ingress(connection, ingress_order)?;
+                self.pubsub
+                    .volatile
+                    .push_inflight_direct(effect, inflight)?;
+                self.last_step_may_unblock_work = false;
             }
             Change::Qos0Delegated {
                 connection,
@@ -3935,7 +4049,7 @@ impl Owner {
                 discard,
                 next,
             } => {
-                let page_session = match &input {
+                let page_session = match input {
                     Input::WorkPage { session, .. } => Some(*session),
                     _ => None,
                 };
@@ -4071,11 +4185,7 @@ impl Owner {
                 if self.pubsub.deliveries.get(slot).is_none() {
                     return Err(stale);
                 }
-                self.pubsub.deliveries.mutate(slot, |d| {
-                    d.early_puback = false;
-                    d.early_pubrec = None;
-                    d.phase = Phase::FinishPending(in_flight);
-                });
+                self.pubsub.deliveries.start_finish(slot, in_flight);
                 if matches!(input, Input::ObservedPuback { .. }) {
                     self.last_step_may_unblock_work = false;
                 }
@@ -4375,10 +4485,7 @@ impl Owner {
                 if self.pubsub.deliveries.get(slot).is_none() {
                     return Err(stale);
                 }
-                self.pubsub.deliveries.mutate(slot, |d| {
-                    d.local_write_completed |= complete;
-                    d.certain_never_started = false;
-                });
+                self.pubsub.deliveries.mark_written(slot, complete);
                 self.last_step_may_unblock_work = false;
             }
         }

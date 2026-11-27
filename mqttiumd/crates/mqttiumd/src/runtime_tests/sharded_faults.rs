@@ -131,7 +131,7 @@ fn a_connection_whose_revision_is_unknown_is_closed_at_attach() {
         let (generation, _client) = connected(runtime, b"attach-unknown");
         let session = runtime.peers[&generation].session.unwrap();
         runtime.session_revisions.remove(&session);
-        let _ = runtime.attach_ready_shards(vec![ConnectionKey {
+        let _ = runtime.attach_ready_shards(&[ConnectionKey {
             session,
             generation,
         }]);
@@ -150,7 +150,7 @@ fn a_connection_attached_twice_is_closed() {
     sharded(|runtime, directory| {
         let (generation, _client) = connected(runtime, b"attach-twice");
         let session = runtime.peers[&generation].session.unwrap();
-        let _ = runtime.attach_ready_shards(vec![ConnectionKey {
+        let _ = runtime.attach_ready_shards(&[ConnectionKey {
             session,
             generation,
         }]);

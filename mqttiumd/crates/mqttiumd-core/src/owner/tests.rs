@@ -50,10 +50,7 @@ impl Owner {
             epoch: self.epoch,
             owner: self.id,
             counters: self.counters,
-            effects: Effects {
-                items: [None, None, None],
-                count: 0,
-            },
+            effects: alloc::boxed::Box::new(Effects::empty()),
             progress: Progress::Complete,
             closed: None,
             receipt_issued: None,
@@ -96,15 +93,25 @@ impl Owner {
         plan.stamp.check(self.id, self.revision)?;
         let mut no_oracle: Option<&mut dyn InlineClaimOracle> = None;
         let mut draft = plan.draft;
-        self.apply_draft(
+        let mut slot = Some(input);
+        let progress = self.apply_draft(
             &mut draft,
             plan.change,
-            input,
+            &mut slot,
             reservation,
-            None,
+            false,
             &mut no_oracle,
-        )
-        .map(|(progress, _)| progress)
+        )?;
+        if let Some(key) = reservation {
+            for slot in &mut draft.effects.items[..draft.effects.count] {
+                if let Some(effect) = slot.take() {
+                    self.outbox
+                        .publish(key, effect)
+                        .map_err(|_| CoreFault::ReservationOverrun)?;
+                }
+            }
+        }
+        Ok(progress)
     }
 }
 
@@ -173,7 +180,7 @@ struct Snapshot {
     slots: Vec<Slot>,
     outgoing_connections: Vec<pubsub::Connection>,
     outgoing_deliveries: Vec<pubsub::Delivery>,
-    volatile: Vec<pubsub::Volatile>,
+    volatile: (Vec<pubsub::InFlightVolatile>, Vec<pubsub::Volatile>),
     retained_qos0: Option<pubsub::RetainedFlight>,
     continuation: (Option<crate::contract::ids::ContinuationId>, bool),
     subscription: Option<ControlSnapshot>,

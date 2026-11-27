@@ -18,10 +18,10 @@ struct Harness {
     commands: Signalled<CoordToShard>,
     events: std::path::PathBuf,
     _lanes: (
-        mpsc::Receiver<Request>,
-        mpsc::SyncSender<Response>,
-        mpsc::Receiver<ControlRequest>,
-        mpsc::SyncSender<ControlResponse>,
+        crate::wake::LaneReceiver<Request>,
+        crate::wake::LaneSender<Response>,
+        crate::wake::LaneReceiver<ControlRequest>,
+        crate::wake::LaneSender<ControlResponse>,
     ),
 }
 
@@ -68,9 +68,9 @@ fn harness(name: &str) -> Harness {
 
     let wake = Wake::new();
     let (store_tx, requests) = crate::wake::signalled(8, &wake);
-    let (reply, receiver) = mpsc::sync_channel(8);
+    let (reply, receiver) = crate::wake::bounded(8);
     let (control_sender, control) = crate::wake::signalled(8, &wake);
-    let (control_reply, control_receiver) = mpsc::sync_channel(8);
+    let (control_reply, control_receiver) = crate::wake::bounded(8);
     let store = ShardStoreHandle {
         sender: store_tx,
         receiver,
@@ -613,7 +613,7 @@ fn a_session_is_read_only_after_the_claims_that_came_before_its_barrier() {
             dirty_seq,
         })
         .unwrap();
-    let reads = |requests: &mpsc::Receiver<Request>| {
+    let reads = |requests: &crate::wake::LaneReceiver<Request>| {
         requests
             .try_iter()
             .filter_map(|request| match request {

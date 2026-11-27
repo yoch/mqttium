@@ -17,7 +17,7 @@ use mqttiumd_contract::effects::{
     CloseReason, Effect, EffectSink, FrameProgress, Input, OwnedEffect, OwnerAuthority,
     RecoveredFact, SubmitBlock, SubmitResult,
 };
-use mqttiumd_contract::flat_map::{FlatMap, FlatSet, ScopedFlatMap};
+use mqttiumd_contract::flat_map::{FlatMap, FlatSet, ScopedSeqMap};
 use mqttiumd_contract::ids::{
     AccountId, ConnectionGeneration, ConnectionKey, DeadlineToken, DeliveryId, EffectId,
     LogicalDuration, LogicalOwnerId, LogicalTime, OperationId, OperationSeq, OutboundPacketId,
@@ -790,6 +790,12 @@ struct Runtime<'a> {
     scratch_incoming: VecDeque<net::Incoming>,
     scratch_written: Vec<net::Written>,
     scratch_progress: Vec<net::WireProgress>,
+    scratch_responses: Vec<Response>,
+    sink_close: Vec<(ConnectionGeneration, &'static str)>,
+    sink_mark_pending: Vec<ConnectionGeneration>,
+    sink_work_targets: Vec<SessionId>,
+    sink_attach_ready: Vec<ConnectionKey>,
+    sink_suback_ready: Vec<SessionId>,
     last_peer_deadline_scan: Instant,
     inputs: VecDeque<Input>,
     /// FIFO lane for credit-releasing subscriber acknowledgements
@@ -800,7 +806,7 @@ struct Runtime<'a> {
     control_inputs: VecDeque<Input>,
     closing_inputs: VecDeque<Input>,
     terminal_inputs: VecDeque<Input>,
-    terminal_effects: ScopedFlatMap<EffectId, u32>,
+    terminal_effects: ScopedSeqMap<EffectId, u32>,
     deferred_inputs: VecDeque<Input>,
     deferred_by_conn: FlatMap<ConnectionGeneration, usize>,
     /// A packet waits in `deferred_inputs` for room in the effect box.
@@ -820,17 +826,17 @@ struct Runtime<'a> {
     /// other work that progresses is pressure, however long it lasts.
     credit_progress: Instant,
     timers: BTreeMap<DeadlineToken, Instant>,
-    inflight: ScopedFlatMap<EffectId, OperationId>,
+    inflight: ScopedSeqMap<EffectId, OperationId>,
     /// Subset of `inflight` ordinary-lane commands that depend on or mutate
     /// `route_revision` or target session presence; control-lane lifecycle and
     /// Will admissions wait for this set to drain so they never overtake and
     /// invalidate in-flight admissions of unrelated clients.
-    inflight_route_ops: ScopedFlatMap<EffectId, ()>,
+    inflight_route_ops: ScopedSeqMap<EffectId, ()>,
     lifecycle_inflight: BTreeMap<EffectId, OperationId>,
     last_session_change: Option<OperationId>,
     session_cardinality_dirty: bool,
     last_session_cardinality: Option<[usize; 13]>,
-    work_reads: ScopedFlatMap<EffectId, SessionId>,
+    work_reads: ScopedSeqMap<EffectId, SessionId>,
     pending_work: VecDeque<SessionId>,
     pending_work_set: BTreeSet<SessionId>,
     queued_work_sessions: FlatSet<SessionId>,
@@ -861,7 +867,7 @@ struct Runtime<'a> {
     #[cfg(feature = "test-hooks")]
     deferred_ack_used: bool,
     retained_output: crate::retained_output::RetainedOutput,
-    frames: ScopedFlatMap<EffectId, PendingFrame>,
+    frames: ScopedSeqMap<EffectId, PendingFrame>,
     outgoing_bindings: FlatMap<(ConnectionKey, OutboundPacketId), PubackTarget>,
     puback_observation: u64,
     #[cfg(feature = "test-hooks")]
@@ -1164,6 +1170,9 @@ impl Runtime<'_> {
         // once, when the turn ends.
         let _wakes = net::hold_wakes();
         let now = Instant::now();
+        if now.saturating_duration_since(self.last_message_clock_sync) >= IDLE_TICK {
+            self.message_clock_needed = true;
+        }
         self.writer_results()?;
         if self.shards.is_some() {
             self.drain_shard_notices()?;
@@ -1244,11 +1253,11 @@ impl Runtime<'_> {
     /// Attaches the sessions whose CONNACK is queued to their shards. A
     /// connection that cannot be attached is closed with the reason: left
     /// open, it would get no delivery and nothing would say why.
-    fn attach_ready_shards(&mut self, ready: Vec<ConnectionKey>) -> Result<(), Failure> {
+    fn attach_ready_shards(&mut self, ready: &[ConnectionKey]) -> Result<(), Failure> {
         if ready.is_empty() || self.shards.is_none() {
             return Ok(());
         }
-        for connection in ready {
+        for &connection in ready {
             let pending_inline = self
                 .owner
                 .pending_delegated_inline_count(connection.session);
@@ -2402,8 +2411,7 @@ impl Runtime<'_> {
             let needs_clock = cfg!(any(test, feature = "test-hooks"))
                 || self.message_clock_needed
                 || self.message_last_time.is_none()
-                || self.owner.has_expiring_messages()
-                || self.last_message_clock_sync.elapsed() >= IDLE_TICK;
+                || self.owner.has_expiring_messages();
             if needs_clock {
                 let now = self.message_now()?;
                 self.message_clock_needed = false;
@@ -2443,57 +2451,77 @@ impl Runtime<'_> {
             let progress_before_pass = self.progress;
             while steps_taken < step_budget {
                 steps_taken += 1;
-                // A wake serves the oldest packet that waits, ahead of
-                // everything else and without moving the others.
-                let retried = if self.deferred_retries > 0 {
-                    self.deferred_retries -= 1;
-                    self.pop_deferred_front()
-                } else {
-                    None
-                };
-                let from_retry = retried.is_some();
-                let control = if !from_retry && control_budget > 0 {
-                    self.control_inputs.pop_front()
-                } else {
-                    None
-                };
-                let Some(input) = retried
-                    .or(control.inspect(|_| control_budget -= 1))
-                    .or_else(|| {
-                        if closing_budget > 0 {
-                            closing_budget -= 1;
-                            self.pop_closing_input()
-                        } else {
-                            None
-                        }
-                    })
-                    .or_else(|| {
-                        if terminal_budget > 0 {
-                            terminal_budget -= 1;
-                            self.pop_terminal_input()
-                        } else {
-                            None
-                        }
-                    })
-                    .or_else(|| {
-                        if expiry_budget > 0 {
-                            expiry_budget -= 1;
-                            self.expiry_inputs.pop_front()
-                        } else {
-                            None
-                        }
-                    })
-                    .or_else(|| self.message_expiry_input.take())
-                    .or_else(|| self.ack_inputs.pop_front())
-                    .or_else(|| {
+                let (from_retry, mut input) = if self.deferred_retries == 0
+                    && self.control_inputs.is_empty()
+                    && self.closing_inputs.is_empty()
+                    && self.terminal_inputs.is_empty()
+                    && self.expiry_inputs.is_empty()
+                    && self.message_expiry_input.is_none()
+                {
+                    let Some(input) = self.ack_inputs.pop_front().or_else(|| {
                         let popped = self.inputs.pop_front()?;
                         if let Input::WorkAvailable { session } = &popped {
                             self.queued_work_sessions.remove(session);
                         }
                         Some(popped)
-                    })
-                else {
-                    break;
+                    }) else {
+                        break;
+                    };
+                    (false, input)
+                } else {
+                    // A wake serves the oldest packet that waits, ahead of
+                    // everything else and without moving the others.
+                    let retried = if self.deferred_retries > 0 {
+                        self.deferred_retries -= 1;
+                        self.pop_deferred_front()
+                    } else {
+                        None
+                    };
+                    let from_retry = retried.is_some();
+                    let control = if !from_retry && control_budget > 0 {
+                        self.control_inputs.pop_front()
+                    } else {
+                        None
+                    };
+                    let Some(input) = retried
+                        .or(control.inspect(|_| control_budget -= 1))
+                        .or_else(|| {
+                            if closing_budget > 0 {
+                                closing_budget -= 1;
+                                self.pop_closing_input()
+                            } else {
+                                None
+                            }
+                        })
+                        .or_else(|| {
+                            if terminal_budget > 0 {
+                                terminal_budget -= 1;
+                                self.pop_terminal_input()
+                            } else {
+                                None
+                            }
+                        })
+                        .or_else(|| {
+                            if expiry_budget > 0 {
+                                expiry_budget -= 1;
+                                self.expiry_inputs.pop_front()
+                            } else {
+                                None
+                            }
+                        })
+                        .or_else(|| self.message_expiry_input.take())
+                        .or_else(|| self.ack_inputs.pop_front())
+                        .or_else(|| {
+                            let popped = self.inputs.pop_front()?;
+                            if let Input::WorkAvailable { session } = &popped {
+                                self.queued_work_sessions.remove(session);
+                            }
+                            Some(popped)
+                        })
+                    else {
+                        break;
+                    };
+                    (from_retry, input)
                 };
                 if !from_retry
                     && !self.deferred_by_conn.is_empty()
@@ -2503,22 +2531,23 @@ impl Runtime<'_> {
                     self.push_deferred_back(input);
                     continue;
                 }
-                let input = match input {
+                match &mut input {
                     Input::ObservedPuback {
                         connection,
                         packet_id,
                         reason,
                         target,
                     } => {
-                        if !self.queued_generation_is_current(connection.generation)? {
+                        let (conn, pi, rsn) = (*connection, *packet_id, *reason);
+                        if !self.queued_generation_is_current(conn.generation)? {
                             self.events
                                 .emit(
                                     "puback_ignored",
                                     puback_fields(
-                                        connection,
-                                        packet_id,
-                                        reason,
-                                        target,
+                                        conn,
+                                        pi,
+                                        rsn,
+                                        *target,
                                         None,
                                         "connection_closed",
                                     ),
@@ -2527,127 +2556,61 @@ impl Runtime<'_> {
                             continue;
                         }
                         #[cfg(feature = "test-hooks")]
-                        let target = if MUTANT_REBIND_OBSERVED_PUBACK {
-                            self.owner.puback_target(connection, packet_id)
-                        } else {
-                            target
-                        };
+                        if MUTANT_REBIND_OBSERVED_PUBACK {
+                            *target = self.owner.puback_target(conn, pi);
+                        }
                         if target.is_none() {
                             self.events
                                 .emit(
                                     "puback_ignored",
                                     puback_fields(
-                                        connection,
-                                        packet_id,
-                                        reason,
-                                        target,
+                                        conn,
+                                        pi,
+                                        rsn,
+                                        *target,
                                         None,
                                         "no_current_matching_occurrence",
                                     ),
                                 )
                                 .map_err(event_failure)?;
                         }
-                        Input::ObservedPuback {
-                            connection,
-                            packet_id,
-                            reason,
-                            target,
-                        }
                     }
                     Input::Packet {
                         packet: InboundPacket::Puback { .. } | InboundPacket::Qos2Ack { .. },
                         ..
                     } => return Err(Failure::plain("uncorrelated_puback_input")),
-                    Input::Packet {
-                        connection,
-                        ingress_order,
-                        packet,
-                    } => {
-                        if !self.queued_generation_is_current(connection)? {
+                    Input::Packet { connection, .. } => {
+                        if !self.queued_generation_is_current(*connection)? {
                             continue;
-                        }
-                        Input::Packet {
-                            connection,
-                            ingress_order,
-                            packet,
                         }
                     }
-                    Input::OpenSession {
-                        connection,
-                        client_id,
-                        clean_start,
-                        expiry,
-                    } => {
-                        if !self.peers.contains_key(&connection) {
+                    Input::OpenSession { connection, .. } => {
+                        if !self.peers.contains_key(connection) {
+                            let conn = *connection;
                             self.session_requests
-                                .retain(|_, pending| pending.connection != connection);
+                                .retain(|_, pending| pending.connection != conn);
                             continue;
-                        }
-                        Input::OpenSession {
-                            connection,
-                            client_id,
-                            clean_start,
-                            expiry,
                         }
                     }
                     Input::OpenSessionWillAt {
-                        connection,
-                        client_id,
-                        clean_start,
-                        expiry,
-                        will,
-                        now: _,
+                        connection, now, ..
+                    }
+                    | Input::OpenSessionAt {
+                        connection, now, ..
                     } => {
-                        if !self.peers.contains_key(&connection) {
+                        if !self.peers.contains_key(connection) {
+                            let conn = *connection;
                             self.session_requests
-                                .retain(|_, pending| pending.connection != connection);
+                                .retain(|_, pending| pending.connection != conn);
                             continue;
                         }
-                        Input::OpenSessionWillAt {
-                            connection,
-                            client_id,
-                            clean_start,
-                            expiry,
-                            will,
-                            now: self.session_now()?,
-                        }
+                        *now = self.session_now()?;
                     }
-                    Input::OpenSessionAt {
-                        connection,
-                        client_id,
-                        clean_start,
-                        expiry,
-                        now: _,
-                    } => {
-                        if !self.peers.contains_key(&connection) {
-                            self.session_requests
-                                .retain(|_, pending| pending.connection != connection);
-                            continue;
-                        }
-                        let now = self.session_now()?;
-                        Input::OpenSessionAt {
-                            connection,
-                            client_id,
-                            clean_start,
-                            expiry,
-                            now,
-                        }
+                    Input::SessionEstablished { connection, .. } => {
+                        *connection = connection.filter(|g| self.peers.contains_key(g));
                     }
-                    Input::SessionEstablished {
-                        connection,
-                        session,
-                        client_id,
-                        revision,
-                        session_present,
-                    } => Input::SessionEstablished {
-                        connection: connection.filter(|g| self.peers.contains_key(g)),
-                        session,
-                        client_id,
-                        revision,
-                        session_present,
-                    },
-                    other => other,
-                };
+                    _ => {}
+                }
                 let mut finish: Option<(OperationId, DeliveryId)> = None;
                 let mut wakes_business = false;
                 let mut collected: Option<(ReceiptCollection, ReceiptClosure, u16, u64, bool)> =
@@ -2973,13 +2936,9 @@ impl Runtime<'_> {
                 let inputs_before_dispatch = self.inputs.len();
                 let mut dispatched_inline = false;
                 let mut inline_accepted = 0usize;
-                let mut inline_close: Vec<(ConnectionGeneration, &'static str)> = Vec::new();
-                let mut inline_mark_pending: Vec<ConnectionGeneration> = Vec::new();
-                let mut inline_work_targets: Vec<SessionId> = Vec::new();
-                let mut inline_attach_ready: Vec<ConnectionKey> = Vec::new();
-                let mut inline_suback_ready: Vec<SessionId> = Vec::new();
                 let mut inline_changed: Option<AppliedSessionChange> = None;
                 let mut inline_error: Option<Failure> = None;
+                let mut input_slot = Some(input);
                 let step_outcome = if !cfg!(feature = "test-hooks")
                     && !zero_effect_step
                     && (!fast_batch_step || self.writer.is_direct())
@@ -2995,6 +2954,11 @@ impl Runtime<'_> {
                 {
                     dispatched_inline = true;
                     let shards_active = self.shards.is_some();
+                    self.sink_close.clear();
+                    self.sink_mark_pending.clear();
+                    self.sink_work_targets.clear();
+                    self.sink_attach_ready.clear();
+                    self.sink_suback_ready.clear();
                     let mut sink = Sink {
                         writer: &mut self.writer,
                         limits: self.limits,
@@ -3028,47 +2992,46 @@ impl Runtime<'_> {
                         frames: &mut self.frames,
                         outgoing_bindings: &mut self.outgoing_bindings,
                         shards_active,
-                        shard_attach_ready: Vec::new(),
-                        shard_suback_ready: Vec::new(),
-                        close: Vec::new(),
-                        mark_pending_peers: Vec::new(),
-                        pending_work_targets: Vec::new(),
+                        shard_attach_ready: &mut self.sink_attach_ready,
+                        shard_suback_ready: &mut self.sink_suback_ready,
+                        close: &mut self.sink_close,
+                        mark_pending_peers: &mut self.sink_mark_pending,
+                        pending_work_targets: &mut self.sink_work_targets,
                         direct_skip_next_deadline: false,
                         session_change: None,
                         error: None,
                     };
                     let mut replay_sink = self.retained_output.sink(&mut sink);
                     let (outcome, accepted) = if let Some(shards) = self.shards.as_mut() {
-                        self.owner.step_and_dispatch_with_oracle(
-                            input,
+                        self.owner.step_and_dispatch_in_place_with_oracle(
+                            &mut input_slot,
                             TurnGrant { work_limit },
                             &mut replay_sink,
                             shards,
                         )
                     } else {
-                        self.owner.step_and_dispatch(
-                            input,
+                        self.owner.step_and_dispatch_in_place(
+                            &mut input_slot,
                             TurnGrant { work_limit },
                             &mut replay_sink,
                         )
                     };
                     inline_accepted = accepted;
-                    inline_close = std::mem::take(&mut sink.close);
-                    inline_mark_pending = std::mem::take(&mut sink.mark_pending_peers);
-                    inline_work_targets = std::mem::take(&mut sink.pending_work_targets);
-                    inline_attach_ready = std::mem::take(&mut sink.shard_attach_ready);
-                    inline_suback_ready = std::mem::take(&mut sink.shard_suback_ready);
                     inline_changed = sink.session_change.take();
                     inline_error = sink.error.take();
                     outcome
                 } else if let Some(shards) = self.shards.as_mut() {
-                    self.owner
-                        .step_with_oracle(input, TurnGrant { work_limit }, shards)
+                    self.owner.step_in_place_with_oracle(
+                        &mut input_slot,
+                        TurnGrant { work_limit },
+                        shards,
+                    )
                 } else {
-                    self.owner.step(input, TurnGrant { work_limit })
+                    self.owner
+                        .step_in_place(&mut input_slot, TurnGrant { work_limit })
                 };
                 match step_outcome {
-                    StepOutcome::Applied { .. } => {
+                    mqttiumd_core::owner::StepResult::Applied { .. } => {
                         applied = true;
                         self.progress = self.progress.wrapping_add(1);
                         if is_receipt_collected {
@@ -3139,7 +3102,8 @@ impl Runtime<'_> {
                             }
                         }
                     }
-                    StepOutcome::NeedCapacity { input, need, .. } => {
+                    mqttiumd_core::owner::StepResult::NeedCapacity { need, .. } => {
+                        let input = input_slot.take().expect("input retained on NeedCapacity");
                         match input {
                             expiry @ Input::MessagesExpired { .. } => {
                                 self.message_expiry_input = Some(expiry);
@@ -3262,8 +3226,10 @@ impl Runtime<'_> {
                             }
                         }
                     }
-                    StepOutcome::Exhausted { .. } => return Err(Failure::plain("core_exhausted")),
-                    StepOutcome::Fatal(fault) => {
+                    mqttiumd_core::owner::StepResult::Exhausted { .. } => {
+                        return Err(Failure::plain("core_exhausted"));
+                    }
+                    mqttiumd_core::owner::StepResult::Fatal(fault) => {
                         self.events
                             .emit(
                                 "core_fault",
@@ -3365,17 +3331,43 @@ impl Runtime<'_> {
                     dispatch_blocked = false;
                 }
                 if dispatched_inline {
-                    for generation in inline_mark_pending {
-                        self.pending_peers.insert(generation);
-                    }
-                    self.attach_ready_shards(inline_attach_ready)?;
-                    for session in inline_suback_ready {
-                        if self.pending_suback_notify.remove(&session) {
-                            self.notify_work(session)?;
+                    if !self.sink_mark_pending.is_empty() {
+                        for generation in self.sink_mark_pending.drain(..) {
+                            self.pending_peers.insert(generation);
                         }
                     }
-                    for target in inline_work_targets {
-                        self.notify_work(target)?;
+                    if !self.sink_attach_ready.is_empty() {
+                        let mut ready = std::mem::take(&mut self.sink_attach_ready);
+                        let res = self.attach_ready_shards(&ready);
+                        ready.clear();
+                        self.sink_attach_ready = ready;
+                        res?;
+                    }
+                    if !self.sink_suback_ready.is_empty() {
+                        let mut suback = std::mem::take(&mut self.sink_suback_ready);
+                        let mut res = Ok(());
+                        for session in suback.drain(..) {
+                            if self.pending_suback_notify.remove(&session)
+                                && let Err(e) = self.notify_work(session)
+                            {
+                                res = Err(e);
+                                break;
+                            }
+                        }
+                        self.sink_suback_ready = suback;
+                        res?;
+                    }
+                    if !self.sink_work_targets.is_empty() {
+                        let mut targets = std::mem::take(&mut self.sink_work_targets);
+                        let mut res = Ok(());
+                        for target in targets.drain(..) {
+                            if let Err(e) = self.notify_work(target) {
+                                res = Err(e);
+                                break;
+                            }
+                        }
+                        self.sink_work_targets = targets;
+                        res?;
                     }
                     if inline_accepted != 0 {
                         self.progress = self.progress.wrapping_add(1);
@@ -3386,18 +3378,28 @@ impl Runtime<'_> {
                     if let Some(error) = inline_error {
                         return Err(error);
                     }
-                    let had_close_or_change = inline_changed.is_some() || !inline_close.is_empty();
-                    for (generation, code) in inline_close {
-                        if code == "outgoing_queue_full"
-                            && self.peers.get(&generation).is_some_and(|peer| {
-                                peer.io.is_tls()
-                                    && peer.io.terminal_reason().is_some()
-                                    && peer.closing().is_none()
-                            })
-                        {
-                            continue;
+                    let had_close_or_change =
+                        inline_changed.is_some() || !self.sink_close.is_empty();
+                    if !self.sink_close.is_empty() {
+                        let mut close = std::mem::take(&mut self.sink_close);
+                        let mut res = Ok(());
+                        for (generation, code) in close.drain(..) {
+                            if code == "outgoing_queue_full"
+                                && self.peers.get(&generation).is_some_and(|peer| {
+                                    peer.io.is_tls()
+                                        && peer.io.terminal_reason().is_some()
+                                        && peer.closing().is_none()
+                                })
+                            {
+                                continue;
+                            }
+                            if let Err(e) = self.close(generation, code) {
+                                res = Err(e);
+                                break;
+                            }
                         }
-                        self.close(generation, code)?;
+                        self.sink_close = close;
+                        res?;
                     }
                     if let Some(changed) = inline_changed {
                         self.session_changed(changed)?;
@@ -3692,11 +3694,11 @@ impl Runtime<'_> {
             frames: &mut self.frames,
             outgoing_bindings: &mut self.outgoing_bindings,
             shards_active,
-            shard_attach_ready: Vec::new(),
-            shard_suback_ready: Vec::new(),
-            close: Vec::new(),
-            mark_pending_peers: Vec::new(),
-            pending_work_targets: Vec::new(),
+            shard_attach_ready: &mut self.sink_attach_ready,
+            shard_suback_ready: &mut self.sink_suback_ready,
+            close: &mut self.sink_close,
+            mark_pending_peers: &mut self.sink_mark_pending,
+            pending_work_targets: &mut self.sink_work_targets,
             direct_skip_next_deadline: false,
             session_change: None,
             error: None,
@@ -3707,25 +3709,46 @@ impl Runtime<'_> {
         let report = self
             .owner
             .dispatch(&mut self.retained_output.sink(&mut sink));
-        let close = std::mem::take(&mut sink.close);
-        let mark_pending = std::mem::take(&mut sink.mark_pending_peers);
-        let work_targets = std::mem::take(&mut sink.pending_work_targets);
-        let attach_ready = std::mem::take(&mut sink.shard_attach_ready);
-        let suback_ready = std::mem::take(&mut sink.shard_suback_ready);
         let changed = sink.session_change.take();
         let error = sink.error.take();
         drop(sink);
-        for generation in mark_pending {
-            self.pending_peers.insert(generation);
-        }
-        self.attach_ready_shards(attach_ready)?;
-        for session in suback_ready {
-            if self.pending_suback_notify.remove(&session) {
-                self.notify_work(session)?;
+        if !self.sink_mark_pending.is_empty() {
+            for generation in self.sink_mark_pending.drain(..) {
+                self.pending_peers.insert(generation);
             }
         }
-        for target in work_targets {
-            self.notify_work(target)?;
+        if !self.sink_attach_ready.is_empty() {
+            let mut ready = std::mem::take(&mut self.sink_attach_ready);
+            let res = self.attach_ready_shards(&ready);
+            ready.clear();
+            self.sink_attach_ready = ready;
+            res?;
+        }
+        if !self.sink_suback_ready.is_empty() {
+            let mut suback = std::mem::take(&mut self.sink_suback_ready);
+            let mut res = Ok(());
+            for session in suback.drain(..) {
+                if self.pending_suback_notify.remove(&session)
+                    && let Err(e) = self.notify_work(session)
+                {
+                    res = Err(e);
+                    break;
+                }
+            }
+            self.sink_suback_ready = suback;
+            res?;
+        }
+        if !self.sink_work_targets.is_empty() {
+            let mut targets = std::mem::take(&mut self.sink_work_targets);
+            let mut res = Ok(());
+            for target in targets.drain(..) {
+                if let Err(e) = self.notify_work(target) {
+                    res = Err(e);
+                    break;
+                }
+            }
+            self.sink_work_targets = targets;
+            res?;
         }
         if report.accepted + retried != 0 {
             self.progress = self.progress.wrapping_add(1);
@@ -3738,21 +3761,30 @@ impl Runtime<'_> {
         if let Some(error) = error {
             return Err(error);
         }
-        let had_close_or_change = changed.is_some() || !close.is_empty();
-        for (generation, code) in close {
-            // A terminated TLS sender can reject a queued PINGRESP before
-            // the reactor reaches the normal DISCONNECT already in its reader
-            // lane. The ordered input terminal decides that transport loss.
-            if code == "outgoing_queue_full"
-                && self.peers.get(&generation).is_some_and(|peer| {
-                    peer.io.is_tls()
-                        && peer.io.terminal_reason().is_some()
-                        && peer.closing().is_none()
-                })
-            {
-                continue;
+        let had_close_or_change = changed.is_some() || !self.sink_close.is_empty();
+        if !self.sink_close.is_empty() {
+            let mut close = std::mem::take(&mut self.sink_close);
+            let mut res = Ok(());
+            for (generation, code) in close.drain(..) {
+                // A terminated TLS sender can reject a queued PINGRESP before
+                // the reactor reaches the normal DISCONNECT already in its reader
+                // lane. The ordered input terminal decides that transport loss.
+                if code == "outgoing_queue_full"
+                    && self.peers.get(&generation).is_some_and(|peer| {
+                        peer.io.is_tls()
+                            && peer.io.terminal_reason().is_some()
+                            && peer.closing().is_none()
+                    })
+                {
+                    continue;
+                }
+                if let Err(e) = self.close(generation, code) {
+                    res = Err(e);
+                    break;
+                }
             }
-            self.close(generation, code)?;
+            self.sink_close = close;
+            res?;
         }
         if let Some(changed) = changed {
             self.session_changed(changed)?;
@@ -3981,189 +4013,191 @@ impl Runtime<'_> {
         } else {
             WRITER_INPUTS.saturating_sub(self.writer_input_count())
         };
-        for _ in 0..writer_budget {
-            let response = match self.writer.try_recv() {
-                Ok(r) => {
-                    self.progress = self.progress.wrapping_add(1);
-                    r
-                }
-                Err(TryRecvError::Empty) => break,
-                Err(TryRecvError::Disconnected) => {
-                    return Err(Failure::plain("writer_disconnected"));
-                }
-            };
-            match response {
-                Response::Wills { effect, result } => {
-                    if self.will_reads.take() != Some(effect) {
-                        return Err(Failure::plain("will_read_correlation"));
+        let mut responses = std::mem::take(&mut self.scratch_responses);
+        responses.clear();
+        let drain_res = self.writer.drain_responses(&mut responses, writer_budget);
+        if matches!(drain_res, Err(TryRecvError::Disconnected)) {
+            self.scratch_responses = responses;
+            return Err(Failure::plain("writer_disconnected"));
+        }
+        let apply_res = (|| -> Result<(), Failure> {
+            for response in responses.drain(..) {
+                self.progress = self.progress.wrapping_add(1);
+                match response {
+                    Response::Wills { effect, result } => {
+                        if self.will_reads.take() != Some(effect) {
+                            return Err(Failure::plain("will_read_correlation"));
+                        }
+                        let page = result.map_err(|e| Failure::read(e, ReadPhase::Work))?;
+                        self.queue(Input::WillPage {
+                            effect,
+                            items: page.items,
+                            next: page.next,
+                        })?;
                     }
-                    let page = result.map_err(|e| Failure::read(e, ReadPhase::Work))?;
-                    self.queue(Input::WillPage {
-                        effect,
-                        items: page.items,
-                        next: page.next,
-                    })?;
-                }
-                Response::Store {
-                    effect,
-                    operation,
-                    reply,
-                    targets,
-                } => {
-                    if self.inflight.remove(&effect) != Some(operation) {
-                        return Err(Failure::plain("uncorrelated_store_result"));
-                    }
-                    self.inflight_route_ops.remove(&effect);
-                    #[cfg(feature = "test-hooks")]
-                    if matches!(
-                        reply,
-                        StoreReply::Outcome(StoreOutcome::Committed(
-                            CommitFacts::DeliveryConsumed { .. }
-                        ))
-                    ) {
-                        self.last_consume_result = Some((effect, operation, reply));
-                    }
-                    #[cfg(feature = "test-hooks")]
-                    if let StoreReply::Outcome(StoreOutcome::Committed(
-                        CommitFacts::DeliveryFinished { delivery, .. }
-                        | CommitFacts::DeliveryConsumed { delivery, .. },
-                    )) = reply
-                    {
-                        self.work_cache.remove(&delivery);
-                    }
-                    #[cfg(feature = "test-hooks")]
-                    if matches!(
-                        reply,
-                        StoreReply::Outcome(StoreOutcome::Committed(
-                            CommitFacts::DeliveryFinished { .. }
-                        ))
-                    ) {
-                        self.last_finish_result = Some((effect, operation, reply));
-                    }
-                    // With shards, the step of an admission's commit names its
-                    // stored targets, and they are notified after it: the step
-                    // marks their leases dirty, and the shard must see that
-                    // mark. A resolution names no target here either.
-                    let named_by_step = self.shards.is_some()
-                        && self.owner.names_stored_targets_at_commit(operation);
-                    self.queue(Input::StoreResult {
+                    Response::Store {
                         effect,
                         operation,
                         reply,
-                    })?;
-                    if !named_by_step
-                        && matches!(
+                        targets,
+                    } => {
+                        if self.inflight.remove(&effect) != Some(operation) {
+                            return Err(Failure::plain("uncorrelated_store_result"));
+                        }
+                        self.inflight_route_ops.remove(&effect);
+                        #[cfg(feature = "test-hooks")]
+                        if matches!(
                             reply,
                             StoreReply::Outcome(StoreOutcome::Committed(
-                                CommitFacts::PublicationAdmitted { .. }
-                                    | CommitFacts::RetainedQos0Stored { .. }
+                                CommitFacts::DeliveryConsumed { .. }
                             ))
-                        )
-                    {
-                        for target in targets {
-                            self.notify_work(target)?;
+                        ) {
+                            self.last_consume_result = Some((effect, operation, reply));
                         }
-                    } else if matches!(
-                        reply,
-                        StoreReply::Outcome(StoreOutcome::Committed(
-                            CommitFacts::SubscriptionsChanged { .. }
-                        ))
-                    ) {
-                        if self.shards.is_some() {
-                            // Defer shard work notification until SUBACK enters
-                            // ConnCore::outgoing so retained replays never
-                            // overtake SUBACK on the wire (MQTT-3.8.4-1).
-                            for target in targets {
-                                self.pending_suback_notify.insert(target);
-                            }
-                        } else {
+                        #[cfg(feature = "test-hooks")]
+                        if let StoreReply::Outcome(StoreOutcome::Committed(
+                            CommitFacts::DeliveryFinished { delivery, .. }
+                            | CommitFacts::DeliveryConsumed { delivery, .. },
+                        )) = reply
+                        {
+                            self.work_cache.remove(&delivery);
+                        }
+                        #[cfg(feature = "test-hooks")]
+                        if matches!(
+                            reply,
+                            StoreReply::Outcome(StoreOutcome::Committed(
+                                CommitFacts::DeliveryFinished { .. }
+                            ))
+                        ) {
+                            self.last_finish_result = Some((effect, operation, reply));
+                        }
+                        // With shards, the step of an admission's commit names its
+                        // stored targets, and they are notified after it: the step
+                        // marks their leases dirty, and the shard must see that
+                        // mark. A resolution names no target here either.
+                        let named_by_step = self.shards.is_some()
+                            && self.owner.names_stored_targets_at_commit(operation);
+                        self.queue(Input::StoreResult {
+                            effect,
+                            operation,
+                            reply,
+                        })?;
+                        if !named_by_step
+                            && matches!(
+                                reply,
+                                StoreReply::Outcome(StoreOutcome::Committed(
+                                    CommitFacts::PublicationAdmitted { .. }
+                                        | CommitFacts::RetainedQos0Stored { .. }
+                                ))
+                            )
+                        {
                             for target in targets {
                                 self.notify_work(target)?;
                             }
+                        } else if matches!(
+                            reply,
+                            StoreReply::Outcome(StoreOutcome::Committed(
+                                CommitFacts::SubscriptionsChanged { .. }
+                            ))
+                        ) {
+                            if self.shards.is_some() {
+                                // Defer shard work notification until SUBACK enters
+                                // ConnCore::outgoing so retained replays never
+                                // overtake SUBACK on the wire (MQTT-3.8.4-1).
+                                for target in targets {
+                                    self.pending_suback_notify.insert(target);
+                                }
+                            } else {
+                                for target in targets {
+                                    self.notify_work(target)?;
+                                }
+                            }
                         }
                     }
-                }
-                Response::Work {
-                    effect,
-                    session,
-                    result,
-                } => {
-                    #[cfg(feature = "test-hooks")]
-                    if result.is_ok()
-                        && self
-                            .hooks
-                            .directory
-                            .as_ref()
-                            .is_some_and(|d| d.join("hold-work-pages").exists())
-                    {
-                        if self.deferred_work.len() >= IN_FLIGHT {
-                            return Err(Failure::plain("held_work_budget"));
-                        }
-                        self.deferred_work.push_back(Response::Work {
-                            effect,
-                            session,
-                            result,
-                        });
-                        self.events
-                            .emit(
-                                "work_page_held",
-                                json!({
-                                    "details": {
-                                        "session": session.get().to_string(),
-                                        "effect": effect_text(effect),
-                                    },
-                                }),
-                            )
-                            .map_err(event_failure)?;
-                        continue;
-                    }
-                    if self.work_reads.remove(&effect) != Some(session) {
-                        return Err(Failure::plain("uncorrelated_work_page"));
-                    }
-                    let page = result.map_err(|e| Failure::read(e, ReadPhase::Work))?;
-                    self.session_cardinality_dirty = true;
-                    if !self.session_ids.contains(&session) {
-                        self.events
-                            .emit(
-                                "work_page_ignored",
-                                json!({
-                                    "details": {
-                                        "session": session.get().to_string(),
-                                        "effect": effect_text(effect),
-                                        "code": "retired_session",
-                                    },
-                                }),
-                            )
-                            .map_err(event_failure)?;
-                        continue;
-                    }
-                    #[cfg(feature = "test-hooks")]
-                    for item in page.items.as_slice() {
-                        if self.work_cache.len()
-                            >= crate::writer::SESSIONS * crate::receiving::MAXIMUM
-                            && !self.work_cache.contains_key(&item.delivery)
-                        {
-                            return Err(Failure::plain("work_cache_budget"));
-                        }
-                        self.work_cache.insert(item.delivery, item.clone());
-                    }
-                    self.queue(Input::WorkPage {
+                    Response::Work {
                         effect,
                         session,
-                        items: page.items,
-                        next: page.next,
-                    })?;
-                }
-                Response::Session { .. } => {
-                    // Product CONNECTs exclusively use the receipted owner path.
-                    return Err(Failure::plain("unexpected_admin_session_result"));
-                }
-                Response::Recovery(_) | Response::Stopped => {
-                    return Err(Failure::plain("unexpected_writer_result"));
+                        result,
+                    } => {
+                        #[cfg(feature = "test-hooks")]
+                        if result.is_ok()
+                            && self
+                                .hooks
+                                .directory
+                                .as_ref()
+                                .is_some_and(|d| d.join("hold-work-pages").exists())
+                        {
+                            if self.deferred_work.len() >= IN_FLIGHT {
+                                return Err(Failure::plain("held_work_budget"));
+                            }
+                            self.deferred_work.push_back(Response::Work {
+                                effect,
+                                session,
+                                result,
+                            });
+                            self.events
+                                .emit(
+                                    "work_page_held",
+                                    json!({
+                                        "details": {
+                                            "session": session.get().to_string(),
+                                            "effect": effect_text(effect),
+                                        },
+                                    }),
+                                )
+                                .map_err(event_failure)?;
+                            continue;
+                        }
+                        if self.work_reads.remove(&effect) != Some(session) {
+                            return Err(Failure::plain("uncorrelated_work_page"));
+                        }
+                        let page = result.map_err(|e| Failure::read(e, ReadPhase::Work))?;
+                        self.session_cardinality_dirty = true;
+                        if !self.session_ids.contains(&session) {
+                            self.events
+                                .emit(
+                                    "work_page_ignored",
+                                    json!({
+                                        "details": {
+                                            "session": session.get().to_string(),
+                                            "effect": effect_text(effect),
+                                            "code": "retired_session",
+                                        },
+                                    }),
+                                )
+                                .map_err(event_failure)?;
+                            continue;
+                        }
+                        #[cfg(feature = "test-hooks")]
+                        for item in page.items.as_slice() {
+                            if self.work_cache.len()
+                                >= crate::writer::SESSIONS * crate::receiving::MAXIMUM
+                                && !self.work_cache.contains_key(&item.delivery)
+                            {
+                                return Err(Failure::plain("work_cache_budget"));
+                            }
+                            self.work_cache.insert(item.delivery, item.clone());
+                        }
+                        self.queue(Input::WorkPage {
+                            effect,
+                            session,
+                            items: page.items,
+                            next: page.next,
+                        })?;
+                    }
+                    Response::Session { .. } => {
+                        // Product CONNECTs exclusively use the receipted owner path.
+                        return Err(Failure::plain("unexpected_admin_session_result"));
+                    }
+                    Response::Recovery(_) | Response::Stopped => {
+                        return Err(Failure::plain("unexpected_writer_result"));
+                    }
                 }
             }
-        }
-        Ok(())
+            Ok(())
+        })();
+        self.scratch_responses = responses;
+        apply_res
     }
     fn notify_work(&mut self, session: SessionId) -> Result<(), Failure> {
         #[cfg(feature = "test-hooks")]
@@ -6683,13 +6717,13 @@ struct Sink<'a, 'b> {
     writer: &'a mut StoreHandle<'b>,
     peers: &'a mut PeerTable,
     events: &'a Events,
-    inflight: &'a mut ScopedFlatMap<EffectId, OperationId>,
-    inflight_route_ops: &'a mut ScopedFlatMap<EffectId, ()>,
+    inflight: &'a mut ScopedSeqMap<EffectId, OperationId>,
+    inflight_route_ops: &'a mut ScopedSeqMap<EffectId, ()>,
     lifecycle_inflight: &'a mut BTreeMap<EffectId, OperationId>,
     lifecycle_operation: Option<OperationId>,
     will_operation: Option<OperationId>,
     will_reads: &'a mut Option<EffectId>,
-    work_reads: &'a mut ScopedFlatMap<EffectId, SessionId>,
+    work_reads: &'a mut ScopedSeqMap<EffectId, SessionId>,
     bindings: &'a FlatMap<SessionId, ConnectionGeneration>,
     #[cfg(feature = "test-hooks")]
     work_cache: &'a BTreeMap<DeliveryId, WorkItem>,
@@ -6703,18 +6737,18 @@ struct Sink<'a, 'b> {
     inputs: &'a mut VecDeque<Input>,
     queued_work_sessions: &'a mut FlatSet<SessionId>,
     terminal_inputs: &'a mut VecDeque<Input>,
-    terminal_effects: &'a mut ScopedFlatMap<EffectId, u32>,
+    terminal_effects: &'a mut ScopedSeqMap<EffectId, u32>,
     ordinary_reserved: usize,
     queued_writer_replies: Option<usize>,
-    frames: &'a mut ScopedFlatMap<EffectId, PendingFrame>,
+    frames: &'a mut ScopedSeqMap<EffectId, PendingFrame>,
     outgoing_bindings: &'a mut FlatMap<(ConnectionKey, OutboundPacketId), PubackTarget>,
     shards_active: bool,
-    shard_attach_ready: Vec<ConnectionKey>,
-    shard_suback_ready: Vec<SessionId>,
+    shard_attach_ready: &'a mut Vec<ConnectionKey>,
+    shard_suback_ready: &'a mut Vec<SessionId>,
     limits: Limits,
-    close: Vec<(ConnectionGeneration, &'static str)>,
-    mark_pending_peers: Vec<ConnectionGeneration>,
-    pending_work_targets: Vec<SessionId>,
+    close: &'a mut Vec<(ConnectionGeneration, &'static str)>,
+    mark_pending_peers: &'a mut Vec<ConnectionGeneration>,
+    pending_work_targets: &'a mut Vec<SessionId>,
     direct_skip_next_deadline: bool,
     session_change: Option<AppliedSessionChange>,
     error: Option<Failure>,

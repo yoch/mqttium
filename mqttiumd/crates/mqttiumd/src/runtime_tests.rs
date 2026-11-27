@@ -180,26 +180,32 @@ fn with_runtime_layout(
         scratch_incoming: VecDeque::new(),
         scratch_written: Vec::new(),
         scratch_progress: Vec::new(),
+        scratch_responses: Vec::new(),
+        sink_close: Vec::new(),
+        sink_mark_pending: Vec::new(),
+        sink_work_targets: Vec::new(),
+        sink_attach_ready: Vec::new(),
+        sink_suback_ready: Vec::new(),
         last_peer_deadline_scan: Instant::now(),
         inputs: VecDeque::new(),
         ack_inputs: VecDeque::new(),
         control_inputs: VecDeque::new(),
         closing_inputs: VecDeque::new(),
         terminal_inputs: VecDeque::new(),
-        terminal_effects: ScopedFlatMap::new(),
+        terminal_effects: ScopedSeqMap::new(),
         deferred_inputs: VecDeque::new(),
         deferred_by_conn: FlatMap::new(),
         effects_awaited: false,
         deferred_retries: 0,
         credit_progress: Instant::now(),
         timers: BTreeMap::new(),
-        inflight: ScopedFlatMap::new(),
-        inflight_route_ops: ScopedFlatMap::new(),
+        inflight: ScopedSeqMap::new(),
+        inflight_route_ops: ScopedSeqMap::new(),
         lifecycle_inflight: BTreeMap::new(),
         last_session_change: None,
         session_cardinality_dirty: false,
         last_session_cardinality: None,
-        work_reads: ScopedFlatMap::new(),
+        work_reads: ScopedSeqMap::new(),
         pending_work: VecDeque::new(),
         pending_work_set: BTreeSet::new(),
         queued_work_sessions: FlatSet::new(),
@@ -230,7 +236,7 @@ fn with_runtime_layout(
         #[cfg(feature = "test-hooks")]
         deferred_ack_used: false,
         retained_output: Default::default(),
-        frames: ScopedFlatMap::new(),
+        frames: ScopedSeqMap::new(),
         outgoing_bindings: FlatMap::new(),
         puback_observation: 0,
         #[cfg(feature = "test-hooks")]
@@ -3499,7 +3505,7 @@ fn a_full_ordinary_lane_still_collects_an_authentic_writer_reply() {
                 ..
             }
         ));
-        let (producer, consumer) = std::sync::mpsc::sync_channel(1);
+        let (producer, consumer) = crate::wake::bounded(1);
         producer.try_send(response).unwrap();
         let original = std::mem::replace(&mut runtime.writer.threaded_mut().receiver, consumer);
         fill_ordinary_inputs(runtime, generation);
@@ -4688,7 +4694,7 @@ fn stale_puback_during_takeover_with_a_blocked_close_cannot_stop_other_connectio
         // Relay one actual admission reply, retaining the real worker's other
         // replies. This distinguishes takeover/control progress from global
         // quiescence while preserving the adapter's original correlations.
-        let (released, receiver) = std::sync::mpsc::sync_channel(IN_FLIGHT * 2);
+        let (released, receiver) = crate::wake::bounded(IN_FLIGHT * 2);
         let worker_receiver =
             std::mem::replace(&mut runtime.writer.threaded_mut().receiver, receiver);
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -5095,7 +5101,7 @@ fn zero_expiry_reconnect_first_resumes_then_ends_the_existing_incarnation() {
 }
 
 fn relay_control_reply(runtime: &mut Runtime<'_>, response: ControlResponse) {
-    let (sender, receiver) = std::sync::mpsc::sync_channel(crate::writer::CONTROL_QUEUE);
+    let (sender, receiver) = crate::wake::bounded(crate::writer::CONTROL_QUEUE);
     let original = std::mem::replace(
         &mut runtime.writer.threaded_mut().control_receiver,
         receiver,
@@ -7387,7 +7393,7 @@ fn blocked_output_and_full_input_preserve_independent_work_and_reconnect_credit(
             };
             let committed_effect = *effect;
             assert!(runtime.inflight.contains_key(&committed_effect));
-            let (replay, ready) = std::sync::mpsc::sync_channel(1);
+            let (replay, ready) = crate::wake::bounded(1);
             replay.try_send(reply).unwrap();
             let writer = std::mem::replace(&mut runtime.writer.threaded_mut().receiver, ready);
             fill_ordinary_inputs(runtime, publisher);
@@ -7651,26 +7657,32 @@ fn direct_volatile_store_commits_inline_and_saves_snapshot() {
         scratch_incoming: VecDeque::new(),
         scratch_written: Vec::new(),
         scratch_progress: Vec::new(),
+        scratch_responses: Vec::new(),
+        sink_close: Vec::new(),
+        sink_mark_pending: Vec::new(),
+        sink_work_targets: Vec::new(),
+        sink_attach_ready: Vec::new(),
+        sink_suback_ready: Vec::new(),
         last_peer_deadline_scan: Instant::now(),
         inputs: VecDeque::new(),
         ack_inputs: VecDeque::new(),
         control_inputs: VecDeque::new(),
         closing_inputs: VecDeque::new(),
         terminal_inputs: VecDeque::new(),
-        terminal_effects: ScopedFlatMap::new(),
+        terminal_effects: ScopedSeqMap::new(),
         deferred_inputs: VecDeque::new(),
         deferred_by_conn: FlatMap::new(),
         effects_awaited: false,
         deferred_retries: 0,
         credit_progress: Instant::now(),
         timers: BTreeMap::new(),
-        inflight: ScopedFlatMap::new(),
-        inflight_route_ops: ScopedFlatMap::new(),
+        inflight: ScopedSeqMap::new(),
+        inflight_route_ops: ScopedSeqMap::new(),
         lifecycle_inflight: BTreeMap::new(),
         last_session_change: None,
         session_cardinality_dirty: false,
         last_session_cardinality: None,
-        work_reads: ScopedFlatMap::new(),
+        work_reads: ScopedSeqMap::new(),
         pending_work: VecDeque::new(),
         pending_work_set: BTreeSet::new(),
         queued_work_sessions: FlatSet::new(),
@@ -7701,7 +7713,7 @@ fn direct_volatile_store_commits_inline_and_saves_snapshot() {
         #[cfg(feature = "test-hooks")]
         deferred_ack_used: false,
         retained_output: Default::default(),
-        frames: ScopedFlatMap::new(),
+        frames: ScopedSeqMap::new(),
         outgoing_bindings: FlatMap::new(),
         puback_observation: 0,
         #[cfg(feature = "test-hooks")]

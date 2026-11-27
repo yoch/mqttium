@@ -1,7 +1,7 @@
 //! Online connections receiving outgoing deliveries, indexed by generation,
 //! active work-page read, and sparse pagination watermarks.
 use crate::contract::capacity::{AllocationFailed, BoundedVec};
-use crate::contract::flat_map::{FlatMap, ScopedFlatMap};
+use crate::contract::flat_map::{FlatMap, ScopedSeqMap};
 use crate::contract::ids::{ConnectionGeneration, DeliveryId, EffectId, SessionId};
 use crate::contract::step::CoreFault;
 use core::num::NonZeroU32;
@@ -35,7 +35,7 @@ pub(super) struct Connection {
 pub(super) struct Connections {
     rows: BoundedVec<Connection>,
     by_generation: FlatMap<ConnectionGeneration, usize>,
-    by_loading_effect: ScopedFlatMap<EffectId, usize>,
+    by_loading_effect: ScopedSeqMap<EffectId, usize>,
     after_by_gen: FlatMap<ConnectionGeneration, DeliveryId>,
     known_through_by_gen: FlatMap<ConnectionGeneration, DeliveryId>,
     loading_by_gen: FlatMap<ConnectionGeneration, Read>,
@@ -46,7 +46,7 @@ impl Connections {
         Ok(Self {
             rows: super::table(bound)?,
             by_generation: FlatMap::new(),
-            by_loading_effect: ScopedFlatMap::new(),
+            by_loading_effect: ScopedSeqMap::new(),
             after_by_gen: FlatMap::new(),
             known_through_by_gen: FlatMap::new(),
             loading_by_gen: FlatMap::new(),

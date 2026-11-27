@@ -26,7 +26,7 @@ use mqttiumd_contract::command::{
     ReleaseInbound, UpdateSubscriptions,
 };
 use mqttiumd_contract::effects::InboundPhase;
-use mqttiumd_contract::flat_map::{FlatMap, FlatSet, ScopedFlatMap};
+use mqttiumd_contract::flat_map::{FlatMap, FlatSet, ScopedSeqMap};
 use mqttiumd_contract::ids::{
     DeliveryId, InboundPacketId, LogicalOwnerId, OperationId, OperationSeq, OutboundPacketId,
     PayloadId, PayloadSeq, PublicationId, PublicationSeq, Revision, RunEpoch, SessionId,
@@ -245,23 +245,23 @@ pub struct VolatileStore {
     pub(crate) hot_frontier: Option<(ReceiptOrigin, ReceiptClosure)>,
     pub(crate) retained: BTreeMap<Vec<u8>, RetainedRecord>,
     pub(crate) wills: BTreeMap<OperationId, WillIntent>,
-    pub(crate) publications: ScopedFlatMap<PublicationId, VPublication>,
-    pub(crate) payloads: ScopedFlatMap<PayloadId, VPayload>,
-    pub(crate) obligations: ScopedFlatMap<DeliveryId, ObligationRecord>,
+    pub(crate) publications: ScopedSeqMap<PublicationId, VPublication>,
+    pub(crate) payloads: ScopedSeqMap<PayloadId, VPayload>,
+    pub(crate) obligations: ScopedSeqMap<DeliveryId, ObligationRecord>,
     pub(crate) inbound: BTreeMap<(SessionId, InboundPacketId), InboundRecord>,
-    pub(crate) outbound: ScopedFlatMap<DeliveryId, OutboundRecord>,
+    pub(crate) outbound: ScopedSeqMap<DeliveryId, OutboundRecord>,
     // Maintained secondary indices for O(1)/O(log N) operations:
     pub(crate) active_sessions: usize,
     pub(crate) active_by_client: BTreeMap<SharedBytes, SessionId>,
     pub(crate) total_routes: usize,
     pub(crate) routes_by_session: BTreeMap<SessionId, BTreeSet<Vec<u8>>>,
     pub(crate) obligations_by_target: FlatMap<SessionId, SessionObligations>,
-    pub(crate) obligations_by_pub: ScopedFlatMap<PublicationId, u32>,
-    pub(crate) inbound_by_pub: ScopedFlatMap<PublicationId, u32>,
+    pub(crate) obligations_by_pub: ScopedSeqMap<PublicationId, u32>,
+    pub(crate) inbound_by_pub: ScopedSeqMap<PublicationId, u32>,
     pub(crate) outbound_by_target_pi: FlatSet<(SessionId, OutboundPacketId)>,
-    pub(crate) publications_by_payload: ScopedFlatMap<PayloadId, u32>,
+    pub(crate) publications_by_payload: ScopedSeqMap<PayloadId, u32>,
     pub(crate) retained_bytes: u64,
-    pub(crate) retained_by_pub: ScopedFlatMap<PublicationId, Vec<u8>>,
+    pub(crate) retained_by_pub: ScopedSeqMap<PublicationId, Vec<u8>>,
     pub(crate) wills_bytes: u64,
     pub(crate) wills_by_client: BTreeMap<Vec<u8>, usize>,
     pub(crate) hot_witness: Option<(ReceiptOrigin, OriginWitness)>,
@@ -395,22 +395,22 @@ impl VolatileStore {
             hot_frontier: None,
             retained: BTreeMap::new(),
             wills: BTreeMap::new(),
-            publications: ScopedFlatMap::new(),
-            payloads: ScopedFlatMap::new(),
-            obligations: ScopedFlatMap::new(),
+            publications: ScopedSeqMap::new(),
+            payloads: ScopedSeqMap::new(),
+            obligations: ScopedSeqMap::new(),
             inbound: BTreeMap::new(),
-            outbound: ScopedFlatMap::new(),
+            outbound: ScopedSeqMap::new(),
             active_sessions: 0,
             active_by_client: BTreeMap::new(),
             total_routes: 0,
             routes_by_session: BTreeMap::new(),
             obligations_by_target: FlatMap::new(),
-            obligations_by_pub: ScopedFlatMap::new(),
-            inbound_by_pub: ScopedFlatMap::new(),
+            obligations_by_pub: ScopedSeqMap::new(),
+            inbound_by_pub: ScopedSeqMap::new(),
             outbound_by_target_pi: FlatSet::new(),
-            publications_by_payload: ScopedFlatMap::new(),
+            publications_by_payload: ScopedSeqMap::new(),
             retained_bytes: 0,
-            retained_by_pub: ScopedFlatMap::new(),
+            retained_by_pub: ScopedSeqMap::new(),
             wills_bytes: 0,
             wills_by_client: BTreeMap::new(),
             hot_witness: None,
@@ -556,8 +556,8 @@ impl VolatileStore {
                     .insert(topic.clone());
             }
         }
-        let mut publications = ScopedFlatMap::new();
-        let mut publications_by_payload: ScopedFlatMap<PayloadId, u32> = ScopedFlatMap::new();
+        let mut publications = ScopedSeqMap::new();
+        let mut publications_by_payload: ScopedSeqMap<PayloadId, u32> = ScopedSeqMap::new();
         let mut expiring_publications = 0usize;
         for (id, row) in state.publications {
             let topic = SharedBytes::copy_from(&row.topic, row.topic.len())
@@ -581,7 +581,7 @@ impl VolatileStore {
                 },
             );
         }
-        let mut payloads = ScopedFlatMap::new();
+        let mut payloads = ScopedSeqMap::new();
         for (id, row) in state.payloads {
             let bytes = SharedBytes::copy_from(&row.bytes, row.bytes.len())
                 .expect("in-memory payload fits its own length");
@@ -593,9 +593,9 @@ impl VolatileStore {
                 },
             );
         }
-        let mut obligations = ScopedFlatMap::new();
+        let mut obligations = ScopedSeqMap::new();
         let mut obligations_by_target: FlatMap<SessionId, SessionObligations> = FlatMap::new();
-        let mut obligations_by_pub: ScopedFlatMap<PublicationId, u32> = ScopedFlatMap::new();
+        let mut obligations_by_pub: ScopedSeqMap<PublicationId, u32> = ScopedSeqMap::new();
         for (delivery, row) in state.obligations {
             obligations_by_target
                 .get_or_insert_default(row.target)
@@ -603,18 +603,18 @@ impl VolatileStore {
             *obligations_by_pub.get_or_insert_default(delivery.publication) += 1;
             obligations.insert(delivery, row);
         }
-        let mut inbound_by_pub: ScopedFlatMap<PublicationId, u32> = ScopedFlatMap::new();
+        let mut inbound_by_pub: ScopedSeqMap<PublicationId, u32> = ScopedSeqMap::new();
         for row in state.inbound.values() {
             *inbound_by_pub.get_or_insert_default(row.publication) += 1;
         }
         let mut outbound_by_target_pi = FlatSet::new();
-        let mut outbound = ScopedFlatMap::new();
+        let mut outbound = ScopedSeqMap::new();
         for (delivery, row) in state.outbound {
             outbound_by_target_pi.insert((row.target, row.packet_id));
             outbound.insert(delivery, row);
         }
         let mut retained_bytes = 0u64;
-        let mut retained_by_pub = ScopedFlatMap::new();
+        let mut retained_by_pub = ScopedSeqMap::new();
         let mut dup_retained_pub = false;
         for (topic, row) in &state.retained {
             if retained_by_pub

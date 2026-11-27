@@ -18,7 +18,7 @@ use core::num::NonZeroUsize;
 use super::connections::Connection;
 use super::deliveries::{Delivery, Phase};
 use super::pubsub::{Emission, Volatile};
-use super::{Draft, Effects, Owner, OwnerConfig, OwnerRefused, Stop, draw};
+use super::{Draft, Owner, OwnerConfig, OwnerRefused, Stop, draw};
 use crate::contract::capacity::{CapacityNeed, PayloadBytes, Resource, WakeCondition};
 use crate::contract::effects::{Effect, EffectReservation, EffectSink, Input, Outbox};
 use crate::contract::ids::{
@@ -30,7 +30,7 @@ use crate::contract::packet::{Qos, SharedBytes};
 use crate::contract::properties::PublishProperties;
 use crate::contract::pubsub::{DeliveryClaim, Qos0DropReason, Qos0Origin};
 use crate::contract::session::SessionExpiry;
-use crate::contract::step::{CoreFault, Exhaustion, Progress, StepOutcome, TurnGrant};
+use crate::contract::step::{CoreFault, Exhaustion, StepOutcome, TurnGrant};
 
 /// The store limits recovery gives an owner (`RecoveredFact::Limits`). A
 /// `DeliveryShard` owner runs no recovery inventory and receives the
@@ -180,7 +180,7 @@ impl Owner {
         grant: TurnGrant,
         oracle: &mut dyn InlineClaimOracle,
     ) -> StepOutcome {
-        self.step_with_sink_and_oracle(input, grant, None, Some(oracle))
+        self.step_with_sink_and_oracle::<dyn EffectSink>(input, grant, None, Some(oracle))
             .0
     }
 
@@ -194,6 +194,31 @@ impl Owner {
         oracle: &mut dyn InlineClaimOracle,
     ) -> (StepOutcome, usize) {
         self.step_with_sink_and_oracle(input, grant, Some(sink), Some(oracle))
+    }
+
+    /// In-place variant of [`Self::step_with_oracle`].
+    #[inline]
+    pub fn step_in_place_with_oracle(
+        &mut self,
+        input: &mut Option<Input>,
+        grant: TurnGrant,
+        oracle: &mut dyn InlineClaimOracle,
+    ) -> super::StepResult {
+        self.step_in_place_with_sink_and_oracle::<dyn EffectSink>(input, grant, None, Some(oracle))
+            .0
+    }
+
+    /// Monomorphized, in-place variant of [`Self::step_and_dispatch_with_oracle`]
+    /// for concrete sinks.
+    #[inline]
+    pub fn step_and_dispatch_in_place_with_oracle<S: EffectSink>(
+        &mut self,
+        input: &mut Option<Input>,
+        grant: TurnGrant,
+        sink: &mut S,
+        oracle: &mut dyn InlineClaimOracle,
+    ) -> (super::StepResult, usize) {
+        self.step_in_place_with_sink_and_oracle(input, grant, Some(sink), Some(oracle))
     }
 
     /// Takes the inline-claimed delivery batch committed by the last applied
@@ -593,68 +618,56 @@ impl Owner {
         delivery.payload = Some(payload);
         delivery.properties = properties;
 
-        let mut draft = Draft {
-            epoch: self.epoch,
-            owner: self.id,
-            counters: self.counters,
-            effects: Effects {
-                items: [None, None, None],
-                count: 0,
-            },
-            progress: Progress::Complete,
-            closed: None,
-            receipt_issued: None,
-            receipt_consumed: None,
-            released: None,
-            inline_outcome: None,
-            delegated_inline_resolved: None,
-            non_inline_resolved: None,
-        };
-        let emission = match self.plan_delivery_emit(&delivery, &mut draft) {
-            Ok(Emission::Frame(effect, connection)) => Some((effect, connection)),
-            Ok(Emission::Held | Emission::TooLarge) => None,
-            Err(Stop::Need(need)) => return ShardStepOutcome::NeedCapacity(need),
-            Err(Stop::Exhausted(ex)) => return ShardStepOutcome::Exhausted(ex),
-            Err(Stop::Fatal(fault)) => return ShardStepOutcome::Fatal(fault),
-        };
-        let (direct_sink, reservation) = match self.shard_reserve(&draft, sink) {
-            Ok(place) => place,
-            Err(outcome) => return outcome,
-        };
-        if let Some((effect, connection)) = emission {
-            delivery.window = Some(connection.generation);
-            delivery.frame = Some((effect, connection));
-            delivery.may_have_started = true;
-            delivery.local_write_completed = false;
-        }
-        if let Err(fault) = self.pubsub.deliveries.push(delivery) {
-            if let Some(key) = reservation {
-                let _ = self.outbox.release(key);
+        let mut draft = self.new_draft();
+        let outcome = (|| {
+            let emission = match self.plan_delivery_emit(&delivery, &mut draft) {
+                Ok(Emission::Frame(effect, connection)) => Some((effect, connection)),
+                Ok(Emission::Held | Emission::TooLarge) => None,
+                Err(Stop::Need(need)) => return ShardStepOutcome::NeedCapacity(need),
+                Err(Stop::Exhausted(ex)) => return ShardStepOutcome::Exhausted(ex),
+                Err(Stop::Fatal(fault)) => return ShardStepOutcome::Fatal(fault),
+            };
+            let (direct_sink, reservation) = match self.shard_reserve(&draft, sink) {
+                Ok(place) => place,
+                Err(outcome) => return outcome,
+            };
+            if let Some((effect, connection)) = emission {
+                delivery.window = Some(connection.generation);
+                delivery.frame = Some((effect, connection));
+                delivery.may_have_started = true;
+                delivery.local_write_completed = false;
             }
-            return ShardStepOutcome::Fatal(fault);
-        }
-        if self
-            .pubsub
-            .connection(claim.generation)
-            .is_some_and(|i| self.pubsub.connections.as_slice()[i].caught_up)
-        {
-            self.pubsub
-                .connections
-                .advance_known_through(claim.generation, claim.delivery);
-        }
-        self.counters = draft.counters;
-        self.revision = next_revision;
-        let accepted = match self.shard_dispatch(&mut draft, direct_sink, reservation) {
-            Ok(accepted) => accepted,
-            Err(outcome) => return outcome,
-        };
-        if emission.is_some() && self.session_provably_idle_work(claim.target) {
-            self.last_step_may_unblock_work = false;
-        }
-        ShardStepOutcome::Applied {
-            accepted,
-            emitted: emission.is_some(),
-        }
+            if let Err(fault) = self.pubsub.deliveries.push(delivery) {
+                if let Some(key) = reservation {
+                    let _ = self.outbox.release(key);
+                }
+                return ShardStepOutcome::Fatal(fault);
+            }
+            if self
+                .pubsub
+                .connection(claim.generation)
+                .is_some_and(|i| self.pubsub.connections.as_slice()[i].caught_up)
+            {
+                self.pubsub
+                    .connections
+                    .advance_known_through(claim.generation, claim.delivery);
+            }
+            self.counters = draft.counters;
+            self.revision = next_revision;
+            let accepted = match self.shard_dispatch(&mut draft, direct_sink, reservation) {
+                Ok(accepted) => accepted,
+                Err(outcome) => return outcome,
+            };
+            if emission.is_some() && self.session_provably_idle_work(claim.target) {
+                self.last_step_may_unblock_work = false;
+            }
+            ShardStepOutcome::Applied {
+                accepted,
+                emitted: emission.is_some(),
+            }
+        })();
+        self.return_scratch_effects(draft.effects);
+        outcome
     }
 
     /// Enqueues one delegated volatile QoS 0 target into this `DeliveryShard`
@@ -685,86 +698,74 @@ impl Owner {
         let Ok(next_revision) = self.revision.checked_next() else {
             return ShardStepOutcome::Exhausted(Exhaustion::IdentityCounter);
         };
-        let mut draft = Draft {
-            epoch: self.epoch,
-            owner: self.id,
-            counters: self.counters,
-            effects: Effects {
-                items: [None, None, None],
-                count: 0,
-            },
-            progress: Progress::Complete,
-            closed: None,
-            receipt_issued: None,
-            receipt_consumed: None,
-            released: None,
-            inline_outcome: None,
-            delegated_inline_resolved: None,
-            non_inline_resolved: None,
-        };
-        let used = self.pubsub.volatile.payload_bytes();
-        let fits = self.pubsub.volatile.len() < self.pubsub.volatile.capacity()
-            && used
-                .checked_add(payload.len() as u64)
-                .is_some_and(|total| total <= self.pubsub.payload_limit());
-        let mut schedule_continuation = None;
-        if !fits {
-            if let Err(stop) = draft.emit(Effect::Qos0Dropped {
-                origin,
-                target: Some(target),
-                reason: Qos0DropReason::CapacityExceeded,
-            }) {
-                return Self::shard_stop(stop);
-            }
-        } else if self.pubsub.continuation.is_none() {
-            let continuation = match draw(
-                &mut draft.counters.continuation,
-                ContinuationId::checked_next,
-            ) {
-                Ok(c) => c,
-                Err(stop) => return Self::shard_stop(stop),
-            };
-            if let Err(stop) = draft.emit(Effect::Continue { continuation }) {
-                return Self::shard_stop(stop);
-            }
-            schedule_continuation = Some(continuation);
-        }
-        let (direct_sink, reservation) = match self.shard_reserve(&draft, sink) {
-            Ok(place) => place,
-            Err(outcome) => return outcome,
-        };
-        if fits {
-            let item = Volatile {
-                origin,
-                target,
-                connection,
-                topic,
-                payload,
-                expiry: expiry.map(Box::new),
-                properties,
-                frame: None,
-            };
-            if let Err(fault) = self.pubsub.volatile.push_pending(item) {
-                if let Some(key) = reservation {
-                    let _ = self.outbox.release(key);
+        let mut draft = self.new_draft();
+        let outcome = (|| {
+            let used = self.pubsub.volatile.payload_bytes();
+            let fits = self.pubsub.volatile.len() < self.pubsub.volatile.capacity()
+                && used
+                    .checked_add(payload.len() as u64)
+                    .is_some_and(|total| total <= self.pubsub.payload_limit());
+            let mut schedule_continuation = None;
+            if !fits {
+                if let Err(stop) = draft.emit(Effect::Qos0Dropped {
+                    origin,
+                    target: Some(target),
+                    reason: Qos0DropReason::CapacityExceeded,
+                }) {
+                    return Self::shard_stop(stop);
                 }
-                return ShardStepOutcome::Fatal(fault);
+            } else if self.pubsub.continuation.is_none() {
+                let continuation = match draw(
+                    &mut draft.counters.continuation,
+                    ContinuationId::checked_next,
+                ) {
+                    Ok(c) => c,
+                    Err(stop) => return Self::shard_stop(stop),
+                };
+                if let Err(stop) = draft.emit(Effect::Continue { continuation }) {
+                    return Self::shard_stop(stop);
+                }
+                schedule_continuation = Some(continuation);
             }
-            if let Some(c) = schedule_continuation {
-                self.pubsub.continuation = Some(c);
-                self.pubsub.continuations_started = true;
+            let (direct_sink, reservation) = match self.shard_reserve(&draft, sink) {
+                Ok(place) => place,
+                Err(outcome) => return outcome,
+            };
+            if fits {
+                let item = Volatile {
+                    origin,
+                    target,
+                    connection,
+                    topic,
+                    payload,
+                    expiry: expiry.map(Box::new),
+                    properties,
+                    frame: None,
+                };
+                if let Err(fault) = self.pubsub.volatile.push_pending(item) {
+                    if let Some(key) = reservation {
+                        let _ = self.outbox.release(key);
+                    }
+                    return ShardStepOutcome::Fatal(fault);
+                }
+                if let Some(c) = schedule_continuation {
+                    self.pubsub.continuation = Some(c);
+                    self.pubsub.continuations_started = true;
+                }
             }
-        }
-        self.counters = draft.counters;
-        self.revision = next_revision;
-        let accepted = match self.shard_dispatch(&mut draft, direct_sink, reservation) {
-            Ok(accepted) => accepted,
-            Err(outcome) => return outcome,
-        };
-        ShardStepOutcome::Applied {
-            accepted,
-            emitted: false,
-        }
+            self.counters = draft.counters;
+            self.revision = next_revision;
+            let accepted = match self.shard_dispatch(&mut draft, direct_sink, reservation) {
+                Ok(accepted) => accepted,
+                Err(outcome) => return outcome,
+            };
+            ShardStepOutcome::Applied {
+                accepted,
+                emitted: false,
+            }
+        })();
+        self.return_scratch_effects(draft.effects);
+        outcome
     }
 
     /// Where a shard step puts its effects, decided before it changes any
@@ -827,6 +828,7 @@ impl Owner {
                     Ok(n) => accepted = n,
                     Err(_) => return Err(ShardStepOutcome::Fatal(CoreFault::ReservationOverrun)),
                 }
+                draft.effects.count = 0;
             }
         } else if let Some(key) = reservation {
             for slot in &mut draft.effects.items[..draft.effects.count] {
@@ -836,6 +838,7 @@ impl Owner {
                     return Err(ShardStepOutcome::Fatal(CoreFault::ReservationOverrun));
                 }
             }
+            draft.effects.count = 0;
         }
         Ok(accepted)
     }

@@ -26,14 +26,94 @@ const MIN_CAPACITY: usize = 16;
 
 /// Deterministic 64-bit Fibonacci mixer (2 instructions on ARM64: `mul` +
 /// shifted `eor`, zero collisions on sequential IDs in power-of-two tables).
+#[inline]
 fn mix64(x: u64) -> u64 {
     let h = x.wrapping_mul(0x9e37_79b9_7f4a_7c15);
     h ^ (h >> 32)
 }
 
+#[inline]
 fn combine64(a: u64, b: u64) -> u64 {
     let h = a.wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ b.wrapping_mul(0x517c_c1b7_2722_0a95);
     h ^ (h >> 32)
+}
+
+/// Monotonically increasing integer key eligible for direct-indexed ring lookup
+/// in [`SeqMap`].
+pub trait SeqKey: FlatKey {
+    fn seq_u64(self) -> u64;
+}
+
+impl SeqKey for u64 {
+    #[inline]
+    fn seq_u64(self) -> u64 {
+        self
+    }
+}
+
+impl SeqKey for usize {
+    #[inline]
+    fn seq_u64(self) -> u64 {
+        self as u64
+    }
+}
+
+impl SeqKey for SessionId {
+    #[inline]
+    fn seq_u64(self) -> u64 {
+        self.get()
+    }
+}
+
+impl SeqKey for ConnectionGeneration {
+    #[inline]
+    fn seq_u64(self) -> u64 {
+        self.get()
+    }
+}
+
+impl SeqKey for DeadlineToken {
+    #[inline]
+    fn seq_u64(self) -> u64 {
+        self.get()
+    }
+}
+
+impl SeqKey for OperationSeq {
+    #[inline]
+    fn seq_u64(self) -> u64 {
+        self.get()
+    }
+}
+
+impl SeqKey for PublicationSeq {
+    #[inline]
+    fn seq_u64(self) -> u64 {
+        self.get()
+    }
+}
+
+impl SeqKey for PayloadSeq {
+    #[inline]
+    fn seq_u64(self) -> u64 {
+        self.get()
+    }
+}
+
+impl SeqKey for EffectSeq {
+    #[inline]
+    fn seq_u64(self) -> u64 {
+        self.get()
+    }
+}
+
+impl SeqKey for (PublicationSeq, u32) {
+    #[inline]
+    fn seq_u64(self) -> u64 {
+        self.0
+            .get()
+            .wrapping_add(u64::from(self.1).wrapping_mul(0x9e37_79b9_7f4a_7c15))
+    }
 }
 
 /// A compact `Copy + Eq` key with a deterministic 64-bit hash.
@@ -245,15 +325,17 @@ impl<K: FlatKey, V> FlatMap<K, V> {
         self.slots = new_slots;
     }
 
+    #[inline]
     fn ensure_capacity_for_insert(&mut self) {
         let cap = self.slots.len();
         if cap == 0 {
             self.grow(MIN_CAPACITY);
-        } else if (self.len + 1) * 10 > cap * 7 {
+        } else if (self.len + 1) * 2 > cap {
             self.grow(cap * 2);
         }
     }
 
+    #[inline]
     fn find_slot(&self, key: K) -> Option<usize> {
         let cap = self.slots.len();
         if cap == 0 || self.len == 0 {
@@ -271,22 +353,26 @@ impl<K: FlatKey, V> FlatMap<K, V> {
     }
 
     #[must_use]
+    #[inline]
     pub fn contains_key(&self, key: &K) -> bool {
         self.find_slot(*key).is_some()
     }
 
     #[must_use]
+    #[inline]
     pub fn get(&self, key: &K) -> Option<&V> {
         let idx = self.find_slot(*key)?;
         self.slots[idx].as_ref().map(|(_, v)| v)
     }
 
     #[must_use]
+    #[inline]
     pub fn get_mut(&mut self, key: &K) -> Option<&mut V> {
         let idx = self.find_slot(*key)?;
         self.slots[idx].as_mut().map(|(_, v)| v)
     }
 
+    #[inline]
     pub fn insert(&mut self, key: K, value: V) -> Option<V> {
         self.ensure_capacity_for_insert();
         let mask = self.slots.len() - 1;
@@ -306,6 +392,7 @@ impl<K: FlatKey, V> FlatMap<K, V> {
         }
     }
 
+    #[inline]
     pub fn get_or_insert_with(&mut self, key: K, f: impl FnOnce() -> V) -> &mut V {
         self.ensure_capacity_for_insert();
         let mask = self.slots.len() - 1;
@@ -327,6 +414,7 @@ impl<K: FlatKey, V> FlatMap<K, V> {
         }
     }
 
+    #[inline]
     pub fn get_or_insert_default(&mut self, key: K) -> &mut V
     where
         V: Default,
@@ -334,6 +422,7 @@ impl<K: FlatKey, V> FlatMap<K, V> {
         self.get_or_insert_with(key, V::default)
     }
 
+    #[inline]
     pub fn remove(&mut self, key: &K) -> Option<V> {
         let idx = self.find_slot(*key)?;
         let removed = self.slots[idx].take().map(|(_, v)| v);
@@ -342,6 +431,7 @@ impl<K: FlatKey, V> FlatMap<K, V> {
         removed
     }
 
+    #[inline]
     fn backward_shift_from(&mut self, mut hole: usize) {
         let mask = self.slots.len() - 1;
         let mut curr = (hole + 1) & mask;
@@ -579,6 +669,7 @@ where
     }
 
     #[must_use]
+    #[inline]
     pub fn contains_key(&self, key: &K) -> bool {
         if self.hot_scope == Some(key.scope()) {
             self.hot.contains_key(&key.local())
@@ -588,6 +679,7 @@ where
     }
 
     #[must_use]
+    #[inline]
     pub fn get(&self, key: &K) -> Option<&V> {
         if self.hot_scope == Some(key.scope()) {
             self.hot.get(&key.local())
@@ -597,6 +689,7 @@ where
     }
 
     #[must_use]
+    #[inline]
     pub fn get_mut(&mut self, key: &K) -> Option<&mut V> {
         if self.hot_scope == Some(key.scope()) {
             self.hot.get_mut(&key.local())
@@ -605,6 +698,7 @@ where
         }
     }
 
+    #[inline]
     pub fn insert(&mut self, key: K, value: V) -> Option<V> {
         let scope = key.scope();
         match self.hot_scope {
@@ -628,6 +722,7 @@ where
         }
     }
 
+    #[inline]
     pub fn remove(&mut self, key: &K) -> Option<V> {
         if self.hot_scope == Some(key.scope()) {
             self.hot.remove(&key.local())
@@ -636,6 +731,457 @@ where
         }
     }
 
+    #[inline]
+    pub fn get_or_insert_default(&mut self, key: K) -> &mut V
+    where
+        V: Default,
+    {
+        let scope = key.scope();
+        match self.hot_scope {
+            Some(hot) if hot == scope => self.hot.get_or_insert_default(key.local()),
+            Some(hot) if !K::later_run(scope, hot) => self.cold.entry(key).or_default(),
+            _ => {
+                self.activate(scope);
+                self.hot.get_or_insert_default(key.local())
+            }
+        }
+    }
+
+    pub fn retain(&mut self, mut f: impl FnMut(K, &mut V) -> bool) {
+        if let Some(scope) = self.hot_scope {
+            self.hot
+                .retain(|local, value| f(K::from_parts(scope, *local), value));
+        }
+        self.cold.retain(|k, value| f(*k, value));
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (K, &V)> + '_ {
+        let hot_scope = self.hot_scope;
+        self.hot
+            .iter()
+            .filter_map(move |(local, value)| {
+                hot_scope.map(|scope| (K::from_parts(scope, *local), value))
+            })
+            .chain(self.cold.iter().map(|(k, v)| (*k, v)))
+    }
+
+    pub fn keys(&self) -> impl Iterator<Item = K> + '_ {
+        self.iter().map(|(k, _)| k)
+    }
+
+    pub fn values(&self) -> impl Iterator<Item = &V> + '_ {
+        self.hot.values().chain(self.cold.values())
+    }
+}
+
+const SEQ_RING_MIN: usize = 64;
+const SEQ_RING_MAX: usize = 16_384;
+
+/// Direct-indexed O(1) ring map for monotonically increasing sequence keys,
+/// backed by a cold [`FlatMap`] overflow for rare wrap-around collisions.
+///
+/// Allocates zero bytes when empty (no idle RSS cost). On steady-state
+/// monotonic keys, `insert`, `get`, `get_mut`, and `remove` perform a single
+/// bitmask array index with zero hashing, zero linear probing, and zero
+/// backward-shift deletion.
+#[derive(Clone, Debug)]
+pub struct SeqMap<K: SeqKey, V> {
+    ring: Vec<Option<(K, V)>>,
+    ring_len: usize,
+    overflow: FlatMap<K, V>,
+}
+
+impl<K: SeqKey, V> Default for SeqMap<K, V> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<K: SeqKey, V> SeqMap<K, V> {
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            ring: Vec::new(),
+            ring_len: 0,
+            overflow: FlatMap::new(),
+        }
+    }
+
+    #[must_use]
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.ring_len + self.overflow.len()
+    }
+
+    #[must_use]
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.ring_len == 0 && self.overflow.is_empty()
+    }
+
+    pub fn clear(&mut self) {
+        if self.ring_len != 0 {
+            for slot in &mut self.ring {
+                *slot = None;
+            }
+            self.ring_len = 0;
+        }
+        self.overflow.clear();
+    }
+
+    #[cold]
+    fn grow_ring(&mut self, new_cap: usize) {
+        let cap = new_cap
+            .clamp(SEQ_RING_MIN, SEQ_RING_MAX)
+            .next_power_of_two();
+        let mask = cap - 1;
+        let mut new_ring: Vec<Option<(K, V)>> = Vec::with_capacity(cap);
+        new_ring.resize_with(cap, || None);
+        let mut new_overflow = FlatMap::new();
+        let mut new_ring_len = 0usize;
+        for (k, v) in self.ring.drain(..).flatten() {
+            let idx = (k.seq_u64() as usize) & mask;
+            if new_ring[idx].is_none() {
+                new_ring[idx] = Some((k, v));
+                new_ring_len += 1;
+            } else {
+                new_overflow.insert(k, v);
+            }
+        }
+        for (k, v) in core::mem::take(&mut self.overflow).into_entries() {
+            let idx = (k.seq_u64() as usize) & mask;
+            if new_ring[idx].is_none() {
+                new_ring[idx] = Some((k, v));
+                new_ring_len += 1;
+            } else {
+                new_overflow.insert(k, v);
+            }
+        }
+        self.ring = new_ring;
+        self.ring_len = new_ring_len;
+        self.overflow = new_overflow;
+    }
+
+    #[must_use]
+    #[inline]
+    pub fn contains_key(&self, key: &K) -> bool {
+        let cap = self.ring.len();
+        if cap == 0 {
+            return false;
+        }
+        let idx = (key.seq_u64() as usize) & (cap - 1);
+        if let Some((k, _)) = &self.ring[idx]
+            && *k == *key
+        {
+            return true;
+        }
+        !self.overflow.is_empty() && self.overflow.contains_key(key)
+    }
+
+    #[must_use]
+    #[inline]
+    pub fn get(&self, key: &K) -> Option<&V> {
+        let cap = self.ring.len();
+        if cap == 0 {
+            return None;
+        }
+        let idx = (key.seq_u64() as usize) & (cap - 1);
+        if let Some((k, v)) = &self.ring[idx]
+            && *k == *key
+        {
+            return Some(v);
+        }
+        if self.overflow.is_empty() {
+            None
+        } else {
+            self.overflow.get(key)
+        }
+    }
+
+    #[must_use]
+    #[inline]
+    pub fn get_mut(&mut self, key: &K) -> Option<&mut V> {
+        let cap = self.ring.len();
+        if cap == 0 {
+            return None;
+        }
+        let idx = (key.seq_u64() as usize) & (cap - 1);
+        if matches!(&self.ring[idx], Some((k, _)) if *k == *key) {
+            return self.ring[idx].as_mut().map(|(_, v)| v);
+        }
+        if self.overflow.is_empty() {
+            None
+        } else {
+            self.overflow.get_mut(key)
+        }
+    }
+
+    #[inline]
+    pub fn insert(&mut self, key: K, value: V) -> Option<V> {
+        if self.ring.is_empty() {
+            self.grow_ring(SEQ_RING_MIN);
+        }
+        let cap = self.ring.len();
+        let idx = (key.seq_u64() as usize) & (cap - 1);
+        match &mut self.ring[idx] {
+            None => {
+                if !self.overflow.is_empty() {
+                    let prev = self.overflow.remove(&key);
+                    self.ring[idx] = Some((key, value));
+                    self.ring_len += 1;
+                    return prev;
+                }
+                self.ring[idx] = Some((key, value));
+                self.ring_len += 1;
+                None
+            }
+            Some((k, v)) if *k == key => Some(core::mem::replace(v, value)),
+            Some(_) => self.insert_collision(key, value),
+        }
+    }
+
+    #[cold]
+    fn insert_collision(&mut self, key: K, value: V) -> Option<V> {
+        if let Some(prev) = self.overflow.insert(key, value) {
+            return Some(prev);
+        }
+        let cap = self.ring.len();
+        if cap < SEQ_RING_MAX
+            && (self.ring_len + self.overflow.len() >= cap / 2 || self.overflow.len() >= 4)
+        {
+            self.grow_ring(cap * 2);
+        }
+        None
+    }
+
+    #[inline]
+    pub fn get_or_insert_default(&mut self, key: K) -> &mut V
+    where
+        V: Default,
+    {
+        if self.ring.is_empty() {
+            self.grow_ring(SEQ_RING_MIN);
+        }
+        let cap = self.ring.len();
+        let idx = (key.seq_u64() as usize) & (cap - 1);
+        if matches!(&self.ring[idx], Some((k, _)) if *k == key) {
+            return match &mut self.ring[idx] {
+                Some((_, v)) => v,
+                None => unreachable_slot(),
+            };
+        }
+        if self.ring[idx].is_none() && self.overflow.is_empty() {
+            self.ring[idx] = Some((key, V::default()));
+            self.ring_len += 1;
+            return match &mut self.ring[idx] {
+                Some((_, v)) => v,
+                None => unreachable_slot(),
+            };
+        }
+        self.get_or_insert_default_slow(key)
+    }
+
+    #[cold]
+    fn get_or_insert_default_slow(&mut self, key: K) -> &mut V
+    where
+        V: Default,
+    {
+        let cap = self.ring.len();
+        let idx = (key.seq_u64() as usize) & (cap - 1);
+        if self.ring[idx].is_none() {
+            let val = self.overflow.remove(&key).unwrap_or_default();
+            self.ring[idx] = Some((key, val));
+            self.ring_len += 1;
+            return match &mut self.ring[idx] {
+                Some((_, v)) => v,
+                None => unreachable_slot(),
+            };
+        }
+        self.overflow.get_or_insert_default(key)
+    }
+
+    #[inline]
+    pub fn remove(&mut self, key: &K) -> Option<V> {
+        let cap = self.ring.len();
+        if cap == 0 {
+            return None;
+        }
+        let idx = (key.seq_u64() as usize) & (cap - 1);
+        if matches!(&self.ring[idx], Some((k, _)) if *k == *key) {
+            self.ring_len -= 1;
+            return self.ring[idx].take().map(|(_, v)| v);
+        }
+        if self.overflow.is_empty() {
+            None
+        } else {
+            self.overflow.remove(key)
+        }
+    }
+
+    pub fn retain(&mut self, mut f: impl FnMut(&K, &mut V) -> bool) {
+        if self.ring_len != 0 {
+            for slot in &mut self.ring {
+                let drop_slot = match slot {
+                    Some((k, v)) => !f(k, v),
+                    None => false,
+                };
+                if drop_slot {
+                    *slot = None;
+                    self.ring_len -= 1;
+                }
+            }
+        }
+        if !self.overflow.is_empty() {
+            self.overflow.retain(f);
+        }
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (&K, &V)> + '_ {
+        self.ring
+            .iter()
+            .filter_map(|s| s.as_ref().map(|(k, v)| (k, v)))
+            .chain(self.overflow.iter())
+    }
+
+    pub fn values(&self) -> impl Iterator<Item = &V> + '_ {
+        self.ring
+            .iter()
+            .filter_map(|s| s.as_ref().map(|(_, v)| v))
+            .chain(self.overflow.values())
+    }
+
+    pub fn into_entries(self) -> impl Iterator<Item = (K, V)> {
+        self.ring
+            .into_iter()
+            .flatten()
+            .chain(self.overflow.into_entries())
+    }
+}
+
+/// Prefix-stripped direct-indexed O(1) map for scoped monotonic identifiers.
+///
+/// Active-scope keys use a zero-hash [`SeqMap<K::Local, V>`] ring; keys from
+/// recovered prior epochs fall back to a cold `BTreeMap<K, V>`.
+#[derive(Clone, Debug)]
+pub struct ScopedSeqMap<K: ScopedKey, V>
+where
+    K::Local: SeqKey,
+{
+    hot_scope: Option<K::Scope>,
+    hot: SeqMap<K::Local, V>,
+    cold: BTreeMap<K, V>,
+}
+
+impl<K: ScopedKey, V> Default for ScopedSeqMap<K, V>
+where
+    K::Local: SeqKey,
+{
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<K: ScopedKey, V> ScopedSeqMap<K, V>
+where
+    K::Local: SeqKey,
+{
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            hot_scope: None,
+            hot: SeqMap::new(),
+            cold: BTreeMap::new(),
+        }
+    }
+
+    #[must_use]
+    pub const fn with_scope(scope: K::Scope) -> Self {
+        Self {
+            hot_scope: Some(scope),
+            hot: SeqMap::new(),
+            cold: BTreeMap::new(),
+        }
+    }
+
+    #[must_use]
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.hot.len() + self.cold.len()
+    }
+
+    #[must_use]
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.hot.is_empty() && self.cold.is_empty()
+    }
+
+    pub fn clear(&mut self) {
+        self.hot.clear();
+        self.cold.clear();
+    }
+
+    #[must_use]
+    #[inline]
+    pub fn contains_key(&self, key: &K) -> bool {
+        if self.hot_scope == Some(key.scope()) {
+            self.hot.contains_key(&key.local())
+        } else {
+            self.cold.contains_key(key)
+        }
+    }
+
+    #[must_use]
+    #[inline]
+    pub fn get(&self, key: &K) -> Option<&V> {
+        if self.hot_scope == Some(key.scope()) {
+            self.hot.get(&key.local())
+        } else {
+            self.cold.get(key)
+        }
+    }
+
+    #[must_use]
+    #[inline]
+    pub fn get_mut(&mut self, key: &K) -> Option<&mut V> {
+        if self.hot_scope == Some(key.scope()) {
+            self.hot.get_mut(&key.local())
+        } else {
+            self.cold.get_mut(key)
+        }
+    }
+
+    #[inline]
+    pub fn insert(&mut self, key: K, value: V) -> Option<V> {
+        let scope = key.scope();
+        match self.hot_scope {
+            Some(hot) if hot == scope => self.hot.insert(key.local(), value),
+            Some(hot) if !K::later_run(scope, hot) => self.cold.insert(key, value),
+            _ => {
+                self.activate(scope);
+                self.hot.insert(key.local(), value)
+            }
+        }
+    }
+
+    #[cold]
+    fn activate(&mut self, scope: K::Scope) {
+        if let Some(earlier) = self.hot_scope.replace(scope) {
+            for (local, value) in core::mem::take(&mut self.hot).into_entries() {
+                self.cold.insert(K::from_parts(earlier, local), value);
+            }
+        }
+    }
+
+    #[inline]
+    pub fn remove(&mut self, key: &K) -> Option<V> {
+        if self.hot_scope == Some(key.scope()) {
+            self.hot.remove(&key.local())
+        } else {
+            self.cold.remove(key)
+        }
+    }
+
+    #[inline]
     pub fn get_or_insert_default(&mut self, key: K) -> &mut V
     where
         V: Default,
@@ -911,6 +1457,113 @@ mod tests {
         let mut seen: Vec<(OperationId, u64)> = map.iter().map(|(k, v)| (k, *v)).collect();
         seen.sort();
         let expected: Vec<(OperationId, u64)> = oracle.into_iter().collect();
+        assert_eq!(seen, expected);
+    }
+
+    #[test]
+    fn seq_map_matches_btree_under_monotonic_and_colliding_keys() {
+        let mut seq: SeqMap<u64, u64> = SeqMap::new();
+        let mut oracle: BTreeMap<u64, u64> = BTreeMap::new();
+        let mut rng: u64 = 0x55aa_1234_9988_7766;
+        let mut next = || {
+            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
+            rng >> 20
+        };
+        // Steady-state monotonic window + periodic old stragglers colliding mod ring size.
+        for step in 1..40_000u64 {
+            let key = if step % 17 == 0 {
+                (next() % 16) * 64 + (step % 64)
+            } else {
+                step.saturating_sub(next() % 96)
+            };
+            match next() % 5 {
+                0 | 1 => assert_eq!(seq.insert(key, step), oracle.insert(key, step)),
+                2 | 3 => assert_eq!(seq.remove(&key), oracle.remove(&key)),
+                _ => {
+                    assert_eq!(seq.get(&key), oracle.get(&key));
+                    assert_eq!(seq.contains_key(&key), oracle.contains_key(&key));
+                }
+            }
+            assert_eq!(seq.len(), oracle.len());
+        }
+        seq.retain(|k, v| (k + *v) % 3 != 0);
+        oracle.retain(|k, v| (k + *v) % 3 != 0);
+        assert_eq!(seq.len(), oracle.len());
+        for (k, v) in &oracle {
+            assert_eq!(seq.get(k), Some(v));
+        }
+        seq.clear();
+        assert!(seq.is_empty());
+    }
+
+    #[test]
+    fn scoped_seq_map_matches_btree_across_epochs_and_owners() {
+        let mut map: ScopedSeqMap<OperationId, u64> = ScopedSeqMap::new();
+        let mut oracle = BTreeMap::new();
+        let mut rng: u64 = 0x0dd0_5eed_1234_abcd;
+        let mut next = || {
+            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
+            rng >> 33
+        };
+        for step in 0..20_000u64 {
+            let newest = 1 + step / 5_000;
+            let epoch = 1 + next() % newest;
+            let key = operation(epoch, next() % 2, 1 + next() % 128);
+            match next() % 10 {
+                0..=4 => assert_eq!(map.insert(key, step), oracle.insert(key, step)),
+                5 => *map.get_or_insert_default(key) += 1,
+                6..=8 => assert_eq!(map.remove(&key), oracle.remove(&key)),
+                _ => assert_eq!(map.get(&key), oracle.get(&key)),
+            }
+            if let Some(value) = map.get(&key)
+                && oracle.get(&key) != Some(value)
+            {
+                *oracle.entry(key).or_default() += 1;
+                assert_eq!(oracle.get(&key), Some(value));
+            }
+            assert_eq!(map.len(), oracle.len());
+        }
+        let mut seen: Vec<(OperationId, u64)> = map.iter().map(|(k, v)| (k, *v)).collect();
+        seen.sort();
+        let expected: Vec<(OperationId, u64)> = oracle.into_iter().collect();
+        assert_eq!(seen, expected);
+    }
+
+    #[test]
+    fn scoped_seq_map_delivery_id_handles_pairs_and_fanout() {
+        let mut map: ScopedSeqMap<DeliveryId, u64> = ScopedSeqMap::new();
+        let mut oracle = BTreeMap::new();
+        let inc = StoreIncarnation::new(1);
+        let ep = RunEpoch::new(1);
+        let owner = LogicalOwnerId::new(0);
+        // 1:1 pairs sliding window + 1:16 fanout mixed
+        for p in 1..=2000u64 {
+            let fanout = if p % 4 == 0 { 16 } else { 1 };
+            for idx in 0..fanout {
+                let id = DeliveryId {
+                    publication: PublicationId::new(inc, ep, owner, PublicationSeq::new(p)),
+                    index: idx,
+                };
+                let val = (p << 8) | u64::from(idx);
+                assert_eq!(map.insert(id, val), oracle.insert(id, val));
+                assert_eq!(map.get(&id), oracle.get(&id));
+            }
+            if p > 64 {
+                let old_p = p - 64;
+                let old_fanout = if old_p % 4 == 0 { 16 } else { 1 };
+                for idx in 0..old_fanout {
+                    let id = DeliveryId {
+                        publication: PublicationId::new(inc, ep, owner, PublicationSeq::new(old_p)),
+                        index: idx,
+                    };
+                    assert_eq!(map.remove(&id), oracle.remove(&id));
+                }
+            }
+            assert_eq!(map.len(), oracle.len());
+        }
+        let mut seen: Vec<(DeliveryId, u64)> = map.iter().map(|(k, v)| (k, *v)).collect();
+        seen.sort();
+        let expected: Vec<(DeliveryId, u64)> = oracle.into_iter().collect();
         assert_eq!(seen, expected);
     }
 }

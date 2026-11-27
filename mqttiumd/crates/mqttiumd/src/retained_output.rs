@@ -17,6 +17,7 @@ pub(crate) struct RetainedOutput {
 }
 
 impl RetainedOutput {
+    #[inline]
     pub(crate) fn is_empty(&self) -> bool {
         self.turns.is_empty()
     }
@@ -58,6 +59,7 @@ pub(crate) struct ReplaySink<'a, S> {
 }
 
 impl<S: EffectSink> EffectSink for ReplaySink<'_, S> {
+    #[inline]
     fn try_submit(&mut self, effect: OwnedEffect) -> SubmitResult {
         let replay = matches!(
             effect.effect(),
@@ -69,6 +71,13 @@ impl<S: EffectSink> EffectSink for ReplaySink<'_, S> {
         if !replay && self.held.is_empty() {
             return self.inner.try_submit(effect);
         }
+        self.try_submit_slow(effect, replay)
+    }
+}
+
+impl<S: EffectSink> ReplaySink<'_, S> {
+    #[cold]
+    fn try_submit_slow(&mut self, effect: OwnedEffect, replay: bool) -> SubmitResult {
         let Some(generation) = effect.effect().wire_generation() else {
             return self.inner.try_submit(effect);
         };

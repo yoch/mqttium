@@ -1,15 +1,21 @@
 /// Used by the tests only.
 impl super::VolatileQueue {
-    pub(in crate::owner) fn to_vec(&self) -> alloc::vec::Vec<Volatile> {
-        let mut out = alloc::vec::Vec::with_capacity(self.len());
-        out.extend(self.inflight.values().cloned());
-        out.extend(
+    pub(in crate::owner) fn to_vec(
+        &self,
+    ) -> (
+        alloc::vec::Vec<super::InFlightVolatile>,
+        alloc::vec::Vec<Volatile>,
+    ) {
+        let inflight: alloc::vec::Vec<super::InFlightVolatile> =
+            self.inflight.values().cloned().collect();
+        let mut queued = alloc::vec::Vec::with_capacity(self.parked_len + self.pending.len());
+        queued.extend(
             self.lanes
                 .values()
                 .flat_map(|lane| lane.parked.iter().cloned()),
         );
-        out.extend(self.pending.iter().cloned());
-        out
+        queued.extend(self.pending.iter().cloned());
+        (inflight, queued)
     }
 }
 
@@ -5245,4 +5251,167 @@ fn inline_preclaim_burst_respects_receive_maximum_and_emits_fifo() {
     assert_eq!(emitted_4, alloc::vec![(4, b'4')]);
     assert_eq!(owner.pubsub.active(CONNECTION), 2);
     assert!(!owner.has_ready_work(TARGET));
+}
+
+#[test]
+fn inline_qos0_direct_emits_within_window_and_spills_in_order() {
+    let mut owner = world();
+    owner.enable_inline_claims();
+    owner.pubsub.volatile = VolatileQueue::new(nonzero(512)).unwrap();
+    owner.pubsub.payload_limit = PayloadBytes::new(1_048_576);
+    let pub_conn = ConnectionGeneration::new(11);
+    let sub_conn = CONNECTION;
+    let sub_session = TARGET;
+    let _ = apply(
+        &mut owner,
+        Input::Packet {
+            connection: pub_conn,
+            ingress_order: 0,
+            packet: InboundPacket::ConnectResume {
+                client_id: bytes(b"other"),
+            },
+        },
+    );
+    let _ = apply(
+        &mut owner,
+        Input::ConnectionSettings {
+            connection: pub_conn,
+            receive_maximum: 16,
+            maximum_packet_size: 4096,
+        },
+    );
+    let filters = crate::contract::pubsub::FilterList::copy_from(&[
+        crate::contract::pubsub::SubscriptionFilter {
+            filter: bytes(b"t/direct"),
+            qos: Qos::AtMostOnce,
+            options: crate::contract::pubsub::SubscriptionOptions::DEFAULT,
+        },
+    ])
+    .unwrap();
+    let sub_effects = apply(
+        &mut owner,
+        Input::Packet {
+            connection: sub_conn,
+            ingress_order: 1,
+            packet: InboundPacket::Subscribe {
+                packet_id: InboundPacketId::new(1).unwrap(),
+                filters,
+                denied: 0,
+            },
+        },
+    );
+    let (sub_eff, Effect::Persist { command }) = &sub_effects[0] else {
+        panic!("expected subscribe persist");
+    };
+    let _ = apply(
+        &mut owner,
+        Input::StoreResult {
+            effect: *sub_eff,
+            operation: command.recipe.operation(),
+            reply: StoreReply::Outcome(StoreOutcome::Committed(
+                CommitFacts::SubscriptionsChanged {
+                    session: sub_session,
+                    route_revision: Revision::new(1),
+                },
+            )),
+        },
+    );
+
+    // First QOS0_WINDOW publishes emit Effect::EmitQos0 directly without Effect::Continue.
+    let mut emitted_effects = alloc::vec::Vec::new();
+    for seq in 1..=(QOS0_WINDOW as u64) {
+        let effects = apply(
+            &mut owner,
+            Input::Packet {
+                connection: pub_conn,
+                ingress_order: seq,
+                packet: InboundPacket::Publish {
+                    topic: bytes(b"t/direct"),
+                    qos: Qos::AtMostOnce,
+                    retain: false,
+                    dup: false,
+                    packet_id: None,
+                    expiry: None,
+                    properties: None,
+                    payload: bytes(&seq.to_be_bytes()),
+                },
+            },
+        );
+        assert_eq!(effects.len(), 1);
+        let (eid, Effect::EmitQos0 { payload, .. }) = &effects[0] else {
+            panic!("expected direct EmitQos0 at seq {seq}, got {effects:?}");
+        };
+        assert_eq!(payload.as_slice(), &seq.to_be_bytes());
+        emitted_effects.push(*eid);
+    }
+
+    // Message QOS0_WINDOW + 1 must spill into VolatileQueue::pending -> park via Continue.
+    let spill_seq = (QOS0_WINDOW as u64) + 1;
+    let spill = apply(
+        &mut owner,
+        Input::Packet {
+            connection: pub_conn,
+            ingress_order: spill_seq,
+            packet: InboundPacket::Publish {
+                topic: bytes(b"t/direct"),
+                qos: Qos::AtMostOnce,
+                retain: false,
+                dup: false,
+                packet_id: None,
+                expiry: None,
+                properties: None,
+                payload: bytes(&spill_seq.to_be_bytes()),
+            },
+        },
+    );
+    assert_eq!(spill.len(), 1);
+    let (_, Effect::Continue { continuation }) = spill[0] else {
+        panic!("expected Continue when window full, got {spill:?}");
+    };
+    let parked = apply(
+        &mut owner,
+        Input::Continue {
+            continuation,
+            budget: WorkUnits::new(64),
+        },
+    );
+    assert!(parked.is_empty());
+
+    // Completing the first emitted frame wakes the parked spillover message in order.
+    let done = apply(
+        &mut owner,
+        Input::FrameResult {
+            effect: emitted_effects[0],
+            connection: ConnectionKey {
+                session: sub_session,
+                generation: sub_conn,
+            },
+            progress: FrameProgress::Written {
+                confirmed: 20,
+                total: 20,
+            },
+        },
+    );
+    assert_eq!(done.len(), 1);
+    let (
+        _,
+        Effect::Continue {
+            continuation: wake_c,
+        },
+    ) = done[0]
+    else {
+        panic!("expected Continue waking parked delivery, got {done:?}");
+    };
+    let resumed = apply(
+        &mut owner,
+        Input::Continue {
+            continuation: wake_c,
+            budget: WorkUnits::new(64),
+        },
+    );
+    assert_eq!(resumed.len(), 1);
+    let (_, Effect::EmitQos0 { payload, .. }) = &resumed[0] else {
+        panic!("expected resumed EmitQos0, got {resumed:?}");
+    };
+    assert_eq!(payload.as_slice(), &spill_seq.to_be_bytes());
 }

@@ -14,7 +14,7 @@ use std::collections::{BTreeMap, VecDeque};
 use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::mpsc::{self, Receiver, TryRecvError, TrySendError};
+use std::sync::mpsc::{self, TryRecvError, TrySendError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -874,7 +874,7 @@ struct PendingQos0Item {
 struct DeliveryShardWorker {
     owner: Owner,
     store: ShardStoreHandle,
-    coord_rx: Receiver<CoordToShard>,
+    coord_rx: crate::wake::LaneReceiver<CoordToShard>,
     io_inbox: Arc<ShardInbox>,
     notices: Arc<Notices>,
     events: Events,
@@ -927,7 +927,7 @@ impl DeliveryShardWorker {
     fn new(
         owner: Owner,
         store: ShardStoreHandle,
-        coord_rx: Receiver<CoordToShard>,
+        coord_rx: crate::wake::LaneReceiver<CoordToShard>,
         io_inbox: Arc<ShardInbox>,
         notices: Arc<Notices>,
         events: Events,

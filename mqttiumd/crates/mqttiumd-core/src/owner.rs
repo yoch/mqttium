@@ -38,7 +38,7 @@ use crate::contract::effects::{
     FrameProgress, Input, Outbox, OwnedEffect, OwnerAuthority, RecoveredFact, RecoveryOrder,
     ReplaceRefusal, RetireRefusal,
 };
-use crate::contract::flat_map::{FlatMap, FlatSet, ScopedFlatMap};
+use crate::contract::flat_map::{FlatMap, FlatSet, ScopedSeqMap, SeqMap};
 use crate::contract::ids::{
     AccountId, ConnectionGeneration, ConnectionKey, ContinuationId, DeadlineToken, DeliveryId,
     EffectId, EffectSeq, ExchangeGeneration, ExchangeId, Exhausted, InboundPacketId,
@@ -983,13 +983,30 @@ struct Effects {
     count: usize,
 }
 
+impl Effects {
+    const fn empty() -> Self {
+        Self {
+            items: [None, None, None],
+            count: 0,
+        }
+    }
+
+    #[inline]
+    fn clear(&mut self) {
+        for slot in &mut self.items[..self.count] {
+            *slot = None;
+        }
+        self.count = 0;
+    }
+}
+
 /// What a plan draws and publishes while it is computed.
 #[derive(Debug)]
 struct Draft {
     epoch: RunEpoch,
     owner: LogicalOwnerId,
     counters: Counters,
-    effects: Effects,
+    effects: alloc::boxed::Box<Effects>,
     progress: Progress,
     closed: Option<ConnectionGeneration>,
     receipt_issued: Option<receipts::Entry>,
@@ -1169,9 +1186,9 @@ pub struct Owner {
     session_by_conn: FlatMap<ConnectionGeneration, usize>,
     slots: BoundedSlab<Slot>,
     slot_by_key: FlatMap<(SessionId, InboundPacketId), usize>,
-    slot_by_op: ScopedFlatMap<OperationId, usize>,
-    slot_by_deadline: FlatMap<DeadlineToken, usize>,
-    slot_by_effect: ScopedFlatMap<EffectId, usize>,
+    slot_by_op: ScopedSeqMap<OperationId, usize>,
+    slot_by_deadline: SeqMap<DeadlineToken, usize>,
+    slot_by_effect: ScopedSeqMap<EffectId, usize>,
     slots_by_session: FlatMap<SessionId, SmallIndexSet>,
     held_answers: usize,
     /// Total slots currently in `AdmissionPending` or `AnswerHeld`.
@@ -1201,7 +1218,7 @@ pub struct Owner {
     /// small rings (e.g. production `128`), `remember_finished` is an O(1)
     /// overwrite with zero hashing or cloning, and cold late-result lookups
     /// scan the small ring directly.
-    finished_by_op: Option<ScopedFlatMap<OperationId, (Finished, u32)>>,
+    finished_by_op: Option<ScopedSeqMap<OperationId, (Finished, u32)>>,
     /// The latest connections that were closed; see `OwnerConfig`.
     closed: BoundedQueue<ConnectionGeneration>,
     closed_set: BTreeSet<ConnectionGeneration>,
@@ -1213,7 +1230,7 @@ pub struct Owner {
     lifecycle_enabled: bool,
     inline_claim_enabled: bool,
     delegated_deliveries: bool,
-    delegated_inline_by_op: ScopedFlatMap<OperationId, DelegatedInlineBatch>,
+    delegated_inline_by_op: ScopedSeqMap<OperationId, DelegatedInlineBatch>,
     delegated_inline_by_session: FlatMap<SessionId, usize>,
     /// The delegated inline admissions whose outcome is unknown: their
     /// claims may still commit, and the committed claims of their targets
@@ -1228,7 +1245,7 @@ pub struct Owner {
     last_delegated_qos0: Option<DelegatedQos0Batch>,
     last_finished_delivery: Option<(SessionId, Option<OutboundPacketId>)>,
     non_inline_targets_by_op:
-        ScopedFlatMap<OperationId, (PublicationId, alloc::vec::Vec<SessionId>)>,
+        ScopedSeqMap<OperationId, (PublicationId, alloc::vec::Vec<SessionId>)>,
     message_now: Option<MessageTime>,
     release_continuation: Option<ContinuationId>,
     release_continuations_started: bool,
@@ -1237,6 +1254,9 @@ pub struct Owner {
     receipt_priority_dispatched: Option<(EffectId, DeadlineToken)>,
     lifecycle_flight_dispatched: Option<(OperationId, DeadlineToken)>,
     will_flight_dispatched: Option<(OperationId, DeadlineToken)>,
+    /// Reusable effect staging buffer borrowed by `Draft` during a step so the
+    /// stack never zero-initializes ~900 bytes of `[Option<OwnedEffect>; 3]`.
+    scratch_effects: Option<alloc::boxed::Box<Effects>>,
     /// The one box of this owner. A renewal replaces it in place.
     outbox: Outbox,
 }
@@ -1277,6 +1297,81 @@ fn run<'a>(
         .unwrap_or(upto)
         .min(upto);
     facts.get(start..end).unwrap_or(&[])
+}
+
+/// Compact, `Copy` step result returned by the in-place step entry points
+/// (`Owner::step_in_place`, `Owner::step_and_dispatch_in_place`).
+///
+/// Unlike [`StepOutcome`], it does not embed the 160-byte [`Input`] by value:
+/// on `NeedCapacity` or `Exhausted`, the caller's `&mut Option<Input>` keeps
+/// the original input intact without stack copies.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum StepResult {
+    Applied {
+        work_used: WorkUnits,
+        progress: Progress,
+    },
+    NeedCapacity {
+        need: CapacityNeed,
+        work_used: WorkUnits,
+    },
+    Exhausted {
+        exhaustion: Exhaustion,
+        work_used: WorkUnits,
+    },
+    Fatal(CoreFault),
+}
+
+impl StepResult {
+    #[inline]
+    fn into_outcome(self, input: &mut Option<Input>) -> StepOutcome {
+        match self {
+            Self::Applied {
+                work_used,
+                progress,
+            } => StepOutcome::Applied {
+                work_used,
+                progress,
+            },
+            Self::NeedCapacity { need, work_used } => StepOutcome::NeedCapacity {
+                input: input.take().expect("input retained on NeedCapacity"),
+                need,
+                work_used,
+            },
+            Self::Exhausted {
+                exhaustion,
+                work_used,
+            } => StepOutcome::Exhausted {
+                input: input.take().expect("input retained on Exhausted"),
+                exhaustion,
+                work_used,
+            },
+            Self::Fatal(fault) => StepOutcome::Fatal(fault),
+        }
+    }
+
+    #[inline]
+    fn reservation_refused(
+        refusal: crate::contract::effects::ReserveRefused,
+        work_used: WorkUnits,
+    ) -> Self {
+        match refusal {
+            crate::contract::effects::ReserveRefused::Need(need) => {
+                Self::NeedCapacity { need, work_used }
+            }
+            crate::contract::effects::ReserveRefused::TableExhausted => Self::Exhausted {
+                exhaustion: Exhaustion::ReservationTable,
+                work_used,
+            },
+            crate::contract::effects::ReserveRefused::LargerThanBox {
+                requested,
+                capacity,
+            } => Self::Fatal(CoreFault::BoxTooSmall {
+                requested,
+                capacity,
+            }),
+        }
+    }
 }
 
 impl Owner {
@@ -1343,9 +1438,9 @@ impl Owner {
             session_by_conn: FlatMap::new(),
             slots,
             slot_by_key: FlatMap::new(),
-            slot_by_op: ScopedFlatMap::with_scope((id.incarnation(), id.epoch(), id.owner())),
-            slot_by_deadline: FlatMap::new(),
-            slot_by_effect: ScopedFlatMap::with_scope((id.epoch(), id.owner())),
+            slot_by_op: ScopedSeqMap::with_scope((id.incarnation(), id.epoch(), id.owner())),
+            slot_by_deadline: SeqMap::new(),
+            slot_by_effect: ScopedSeqMap::with_scope((id.epoch(), id.owner())),
             slots_by_session: FlatMap::new(),
             held_answers: 0,
             unanswered_slots: 0,
@@ -1360,7 +1455,7 @@ impl Owner {
             leases,
             finished,
             finished_by_op: (config.retained_operations.get() > 256)
-                .then(|| ScopedFlatMap::with_scope((id.incarnation(), id.epoch(), id.owner()))),
+                .then(|| ScopedSeqMap::with_scope((id.incarnation(), id.epoch(), id.owner()))),
             closed,
             closed_set: BTreeSet::new(),
             resolution_delay: config.resolution_delay,
@@ -1371,7 +1466,7 @@ impl Owner {
             lifecycle_enabled: false,
             inline_claim_enabled: false,
             delegated_deliveries: false,
-            delegated_inline_by_op: ScopedFlatMap::with_scope((
+            delegated_inline_by_op: ScopedSeqMap::with_scope((
                 id.incarnation(),
                 id.epoch(),
                 id.owner(),
@@ -1383,7 +1478,7 @@ impl Owner {
             last_delegated_rejected: None,
             last_delegated_qos0: None,
             last_finished_delivery: None,
-            non_inline_targets_by_op: ScopedFlatMap::with_scope((
+            non_inline_targets_by_op: ScopedSeqMap::with_scope((
                 id.incarnation(),
                 id.epoch(),
                 id.owner(),
@@ -1394,6 +1489,7 @@ impl Owner {
             receipt_priority_dispatched: None,
             lifecycle_flight_dispatched: None,
             will_flight_dispatched: None,
+            scratch_effects: Some(alloc::boxed::Box::new(Effects::empty())),
             outbox,
         })
     }
@@ -1965,13 +2061,55 @@ impl Owner {
         self.last_observed_puback_ignored
     }
 
+    #[inline]
+    fn new_draft(&mut self) -> Draft {
+        let effects = self
+            .scratch_effects
+            .take()
+            .unwrap_or_else(|| alloc::boxed::Box::new(Effects::empty()));
+        Draft {
+            epoch: self.epoch,
+            owner: self.id,
+            counters: self.counters,
+            effects,
+            progress: Progress::Complete,
+            closed: None,
+            receipt_issued: None,
+            receipt_consumed: None,
+            released: None,
+            inline_outcome: None,
+            delegated_inline_resolved: None,
+            non_inline_resolved: None,
+        }
+    }
+
+    #[inline]
+    fn return_scratch_effects(&mut self, mut effects: alloc::boxed::Box<Effects>) {
+        if effects.count != 0 {
+            effects.clear();
+        }
+        self.scratch_effects = Some(effects);
+    }
+
     /// Applies `input` entirely, or hands it back intact (DEM-006).
     ///
     /// A refusal keeps the input, the state, the identity counters, the
     /// account, the reservations held and the content of the box as they
     /// were.
     pub fn step(&mut self, input: Input, grant: TurnGrant) -> StepOutcome {
-        self.step_with_sink_and_oracle(input, grant, None, None).0
+        let mut slot = Some(input);
+        let (result, _) =
+            self.step_in_place_with_sink_and_oracle::<dyn EffectSink>(&mut slot, grant, None, None);
+        result.into_outcome(&mut slot)
+    }
+
+    /// In-place variant of [`Self::step`]: avoids moving the input or returning
+    /// it inside a large `StepOutcome`. On `NeedCapacity`/`Exhausted`, `input`
+    /// remains `Some(...)`.
+    #[inline]
+    pub fn step_in_place(&mut self, input: &mut Option<Input>, grant: TurnGrant) -> StepResult {
+        self.step_in_place_with_sink_and_oracle::<dyn EffectSink>(input, grant, None, None)
+            .0
     }
 
     /// Applies `input` and, when the outbox is empty and has no live
@@ -1984,16 +2122,61 @@ impl Owner {
         grant: TurnGrant,
         sink: &mut dyn EffectSink,
     ) -> (StepOutcome, usize) {
-        self.step_with_sink_and_oracle(input, grant, Some(sink), None)
+        let mut slot = Some(input);
+        let (result, accepted) =
+            self.step_in_place_with_sink_and_oracle(&mut slot, grant, Some(sink), None);
+        (result.into_outcome(&mut slot), accepted)
     }
 
-    pub(super) fn step_with_sink_and_oracle<'o>(
+    /// Monomorphized, in-place variant of [`Self::step_and_dispatch`] for
+    /// concrete sinks: avoids both vtable dispatch and copying `Input`/`StepOutcome`.
+    #[inline]
+    pub fn step_and_dispatch_in_place<S: EffectSink>(
+        &mut self,
+        input: &mut Option<Input>,
+        grant: TurnGrant,
+        sink: &mut S,
+    ) -> (StepResult, usize) {
+        self.step_in_place_with_sink_and_oracle(input, grant, Some(sink), None)
+    }
+
+    pub(super) fn step_with_sink_and_oracle<'o, S: EffectSink + ?Sized>(
         &mut self,
         input: Input,
         grant: TurnGrant,
-        sink: Option<&mut dyn EffectSink>,
-        mut oracle: Option<&mut (dyn InlineClaimOracle + 'o)>,
+        sink: Option<&mut S>,
+        oracle: Option<&mut (dyn InlineClaimOracle + 'o)>,
     ) -> (StepOutcome, usize) {
+        let mut slot = Some(input);
+        let (result, accepted) =
+            self.step_in_place_with_sink_and_oracle(&mut slot, grant, sink, oracle);
+        (result.into_outcome(&mut slot), accepted)
+    }
+
+    pub(super) fn step_in_place_with_sink_and_oracle<'o, S: EffectSink + ?Sized>(
+        &mut self,
+        input: &mut Option<Input>,
+        grant: TurnGrant,
+        sink: Option<&mut S>,
+        oracle: Option<&mut (dyn InlineClaimOracle + 'o)>,
+    ) -> (StepResult, usize) {
+        let mut draft = self.new_draft();
+        let outcome = self.step_with_draft(&mut draft, input, grant, sink, oracle);
+        self.return_scratch_effects(draft.effects);
+        outcome
+    }
+
+    fn step_with_draft<'o, S: EffectSink + ?Sized>(
+        &mut self,
+        draft: &mut Draft,
+        input_slot: &mut Option<Input>,
+        grant: TurnGrant,
+        sink: Option<&mut S>,
+        mut oracle: Option<&mut (dyn InlineClaimOracle + 'o)>,
+    ) -> (StepResult, usize) {
+        let Some(input) = input_slot.as_ref() else {
+            return (StepResult::Fatal(CoreFault::ImpossibleInput), 0);
+        };
         self.last_observed_puback_ignored = false;
         self.last_step_may_unblock_work = true;
         self.last_inline_ready_target = None;
@@ -2004,13 +2187,12 @@ impl Owner {
         self.last_delegated_rejected = None;
         self.last_delegated_qos0 = None;
         self.last_finished_delivery = None;
-        let planned_work = self.cost(&input);
+        let planned_work = self.cost(input);
         if let Some(missing) = planned_work.checked_sub(grant.work_limit)
             && missing > WorkUnits::ZERO
         {
             return (
-                StepOutcome::NeedCapacity {
-                    input,
+                StepResult::NeedCapacity {
                     need: CapacityNeed {
                         resource: Resource::Work,
                         amount: missing.get(),
@@ -2021,25 +2203,8 @@ impl Owner {
                 0,
             );
         }
-        let mut draft = Draft {
-            epoch: self.epoch,
-            owner: self.id,
-            counters: self.counters,
-            effects: Effects {
-                items: [None, None, None],
-                count: 0,
-            },
-            progress: Progress::Complete,
-            closed: None,
-            receipt_issued: None,
-            receipt_consumed: None,
-            released: None,
-            inline_outcome: None,
-            delegated_inline_resolved: None,
-            non_inline_resolved: None,
-        };
         let change = match if self.revision.checked_next().is_ok() {
-            self.plan_change(&input, &mut draft, &mut oracle)
+            self.plan_change(input, draft, &mut oracle)
         } else {
             Err(Stop::Exhausted(Exhaustion::IdentityCounter))
         } {
@@ -2047,17 +2212,15 @@ impl Owner {
             Err(stop) => {
                 return (
                     match stop {
-                        Stop::Need(need) => StepOutcome::NeedCapacity {
-                            input,
+                        Stop::Need(need) => StepResult::NeedCapacity {
                             need,
                             work_used: planned_work,
                         },
-                        Stop::Exhausted(exhaustion) => StepOutcome::Exhausted {
-                            input,
+                        Stop::Exhausted(exhaustion) => StepResult::Exhausted {
                             exhaustion,
                             work_used: planned_work,
                         },
-                        Stop::Fatal(fault) => StepOutcome::Fatal(fault),
+                        Stop::Fatal(fault) => StepResult::Fatal(fault),
                     },
                     0,
                 );
@@ -2078,8 +2241,7 @@ impl Owner {
         {
             Self::rollback_delegated_change(&change, &mut oracle);
             return (
-                StepOutcome::NeedCapacity {
-                    input,
+                StepResult::NeedCapacity {
                     need: CapacityNeed {
                         resource: Resource::Work,
                         amount: missing.get(),
@@ -2091,14 +2253,13 @@ impl Owner {
             );
         }
         if self.receipts.enabled
-            && !self.receipts.maintenance_input(&input)
+            && !self.receipts.maintenance_input(input)
             && draft.effects.count > 0
             && self.outbox.free_slots() < draft.effects.count.saturating_add(2)
         {
             Self::rollback_delegated_change(&change, &mut oracle);
             return (
-                StepOutcome::NeedCapacity {
-                    input,
+                StepResult::NeedCapacity {
                     need: CapacityNeed {
                         resource: Resource::EffectSlots,
                         amount: u64::try_from(
@@ -2122,10 +2283,7 @@ impl Owner {
             (Some(slots), true) => {
                 if let Err(refusal) = self.outbox.check_reserve(slots) {
                     Self::rollback_delegated_change(&change, &mut oracle);
-                    return (
-                        StepOutcome::reservation_refused(input, refusal, planned_work),
-                        0,
-                    );
+                    return (StepResult::reservation_refused(refusal, planned_work), 0);
                 }
                 None
             }
@@ -2133,10 +2291,7 @@ impl Owner {
                 Ok(key) => Some(key),
                 Err(refusal) => {
                     Self::rollback_delegated_change(&change, &mut oracle);
-                    return (
-                        StepOutcome::reservation_refused(input, refusal, planned_work),
-                        0,
-                    );
+                    return (StepResult::reservation_refused(refusal, planned_work), 0);
                 }
             },
         };
@@ -2146,23 +2301,47 @@ impl Owner {
         {
             self.last_observed_puback_ignored = true;
         }
-        match self.apply_draft(
-            &mut draft,
+        let progress = match self.apply_draft(
+            draft,
             change,
-            input,
+            input_slot,
             reservation,
-            direct_sink,
+            direct_sink.is_some(),
             &mut oracle,
         ) {
-            Ok((progress, accepted)) => (
-                StepOutcome::Applied {
-                    work_used,
-                    progress,
-                },
-                accepted,
-            ),
-            Err(fault) => (StepOutcome::Fatal(fault), 0),
+            Ok(progress) => progress,
+            Err(fault) => return (StepResult::Fatal(fault), 0),
+        };
+        *input_slot = None;
+        let mut accepted = 0;
+        let effect_count = draft.effects.count;
+        if effect_count > 0 {
+            if let Some(sink) = direct_sink {
+                match self
+                    .outbox
+                    .dispatch_immediate(&mut draft.effects.items[..effect_count], sink)
+                {
+                    Ok(n) => accepted = n,
+                    Err(_) => return (StepResult::Fatal(CoreFault::ReservationOverrun), 0),
+                }
+            } else if let Some(key) = reservation {
+                for slot in &mut draft.effects.items[..effect_count] {
+                    if let Some(effect) = slot.take()
+                        && self.outbox.publish(key, effect).is_err()
+                    {
+                        return (StepResult::Fatal(CoreFault::ReservationOverrun), 0);
+                    }
+                }
+            }
+            draft.effects.count = 0;
         }
+        (
+            StepResult::Applied {
+                work_used,
+                progress,
+            },
+            accepted,
+        )
     }
 
     fn rollback_delegated_change<'o>(
@@ -4061,32 +4240,29 @@ impl Owner {
         Ok(Change::Recover)
     }
 
-    /// Applies a planned transition. The draft is taken by reference: it is
-    /// the largest value of a step, and a move of it costs a copy that the
-    /// optimiser does not always elide.
+    /// Applies a planned transition's state mutations. The caller dispatches or
+    /// publishes `draft.effects` immediately afterward so this body stays
+    /// non-generic across concrete sinks.
     fn apply_draft<'o>(
         &mut self,
         draft: &mut Draft,
         change: Change,
-        input: Input,
+        input: &mut Option<Input>,
         reservation: Option<EffectReservation>,
-        direct_sink: Option<&mut dyn EffectSink>,
+        use_direct_sink: bool,
         oracle: &mut Option<&mut (dyn InlineClaimOracle + 'o)>,
-    ) -> Result<(Progress, usize), CoreFault> {
-        let Draft {
-            counters,
-            ref mut effects,
-            progress,
-            closed,
-            receipt_issued,
-            receipt_consumed,
-            released,
-            ref mut inline_outcome,
-            delegated_inline_resolved,
-            non_inline_resolved,
-            ..
-        } = *draft;
-        if direct_sink.is_none() {
+    ) -> Result<Progress, CoreFault> {
+        let counters = draft.counters;
+        let effect_count = draft.effects.count;
+        let progress = draft.progress;
+        let closed = draft.closed;
+        let receipt_issued = draft.receipt_issued;
+        let receipt_consumed = draft.receipt_consumed;
+        let released = draft.released;
+        let mut inline_outcome = draft.inline_outcome.take();
+        let delegated_inline_resolved = draft.delegated_inline_resolved;
+        let non_inline_resolved = draft.non_inline_resolved;
+        if !use_direct_sink {
             let reserved = match reservation {
                 Some(key) => self
                     .outbox
@@ -4094,7 +4270,7 @@ impl Owner {
                     .map_err(|_| CoreFault::ReservationOverrun)?,
                 None => 0,
             };
-            if reserved != effects.count {
+            if reserved != effect_count {
                 return Err(CoreFault::ReservationOverrun);
             }
         }
@@ -4208,38 +4384,23 @@ impl Owner {
         }
         self.counters = counters;
         self.revision = revision;
-
-        let mut accepted = 0;
-        if let Some(sink) = direct_sink {
-            if effects.count > 0 {
-                accepted = self
-                    .outbox
-                    .dispatch_immediate(&mut effects.items[..effects.count], sink)
-                    .map_err(|_| CoreFault::ReservationOverrun)?;
-            }
-        } else if let Some(key) = reservation {
-            for slot in &mut effects.items[..effects.count] {
-                if let Some(effect) = slot.take() {
-                    self.outbox
-                        .publish(key, effect)
-                        .map_err(|_| CoreFault::ReservationOverrun)?;
-                }
-            }
-        }
-        Ok((progress, accepted))
+        Ok(progress)
     }
 
     fn apply_change<'o>(
         &mut self,
         change: Change,
-        input: Input,
+        input: &mut Option<Input>,
         oracle: &mut Option<&mut (dyn InlineClaimOracle + 'o)>,
     ) -> Result<(), CoreFault> {
         const STALE: CoreFault = CoreFault::StalePlan;
         match change {
             Change::Session(change) => self.apply_session(*change)?,
             Change::Receipts(change) => self.receipts.apply(*change)?,
-            Change::Pubsub(change) => self.apply_pubsub(change, input)?,
+            Change::Pubsub(change) => {
+                let input_ref = input.as_ref().ok_or(STALE)?;
+                self.apply_pubsub(change, input_ref)?;
+            }
             Change::Will(change) => self.apply_will(*change)?,
             Change::Nothing => {
                 self.last_step_may_unblock_work = false;
@@ -4249,13 +4410,13 @@ impl Owner {
                 self.pubsub.evict_expired_cache(now);
             }
             Change::Recover => {
-                let Input::Recovery { facts, last } = input else {
+                let Some(Input::Recovery { facts, last }) = input.as_ref() else {
                     return Err(STALE);
                 };
                 for fact in facts.as_slice() {
                     self.recover(fact)?;
                 }
-                if last {
+                if *last {
                     self.recovery = None;
                 }
             }
@@ -4303,7 +4464,7 @@ impl Owner {
                 };
                 self.push_slot(slot)?;
                 if !inline_claims.is_empty() {
-                    let Input::Packet {
+                    let Some(Input::Packet {
                         packet:
                             InboundPacket::Publish {
                                 topic,
@@ -4312,7 +4473,7 @@ impl Owner {
                                 ..
                             },
                         ..
-                    } = input
+                    }) = input.take()
                     else {
                         return Err(STALE);
                     };
@@ -4474,7 +4635,7 @@ impl Owner {
                 self.index_slot_state(slot);
             }
             Change::End { slot, finished } => {
-                if matches!(input, Input::FrameResult { .. }) {
+                if matches!(input.as_ref(), Some(Input::FrameResult { .. })) {
                     self.last_step_may_unblock_work = false;
                 }
                 let lease = self.slots.get(slot).ok_or(STALE)?.lease;

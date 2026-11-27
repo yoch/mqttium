@@ -252,8 +252,40 @@ fn check_startup_cancel(cancel: &AtomicBool) -> Result<(), Failure> {
         Ok(())
     }
 }
+trait StartupRecv<T> {
+    fn try_recv_startup(&self) -> Result<T, TryRecvError>;
+    fn recv_timeout_startup(
+        &self,
+        timeout: Duration,
+    ) -> Result<T, std::sync::mpsc::RecvTimeoutError>;
+}
+
+impl<T> StartupRecv<T> for std::sync::mpsc::Receiver<T> {
+    fn try_recv_startup(&self) -> Result<T, TryRecvError> {
+        self.try_recv()
+    }
+    fn recv_timeout_startup(
+        &self,
+        timeout: Duration,
+    ) -> Result<T, std::sync::mpsc::RecvTimeoutError> {
+        self.recv_timeout(timeout)
+    }
+}
+
+impl<T> StartupRecv<T> for crate::wake::LaneReceiver<T> {
+    fn try_recv_startup(&self) -> Result<T, TryRecvError> {
+        self.try_recv()
+    }
+    fn recv_timeout_startup(
+        &self,
+        timeout: Duration,
+    ) -> Result<T, std::sync::mpsc::RecvTimeoutError> {
+        self.recv_timeout(timeout)
+    }
+}
+
 fn startup_reply<T>(
-    receiver: &std::sync::mpsc::Receiver<T>,
+    receiver: &impl StartupRecv<T>,
     cancel: &AtomicBool,
     deadline: Instant,
     code: &'static str,
@@ -261,7 +293,7 @@ fn startup_reply<T>(
     loop {
         // An already produced typed failure is read before observing the stop
         // flag. Cancelling an outstanding request never calls it rejected.
-        match receiver.try_recv() {
+        match receiver.try_recv_startup() {
             Ok(reply) => return Ok(reply),
             Err(TryRecvError::Disconnected) => return Err(Failure::plain("writer_disconnected")),
             Err(TryRecvError::Empty) => {}
@@ -271,7 +303,7 @@ fn startup_reply<T>(
         if remaining.is_zero() {
             return Err(Failure::plain(code));
         }
-        match receiver.recv_timeout(remaining.min(Duration::from_millis(10))) {
+        match receiver.recv_timeout_startup(remaining.min(Duration::from_millis(10))) {
             Ok(reply) => return Ok(reply),
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                 return Err(Failure::plain("writer_disconnected"));
@@ -435,26 +467,32 @@ pub(super) fn run_inner(
         scratch_incoming: VecDeque::new(),
         scratch_written: Vec::new(),
         scratch_progress: Vec::new(),
+        scratch_responses: Vec::new(),
+        sink_close: Vec::new(),
+        sink_mark_pending: Vec::new(),
+        sink_work_targets: Vec::new(),
+        sink_attach_ready: Vec::new(),
+        sink_suback_ready: Vec::new(),
         last_peer_deadline_scan: Instant::now(),
         inputs: VecDeque::new(),
         ack_inputs: VecDeque::new(),
         control_inputs: VecDeque::new(),
         closing_inputs: VecDeque::new(),
         terminal_inputs: VecDeque::new(),
-        terminal_effects: ScopedFlatMap::new(),
+        terminal_effects: ScopedSeqMap::with_scope((epoch, LogicalOwnerId::new(0))),
         deferred_inputs: VecDeque::new(),
         deferred_by_conn: FlatMap::new(),
         effects_awaited: false,
         deferred_retries: 0,
         credit_progress: Instant::now(),
         timers: BTreeMap::new(),
-        inflight: ScopedFlatMap::new(),
-        inflight_route_ops: ScopedFlatMap::new(),
+        inflight: ScopedSeqMap::with_scope((epoch, LogicalOwnerId::new(0))),
+        inflight_route_ops: ScopedSeqMap::with_scope((epoch, LogicalOwnerId::new(0))),
         lifecycle_inflight: BTreeMap::new(),
         last_session_change: None,
         session_cardinality_dirty: false,
         last_session_cardinality: None,
-        work_reads: ScopedFlatMap::new(),
+        work_reads: ScopedSeqMap::with_scope((epoch, LogicalOwnerId::new(0))),
         pending_work: VecDeque::new(),
         pending_work_set: BTreeSet::new(),
         queued_work_sessions: FlatSet::new(),
@@ -485,7 +523,7 @@ pub(super) fn run_inner(
         #[cfg(feature = "test-hooks")]
         deferred_ack_used: false,
         retained_output: Default::default(),
-        frames: ScopedFlatMap::new(),
+        frames: ScopedSeqMap::with_scope((epoch, LogicalOwnerId::new(0))),
         outgoing_bindings: FlatMap::new(),
         puback_observation: 0,
         #[cfg(feature = "test-hooks")]

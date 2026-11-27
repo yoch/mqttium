@@ -950,10 +950,11 @@ impl Outbox {
     /// live reservations, avoiding queue round-trips on the steady-state path.
     /// Any refused effect and all subsequent effects in the batch are pushed
     /// onto the queue in exact FIFO order.
-    pub fn dispatch_immediate(
+    #[inline]
+    pub fn dispatch_immediate<S: EffectSink + ?Sized>(
         &mut self,
         effects: &mut [Option<OwnedEffect>],
-        sink: &mut dyn EffectSink,
+        sink: &mut S,
     ) -> Result<usize, ReservationError> {
         let mut accepted = 0usize;
         for slot in effects.iter_mut() {

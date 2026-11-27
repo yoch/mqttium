@@ -340,16 +340,104 @@ impl SessionDeliveries {
     }
 }
 
+/// Compact slot index for `by_claim_op`: almost all claims target a single
+/// delivery, avoiding `SmallIndexSet` overhead on the steady-state hot path
+/// while still supporting multi-target inline claims.
+#[derive(Clone, Debug, Default)]
+pub(super) enum ClaimSlots {
+    #[default]
+    Empty,
+    One(usize),
+    Many(alloc::boxed::Box<SmallIndexSet>),
+}
+
+pub(super) enum ClaimSlotsIter<'a> {
+    Empty,
+    One(core::option::IntoIter<usize>),
+    Many(crate::slab::SmallIndexIter<'a>),
+}
+
+impl Iterator for ClaimSlotsIter<'_> {
+    type Item = usize;
+
+    #[inline]
+    fn next(&mut self) -> Option<usize> {
+        match self {
+            Self::Empty => None,
+            Self::One(it) => it.next(),
+            Self::Many(it) => it.next(),
+        }
+    }
+}
+
+impl ClaimSlots {
+    #[inline]
+    pub(super) fn len(&self) -> usize {
+        match self {
+            Self::Empty => 0,
+            Self::One(_) => 1,
+            Self::Many(set) => set.len(),
+        }
+    }
+
+    #[inline]
+    pub(super) fn is_empty(&self) -> bool {
+        matches!(self, Self::Empty)
+    }
+
+    #[inline]
+    pub(super) fn insert(&mut self, index: usize) {
+        match self {
+            Self::Empty => *self = Self::One(index),
+            Self::One(existing) if *existing == index => {}
+            Self::One(existing) => {
+                let first = *existing;
+                let mut set = alloc::boxed::Box::new(SmallIndexSet::default());
+                set.insert(first);
+                set.insert(index);
+                *self = Self::Many(set);
+            }
+            Self::Many(set) => {
+                set.insert(index);
+            }
+        }
+    }
+
+    #[inline]
+    pub(super) fn remove(&mut self, index: &usize) {
+        match self {
+            Self::Empty => {}
+            Self::One(existing) if *existing == *index => *self = Self::Empty,
+            Self::One(_) => {}
+            Self::Many(set) => {
+                set.remove(index);
+                if set.is_empty() {
+                    *self = Self::Empty;
+                }
+            }
+        }
+    }
+
+    #[inline]
+    pub(super) fn iter(&self) -> ClaimSlotsIter<'_> {
+        match self {
+            Self::Empty => ClaimSlotsIter::Empty,
+            Self::One(slot) => ClaimSlotsIter::One(Some(*slot).into_iter()),
+            Self::Many(set) => ClaimSlotsIter::Many(set.iter()),
+        }
+    }
+}
+
 /// Encapsulated table of outgoing QoS 1/2 deliveries and all secondary indices.
 #[derive(Debug)]
 pub(super) struct Deliveries {
     rows: BoundedSlab<Delivery>,
-    by_id: ScopedFlatMap<DeliveryId, usize>,
-    by_op: ScopedFlatMap<OperationId, usize>,
-    by_deadline: FlatMap<DeadlineToken, usize>,
-    by_frame: ScopedFlatMap<EffectId, usize>,
-    by_claim_op: ScopedFlatMap<OperationId, SmallIndexSet>,
-    by_claim_result_op: ScopedFlatMap<OperationId, usize>,
+    by_id: ScopedSeqMap<DeliveryId, usize>,
+    by_op: ScopedSeqMap<OperationId, usize>,
+    by_deadline: SeqMap<DeadlineToken, usize>,
+    by_frame: ScopedSeqMap<EffectId, usize>,
+    by_claim_op: ScopedSeqMap<OperationId, ClaimSlots>,
+    by_claim_result_op: ScopedSeqMap<OperationId, usize>,
     by_target_pi: FlatMap<(SessionId, OutboundPacketId), usize>,
     by_session: FlatMap<SessionId, SessionDeliveries>,
     by_window: FlatMap<ConnectionGeneration, SmallIndexSet>,
@@ -363,12 +451,12 @@ impl Deliveries {
     pub(super) fn new(bound: NonZeroU32) -> Result<Self, AllocationFailed> {
         Ok(Self {
             rows: super::slab(bound)?,
-            by_id: ScopedFlatMap::new(),
-            by_op: ScopedFlatMap::new(),
-            by_deadline: FlatMap::new(),
-            by_frame: ScopedFlatMap::new(),
-            by_claim_op: ScopedFlatMap::new(),
-            by_claim_result_op: ScopedFlatMap::new(),
+            by_id: ScopedSeqMap::new(),
+            by_op: ScopedSeqMap::new(),
+            by_deadline: SeqMap::new(),
+            by_frame: ScopedSeqMap::new(),
+            by_claim_op: ScopedSeqMap::new(),
+            by_claim_result_op: ScopedSeqMap::new(),
             by_target_pi: FlatMap::new(),
             by_session: FlatMap::new(),
             by_window: FlatMap::new(),
@@ -480,7 +568,7 @@ impl Deliveries {
         self.by_frame.get(&effect).copied()
     }
 
-    pub(super) fn slots_by_claim_op(&self, op: OperationId) -> Option<&SmallIndexSet> {
+    pub(super) fn slots_by_claim_op(&self, op: OperationId) -> Option<&ClaimSlots> {
         self.by_claim_op.get(&op)
     }
 
@@ -671,6 +759,8 @@ impl Deliveries {
         let was_unsent = Self::is_unsent_delivery(d);
         let was_queued = Self::is_queued_delivery(d);
         let payload_len = d.payload.as_ref().map_or(0, |p| p.len() as u64);
+        let was_ctrl = Self::is_control_candidate(d);
+        let had_expiry = d.expiry.is_some();
         let was_pubrec = Self::is_pubrec_pending(d);
         if let Some(sd) = self.by_session.get_mut(&target) {
             sd.all.remove(&index);
@@ -696,8 +786,12 @@ impl Deliveries {
         if payload_len != 0 {
             self.loaded_payload_bytes = self.loaded_payload_bytes.saturating_sub(payload_len);
         }
-        self.control_candidates.remove(&index);
-        self.expiring.remove(&index);
+        if was_ctrl {
+            self.control_candidates.remove(&index);
+        }
+        if had_expiry {
+            self.expiring.remove(&index);
+        }
         if was_pubrec {
             self.pubrec_pending_count = self.pubrec_pending_count.saturating_sub(1);
         }
@@ -897,6 +991,113 @@ impl Deliveries {
             } else {
                 self.pubrec_pending_count = self.pubrec_pending_count.saturating_sub(1);
             }
+        }
+    }
+
+    /// Fast path for `Change::Written`: only `local_write_completed` and
+    /// `certain_never_started` change, which cannot affect any index when the
+    /// delivery has no expiry.
+    #[inline]
+    pub(super) fn mark_written(&mut self, index: usize, complete: bool) {
+        let d = &mut self.rows[index];
+        if d.expiry.is_none() {
+            d.local_write_completed |= complete;
+            d.certain_never_started = false;
+        } else {
+            self.mutate(index, |d| {
+                d.local_write_completed |= complete;
+                d.certain_never_started = false;
+            });
+        }
+    }
+
+    /// Fast path for `Change::Finish`: transitions a steady-state `AwaitPuback`
+    /// delivery to `FinishPending(in_flight)`, falling back to `mutate` on any
+    /// unusual state (retired, early ack, expiry, etc.).
+    #[inline]
+    pub(super) fn start_finish(&mut self, index: usize, in_flight: InFlight) {
+        let d = &self.rows[index];
+        if !d.retired
+            && d.phase == Phase::AwaitPuback
+            && !d.early_puback
+            && d.early_pubrec.is_none()
+            && d.expiry.is_none()
+        {
+            let target = d.target;
+            let sent_gen = d.frame.map(|(_, key)| key.generation);
+            let op = in_flight.operation;
+            let dl = in_flight.deadline;
+            self.rows[index].phase = Phase::FinishPending(in_flight);
+            self.by_op.insert(op, index);
+            self.by_deadline.insert(dl, index);
+            if let Some(sd) = self.by_session.get_mut(&target) {
+                if let Some(generation) = sent_gen {
+                    sd.sub_sent(generation);
+                } else {
+                    sd.unsent.remove(&index);
+                }
+                sd.busy = sd.busy.saturating_add(1);
+            }
+        } else {
+            self.mutate(index, |d| {
+                d.early_puback = false;
+                d.early_pubrec = None;
+                d.phase = Phase::FinishPending(in_flight);
+            });
+        }
+    }
+
+    /// Fast path for `InlineSlotOutcome::Committed`: transitions a steady-state
+    /// `InlineClaimPending` delivery to `AwaitPuback` and records its frame and
+    /// window when emitted immediately.
+    #[inline]
+    pub(super) fn commit_inline_emitted(
+        &mut self,
+        index: usize,
+        emission: Option<(EffectId, ConnectionKey)>,
+    ) {
+        let d = &self.rows[index];
+        if !d.retired
+            && matches!(d.phase, Phase::InlineClaimPending(_))
+            && d.frame.is_none()
+            && d.window.is_none()
+            && d.expiry.is_none()
+            && !d.early_puback
+            && d.early_pubrec.is_none()
+        {
+            let target = d.target;
+            let row = &mut self.rows[index];
+            row.phase = Phase::AwaitPuback;
+            if let Some((effect, connection)) = emission {
+                row.window = Some(connection.generation);
+                row.frame = Some((effect, connection));
+                row.may_have_started = true;
+                row.local_write_completed = false;
+                self.by_frame.insert(effect, index);
+                self.by_window
+                    .get_or_insert_default(connection.generation)
+                    .insert(index);
+                if let Some(sd) = self.by_session.get_mut(&target) {
+                    sd.inline_pending.remove(&index);
+                    sd.unsent.remove(&index);
+                    sd.add_sent(connection.generation);
+                }
+            } else if let Some(sd) = self.by_session.get_mut(&target) {
+                sd.inline_pending.remove(&index);
+            }
+        } else {
+            self.mutate(index, |d| {
+                d.phase = Phase::AwaitPuback;
+                if let Some((effect, connection)) = emission {
+                    d.window = Some(connection.generation);
+                    if d.frame.is_some() {
+                        d.certain_never_started = false;
+                    }
+                    d.frame = Some((effect, connection));
+                    d.may_have_started = true;
+                    d.local_write_completed = false;
+                }
+            });
         }
     }
 
