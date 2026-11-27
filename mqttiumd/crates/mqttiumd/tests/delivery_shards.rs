@@ -373,6 +373,14 @@ fn sharded_slow_subscriber_isolation_and_fifo_drain() {
     let broker = Broker::start("slow-iso", "log", 2);
     let addr = broker.address;
     let total = 80usize;
+    // The slow subscriber drains in at least 80 * 40 ms = 3.2 s, and a
+    // publisher it paced would take at least 78 * 40 ms = 3.1 s. The fast
+    // subscribers must be done within 2 s, room for a loaded runner: 1.41 s
+    // at worst on CI before the slow subscriber went from 8 to 40 ms (report
+    // 0048). A per-subscriber buffer of fewer than 28 publications that
+    // paced the publisher would still exceed it.
+    let slow_ack_delay = Duration::from_millis(40);
+    let fast_bound = Duration::from_secs(2);
 
     let ready = Arc::new(AtomicUsize::new(0));
     let fast_done = Arc::new(AtomicUsize::new(0));
@@ -394,7 +402,7 @@ fn sharded_slow_subscriber_isolation_and_fifo_drain() {
                 let (_qos, _, _, pid, payload) = decode_v5_publish(hdr, &body);
                 let got = usize::from_be_bytes(payload[..8].try_into().unwrap());
                 assert_eq!(got, expected, "slow-sub FIFO violation");
-                thread::sleep(Duration::from_millis(8));
+                thread::sleep(slow_ack_delay);
                 send_ack(&mut sub, 0x40, pid.unwrap());
                 expected += 1;
             }
@@ -443,14 +451,13 @@ fn sharded_slow_subscriber_isolation_and_fifo_drain() {
         assert!(reason < 0x80);
     }
 
-    // Fast subscribers should finish well before the slow subscriber finishes 80 * 8ms = 640ms.
     let wait = Instant::now();
     while fast_done.load(Ordering::Acquire) < 3 && wait.elapsed() < Duration::from_secs(5) {
         thread::sleep(Duration::from_millis(5));
     }
     assert_eq!(fast_done.load(Ordering::Acquire), 3);
     assert!(
-        start.elapsed() < Duration::from_millis(550),
+        start.elapsed() < fast_bound,
         "fast subscribers appeared blocked by slow subscriber: {:?}",
         start.elapsed()
     );
