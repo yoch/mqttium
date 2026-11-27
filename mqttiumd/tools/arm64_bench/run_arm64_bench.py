@@ -154,6 +154,10 @@ def run_one(
                 ]
             else:
                 lines += ["allow_anonymous true"]
+            if os.geteuid() == 0:
+                # Run as root, Mosquitto would drop to `nobody` and could not
+                # read the ACL and keys of this private directory.
+                lines += ["user root"]
             lines += ["persistence false", "log_type error", ""]
             config_text = "\n".join(lines)
             conf.write_text(config_text)
