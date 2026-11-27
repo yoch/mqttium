@@ -422,8 +422,20 @@ fn pump(runtime: &mut Runtime<'_>) {
     runtime.dispatch().unwrap();
 }
 
+#[track_caller]
 fn until(runtime: &mut Runtime<'_>, condition: impl Fn(&Runtime<'_>) -> bool) {
-    let deadline = Instant::now() + Duration::from_secs(1);
+    until_within(runtime, Duration::from_secs(1), condition);
+}
+
+/// `until` for a wait that spans several durable commits, one after the
+/// other: its budget is that of the commits on a slow disk.
+#[track_caller]
+fn until_within(
+    runtime: &mut Runtime<'_>,
+    budget: Duration,
+    condition: impl Fn(&Runtime<'_>) -> bool,
+) {
+    let deadline = Instant::now() + budget;
     while !condition(runtime) && Instant::now() < deadline {
         pump(runtime);
         thread::sleep(Duration::from_millis(1));
@@ -733,7 +745,10 @@ fn check_retained_qos0_replay(version: codec::Version) {
             codec::Version::V5 => (0x31, vec![0, 1, topic, 0, b'v']),
         };
         runtime.packet(slow, 0x82, subscribe.clone()).unwrap();
-        until(runtime, |r| {
+        // The subscription and its retained replay take seventeen store
+        // commits, one after the other: 1 s failed on a runner whose fsync
+        // took about 100 ms.
+        until_within(runtime, Duration::from_secs(10), |r| {
             r.retained_output.pending(slow) == QOS0_CONSUMED_WINDOW && r.owner.outbox_is_empty()
         });
         runtime.packet(fast, 0x82, subscribe).unwrap();
