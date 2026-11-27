@@ -129,11 +129,11 @@
         "status": "covered",
         "evidence": [
           {
-            "file": "mqttiumd/crates/mqttiumd-core/src/owner.rs",
+            "file": "mqttiumd/crates/mqttiumd-core/src/owner/tests.rs",
             "test": "product_pubsub_reconnect_replays_same_claims_under_smaller_peer_window"
           },
           {
-            "file": "mqttiumd/crates/mqttiumd-core/src/owner/pubsub.rs",
+            "file": "mqttiumd/crates/mqttiumd-core/src/owner/pubsub/tests.rs",
             "test": "qos2_keeps_window_and_identifier_until_pubcomp_finish_is_known"
           }
         ],
@@ -154,11 +154,11 @@
             "test": "eight_live_qos2_exchanges_still_refuse_a_genuine_ninth_identifier"
           },
           {
-            "file": "mqttiumd/crates/mqttiumd-core/src/owner.rs",
+            "file": "mqttiumd/crates/mqttiumd-core/src/owner/tests.rs",
             "test": "rule_inbound_qos2_release_pending_committed_complete"
           },
           {
-            "file": "mqttiumd/crates/mqttiumd-core/src/owner/pubsub.rs",
+            "file": "mqttiumd/crates/mqttiumd-core/src/owner/pubsub/tests.rs",
             "test": "qos2_keeps_window_and_identifier_until_pubcomp_finish_is_known"
           }
         ],
@@ -568,7 +568,7 @@
             "test": "a_refusal_never_exceeds_a_validated_connects_tiny_packet_limit"
           },
           {
-            "file": "mqttiumd/crates/mqttiumd-core/src/owner.rs",
+            "file": "mqttiumd/crates/mqttiumd-core/src/owner/tests.rs",
             "test": "product_pubsub_delivery_over_peer_maximum_packet_size_is_discarded_and_the_next_one_sent"
           },
           {
@@ -589,11 +589,11 @@
         "status": "covered",
         "evidence": [
           {
-            "file": "mqttiumd/crates/mqttiumd-core/src/owner/pubsub.rs",
+            "file": "mqttiumd/crates/mqttiumd-core/src/owner/pubsub/tests.rs",
             "test": "a_delivery_is_sent_at_its_exact_packet_size_and_discarded_one_byte_below"
           },
           {
-            "file": "mqttiumd/crates/mqttiumd-core/src/owner.rs",
+            "file": "mqttiumd/crates/mqttiumd-core/src/owner/tests.rs",
             "test": "product_pubsub_delivery_over_peer_maximum_packet_size_is_discarded_and_the_next_one_sent"
           },
           {
@@ -1238,11 +1238,11 @@
         "status": "covered",
         "evidence": [
           {
-            "file": "mqttiumd/crates/mqttiumd-core/src/owner.rs",
+            "file": "mqttiumd/crates/mqttiumd-core/src/owner/tests.rs",
             "test": "product_pubsub_reconnect_replays_same_claims_under_smaller_peer_window"
           },
           {
-            "file": "mqttiumd/crates/mqttiumd-core/src/owner/pubsub.rs",
+            "file": "mqttiumd/crates/mqttiumd-core/src/owner/pubsub/tests.rs",
             "test": "resumed_qos2_pubrel_is_independent_of_the_reduced_publish_window"
           },
           {
@@ -1306,7 +1306,7 @@
             "test": "retained_replacement_clear_and_replay_freeze"
           },
           {
-            "file": "mqttiumd/crates/mqttiumd-core/src/owner.rs",
+            "file": "mqttiumd/crates/mqttiumd-core/src/owner/tests.rs",
             "test": "a_product_retained_publish_is_a_durable_admission_even_without_live_subscribers"
           }
         ],
@@ -1760,7 +1760,7 @@
             "test": "eight_live_qos2_exchanges_still_refuse_a_genuine_ninth_identifier"
           },
           {
-            "file": "mqttiumd/crates/mqttiumd-core/src/owner.rs",
+            "file": "mqttiumd/crates/mqttiumd-core/src/owner/tests.rs",
             "test": "product_qos0_fanout_is_volatile_and_absence_is_an_owner_decision"
           }
         ],
@@ -1851,11 +1851,11 @@
             "test": "twelve_offline_deliveries_drain_without_a_discovery_tick_per_message_or_page"
           },
           {
-            "file": "mqttiumd/crates/mqttiumd-core/src/owner.rs",
+            "file": "mqttiumd/crates/mqttiumd-core/src/owner/tests.rs",
             "test": "product_pubsub_reconnect_replays_same_claims_under_smaller_peer_window"
           },
           {
-            "file": "mqttiumd/crates/mqttiumd-core/src/owner/pubsub.rs",
+            "file": "mqttiumd/crates/mqttiumd-core/src/owner/pubsub/tests.rs",
             "test": "qos2_keeps_window_and_identifier_until_pubcomp_finish_is_known"
           }
         ],
@@ -1868,7 +1868,7 @@
         "status": "covered",
         "evidence": [
           {
-            "file": "mqttiumd/crates/mqttiumd-core/src/owner/pubsub.rs",
+            "file": "mqttiumd/crates/mqttiumd-core/src/owner/pubsub/tests.rs",
             "test": "resumed_qos2_pubrel_is_independent_of_the_reduced_publish_window"
           }
         ],
@@ -2013,7 +2013,7 @@
             "test": "puback_encodes_only_reasons_valid_for_its_packet_role"
           },
           {
-            "file": "mqttiumd/crates/mqttiumd-core/src/owner.rs",
+            "file": "mqttiumd/crates/mqttiumd-core/src/owner/tests.rs",
             "test": "rule_inbound_qos2_absent_pubrel_not_found"
           }
         ],
@@ -2138,7 +2138,7 @@
             "test": "a_publication_is_delivered_without_waiting_for_a_timer"
           },
           {
-            "file": "mqttiumd/crates/mqttiumd-core/src/owner.rs",
+            "file": "mqttiumd/crates/mqttiumd-core/src/owner/tests.rs",
             "test": "product_pubsub_suback_requires_commit_then_routing_projection"
           },
           {
@@ -2170,7 +2170,7 @@
             "test": "duplicate_filter_last_options_win_only_after_known_commit_and_before_suback"
           },
           {
-            "file": "mqttiumd/crates/mqttiumd-core/src/owner.rs",
+            "file": "mqttiumd/crates/mqttiumd-core/src/owner/tests.rs",
             "test": "product_pubsub_filter_replacement_and_removal_preserve_preexisting_work"
           }
         ],
@@ -2187,7 +2187,7 @@
             "test": "thirty_two_topics_and_ordered_options"
           },
           {
-            "file": "mqttiumd/crates/mqttiumd-core/src/owner.rs",
+            "file": "mqttiumd/crates/mqttiumd-core/src/owner/tests.rs",
             "test": "product_pubsub_filter_replacement_and_removal_preserve_preexisting_work"
           }
         ],
@@ -2248,7 +2248,7 @@
             "test": "duplicate_filter_last_options_win_only_after_known_commit_and_before_suback"
           },
           {
-            "file": "mqttiumd/crates/mqttiumd-core/src/owner.rs",
+            "file": "mqttiumd/crates/mqttiumd-core/src/owner/tests.rs",
             "test": "product_pubsub_subscription_capacity_refusal_is_atomic_and_has_negative_suback"
           }
         ],
@@ -2326,7 +2326,7 @@
             "test": "duplicate_filter_last_options_win_only_after_known_commit_and_before_suback"
           },
           {
-            "file": "mqttiumd/crates/mqttiumd-core/src/owner.rs",
+            "file": "mqttiumd/crates/mqttiumd-core/src/owner/tests.rs",
             "test": "product_pubsub_subscription_capacity_refusal_is_atomic_and_has_negative_suback"
           }
         ],
@@ -2390,7 +2390,7 @@
         "status": "covered",
         "evidence": [
           {
-            "file": "mqttiumd/crates/mqttiumd-core/src/owner.rs",
+            "file": "mqttiumd/crates/mqttiumd-core/src/owner/tests.rs",
             "test": "product_pubsub_filter_replacement_and_removal_preserve_preexisting_work"
           }
         ],
@@ -2403,7 +2403,7 @@
         "status": "covered",
         "evidence": [
           {
-            "file": "mqttiumd/crates/mqttiumd-core/src/owner.rs",
+            "file": "mqttiumd/crates/mqttiumd-core/src/owner/tests.rs",
             "test": "product_pubsub_filter_replacement_and_removal_preserve_preexisting_work"
           }
         ],
@@ -2420,7 +2420,7 @@
             "test": "duplicate_filter_last_options_win_only_after_known_commit_and_before_suback"
           },
           {
-            "file": "mqttiumd/crates/mqttiumd-core/src/owner.rs",
+            "file": "mqttiumd/crates/mqttiumd-core/src/owner/tests.rs",
             "test": "product_pubsub_filter_replacement_and_removal_preserve_preexisting_work"
           },
           {
@@ -2530,7 +2530,7 @@
             "test": "an_untimed_packet_does_not_acquire_a_reader_clock_dependency"
           },
           {
-            "file": "mqttiumd/crates/mqttiumd-core/src/owner.rs",
+            "file": "mqttiumd/crates/mqttiumd-core/src/owner/tests.rs",
             "test": "product_ping_is_answered_only_on_a_bound_live_connection"
           },
           {
@@ -2812,11 +2812,11 @@
         "status": "covered",
         "evidence": [
           {
-            "file": "mqttiumd/crates/mqttiumd-core/src/owner.rs",
+            "file": "mqttiumd/crates/mqttiumd-core/src/owner/tests.rs",
             "test": "product_pubsub_reconnect_replays_same_claims_under_smaller_peer_window"
           },
           {
-            "file": "mqttiumd/crates/mqttiumd-core/src/owner/pubsub.rs",
+            "file": "mqttiumd/crates/mqttiumd-core/src/owner/pubsub/tests.rs",
             "test": "an_unknown_claim_keeps_its_packet_identifier_unavailable"
           }
         ],
@@ -2829,7 +2829,7 @@
         "status": "covered",
         "evidence": [
           {
-            "file": "mqttiumd/crates/mqttiumd-core/src/owner.rs",
+            "file": "mqttiumd/crates/mqttiumd-core/src/owner/tests.rs",
             "test": "product_pubsub_reconnect_replays_same_claims_under_smaller_peer_window"
           }
         ],
@@ -2842,7 +2842,7 @@
         "status": "covered",
         "evidence": [
           {
-            "file": "mqttiumd/crates/mqttiumd-core/src/owner.rs",
+            "file": "mqttiumd/crates/mqttiumd-core/src/owner/tests.rs",
             "test": "product_pubsub_reconnect_replays_same_claims_under_smaller_peer_window"
           },
           {
@@ -2863,7 +2863,7 @@
             "test": "a_new_identifier_after_received_puback_does_not_exceed_receive_maximum"
           },
           {
-            "file": "mqttiumd/crates/mqttiumd-core/src/owner.rs",
+            "file": "mqttiumd/crates/mqttiumd-core/src/owner/tests.rs",
             "test": "qos1_admission_is_durable_without_a_pubrel_slot"
           }
         ],
@@ -2876,7 +2876,7 @@
         "status": "covered",
         "evidence": [
           {
-            "file": "mqttiumd/crates/mqttiumd-core/src/owner.rs",
+            "file": "mqttiumd/crates/mqttiumd-core/src/owner/tests.rs",
             "test": "qos1_reused_identifier_precedes_the_old_puback_write_receipt"
           },
           {
@@ -2893,7 +2893,7 @@
         "status": "covered",
         "evidence": [
           {
-            "file": "mqttiumd/crates/mqttiumd-core/src/owner/pubsub.rs",
+            "file": "mqttiumd/crates/mqttiumd-core/src/owner/pubsub/tests.rs",
             "test": "qos2_keeps_window_and_identifier_until_pubcomp_finish_is_known"
           }
         ],
@@ -2917,7 +2917,7 @@
         "status": "covered",
         "evidence": [
           {
-            "file": "mqttiumd/crates/mqttiumd-core/src/owner/pubsub.rs",
+            "file": "mqttiumd/crates/mqttiumd-core/src/owner/pubsub/tests.rs",
             "test": "qos2_keeps_window_and_identifier_until_pubcomp_finish_is_known"
           }
         ],
@@ -2930,7 +2930,7 @@
         "status": "covered",
         "evidence": [
           {
-            "file": "mqttiumd/crates/mqttiumd-core/src/owner/pubsub.rs",
+            "file": "mqttiumd/crates/mqttiumd-core/src/owner/pubsub/tests.rs",
             "test": "qos2_keeps_window_and_identifier_until_pubcomp_finish_is_known"
           }
         ],
@@ -2943,11 +2943,11 @@
         "status": "covered",
         "evidence": [
           {
-            "file": "mqttiumd/crates/mqttiumd-core/src/owner/pubsub.rs",
+            "file": "mqttiumd/crates/mqttiumd-core/src/owner/pubsub/tests.rs",
             "test": "qos2_keeps_window_and_identifier_until_pubcomp_finish_is_known"
           },
           {
-            "file": "mqttiumd/crates/mqttiumd-core/src/owner/pubsub.rs",
+            "file": "mqttiumd/crates/mqttiumd-core/src/owner/pubsub/tests.rs",
             "test": "recovered_qos2_phase_selects_pubrel_even_with_publish_bytes_available"
           }
         ],
@@ -2960,7 +2960,7 @@
         "status": "covered",
         "evidence": [
           {
-            "file": "mqttiumd/crates/mqttiumd-core/src/owner/pubsub.rs",
+            "file": "mqttiumd/crates/mqttiumd-core/src/owner/pubsub/tests.rs",
             "test": "recovered_qos2_phase_selects_pubrel_even_with_publish_bytes_available"
           }
         ],
@@ -2989,7 +2989,7 @@
             "test": "eight_live_qos2_exchanges_still_refuse_a_genuine_ninth_identifier"
           },
           {
-            "file": "mqttiumd/crates/mqttiumd-core/src/owner.rs",
+            "file": "mqttiumd/crates/mqttiumd-core/src/owner/tests.rs",
             "test": "rule_inbound_qos2_admission_pending_committed_authorize"
           }
         ],
@@ -3002,7 +3002,7 @@
         "status": "covered",
         "evidence": [
           {
-            "file": "mqttiumd/crates/mqttiumd-core/src/owner.rs",
+            "file": "mqttiumd/crates/mqttiumd-core/src/owner/tests.rs",
             "test": "rule_inbound_qos2_admission_pending_rejected_refuse"
           },
           {
@@ -3019,7 +3019,7 @@
         "status": "covered",
         "evidence": [
           {
-            "file": "mqttiumd/crates/mqttiumd-core/src/owner.rs",
+            "file": "mqttiumd/crates/mqttiumd-core/src/owner/tests.rs",
             "test": "rule_inbound_qos2_await_pubrel_publish_replay"
           },
           {
@@ -3036,7 +3036,7 @@
         "status": "covered",
         "evidence": [
           {
-            "file": "mqttiumd/crates/mqttiumd-core/src/owner.rs",
+            "file": "mqttiumd/crates/mqttiumd-core/src/owner/tests.rs",
             "test": "rule_inbound_qos2_release_pending_committed_complete"
           },
           {
@@ -3053,7 +3053,7 @@
         "status": "covered",
         "evidence": [
           {
-            "file": "mqttiumd/crates/mqttiumd-core/src/owner.rs",
+            "file": "mqttiumd/crates/mqttiumd-core/src/owner/tests.rs",
             "test": "product_new_session_reuses_a_completed_packet_identifier_for_a_new_exchange"
           },
           {
@@ -3074,7 +3074,7 @@
             "test": "zero_replacement_at_capacity_and_qos2_continuation"
           },
           {
-            "file": "mqttiumd/crates/mqttiumd-core/src/owner/pubsub.rs",
+            "file": "mqttiumd/crates/mqttiumd-core/src/owner/pubsub/tests.rs",
             "test": "message_expiry_qos12_admission_freezes_origin_and_handshakes_outlive_ttl"
           }
         ],
@@ -3087,15 +3087,15 @@
         "status": "covered",
         "evidence": [
           {
-            "file": "mqttiumd/crates/mqttiumd-core/src/owner.rs",
+            "file": "mqttiumd/crates/mqttiumd-core/src/owner/tests.rs",
             "test": "product_pubsub_reconnect_replays_same_claims_under_smaller_peer_window"
           },
           {
-            "file": "mqttiumd/crates/mqttiumd-core/src/owner/pubsub.rs",
+            "file": "mqttiumd/crates/mqttiumd-core/src/owner/pubsub/tests.rs",
             "test": "recovered_qos2_phase_selects_pubrel_even_with_publish_bytes_available"
           },
           {
-            "file": "mqttiumd/crates/mqttiumd-core/src/owner/pubsub.rs",
+            "file": "mqttiumd/crates/mqttiumd-core/src/owner/pubsub/tests.rs",
             "test": "takeover_keeps_claim_and_number_but_replaces_the_connection_and_emission_target"
           }
         ],
@@ -3108,7 +3108,7 @@
         "status": "covered",
         "evidence": [
           {
-            "file": "mqttiumd/crates/mqttiumd-core/src/owner.rs",
+            "file": "mqttiumd/crates/mqttiumd-core/src/owner/tests.rs",
             "test": "product_pubsub_unknown_claim_and_finish_resolve_the_original_operation"
           }
         ],
@@ -3125,7 +3125,7 @@
             "test": "twelve_offline_deliveries_drain_without_a_discovery_tick_per_message_or_page"
           },
           {
-            "file": "mqttiumd/crates/mqttiumd-core/src/owner.rs",
+            "file": "mqttiumd/crates/mqttiumd-core/src/owner/tests.rs",
             "test": "an_admission_freezes_a_recipe_from_the_recovered_routes_and_limits"
           }
         ],
@@ -3416,7 +3416,7 @@
             "test": "twelve_offline_deliveries_drain_without_a_discovery_tick_per_message_or_page"
           },
           {
-            "file": "mqttiumd/crates/mqttiumd-core/src/owner.rs",
+            "file": "mqttiumd/crates/mqttiumd-core/src/owner/tests.rs",
             "test": "product_pubsub_reconnect_replays_same_claims_under_smaller_peer_window"
           }
         ],
@@ -3433,11 +3433,11 @@
             "test": "twelve_offline_deliveries_drain_without_a_discovery_tick_per_message_or_page"
           },
           {
-            "file": "mqttiumd/crates/mqttiumd-core/src/owner.rs",
+            "file": "mqttiumd/crates/mqttiumd-core/src/owner/tests.rs",
             "test": "product_pubsub_reconnect_replays_same_claims_under_smaller_peer_window"
           },
           {
-            "file": "mqttiumd/crates/mqttiumd-core/src/owner/pubsub.rs",
+            "file": "mqttiumd/crates/mqttiumd-core/src/owner/pubsub/tests.rs",
             "test": "qos2_keeps_window_and_identifier_until_pubcomp_finish_is_known"
           }
         ],
@@ -3450,7 +3450,7 @@
         "status": "covered",
         "evidence": [
           {
-            "file": "mqttiumd/crates/mqttiumd-core/src/owner/pubsub.rs",
+            "file": "mqttiumd/crates/mqttiumd-core/src/owner/pubsub/tests.rs",
             "test": "resumed_qos2_pubrel_is_independent_of_the_reduced_publish_window"
           }
         ],
@@ -3752,11 +3752,11 @@
         "status": "covered",
         "evidence": [
           {
-            "file": "mqttiumd/crates/mqttiumd-core/src/owner.rs",
+            "file": "mqttiumd/crates/mqttiumd-core/src/owner/tests.rs",
             "test": "product_pubsub_reconnect_replays_same_claims_under_smaller_peer_window"
           },
           {
-            "file": "mqttiumd/crates/mqttiumd-core/src/owner/pubsub.rs",
+            "file": "mqttiumd/crates/mqttiumd-core/src/owner/pubsub/tests.rs",
             "test": "qos2_keeps_window_and_identifier_until_pubcomp_finish_is_known"
           }
         ],
@@ -3794,7 +3794,7 @@
             "test": "versioned_subscription_acknowledgements_and_disconnect"
           },
           {
-            "file": "mqttiumd/crates/mqttiumd-core/src/owner.rs",
+            "file": "mqttiumd/crates/mqttiumd-core/src/owner/tests.rs",
             "test": "rule_inbound_qos2_release_pending_committed_complete"
           }
         ],
@@ -4460,11 +4460,11 @@
         "status": "covered",
         "evidence": [
           {
-            "file": "mqttiumd/crates/mqttiumd-core/src/owner.rs",
+            "file": "mqttiumd/crates/mqttiumd-core/src/owner/tests.rs",
             "test": "product_pubsub_reconnect_replays_same_claims_under_smaller_peer_window"
           },
           {
-            "file": "mqttiumd/crates/mqttiumd-core/src/owner/pubsub.rs",
+            "file": "mqttiumd/crates/mqttiumd-core/src/owner/pubsub/tests.rs",
             "test": "resumed_qos2_pubrel_is_independent_of_the_reduced_publish_window"
           }
         ],
@@ -4821,7 +4821,7 @@
             "test": "thirty_two_topics_and_ordered_options"
           },
           {
-            "file": "mqttiumd/crates/mqttiumd-core/src/owner.rs",
+            "file": "mqttiumd/crates/mqttiumd-core/src/owner/tests.rs",
             "test": "product_pubsub_filter_replacement_and_removal_preserve_preexisting_work"
           }
         ],
@@ -4967,7 +4967,7 @@
         "status": "covered",
         "evidence": [
           {
-            "file": "mqttiumd/crates/mqttiumd-core/src/owner.rs",
+            "file": "mqttiumd/crates/mqttiumd-core/src/owner/tests.rs",
             "test": "product_pubsub_filter_replacement_and_removal_preserve_preexisting_work"
           }
         ],
@@ -4980,7 +4980,7 @@
         "status": "covered",
         "evidence": [
           {
-            "file": "mqttiumd/crates/mqttiumd-core/src/owner.rs",
+            "file": "mqttiumd/crates/mqttiumd-core/src/owner/tests.rs",
             "test": "product_pubsub_filter_replacement_and_removal_preserve_preexisting_work"
           }
         ],
@@ -5176,7 +5176,7 @@
         "status": "covered",
         "evidence": [
           {
-            "file": "mqttiumd/crates/mqttiumd-core/src/owner.rs",
+            "file": "mqttiumd/crates/mqttiumd-core/src/owner/tests.rs",
             "test": "product_pubsub_reconnect_replays_same_claims_under_smaller_peer_window"
           },
           {
@@ -5201,7 +5201,7 @@
             "test": "a_new_identifier_after_received_puback_does_not_exceed_receive_maximum"
           },
           {
-            "file": "mqttiumd/crates/mqttiumd-core/src/owner.rs",
+            "file": "mqttiumd/crates/mqttiumd-core/src/owner/tests.rs",
             "test": "qos1_reused_identifier_precedes_the_old_puback_write_receipt"
           }
         ],
@@ -5214,11 +5214,11 @@
         "status": "covered",
         "evidence": [
           {
-            "file": "mqttiumd/crates/mqttiumd-core/src/owner/pubsub.rs",
+            "file": "mqttiumd/crates/mqttiumd-core/src/owner/pubsub/tests.rs",
             "test": "qos2_keeps_window_and_identifier_until_pubcomp_finish_is_known"
           },
           {
-            "file": "mqttiumd/crates/mqttiumd-core/src/owner/pubsub.rs",
+            "file": "mqttiumd/crates/mqttiumd-core/src/owner/pubsub/tests.rs",
             "test": "recovered_qos2_phase_selects_pubrel_even_with_publish_bytes_available"
           }
         ],
@@ -5231,15 +5231,15 @@
         "status": "covered",
         "evidence": [
           {
-            "file": "mqttiumd/crates/mqttiumd-core/src/owner.rs",
+            "file": "mqttiumd/crates/mqttiumd-core/src/owner/tests.rs",
             "test": "rule_inbound_qos2_await_pubrel_publish_replay"
           },
           {
-            "file": "mqttiumd/crates/mqttiumd-core/src/owner.rs",
+            "file": "mqttiumd/crates/mqttiumd-core/src/owner/tests.rs",
             "test": "rule_inbound_qos2_release_pending_committed_complete"
           },
           {
-            "file": "mqttiumd/crates/mqttiumd-core/src/owner.rs",
+            "file": "mqttiumd/crates/mqttiumd-core/src/owner/tests.rs",
             "test": "product_new_session_reuses_a_completed_packet_identifier_for_a_new_exchange"
           },
           {
@@ -5256,11 +5256,11 @@
         "status": "covered",
         "evidence": [
           {
-            "file": "mqttiumd/crates/mqttiumd-core/src/owner.rs",
+            "file": "mqttiumd/crates/mqttiumd-core/src/owner/tests.rs",
             "test": "product_pubsub_reconnect_replays_same_claims_under_smaller_peer_window"
           },
           {
-            "file": "mqttiumd/crates/mqttiumd-core/src/owner/pubsub.rs",
+            "file": "mqttiumd/crates/mqttiumd-core/src/owner/pubsub/tests.rs",
             "test": "recovered_qos2_phase_selects_pubrel_even_with_publish_bytes_available"
           },
           {
@@ -5311,11 +5311,11 @@
             "test": "deliveries_keep_the_order_of_reception_when_an_earlier_store_result_is_late"
           },
           {
-            "file": "mqttiumd/crates/mqttiumd-core/src/owner.rs",
+            "file": "mqttiumd/crates/mqttiumd-core/src/owner/tests.rs",
             "test": "an_acknowledgement_waits_for_those_of_earlier_publications_of_its_connection"
           },
           {
-            "file": "mqttiumd/crates/mqttiumd-core/src/owner.rs",
+            "file": "mqttiumd/crates/mqttiumd-core/src/owner/tests.rs",
             "test": "held_acknowledgements_leave_one_after_the_other_with_the_receipts"
           }
         ],
@@ -5337,11 +5337,11 @@
             "test": "deliveries_keep_the_order_of_reception_when_an_earlier_store_result_is_late"
           },
           {
-            "file": "mqttiumd/crates/mqttiumd-core/src/owner.rs",
+            "file": "mqttiumd/crates/mqttiumd-core/src/owner/tests.rs",
             "test": "an_acknowledgement_waits_for_those_of_earlier_publications_of_its_connection"
           },
           {
-            "file": "mqttiumd/crates/mqttiumd-core/src/owner.rs",
+            "file": "mqttiumd/crates/mqttiumd-core/src/owner/tests.rs",
             "test": "held_acknowledgements_leave_one_after_the_other_with_the_receipts"
           },
           {
@@ -5363,7 +5363,7 @@
         "status": "covered",
         "evidence": [
           {
-            "file": "mqttiumd/crates/mqttiumd-core/src/owner/pubsub.rs",
+            "file": "mqttiumd/crates/mqttiumd-core/src/owner/pubsub/tests.rs",
             "test": "pubrel_leaves_in_the_order_of_the_pubrecs_whatever_the_order_of_the_results"
           },
           {
@@ -5411,7 +5411,7 @@
             "test": "deliveries_keep_the_order_of_reception_when_an_earlier_store_result_is_late"
           },
           {
-            "file": "mqttiumd/crates/mqttiumd-core/src/owner/pubsub.rs",
+            "file": "mqttiumd/crates/mqttiumd-core/src/owner/pubsub/tests.rs",
             "test": "pubrel_leaves_in_the_order_of_the_pubrecs_whatever_the_order_of_the_results"
           },
           {
@@ -5575,7 +5575,7 @@
         "status": "covered",
         "evidence": [
           {
-            "file": "mqttiumd/crates/mqttiumd-core/src/owner.rs",
+            "file": "mqttiumd/crates/mqttiumd-core/src/owner/tests.rs",
             "test": "a_publish_no_credit_can_ever_cover_closes_its_connection"
           },
           {

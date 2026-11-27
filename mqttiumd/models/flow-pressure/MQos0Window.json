@@ -6,16 +6,16 @@
     672
   ],
   "tests": [
-    "mqttiumd/crates/mqttiumd-core/src/owner.rs",
+    "mqttiumd/crates/mqttiumd-core/src/owner/tests.rs",
     "mqttiumd/crates/mqttiumd/src/runtime_tests.rs"
   ],
   "replays": [
     {
-      "file": "mqttiumd/crates/mqttiumd-core/src/owner.rs",
+      "file": "mqttiumd/crates/mqttiumd-core/src/owner/tests.rs",
       "test": "product_qos0_past_what_a_connection_keeps_waiting_the_newest_is_dropped"
     },
     {
-      "file": "mqttiumd/crates/mqttiumd-core/src/owner.rs",
+      "file": "mqttiumd/crates/mqttiumd-core/src/owner/tests.rs",
       "test": "product_qos0_burst_is_paced_by_the_window_and_resumes_in_order"
     },
     {

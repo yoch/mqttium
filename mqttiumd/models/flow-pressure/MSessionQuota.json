@@ -6,12 +6,12 @@
     672
   ],
   "tests": [
-    "mqttiumd/crates/mqttiumd-core/src/owner.rs",
+    "mqttiumd/crates/mqttiumd-core/src/owner/tests.rs",
     "mqttiumd/crates/mqttiumd/tests/reactor_wake.rs"
   ],
   "replays": [
     {
-      "file": "mqttiumd/crates/mqttiumd-core/src/owner.rs",
+      "file": "mqttiumd/crates/mqttiumd-core/src/owner/tests.rs",
       "test": "a_session_holds_a_bounded_number_of_exchanges_across_its_connections"
     },
     {

@@ -179,7 +179,7 @@ class CheckModels(unittest.TestCase):
         self.refused(
             sidecar("M1Answers.json", change_data),
             "M1Answers: replay a_test_that_does_not_exist is not a test of "
-            "mqttiumd/crates/mqttiumd-core/src/owner.rs",
+            "mqttiumd/crates/mqttiumd-core/src/owner/tests.rs",
         )
 
     def test_a_replay_in_a_file_outside_tests_is_refused(self) -> None:
