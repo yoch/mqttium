@@ -503,14 +503,18 @@ fn closing_qos0_without_collecting_written_retires_the_exact_attempt() {
             .unwrap();
         for _ in 0..8 {
             runtime.drain_inputs().unwrap();
-            if runtime.frames.values().any(|f| f.kind == "PUBLISH0") {
+            if runtime
+                .frames
+                .values()
+                .any(|f| f.kind == FrameKind::Publish0)
+            {
                 break;
             }
         }
         let effect = runtime
             .frames
             .iter()
-            .find(|(_, f)| f.kind == "PUBLISH0")
+            .find(|(_, f)| f.kind == FrameKind::Publish0)
             .expect("actual adapter accepted QoS0 attempt")
             .0;
         runtime
@@ -2590,11 +2594,21 @@ fn a_real_delayed_pubcomp_write_receipt_cannot_release_a_new_packet_identifier_u
         // The socket task writes PUBCOMP, but the reactor has not consumed its
         // receipt. A real peer is already allowed to reuse this identifier.
         assert_eq!(read_frame(&mut client).0, 0x70);
-        assert!(runtime.frames.values().any(|p| p.kind == "PUBCOMP"));
+        assert!(
+            runtime
+                .frames
+                .values()
+                .any(|p| p.kind == FrameKind::Pubcomp)
+        );
         runtime.packet(generation, 0x34, publish_body(1)).unwrap();
         let serial = runtime.peers[&generation].receiving_serial(1).unwrap();
         let deadline = Instant::now() + Duration::from_secs(1);
-        while runtime.frames.values().any(|p| p.kind == "PUBCOMP") && Instant::now() < deadline {
+        while runtime
+            .frames
+            .values()
+            .any(|p| p.kind == FrameKind::Pubcomp)
+            && Instant::now() < deadline
+        {
             runtime.connections().unwrap();
             thread::sleep(Duration::from_millis(1));
         }
@@ -2623,9 +2637,13 @@ fn a_real_puback_write_receipt_returns_its_receive_credit() {
         until(runtime, |r| r.session_requests.is_empty());
         assert_eq!(read_frame(&mut client).0, 0x20);
         runtime.packet(generation, 0x32, publish_body(1)).unwrap();
-        until(runtime, |r| r.frames.values().any(|p| p.kind == "PUBACK"));
+        until(runtime, |r| {
+            r.frames.values().any(|p| p.kind == FrameKind::Puback)
+        });
         assert_eq!(read_frame(&mut client).0, 0x40);
-        until(runtime, |r| !r.frames.values().any(|p| p.kind == "PUBACK"));
+        until(runtime, |r| {
+            !r.frames.values().any(|p| p.kind == FrameKind::Puback)
+        });
         assert_eq!(
             runtime.peers[&generation].receiving_serial(1),
             None,
@@ -2665,10 +2683,12 @@ fn a_new_identifier_after_received_puback_does_not_exceed_receive_maximum() {
         assert_eq!(read_frame(&mut client).0, 0x20);
         seven_qos2(runtime, generation, &mut client);
         runtime.packet(generation, 0x32, publish_body(8)).unwrap();
-        until(runtime, |r| r.frames.values().any(|p| p.kind == "PUBACK"));
+        until(runtime, |r| {
+            r.frames.values().any(|p| p.kind == FrameKind::Puback)
+        });
         assert_eq!(read_frame(&mut client), (0x40, unmatched(8)));
         assert!(
-            runtime.frames.values().any(|p| p.kind == "PUBACK"),
+            runtime.frames.values().any(|p| p.kind == FrameKind::Puback),
             "the core's write receipt is still unprocessed"
         );
         let mut bytes = vec![0x32, 7];
@@ -2698,7 +2718,7 @@ fn a_new_identifier_after_received_puback_does_not_exceed_receive_maximum() {
         until(runtime, |r| {
             r.frames
                 .values()
-                .any(|p| p.kind == "PUBACK" && p.packet_id == Some(9))
+                .any(|p| p.kind == FrameKind::Puback && p.packet_id == Some(9))
         });
         assert_eq!(read_frame(&mut client), (0x40, unmatched(9)));
     });
@@ -2719,7 +2739,9 @@ fn a_received_puback_can_precede_publication_of_its_network_progress() {
         until(runtime, |r| r.frames.is_empty());
         runtime.peers[&generation].io.pause_wire_progress(true);
         runtime.packet(generation, 0x32, publish_body(8)).unwrap();
-        until(runtime, |r| r.frames.values().any(|p| p.kind == "PUBACK"));
+        until(runtime, |r| {
+            r.frames.values().any(|p| p.kind == FrameKind::Puback)
+        });
         assert_eq!(read_frame(&mut client), (0x40, unmatched(8)));
         let deadline = Instant::now() + Duration::from_secs(1);
         while !runtime.peers[&generation].io.wire_progress_is_waiting() && Instant::now() < deadline
@@ -2757,7 +2779,7 @@ fn a_received_puback_can_precede_publication_of_its_network_progress() {
         until(runtime, |r| {
             r.frames
                 .values()
-                .any(|p| p.kind == "PUBACK" && p.packet_id == Some(9))
+                .any(|p| p.kind == FrameKind::Puback && p.packet_id == Some(9))
         });
         assert_eq!(read_frame(&mut client), (0x40, unmatched(9)));
         assert!(runtime.peers[&generation].deferred_publish().is_none());
@@ -2820,7 +2842,7 @@ fn a_new_identifier_progresses_while_the_old_core_ack_receipt_is_held() {
             && !runtime
                 .frames
                 .values()
-                .any(|p| p.kind == "PUBACK" && p.packet_id == Some(9))
+                .any(|p| p.kind == FrameKind::Puback && p.packet_id == Some(9))
         {
             pump(runtime);
             thread::sleep(Duration::from_millis(1));
@@ -2852,14 +2874,16 @@ fn a_peer_reuses_qos1_identifier_before_the_old_internal_written_receipt() {
         let session = runtime.sessions[b"qos1-reuse-race".as_slice()].id;
         let id = InboundPacketId::new(1).unwrap();
         runtime.packet(generation, 0x32, publish_body(1)).unwrap();
-        until(runtime, |r| r.frames.values().any(|p| p.kind == "PUBACK"));
+        until(runtime, |r| {
+            r.frames.values().any(|p| p.kind == FrameKind::Puback)
+        });
         // This read proves the client can legally reuse PI 1. Deliberately do
         // not poll the socket's internal Written channel before the new input.
         assert_eq!(read_frame(&mut client), (0x40, unmatched(1)));
         let old = runtime
             .frames
             .iter()
-            .find(|(_, f)| f.kind == "PUBACK")
+            .find(|(_, f)| f.kind == FrameKind::Puback)
             .unwrap()
             .0;
         runtime.packet(generation, 0x3a, publish_body(1)).unwrap();
@@ -2891,7 +2915,9 @@ fn a_peer_reuses_qos1_identifier_before_the_old_internal_written_receipt() {
             runtime.owner.exchange(session, id).unwrap().1,
             ExchangePhase::AdmissionPending
         );
-        until(runtime, |r| r.frames.values().any(|p| p.kind == "PUBACK"));
+        until(runtime, |r| {
+            r.frames.values().any(|p| p.kind == FrameKind::Puback)
+        });
         assert_eq!(read_frame(&mut client), (0x40, unmatched(1)));
     });
 }
@@ -3131,7 +3157,9 @@ fn a_slow_transport_holds_its_acks_while_an_independent_exchange_progresses() {
                 .packet(independent, 0x82, vec![0, 1, 0, 0, 1, b't', 1])
                 .unwrap();
             until(runtime, |r| {
-                r.frames.values().all(|frame| frame.kind != "SUBACK")
+                r.frames
+                    .values()
+                    .all(|frame| frame.kind != FrameKind::Suback)
                     && r.inflight.is_empty()
                     && r.inputs.is_empty()
             });
@@ -3201,7 +3229,7 @@ fn a_slow_transport_holds_its_acks_while_an_independent_exchange_progresses() {
             runtime.packet(independent, 0x32, publish_body(7)).unwrap();
             until(runtime, |r| {
                 r.frames.values().any(|frame| {
-                    frame.connection.generation == independent && frame.kind == "PUBLISH"
+                    frame.connection.generation == independent && frame.kind == FrameKind::Publish
                 })
             });
             let frames = [read_frame(&mut receiver_b), read_frame(&mut receiver_b)];
@@ -3868,7 +3896,9 @@ fn terminal_admission_results_retire_deadlines_after_the_owner_applies_them() {
         until(runtime, |r| r.session_requests.is_empty());
         assert_eq!(read_frame(&mut client).0, 0x20);
         runtime.packet(generation, 0x32, publish_body(1)).unwrap();
-        until(runtime, |r| r.frames.values().any(|p| p.kind == "PUBACK"));
+        until(runtime, |r| {
+            r.frames.values().any(|p| p.kind == FrameKind::Puback)
+        });
         assert_eq!(read_frame(&mut client).0, 0x40);
         until(runtime, |r| r.inflight.is_empty() && r.inputs.is_empty());
         assert!(
@@ -4128,9 +4158,13 @@ fn four_blocked_ordinary_deadlines_cannot_occupy_the_collectors_reserved_reply_l
         );
         for _ in known_open_span..63 {
             runtime.packet(generation, 0x32, publish_body(1)).unwrap();
-            until(runtime, |r| r.frames.values().any(|f| f.kind == "PUBACK"));
+            until(runtime, |r| {
+                r.frames.values().any(|f| f.kind == FrameKind::Puback)
+            });
             assert_eq!(read_frame(&mut client).0, 0x40);
-            until(runtime, |r| !r.frames.values().any(|f| f.kind == "PUBACK"));
+            until(runtime, |r| {
+                !r.frames.values().any(|f| f.kind == FrameKind::Puback)
+            });
         }
         runtime.packet(generation, 0x32, publish_body(1)).unwrap();
         let deadline = Instant::now() + Duration::from_secs(2);
@@ -5565,7 +5599,9 @@ fn closing_an_ephemeral_transport_keeps_accepted_frame_facts_under_input_pressur
         until(runtime, |r| r.frames.is_empty() && r.inputs.is_empty());
         runtime.packet(generation, 0x32, publish_body(1)).unwrap();
         until(runtime, |r| {
-            r.frames.values().any(|frame| frame.kind == "PUBACK")
+            r.frames
+                .values()
+                .any(|frame| frame.kind == FrameKind::Puback)
         });
         assert_eq!(read_frame(&mut client).0, 0x40);
         for order in 0..ORDINARY_INPUTS {

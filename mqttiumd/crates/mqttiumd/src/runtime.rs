@@ -559,7 +559,7 @@ struct DeferredPublish {
 }
 struct PendingFrame {
     connection: ConnectionKey,
-    kind: &'static str,
+    kind: FrameKind,
     packet_id: Option<u16>,
     receive_serial: Option<u64>,
     terminal: Option<Terminal>,
@@ -1748,15 +1748,13 @@ impl Runtime<'_> {
                 .close_observed_at = Some(observed);
         }
         self.peers[&generation].io.close();
-        let must_preserve_write_facts = self
-            .frames
-            .values()
-            .any(|frame| frame.connection.generation == generation && frame.kind == "PUBLISH")
-            || self.terminal_inputs.iter().any(|input| {
-                matches!(input,
+        let must_preserve_write_facts = self.frames.values().any(|frame| {
+            frame.connection.generation == generation && frame.kind == FrameKind::Publish
+        }) || self.terminal_inputs.iter().any(|input| {
+            matches!(input,
             Input::FrameResult {connection,..} | Input::Qos0EmitRefused {connection,..}
                 if connection.generation == generation)
-            });
+        });
         if must_preserve_write_facts {
             self.collect_written(generation)?;
             self.drain_inputs()?;
@@ -1899,7 +1897,7 @@ impl Runtime<'_> {
                     .remove(&id)
                     .ok_or_else(|| Failure::plain("frame_missing_on_close"))?;
                 self.retained_write_failed(id, &frame, code)?;
-                if frame.kind == "PUBLISH0" {
+                if frame.kind == FrameKind::Publish0 {
                     self.queue(Input::Qos0EmitRefused {
                         effect: id,
                         connection: frame.connection,
@@ -5954,7 +5952,10 @@ impl Runtime<'_> {
                         if let Some((effect, connection)) = correlation
                             && self.frames.get(&effect).is_some_and(|frame| {
                                 frame.connection == connection
-                                    && matches!(frame.kind, "PUBLISH" | "PUBLISH0")
+                                    && matches!(
+                                        frame.kind,
+                                        FrameKind::Publish | FrameKind::Publish0
+                                    )
                             })
                         {
                             self.events
@@ -6001,7 +6002,7 @@ impl Runtime<'_> {
                                     }),
                                 )
                                 .map_err(event_failure)?;
-                            if pending.kind == "PUBLISH0" {
+                            if pending.kind == FrameKind::Publish0 {
                                 let reason = match reason {
                                     mqttiumd_contract::message_expiry::MessageExpiryBlock::Expired => Qos0DropReason::MessageExpired,
                                     mqttiumd_contract::message_expiry::MessageExpiryBlock::TemporalUncertain => Qos0DropReason::TemporalUncertain,
@@ -6026,7 +6027,7 @@ impl Runtime<'_> {
                             if self
                                 .frames
                                 .get(&effect)
-                                .is_some_and(|frame| frame.kind == "PUBLISH")
+                                .is_some_and(|frame| frame.kind == FrameKind::Publish)
                                 && self.hooks.directory.as_ref().is_some_and(|dir| {
                                     consume_control(&dir.join("hold-next-outgoing-written"))
                                 })
@@ -6063,7 +6064,7 @@ impl Runtime<'_> {
                             if !self.deferred_ack_used
                                 && self.hooks.pause.iter().any(|p| p == "ack.receipt")
                                 && let Some(pending) = self.frames.get(&effect)
-                                && pending.kind == "PUBACK"
+                                && pending.kind == FrameKind::Puback
                             {
                                 self.events.emit("barrier_hit", json!({
                                     "point": "ack.receipt",
@@ -6167,7 +6168,7 @@ impl Runtime<'_> {
                         "connection": generation.get().to_string(),
                         "details": {
                             "effect": effect_text(progress.effect),
-                            "packet_kind": frame_kind,
+                            "packet_kind": frame_kind.as_str(),
                             "packet_id": id,
                             "publish_order": frame_serial.map(|v|v.to_string()).unwrap_or_default(),
                             "released": released,
@@ -6256,7 +6257,7 @@ impl Runtime<'_> {
         }
         let generation = connection.generation;
         let (kind, id) = (pending.kind, pending.packet_id);
-        if kind == "PUBLISH0" {
+        if kind == FrameKind::Publish0 {
             self.events
                 .emit_with("frame_written", || {
                     json!({
@@ -6270,14 +6271,14 @@ impl Runtime<'_> {
                     })
                 })
                 .map_err(event_failure)?;
-        } else if kind != "PINGRESP" || pending.was_retained {
+        } else if kind != FrameKind::Pingresp || pending.was_retained {
             let serial = pending.receive_serial;
             self.events
                 .emit_with("frame_written", || {
                     json!({
                         "connection": generation.get().to_string(),
                         "details": {
-                            "packet_kind": kind,
+                            "packet_kind": kind.as_str(),
                             "effect": effect_text(effect),
                             "packet_id": id.unwrap_or(0),
                             "publish_order": serial.map(|v|v.to_string()).unwrap_or_default(),
@@ -6287,7 +6288,7 @@ impl Runtime<'_> {
                 })
                 .map_err(event_failure)?;
         }
-        if kind == "PUBREC"
+        if kind == FrameKind::Pubrec
             && pending.terminal.is_none()
             && let Some(id) = id
             && let Some(peer) = self.peers.get_mut(&generation)
@@ -6317,7 +6318,7 @@ impl Runtime<'_> {
                     json!({
                         "connection": generation.get().to_string(),
                         "details": {
-                            "packet_kind": kind,
+                            "packet_kind": kind.as_str(),
                             "effect": effect_text(effect),
                             "packet_id": id,
                             "publish_order": serial.map(|v|v.to_string()).unwrap_or_default(),
@@ -6328,7 +6329,7 @@ impl Runtime<'_> {
                 .map_err(event_failure)?;
         }
         #[cfg(feature = "test-hooks")]
-        if kind == "PUBLISH"
+        if kind == FrameKind::Publish
             && self
                 .hooks
                 .directory
@@ -6586,7 +6587,7 @@ impl Runtime<'_> {
                 .emit(
                     "frame_failed",
                     json!({"connection":frame.connection.generation.get().to_string(),
-                "details":{"effect":effect_text(effect),"packet_kind":frame.kind,"code":code}}),
+                "details":{"effect":effect_text(effect),"packet_kind":frame.kind.as_str(),"code":code}}),
                 )
                 .map_err(event_failure)?;
         }
@@ -7107,7 +7108,7 @@ impl EffectSink for Sink<'_, '_> {
                             id,
                             PendingFrame {
                                 connection,
-                                kind: "PUBLISH0",
+                                kind: FrameKind::Publish0,
                                 packet_id: None,
                                 receive_serial: None,
                                 terminal: None,
@@ -7466,7 +7467,7 @@ impl EffectSink for Sink<'_, '_> {
                     .is_none_or(|used| used >= self.limits.terminal_inputs)
                     || self.frames.len() >= self.limits.frames
                     || (!self.shards_active
-                        && kind == "CONNACK"
+                        && kind == FrameKind::Connack
                         && ordinary_room(
                             self.inputs,
                             self.ordinary_reserved,
@@ -7488,7 +7489,7 @@ impl EffectSink for Sink<'_, '_> {
                                 "connection": generation.get().to_string(),
                                 "details": {
                                     "effect": effect_text(id),
-                                    "packet_kind": kind,
+                                    "packet_kind": kind.as_str(),
                                     "code": "unusable_generation",
                                 },
                             }),
@@ -7509,7 +7510,7 @@ impl EffectSink for Sink<'_, '_> {
                 // the whole request and reported to the core as written.
                 let part_of = matches!(frame, OutboundFrame::Unsuback { .. });
                 if let Some(answered) = packet_id
-                    && matches!(kind, "SUBACK" | "UNSUBACK")
+                    && matches!(kind, FrameKind::Suback | FrameKind::Unsuback)
                     && let Some(requests) = peer.cold.as_mut().and_then(|c| c.requests.as_mut())
                     && requests.awaiting
                     && requests.packet_id.get() == answered
@@ -7573,7 +7574,7 @@ impl EffectSink for Sink<'_, '_> {
                     payload: None,
                     report,
                 };
-                let sent = if self.shards_active && kind == "SUBACK" {
+                let sent = if self.shards_active && kind == FrameKind::Suback {
                     peer.io.try_send_suback(write)
                 } else {
                     peer.io.try_send_outgoing(write)
@@ -7583,7 +7584,7 @@ impl EffectSink for Sink<'_, '_> {
                         if let Some((key, target)) = binding {
                             self.outgoing_bindings.insert(key, target);
                         }
-                        if kind == "CONNACK" {
+                        if kind == FrameKind::Connack {
                             // Pipeline processing starts only after the core's
                             // CONNACK occupies the ordered socket output queue.
                             peer.pending = false;
@@ -7599,7 +7600,7 @@ impl EffectSink for Sink<'_, '_> {
                                     session: connection.session,
                                 });
                             }
-                        } else if self.shards_active && kind == "SUBACK" {
+                        } else if self.shards_active && kind == FrameKind::Suback {
                             self.shard_suback_ready.push(connection.session);
                         }
                         self.frames.insert(
@@ -7615,14 +7616,14 @@ impl EffectSink for Sink<'_, '_> {
                             },
                         );
                         let _ = effect.into_parts();
-                        if kind != "PINGRESP"
+                        if kind != FrameKind::Pingresp
                             && self
                                 .events
                                 .emit_with("frame_queued", || {
                                     json!({
                                         "connection": generation.get().to_string(),
                                         "details": {
-                                            "packet_kind": kind,
+                                            "packet_kind": kind.as_str(),
                                             "effect": effect_text(id),
                                             "packet_id": packet_id.unwrap_or(0),
                                         },
@@ -7645,7 +7646,7 @@ impl EffectSink for Sink<'_, '_> {
                                         "details": {
                                             "code": "output_queue_full",
                                             "effect": effect_text(id),
-                                            "packet_kind": kind,
+                                            "packet_kind": kind.as_str(),
                                         },
                                     })
                                 })
@@ -7960,7 +7961,7 @@ impl EffectSink for Sink<'_, '_> {
                                 id,
                                 PendingFrame {
                                     connection,
-                                    kind: "PUBLISH",
+                                    kind: FrameKind::Publish,
                                     packet_id: Some(packet_id.get()),
                                     receive_serial: None,
                                     terminal: None,
@@ -8079,16 +8080,50 @@ fn puback_fields(
         "details": {"authority": "reader_dequeue", "code": code},
     })
 }
-fn frame_info(frame: OutboundFrame) -> (&'static str, Option<u16>) {
+/// The kind of an outgoing frame the runtime tracks until its write is
+/// reported. `Publish0` is a QoS 0 PUBLISH, which has no packet identifier.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum FrameKind {
+    Connack,
+    Pingresp,
+    Puback,
+    Pubrec,
+    Pubcomp,
+    Pubrel,
+    Suback,
+    Unsuback,
+    Publish,
+    Publish0,
+}
+
+impl FrameKind {
+    /// The name the event journal gives the frame.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Connack => "CONNACK",
+            Self::Pingresp => "PINGRESP",
+            Self::Puback => "PUBACK",
+            Self::Pubrec => "PUBREC",
+            Self::Pubcomp => "PUBCOMP",
+            Self::Pubrel => "PUBREL",
+            Self::Suback => "SUBACK",
+            Self::Unsuback => "UNSUBACK",
+            Self::Publish => "PUBLISH",
+            Self::Publish0 => "PUBLISH0",
+        }
+    }
+}
+
+fn frame_info(frame: OutboundFrame) -> (FrameKind, Option<u16>) {
     match frame {
-        OutboundFrame::Connack { .. } => ("CONNACK", None),
-        OutboundFrame::Pingresp => ("PINGRESP", None),
-        OutboundFrame::Puback { packet_id, .. } => ("PUBACK", Some(packet_id.get())),
-        OutboundFrame::Pubrec { packet_id, .. } => ("PUBREC", Some(packet_id.get())),
-        OutboundFrame::Pubcomp { packet_id, .. } => ("PUBCOMP", Some(packet_id.get())),
-        OutboundFrame::Pubrel { packet_id } => ("PUBREL", Some(packet_id.get())),
-        OutboundFrame::Suback { packet_id, .. } => ("SUBACK", Some(packet_id.get())),
-        OutboundFrame::Unsuback { packet_id, .. } => ("UNSUBACK", Some(packet_id.get())),
+        OutboundFrame::Connack { .. } => (FrameKind::Connack, None),
+        OutboundFrame::Pingresp => (FrameKind::Pingresp, None),
+        OutboundFrame::Puback { packet_id, .. } => (FrameKind::Puback, Some(packet_id.get())),
+        OutboundFrame::Pubrec { packet_id, .. } => (FrameKind::Pubrec, Some(packet_id.get())),
+        OutboundFrame::Pubcomp { packet_id, .. } => (FrameKind::Pubcomp, Some(packet_id.get())),
+        OutboundFrame::Pubrel { packet_id } => (FrameKind::Pubrel, Some(packet_id.get())),
+        OutboundFrame::Suback { packet_id, .. } => (FrameKind::Suback, Some(packet_id.get())),
+        OutboundFrame::Unsuback { packet_id, .. } => (FrameKind::Unsuback, Some(packet_id.get())),
     }
 }
 /// PUBLISH, SUBSCRIBE and UNSUBSCRIBE ask the broker for new work. Every

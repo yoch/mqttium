@@ -48,7 +48,7 @@ use crate::net::{
     self, OutgoingHandle, ShardInbox, ShardIoEvent, ShardIoRoute, Write, WriteExpiry, WriteReport,
     Written,
 };
-use crate::runtime::Limits;
+use crate::runtime::{FrameKind, Limits};
 use crate::session_time::SessionClock;
 use crate::wake::{Signalled, Wake};
 use crate::writer::{
@@ -851,7 +851,7 @@ struct ShardSession {
 
 struct ShardPendingFrame {
     connection: ConnectionKey,
-    kind: &'static str,
+    kind: FrameKind,
 }
 
 struct PendingInlineItem {
@@ -1402,7 +1402,7 @@ impl DeliveryShardWorker {
                 reason,
             } => {
                 if let Some(frame) = self.frames.remove(&effect) {
-                    if frame.kind == "PUBLISH0" {
+                    if frame.kind == FrameKind::Publish0 {
                         let drop_reason = match reason {
                             mqttiumd_contract::message_expiry::MessageExpiryBlock::Expired => {
                                 Qos0DropReason::MessageExpired
@@ -1445,7 +1445,7 @@ impl DeliveryShardWorker {
                 ..
             } => {
                 if let Some(frame) = self.frames.remove(&effect) {
-                    if frame.kind == "PUBLISH0" {
+                    if frame.kind == FrameKind::Publish0 {
                         self.terminal_inputs.push_back(Input::Qos0EmitRefused {
                             effect,
                             connection,
@@ -1693,7 +1693,7 @@ impl DeliveryShardWorker {
             .collect();
         for id in stale {
             if let Some(frame) = self.frames.remove(&id) {
-                if frame.kind == "PUBLISH0" {
+                if frame.kind == FrameKind::Publish0 {
                     self.terminal_inputs.push_back(Input::Qos0EmitRefused {
                         effect: id,
                         connection: frame.connection,
@@ -2473,7 +2473,7 @@ impl EffectSink for ShardSink<'_> {
                                 id,
                                 ShardPendingFrame {
                                     connection,
-                                    kind: "PUBLISH",
+                                    kind: FrameKind::Publish,
                                 },
                             );
                         }
@@ -2575,7 +2575,7 @@ impl EffectSink for ShardSink<'_> {
                             id,
                             ShardPendingFrame {
                                 connection,
-                                kind: "PUBREL",
+                                kind: FrameKind::Pubrel,
                             },
                         );
                         let _ = effect.into_parts();
@@ -2672,7 +2672,7 @@ impl EffectSink for ShardSink<'_> {
                             id,
                             ShardPendingFrame {
                                 connection,
-                                kind: "PUBLISH0",
+                                kind: FrameKind::Publish0,
                             },
                         );
                     }
