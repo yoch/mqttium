@@ -2,9 +2,91 @@
 //! active work-page read, and sparse pagination watermarks.
 use crate::contract::capacity::{AllocationFailed, BoundedVec};
 use crate::contract::flat_map::{FlatMap, ScopedSeqMap};
-use crate::contract::ids::{ConnectionGeneration, DeliveryId, EffectId, SessionId};
+use crate::contract::ids::{ConnectionGeneration, DeliveryId, EffectId, PublicationId, SessionId};
+use crate::contract::pubsub::WorkItem;
 use crate::contract::step::CoreFault;
+use alloc::vec::Vec;
 use core::num::NonZeroU32;
+
+/// Upper bound on distinct dirty publications tracked per active `LoadWork`.
+/// Strictly exceeds `WORK_PAGE_LIMIT` (8): when more than `DIRTY_SET_CAP`
+/// distinct publications commit during one load and every kept publication
+/// `<= bound` appears in `items`, the pigeonhole principle guarantees at least
+/// one kept publication lies strictly above `bound`, hence every elided
+/// (larger) publication also lies strictly above `bound`.
+const DIRTY_SET_CAP: usize = 16;
+
+/// Dirty notifications observed while a `LoadWork` read is in flight.
+#[derive(Clone, Debug)]
+enum DirtyDuringLoad {
+    /// Unbounded invalidation (retained replay, Will, Subscribe, shard dirty
+    /// without publication identity, or `mark_all_dirty`).
+    Any,
+    /// Bounded ascending set of the smallest distinct `PublicationId`s
+    /// committed while this read was in flight, plus whether larger
+    /// publications were elided past `DIRTY_SET_CAP`.
+    Pubs {
+        smallest: Vec<PublicationId>,
+        overflowed: bool,
+    },
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct DirtyCheck {
+    missed: bool,
+    has_above: bool,
+}
+
+impl DirtyDuringLoad {
+    fn check(dirty: Option<&Self>, bound: Option<PublicationId>, items: &[WorkItem]) -> DirtyCheck {
+        match dirty {
+            None => DirtyCheck {
+                missed: false,
+                has_above: false,
+            },
+            Some(Self::Any) => DirtyCheck {
+                missed: true,
+                has_above: true,
+            },
+            Some(Self::Pubs {
+                smallest,
+                overflowed,
+            }) => {
+                if smallest.is_empty() {
+                    return DirtyCheck {
+                        missed: false,
+                        has_above: false,
+                    };
+                }
+                if *overflowed && items.len() >= DIRTY_SET_CAP {
+                    return DirtyCheck {
+                        missed: true,
+                        has_above: true,
+                    };
+                }
+                let Some(b) = bound else {
+                    return DirtyCheck {
+                        missed: false,
+                        has_above: true,
+                    };
+                };
+                let mut missed = false;
+                let mut has_above = *overflowed;
+                for &p in smallest {
+                    if p > b {
+                        has_above = true;
+                        break;
+                    }
+                    if !items.iter().any(|item| item.delivery.publication == p) {
+                        missed = true;
+                        break;
+                    }
+                }
+                DirtyCheck { missed, has_above }
+            }
+        }
+    }
+}
 
 /// A read of outgoing work in flight on a connection.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -39,6 +121,7 @@ pub(super) struct Connections {
     after_by_gen: FlatMap<ConnectionGeneration, DeliveryId>,
     known_through_by_gen: FlatMap<ConnectionGeneration, DeliveryId>,
     loading_by_gen: FlatMap<ConnectionGeneration, Read>,
+    dirty_by_gen: FlatMap<ConnectionGeneration, DirtyDuringLoad>,
 }
 
 impl Connections {
@@ -50,6 +133,7 @@ impl Connections {
             after_by_gen: FlatMap::new(),
             known_through_by_gen: FlatMap::new(),
             loading_by_gen: FlatMap::new(),
+            dirty_by_gen: FlatMap::new(),
         })
     }
 
@@ -232,6 +316,9 @@ impl Connections {
             state.dirty_during_load = false;
             state.generation
         };
+        if !self.dirty_by_gen.is_empty() {
+            self.dirty_by_gen.remove(&generation);
+        }
         self.set_loading(generation, index, Some(read));
         Ok(())
     }
@@ -241,23 +328,143 @@ impl Connections {
         index: usize,
         discard: bool,
         next: Option<DeliveryId>,
+        items: &[WorkItem],
         no_pending_non_inline: bool,
-    ) -> Result<ConnectionGeneration, CoreFault> {
+    ) -> Result<(ConnectionGeneration, bool), CoreFault> {
         if index >= self.rows.len() {
             return Err(CoreFault::StalePlan);
         }
+        let generation = self.rows.as_slice()[index].generation;
+        let dirty = if self.dirty_by_gen.is_empty() {
+            None
+        } else {
+            self.dirty_by_gen.remove(&generation)
+        };
         let c = &mut self.rows.as_mut_slice()[index];
-        // begin_scan consumed the preceding notification. A later rescan
-        // survives this result, even when its WorkAvailable already ran.
-        c.rescan_needed |= discard;
-        c.caught_up =
-            !c.rescan_needed && next.is_none() && !c.dirty_during_load && no_pending_non_inline;
+        // begin_scan consumed the preceding notification. A dirty event during
+        // the read only rewinds `next` or blocks `known_through` when a
+        // notified obligation at or below the page bound was missed by `items`.
+        let (next_after, allow_advance) = if discard {
+            c.rescan_needed = true;
+            c.caught_up = false;
+            (None, false)
+        } else if let Some(cursor) = next {
+            let check = if c.rescan_needed && dirty.is_none() {
+                DirtyCheck {
+                    missed: true,
+                    has_above: true,
+                }
+            } else {
+                DirtyDuringLoad::check(dirty.as_ref(), Some(cursor.publication), items)
+            };
+            if check.missed {
+                c.rescan_needed = true;
+                c.caught_up = false;
+                (None, false)
+            } else {
+                c.rescan_needed = false;
+                c.caught_up = false;
+                (Some(cursor), true)
+            }
+        } else {
+            let bound = items.last().map(|item| item.delivery.publication);
+            let check = if c.rescan_needed && dirty.is_none() {
+                DirtyCheck {
+                    missed: true,
+                    has_above: true,
+                }
+            } else {
+                DirtyDuringLoad::check(dirty.as_ref(), bound, items)
+            };
+            if check.missed {
+                c.rescan_needed = true;
+                c.caught_up = false;
+                (None, false)
+            } else if check.has_above {
+                c.rescan_needed = true;
+                c.caught_up = false;
+                (None, bound.is_some())
+            } else {
+                let all_dirty_covered = dirty.is_some();
+                c.rescan_needed = false;
+                c.caught_up = (!c.dirty_during_load || all_dirty_covered) && no_pending_non_inline;
+                (None, bound.is_some())
+            }
+        };
         c.dirty_during_load = false;
-        let generation = c.generation;
-        let next = if c.rescan_needed { None } else { next };
         self.set_loading(generation, index, None);
-        self.set_after(generation, next);
-        Ok(generation)
+        self.set_after(generation, next_after);
+        Ok((generation, allow_advance))
+    }
+
+    fn record_dirty_pub(&mut self, generation: ConnectionGeneration, publication: PublicationId) {
+        match self.dirty_by_gen.get_mut(&generation) {
+            Some(DirtyDuringLoad::Any) => {}
+            Some(DirtyDuringLoad::Pubs {
+                smallest,
+                overflowed,
+            }) => {
+                if let Some(&last) = smallest.last()
+                    && publication > last
+                {
+                    if smallest.len() < DIRTY_SET_CAP {
+                        smallest.push(publication);
+                    } else {
+                        *overflowed = true;
+                    }
+                    return;
+                }
+                if let Err(pos) = smallest.binary_search(&publication) {
+                    if smallest.len() < DIRTY_SET_CAP {
+                        smallest.insert(pos, publication);
+                    } else {
+                        *overflowed = true;
+                        smallest.pop();
+                        smallest.insert(pos, publication);
+                    }
+                }
+            }
+            None => {
+                let mut smallest = Vec::with_capacity(4);
+                smallest.push(publication);
+                self.dirty_by_gen.insert(
+                    generation,
+                    DirtyDuringLoad::Pubs {
+                        smallest,
+                        overflowed: false,
+                    },
+                );
+            }
+        }
+    }
+
+    pub(super) fn mark_dirty_from(
+        &mut self,
+        generation: ConnectionGeneration,
+        publication: PublicationId,
+    ) {
+        if let Some(index) = self.index_of(generation) {
+            let is_loading = self.is_loading(generation);
+            let c = &mut self.rows.as_mut_slice()[index];
+            c.caught_up = false;
+            c.rescan_needed = true;
+            if is_loading {
+                c.dirty_during_load = true;
+                self.record_dirty_pub(generation, publication);
+            }
+            if self
+                .after_of(generation)
+                .is_some_and(|after| after.publication >= publication)
+            {
+                self.set_after(generation, None);
+            }
+            if self
+                .known_through_of(generation)
+                .is_some_and(|known| known.publication >= publication)
+            {
+                self.known_through_by_gen.remove(&generation);
+            }
+        }
     }
 
     pub(super) fn mark_dirty(&mut self, generation: ConnectionGeneration, rescan: bool) {
@@ -267,6 +474,9 @@ impl Connections {
             c.caught_up = false;
             if is_loading {
                 c.dirty_during_load = true;
+                if rescan {
+                    self.dirty_by_gen.insert(generation, DirtyDuringLoad::Any);
+                }
             }
             if rescan {
                 c.rescan_needed = true;
@@ -280,6 +490,9 @@ impl Connections {
             c.caught_up = false;
             if has_any_loading && self.loading_by_gen.contains_key(&c.generation) {
                 c.dirty_during_load = true;
+                if rescan {
+                    self.dirty_by_gen.insert(c.generation, DirtyDuringLoad::Any);
+                }
             }
             if rescan {
                 c.rescan_needed = true;
@@ -299,6 +512,9 @@ impl Connections {
             self.loading_by_gen.remove(&removed_gen);
             self.after_by_gen.remove(&removed_gen);
             self.known_through_by_gen.remove(&removed_gen);
+            if !self.dirty_by_gen.is_empty() {
+                self.dirty_by_gen.remove(&removed_gen);
+            }
             if index != last {
                 self.unindex(last);
                 self.rows.as_mut_slice().swap(index, last);

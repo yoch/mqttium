@@ -2007,6 +2007,272 @@ fn a_read_started_before_an_older_obligation_revisits_the_lower_range() {
 }
 
 #[test]
+fn higher_publication_commit_during_load_preserves_page_cursor_and_known_through() {
+    fn pub_id(sequence: u64) -> PublicationId {
+        PublicationId::new(
+            StoreIncarnation::new(1),
+            RunEpoch::new(1),
+            LogicalOwnerId::new(4),
+            PublicationSeq::new(sequence),
+        )
+    }
+    fn id(sequence: u64) -> DeliveryId {
+        DeliveryId {
+            publication: pub_id(sequence),
+            index: 0,
+        }
+    }
+    fn item(sequence: u64) -> WorkItem {
+        WorkItem {
+            delivery: id(sequence),
+            target: TARGET,
+            target_revision: Revision::new(1),
+            qos: Qos::AtLeastOnce,
+            cause: DeliveryCause::LiveExact,
+            retain: false,
+            expiry: None,
+            properties: None,
+            topic: bytes(b"t/a"),
+            payload: bytes(b"p"),
+            claim: None,
+        }
+    }
+    fn load(owner: &mut Owner) -> (EffectId, Option<DeliveryId>) {
+        apply(owner, Input::WorkAvailable { session: TARGET })
+            .into_iter()
+            .find_map(|(effect, value)| match value {
+                Effect::LoadWork { after, .. } => Some((effect, after)),
+                _ => None,
+            })
+            .expect("work discovery should issue one bounded page read")
+    }
+
+    let mut owner = world();
+    owner.enable_inline_claims();
+    owner.mark_session_dirty_from(TARGET, pub_id(10));
+    let (effect, after) = load(&mut owner);
+    assert_eq!(after, None);
+
+    // A burst of > DIRTY_SET_CAP live commits arrives while the read is in
+    // flight: 10..=12 are already present on this page and 13..=35 lie above
+    // `next = Some(12)`. Neither should discard `next` or block `known_through`.
+    for seq in 10..=35 {
+        owner.mark_session_dirty_from(TARGET, pub_id(seq));
+    }
+    assert!(apply(&mut owner, Input::WorkAvailable { session: TARGET }).is_empty());
+
+    let page_items = BoundedVec::from_slice(&[item(10), item(11), item(12)], 3).unwrap();
+    apply(
+        &mut owner,
+        Input::WorkPage {
+            effect,
+            session: TARGET,
+            items: page_items,
+            next: Some(id(12)),
+        },
+    );
+
+    assert_eq!(
+        owner.pubsub.connections.known_through_of(CONNECTION),
+        Some(id(12)),
+        "covered and strictly higher commits must not block known_through"
+    );
+    assert_eq!(
+        owner.pubsub.connections.after_of(CONNECTION),
+        Some(id(12)),
+        "covered and strictly higher commits must preserve the page continuation cursor"
+    );
+    assert!(owner.has_ready_work(TARGET));
+
+    // Drain the 3 loaded rows into flight so the next WorkAvailable issues the
+    // continuation LoadWork rather than claiming local rows.
+    for _ in 0..3 {
+        let _ = apply(&mut owner, Input::WorkAvailable { session: TARGET });
+    }
+    let (_, next_after) = load(&mut owner);
+    assert_eq!(
+        next_after,
+        Some(id(12)),
+        "continuation scan must advance monotonically from next=12 without rewinding"
+    );
+}
+
+#[test]
+fn lower_publication_commit_during_load_rewinds_page_cursor() {
+    fn pub_id(sequence: u64) -> PublicationId {
+        PublicationId::new(
+            StoreIncarnation::new(1),
+            RunEpoch::new(1),
+            LogicalOwnerId::new(4),
+            PublicationSeq::new(sequence),
+        )
+    }
+    fn id(sequence: u64) -> DeliveryId {
+        DeliveryId {
+            publication: pub_id(sequence),
+            index: 0,
+        }
+    }
+    fn item(sequence: u64) -> WorkItem {
+        WorkItem {
+            delivery: id(sequence),
+            target: TARGET,
+            target_revision: Revision::new(1),
+            qos: Qos::AtLeastOnce,
+            cause: DeliveryCause::LiveExact,
+            retain: false,
+            expiry: None,
+            properties: None,
+            topic: bytes(b"t/a"),
+            payload: bytes(b"p"),
+            claim: None,
+        }
+    }
+    fn load(owner: &mut Owner) -> (EffectId, Option<DeliveryId>) {
+        apply(owner, Input::WorkAvailable { session: TARGET })
+            .into_iter()
+            .find_map(|(effect, value)| match value {
+                Effect::LoadWork { after, .. } => Some((effect, after)),
+                _ => None,
+            })
+            .expect("work discovery should issue one bounded page read")
+    }
+
+    // Part 1: an out-of-order publication below `next` that was NOT in `items`
+    // must rewind `after` and block `known_through` (replays mut-no-floor-check).
+    let mut owner = world();
+    owner.enable_inline_claims();
+    owner
+        .pubsub
+        .connections
+        .advance_known_through(CONNECTION, id(50));
+    owner.mark_session_dirty_from(TARGET, pub_id(60));
+    let (effect, after) = load(&mut owner);
+    assert_eq!(after, Some(id(50)));
+
+    // Publication 40 commits out-of-order while the snapshot starting at 50 is
+    // in flight; it cannot appear in `items = [60]`.
+    owner.mark_session_dirty_from(TARGET, pub_id(40));
+    apply(
+        &mut owner,
+        Input::WorkPage {
+            effect,
+            session: TARGET,
+            items: BoundedVec::from_slice(&[item(60)], 1).unwrap(),
+            next: Some(id(60)),
+        },
+    );
+    assert_eq!(owner.pubsub.connections.after_of(CONNECTION), None);
+    assert_eq!(owner.pubsub.connections.known_through_of(CONNECTION), None);
+    let _ = apply(&mut owner, Input::WorkAvailable { session: TARGET });
+    let (_, rewind_after) = load(&mut owner);
+    assert_eq!(
+        rewind_after, None,
+        "missed lower publication must rewind scan to the start"
+    );
+
+    // Part 2: a lower pending non-inline publication prevents known_through
+    // from overtaking it (replays mut-advance-under-pending).
+    let mut owner2 = world();
+    owner2.enable_inline_claims();
+    owner2.pubsub.pending_non_inline_pubs.insert(pub_id(10));
+    owner2.mark_session_dirty_from(TARGET, pub_id(20));
+    let (effect2, _) = load(&mut owner2);
+    apply(
+        &mut owner2,
+        Input::WorkPage {
+            effect: effect2,
+            session: TARGET,
+            items: BoundedVec::from_slice(&[item(20)], 1).unwrap(),
+            next: Some(id(20)),
+        },
+    );
+    assert_eq!(
+        owner2.pubsub.connections.known_through_of(CONNECTION),
+        None,
+        "known_through must not overtake a lower pending non-inline publication"
+    );
+}
+
+#[test]
+fn higher_publication_commit_during_terminal_page_still_rescans_above_known_through() {
+    fn pub_id(sequence: u64) -> PublicationId {
+        PublicationId::new(
+            StoreIncarnation::new(1),
+            RunEpoch::new(1),
+            LogicalOwnerId::new(4),
+            PublicationSeq::new(sequence),
+        )
+    }
+    fn id(sequence: u64) -> DeliveryId {
+        DeliveryId {
+            publication: pub_id(sequence),
+            index: 0,
+        }
+    }
+    fn item(sequence: u64) -> WorkItem {
+        WorkItem {
+            delivery: id(sequence),
+            target: TARGET,
+            target_revision: Revision::new(1),
+            qos: Qos::AtLeastOnce,
+            cause: DeliveryCause::LiveExact,
+            retain: false,
+            expiry: None,
+            properties: None,
+            topic: bytes(b"t/a"),
+            payload: bytes(b"p"),
+            claim: None,
+        }
+    }
+    fn load(owner: &mut Owner) -> (EffectId, Option<DeliveryId>) {
+        apply(owner, Input::WorkAvailable { session: TARGET })
+            .into_iter()
+            .find_map(|(effect, value)| match value {
+                Effect::LoadWork { after, .. } => Some((effect, after)),
+                _ => None,
+            })
+            .expect("work discovery should issue one bounded page read")
+    }
+
+    // Replays lot9-lost-wakeup and mut-no-rescan-on-empty: a higher commit
+    // arriving during a terminal page (next = None) must keep rescan_needed,
+    // advance known_through to the returned page's high item, and start the
+    // follow-up scan strictly above that high item without rewinding to None.
+    let mut owner = world();
+    owner.enable_inline_claims();
+    owner.mark_session_dirty_from(TARGET, pub_id(10));
+    let (effect, _) = load(&mut owner);
+
+    owner.mark_session_dirty_from(TARGET, pub_id(25));
+    apply(
+        &mut owner,
+        Input::WorkPage {
+            effect,
+            session: TARGET,
+            items: BoundedVec::from_slice(&[item(10)], 1).unwrap(),
+            next: None,
+        },
+    );
+    assert_eq!(
+        owner.pubsub.connections.known_through_of(CONNECTION),
+        Some(id(10)),
+        "terminal page with only higher dirty publication may advance known_through to high"
+    );
+    assert!(
+        owner.has_ready_work(TARGET),
+        "higher commit during terminal page must retain rescan_needed"
+    );
+    let _ = apply(&mut owner, Input::WorkAvailable { session: TARGET });
+    let (_, follow_up_after) = load(&mut owner);
+    assert_eq!(
+        follow_up_after,
+        Some(id(10)),
+        "follow-up scan must resume strictly above known_through(10)"
+    );
+}
+
+#[test]
 fn a_later_work_page_cannot_rewrite_an_already_loaded_retain_flag() {
     let mut owner = world();
     queued(&mut owner, 0);

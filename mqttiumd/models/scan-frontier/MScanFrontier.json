@@ -1,0 +1,76 @@
+{
+  "module": "MScanFrontier.tla",
+  "status": "refinement",
+  "summary": "Scan-frontier pagination and DirtyDuringLoad invalidation for one subscriber session (R1 / commit 76af3a54): live non-inline publications 1..N admit monotonically while store commits and StoreResult notifications can arrive out of order, an arbitrary-low obligation (0) models retained replay / Will / shard clear, and bounded LoadWork pages advance after and known_through. Configurations reproduce Lot 9's lost wake-up (NoInvisibleObligation violated), 76af3a54's unconditional fan-in cursor rewind (MonotoneFanInProgress violated), the repaired DirtyDuringLoad frontier passing safety (with out-of-order commits, low replay, and finish invalidation) and monotone progress (N=4, Page=2), and three mutants removing each safety guard.",
+  "issues": [
+    685
+  ],
+  "tests": [
+    "mqttiumd/crates/mqttiumd-core/src/owner/pubsub/tests.rs"
+  ],
+  "replays": [
+    {
+      "file": "mqttiumd/crates/mqttiumd-core/src/owner/pubsub/tests.rs",
+      "test": "a_read_started_before_an_older_obligation_revisits_the_lower_range"
+    },
+    {
+      "file": "mqttiumd/crates/mqttiumd-core/src/owner/pubsub/tests.rs",
+      "test": "higher_publication_commit_during_load_preserves_page_cursor_and_known_through"
+    },
+    {
+      "file": "mqttiumd/crates/mqttiumd-core/src/owner/pubsub/tests.rs",
+      "test": "lower_publication_commit_during_load_rewinds_page_cursor"
+    },
+    {
+      "file": "mqttiumd/crates/mqttiumd-core/src/owner/pubsub/tests.rs",
+      "test": "higher_publication_commit_during_terminal_page_still_rescans_above_known_through"
+    }
+  ],
+  "not_replayed": "Every safety and progress configuration is replayed by deterministic unit tests in owner/pubsub/tests.rs: a_read_started_before_an_older_obligation_revisits_the_lower_range replays DirtyFloor::Any; lower_publication_commit_during_load_rewinds_page_cursor replays mut-no-floor-check and mut-advance-under-pending; higher_publication_commit_during_load_preserves_page_cursor_and_known_through replays 76af3a5-rewind and monotone-no-rewind; higher_publication_commit_during_terminal_page_still_rescans_above_known_through replays lot9-lost-wakeup and mut-no-rescan-on-empty.",
+  "configs": [
+    {
+      "config": "MScanFrontier-safety.cfg",
+      "expect": "pass",
+      "invariants": [
+        "TypeOK",
+        "KnownThroughSound",
+        "NoInvisibleObligation"
+      ]
+    },
+    {
+      "config": "MScanFrontier-monotone-no-rewind.cfg",
+      "expect": "pass",
+      "invariants": [
+        "TypeOK",
+        "KnownThroughSound",
+        "NoInvisibleObligation",
+        "MonotoneFanInProgress"
+      ]
+    },
+    {
+      "config": "MScanFrontier-76af3a5-rewind.cfg",
+      "expect": "violation",
+      "invariant": "MonotoneFanInProgress"
+    },
+    {
+      "config": "MScanFrontier-lot9-lost-wakeup.cfg",
+      "expect": "violation",
+      "invariant": "NoInvisibleObligation"
+    },
+    {
+      "config": "MScanFrontier-mut-no-floor-check.cfg",
+      "expect": "violation",
+      "invariant": "NoInvisibleObligation"
+    },
+    {
+      "config": "MScanFrontier-mut-no-rescan-on-empty.cfg",
+      "expect": "violation",
+      "invariant": "NoInvisibleObligation"
+    },
+    {
+      "config": "MScanFrontier-mut-advance-under-pending.cfg",
+      "expect": "violation",
+      "invariant": "KnownThroughSound"
+    }
+  ]
+}

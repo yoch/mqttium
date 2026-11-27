@@ -3552,6 +3552,18 @@ impl Owner {
         }
     }
 
+    pub(super) fn mark_session_dirty_from(
+        &mut self,
+        session: SessionId,
+        publication: PublicationId,
+    ) {
+        if let Some(generation) = self.connection_of(session) {
+            self.pubsub
+                .connections
+                .mark_dirty_from(generation, publication);
+        }
+    }
+
     pub(super) fn mark_all_sessions_dirty(&mut self, rescan: bool) {
         self.pubsub.connections.mark_all_dirty(rescan);
     }
@@ -4058,10 +4070,15 @@ impl Owner {
                     && self.pubsub.control.is_none()
                     && self.pubsub.retained.is_none()
                     && !self.will_status().admission_pending;
-                let generation = self.pubsub.connections.complete_page(
+                let page_items = match input {
+                    Input::WorkPage { items, .. } => items.as_slice(),
+                    _ => &[],
+                };
+                let (generation, allow_advance) = self.pubsub.connections.complete_page(
                     connection,
                     discard,
                     next,
+                    page_items,
                     no_pending_non_inline,
                 )?;
                 if !discard {
@@ -4096,9 +4113,10 @@ impl Owner {
                             self.pubsub.deliveries.push(d)?;
                         }
                     }
-                    // The returned items are valid. Their high-water mark
-                    // cannot cover obligations made visible since the read.
-                    if !self.pubsub.connections.as_slice()[connection].rescan_needed
+                    // The returned items are valid. Their high-water mark can
+                    // advance whenever no dirty notification at or below `high`
+                    // was missed and no lower non-inline admission is pending.
+                    if allow_advance
                         && self.inline_claim_enabled
                         && self.pubsub.control.is_none()
                         && self.pubsub.retained.is_none()

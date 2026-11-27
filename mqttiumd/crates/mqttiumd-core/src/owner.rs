@@ -4355,7 +4355,7 @@ impl Owner {
                     {
                         oracle_ref.mark_ineligible(target);
                     }
-                    self.mark_session_dirty(target, true);
+                    self.mark_session_dirty_from(target, publication);
                     self.push_inline_ready_target(target);
                     self.last_step_may_unblock_work = true;
                 }
