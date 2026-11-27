@@ -268,7 +268,7 @@ Still open: records `0051`–`0054` remain `Proposed` pending owner acceptance; 
 ## Validation of the lot 10 head (`9dfd568`, 26 November 2026)
 
 The branch `refactor/lot10-validated-base` checks the proofs and the code
-of `9dfd568` and corrects what it finds; report 0043 has the account. The
+of `9dfd568` and corrects what it finds; reports 0043 to 0047 have the account. The
 defects of the default path it found are fixed, each by a test committed
 while it failed. What it leaves open:
 
@@ -282,6 +282,7 @@ while it failed. What it leaves open:
 | **Volatile store, what the validation did not change.** The operation table keeps an owner's ring after its run (32 rings at most, then the ordered fallback), and a ring grows with the span of sequences from its oldest live entry. A recovery page reads the whole inventory, and an expiry sweep scans every delivery of each expired publication | Store lot | Recovery and expiry at the session bound |
 | **The oracle judges one owner on two stores.** It reads recipes 24 and 25 since this validation, and leaves them out of the scope of a verdict. The log store, the volatile store and the sharded mode are judged by their conformance suites and by the bench, not by the oracle | Oracle lot | Qualifying campaigns on those stores |
 | **`tools/bounded-batch.mutant` no longer applies.** It belongs to the frozen receptions of report 0026 | Not planned: frozen evidence | — |
+| **What the cleanup left.** `drain_inputs` and `Sink::try_submit`, about 1,100 lines each, keep their arms inline: the large ones are the per-publication paths, and splitting them relies on the inliner. `net.rs` and `writer.rs` were not split (report 0047) | A lot that splits them arm by arm with instruction counts for each | — |
 
 ## Follow-up of the external audit of `47e1d12`
 
