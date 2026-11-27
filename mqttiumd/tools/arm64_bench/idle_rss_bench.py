@@ -19,6 +19,10 @@ REPO = HERE.parents[1]
 sys.path.insert(0, str(HERE))
 import run_arm64_bench as bench
 
+# Run as root, Mosquitto would drop to `nobody` and could not read the keys
+# of this private directory.
+MOSQUITTO_USER = "user root\n" if os.geteuid() == 0 else ""
+
 
 def make_connect(cid: str) -> bytes:
     cid_b = cid.encode()
@@ -204,6 +208,7 @@ def main() -> None:
             mconf = tmp / "mosq_plain.conf"
             mconf.write_text(
                 f"listener {p} 127.0.0.1\nallow_anonymous true\npersistence false\nmax_connections -1\nlog_type error\n"
+                + MOSQUITTO_USER
             )
             results["mosquitto_plain"] = run_idle_test(
                 "mosquitto_plain",
@@ -256,7 +261,7 @@ def main() -> None:
             mconf2.write_text(
                 f"listener {p} 127.0.0.1\nallow_anonymous true\npersistence false\nmax_connections -1\n"
                 f"cafile {pki / 'ca.crt'}\ncertfile {pki / 'server.crt'}\nkeyfile {pki / 'server.key'}\n"
-                f"require_certificate true\ntls_version tlsv1.3\nlog_type error\n"
+                f"require_certificate true\ntls_version tlsv1.3\nlog_type error\n" + MOSQUITTO_USER
             )
             results["mosquitto_mtls"] = run_idle_test(
                 "mosquitto_mtls",
