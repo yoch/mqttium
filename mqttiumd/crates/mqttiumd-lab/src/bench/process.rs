@@ -1044,9 +1044,7 @@ impl<S: DurableStore> Process<S> {
     /// `Option` of `Owner::outbox` is always `Some`, and the bench keeps no
     /// branch for its absence.
     fn outbox(&self) -> &Outbox {
-        self.owner
-            .outbox()
-            .expect("an owner always holds its box (finding R2)")
+        self.owner.outbox()
     }
 
     /// Whether an effect still waits in the box, or an input for room.

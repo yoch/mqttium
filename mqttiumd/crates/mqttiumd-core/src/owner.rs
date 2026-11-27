@@ -1394,12 +1394,10 @@ impl Owner {
     }
 
     /// The box of the owner. It is always present: a renewal replaces it
-    /// in place, and a refused renewal keeps it (review R2). The `Option`
-    /// is kept so that the callers written against the earlier form go on
-    /// compiling.
+    /// in place, and a refused renewal keeps it (review R2).
     #[must_use]
-    pub fn outbox(&self) -> Option<&Outbox> {
-        Some(&self.outbox)
+    pub fn outbox(&self) -> &Outbox {
+        &self.outbox
     }
 
     /// Hands effects to `sink` with the receipt and lifecycle control lanes.

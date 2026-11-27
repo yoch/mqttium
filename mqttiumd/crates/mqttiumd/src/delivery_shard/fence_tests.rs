@@ -183,7 +183,7 @@ fn submitted_ack_precedes_detach_even_when_the_writer_withholds_credit() {
         StepOutcome::Applied { .. }
     ));
     let is_finish = |effect: &OwnedEffect| matches!(effect.effect(), Effect::Persist {command} if matches!(command.recipe.get(), Recipe::FinishDelivery(f) if f.delivery == claim.delivery));
-    assert!(worker.owner.outbox().unwrap().pending().any(is_finish));
+    assert!(worker.owner.outbox().pending().any(is_finish));
 
     worker.limits.in_flight = 0;
     let completed = Arc::<AtomicBool>::default();
