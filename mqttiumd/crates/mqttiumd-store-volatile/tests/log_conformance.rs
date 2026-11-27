@@ -1094,6 +1094,190 @@ fn log_refuses_a_zero_length_that_no_torn_frame_explains() {
     let _ = std::fs::remove_dir_all(&log.dir);
 }
 
+/// A committed frame whose first sector reads as zeros, followed by another
+/// committed frame well within the reach of one frame (64 MiB), MUST fail
+/// closed with `OpenError::Corrupt` rather than being truncated as a torn
+/// tail (closing the open condition of ADR 0055).
+#[test]
+fn log_refuses_a_zeroed_first_sector_when_a_committed_frame_follows_within_one_frame() {
+    let dir = temp_dir("zeroed-first-sector-followed");
+    let path = dir.join("store.sqlite");
+    let wal_path = dir.join("store.sqlite.mlog");
+    let limits = fixture_limits();
+
+    // Case A: Frame 2 spans across a 512-byte sector boundary, followed by
+    // committed Frame 3 completely past that sector.
+    {
+        let mut world = World::with_limits(
+            &|incarnation, lim| {
+                LogStore::open_or_create(&path, incarnation, lim, None, false).expect("log")
+            },
+            limits,
+        );
+        assert!(
+            world
+                .store
+                .apply(&world.admission(1, 1, b"anchor", &[world.b]))
+                .committed_now
+        );
+        let pos2 = world.store.wal_len();
+        assert!(
+            world
+                .store
+                .apply(&world.admission(2, 2, &[0x42; 700], &[world.b]))
+                .committed_now
+        );
+        assert!(
+            world
+                .store
+                .apply(&world.admission(3, 3, b"later-committed", &[world.c]))
+                .committed_now
+        );
+        drop(world);
+
+        let sector_end = (pos2 / SECTOR + 1) * SECTOR;
+        let mut f = OpenOptions::new().write(true).open(&wal_path).unwrap();
+        f.seek(SeekFrom::Start(pos2)).unwrap();
+        f.write_all(&vec![0u8; (sector_end - pos2) as usize])
+            .unwrap();
+        f.sync_all().unwrap();
+
+        let err = LogStore::open_or_create(&path, StoreIncarnation::new(9), limits, None, true)
+            .expect_err("committed frame following zeroed first sector must fail closed");
+        assert!(matches!(err, OpenError::Corrupt), "got {err:?}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+
+    // Case B: Frame 2 and Frame 3's header BOTH lie inside the zeroed sector,
+    // leaving only Frame 3's tail + backward-readable footer in the next sector.
+    let dir2 = temp_dir("zeroed-shared-sector-followed");
+    let path2 = dir2.join("store.sqlite");
+    let wal_path2 = dir2.join("store.sqlite.mlog");
+    let wide_limits = Limits {
+        payload_bytes: mqttiumd_contract::capacity::PayloadBytes::new(64 * 1024),
+        references: mqttiumd_contract::capacity::References::new(32),
+        exchange_slots: mqttiumd_contract::capacity::ExchangeSlots::new(32),
+        receipt_slots: mqttiumd_contract::capacity::ReceiptSlots::new(64),
+        ..limits
+    };
+    {
+        let mut world = World::with_limits(
+            &|incarnation, lim| {
+                LogStore::open_or_create(&path2, incarnation, lim, None, false).expect("log")
+            },
+            wide_limits,
+        );
+        // Advance until `pos2` falls near the beginning of a 512-byte sector so
+        // Frame 2 (small) fits completely inside that sector and Frame 3 starts
+        // in the same sector before crossing into the next sector.
+        let mut seq = 1u64;
+        while world.store.wal_len() % SECTOR > 160 {
+            let cmd = world.admission(seq, u16::try_from(seq).unwrap(), &[0x11; 32], &[world.b]);
+            let applied = world.store.apply(&cmd);
+            assert!(applied.committed_now, "seq={seq}: {applied:?}");
+            seq += 1;
+        }
+        let pos2 = world.store.wal_len();
+        let sector_end = (pos2 / SECTOR + 1) * SECTOR;
+        // Frame 2 stays completely inside this sector.
+        let f2 = world.admission(seq, u16::try_from(seq).unwrap(), b"small-f2", &[world.b]);
+        assert!(world.store.apply(&f2).committed_now);
+        seq += 1;
+        let pos3 = world.store.wal_len();
+        assert!(
+            pos3 < sector_end,
+            "expected Frame 3 to start inside the same sector ({pos3} < {sector_end}; pos2={pos2})"
+        );
+        // Frame 3 crosses into the next sector so its tail + footer survive.
+        let f3 = world.admission(seq, u16::try_from(seq).unwrap(), &[0x33; 600], &[world.c]);
+        assert!(world.store.apply(&f3).committed_now);
+        assert!(world.store.wal_len() > sector_end + 32);
+        drop(world);
+
+        let mut f = OpenOptions::new().write(true).open(&wal_path2).unwrap();
+        f.seek(SeekFrom::Start(pos2)).unwrap();
+        f.write_all(&vec![0u8; (sector_end - pos2) as usize])
+            .unwrap();
+        f.sync_all().unwrap();
+
+        let err =
+            LogStore::open_or_create(&path2, StoreIncarnation::new(9), wide_limits, None, true)
+                .expect_err(
+                    "shared zeroed sector wiping Frame 2 and Frame 3 header must fail closed",
+                );
+        assert!(matches!(err, OpenError::Corrupt), "got {err:?}");
+    }
+    let _ = std::fs::remove_dir_all(&dir2);
+
+    // Case C: A single multi-sector v2 tail frame whose first sector was lost
+    // STILL recovers cleanly even when its valid v2 footer reached disk (because
+    // its footer's computed start equals `pos`).
+    let dir3 = temp_dir("single-v2-torn-first-sector");
+    let path3 = dir3.join("store.sqlite");
+    let wal_path3 = dir3.join("store.sqlite.mlog");
+    {
+        let mut world = World::with_limits(
+            &|incarnation, lim| {
+                LogStore::open_or_create(&path3, incarnation, lim, None, false).expect("log")
+            },
+            limits,
+        );
+        assert!(
+            world
+                .store
+                .apply(&world.admission(1, 1, b"anchor", &[world.b]))
+                .committed_now
+        );
+        let pos2 = world.store.wal_len();
+        let expected = world.store.snapshot().expect("anchor state");
+        // Write a real v2 multi-sector frame at `pos2`, then zero its first
+        // sector while keeping its later sectors including its v2 footer.
+        assert!(
+            world
+                .store
+                .apply(&world.admission(2, 2, &[0x77; 900], &[world.b]))
+                .committed_now
+        );
+        drop(world);
+
+        let sector_end = (pos2 / SECTOR + 1) * SECTOR;
+        let mut f = OpenOptions::new().write(true).open(&wal_path3).unwrap();
+        f.seek(SeekFrom::Start(pos2)).unwrap();
+        f.write_all(&vec![0u8; (sector_end - pos2) as usize])
+            .unwrap();
+        f.sync_all().unwrap();
+
+        let recovered =
+            LogStore::open_or_create(&path3, StoreIncarnation::new(9), limits, None, true)
+                .expect("single torn v2 tail frame with lost first sector still recovers");
+        assert_eq!(recovered.snapshot().unwrap(), expected);
+        assert_eq!(recovered.wal_len(), pos2);
+    }
+    let _ = std::fs::remove_dir_all(&dir3);
+
+    // Case D: Legacy v1 `.mlog` header is refused fail-closed before mutation.
+    let log_v1 = closed_log("legacy-v1-refused");
+    {
+        let mut f = OpenOptions::new()
+            .write(true)
+            .open(&log_v1.wal_path)
+            .unwrap();
+        f.seek(SeekFrom::Start(4)).unwrap();
+        f.write_all(&1u16.to_be_bytes()).unwrap();
+        f.sync_all().unwrap();
+    }
+    let err = LogStore::open_or_create(
+        &log_v1.path,
+        StoreIncarnation::new(9),
+        log_v1.limits,
+        None,
+        true,
+    )
+    .expect_err("legacy v1 .mlog must be refused fail-closed");
+    assert!(matches!(err, OpenError::Corrupt), "got {err:?}");
+    let _ = std::fs::remove_dir_all(&log_v1.dir);
+}
+
 /// A frame whose write failed is cut from the file; when the cut fails too
 /// its bytes stay beyond the end of the log. Before the next frame is
 /// written every byte beyond the end is zero again, so that no later crash

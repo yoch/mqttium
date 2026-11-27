@@ -817,7 +817,8 @@ fn retained_qos0_replay_batches_consume_commits_in_log_mode() {
                 break;
             }
             frames += 1;
-            pos += 4 + body_len + 4;
+            // v2 frame layout: 4-byte body_len + body + 16-byte footer.
+            pos += 4 + body_len + 16;
         }
         frames
     }

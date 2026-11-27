@@ -78,8 +78,13 @@ pub const LOG_MAX_GROUP: usize = 256;
 pub const DEFAULT_CHECKPOINT_BYTES: u64 = 128 * 1024 * 1024;
 
 const WAL_MAGIC: &[u8; 4] = b"MQLG";
-const WAL_VERSION: u16 = 1;
+const WAL_VERSION: u16 = 2;
 const WAL_HEADER_LEN: u64 = 24;
+const FRAME_HEADER_LEN: u64 = 4;
+const FRAME_FOOTER_MAGIC: &[u8; 4] = b"MLGE";
+/// Frame footer: `[body_crc: u32 BE][body_len: u32 BE][footer_crc: u32 BE][b"MLGE"]`.
+const FRAME_FOOTER_LEN: u64 = 16;
+const FRAME_OVERHEAD: u64 = FRAME_HEADER_LEN + FRAME_FOOTER_LEN;
 const MIN_PREALLOC_CHUNK: u64 = 256 * 1024;
 const MAX_PREALLOC_CHUNK: u64 = 4 * 1024 * 1024;
 const MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
@@ -529,17 +534,23 @@ impl LogStore {
         self.encode_buf
             .extend_from_slice(&record_count.to_be_bytes());
         write_body(&mut self.encode_buf);
-        let body_len = self.encode_buf.len() - 4;
+        let body_len = self.encode_buf.len() - FRAME_HEADER_LEN as usize;
         let len_u32 = u32::try_from(body_len).expect("frame fits in u32");
         self.encode_buf[0..4].copy_from_slice(&len_u32.to_be_bytes());
         let crc = crc32c(&self.encode_buf);
         self.encode_buf.extend_from_slice(&crc.to_be_bytes());
+        self.encode_buf.extend_from_slice(&len_u32.to_be_bytes());
+        // Finalized in `flush_prepared_frame` once `self.wal_len` is settled
+        // after any pending WAL rotation.
+        self.encode_buf.extend_from_slice(&0u32.to_be_bytes());
+        self.encode_buf.extend_from_slice(FRAME_FOOTER_MAGIC);
     }
 
     /// Whether recovery accepts the prepared frame: `replay_wal` reads no
     /// body longer than `MAX_FRAME_BYTES`.
     fn prepared_frame_is_readable(&self) -> bool {
-        self.encode_buf.len() - 8 <= MAX_FRAME_BYTES
+        self.encode_buf.len() >= FRAME_OVERHEAD as usize
+            && self.encode_buf.len() - FRAME_OVERHEAD as usize <= MAX_FRAME_BYTES
     }
 
     /// Appends the prepared frame to `.mlog` and calls `sync_data()`.
@@ -555,6 +566,12 @@ impl LogStore {
             return Err(());
         }
         let prev_len = self.wal_len;
+        let body_len = u32::try_from(self.encode_buf.len() - FRAME_OVERHEAD as usize)
+            .expect("frame fits in u32");
+        let footer_crc = frame_footer_crc(prev_len, body_len);
+        let footer_crc_pos = self.encode_buf.len() - 8;
+        self.encode_buf[footer_crc_pos..footer_crc_pos + 4]
+            .copy_from_slice(&footer_crc.to_be_bytes());
         let frame_len = self.encode_buf.len() as u64;
         let needed_end = prev_len.saturating_add(frame_len);
         #[cfg(feature = "log-write-points")]
@@ -1149,6 +1166,96 @@ fn remaining_is_all_zero(file: &mut File, from: u64, file_len: u64) -> Result<bo
     Ok(true)
 }
 
+/// Authenticates a v2 backward-readable frame footer against its exact file
+/// offset and declared `body_len`.
+fn frame_footer_crc(frame_start: u64, body_len: u32) -> u32 {
+    let mut buf = [0u8; 16];
+    buf[0..8].copy_from_slice(&frame_start.to_be_bytes());
+    buf[8..12].copy_from_slice(&body_len.to_be_bytes());
+    buf[12..16].copy_from_slice(FRAME_FOOTER_MAGIC);
+    crc32c(&buf)
+}
+
+/// Returns the byte offset strictly after the last non-zero byte in
+/// `[start, end)`, or `start` if the range is all zeros.
+fn last_nonzero_end(file: &mut File, start: u64, end: u64) -> Result<u64, OpenError> {
+    if start >= end {
+        return Ok(start);
+    }
+    let mut buf = [0u8; 16_384];
+    let mut cursor = end;
+    while cursor > start {
+        let want = usize::try_from((cursor - start).min(buf.len() as u64)).unwrap_or(16_384);
+        let chunk_start = cursor - want as u64;
+        file.seek(SeekFrom::Start(chunk_start))
+            .map_err(OpenError::WriterLock)?;
+        file.read_exact(&mut buf[..want])
+            .map_err(OpenError::WriterLock)?;
+        if let Some(rel) = buf[..want].iter().rposition(|&b| b != 0) {
+            return Ok(chunk_start + rel as u64 + 1);
+        }
+        cursor = chunk_start;
+    }
+    Ok(start)
+}
+
+/// Scans `[scan_start, scan_end)` for any self-authenticating v2 frame footer
+/// whose computed frame start offset lies strictly past `pos`. Such a footer
+/// proves a subsequent frame was written after the zeroed region at `pos`
+/// (even if that subsequent frame's own header fell inside the same zeroed
+/// sector), distinguishing damaged committed frames from a single uncommitted
+/// torn tail whose first sector was lost.
+fn has_subsequent_frame_footer(
+    file: &mut File,
+    pos: u64,
+    scan_start: u64,
+    scan_end: u64,
+) -> Result<bool, OpenError> {
+    let last_nz = last_nonzero_end(file, scan_start, scan_end)?;
+    if last_nz < scan_start.saturating_add(12) {
+        return Ok(false);
+    }
+    const CHUNK: usize = 65_536;
+    const OVERLAP: usize = 12;
+    let mut buf = vec![0u8; CHUNK + OVERLAP];
+    let mut offset = scan_start;
+    while offset < last_nz {
+        let want = usize::try_from((last_nz - offset).min(CHUNK as u64)).unwrap_or(CHUNK);
+        let prefix = if offset > scan_start { OVERLAP } else { 0 };
+        let read_from = offset - prefix as u64;
+        let total = prefix + want;
+        file.seek(SeekFrom::Start(read_from))
+            .map_err(OpenError::WriterLock)?;
+        file.read_exact(&mut buf[..total])
+            .map_err(OpenError::WriterLock)?;
+        let mut i = 8usize;
+        while i + 4 <= total {
+            if &buf[i..i + 4] == FRAME_FOOTER_MAGIC {
+                let magic_off = read_from + i as u64;
+                if magic_off >= scan_start + 8 {
+                    let body_len =
+                        u32::from_be_bytes([buf[i - 8], buf[i - 7], buf[i - 6], buf[i - 5]]);
+                    let footer_crc =
+                        u32::from_be_bytes([buf[i - 4], buf[i - 3], buf[i - 2], buf[i - 1]]);
+                    if (2..=MAX_FRAME_BYTES as u32).contains(&body_len) {
+                        let frame_end_off = magic_off + 4;
+                        let total_frame = FRAME_OVERHEAD + u64::from(body_len);
+                        if let Some(computed_start) = frame_end_off.checked_sub(total_frame)
+                            && computed_start > pos
+                            && footer_crc == frame_footer_crc(computed_start, body_len)
+                        {
+                            return Ok(true);
+                        }
+                    }
+                }
+            }
+            i += 1;
+        }
+        offset += want as u64;
+    }
+    Ok(false)
+}
+
 fn replay_wal(
     file: &mut File,
     file_len: u64,
@@ -1158,7 +1265,7 @@ fn replay_wal(
     let mut frame_buf = Vec::new();
     while pos < file_len {
         let remaining = file_len - pos;
-        if remaining < 4 {
+        if remaining < FRAME_HEADER_LEN {
             let clean = remaining_is_all_zero(file, pos, file_len)?;
             return Ok((pos, clean));
         }
@@ -1171,20 +1278,24 @@ fn replay_wal(
             if remaining_is_all_zero(file, pos + 4, file_len)? {
                 return Ok((pos, true));
             }
-            // Or a frame cut by a power loss that kept later sectors and
-            // lost its first. That sector then holds what it held before,
-            // zeros from here to its end, and what was kept lies within
-            // the reach of one frame. Anything else is damage.
+            // Or a single uncommitted frame cut by a power loss that kept
+            // later sectors and lost its first. That sector holds zeros from
+            // `pos` to its end, nothing lies past the reach of one frame, and
+            // no self-authenticating v2 footer proves a subsequent frame
+            // started strictly past `pos`. Anything else is damage.
             let sector_end = (pos / SECTOR_BYTES + 1) * SECTOR_BYTES;
-            let frame_end = pos + 8 + MAX_FRAME_BYTES as u64;
+            let frame_end = pos
+                .saturating_add(FRAME_OVERHEAD)
+                .saturating_add(MAX_FRAME_BYTES as u64);
             if remaining_is_all_zero(file, pos + 4, sector_end.min(file_len))?
                 && remaining_is_all_zero(file, frame_end, file_len)?
+                && !has_subsequent_frame_footer(file, pos, sector_end, frame_end.min(file_len))?
             {
                 return Ok((pos, false));
             }
             return Err(OpenError::Corrupt);
         }
-        if remaining < 10 {
+        if remaining < FRAME_OVERHEAD + 2 {
             return Ok((pos, false));
         }
         if !(2..=MAX_FRAME_BYTES).contains(&body_len) {
@@ -1193,9 +1304,8 @@ fn replay_wal(
             }
             return Err(OpenError::Corrupt);
         }
-        let total_frame = 4u64
+        let total_frame = FRAME_OVERHEAD
             .checked_add(body_len as u64)
-            .and_then(|n| n.checked_add(4))
             .ok_or(OpenError::Corrupt)?;
         if total_frame > remaining {
             // Torn tail frame at EOF before fdatasync completed: truncate here.
@@ -1209,12 +1319,20 @@ fn replay_wal(
         frame_buf.resize(4 + body_len, 0);
         file.read_exact(&mut frame_buf[4..])
             .map_err(OpenError::WriterLock)?;
-        let mut crc_bytes = [0u8; 4];
-        file.read_exact(&mut crc_bytes)
+        let mut footer = [0u8; 16];
+        file.read_exact(&mut footer)
             .map_err(OpenError::WriterLock)?;
-        let expected_crc = u32::from_be_bytes(crc_bytes);
+        let expected_crc = u32::from_be_bytes([footer[0], footer[1], footer[2], footer[3]]);
+        let trailer_len = u32::from_be_bytes([footer[4], footer[5], footer[6], footer[7]]);
+        let footer_crc = u32::from_be_bytes([footer[8], footer[9], footer[10], footer[11]]);
+        let footer_magic = &footer[12..16];
         let actual_crc = crc32c(&frame_buf);
-        if actual_crc != expected_crc {
+        let expected_footer_crc = frame_footer_crc(pos, body_len as u32);
+        if actual_crc != expected_crc
+            || trailer_len as usize != body_len
+            || footer_crc != expected_footer_crc
+            || footer_magic != FRAME_FOOTER_MAGIC
+        {
             if pos + total_frame == file_len
                 || remaining_is_all_zero(file, pos + total_frame, file_len)?
             {
