@@ -108,15 +108,30 @@ verification did not run the register's check, the CI of `9884c3d` did.
 prose: the model `MTransportCredit`, the tables of `transport-credit` and
 `takeover`, and record 0065.
 
-At `88f9e99`, `sharded_slow_subscriber_isolation_and_fifo_drain` failed
-once in the instrumented build on the CI runner: the publisher and the
-three fast subscribers took 1.41 s where the test allows 550 ms. It
-passed in the CI of `efd618c` and again in that of `9884c3d`. Played here with the instrumented
-build, ten times alone and ten times with the other tests of its binary,
-at the head and at `efd618c`, it took 75 to 266 ms alone and 115 to
-198 ms with the others, the two commits alike. No cause was found; the
-runner's load and the head-of-line blocking of the store worker (D8, open)
-are the candidates. The test is unchanged.
+`sharded_slow_subscriber_isolation_and_fifo_drain` failed in the
+instrumented build on the CI runner at `88f9e99` (1.41 s) and at `cb77770`
+(991 ms), where it allows 550 ms; it passed at `efd618c` and `9884c3d`.
+The test publishes 80 QoS 1 messages to three fast subscribers and one
+that acknowledges every 8 ms with a Receive Maximum of 2, and bounds the
+time the fast ones take. Played here with the instrumented build,
+alternating the head (`63ac1c5` for the first two rows, `9884c3d` for the
+other two) and `efd618c`:
+
+| Condition | Head | `efd618c` |
+| - | - | - |
+| Alone, ten runs | 78 to 266 ms | 75 to 107 ms |
+| With the other tests of its binary, ten runs | 115 to 177 ms | 137 to 198 ms |
+| On two cores busy with another process, default test threads, twenty runs | median 226 ms, 0 over the bound | median 241 ms, 0 over |
+| The same, eleven test threads, twenty runs | median 427 ms, 4 over | median 452 ms, 4 over |
+
+The cleanup does not change how the test behaves: it exceeds its bound
+under load at both commits alike. The bound has little room. A
+publisher paced by the slow subscriber would take at least 78 × 8 ms,
+about 625 ms, so the bound must stay below that to detect it, and runs
+that are not paced reach 655 ms on an overloaded machine. The fence spin
+of report 0046 took 809 ms. The test is unchanged; giving it room (a
+slower slow subscriber, a bound scaled to it) is a change of the test
+the owner may want, and it would have to keep failing on the spin.
 
 ## Verification
 
@@ -196,4 +211,6 @@ the owner holds:
   has a table), and record 0066 against record 0044;
 - whether the sharded mode leaves "experimental";
 - whether `e081f9c`, which removed the foreign identifiers of report 0045
-  once the read fence made them unnecessary (report 0046), stays.
+  once the read fence made them unnecessary (report 0046), stays;
+- whether `sharded_slow_subscriber_isolation_and_fifo_drain` is given more
+  room, above.
