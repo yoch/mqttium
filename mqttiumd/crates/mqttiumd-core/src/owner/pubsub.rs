@@ -526,7 +526,7 @@ impl State {
         self.payload_limit.get()
     }
 
-    pub(super) fn work_bound(&self, input: &Input, _routes: usize) -> u64 {
+    pub(super) fn work_bound(&self, input: &Input) -> u64 {
         if let Input::MessagesExpired { deliveries } = input {
             let count = capacity_of(deliveries.len());
             return count.saturating_mul(16).saturating_add(16);
@@ -623,8 +623,8 @@ impl State {
         )
     }
 
-    fn loaded_bytes(&self) -> Option<u64> {
-        Some(self.deliveries.loaded_bytes())
+    fn loaded_bytes(&self) -> u64 {
+        self.deliveries.loaded_bytes()
     }
 
     pub(super) fn accepts_message_time(&self, now: MessageTime) -> bool {
@@ -2575,7 +2575,7 @@ impl Owner {
             .get(&session)
             .and_then(|&idx| self.sessions.as_slice().get(idx))
             .ok_or(IMPOSSIBLE)?;
-        let mut total = self.pubsub.loaded_bytes().ok_or(IMPOSSIBLE)?;
+        let mut total = self.pubsub.loaded_bytes();
         let mut added = 0usize;
         let limits = self.limits.ok_or(IMPOSSIBLE)?;
         for (position, item) in items.iter().enumerate() {

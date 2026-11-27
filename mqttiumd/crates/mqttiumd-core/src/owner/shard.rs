@@ -179,12 +179,6 @@ impl Owner {
         self.delegated_deliveries = true;
     }
 
-    /// Whether this owner delegates outgoing deliveries to external shards.
-    #[must_use]
-    pub fn delegated_deliveries_enabled(&self) -> bool {
-        self.delegated_deliveries
-    }
-
     /// Applies `input` with an external `InlineClaimOracle`, without immediate
     /// sink dispatch.
     pub fn step_with_oracle(

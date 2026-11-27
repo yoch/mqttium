@@ -1570,12 +1570,6 @@ impl Owner {
             })
     }
 
-    /// Number of currently bound sessions in O(1).
-    #[must_use]
-    pub fn bound_sessions(&self) -> usize {
-        self.session_by_conn.len()
-    }
-
     fn is_closed(&self, connection: ConnectionGeneration) -> bool {
         self.closed_set.contains(&connection)
     }
@@ -2186,7 +2180,7 @@ impl Owner {
         }
         let Input::Recovery { facts, last } = input else {
             return WorkUnits::new(
-                1u64.saturating_add(self.pubsub.work_bound(input, self.routes.capacity()))
+                1u64.saturating_add(self.pubsub.work_bound(input))
                     .saturating_add(self.session_work_bound(input))
                     .saturating_add(self.routing_work_bound(input))
                     .saturating_add(self.retained_work_bound(input))
