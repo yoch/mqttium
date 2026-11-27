@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import re
+import resource
 import signal
 import socket
 import subprocess
@@ -25,6 +26,18 @@ def mosquitto_identity(binary: Path | str) -> dict:
         raise ValueError(f"cannot read Mosquitto version from {path}")
     with path.open("rb") as source:
         return {"version": version.group(1), "sha256": hashlib.file_digest(source, "sha256").hexdigest()}
+
+
+def process_cpu_seconds(pid: int) -> float:
+    """User and system CPU seconds of a live process, from /proc."""
+    fields = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()
+    return (int(fields[11]) + int(fields[12])) / os.sysconf("SC_CLK_TCK")
+
+
+def children_cpu_seconds() -> float:
+    """User and system CPU seconds of the children this process waited for."""
+    usage = resource.getrusage(resource.RUSAGE_CHILDREN)
+    return usage.ru_utime + usage.ru_stime
 
 
 def free_port() -> int:
@@ -141,6 +154,10 @@ def run_one(
                 ]
             else:
                 lines += ["allow_anonymous true"]
+            if os.geteuid() == 0:
+                # Run as root, Mosquitto would drop to `nobody` and could not
+                # read the ACL and keys of this private directory.
+                lines += ["user root"]
             lines += ["persistence false", "log_type error", ""]
             config_text = "\n".join(lines)
             conf.write_text(config_text)
@@ -202,13 +219,21 @@ def run_one(
                 ]
                 if gen_cpus:
                     dcmd = ["taskset", "-c", gen_cpus, *dcmd]
+                broker_before = process_cpu_seconds(proc.pid)
+                generator_before = children_cpu_seconds()
                 res = subprocess.run(dcmd, capture_output=True, text=True, timeout=45)
+                generator_cpu = children_cpu_seconds() - generator_before
+                broker_cpu = process_cpu_seconds(proc.pid) - broker_before
                 if res.returncode != 0:
                     raise RuntimeError(
                         f"driver failed ({res.returncode}): {res.stderr}\n{log.read_text()}"
                     )
                 row = json.loads(res.stdout.strip())
                 row["broker"] = kind
+                # CPU while the driver ran, its drain included: the
+                # broker's start and stop are not counted.
+                row["broker_cpu_s"] = broker_cpu
+                row["generator_cpu_s"] = generator_cpu
                 row["work_dir_backing"] = backing_info(d)
                 row["db_present"] = db_path.exists()
                 row["db_bytes"] = db_path.stat().st_size if db_path.exists() else 0

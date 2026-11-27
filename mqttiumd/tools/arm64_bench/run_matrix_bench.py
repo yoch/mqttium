@@ -14,7 +14,7 @@ import subprocess
 import tempfile
 import time
 
-from run_arm64_bench import mosquitto_identity
+from run_arm64_bench import children_cpu_seconds, mosquitto_identity, process_cpu_seconds
 
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parents[1]
@@ -97,8 +97,16 @@ def run_case(
                 "--host", "127.0.0.1", "--port", str(port),
                 *case_args,
             ]
+            broker_before = process_cpu_seconds(proc.pid)
+            generator_before = children_cpu_seconds()
             res = subprocess.run(gen_cmd, capture_output=True, text=True, check=True)
+            generator_cpu = children_cpu_seconds() - generator_before
+            broker_cpu = process_cpu_seconds(proc.pid) - broker_before
             data = json.loads(res.stdout.strip().splitlines()[-1])
+            # CPU while the driver ran: the broker's start and stop are not
+            # counted.
+            data["broker_cpu_s"] = broker_cpu
+            data["generator_cpu_s"] = generator_cpu
             data["label"] = label
             data["case"] = case_name
             return data
