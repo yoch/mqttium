@@ -288,13 +288,6 @@ struct Route {
     options: crate::contract::pubsub::SubscriptionOptions,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-struct Limits {
-    max_targets: u32,
-    max_topic_bytes: u32,
-    max_payload_bytes: PayloadBytes,
-}
-
 /// The effects whose results the owner applies to one operation (ADR 0001,
 /// audit F3). The invariants, for the correspondence with model M1:
 ///
@@ -1165,7 +1158,7 @@ pub struct Owner {
     /// The order of the inventory read so far, while the owner recovers.
     recovery: Option<RecoveryOrder>,
     epoch_recovered: bool,
-    limits: Option<Limits>,
+    limits: Option<ShardLimits>,
     route_revision: Option<Revision>,
     routes: BoundedVec<Route>,
     route_index: routing::RouteIndex,
@@ -4710,7 +4703,7 @@ impl Owner {
                 max_topic_bytes,
                 max_payload_bytes,
             } => {
-                self.limits = Some(Limits {
+                self.limits = Some(ShardLimits {
                     max_targets: *max_targets_per_admission,
                     max_topic_bytes: *max_topic_bytes,
                     max_payload_bytes: *max_payload_bytes,

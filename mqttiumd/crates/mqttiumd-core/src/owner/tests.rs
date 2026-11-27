@@ -166,7 +166,7 @@ struct Snapshot {
     counters: Counters,
     recovery: Option<RecoveryOrder>,
     epoch_recovered: bool,
-    limits: Option<Limits>,
+    limits: Option<ShardLimits>,
     route_revision: Option<Revision>,
     routes: Vec<Route>,
     sessions: Vec<Session>,

@@ -18,7 +18,7 @@ use core::num::NonZeroUsize;
 use super::connections::Connection;
 use super::deliveries::{Delivery, Phase};
 use super::pubsub::{Emission, Volatile};
-use super::{Draft, Effects, Limits, Owner, OwnerConfig, OwnerRefused, Stop, draw};
+use super::{Draft, Effects, Owner, OwnerConfig, OwnerRefused, Stop, draw};
 use crate::contract::capacity::{CapacityNeed, PayloadBytes, Resource, WakeCondition};
 use crate::contract::effects::{Effect, EffectReservation, EffectSink, Input, Outbox};
 use crate::contract::ids::{
@@ -32,8 +32,9 @@ use crate::contract::pubsub::{DeliveryClaim, Qos0DropReason, Qos0Origin};
 use crate::contract::session::SessionExpiry;
 use crate::contract::step::{CoreFault, Exhaustion, Progress, StepOutcome, TurnGrant};
 
-/// Recovered store limits needed to construct a standalone `DeliveryShard`
-/// owner without running a recovery inventory pass.
+/// The store limits recovery gives an owner (`RecoveredFact::Limits`). A
+/// `DeliveryShard` owner runs no recovery inventory and receives the
+/// coordinator's instead.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct ShardLimits {
     pub max_targets: u32,
@@ -151,11 +152,7 @@ impl Owner {
         let mut owner = Self::new(config, outbox)?;
         owner.recovery = None;
         owner.epoch_recovered = true;
-        owner.limits = Some(Limits {
-            max_targets: limits.max_targets,
-            max_topic_bytes: limits.max_topic_bytes,
-            max_payload_bytes: limits.max_payload_bytes,
-        });
+        owner.limits = Some(limits);
         owner.route_revision = Some(Revision::new(0));
         owner.inline_claim_enabled = true;
         Ok(owner)
@@ -165,11 +162,7 @@ impl Owner {
     /// supplied them.
     #[must_use]
     pub fn shard_limits(&self) -> Option<ShardLimits> {
-        self.limits.map(|l| ShardLimits {
-            max_targets: l.max_targets,
-            max_topic_bytes: l.max_topic_bytes,
-            max_payload_bytes: l.max_payload_bytes,
-        })
+        self.limits
     }
 
     /// Configures this Coordinator owner to delegate outgoing deliveries
