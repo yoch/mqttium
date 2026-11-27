@@ -15,7 +15,8 @@ the passes.
         --cases fanout-1x16-q1 --passes 6 --out runs.jsonl
     run_ab_campaign.py --summary runs.jsonl
 
-A target is LABEL=EXECUTABLE[,ARG...]: the arguments are added to the
+A matrix case NAME@RATE plays NAME at another total rate. A target is
+LABEL=EXECUTABLE[,ARG...]: the arguments are added to the
 broker's command line. The label `mosquitto` names a Mosquitto executable,
 which runs with `persistence false` and is only meaningful against
 `--mode volatile`. Modes: volatile (no database), log and durable, on
@@ -53,6 +54,15 @@ def parse_target(text: str) -> tuple[str, Path, list[str]]:
     return label, Path(executable).resolve(), args
 
 
+def matrix_arguments(case: str) -> list[str]:
+    """The driver's arguments of a matrix case; NAME@RATE sets its rate."""
+    name, _, rate = case.partition("@")
+    arguments = list(dict(SCENARIOS)[name])
+    if rate:
+        arguments[arguments.index("--rate") + 1] = str(int(rate))
+    return arguments
+
+
 def load_average() -> float:
     return float(Path("/proc/loadavg").read_text().split()[0])
 
@@ -68,7 +78,7 @@ def campaign(args: argparse.Namespace) -> None:
         driver = ensure_matrix_driver()
         known = dict(SCENARIOS)
         cases = [c.strip() for c in args.cases.split(",") if c.strip()] or list(known)
-        unknown = [c for c in cases if c not in known]
+        unknown = [c for c in cases if c.partition("@")[0] not in known]
         if unknown:
             raise SystemExit(f"unknown matrix cases: {unknown}")
     identities = {
@@ -113,7 +123,7 @@ def campaign(args: argparse.Namespace) -> None:
                             path,
                             broker_args,
                             case,
-                            dict(SCENARIOS)[case],
+                            matrix_arguments(case),
                             args.work_dir,
                             args.broker_cpus,
                             args.gen_cpus,
