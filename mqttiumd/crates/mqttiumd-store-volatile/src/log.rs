@@ -54,7 +54,7 @@ use mqttiumd_store_api::{
 };
 use mqttiumd_store_sqlite::{
     GroupRefused, OpenError, Settings, SqliteStore, StoragePolicy, WriterLease,
-    acquire_writer_lock, save_state_atomic,
+    acquire_writer_lock, save_state_atomic, sync_parent_dir,
 };
 
 use crate::{UNKNOWN, VolatileStore};
@@ -168,16 +168,6 @@ fn wal_temp_path(wal_path: &Path) -> PathBuf {
     let mut name = wal_path.as_os_str().to_os_string();
     name.push(format!(".rotate.{}.{seq}.tmp", std::process::id()));
     PathBuf::from(name)
-}
-
-fn sync_parent_dir(path: &Path) -> Result<(), OpenError> {
-    let dir = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    File::open(dir)
-        .and_then(|handle| handle.sync_all())
-        .map_err(OpenError::WriterLock)
 }
 
 fn encode_wal_header(incarnation: StoreIncarnation, base_revision: u64) -> [u8; 24] {

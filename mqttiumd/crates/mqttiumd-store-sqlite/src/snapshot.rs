@@ -72,7 +72,10 @@ fn create_temp_with_permissions(
     Ok(())
 }
 
-fn sync_parent_dir(path: &Path) -> Result<(), OpenError> {
+/// Makes durable the directory entry of `path`: opens its parent directory
+/// (the current one for a bare name) and syncs it. Used after a rename
+/// that replaces a file of the store.
+pub fn sync_parent_dir(path: &Path) -> Result<(), OpenError> {
     let dir = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())

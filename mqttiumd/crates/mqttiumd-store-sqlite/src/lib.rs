@@ -188,7 +188,7 @@ pub use policy_transition::{
 };
 pub use schema::{FORMAT, SCHEMA_VERSION};
 pub use security::{SECURE_SCHEMA_VERSION, StoragePolicy};
-pub use snapshot::save_state_atomic;
+pub use snapshot::{save_state_atomic, sync_parent_dir};
 
 #[derive(Clone, Copy)]
 struct Admission<'a> {
