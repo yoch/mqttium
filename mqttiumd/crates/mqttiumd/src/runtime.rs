@@ -1130,12 +1130,29 @@ impl Runtime<'_> {
                 && !self.checkpoint_degraded
             {
                 self.checkpoint_degraded = true;
-                self.events.emit("session_clock_degraded", json!({"details":{"code":"checkpoint_late","age_ms":self.last_clock_checkpoint.elapsed().as_millis().to_string()}})).map_err(event_failure)?;
+                self.events.emit("session_clock_degraded", json!({
+                    "details": {
+                        "code": "checkpoint_late",
+                        "age_ms": self.last_clock_checkpoint.elapsed().as_millis().to_string(),
+                    },
+                })).map_err(event_failure)?;
             }
         }
         let inventory = (self.expiry_timers.len(), self.clock_checkpoint.is_some());
         if self.last_expiry_inventory != Some(inventory) {
-            self.events.emit("expiry_inventory", json!({"details":{"finite_timers":inventory.0,"checkpoint_inflight":inventory.1,"queued":self.expiry_inputs.len(),"period_ms":30000}})).map_err(event_failure)?;
+            self.events
+                .emit(
+                    "expiry_inventory",
+                    json!({
+                        "details": {
+                            "finite_timers": inventory.0,
+                            "checkpoint_inflight": inventory.1,
+                            "queued": self.expiry_inputs.len(),
+                            "period_ms": 30000,
+                        },
+                    }),
+                )
+                .map_err(event_failure)?;
             self.last_expiry_inventory = Some(inventory);
         }
         Ok(())
@@ -1381,7 +1398,15 @@ impl Runtime<'_> {
                 has_opened_by: false,
             },
         );
-        self.events.emit("connection_opened", json!({"connection":self.generation.get().to_string(),"details":{"send_buffer_bytes":sendbuf}})).map_err(event_failure)?;
+        self.events
+            .emit(
+                "connection_opened",
+                json!({
+                    "connection": self.generation.get().to_string(),
+                    "details": {"send_buffer_bytes": sendbuf},
+                }),
+            )
+            .map_err(event_failure)?;
         Ok(true)
     }
     fn queue(&mut self, input: Input) -> Result<(), Failure> {
@@ -1957,11 +1982,30 @@ impl Runtime<'_> {
                 && self.timers.is_empty()
                 && self.owner.outbox().is_empty();
             if complete {
-                self.events.emit("session_shutdown_completed", json!({"details":{"persistent_sessions":self.sessions.len(),"owner_bindings":status.bindings}})).map_err(event_failure)?;
+                self.events
+                    .emit(
+                        "session_shutdown_completed",
+                        json!({
+                            "details": {
+                                "persistent_sessions": self.sessions.len(),
+                                "owner_bindings": status.bindings,
+                            },
+                        }),
+                    )
+                    .map_err(event_failure)?;
                 return Ok(());
             }
             if Instant::now() >= deadline {
-                let mut fields = json!({"details":{"code":"pending_or_unknown","phase":"Shutdown","lifecycle_pending":status.lifecycle_pending,"retired_flights":status.retired_flights,"in_flight":self.inflight.len()+self.lifecycle_inflight.len(),"closing_inputs":self.closing_inputs.len()}});
+                let mut fields = json!({
+                    "details": {
+                        "code": "pending_or_unknown",
+                        "phase": "Shutdown",
+                        "lifecycle_pending": status.lifecycle_pending,
+                        "retired_flights": status.retired_flights,
+                        "in_flight": self.inflight.len()+self.lifecycle_inflight.len(),
+                        "closing_inputs": self.closing_inputs.len(),
+                    },
+                });
                 if let Some((pending, _)) = self.owner.lifecycle_dispatch() {
                     fields["operation"] = operation(pending);
                 }
@@ -1992,7 +2036,15 @@ impl Runtime<'_> {
                 return Err(Failure::plain("lifecycle_origin_mismatch"));
             }
             if changed_by.sequence() <= previous.sequence() {
-                self.events.emit("session_change_ignored", json!({"operation":operation(changed_by),"details":{"code":"stale_lifecycle_result"}})).map_err(event_failure)?;
+                self.events
+                    .emit(
+                        "session_change_ignored",
+                        json!({
+                            "operation": operation(changed_by),
+                            "details": {"code": "stale_lifecycle_result"},
+                        }),
+                    )
+                    .map_err(event_failure)?;
                 return Ok(());
             }
         }
@@ -2098,7 +2150,15 @@ impl Runtime<'_> {
                 }
                 self.expiry_timers.remove(&session);
 
-                let mut fields = json!({"operation":operation(changed_by),"details":{"session":session.get().to_string(),"session_present":session_present,"expiry":expiry_json(expiry),"source":"lifecycle_commit"}});
+                let mut fields = json!({
+                    "operation": operation(changed_by),
+                    "details": {
+                        "session": session.get().to_string(),
+                        "session_present": session_present,
+                        "expiry": expiry_json(expiry),
+                        "source": "lifecycle_commit",
+                    },
+                });
                 if let Some(generation) = connection {
                     fields["connection"] = json!(generation.get().to_string());
                 }
@@ -2148,17 +2208,28 @@ impl Runtime<'_> {
                 route_revision,
                 cancelled,
             } => json!({
-                "action":"Opened","session":session.get().to_string(),"revision":revision.get().to_string(),
-                "session_present":session_present,"expiry":expiry_json(expiry),
-                "retired_session":retired.map(|id|id.get().to_string()),"route_revision":route_revision.get().to_string(),
-                "cancelled_inbound":cancelled.inbound,"cancelled_deliveries":cancelled.deliveries,"cancelled_routes":cancelled.routes
+                "action": "Opened",
+                "session": session.get().to_string(),
+                "revision": revision.get().to_string(),
+                "session_present": session_present,
+                "expiry": expiry_json(expiry),
+                "retired_session": retired.map(|id|id.get().to_string()),
+                "route_revision": route_revision.get().to_string(),
+                "cancelled_inbound": cancelled.inbound,
+                "cancelled_deliveries": cancelled.deliveries,
+                "cancelled_routes": cancelled.routes,
             }),
             SessionChange::Detached {
                 session,
                 expiry,
                 detached,
             } => {
-                let mut details = json!({"action":"Detached","session":session.get().to_string(),"expiry":expiry_json(expiry),"detached_by":operation_text(detached.operation)});
+                let mut details = json!({
+                    "action": "Detached",
+                    "session": session.get().to_string(),
+                    "expiry": expiry_json(expiry),
+                    "detached_by": operation_text(detached.operation),
+                });
                 if let Some(deadline) = detached.deadline {
                     details["deadline"] = json!(deadline.to_string());
                 }
@@ -2169,8 +2240,12 @@ impl Runtime<'_> {
                 route_revision,
                 cancelled,
             } => json!({
-                "action":"Closed","session":session.get().to_string(),"route_revision":route_revision.get().to_string(),
-                "cancelled_inbound":cancelled.inbound,"cancelled_deliveries":cancelled.deliveries,"cancelled_routes":cancelled.routes
+                "action": "Closed",
+                "session": session.get().to_string(),
+                "route_revision": route_revision.get().to_string(),
+                "cancelled_inbound": cancelled.inbound,
+                "cancelled_deliveries": cancelled.deliveries,
+                "cancelled_routes": cancelled.routes,
             }),
         };
         // No ClientID or payload bytes enter bounded lifecycle diagnostics.
@@ -2224,11 +2299,28 @@ impl Runtime<'_> {
             return Ok(());
         }
         self.last_session_cardinality = Some(values);
-        self.events.emit("session_cardinality", json!({"details":{
-            "session_cache":values[0],"owner_sessions":values[1],"owner_bindings":values[2],"work_requests":values[3],"work_ready":values[4],
-            "emit_registrations":values[5],"lifecycle_requests":values[6],"closed_generations":values[7],"retired_flights":values[8],
-            "owner_inbound":values[9],"owner_outgoing":values[10],"frames":values[11],"timers":values[12]
-        }})).map_err(event_failure)
+        self.events
+            .emit(
+                "session_cardinality",
+                json!({
+                    "details": {
+                        "session_cache": values[0],
+                        "owner_sessions": values[1],
+                        "owner_bindings": values[2],
+                        "work_requests": values[3],
+                        "work_ready": values[4],
+                        "emit_registrations": values[5],
+                        "lifecycle_requests": values[6],
+                        "closed_generations": values[7],
+                        "retired_flights": values[8],
+                        "owner_inbound": values[9],
+                        "owner_outgoing": values[10],
+                        "frames": values[11],
+                        "timers": values[12],
+                    },
+                }),
+            )
+            .map_err(event_failure)
     }
 
     /// Already collected TCP facts precede the logical close. The transport
@@ -3025,7 +3117,14 @@ impl Runtime<'_> {
                                 .map_err(event_failure)?;
                         }
                         if let Some((id, delivery)) = finish {
-                            self.events.emit_with("core_finish_observed",||json!({"operation":operation(id),"details":{"delivery":delivery_text(delivery)}})).map_err(event_failure)?;
+                            self.events
+                                .emit_with("core_finish_observed", || {
+                                    json!({
+                                        "operation": operation(id),
+                                        "details": {"delivery": delivery_text(delivery)},
+                                    })
+                                })
+                                .map_err(event_failure)?;
                         }
                         if wakes_business || returns_credit {
                             if self.capacity_waiters != 0 {
@@ -3063,7 +3162,19 @@ impl Runtime<'_> {
                                             .receipt_status()
                                             .map(|(_, s, h)| (s, h))
                                             .unwrap_or((0, 0));
-                                        self.events.emit("receipt_window_pressure",json!({"details":{"resource":"ReceiptSlots","code":"receipt_window_business_full","span":span,"unconsumed_holes":holes}})).map_err(event_failure)?;
+                                        self.events
+                                            .emit(
+                                                "receipt_window_pressure",
+                                                json!({
+                                                    "details": {
+                                                        "resource": "ReceiptSlots",
+                                                        "code": "receipt_window_business_full",
+                                                        "span": span,
+                                                        "unconsumed_holes": holes,
+                                                    },
+                                                }),
+                                            )
+                                            .map_err(event_failure)?;
                                     }
                                 }
                                 self.defer(packet, from_retry)
@@ -3111,7 +3222,19 @@ impl Runtime<'_> {
                             Input::Packet { connection, .. } => {
                                 // No transition applied and no effect was submitted for this packet.
                                 // Close its transport rather than reorder its positive acknowledgements.
-                                self.events.emit("input_capacity_refused",json!({"connection":connection.get().to_string(),"details":{"accepted_command_rejected":false,"resource":format!("{:?}",need.resource),"wake":format!("{:?}",need.wake)}})).map_err(event_failure)?;
+                                self.events
+                                    .emit(
+                                        "input_capacity_refused",
+                                        json!({
+                                            "connection": connection.get().to_string(),
+                                            "details": {
+                                                "accepted_command_rejected": false,
+                                                "resource": format!("{:?}",need.resource),
+                                                "wake": format!("{:?}",need.wake),
+                                            },
+                                        }),
+                                    )
+                                    .map_err(event_failure)?;
                                 self.close(connection, "input_capacity")?;
                             }
                             other if Self::terminal_input(&other) => {
@@ -3413,7 +3536,15 @@ impl Runtime<'_> {
                     mqttiumd_core::owner::WillDeferredReason::PayloadLimit => "payload_limit",
                     mqttiumd_core::owner::WillDeferredReason::StoreRefusal => "store_refusal",
                 };
-                self.events.emit("will_deferred",json!({"operation":operation(id),"details":{"code":code,"durable_intention_preserved":true}})).map_err(event_failure)?;
+                self.events
+                    .emit(
+                        "will_deferred",
+                        json!({
+                            "operation": operation(id),
+                            "details": {"code": code, "durable_intention_preserved": true},
+                        }),
+                    )
+                    .map_err(event_failure)?;
             }
             self.last_will_deferred = deferred;
         }
@@ -3693,7 +3824,15 @@ impl Runtime<'_> {
                         reply,
                     })?;
                 } else {
-                    self.events.emit("receipt_collection_result_ignored",json!({"command_kind":"ReceiptCollection","details":crate::writer::collection_details(collection)})).map_err(event_failure)?;
+                    self.events
+                        .emit(
+                            "receipt_collection_result_ignored",
+                            json!({
+                                "command_kind": "ReceiptCollection",
+                                "details": crate::writer::collection_details(collection),
+                            }),
+                        )
+                        .map_err(event_failure)?;
                 }
             }
             ControlResponse::Lifecycle {
@@ -3724,7 +3863,10 @@ impl Runtime<'_> {
                         reply,
                     });
                 } else {
-                    self.events.emit("session_result_ignored", json!({"operation":crate::events::operation(operation),"details":{"effect":effect_text(effect),"code":"stale_lifecycle_result"}})).map_err(event_failure)?;
+                    self.events.emit("session_result_ignored", json!({
+                        "operation": crate::events::operation(operation),
+                        "details": {"effect": effect_text(effect), "code": "stale_lifecycle_result"},
+                    })).map_err(event_failure)?;
                 }
             }
             ControlResponse::MessageExpiryUnknown { now, after } => {
@@ -3787,7 +3929,17 @@ impl Runtime<'_> {
                     self.last_clock_checkpoint = Instant::now();
                     self.checkpoint_degraded = false;
                 }
-                self.events.emit("session_clock_checkpoint", json!({"details":{"logical":self.clock_anchor.logical.to_string(),"tick":self.clock_anchor.reading.tick.to_string()}})).map_err(event_failure)?;
+                self.events
+                    .emit(
+                        "session_clock_checkpoint",
+                        json!({
+                            "details": {
+                                "logical": self.clock_anchor.logical.to_string(),
+                                "tick": self.clock_anchor.reading.tick.to_string(),
+                            },
+                        }),
+                    )
+                    .map_err(event_failure)?;
             }
             ControlResponse::Failed(failure) => return Err(failure),
             ControlResponse::Closed { .. } => {
@@ -3954,7 +4106,17 @@ impl Runtime<'_> {
                             session,
                             result,
                         });
-                        self.events.emit("work_page_held",json!({"details":{"session":session.get().to_string(),"effect":effect_text(effect)}})).map_err(event_failure)?;
+                        self.events
+                            .emit(
+                                "work_page_held",
+                                json!({
+                                    "details": {
+                                        "session": session.get().to_string(),
+                                        "effect": effect_text(effect),
+                                    },
+                                }),
+                            )
+                            .map_err(event_failure)?;
                         continue;
                     }
                     if self.work_reads.remove(&effect) != Some(session) {
@@ -3963,7 +4125,18 @@ impl Runtime<'_> {
                     let page = result.map_err(|e| Failure::read(e, ReadPhase::Work))?;
                     self.session_cardinality_dirty = true;
                     if !self.session_ids.contains(&session) {
-                        self.events.emit("work_page_ignored", json!({"details":{"session":session.get().to_string(),"effect":effect_text(effect),"code":"retired_session"}})).map_err(event_failure)?;
+                        self.events
+                            .emit(
+                                "work_page_ignored",
+                                json!({
+                                    "details": {
+                                        "session": session.get().to_string(),
+                                        "effect": effect_text(effect),
+                                        "code": "retired_session",
+                                    },
+                                }),
+                            )
+                            .map_err(event_failure)?;
                         continue;
                     }
                     #[cfg(feature = "test-hooks")]
@@ -4176,7 +4349,24 @@ impl Runtime<'_> {
                 );
             }
         }
-        self.events.emit("connect_validated",json!({"connection":generation.get().to_string(),"details":{"protocol_level":connect.version.level(),"keep_alive":connect.keep_alive,"max_packet_size":connect.max_packet_size,"receive_maximum":connect.receive_maximum,"topic_alias_maximum":connect.topic_alias_maximum,"request_problem_information":connect.request_problem_information,"clean_start":connect.clean_start,"expiry":expiry_json(connect.expiry)}})).map_err(event_failure)?;
+        self.events
+            .emit(
+                "connect_validated",
+                json!({
+                    "connection": generation.get().to_string(),
+                    "details": {
+                        "protocol_level": connect.version.level(),
+                        "keep_alive": connect.keep_alive,
+                        "max_packet_size": connect.max_packet_size,
+                        "receive_maximum": connect.receive_maximum,
+                        "topic_alias_maximum": connect.topic_alias_maximum,
+                        "request_problem_information": connect.request_problem_information,
+                        "clean_start": connect.clean_start,
+                        "expiry": expiry_json(connect.expiry),
+                    },
+                }),
+            )
+            .map_err(event_failure)?;
         let now_ns = self.elapsed_ns(Instant::now());
         if let Some(p) = self.peers.get_mut(&generation) {
             if p.connected || p.pending {
@@ -4189,7 +4379,15 @@ impl Runtime<'_> {
         }
         #[cfg(feature = "test-hooks")]
         if self.captured.is_none() {
-            self.events.emit("input_captured",json!({"connection":generation.get().to_string(),"details":{"packet_kind":"CONNECT"}})).map_err(event_failure)?;
+            self.events
+                .emit(
+                    "input_captured",
+                    json!({
+                        "connection": generation.get().to_string(),
+                        "details": {"packet_kind": "CONNECT"},
+                    }),
+                )
+                .map_err(event_failure)?;
             self.captured = Some((generation, connect.clone()));
         }
         self.queue(Input::ConnectionSettings {
@@ -4484,7 +4682,15 @@ impl Runtime<'_> {
         ) {
             Ok(v) => v,
             Err(error) => {
-                self.events.emit("packet_refused",json!({"connection":generation.get().to_string(),"details":{"code":error.code(),"reason":error.reason_code()}})).map_err(event_failure)?;
+                self.events
+                    .emit(
+                        "packet_refused",
+                        json!({
+                            "connection": generation.get().to_string(),
+                            "details": {"code": error.code(), "reason": error.reason_code()},
+                        }),
+                    )
+                    .map_err(event_failure)?;
                 // Refusal output has the same bounded absolute write path as business frames.
                 if let Some(p) = self.peers.get_mut(&generation) {
                     let cap = if p.connected {
@@ -4619,12 +4825,18 @@ impl Runtime<'_> {
                     return Err(Failure::plain("timed_publish_kind"));
                 };
                 *saved = Some(expiry);
-                self.events.emit("message_expiry_received", json!({"connection":generation.get().to_string(),"details":{
-                    "topic":std::str::from_utf8(topic.as_slice()).map_err(|_| Failure::plain("invalid_topic"))?.chars().take(256).collect::<String>(),
-                    "qos":qos.to_wire(),"retain":retain,"interval":interval,
-                    "authority":"reader_frame_completion",
-                    "domain":hex_domain(observed.domain),"tick":observed.tick.to_string()
-                }})).map_err(event_failure)?;
+                self.events.emit("message_expiry_received", json!({
+                    "connection": generation.get().to_string(),
+                    "details": {
+                        "topic": std::str::from_utf8(topic.as_slice()).map_err(|_| Failure::plain("invalid_topic"))?.chars().take(256).collect::<String>(),
+                        "qos": qos.to_wire(),
+                        "retain": retain,
+                        "interval": interval,
+                        "authority": "reader_frame_completion",
+                        "domain": hex_domain(observed.domain),
+                        "tick": observed.tick.to_string(),
+                    },
+                })).map_err(event_failure)?;
                 self.message_clock_needed = true;
                 Packet::Core(packet)
             }
@@ -4679,7 +4891,10 @@ impl Runtime<'_> {
                     && expiry.is_some_and(|value| value != SessionExpiry::OnDisconnect)
                 {
                     let bytes = codec::disconnect_reason(0x82);
-                    self.events.emit("packet_refused", json!({"connection":generation.get().to_string(),"details":{"code":"SessionExpiryIncreaseForbidden","reason":0x82}})).map_err(event_failure)?;
+                    self.events.emit("packet_refused", json!({
+                        "connection": generation.get().to_string(),
+                        "details": {"code": "SessionExpiryIncreaseForbidden", "reason": 0x82},
+                    })).map_err(event_failure)?;
                     if bytes.len() <= p.max_packet_bytes()
                         && p.io
                             .try_send_outgoing(net::Write {
@@ -4759,7 +4974,15 @@ impl Runtime<'_> {
                             mqttiumd_contract::packet::Qos::AtLeastOnce,
                         )
                         .is_ok();
-                    self.events.emit("qos0_receive_credit",json!({"connection":generation.get().to_string(),"details":{"charged":charged,"wrong_qos":1}})).map_err(event_failure)?;
+                    self.events
+                        .emit(
+                            "qos0_receive_credit",
+                            json!({
+                                "connection": generation.get().to_string(),
+                                "details": {"charged": charged, "wrong_qos": 1},
+                            }),
+                        )
+                        .map_err(event_failure)?;
                 }
                 if let InboundPacket::Publish {
                     packet_id: Some(id),
@@ -4771,7 +4994,19 @@ impl Runtime<'_> {
                     let pid = id.get();
                     let wire_qos = qos.to_wire();
                     let dup = *dup;
-                    self.events.emit_with("publish_validated", || json!({"connection":generation.get().to_string(),"details":{"packet_id":pid,"qos":wire_qos,"dup":dup,"publish_order":ingress_order.to_string()}})).map_err(event_failure)?;
+                    self.events
+                        .emit_with("publish_validated", || {
+                            json!({
+                                "connection": generation.get().to_string(),
+                                "details": {
+                                    "packet_id": pid,
+                                    "qos": wire_qos,
+                                    "dup": dup,
+                                    "publish_order": ingress_order.to_string(),
+                                },
+                            })
+                        })
+                        .map_err(event_failure)?;
                 }
                 if let InboundPacket::Publish {
                     packet_id: Some(id),
@@ -4831,7 +5066,15 @@ impl Runtime<'_> {
                             wire: pending_terminal,
                         });
                         self.pending_peers.insert(generation);
-                        self.events.emit("publish_waiting_wire",json!({"connection":generation.get().to_string(),"details":{"publish_order":ingress_order.to_string()}})).map_err(event_failure)?;
+                        self.events
+                            .emit(
+                                "publish_waiting_wire",
+                                json!({
+                                    "connection": generation.get().to_string(),
+                                    "details": {"publish_order": ingress_order.to_string()},
+                                }),
+                            )
+                            .map_err(event_failure)?;
                         return Ok(());
                     }
                     let bytes = net::FrameBytes::from_slice(&[0xe0, 2, 0x93, 0]);
@@ -5228,8 +5471,17 @@ impl Runtime<'_> {
                                 match incoming {
                                     net::Incoming::Authenticated { elapsed } => {
                                         non_ack_drained += 1;
-                                        self.events.emit("tls_authenticated", json!({"connection":generation.get().to_string(),
-                                            "details":{"version":"TLS1.3","handshake_us":elapsed.as_micros() as u64}}))
+                                        self.events
+                                            .emit(
+                                                "tls_authenticated",
+                                                json!({
+                                                    "connection": generation.get().to_string(),
+                                                    "details": {
+                                                        "version": "TLS1.3",
+                                                        "handshake_us": elapsed.as_micros() as u64,
+                                                    },
+                                                }),
+                                            )
                                             .map_err(event_failure)?;
                                     }
                                     net::Incoming::Packet {
@@ -5431,8 +5683,17 @@ impl Runtime<'_> {
                             }
                             match incoming {
                                 Ok(net::Incoming::Authenticated { elapsed }) => {
-                                    self.events.emit("tls_authenticated", json!({"connection":generation.get().to_string(),
-                                        "details":{"version":"TLS1.3","handshake_us":elapsed.as_micros() as u64}}))
+                                    self.events
+                                        .emit(
+                                            "tls_authenticated",
+                                            json!({
+                                                "connection": generation.get().to_string(),
+                                                "details": {
+                                                    "version": "TLS1.3",
+                                                    "handshake_us": elapsed.as_micros() as u64,
+                                                },
+                                            }),
+                                        )
                                         .map_err(event_failure)?;
                                 }
                                 Ok(net::Incoming::Packet {
@@ -5696,7 +5957,18 @@ impl Runtime<'_> {
                                     && matches!(frame.kind, "PUBLISH" | "PUBLISH0")
                             })
                         {
-                            self.events.emit("message_transmission_started",json!({"connection":connection.generation.get().to_string(),"details":{"effect":effect_text(effect),"authority":"positive_socket_write"}})).map_err(event_failure)?;
+                            self.events
+                                .emit(
+                                    "message_transmission_started",
+                                    json!({
+                                        "connection": connection.generation.get().to_string(),
+                                        "details": {
+                                            "effect": effect_text(effect),
+                                            "authority": "positive_socket_write",
+                                        },
+                                    }),
+                                )
+                                .map_err(event_failure)?;
                             self.queue(Input::FrameResult {
                                 effect,
                                 connection,
@@ -5716,7 +5988,19 @@ impl Runtime<'_> {
                             }
                             self.outgoing_bindings
                                 .retain(|_, value| value.frame != effect);
-                            self.events.emit("message_transmission_not_started",json!({"connection":connection.generation.get().to_string(),"details":{"effect":effect_text(effect),"reason":format!("{reason:?}"),"authority":"zero_socket_bytes"}})).map_err(event_failure)?;
+                            self.events
+                                .emit(
+                                    "message_transmission_not_started",
+                                    json!({
+                                        "connection": connection.generation.get().to_string(),
+                                        "details": {
+                                            "effect": effect_text(effect),
+                                            "reason": format!("{reason:?}"),
+                                            "authority": "zero_socket_bytes",
+                                        },
+                                    }),
+                                )
+                                .map_err(event_failure)?;
                             if pending.kind == "PUBLISH0" {
                                 let reason = match reason {
                                     mqttiumd_contract::message_expiry::MessageExpiryBlock::Expired => Qos0DropReason::MessageExpired,
@@ -5760,7 +6044,19 @@ impl Runtime<'_> {
                                 ));
                                 self.deferred_outgoing_written =
                                     Some((effect, connection, bytes, Instant::now()));
-                                self.events.emit("outgoing_written_held",json!({"connection":connection.generation.get().to_string(),"details":{"effect":effect_text(effect),"socket_write_complete":true,"bytes":bytes}})).map_err(event_failure)?;
+                                self.events
+                                    .emit(
+                                        "outgoing_written_held",
+                                        json!({
+                                            "connection": connection.generation.get().to_string(),
+                                            "details": {
+                                                "effect": effect_text(effect),
+                                                "socket_write_complete": true,
+                                                "bytes": bytes,
+                                            },
+                                        }),
+                                    )
+                                    .map_err(event_failure)?;
                                 continue;
                             }
                             #[cfg(feature = "test-hooks")]
@@ -5769,7 +6065,17 @@ impl Runtime<'_> {
                                 && let Some(pending) = self.frames.get(&effect)
                                 && pending.kind == "PUBACK"
                             {
-                                self.events.emit("barrier_hit", json!({"point":"ack.receipt","connection":generation.get().to_string(),"details":{"effect":effect_text(effect),"packet_id":pending.packet_id.unwrap_or(0),"publish_order":pending.receive_serial.map(|v|v.to_string()).unwrap_or_default(),"bytes":bytes,"socket_write_complete":true}})).map_err(event_failure)?;
+                                self.events.emit("barrier_hit", json!({
+                                    "point": "ack.receipt",
+                                    "connection": generation.get().to_string(),
+                                    "details": {
+                                        "effect": effect_text(effect),
+                                        "packet_id": pending.packet_id.unwrap_or(0),
+                                        "publish_order": pending.receive_serial.map(|v|v.to_string()).unwrap_or_default(),
+                                        "bytes": bytes,
+                                        "socket_write_complete": true,
+                                    },
+                                })).map_err(event_failure)?;
                                 self.deferred_ack_used = true;
                                 self.deferred_ack =
                                     Some((effect, connection, bytes, Instant::now()));
@@ -5857,7 +6163,16 @@ impl Runtime<'_> {
                     frame.wire_released |= released;
                     let frame_kind = frame.kind;
                     let frame_serial = frame.receive_serial;
-                    self.events.emit_with("wire_receive_credit",||json!({"connection":generation.get().to_string(),"details":{"effect":effect_text(progress.effect),"packet_kind":frame_kind,"packet_id":id,"publish_order":frame_serial.map(|v|v.to_string()).unwrap_or_default(),"released":released}})).map_err(event_failure)?;
+                    self.events.emit_with("wire_receive_credit",||json!({
+                        "connection": generation.get().to_string(),
+                        "details": {
+                            "effect": effect_text(progress.effect),
+                            "packet_kind": frame_kind,
+                            "packet_id": id,
+                            "publish_order": frame_serial.map(|v|v.to_string()).unwrap_or_default(),
+                            "released": released,
+                        },
+                    })).map_err(event_failure)?;
                 }
             }
             Ok(())
@@ -5922,7 +6237,15 @@ impl Runtime<'_> {
     ) -> Result<(), Failure> {
         let Some(pending) = self.frames.remove(&effect) else {
             if !self.peers.contains_key(&connection.generation) {
-                self.events.emit("frame_result_ignored", json!({"connection":connection.generation.get().to_string(),"details":{"effect":effect_text(effect),"code":"retired_transport"}})).map_err(event_failure)?;
+                self.events
+                    .emit(
+                        "frame_result_ignored",
+                        json!({
+                            "connection": connection.generation.get().to_string(),
+                            "details": {"effect": effect_text(effect), "code": "retired_transport"},
+                        }),
+                    )
+                    .map_err(event_failure)?;
                 return Ok(());
             }
             return Err(Failure::plain("uncorrelated_frame_result"));
@@ -5934,10 +6257,35 @@ impl Runtime<'_> {
         let generation = connection.generation;
         let (kind, id) = (pending.kind, pending.packet_id);
         if kind == "PUBLISH0" {
-            self.events.emit_with("frame_written",||json!({"connection":generation.get().to_string(),"details":{"packet_kind":"PUBLISH","qos":0,"effect":effect_text(effect),"bytes":bytes}})).map_err(event_failure)?;
+            self.events
+                .emit_with("frame_written", || {
+                    json!({
+                        "connection": generation.get().to_string(),
+                        "details": {
+                            "packet_kind": "PUBLISH",
+                            "qos": 0,
+                            "effect": effect_text(effect),
+                            "bytes": bytes,
+                        },
+                    })
+                })
+                .map_err(event_failure)?;
         } else if kind != "PINGRESP" || pending.was_retained {
             let serial = pending.receive_serial;
-            self.events.emit_with("frame_written",||json!({"connection":generation.get().to_string(),"details":{"packet_kind":kind,"effect":effect_text(effect),"packet_id":id.unwrap_or(0),"publish_order":serial.map(|v|v.to_string()).unwrap_or_default(),"bytes":bytes}})).map_err(event_failure)?;
+            self.events
+                .emit_with("frame_written", || {
+                    json!({
+                        "connection": generation.get().to_string(),
+                        "details": {
+                            "packet_kind": kind,
+                            "effect": effect_text(effect),
+                            "packet_id": id.unwrap_or(0),
+                            "publish_order": serial.map(|v|v.to_string()).unwrap_or_default(),
+                            "bytes": bytes,
+                        },
+                    })
+                })
+                .map_err(event_failure)?;
         }
         if kind == "PUBREC"
             && pending.terminal.is_none()
@@ -5964,7 +6312,20 @@ impl Runtime<'_> {
                 released
             };
             let serial = pending.receive_serial;
-            self.events.emit_with("receive_credit", || json!({"connection":generation.get().to_string(),"details":{"packet_kind":kind,"effect":effect_text(effect),"packet_id":id,"publish_order":serial.map(|v|v.to_string()).unwrap_or_default(),"released":released}})).map_err(event_failure)?;
+            self.events
+                .emit_with("receive_credit", || {
+                    json!({
+                        "connection": generation.get().to_string(),
+                        "details": {
+                            "packet_kind": kind,
+                            "effect": effect_text(effect),
+                            "packet_id": id,
+                            "publish_order": serial.map(|v|v.to_string()).unwrap_or_default(),
+                            "released": released,
+                        },
+                    })
+                })
+                .map_err(event_failure)?;
         }
         #[cfg(feature = "test-hooks")]
         if kind == "PUBLISH"
@@ -5982,7 +6343,15 @@ impl Runtime<'_> {
                     total: bytes as u64,
                 },
             ));
-            self.events.emit("outgoing_frame_result_copied",json!({"connection":generation.get().to_string(),"details":{"effect":effect_text(effect),"bytes":bytes}})).map_err(event_failure)?;
+            self.events
+                .emit(
+                    "outgoing_frame_result_copied",
+                    json!({
+                        "connection": generation.get().to_string(),
+                        "details": {"effect": effect_text(effect), "bytes": bytes},
+                    }),
+                )
+                .map_err(event_failure)?;
         }
         self.queue(Input::FrameResult {
             effect,
@@ -6008,13 +6377,24 @@ impl Runtime<'_> {
             if let Some((effect, connection, bytes, since)) = self.deferred_outgoing_written {
                 if !self.frames.contains_key(&effect) {
                     self.deferred_outgoing_written = None;
-                    self.events.emit("outgoing_written_discarded",json!({"connection":connection.generation.get().to_string(),"details":{"effect":effect_text(effect),"code":"connection_closed"}})).map_err(event_failure)?;
+                    self.events.emit("outgoing_written_discarded",json!({
+                        "connection": connection.generation.get().to_string(),
+                        "details": {"effect": effect_text(effect), "code": "connection_closed"},
+                    })).map_err(event_failure)?;
                 } else if since.elapsed() > Duration::from_secs(30) {
                     return Err(Failure::plain("outgoing_written_deadline"));
                 } else if consume_control(&dir.join("release-outgoing-written")) {
                     self.deferred_outgoing_written = None;
                     self.written_complete(effect, connection, bytes)?;
-                    self.events.emit("outgoing_written_released",json!({"connection":connection.generation.get().to_string(),"details":{"effect":effect_text(effect)}})).map_err(event_failure)?;
+                    self.events
+                        .emit(
+                            "outgoing_written_released",
+                            json!({
+                                "connection": connection.generation.get().to_string(),
+                                "details": {"effect": effect_text(effect)},
+                            }),
+                        )
+                        .map_err(event_failure)?;
                 }
             }
             if consume_control(&dir.join("replay-last-outgoing-frame-result")) {
@@ -6026,7 +6406,15 @@ impl Runtime<'_> {
                     connection,
                     progress,
                 })?;
-                self.events.emit("outgoing_frame_result_replayed",json!({"connection":connection.generation.get().to_string(),"details":{"effect":effect_text(effect)}})).map_err(event_failure)?;
+                self.events
+                    .emit(
+                        "outgoing_frame_result_replayed",
+                        json!({
+                            "connection": connection.generation.get().to_string(),
+                            "details": {"effect": effect_text(effect)},
+                        }),
+                    )
+                    .map_err(event_failure)?;
             }
             if consume_control(&dir.join("replay-last-finish-result")) {
                 let (effect, operation_id, reply) = self
@@ -6037,7 +6425,16 @@ impl Runtime<'_> {
                     operation: operation_id,
                     reply,
                 })?;
-                self.events.emit("finish_result_replayed",json!({"operation":operation(operation_id),"command_kind":"Finish","details":{"effect":effect_text(effect)}})).map_err(event_failure)?;
+                self.events
+                    .emit(
+                        "finish_result_replayed",
+                        json!({
+                            "operation": operation(operation_id),
+                            "command_kind": "Finish",
+                            "details": {"effect": effect_text(effect)},
+                        }),
+                    )
+                    .map_err(event_failure)?;
             }
         }
         if self
@@ -6061,7 +6458,18 @@ impl Runtime<'_> {
                 let page = result.map_err(|e| Failure::read(e, ReadPhase::Work))?;
                 self.session_cardinality_dirty = true;
                 if !self.session_ids.contains(&session) {
-                    self.events.emit("work_page_ignored", json!({"details":{"session":session.get().to_string(),"effect":effect_text(effect),"code":"retired_session"}})).map_err(event_failure)?;
+                    self.events
+                        .emit(
+                            "work_page_ignored",
+                            json!({
+                                "details": {
+                                    "session": session.get().to_string(),
+                                    "effect": effect_text(effect),
+                                    "code": "retired_session",
+                                },
+                            }),
+                        )
+                        .map_err(event_failure)?;
                     continue;
                 }
                 for item in page.items.as_slice() {
@@ -6114,7 +6522,16 @@ impl Runtime<'_> {
                     std::fs::remove_file(release).map_err(|_| Failure::plain("hook_release"))?;
                     self.deferred_ack = None;
                     self.written_complete(effect, connection, bytes)?;
-                    self.events.emit("barrier_released", json!({"point":"ack.receipt","connection":connection.generation.get().to_string(),"details":{"effect":effect_text(effect)}})).map_err(event_failure)?;
+                    self.events
+                        .emit(
+                            "barrier_released",
+                            json!({
+                                "point": "ack.receipt",
+                                "connection": connection.generation.get().to_string(),
+                                "details": {"effect": effect_text(effect)},
+                            }),
+                        )
+                        .map_err(event_failure)?;
                 }
             }
         }
@@ -6184,7 +6601,10 @@ impl AppliedSessionChange {
             SessionChange::Closed { session, .. } => ("Closed", session),
             SessionChange::Detached { session, .. } => ("Detached", session),
         };
-        let mut fields = json!({"operation":operation(self.operation),"details":{"action":action,"session":session.get().to_string()}});
+        let mut fields = json!({
+            "operation": operation(self.operation),
+            "details": {"action": action, "session": session.get().to_string()},
+        });
         if let Some(connection) = self.connection {
             fields["connection"] = json!(connection.get().to_string());
         }
@@ -6201,7 +6621,10 @@ struct SessionCloseObservation {
 #[cfg(feature = "test-hooks")]
 impl SessionCloseObservation {
     fn fields(self) -> serde_json::Value {
-        let mut fields = json!({"connection":self.generation.get().to_string(),"details":{"session":self.session.get().to_string()}});
+        let mut fields = json!({
+            "connection": self.generation.get().to_string(),
+            "details": {"session": self.session.get().to_string()},
+        });
         if let Some(token) = self.opened_by {
             fields["operation"] = operation(token);
         }
@@ -6358,7 +6781,18 @@ impl Sink<'_, '_> {
         {
             Ok(()) => {
                 self.lifecycle_inflight.insert(id, operation_id);
-                if self.events.emit("command_submitted", json!({"operation":operation(operation_id),"command_kind":"SessionLifecycle","details":details})).is_err() {
+                if self
+                    .events
+                    .emit(
+                        "command_submitted",
+                        json!({
+                            "operation": operation(operation_id),
+                            "command_kind": "SessionLifecycle",
+                            "details": details,
+                        }),
+                    )
+                    .is_err()
+                {
                     self.error = Some(Failure::plain("events_unavailable"));
                 }
                 SubmitResult::Accepted
@@ -6485,7 +6919,10 @@ impl EffectSink for Sink<'_, '_> {
                         self.close.push((generation, "session_refused"));
                     }
                 }
-                if self.events.emit("session_refused", json!({"connection":generation.get().to_string(),"details":{"reason_code":reason,"code":"lifecycle_rejected_certain"}})).is_err() {
+                if self.events.emit("session_refused", json!({
+                    "connection": generation.get().to_string(),
+                    "details": {"reason_code": reason, "code": "lifecycle_rejected_certain"},
+                })).is_err() {
                     self.error = Some(Failure::plain("events_unavailable"));
                 }
                 let _ = effect.into_parts();
@@ -6497,7 +6934,21 @@ impl EffectSink for Sink<'_, '_> {
                 reason,
             } => {
                 let (origin, target, reason) = (*origin, *target, *reason);
-                if self.events.emit_with("qos0_dropped",||json!({"details":{"origin":qos0_origin(origin),"target":target.map(|t|t.get().to_string()).unwrap_or_default(),"reason":reason.code()}})).is_err(){self.error=Some(Failure::plain("events_unavailable"));}
+                if self
+                    .events
+                    .emit_with("qos0_dropped", || {
+                        json!({
+                            "details": {
+                                "origin": qos0_origin(origin),
+                                "target": target.map(|t|t.get().to_string()).unwrap_or_default(),
+                                "reason": reason.code(),
+                            },
+                        })
+                    })
+                    .is_err()
+                {
+                    self.error = Some(Failure::plain("events_unavailable"));
+                }
                 let _ = effect.into_parts();
                 SubmitResult::Accepted
             }
@@ -6558,7 +7009,21 @@ impl EffectSink for Sink<'_, '_> {
                     if self.emission_barriers.len() >= IN_FLIGHT {
                         return refused(effect, SubmitBlock::QueueFull);
                     }
-                    if self.events.emit("barrier_hit",json!({"point":"consume.emission","command_kind":"Consume","operation":operation(id_op)})).is_err(){self.error=Some(Failure::plain("events_unavailable"));return refused(effect,SubmitBlock::Closed);}
+                    if self
+                        .events
+                        .emit(
+                            "barrier_hit",
+                            json!({
+                                "point": "consume.emission",
+                                "command_kind": "Consume",
+                                "operation": operation(id_op),
+                            }),
+                        )
+                        .is_err()
+                    {
+                        self.error = Some(Failure::plain("events_unavailable"));
+                        return refused(effect, SubmitBlock::Closed);
+                    }
                     self.emission_barriers.push_back(HeldEmission {
                         point: "consume.emission",
                         effect,
@@ -6650,7 +7115,23 @@ impl EffectSink for Sink<'_, '_> {
                                 was_retained: false,
                             },
                         );
-                        if self.events.emit_with("frame_queued",||json!({"connection":generation.get().to_string(),"details":{"packet_kind":"PUBLISH","qos":0,"origin":qos0_origin(origin),"effect":effect_text(id)}})).is_err(){self.error=Some(Failure::plain("events_unavailable"));}
+                        if self
+                            .events
+                            .emit_with("frame_queued", || {
+                                json!({
+                                    "connection": generation.get().to_string(),
+                                    "details": {
+                                        "packet_kind": "PUBLISH",
+                                        "qos": 0,
+                                        "origin": qos0_origin(origin),
+                                        "effect": effect_text(id),
+                                    },
+                                })
+                            })
+                            .is_err()
+                        {
+                            self.error = Some(Failure::plain("events_unavailable"));
+                        }
                     }
                     Err(reason) => self.push_terminal(Input::Qos0EmitRefused {
                         effect: id,
@@ -6858,7 +7339,11 @@ impl EffectSink for Sink<'_, '_> {
                             .events
                             .emit(
                                 "command_submitted",
-                                json!({"operation":operation(operation_id),"command_kind":command_kind,"details":details}),
+                                json!({
+                                    "operation": operation(operation_id),
+                                    "command_kind": command_kind,
+                                    "details": details,
+                                }),
                             )
                             .is_err()
                     {
@@ -6885,7 +7370,11 @@ impl EffectSink for Sink<'_, '_> {
                                 .events
                                 .emit(
                                     "command_submitted",
-                                    json!({"operation":operation(operation_id),"command_kind":command_kind,"details":details}),
+                                    json!({
+                                        "operation": operation(operation_id),
+                                        "command_kind": command_kind,
+                                        "details": details,
+                                    }),
                                 )
                                 .is_err()
                         {
@@ -6991,7 +7480,23 @@ impl EffectSink for Sink<'_, '_> {
                         && self.bindings.get(&connection.session) == Some(&generation)
                 }) else {
                     let _ = effect.into_parts();
-                    if self.events.emit("frame_failed",json!({"connection":generation.get().to_string(),"details":{"effect":effect_text(id),"packet_kind":kind,"code":"unusable_generation"}})).is_err(){self.error=Some(Failure::plain("events_unavailable"));}
+                    if self
+                        .events
+                        .emit(
+                            "frame_failed",
+                            json!({
+                                "connection": generation.get().to_string(),
+                                "details": {
+                                    "effect": effect_text(id),
+                                    "packet_kind": kind,
+                                    "code": "unusable_generation",
+                                },
+                            }),
+                        )
+                        .is_err()
+                    {
+                        self.error = Some(Failure::plain("events_unavailable"));
+                    }
                     self.push_terminal(Input::FrameResult {
                         effect: id,
                         connection,
@@ -7110,13 +7615,44 @@ impl EffectSink for Sink<'_, '_> {
                             },
                         );
                         let _ = effect.into_parts();
-                        if kind!="PINGRESP"&&self.events.emit_with("frame_queued",||json!({"connection":generation.get().to_string(),"details":{"packet_kind":kind,"effect":effect_text(id),"packet_id":packet_id.unwrap_or(0)}})).is_err(){self.error=Some(Failure::plain("events_unavailable"));}
+                        if kind != "PINGRESP"
+                            && self
+                                .events
+                                .emit_with("frame_queued", || {
+                                    json!({
+                                        "connection": generation.get().to_string(),
+                                        "details": {
+                                            "packet_kind": kind,
+                                            "effect": effect_text(id),
+                                            "packet_id": packet_id.unwrap_or(0),
+                                        },
+                                    })
+                                })
+                                .is_err()
+                        {
+                            self.error = Some(Failure::plain("events_unavailable"));
+                        }
                         SubmitResult::Accepted
                     }
                     Err(TrySendError::Full(_)) => {
                         self.mark_pending_peers.push(generation);
                         if peer.cold_mut().blocked_output.replace(id) != Some(id)
-                            && self.events.emit_with("effect_retained",||json!({"connection":generation.get().to_string(),"details":{"code":"output_queue_full","effect":effect_text(id),"packet_kind":kind}})).is_err(){self.error=Some(Failure::plain("events_unavailable"));}
+                            && self
+                                .events
+                                .emit_with("effect_retained", || {
+                                    json!({
+                                        "connection": generation.get().to_string(),
+                                        "details": {
+                                            "code": "output_queue_full",
+                                            "effect": effect_text(id),
+                                            "packet_kind": kind,
+                                        },
+                                    })
+                                })
+                                .is_err()
+                        {
+                            self.error = Some(Failure::plain("events_unavailable"));
+                        }
                         refused(effect, SubmitBlock::TransportBackpressure)
                     }
                     Err(TrySendError::Disconnected(_)) => {
@@ -7299,8 +7835,21 @@ impl EffectSink for Sink<'_, '_> {
                     if self.emission_barriers.len() >= IN_FLIGHT {
                         return refused(effect, SubmitBlock::QueueFull);
                     }
-                    if self.events.emit("barrier_hit",json!({"point":"publish.emission","command_kind":"Claim","operation":operation(claim),"details":{"delivery":delivery_text(delivery)}})).is_err() {
-                        self.error=Some(Failure::plain("events_unavailable")); return refused(effect, SubmitBlock::Closed);
+                    if self
+                        .events
+                        .emit(
+                            "barrier_hit",
+                            json!({
+                                "point": "publish.emission",
+                                "command_kind": "Claim",
+                                "operation": operation(claim),
+                                "details": {"delivery": delivery_text(delivery)},
+                            }),
+                        )
+                        .is_err()
+                    {
+                        self.error = Some(Failure::plain("events_unavailable"));
+                        return refused(effect, SubmitBlock::Closed);
                     }
                     self.emission_barriers.push_back(HeldEmission {
                         point: "publish.emission",
@@ -7421,14 +7970,49 @@ impl EffectSink for Sink<'_, '_> {
                             );
                         }
                         let _ = effect.into_parts();
-                        if self.events.emit_with("frame_queued",||json!({"connection":generation.get().to_string(),"details":{"packet_kind":"PUBLISH","effect":effect_text(id),"delivery":delivery_text(delivery),"target":connection.session.get().to_string(),"packet_id":packet_id.get(),"claim":operation_text(claim),"dup":dup,"retain":retain}})).is_err(){self.error=Some(Failure::plain("events_unavailable"));}
+                        if self
+                            .events
+                            .emit_with("frame_queued", || {
+                                json!({
+                                    "connection": generation.get().to_string(),
+                                    "details": {
+                                        "packet_kind": "PUBLISH",
+                                        "effect": effect_text(id),
+                                        "delivery": delivery_text(delivery),
+                                        "target": connection.session.get().to_string(),
+                                        "packet_id": packet_id.get(),
+                                        "claim": operation_text(claim),
+                                        "dup": dup,
+                                        "retain": retain,
+                                    },
+                                })
+                            })
+                            .is_err()
+                        {
+                            self.error = Some(Failure::plain("events_unavailable"));
+                        }
                         SubmitResult::Accepted
                     }
                     Err(TrySendError::Full(_)) => {
                         self.outgoing_bindings.remove(&binding_key);
                         self.mark_pending_peers.push(generation);
                         if peer.cold_mut().blocked_output.replace(id) != Some(id)
-                            && self.events.emit_with("effect_retained",||json!({"connection":generation.get().to_string(),"details":{"code":"output_queue_full","effect":effect_text(id),"packet_kind":"PUBLISH"}})).is_err(){self.error=Some(Failure::plain("events_unavailable"));}
+                            && self
+                                .events
+                                .emit_with("effect_retained", || {
+                                    json!({
+                                        "connection": generation.get().to_string(),
+                                        "details": {
+                                            "code": "output_queue_full",
+                                            "effect": effect_text(id),
+                                            "packet_kind": "PUBLISH",
+                                        },
+                                    })
+                                })
+                                .is_err()
+                        {
+                            self.error = Some(Failure::plain("events_unavailable"));
+                        }
                         refused(effect, SubmitBlock::TransportBackpressure)
                     }
                     Err(TrySendError::Disconnected(_)) => {
@@ -7458,12 +8042,42 @@ fn puback_fields(
     observation: Option<u64>,
     code: &str,
 ) -> serde_json::Value {
-    let target=target.map(|target|json!({"delivery_id":{"publication_id":{"incarnation":target.delivery.publication.incarnation().get().to_string(),"epoch":target.delivery.publication.epoch().get().to_string(),"owner":target.delivery.publication.owner().get().to_string(),"sequence":target.delivery.publication.sequence().get().to_string()},"index":target.delivery.index},"claim_operation_id":operation(target.claim),"frame_effect_id":{"epoch":target.frame.epoch.get().to_string(),"owner":target.frame.owner.get().to_string(),"sequence":target.frame.sequence.get().to_string()}}));
-    let mut puback = json!({"connection":{"session":connection.session.get().to_string(),"generation":connection.generation.get().to_string()},"packet_id":packet_id.get(),"reason_code":reason,"target":target});
+    let target = target.map(|target| {
+        json!({
+            "delivery_id": {
+                "publication_id": {
+                    "incarnation": target.delivery.publication.incarnation().get().to_string(),
+                    "epoch": target.delivery.publication.epoch().get().to_string(),
+                    "owner": target.delivery.publication.owner().get().to_string(),
+                    "sequence": target.delivery.publication.sequence().get().to_string(),
+                },
+                "index": target.delivery.index,
+            },
+            "claim_operation_id": operation(target.claim),
+            "frame_effect_id": {
+                "epoch": target.frame.epoch.get().to_string(),
+                "owner": target.frame.owner.get().to_string(),
+                "sequence": target.frame.sequence.get().to_string(),
+            },
+        })
+    });
+    let mut puback = json!({
+        "connection": {
+            "session": connection.session.get().to_string(),
+            "generation": connection.generation.get().to_string(),
+        },
+        "packet_id": packet_id.get(),
+        "reason_code": reason,
+        "target": target,
+    });
     if let Some(sequence) = observation {
         puback["source_observation_sequence"] = json!(sequence.to_string());
     }
-    json!({"connection":connection.generation.get().to_string(),"puback":puback,"details":{"authority":"reader_dequeue","code":code}})
+    json!({
+        "connection": connection.generation.get().to_string(),
+        "puback": puback,
+        "details": {"authority": "reader_dequeue", "code": code},
+    })
 }
 fn frame_info(frame: OutboundFrame) -> (&'static str, Option<u16>) {
     match frame {
@@ -7526,12 +8140,23 @@ fn recipe_details(recipe: &Recipe) -> serde_json::Value {
                 (v.publication, &v.topic)
             }
         };
-        return json!({"publication":format!("{:?}",publication),"topic":String::from_utf8_lossy(topic.as_slice()).chars().take(256).collect::<String>(),
-            "message_expiry_domain":hex_domain(value.expiry.observed.domain),"message_expiry_tick":value.expiry.observed.tick.to_string(),"message_expiry_interval":value.expiry.interval});
+        return json!({
+            "publication": format!("{:?}",publication),
+            "topic": String::from_utf8_lossy(topic.as_slice()).chars().take(256).collect::<String>(),
+            "message_expiry_domain": hex_domain(value.expiry.observed.domain),
+            "message_expiry_tick": value.expiry.observed.tick.to_string(),
+            "message_expiry_interval": value.expiry.interval,
+        });
     }
     match recipe {
         Recipe::WillPublication(value) => {
-            json!({"will":operation_text(value.will),"publication":format!("{:?}",value.publication),"destinations":value.targets.len(),"topic_bytes":value.topic.len(),"payload_bytes":value.payload.length.get()})
+            json!({
+                "will": operation_text(value.will),
+                "publication": format!("{:?}",value.publication),
+                "destinations": value.targets.len(),
+                "topic_bytes": value.topic.len(),
+                "payload_bytes": value.payload.length.get(),
+            })
         }
         Recipe::SessionLifecycle(lifecycle) => match &lifecycle.action {
             SessionAction::Open {
@@ -7552,7 +8177,12 @@ fn recipe_details(recipe: &Recipe) -> serde_json::Value {
                 expiry,
                 ..
             } => {
-                json!({"action":"Open","clean_start":clean_start,"expiry":expiry_json(*expiry),"expected_session":expected.map(|g|g.session.get().to_string())})
+                json!({
+                    "action": "Open",
+                    "clean_start": clean_start,
+                    "expiry": expiry_json(*expiry),
+                    "expected_session": expected.map(|g|g.session.get().to_string()),
+                })
             }
             SessionAction::EndWill {
                 guard,
@@ -7560,34 +8190,66 @@ fn recipe_details(recipe: &Recipe) -> serde_json::Value {
                 observed_at,
                 publish,
             } => {
-                json!({"action":"EndWill","session":guard.session.get().to_string(),"opened_by":guard.opened_by.map(operation_text),"expiry":expiry_json(*expiry),"observed_at":observed_at.to_string(),"publish":publish})
+                json!({
+                    "action": "EndWill",
+                    "session": guard.session.get().to_string(),
+                    "opened_by": guard.opened_by.map(operation_text),
+                    "expiry": expiry_json(*expiry),
+                    "observed_at": observed_at.to_string(),
+                    "publish": publish,
+                })
             }
             SessionAction::Detach {
                 guard,
                 expiry,
                 observed_at,
             } => {
-                json!({"action":"Detach","session":guard.session.get().to_string(),"expiry":expiry_json(*expiry),"observed_at":observed_at.to_string()})
+                json!({
+                    "action": "Detach",
+                    "session": guard.session.get().to_string(),
+                    "expiry": expiry_json(*expiry),
+                    "observed_at": observed_at.to_string(),
+                })
             }
             SessionAction::Expire {
                 guard,
                 detached,
                 now,
             } => {
-                json!({"action":"Expire","session":guard.session.get().to_string(),"detached_by":operation(detached.operation),"deadline":detached.deadline.map(|n|n.to_string()),"now":now.to_string()})
+                json!({
+                    "action": "Expire",
+                    "session": guard.session.get().to_string(),
+                    "detached_by": operation(detached.operation),
+                    "deadline": detached.deadline.map(|n|n.to_string()),
+                    "now": now.to_string(),
+                })
             }
             SessionAction::Close { guard, reason } => {
-                json!({"action":"Close","session":guard.session.get().to_string(),"opened_by":guard.opened_by.map(operation_text).unwrap_or_default(),"reason":format!("{reason:?}")})
+                json!({
+                    "action": "Close",
+                    "session": guard.session.get().to_string(),
+                    "opened_by": guard.opened_by.map(operation_text).unwrap_or_default(),
+                    "reason": format!("{reason:?}"),
+                })
             }
         },
         Recipe::ConsumeDelivery(c) => {
             json!({"delivery":delivery_text(c.delivery),"target":c.target.get().to_string()})
         }
         Recipe::ClaimDelivery(c) => {
-            json!({"delivery":delivery_text(c.delivery),"target":c.target.get().to_string(),"packet_id":c.packet_id.get()})
+            json!({
+                "delivery": delivery_text(c.delivery),
+                "target": c.target.get().to_string(),
+                "packet_id": c.packet_id.get(),
+            })
         }
         Recipe::FinishDelivery(c) => {
-            json!({"delivery":delivery_text(c.delivery),"target":c.target.get().to_string(),"packet_id":c.packet_id.get(),"claim":operation_text(c.claim)})
+            json!({
+                "delivery": delivery_text(c.delivery),
+                "target": c.target.get().to_string(),
+                "packet_id": c.packet_id.get(),
+                "claim": operation_text(c.claim),
+            })
         }
         _ => json!({}),
     }
@@ -7698,7 +8360,17 @@ pub fn run(config: Config) -> Result<(), Failure> {
     let signal = cancel.clone();
     ctrlc::set_handler(move || signal.store(true, Ordering::Relaxed))
         .map_err(|_| Failure::plain("signal_handler"))?;
-    events.emit("starting",json!({"details":{"test_hooks":cfg!(feature="test-hooks"),"sqlite_kill_points":mqttiumd_store_sqlite::KILL_POINTS_ENABLED}})).map_err(event_failure)?;
+    events
+        .emit(
+            "starting",
+            json!({
+                "details": {
+                    "test_hooks": cfg!(feature="test-hooks"),
+                    "sqlite_kill_points": mqttiumd_store_sqlite::KILL_POINTS_ENABLED,
+                },
+            }),
+        )
+        .map_err(event_failure)?;
     let policy = security
         .as_ref()
         .map(|security| security.policy.storage().clone());
@@ -7738,7 +8410,9 @@ pub fn run(config: Config) -> Result<(), Failure> {
         if let Err(failure) = &writer_result {
             let _ = events.emit("startup_or_runtime_refused", failure.fields());
         } else {
-            events.emit("stopped",json!({"details":{"writer_released":true,"accepted_commands_certainly_rejected":false}})).map_err(event_failure)?;
+            events.emit("stopped",json!({
+                "details": {"writer_released": true, "accepted_commands_certainly_rejected": false},
+            })).map_err(event_failure)?;
         }
         return result.and(writer_result);
     }
@@ -7789,7 +8463,9 @@ pub fn run(config: Config) -> Result<(), Failure> {
     if let Err(failure) = &writer_result {
         let _ = events.emit("startup_or_runtime_refused", failure.fields());
     } else {
-        events.emit("stopped",json!({"details":{"writer_released":true,"accepted_commands_certainly_rejected":false}})).map_err(event_failure)?;
+        events.emit("stopped",json!({
+            "details": {"writer_released": true, "accepted_commands_certainly_rejected": false},
+        })).map_err(event_failure)?;
     }
     result.and(writer_result)
 }
@@ -8229,7 +8905,20 @@ fn run_inner(
                         retained,
                         more,
                     } => {
-                        events.emit("closed_receipts_collected",json!({"details":{"through":through.get().to_string(),"removed":removed,"removed_origins":removed_origins,"retained":retained.to_string(),"more":more}})).map_err(event_failure)?;
+                        events
+                            .emit(
+                                "closed_receipts_collected",
+                                json!({
+                                    "details": {
+                                        "through": through.get().to_string(),
+                                        "removed": removed,
+                                        "removed_origins": removed_origins,
+                                        "retained": retained.to_string(),
+                                        "more": more,
+                                    },
+                                }),
+                            )
+                            .map_err(event_failure)?;
                         if !more {
                             completed = true;
                             break;
@@ -8299,15 +8988,63 @@ fn run_inner(
         }
         runtime.emit_session_clock_anchor()?;
         let now = runtime.message_now()?;
-        events.emit("message_expiry_clock", json!({"details":{
-            "domain":hex_domain(now.domain),"tick":now.tick.to_string(),"origin_status":runtime.clock.origin_status(),
-            "policy":"quarantine-on-unknown-origin","time_unit":"nanoseconds","scan_ms":100,"batch":MESSAGE_EXPIRY_PAGE_SIZE,
-            "started_proof":"positive-socket-write-then-durable-marker","terminal_input_slots":limits.terminal_inputs,
-            "socket_write_receipt_slots":net::WRITTEN_SLOTS
-        }})).map_err(event_failure)?;
-        events.emit("receipt_policy",json!({"details":{"receipt_window":mqttiumd_contract::receipts::RECEIPT_WINDOW,"receipt_data_window":mqttiumd_contract::receipts::RECEIPT_DATA_WINDOW,"receipt_control_reserve":mqttiumd_contract::receipts::RECEIPT_CONTROL_RESERVE,"receipt_collection_rows":mqttiumd_contract::receipts::MAX_COLLECTION_ROWS,"receipt_collection_bytes":mqttiumd_store_api::ReadBudget::COLLECTION.max_bytes,"receipt_collection_field_bytes":mqttiumd_store_api::ReadBudget::COLLECTION.max_field_bytes,"receipt_collection_trigger":mqttiumd_contract::receipts::RECEIPT_COLLECTION_TRIGGER,"max_receipt_origins":mqttiumd_contract::receipts::MAX_RECEIPT_ORIGINS,"startup_origins_trigger":32,"startup_receipts_trigger":4096,"startup_closed_collection":collect_closed,"control_request_slots":crate::writer::CONTROL_QUEUE,"control_reply_slots":crate::writer::CONTROL_QUEUE,"control_input_slots":crate::writer::CONTROL_QUEUE}})).map_err(event_failure)?;
+        events
+            .emit(
+                "message_expiry_clock",
+                json!({
+                    "details": {
+                        "domain": hex_domain(now.domain),
+                        "tick": now.tick.to_string(),
+                        "origin_status": runtime.clock.origin_status(),
+                        "policy": "quarantine-on-unknown-origin",
+                        "time_unit": "nanoseconds",
+                        "scan_ms": 100,
+                        "batch": MESSAGE_EXPIRY_PAGE_SIZE,
+                        "started_proof": "positive-socket-write-then-durable-marker",
+                        "terminal_input_slots": limits.terminal_inputs,
+                        "socket_write_receipt_slots": net::WRITTEN_SLOTS,
+                    },
+                }),
+            )
+            .map_err(event_failure)?;
+        events.emit("receipt_policy",json!({
+            "details": {
+                "receipt_window": mqttiumd_contract::receipts::RECEIPT_WINDOW,
+                "receipt_data_window": mqttiumd_contract::receipts::RECEIPT_DATA_WINDOW,
+                "receipt_control_reserve": mqttiumd_contract::receipts::RECEIPT_CONTROL_RESERVE,
+                "receipt_collection_rows": mqttiumd_contract::receipts::MAX_COLLECTION_ROWS,
+                "receipt_collection_bytes": mqttiumd_store_api::ReadBudget::COLLECTION.max_bytes,
+                "receipt_collection_field_bytes": mqttiumd_store_api::ReadBudget::COLLECTION.max_field_bytes,
+                "receipt_collection_trigger": mqttiumd_contract::receipts::RECEIPT_COLLECTION_TRIGGER,
+                "max_receipt_origins": mqttiumd_contract::receipts::MAX_RECEIPT_ORIGINS,
+                "startup_origins_trigger": 32,
+                "startup_receipts_trigger": 4096,
+                "startup_closed_collection": collect_closed,
+                "control_request_slots": crate::writer::CONTROL_QUEUE,
+                "control_reply_slots": crate::writer::CONTROL_QUEUE,
+                "control_input_slots": crate::writer::CONTROL_QUEUE,
+            },
+        })).map_err(event_failure)?;
         if let Some(sqlite) = &sqlite {
-            events.emit("sqlite_configuration",json!({"details":{"journal_mode":sqlite.journal_mode,"synchronous":sqlite.synchronous,"wal_autocheckpoint":sqlite.wal_autocheckpoint,"checkpoint_policy":sqlite.checkpoint_policy,"sqlite_version":sqlite.sqlite_version,"user_version":sqlite.user_version,"page_size":sqlite.page_size,"kill_points":sqlite.kill_points,"hooks_active":false,"install_order":"sqlite-autocheckpoint-before-optional-business-hook"}})).map_err(event_failure)?;
+            events
+                .emit(
+                    "sqlite_configuration",
+                    json!({
+                        "details": {
+                            "journal_mode": sqlite.journal_mode,
+                            "synchronous": sqlite.synchronous,
+                            "wal_autocheckpoint": sqlite.wal_autocheckpoint,
+                            "checkpoint_policy": sqlite.checkpoint_policy,
+                            "sqlite_version": sqlite.sqlite_version,
+                            "user_version": sqlite.user_version,
+                            "page_size": sqlite.page_size,
+                            "kill_points": sqlite.kill_points,
+                            "hooks_active": false,
+                            "install_order": "sqlite-autocheckpoint-before-optional-business-hook",
+                        },
+                    }),
+                )
+                .map_err(event_failure)?;
         }
         let sqlite_schema = sqlite.as_ref().map_or_else(
             || {
@@ -8334,7 +9071,50 @@ fn run_inner(
         let pi_candidate_limit =
             mqttiumd_core::owner::outgoing_pi_candidate_limit(max_exchanges, u16::MAX);
         let pi_bitmap_bits = mqttiumd_core::owner::OUTGOING_PI_BITMAP_BITS;
-        let mut readiness = json!({"details":{"address":address.to_string(),"epoch":epoch.get().to_string(),"incarnation":incarnation.get().to_string(),"max_connections":limits.connections,"max_sessions":crate::writer::SESSIONS,"max_packet_bytes":net::MAX_PACKET_BYTES,"max_client_id_bytes":crate::writer::MAX_CLIENT,"max_topic_bytes":crate::writer::MAX_TOPIC,"max_payload_bytes":crate::writer::MAX_PAYLOAD,"receive_maximum":crate::receiving::MAXIMUM,"max_exchange_slots":max_exchanges,"input_slots":net::INPUT_SLOTS,"output_slots":net::OUTPUT_SLOTS,"writer_slots":crate::writer::QUEUE,"commands_in_flight":limits.in_flight,"max_timers":limits.timers,"receipt_slots":crate::writer::limits().receipt_slots.get(),"partial_packet_ms":5000,"connect_ms":3000,"write_ms":250,"remembered_connections":8,"max_subscriptions":mqttiumd_contract::pubsub::MAX_SUBSCRIPTIONS,"max_targets":mqttiumd_contract::retained::MAX_RETAIN_MASK_TARGETS,"outgoing_per_connection":mqttiumd_core::owner::MAX_OUTGOING_WINDOW,"outgoing_metadata":limits.outgoing_bindings,"outgoing_packet_identifier_max":u16::MAX,"outgoing_packet_identifier_probe_limit":pi_candidate_limit,"outgoing_payload_bytes":64*1024*1024,"work_page_items":8,"work_scan_ms":100,"wildcard_subscriptions":true,"no_local":true,"shared_subscriptions":false,"subscription_identifiers":false,"sqlite_schema":sqlite_schema,"retained_available":true,"retained_topics":mqttiumd_contract::retained::MAX_RETAINED_TOPICS,"retained_bytes":mqttiumd_contract::retained::MAX_RETAINED_BYTES,"max_replay_candidates":mqttiumd_contract::retained::MAX_REPLAYS,"profile":profile}});
+        let mut readiness = json!({
+            "details": {
+                "address": address.to_string(),
+                "epoch": epoch.get().to_string(),
+                "incarnation": incarnation.get().to_string(),
+                "max_connections": limits.connections,
+                "max_sessions": crate::writer::SESSIONS,
+                "max_packet_bytes": net::MAX_PACKET_BYTES,
+                "max_client_id_bytes": crate::writer::MAX_CLIENT,
+                "max_topic_bytes": crate::writer::MAX_TOPIC,
+                "max_payload_bytes": crate::writer::MAX_PAYLOAD,
+                "receive_maximum": crate::receiving::MAXIMUM,
+                "max_exchange_slots": max_exchanges,
+                "input_slots": net::INPUT_SLOTS,
+                "output_slots": net::OUTPUT_SLOTS,
+                "writer_slots": crate::writer::QUEUE,
+                "commands_in_flight": limits.in_flight,
+                "max_timers": limits.timers,
+                "receipt_slots": crate::writer::limits().receipt_slots.get(),
+                "partial_packet_ms": 5000,
+                "connect_ms": 3000,
+                "write_ms": 250,
+                "remembered_connections": 8,
+                "max_subscriptions": mqttiumd_contract::pubsub::MAX_SUBSCRIPTIONS,
+                "max_targets": mqttiumd_contract::retained::MAX_RETAIN_MASK_TARGETS,
+                "outgoing_per_connection": mqttiumd_core::owner::MAX_OUTGOING_WINDOW,
+                "outgoing_metadata": limits.outgoing_bindings,
+                "outgoing_packet_identifier_max": u16::MAX,
+                "outgoing_packet_identifier_probe_limit": pi_candidate_limit,
+                "outgoing_payload_bytes": 64*1024*1024,
+                "work_page_items": 8,
+                "work_scan_ms": 100,
+                "wildcard_subscriptions": true,
+                "no_local": true,
+                "shared_subscriptions": false,
+                "subscription_identifiers": false,
+                "sqlite_schema": sqlite_schema,
+                "retained_available": true,
+                "retained_topics": mqttiumd_contract::retained::MAX_RETAINED_TOPICS,
+                "retained_bytes": mqttiumd_contract::retained::MAX_RETAINED_BYTES,
+                "max_replay_candidates": mqttiumd_contract::retained::MAX_REPLAYS,
+                "profile": profile,
+            },
+        });
         if let Some(details) = readiness["details"].as_object_mut() {
             details.insert("storage_mode".into(), json!(storage_mode.mode_name()));
             details.insert(
@@ -8372,13 +9152,45 @@ fn run_inner(
             );
         }
         if let Some(security) = &runtime.security {
-            events.emit("tls_profile", json!({"details":{"version":"TLS1.3","client_certificate":"required",
-                "policy_fingerprint":hex_domain(security.policy.storage().fingerprint),"max_handshakes":security::MAX_UNAUTHENTICATED,
-                "handshake_ms":security::HANDSHAKE_TIMEOUT.as_millis() as u64,"handshake_bytes":security::HANDSHAKE_BYTES,
-                "certificate_bytes":security::CERT_BYTES,"chain_bytes":security::CHAIN_BYTES,"chain_certificates":security::CHAIN_CERTS,
-                "tls_buffer_bytes":security::TLS_BUFFER_BYTES,"resumption":false,"early_data":false}})).map_err(event_failure)?;
+            events
+                .emit(
+                    "tls_profile",
+                    json!({
+                        "details": {
+                            "version": "TLS1.3",
+                            "client_certificate": "required",
+                            "policy_fingerprint": hex_domain(security.policy.storage().fingerprint),
+                            "max_handshakes": security::MAX_UNAUTHENTICATED,
+                            "handshake_ms": security::HANDSHAKE_TIMEOUT.as_millis() as u64,
+                            "handshake_bytes": security::HANDSHAKE_BYTES,
+                            "certificate_bytes": security::CERT_BYTES,
+                            "chain_bytes": security::CHAIN_BYTES,
+                            "chain_certificates": security::CHAIN_CERTS,
+                            "tls_buffer_bytes": security::TLS_BUFFER_BYTES,
+                            "resumption": false,
+                            "early_data": false,
+                        },
+                    }),
+                )
+                .map_err(event_failure)?;
         }
-        events.emit("will_capabilities",json!({"details":{"will":true,"will_qos":1,"will_retain":true,"will_delay_interval":0,"will_message_expiry":false,"max_will_intents":mqttiumd_contract::will::MAX_WILL_INTENTS,"max_will_bytes":mqttiumd_contract::will::MAX_WILL_BYTES,"max_will_receipt_bytes":8388608}})).map_err(event_failure)?;
+        events
+            .emit(
+                "will_capabilities",
+                json!({
+                    "details": {
+                        "will": true,
+                        "will_qos": 1,
+                        "will_retain": true,
+                        "will_delay_interval": 0,
+                        "will_message_expiry": false,
+                        "max_will_intents": mqttiumd_contract::will::MAX_WILL_INTENTS,
+                        "max_will_bytes": mqttiumd_contract::will::MAX_WILL_BYTES,
+                        "max_will_receipt_bytes": 8388608,
+                    },
+                }),
+            )
+            .map_err(event_failure)?;
         events.emit("ready", readiness).map_err(event_failure)?;
         // The sharded mode has no model of its own protocol yet and known
         // open conditions (record 0066): the operator is told.

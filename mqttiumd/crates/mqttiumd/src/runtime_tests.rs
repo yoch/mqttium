@@ -7469,18 +7469,33 @@ fn blocked_output_and_full_input_preserve_independent_work_and_reconnect_credit(
             eprintln!(
                 "progression witness {}",
                 json!({
-                    "reversed": reverse, "slow_generation": slow.get(), "publisher_generation": publisher.get(),
-                    "resumed_generation": resumed.get(), "ordinary_input_count": ORDINARY_INPUTS,
+                    "reversed": reverse,
+                    "slow_generation": slow.get(),
+                    "publisher_generation": publisher.get(),
+                    "resumed_generation": resumed.get(),
+                    "ordinary_input_count": ORDINARY_INPUTS,
                     "actual_writer_reply": effect_text(committed_effect),
                     "held_frames": pending.iter().map(|(effect, mid)| (effect_text(*effect), *mid)).collect::<Vec<_>>(),
-                    "repeated_dispatch_passes": 3, "independent_subscriber_micros": independent_micros,
-                    "independent_publisher_puback": 7, "independent_subscriber_packet_id": b_id,
-                    "session_present": true, "replay_dup": true, "packet_id": 1,
-                    "original_frame": effect_text(old_target.frame), "resumed_frame": effect_text(new_target.frame),
+                    "repeated_dispatch_passes": 3,
+                    "independent_subscriber_micros": independent_micros,
+                    "independent_publisher_puback": 7,
+                    "independent_subscriber_packet_id": b_id,
+                    "session_present": true,
+                    "replay_dup": true,
+                    "packet_id": 1,
+                    "original_frame": effect_text(old_target.frame),
+                    "resumed_frame": effect_text(new_target.frame),
                     "late_written_bytes": old_completion,
-                    "outgoing_claims_before_and_after_old_callback": [waiting.outbound.len(), after_late.outbound.len()],
-                    "obligations_before_and_after_old_callback": [waiting.obligations.len(), after_late.obligations.len()],
-                    "final_claims": final_state.outbound.len(), "final_obligations": final_state.obligations.len(),
+                    "outgoing_claims_before_and_after_old_callback": [
+                        waiting.outbound.len(),
+                        after_late.outbound.len(),
+                    ],
+                    "obligations_before_and_after_old_callback": [
+                        waiting.obligations.len(),
+                        after_late.obligations.len(),
+                    ],
+                    "final_claims": final_state.outbound.len(),
+                    "final_obligations": final_state.obligations.len(),
                 })
             );
         });

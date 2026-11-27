@@ -467,9 +467,9 @@ pub fn message_expiry_details(
     after: Option<mqttiumd_contract::ids::PublicationId>,
 ) -> serde_json::Value {
     json!({
-        "domain":hex_domain(now.domain),
-        "tick":now.tick.to_string(),
-        "after":after.map(|id|format!("{}/{}/{}/{}",id.incarnation().get(),id.epoch().get(),id.owner().get(),id.sequence().get())).unwrap_or_default()
+        "domain": hex_domain(now.domain),
+        "tick": now.tick.to_string(),
+        "after": after.map(|id|format!("{}/{}/{}/{}",id.incarnation().get(),id.epoch().get(),id.owner().get(),id.sequence().get())).unwrap_or_default(),
     })
 }
 pub fn limits() -> Limits {
@@ -652,7 +652,15 @@ pub enum Response {
 }
 pub fn collection_details(collection: ReceiptCollection) -> serde_json::Value {
     let closure = collection.closure;
-    json!({"incarnation":closure.origin.incarnation.get().to_string(),"epoch":closure.origin.epoch.get().to_string(),"owner":closure.origin.owner.get().to_string(),"through":closure.through.get().to_string(),"publication_through":closure.publication_through.get().to_string(),"payload_through":closure.payload_through.get().to_string(),"limit":collection.limit})
+    json!({
+        "incarnation": closure.origin.incarnation.get().to_string(),
+        "epoch": closure.origin.epoch.get().to_string(),
+        "owner": closure.origin.owner.get().to_string(),
+        "through": closure.through.get().to_string(),
+        "publication_through": closure.publication_through.get().to_string(),
+        "payload_through": closure.payload_through.get().to_string(),
+        "limit": collection.limit,
+    })
 }
 
 pub fn returned_closure_details(
@@ -940,19 +948,14 @@ impl Writer {
                 StorageMode::Volatile { .. } => "volatile-writer".into(),
             })
             .spawn(move || -> Result<(), Failure> {
-                let (mut store, boot) = match bootstrap_bound(
-                    &path,
-                    clock,
-                    policy,
-                    require_existing,
-                    storage_mode,
-                ) {
-                    Ok(value) => value,
-                    Err(error) => {
-                        let _ = btx.send(Err(error));
-                        return Ok(());
-                    }
-                };
+                let (mut store, boot) =
+                    match bootstrap_bound(&path, clock, policy, require_existing, storage_mode) {
+                        Ok(value) => value,
+                        Err(error) => {
+                            let _ = btx.send(Err(error));
+                            return Ok(());
+                        }
+                    };
                 worker_has_expiring.store(store.has_expiring_publications(), Ordering::Release);
                 if btx.send(Ok(boot)).is_err() {
                     return Ok(());
@@ -975,11 +978,13 @@ impl Writer {
                 let mut members: Vec<Member> = Vec::with_capacity(group);
                 let mut deferred_reads: Vec<(usize, EffectId, Effect)> = Vec::new();
                 let mut shard_rr: usize = 0;
-                #[cfg(feature="test-hooks")]
+                #[cfg(feature = "test-hooks")]
                 let mut duplicate_control: Option<ControlResponse> = None;
                 loop {
-                    #[cfg(feature="test-hooks")]
-                    if replay_controls(&mut store,&state,&hooks,&events).is_err() { cancel.store(true,Ordering::Relaxed); }
+                    #[cfg(feature = "test-hooks")]
+                    if replay_controls(&mut store, &state, &hooks, &events).is_err() {
+                        cancel.store(true, Ordering::Relaxed);
+                    }
                     // A reply lane an owner has not drained is retried on a
                     // short timer; nothing else in this loop waits on a timer.
                     let mut stalled = false;
@@ -1044,7 +1049,7 @@ impl Writer {
                     }
                     // Even a completely unread ordinary result lane cannot prevent
                     // a reserved receipt closure from committing and replying.
-                    #[cfg(feature="test-hooks")]
+                    #[cfg(feature = "test-hooks")]
                     if lanes[0].pending_control.is_none() {
                         lanes[0].pending_control = duplicate_control.take();
                     }
@@ -1057,20 +1062,46 @@ impl Writer {
                                 let reply = control_response(
                                     &mut store, request, &events, &hooks, &cancel, &mut state,
                                 );
-                                worker_has_expiring.store(
-                                    store.has_expiring_publications(),
-                                    Ordering::Release,
-                                );
-                                #[cfg(feature="test-hooks")]
+                                worker_has_expiring
+                                    .store(store.has_expiring_publications(), Ordering::Release);
+                                #[cfg(feature = "test-hooks")]
                                 if idx == 0 {
-                                    if let ControlResponse::Collected { collection, result:Ok(ReceiptCollectionReply::Applied { .. }),.. } = &reply
-                                        && hooks.directory.as_ref().is_some_and(|d| consume_file(&d.join("duplicate-close-result"))) {
-                                        let _ = events.emit("receipt_collection_result_duplicated",json!({"command_kind":"ReceiptCollection","details":collection_details(*collection)}));
+                                    if let ControlResponse::Collected {
+                                        collection,
+                                        result: Ok(ReceiptCollectionReply::Applied { .. }),
+                                        ..
+                                    } = &reply
+                                        && hooks.directory.as_ref().is_some_and(|d| {
+                                            consume_file(&d.join("duplicate-close-result"))
+                                        })
+                                    {
+                                        let _ = events.emit(
+                                            "receipt_collection_result_duplicated",
+                                            json!({
+                                                "command_kind": "ReceiptCollection",
+                                                "details": collection_details(*collection),
+                                            }),
+                                        );
                                         duplicate_control = Some(reply.clone());
                                     }
-                                    if let ControlResponse::MessageExpiry { now, after, result:Ok(_),.. } = &reply
-                                        && hooks.directory.as_ref().is_some_and(|d| consume_file(&d.join("duplicate-next-message-expire-result"))) {
-                                        let _ = events.emit("message_expiry_result_duplicated",json!({"details":message_expiry_details(*now,*after)}));
+                                    if let ControlResponse::MessageExpiry {
+                                        now,
+                                        after,
+                                        result: Ok(_),
+                                        ..
+                                    } = &reply
+                                        && hooks.directory.as_ref().is_some_and(|d| {
+                                            consume_file(
+                                                &d.join("duplicate-next-message-expire-result"),
+                                            )
+                                        })
+                                    {
+                                        let _ = events.emit(
+                                            "message_expiry_result_duplicated",
+                                            json!({
+                                                "details": message_expiry_details(*now,*after),
+                                            }),
+                                        );
                                         duplicate_control = Some(reply.clone());
                                     }
                                 }
@@ -1145,68 +1176,72 @@ impl Writer {
                             let shard_count = lane_count - 1;
                             let coord_reserve = (group / 8).clamp(8, 64).min(group);
                             let shard_budget = group.saturating_sub(coord_reserve);
-                            let drain_shards = |lanes: &mut [OwnerLane],
-                                                members: &mut Vec<Member>,
-                                                deferred_reads: &mut Vec<(usize, EffectId, Effect)>,
-                                                other: &mut Option<NonGroupItem>,
-                                                limit: usize,
-                                                start: usize| {
-                                while members.len() < limit
-                                    && deferred_reads.len() < group
-                                    && other.is_none()
-                                {
-                                    let mut made_progress = false;
-                                    for step in 0..shard_count {
-                                        if members.len() >= limit
-                                            || deferred_reads.len() >= group
-                                            || other.is_some()
-                                        {
-                                            break;
-                                        }
-                                        let idx = 1 + ((start + step) % shard_count);
-                                        if lanes[idx].closed {
-                                            continue;
-                                        }
-                                        match lanes[idx].rx.try_recv() {
-                                            Ok(Request::Effect(effect)) => {
-                                                made_progress = true;
-                                                match effect.into_parts() {
-                                                    (effect, Effect::Persist { command })
-                                                        if group > 1 =>
-                                                    {
-                                                        members.push(Member {
-                                                            owner_idx: idx,
-                                                            effect,
-                                                            command,
-                                                        });
-                                                    }
-                                                    (effect, work @ Effect::LoadWork { .. })
-                                                        if group > 1 =>
-                                                    {
-                                                        deferred_reads.push((idx, effect, work));
-                                                    }
-                                                    (effect, work) => {
-                                                        *other = Some((idx, Ok((effect, work))));
-                                                        break;
-                                                    }
-                                                }
-                                            }
-                                            Ok(request) => {
-                                                made_progress = true;
-                                                *other = Some((idx, Err(request)));
+                            let drain_shards =
+                                |lanes: &mut [OwnerLane],
+                                 members: &mut Vec<Member>,
+                                 deferred_reads: &mut Vec<(usize, EffectId, Effect)>,
+                                 other: &mut Option<NonGroupItem>,
+                                 limit: usize,
+                                 start: usize| {
+                                    while members.len() < limit
+                                        && deferred_reads.len() < group
+                                        && other.is_none()
+                                    {
+                                        let mut made_progress = false;
+                                        for step in 0..shard_count {
+                                            if members.len() >= limit
+                                                || deferred_reads.len() >= group
+                                                || other.is_some()
+                                            {
                                                 break;
                                             }
-                                            Err(TryRecvError::Empty) => {}
-                                            Err(TryRecvError::Disconnected) => {
-                                                lanes[idx].closed = true;
+                                            let idx = 1 + ((start + step) % shard_count);
+                                            if lanes[idx].closed {
+                                                continue;
+                                            }
+                                            match lanes[idx].rx.try_recv() {
+                                                Ok(Request::Effect(effect)) => {
+                                                    made_progress = true;
+                                                    match effect.into_parts() {
+                                                        (effect, Effect::Persist { command })
+                                                            if group > 1 =>
+                                                        {
+                                                            members.push(Member {
+                                                                owner_idx: idx,
+                                                                effect,
+                                                                command,
+                                                            });
+                                                        }
+                                                        (
+                                                            effect,
+                                                            work @ Effect::LoadWork { .. },
+                                                        ) if group > 1 => {
+                                                            deferred_reads
+                                                                .push((idx, effect, work));
+                                                        }
+                                                        (effect, work) => {
+                                                            *other =
+                                                                Some((idx, Ok((effect, work))));
+                                                            break;
+                                                        }
+                                                    }
+                                                }
+                                                Ok(request) => {
+                                                    made_progress = true;
+                                                    *other = Some((idx, Err(request)));
+                                                    break;
+                                                }
+                                                Err(TryRecvError::Empty) => {}
+                                                Err(TryRecvError::Disconnected) => {
+                                                    lanes[idx].closed = true;
+                                                }
                                             }
                                         }
+                                        if !made_progress {
+                                            break;
+                                        }
                                     }
-                                    if !made_progress {
-                                        break;
-                                    }
-                                }
-                            };
+                                };
                             drain_shards(
                                 &mut lanes,
                                 &mut members,
@@ -1262,7 +1297,9 @@ impl Writer {
                         let idle_turn =
                             members.is_empty() && deferred_reads.is_empty() && other.is_none();
                         if !members.is_empty() {
-                            group_responses_into(&mut store, &members, &events, &cancel, &mut lanes);
+                            group_responses_into(
+                                &mut store, &members, &events, &cancel, &mut lanes,
+                            );
                             members.clear();
                             worker_has_expiring
                                 .store(store.has_expiring_publications(), Ordering::Release);
@@ -1787,11 +1824,27 @@ fn record_result(
                     will: Some(spec), ..
                 } => Some((
                     "will_installed",
-                    json!({"operation":operation(id),"will":operation(id),"details":{"topic_bytes":spec.topic.len(),"payload_bytes":spec.payload.len(),"authority":"durable_open_commit"}}),
+                    json!({
+                        "operation": operation(id),
+                        "will": operation(id),
+                        "details": {
+                            "topic_bytes": spec.topic.len(),
+                            "payload_bytes": spec.payload.len(),
+                            "authority": "durable_open_commit",
+                        },
+                    }),
                 )),
                 SessionAction::EndWill { guard, publish, .. } => Some((
                     "will_decided",
-                    json!({"operation":operation(id),"will":guard.opened_by.map(operation),"details":{"publish":publish,"session":guard.session.get().to_string(),"authority":"durable_end_commit"}}),
+                    json!({
+                        "operation": operation(id),
+                        "will": guard.opened_by.map(operation),
+                        "details": {
+                            "publish": publish,
+                            "session": guard.session.get().to_string(),
+                            "authority": "durable_end_commit",
+                        },
+                    }),
                 )),
                 _ => None,
             },
@@ -1803,7 +1856,16 @@ fn record_result(
                 })),
             ) => Some((
                 "will_admitted",
-                json!({"operation":operation(id),"will":operation(will),"details":{"publication":format!("{}/{}/{}/{}",publication.incarnation().get(),publication.epoch().get(),publication.owner().get(),publication.sequence().get()),"targets":value.targets.len(),"retained":value.live_retain.is_some(),"authority":"durable_admission_commit"}}),
+                json!({
+                    "operation": operation(id),
+                    "will": operation(will),
+                    "details": {
+                        "publication": format!("{}/{}/{}/{}",publication.incarnation().get(),publication.epoch().get(),publication.owner().get(),publication.sequence().get()),
+                        "targets": value.targets.len(),
+                        "retained": value.live_retain.is_some(),
+                        "authority": "durable_admission_commit",
+                    },
+                }),
             )),
             _ => None,
         };
@@ -1813,7 +1875,22 @@ fn record_result(
             cancel.store(true, Ordering::Relaxed);
         }
     }
-    if events.emit_with("store_result",||json!({"operation":operation(id),"command_kind":kind,"details":{"committed_now":applied.committed_now,"wrote":applied.wrote,"outcome":outcome_name(applied.reply)}})).is_err(){cancel.store(true,Ordering::Relaxed);}
+    if events
+        .emit_with("store_result", || {
+            json!({
+                "operation": operation(id),
+                "command_kind": kind,
+                "details": {
+                    "committed_now": applied.committed_now,
+                    "wrote": applied.wrote,
+                    "outcome": outcome_name(applied.reply),
+                },
+            })
+        })
+        .is_err()
+    {
+        cancel.store(true, Ordering::Relaxed);
+    }
 }
 
 /// One command of a group, the owner lane that submitted it, and the effect
@@ -1926,7 +2003,14 @@ fn effect_response(
             {
                 state.captured = Some(command.clone());
                 if let Some(a) = command.recipe.get().admission() {
-                    let _ = events.emit("receipt_replay_captured",json!({"command_kind":"Admission","operation":operation(id),"details":{"publication":identity_text(a.publication.incarnation().get(),a.publication.epoch().get(),a.publication.owner().get(),a.publication.sequence().get()),"payload":identity_text(a.payload.id.incarnation().get(),a.payload.id.epoch().get(),a.payload.id.owner().get(),a.payload.id.sequence().get())}}));
+                    let _ = events.emit("receipt_replay_captured",json!({
+                        "command_kind": "Admission",
+                        "operation": operation(id),
+                        "details": {
+                            "publication": identity_text(a.publication.incarnation().get(),a.publication.epoch().get(),a.publication.owner().get(),a.publication.sequence().get()),
+                            "payload": identity_text(a.payload.id.incarnation().get(),a.payload.id.epoch().get(),a.payload.id.owner().get(),a.payload.id.sequence().get()),
+                        },
+                    }));
                 }
             }
             #[cfg(feature = "test-hooks")]
@@ -2045,7 +2129,18 @@ fn effect_response(
             let reply = StoreReply::Outcome(store.resolve_and_fence(id).outcome);
             #[cfg(feature = "test-hooks")]
             let reply = hold_business_reply(state, hooks, id, "Resolution", reply, events);
-            if events.emit("store_resolved",json!({"operation":operation(id),"details":{"outcome":outcome_name(reply).to_ascii_lowercase()}})).is_err(){cancel.store(true,Ordering::Relaxed);}
+            if events
+                .emit(
+                    "store_resolved",
+                    json!({
+                        "operation": operation(id),
+                        "details": {"outcome": outcome_name(reply).to_ascii_lowercase()},
+                    }),
+                )
+                .is_err()
+            {
+                cancel.store(true, Ordering::Relaxed);
+            }
             Response::Store {
                 effect,
                 operation: id,
@@ -2075,10 +2170,13 @@ fn effect_response(
                             && hooks
                                 .barrier_fields(
                                     "work.read.before",
-                                    json!({"point":"work.read.before","details":{
-                                        "session":session.get().to_string(),
-                                        "effect":format!("{}/{}/{}",effect.epoch.get(),effect.owner.get(),effect.sequence.get())
-                                    }}),
+                                    json!({
+                                        "point": "work.read.before",
+                                        "details": {
+                                            "session": session.get().to_string(),
+                                            "effect": format!("{}/{}/{}",effect.epoch.get(),effect.owner.get(),effect.sequence.get()),
+                                        },
+                                    }),
                                     events,
                                     cancel,
                                 )
@@ -2168,7 +2266,14 @@ fn hold_business_reply(
             *held = Some(id);
         }
         if *held == Some(id) {
-            let _=events.emit("store_result_held",json!({"operation":operation(id),"command_kind":name,"details":{"outcome":outcome_name(reply),"source":kind}}));
+            let _ = events.emit(
+                "store_result_held",
+                json!({
+                    "operation": operation(id),
+                    "command_kind": name,
+                    "details": {"outcome": outcome_name(reply), "source": kind},
+                }),
+            );
             return StoreReply::Outcome(mqttiumd_contract::outcome::StoreOutcome::PendingOrUnknown);
         }
     }
@@ -2201,7 +2306,14 @@ fn hold_admission_reply(
         state.held_admission = Some(id);
     }
     if state.held_admission == Some(id) {
-        let _ = events.emit("store_result_held",json!({"operation":operation(id),"command_kind":"Admission","details":{"outcome":outcome_name(reply),"source":kind}}));
+        let _ = events.emit(
+            "store_result_held",
+            json!({
+                "operation": operation(id),
+                "command_kind": "Admission",
+                "details": {"outcome": outcome_name(reply), "source": kind},
+            }),
+        );
         StoreReply::Outcome(mqttiumd_contract::outcome::StoreOutcome::PendingOrUnknown)
     } else {
         reply
@@ -2378,7 +2490,39 @@ fn replay_controls(
             )) => format!("{reason:?}"),
             _ => String::new(),
         };
-        events.emit("receipt_replay_result",json!({"operation":operation(probe.recipe.operation()),"command_kind":"Admission","details":{"mode":mode,"outcome":outcome_name(applied.reply),"reason":reason,"business_changed":business_changed,"wrote":applied.wrote,"committed_now":applied.committed_now,"before_receipts":before.accounts.receipt_slots.get().to_string(),"after_receipts":after.accounts.receipt_slots.get().to_string(),"before_references":before.accounts.references.get().to_string(),"after_references":after.accounts.references.get().to_string(),"before_payload_bytes":before.accounts.payload_bytes.get().to_string(),"after_payload_bytes":after.accounts.payload_bytes.get().to_string(),"before_publications":before.publications.len(),"after_publications":after.publications.len(),"before_payloads":before.payloads.len(),"after_payloads":after.payloads.len(),"before_obligations":before.obligations.len(),"after_obligations":after.obligations.len(),"current_route_revision":before.route_revision.get().to_string(),"closure_through":frontier.through.get().to_string(),"publication_through":frontier.publication_through.get().to_string(),"payload_through":frontier.payload_through.get().to_string()}})).map_err(|_|Failure::plain("events_unavailable"))?;
+        events
+            .emit(
+                "receipt_replay_result",
+                json!({
+                    "operation": operation(probe.recipe.operation()),
+                    "command_kind": "Admission",
+                    "details": {
+                        "mode": mode,
+                        "outcome": outcome_name(applied.reply),
+                        "reason": reason,
+                        "business_changed": business_changed,
+                        "wrote": applied.wrote,
+                        "committed_now": applied.committed_now,
+                        "before_receipts": before.accounts.receipt_slots.get().to_string(),
+                        "after_receipts": after.accounts.receipt_slots.get().to_string(),
+                        "before_references": before.accounts.references.get().to_string(),
+                        "after_references": after.accounts.references.get().to_string(),
+                        "before_payload_bytes": before.accounts.payload_bytes.get().to_string(),
+                        "after_payload_bytes": after.accounts.payload_bytes.get().to_string(),
+                        "before_publications": before.publications.len(),
+                        "after_publications": after.publications.len(),
+                        "before_payloads": before.payloads.len(),
+                        "after_payloads": after.payloads.len(),
+                        "before_obligations": before.obligations.len(),
+                        "after_obligations": after.obligations.len(),
+                        "current_route_revision": before.route_revision.get().to_string(),
+                        "closure_through": frontier.through.get().to_string(),
+                        "publication_through": frontier.publication_through.get().to_string(),
+                        "payload_through": frontier.payload_through.get().to_string(),
+                    },
+                }),
+            )
+            .map_err(|_| Failure::plain("events_unavailable"))?;
     }
     Ok(())
 }
@@ -2407,7 +2551,19 @@ fn control_response(
                 let stop = cancel.clone();
                 let hook = Box::new(move |point| {
                     if point == mqttiumd_store_sqlite::kill_points::KillPoint::CommitPrepared
-                        && hc.barrier_fields("message.expire.prepared", json!({"point":"message.expire.prepared","command_kind":"MessageExpiry","details":message_expiry_details(now, after)}), &ev, &stop).is_err() {
+                        && hc
+                            .barrier_fields(
+                                "message.expire.prepared",
+                                json!({
+                                    "point": "message.expire.prepared",
+                                    "command_kind": "MessageExpiry",
+                                    "details": message_expiry_details(now, after),
+                                }),
+                                &ev,
+                                &stop,
+                            )
+                            .is_err()
+                    {
                         stop.store(true, Ordering::Relaxed);
                     }
                 });
@@ -2426,23 +2582,51 @@ fn control_response(
             if let Ok(sweep) = &result {
                 #[cfg(feature = "test-hooks")]
                 if (!sweep.removed.is_empty() || sweep.retained_removed > 0)
-                    && hooks.barrier_fields("message.expire.committed", json!({"point":"message.expire.committed","command_kind":"MessageExpiry","details":message_expiry_details(now, after)}), events, cancel).is_err() {
+                    && hooks
+                        .barrier_fields(
+                            "message.expire.committed",
+                            json!({
+                                "point": "message.expire.committed",
+                                "command_kind": "MessageExpiry",
+                                "details": message_expiry_details(now, after),
+                            }),
+                            events,
+                            cancel,
+                        )
+                        .is_err()
+                {
                     cancel.store(true, Ordering::Relaxed);
                 }
                 for removed in sweep.removed.as_slice() {
                     let publication = removed.delivery.publication;
-                    if events.emit("message_expiry_removed",json!({"details":{
-                        "source":"durable_commit","publication":format!("{}/{}/{}/{}",publication.incarnation().get(),publication.epoch().get(),publication.owner().get(),publication.sequence().get()),
-                        "index":removed.delivery.index,"target":removed.target.get().to_string()
-                    }})).is_err() { return ControlResponse::Failed(Failure::plain("events_unavailable")); }
+                    if events.emit("message_expiry_removed",json!({
+                        "details": {
+                            "source": "durable_commit",
+                            "publication": format!("{}/{}/{}/{}",publication.incarnation().get(),publication.epoch().get(),publication.owner().get(),publication.sequence().get()),
+                            "index": removed.delivery.index,
+                            "target": removed.target.get().to_string(),
+                        },
+                    })).is_err() { return ControlResponse::Failed(Failure::plain("events_unavailable")); }
                 }
                 let removed = sweep.removed.len();
                 if (removed != 0 || sweep.retained_removed > 0 || sweep.quarantined > 0)
-                    && events.emit("message_expiry_sweep", json!({"details":{
-                        "source":"durable_commit","domain":hex_domain(now.domain),"tick":now.tick.to_string(),
-                        "removed":removed,"retained_removed":sweep.retained_removed,
-                        "quarantined":sweep.quarantined,"more":sweep.more
-                    }})).is_err() {
+                    && events
+                        .emit(
+                            "message_expiry_sweep",
+                            json!({
+                                "details": {
+                                    "source": "durable_commit",
+                                    "domain": hex_domain(now.domain),
+                                    "tick": now.tick.to_string(),
+                                    "removed": removed,
+                                    "retained_removed": sweep.retained_removed,
+                                    "quarantined": sweep.quarantined,
+                                    "more": sweep.more,
+                                },
+                            }),
+                        )
+                        .is_err()
+                {
                     return ControlResponse::Failed(Failure::plain("events_unavailable"));
                 }
             }
@@ -2526,7 +2710,22 @@ fn control_response(
                 store.set_receipt_hook(Some(Box::new(move |point, current| {
                     let mut details = collection_details(current);
                     details["requested_limit"] = json!(collection.limit);
-                    if current.closure.through.get()!=0 && hc.barrier_fields(point.name(), json!({"point":point.name(),"command_kind":"ReceiptCollection","details":details}), &ev, &stop).is_err() { stop.store(true, Ordering::Relaxed); }
+                    if current.closure.through.get() != 0
+                        && hc
+                            .barrier_fields(
+                                point.name(),
+                                json!({
+                                    "point": point.name(),
+                                    "command_kind": "ReceiptCollection",
+                                    "details": details,
+                                }),
+                                &ev,
+                                &stop,
+                            )
+                            .is_err()
+                    {
+                        stop.store(true, Ordering::Relaxed);
+                    }
                 })));
             }
             let result = store

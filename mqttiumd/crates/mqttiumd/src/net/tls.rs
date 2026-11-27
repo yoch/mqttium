@@ -252,10 +252,14 @@ impl Task {
         sent: usize,
     ) -> Result<(), &'static str> {
         let (effect, connection) = frame.correlation.ok_or("tls_hook_missing_frame")?;
-        self.trace.0.barrier_fields(point, serde_json::json!({"point":point,
-            "connection":connection.generation.get().to_string(), "details":{
-                "effect":format!("{}/{}/{}",effect.epoch.get(),effect.owner.get(),effect.sequence.get()),
-                "ciphertext_bytes_sent":sent}}), &self.trace.1, &self.core.cancelled)
+        self.trace.0.barrier_fields(point, serde_json::json!({
+            "point": point,
+            "connection": connection.generation.get().to_string(),
+            "details": {
+                "effect": format!("{}/{}/{}",effect.epoch.get(),effect.owner.get(),effect.sequence.get()),
+                "ciphertext_bytes_sent": sent,
+            },
+        }), &self.trace.1, &self.core.cancelled)
             .map_err(|_| "tls_hook_failed")
     }
 
