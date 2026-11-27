@@ -133,6 +133,15 @@ of report 0046 took 809 ms. The test is unchanged; giving it room (a
 slower slow subscriber, a bound scaled to it) is a change of the test
 the owner may want, and it would have to keep failing on the spin.
 
+At `791cb04`, `fanin_16x1_qos1_zero_refusals_and_fast_drain_in_log_mode`
+(`tests/concurrent_churn_refusals.rs`, `K = 0`, `--storage-mode log`)
+failed in the same step: the broker closed four connections before their
+CONNACK and nine publishers in the middle of their flow. A test of that
+file in log mode failed the same way in the CI of `bb6c30d`, before this
+lot; neither failure has been reproduced here. Both tests run against a
+real broker with real deadlines on a shared runner; they are the only
+tests that failed in the CI since report 0046.
+
 ## Verification
 
 From `mqttiumd/`, with `env -u CARGO_TARGET_DIR -u CARGO_ENCODED_RUSTFLAGS`.
