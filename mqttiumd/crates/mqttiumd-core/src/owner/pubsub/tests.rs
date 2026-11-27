@@ -132,6 +132,9 @@ fn apply(owner: &mut Owner, input: Input) -> Vec<(EffectId, Effect)> {
     drain(owner)
 }
 fn world() -> Owner {
+    world_with_exchanges(8)
+}
+fn world_with_exchanges(max_exchanges: u32) -> Owner {
     let incarnation = StoreIncarnation::new(1);
     let epoch = RunEpoch::new(2);
     let mut opening = EpochOpening::new(incarnation, StartupNonce::new([7; 16]));
@@ -147,19 +150,19 @@ fn world() -> Owner {
     let outbox = authority
         .create_outbox(
             LogicalOwnerId::new(4),
-            NonZeroUsize::new(32).unwrap(),
-            nonzero(8),
+            NonZeroUsize::new((max_exchanges as usize).max(32) * 2).unwrap(),
+            nonzero(max_exchanges.max(8)),
         )
         .unwrap();
     let config = OwnerConfig {
         max_sessions: nonzero(2),
         max_routes: nonzero(2),
-        max_exchanges: nonzero(8),
+        max_exchanges: nonzero(max_exchanges),
         session_qos2_exchanges: NonZeroU32::MAX,
         account: AccountId::new(1),
         payload_bytes: PayloadBytes::new(1024),
         resolution_delay: LogicalDuration::new(1),
-        retained_operations: nonzero(16),
+        retained_operations: nonzero(max_exchanges.max(16) * 2),
         remembered_connections: nonzero(4),
     };
     let mut owner = Owner::new(config, outbox).unwrap();
@@ -2269,6 +2272,220 @@ fn higher_publication_commit_during_terminal_page_still_rescans_above_known_thro
         follow_up_after,
         Some(id(10)),
         "follow-up scan must resume strictly above known_through(10)"
+    );
+}
+
+#[test]
+fn retained_qos0_replay_pipelines_consume_within_window_and_prefetches_next_page() {
+    fn id(sequence: u64) -> DeliveryId {
+        DeliveryId {
+            publication: PublicationId::new(
+                StoreIncarnation::new(1),
+                RunEpoch::new(1),
+                LogicalOwnerId::new(4),
+                PublicationSeq::new(sequence),
+            ),
+            index: 0,
+        }
+    }
+    fn qos0_retained(sequence: u64) -> WorkItem {
+        WorkItem {
+            delivery: id(sequence),
+            target: TARGET,
+            target_revision: Revision::new(1),
+            qos: Qos::AtMostOnce,
+            cause: DeliveryCause::RetainedReplay,
+            retain: true,
+            expiry: None,
+            properties: None,
+            topic: bytes(b"t/r"),
+            payload: bytes(b"v"),
+            claim: None,
+        }
+    }
+
+    let mut owner = world_with_exchanges(32);
+    owner.mark_session_dirty(TARGET, true);
+    let page1_load = apply(&mut owner, Input::WorkAvailable { session: TARGET });
+    let [(load1, Effect::LoadWork { after: None, .. })] = page1_load.as_slice() else {
+        panic!("expected initial LoadWork");
+    };
+
+    // Page 1 returns 8 retained QoS 0 deliveries with `next = Some(8)`.
+    let page1_items: Vec<WorkItem> = (1..=8).map(qos0_retained).collect();
+    apply(
+        &mut owner,
+        Input::WorkPage {
+            effect: *load1,
+            session: TARGET,
+            items: BoundedVec::from_slice(&page1_items, 8).unwrap(),
+            next: Some(id(8)),
+        },
+    );
+
+    // All 8 ConsumeDelivery commands must be submitted in pipeline without
+    // waiting for the first commit, followed immediately by a prefetch LoadWork
+    // for page 2.
+    let mut consumed_ids = Vec::new();
+    for _ in 0..8 {
+        assert!(owner.has_ready_work(TARGET));
+        let effects = apply(&mut owner, Input::WorkAvailable { session: TARGET });
+        let delivery = effects
+            .iter()
+            .find_map(|(_, e)| match e {
+                Effect::Persist { command } => match command.recipe.get() {
+                    Recipe::ConsumeDelivery(c) => Some(c.delivery),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .expect("expected pipelined ConsumeDelivery");
+        consumed_ids.push(delivery);
+    }
+    assert_eq!(consumed_ids, (1..=8).map(id).collect::<Vec<_>>());
+
+    // 9th WorkAvailable prefetches page 2 while page 1 consumes are in flight.
+    assert!(owner.has_ready_work(TARGET));
+    let page2_load = apply(&mut owner, Input::WorkAvailable { session: TARGET });
+    let [(load2, Effect::LoadWork { after, .. })] = page2_load.as_slice() else {
+        panic!("expected prefetch LoadWork for page 2, got {page2_load:?}");
+    };
+    assert_eq!(*after, Some(id(8)));
+
+    // Page 2 returns 8 more retained QoS 0 deliveries (9..=16) with more behind.
+    let page2_items: Vec<WorkItem> = (9..=16).map(qos0_retained).collect();
+    apply(
+        &mut owner,
+        Input::WorkPage {
+            effect: *load2,
+            session: TARGET,
+            items: BoundedVec::from_slice(&page2_items, 8).unwrap(),
+            next: Some(id(16)),
+        },
+    );
+    for expected in 9..=16 {
+        assert!(owner.has_ready_work(TARGET));
+        let effects = apply(&mut owner, Input::WorkAvailable { session: TARGET });
+        let delivery = effects
+            .iter()
+            .find_map(|(_, e)| match e {
+                Effect::Persist { command } => match command.recipe.get() {
+                    Recipe::ConsumeDelivery(c) => Some(c.delivery),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .expect("expected pipelined ConsumeDelivery up to QOS0_CONSUMED_WINDOW");
+        assert_eq!(delivery, id(expected));
+    }
+
+    // Window of QOS0_CONSUMED_WINDOW (16) is now full: no 17th ConsumeDelivery
+    // and no further prefetch LoadWork may issue until a write completes.
+    assert!(
+        !owner.has_ready_work(TARGET),
+        "must stop at QOS0_CONSUMED_WINDOW (16) in-flight consumes"
+    );
+    assert!(apply(&mut owner, Input::WorkAvailable { session: TARGET }).is_empty());
+}
+
+#[test]
+fn consume_pipeline_stops_at_indeterminate_and_does_not_cross_qos1() {
+    fn id(sequence: u64) -> DeliveryId {
+        DeliveryId {
+            publication: PublicationId::new(
+                StoreIncarnation::new(1),
+                RunEpoch::new(1),
+                LogicalOwnerId::new(4),
+                PublicationSeq::new(sequence),
+            ),
+            index: 0,
+        }
+    }
+    fn item(sequence: u64, qos: Qos) -> WorkItem {
+        WorkItem {
+            delivery: id(sequence),
+            target: TARGET,
+            target_revision: Revision::new(1),
+            qos,
+            cause: DeliveryCause::RetainedReplay,
+            retain: true,
+            expiry: None,
+            properties: None,
+            topic: bytes(b"t/r"),
+            payload: bytes(b"v"),
+            claim: None,
+        }
+    }
+
+    // Part 1: mixed QoS 0 followed by QoS 1 must NOT pipeline the QoS 1 claim
+    // ahead of the pending QoS 0 consume.
+    let mut owner = world();
+    owner.mark_session_dirty(TARGET, true);
+    let [(load, Effect::LoadWork { .. })] =
+        apply(&mut owner, Input::WorkAvailable { session: TARGET }).as_slice()[..]
+    else {
+        panic!("expected LoadWork");
+    };
+    apply(
+        &mut owner,
+        Input::WorkPage {
+            effect: load,
+            session: TARGET,
+            items: BoundedVec::from_slice(
+                &[item(1, Qos::AtMostOnce), item(2, Qos::AtLeastOnce)],
+                2,
+            )
+            .unwrap(),
+            next: None,
+        },
+    );
+    let first = apply(&mut owner, Input::WorkAvailable { session: TARGET });
+    assert!(first.iter().any(|(_, e)| matches!(
+        e,
+        Effect::Persist { command } if matches!(command.recipe.get(), Recipe::ConsumeDelivery(_))
+    )));
+    assert!(
+        !owner.has_ready_work(TARGET),
+        "QoS 1 claim must wait behind pending QoS 0 consume"
+    );
+
+    // Part 2: an Indeterminate ConsumePending must stop pipelining even for
+    // a subsequent QoS 0 delivery.
+    let mut owner2 = world();
+    owner2.mark_session_dirty(TARGET, true);
+    let [(load2, Effect::LoadWork { .. })] =
+        apply(&mut owner2, Input::WorkAvailable { session: TARGET }).as_slice()[..]
+    else {
+        panic!("expected LoadWork");
+    };
+    apply(
+        &mut owner2,
+        Input::WorkPage {
+            effect: load2,
+            session: TARGET,
+            items: BoundedVec::from_slice(&[item(1, Qos::AtMostOnce), item(2, Qos::AtMostOnce)], 2)
+                .unwrap(),
+            next: None,
+        },
+    );
+    let first2 = apply(&mut owner2, Input::WorkAvailable { session: TARGET });
+    let deadline1 = first2
+        .iter()
+        .find_map(|(_, e)| match e {
+            Effect::ArmDeadline { token, .. } => Some(*token),
+            _ => None,
+        })
+        .expect("expected deadline for ConsumeDelivery");
+    apply(
+        &mut owner2,
+        Input::Deadline {
+            token: deadline1,
+            now: crate::contract::ids::LogicalTime::new(10_000),
+        },
+    );
+    assert!(
+        !owner2.has_ready_work(TARGET),
+        "Indeterminate ConsumePending must block pipelining of later QoS 0 deliveries"
     );
 }
 

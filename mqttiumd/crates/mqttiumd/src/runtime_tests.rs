@@ -60,6 +60,7 @@ fn with_runtime_clock_hooks(
 
 enum TestWriter {
     Single(Arc<dyn SessionClock>),
+    Log,
     Sharded(NonZeroUsize),
 }
 
@@ -76,6 +77,19 @@ fn with_runtime_layout(
     let (writer, shards) = match writer {
         TestWriter::Single(clock) => (
             Writer::spawn_with_clock(path, events.clone(), hooks.clone(), cancel.clone(), clock),
+            0,
+        ),
+        TestWriter::Log => (
+            Writer::spawn_configured_sharded(
+                path,
+                events.clone(),
+                hooks.clone(),
+                cancel.clone(),
+                None,
+                false,
+                crate::writer::StorageMode::Log,
+                0,
+            ),
             0,
         ),
         TestWriter::Sharded(count) => (
@@ -751,9 +765,9 @@ fn check_retained_qos0_replay(version: codec::Version) {
             codec::Version::V5 => (0x31, vec![0, 1, topic, 0, b'v']),
         };
         runtime.packet(slow, 0x82, subscribe.clone()).unwrap();
-        // The subscription and its retained replay take seventeen store
-        // commits, one after the other: 1 s failed on a runner whose fsync
-        // took about 100 ms.
+        // Retained QoS 0 consumes pipeline within QOS0_CONSUMED_WINDOW so the
+        // writer batches them into a handful of group commits instead of one
+        // serial fsync per retained message.
         until_within(runtime, Duration::from_secs(10), |r| {
             r.retained_output.pending(slow) == QOS0_CONSUMED_WINDOW && r.owner.outbox_is_empty()
         });
@@ -786,6 +800,75 @@ fn check_retained_qos0_replay(version: codec::Version) {
             r.frames.is_empty() && r.owner.outbox_is_empty() && r.retained_output.is_empty()
         });
     });
+}
+
+#[test]
+fn retained_qos0_replay_batches_consume_commits_in_log_mode() {
+    use mqttiumd_core::owner::QOS0_CONSUMED_WINDOW;
+    fn count_mlog_frames(path: &Path) -> usize {
+        let bytes = std::fs::read(path).expect("read .mlog");
+        let mut pos = 24usize;
+        let mut frames = 0usize;
+        while pos + 4 <= bytes.len() {
+            let body_len =
+                u32::from_be_bytes([bytes[pos], bytes[pos + 1], bytes[pos + 2], bytes[pos + 3]])
+                    as usize;
+            if body_len == 0 {
+                break;
+            }
+            frames += 1;
+            pos += 4 + body_len + 4;
+        }
+        frames
+    }
+    with_runtime_layout(
+        128,
+        TestWriter::Log,
+        Hooks::default(),
+        |runtime, directory| {
+            let (source, mut publisher) =
+                connected_version(runtime, b"retained-batch-src", codec::Version::V5);
+            let topics = b'a'..(b'a' + QOS0_CONSUMED_WINDOW as u8);
+            for (index, topic) in topics.clone().enumerate() {
+                let id = u16::try_from(index + 1).unwrap();
+                let [high, low] = id.to_be_bytes();
+                let body = vec![0, 1, topic, high, low, 0, b'v'];
+                runtime.packet(source, 0x33, body).unwrap();
+                assert_eq!(
+                    served_frame(runtime, &mut publisher),
+                    (0x40, vec![high, low, 0x10])
+                );
+            }
+            let (sub, mut sub_socket) =
+                connected_version(runtime, b"retained-batch-sub", codec::Version::V5);
+            let mlog = directory.join("store.sqlite.mlog");
+            let frames_before = count_mlog_frames(&mlog);
+            runtime
+                .packet(sub, 0x82, vec![0, 1, 0, 0, 1, b'+', 0])
+                .unwrap();
+            assert_eq!(
+                served_frame(runtime, &mut sub_socket),
+                (0x90, vec![0, 1, 0, 0])
+            );
+            for topic in topics.clone() {
+                assert_eq!(
+                    served_frame(runtime, &mut sub_socket),
+                    (0x31, vec![0, 1, topic, 0, b'v'])
+                );
+            }
+            until(runtime, |r| {
+                r.frames.is_empty() && r.owner.outbox_is_empty() && r.retained_output.is_empty()
+            });
+            let frames_after = count_mlog_frames(&mlog);
+            let added = frames_after - frames_before;
+            // Before pipelining ConsumeDelivery (reserve R3), 16 retained QoS 0
+            // replays took 17 serial commits (1 SUBSCRIBE + 16 ConsumeDelivery).
+            assert!(
+                added < 10,
+                "expected batched retained QoS 0 consume commits (< 10 frames), observed {added}"
+            );
+        },
+    );
 }
 
 fn event_turn_without_scan(runtime: &mut Runtime<'_>) {

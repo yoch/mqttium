@@ -657,8 +657,12 @@ impl State {
         self.deliveries.active(generation)
     }
 
-    fn qos0_writing(&self, session: SessionId, generation: ConnectionGeneration) -> usize {
-        self.deliveries.qos0_writing(session, generation)
+    fn qos0_consumed_in_flight(
+        &self,
+        session: SessionId,
+        generation: ConnectionGeneration,
+    ) -> usize {
+        self.deliveries.qos0_consumed_in_flight(session, generation)
     }
 
     fn next_send(
@@ -671,15 +675,16 @@ impl State {
         self.deliveries.next_send(session, generation, now, room)
     }
 
-    fn next_pipelined_claim(
+    fn next_pipelined_action(
         &self,
         session: SessionId,
         generation: ConnectionGeneration,
         now: Option<MessageTime>,
         room: bool,
-    ) -> (Option<(usize, &Delivery)>, bool) {
+        qos0_room: bool,
+    ) -> (Option<deliveries::PipelinedAction<'_>>, bool) {
         self.deliveries
-            .next_pipelined_claim(session, generation, now, room)
+            .next_pipelined_action(session, generation, now, room, qos0_room)
     }
 
     fn free_packet_id(&self, session: SessionId, maximum: u16) -> Option<OutboundPacketId> {
@@ -884,9 +889,9 @@ impl Owner {
                 self.pubsub
                     .next_send(session, generation, self.message_now, room)
             {
-                if delivery.phase == Phase::Queued
-                    && delivery.qos == Qos::AtMostOnce
-                    && self.pubsub.qos0_writing(session, generation) >= QOS0_CONSUMED_WINDOW
+                let qos0_room =
+                    self.pubsub.qos0_consumed_in_flight(session, generation) < QOS0_CONSUMED_WINDOW;
+                if delivery.phase == Phase::Queued && delivery.qos == Qos::AtMostOnce && !qos0_room
                 {
                     // Held until a write of the connection ends (record 0063).
                     return None;
@@ -903,11 +908,12 @@ impl Owner {
                     if sd.queued == 0 && !needs_scan {
                         return None;
                     }
-                    let (candidate, can_prefetch) = self.pubsub.next_pipelined_claim(
+                    let (candidate, can_prefetch) = self.pubsub.next_pipelined_action(
                         session,
                         generation,
                         self.message_now,
                         room,
+                        qos0_room,
                     );
                     if candidate.is_some() {
                         return Some(generation);
@@ -2489,6 +2495,7 @@ impl Owner {
             .pubsub
             .next_send(session, generation, self.message_now, room);
         let mut claim_target = None;
+        let mut consume_target = None;
         let mut allow_prefetch = true;
         if let Some((_, d)) = next
             && matches!(
@@ -2504,25 +2511,39 @@ impl Owner {
             if !has_queued && (!needs_scan || loading) {
                 return Ok(super::Change::Nothing);
             }
-            // A lost (Indeterminate) claim result or a pending QoS 0 consume
-            // must be reconciled before a later publication can be claimed on
-            // this destination. Healthy in-flight Submitted claims allow
-            // pipelining further QoS 1/2 claims within Receive Maximum while
-            // `plan_delivery_emit` continues to enforce strict wire order.
-            let (candidate, can_prefetch) =
-                self.pubsub
-                    .next_pipelined_claim(session, generation, self.message_now, room);
-            if let Some(pair) = candidate {
-                claim_target = Some(pair);
-            } else if can_prefetch && !loading && needs_scan {
-                allow_prefetch = true;
-            } else {
-                return Ok(super::Change::Nothing);
+            let qos0_room =
+                self.pubsub.qos0_consumed_in_flight(session, generation) < QOS0_CONSUMED_WINDOW;
+            // A lost (Indeterminate) claim/consume result must be reconciled
+            // before later deliveries proceed. Healthy Submitted claims
+            // pipeline QoS 1/2 claims within Receive Maximum; healthy
+            // Submitted consumes pipeline QoS 0 consumes within
+            // QOS0_CONSUMED_WINDOW without reordering across QoS classes.
+            let (candidate, can_prefetch) = self.pubsub.next_pipelined_action(
+                session,
+                generation,
+                self.message_now,
+                room,
+                qos0_room,
+            );
+            match candidate {
+                Some(deliveries::PipelinedAction::Claim(slot, d)) => {
+                    claim_target = Some((slot, d));
+                }
+                Some(deliveries::PipelinedAction::Consume(slot, d)) => {
+                    consume_target = Some((slot, d));
+                }
+                None if can_prefetch && !loading && needs_scan => {
+                    allow_prefetch = true;
+                }
+                None => {
+                    return Ok(super::Change::Nothing);
+                }
             }
         } else {
             allow_prefetch = false;
         }
         if claim_target.is_none()
+            && consume_target.is_none()
             && let Some((slot, d)) = next
             && d.phase == Phase::AwaitPuback
             && d.ready_to_send(generation, room)
@@ -2551,17 +2572,22 @@ impl Owner {
                 Emission::Held => {}
             }
         }
-        if claim_target.is_none()
-            && let Some((slot, d)) = next
-            && d.phase == Phase::Queued
-            && d.qos == Qos::AtMostOnce
-            && d.payload.is_some()
-        {
+        let consume_candidate = consume_target.or_else(|| {
+            if claim_target.is_none() {
+                next.filter(|(_, d)| {
+                    d.phase == Phase::Queued && d.qos == Qos::AtMostOnce && d.payload.is_some()
+                })
+            } else {
+                None
+            }
+        });
+        if let Some((slot, d)) = consume_candidate {
             // The frame of a consumed delivery must find a place in the
             // output queue: the store no longer owes the message. No more
-            // are consumed than the connection may have being written
-            // (record 0063); the end of a write brings this work back.
-            if self.pubsub.qos0_writing(session, generation) >= QOS0_CONSUMED_WINDOW {
+            // are consumed (in flight or being written) than the connection
+            // window allows (record 0063); the end of a write brings this
+            // work back.
+            if self.pubsub.qos0_consumed_in_flight(session, generation) >= QOS0_CONSUMED_WINDOW {
                 return Ok(super::Change::Nothing);
             }
             let operation = self.operation(draft)?;

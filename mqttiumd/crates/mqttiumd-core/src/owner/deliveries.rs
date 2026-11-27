@@ -613,7 +613,7 @@ impl Deliveries {
             .and_then(|d| d.claim_result.as_deref())
     }
 
-    pub(super) fn qos0_writing(
+    pub(super) fn qos0_consumed_in_flight(
         &self,
         session: SessionId,
         generation: ConnectionGeneration,
@@ -625,8 +625,13 @@ impl Deliveries {
             .iter()
             .filter(|&index| {
                 let d = &self.rows[index];
-                matches!(d.phase, Phase::Qos0Writing(_))
-                    && d.frame.is_some_and(|(_, key)| key.generation == generation)
+                match d.phase {
+                    Phase::Qos0Writing(_) => {
+                        d.frame.is_some_and(|(_, key)| key.generation == generation)
+                    }
+                    Phase::ConsumePending(_, key) => key.generation == generation,
+                    _ => false,
+                }
             })
             .count()
     }
@@ -1325,52 +1330,87 @@ impl Deliveries {
         }
     }
 
-    pub(super) fn next_pipelined_claim(
+    pub(super) fn next_pipelined_action(
         &self,
         session: SessionId,
         generation: ConnectionGeneration,
         now: Option<MessageTime>,
         room: bool,
-    ) -> (Option<(usize, &Delivery)>, bool) {
-        if !room {
+        qos0_room: bool,
+    ) -> (Option<PipelinedAction<'_>>, bool) {
+        if !room && !qos0_room {
             return (None, false);
         }
         let Some(sd) = self.by_session.get(&session) else {
-            return (None, true);
+            return (None, room || qos0_room);
         };
         let indices = sd.waiting_candidates(generation);
-        let mut blocker: Option<DeliveryId> = None;
-        let mut best_queued: Option<(usize, &Delivery)> = None;
-        let mut blocked_all = false;
+        let mut claim_blocker: Option<DeliveryId> = None;
+        let mut best_claim: Option<(usize, &Delivery)> = None;
+        let mut claim_blocked_all = !room;
+
+        let mut consume_blocker: Option<DeliveryId> = None;
+        let mut best_consume: Option<(usize, &Delivery)> = None;
+        let mut consume_blocked_all = !qos0_room;
+
         for idx in indices {
             let d = &self.rows[idx];
             if !d.waiting_to_send(generation, now) || d.awaits_pubcomp() {
                 continue;
             }
-            match &d.phase {
-                Phase::ClaimPending(f) if f.phase == CommandPhase::Submitted => {}
-                Phase::AwaitPuback if d.window == Some(generation) => {}
-                Phase::Queued if d.qos != Qos::AtMostOnce && d.payload.is_some() => {
-                    if best_queued.is_none_or(|(_, prev)| d.id < prev.id) {
-                        best_queued = Some((idx, d));
+            if room {
+                match &d.phase {
+                    Phase::ClaimPending(f) if f.phase == CommandPhase::Submitted => {}
+                    Phase::AwaitPuback if d.window == Some(generation) => {}
+                    Phase::Queued if d.qos != Qos::AtMostOnce && d.payload.is_some() => {
+                        if best_claim.is_none_or(|(_, prev)| d.id < prev.id) {
+                            best_claim = Some((idx, d));
+                        }
+                    }
+                    _ => {
+                        claim_blocked_all = true;
+                        if claim_blocker.is_none_or(|prev| d.id < prev) {
+                            claim_blocker = Some(d.id);
+                        }
                     }
                 }
-                _ => {
-                    blocked_all = true;
-                    if blocker.is_none_or(|prev| d.id < prev) {
-                        blocker = Some(d.id);
+            }
+            if qos0_room {
+                match &d.phase {
+                    Phase::ConsumePending(f, key)
+                        if f.phase == CommandPhase::Submitted && key.generation == generation => {}
+                    Phase::Queued if d.qos == Qos::AtMostOnce && d.payload.is_some() => {
+                        if best_consume.is_none_or(|(_, prev)| d.id < prev.id) {
+                            best_consume = Some((idx, d));
+                        }
+                    }
+                    _ => {
+                        consume_blocked_all = true;
+                        if consume_blocker.is_none_or(|prev| d.id < prev) {
+                            consume_blocker = Some(d.id);
+                        }
                     }
                 }
             }
         }
-        if let Some((idx, d)) = best_queued {
-            if blocker.is_none_or(|b| d.id < b) {
-                return (Some((idx, d)), false);
-            }
-            return (None, false);
+        if let Some((idx, d)) = best_claim
+            && claim_blocker.is_none_or(|b| d.id < b)
+        {
+            return (Some(PipelinedAction::Claim(idx, d)), false);
         }
-        (None, !blocked_all)
+        if let Some((idx, d)) = best_consume
+            && consume_blocker.is_none_or(|b| d.id < b)
+        {
+            return (Some(PipelinedAction::Consume(idx, d)), false);
+        }
+        (None, !claim_blocked_all || !consume_blocked_all)
     }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(super) enum PipelinedAction<'a> {
+    Claim(usize, &'a Delivery),
+    Consume(usize, &'a Delivery),
 }
 
 #[cfg(test)]
