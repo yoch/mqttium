@@ -127,7 +127,9 @@ impl OriginWitness {
             .to_be_bytes()
         };
         let mut statement = conn.prepare_cached(
-            "SELECT id,recipe,decision,publication,exchange,reason,resource,facts FROM operations WHERE id>=?1 AND id<=?2 ORDER BY id",
+            "SELECT id,recipe,decision,publication,exchange,reason,resource,facts \
+             FROM operations WHERE id>=?1 AND id<=?2 \
+             ORDER BY id",
         )?;
         let mut rows = statement.query(params![op(0).as_slice(), op(u64::MAX).as_slice()])?;
         let mut meter = reader::Meter::new(ReadBudget::SNAPSHOT);
@@ -362,7 +364,12 @@ fn snapshot_with_lengths(
     let mut lengths = BTreeMap::new();
     let mut meter = reader::Meter::new(budget);
     let mut total = 0u64;
-    let mut stmt=conn.prepare_cached("SELECT r.topic,r.publication,r.producer_client_id,p.topic,p.qos,p.retain,p.retained_version,y.length,y.refs,length(y.bytes),p.expiry_domain,p.expiry_tick,p.expiry_interval FROM retained r LEFT JOIN publications p ON p.id=r.publication LEFT JOIN payloads y ON y.id=p.payload ORDER BY r.topic LIMIT ?1")?;
+    let mut stmt=conn.prepare_cached("SELECT \
+                                      r.topic,r.publication,r.producer_client_id,p.topic,p.qos,p.retain,p.retained_version,y.length,y.refs,length(y.bytes),p.expiry_domain,p.expiry_tick,p.expiry_interval \
+                                      FROM retained r LEFT JOIN publications p \
+                                      ON p.id=r.publication \
+                                      LEFT JOIN payloads y ON y.id=p.payload \
+                                      ORDER BY r.topic LIMIT ?1")?;
     let mut rows =
         stmt.query([i64::try_from(MAX_RETAINED_TOPICS + 1).map_err(|_| Fault::Corrupt)?])?;
     while let Some(row) = rows.next()? {
@@ -427,7 +434,19 @@ fn snapshot_with_lengths(
 
 /// Drop one retained-owned reference, never an obligation or another owner's ref.
 pub(super) fn release(conn: &Connection, meta: &mut Meta, publication: PublicationId) -> Guard<()> {
-    let row=conn.prepare_cached("SELECT p.payload,y.refs,y.length FROM publications p JOIN payloads y ON y.id=p.payload WHERE p.id=?1")?.query_row([publication.to_be_bytes().as_slice()],|row|Ok((reader::copy_blob(row,0,32)?,reader::copy_blob(row,1,8)?,reader::copy_blob(row,2,8)?)))?;
+    let row = conn
+        .prepare_cached(
+            "SELECT p.payload,y.refs,y.length \
+             FROM publications p JOIN payloads y ON y.id=p.payload \
+             WHERE p.id=?1",
+        )?
+        .query_row([publication.to_be_bytes().as_slice()], |row| {
+            Ok((
+                reader::copy_blob(row, 0, 32)?,
+                reader::copy_blob(row, 1, 8)?,
+                reader::copy_blob(row, 2, 8)?,
+            ))
+        })?;
     let refs = blob_u64(&row.1)?.checked_sub(1).ok_or(Abort::Fault)?;
     meta.accounts.references = meta
         .accounts
@@ -632,8 +651,14 @@ pub(super) fn subscribe(
                 ))
             })?;
         let qos = code_qos(row.1)?.min(granted);
-        conn.prepare_cached("INSERT INTO publications(id,operation,source,qos,retain,payload,retained_version,expiry_domain,expiry_tick,expiry_interval,topic,properties) SELECT ?1,?2,?3,?4,1,?5,?6,expiry_domain,expiry_tick,expiry_interval,?7,properties FROM publications WHERE id=?6")?.execute(params![publication.to_be_bytes().as_slice(),update.operation.to_be_bytes().as_slice(),row.0,row.1,row.2,version.to_be_bytes().as_slice(),row.3])?;
-        conn.prepare_cached("INSERT INTO obligations(publication,idx,target,target_revision,qos,cause,phase,retain) VALUES(?1,0,?2,?3,?4,2,1,1)")?.execute(params![publication.to_be_bytes().as_slice(),update.session.to_be_bytes().as_slice(),update.session_revision.to_be_bytes().as_slice(),qos_code(qos)])?;
+        conn.prepare_cached("INSERT INTO \
+                             publications(id,operation,source,qos,retain,payload,retained_version,expiry_domain,expiry_tick,expiry_interval,topic,properties) \
+                             SELECT \
+                             ?1,?2,?3,?4,1,?5,?6,expiry_domain,expiry_tick,expiry_interval,?7,properties \
+                             FROM publications WHERE id=?6")?.execute(params![publication.to_be_bytes().as_slice(),update.operation.to_be_bytes().as_slice(),row.0,row.1,row.2,version.to_be_bytes().as_slice(),row.3])?;
+        conn.prepare_cached("INSERT INTO \
+                             obligations(publication,idx,target,target_revision,qos,cause,phase,retain) \
+                             VALUES(?1,0,?2,?3,?4,2,1,1)")?.execute(params![publication.to_be_bytes().as_slice(),update.session.to_be_bytes().as_slice(),update.session_revision.to_be_bytes().as_slice(),qos_code(qos)])?;
         let refs: Vec<u8> = conn
             .prepare_cached("SELECT refs FROM payloads WHERE id=?1")?
             .query_row([row.2.as_slice()], |row| reader::copy_blob(row, 0, 8))?;

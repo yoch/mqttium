@@ -128,15 +128,20 @@ impl StoragePolicy {
             let begin = CREATE.find(&prefix).ok_or(OpenError::Corrupt)?;
             let end = CREATE[begin..].find("\nEND;").ok_or(OpenError::Corrupt)? + 4;
             let trigger_exists: bool = conn.query_row(
-                "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='trigger' AND name=?1 AND sql=?2)",
-                params![name, &CREATE[begin..begin + end]], |row| row.get(0))?;
+                "SELECT EXISTS(SELECT 1 FROM sqlite_schema \
+                 WHERE type='trigger' AND name=?1 AND sql=?2)",
+                params![name, &CREATE[begin..begin + end]],
+                |row| row.get(0),
+            )?;
             if !trigger_exists {
                 return Err(OpenError::Corrupt);
             }
         }
         {
             let mut statement = conn.prepare(
-                "SELECT client_id, principal FROM security_client_owners ORDER BY client_id LIMIT 4097",
+                "SELECT client_id, principal \
+                 FROM security_client_owners \
+                 ORDER BY client_id LIMIT 4097",
             )?;
             let mut rows = statement.query([])?;
             for (badged_id, badged_owner) in &self.owners {

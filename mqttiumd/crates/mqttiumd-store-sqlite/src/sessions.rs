@@ -100,7 +100,9 @@ pub(super) fn validate_metadata(
     only: Option<SessionId>,
 ) -> Result<(), Fault> {
     let mut statement = conn.prepare_cached(
-        "SELECT state,expiry,opened_by,detached_by,deadline FROM sessions WHERE (?1 IS NULL OR id=?1) LIMIT ?2",
+        "SELECT state,expiry,opened_by,detached_by,deadline \
+         FROM sessions WHERE (?1 IS NULL OR id=?1) \
+         LIMIT ?2",
     )?;
     let mut rows = statement.query(params![
         only.map(|id| id.to_be_bytes().to_vec()),
@@ -130,7 +132,9 @@ fn active_for_client(
     client: &[u8],
 ) -> Result<Option<CurrentSession>, Fault> {
     let mut stmt = conn.prepare_cached(
-        "SELECT id,revision,state,expiry,opened_by,detached_by,deadline FROM sessions WHERE client_id=?1 LIMIT 2",
+        "SELECT id,revision,state,expiry,opened_by,detached_by,deadline \
+         FROM sessions WHERE client_id=?1 \
+         LIMIT 2",
     )?;
     let mut rows = stmt.query([client])?;
     let mut found = None;
@@ -242,7 +246,12 @@ pub(super) fn erase(
         .try_reserve_exact(deliveries)
         .map_err(|_| Abort::Refused(AdminRefused::WriteFailed))?;
     {
-        let mut stmt = conn.prepare_cached("SELECT o.publication,o.idx,o.target_revision,o.qos,o.cause,o.phase,c.packet_id,c.claim,c.target,c.target_revision FROM obligations o LEFT JOIN outbound c ON c.publication=o.publication AND c.idx=o.idx WHERE o.target=?1 ORDER BY o.publication,o.idx")?;
+        let mut stmt = conn.prepare_cached("SELECT \
+                                            o.publication,o.idx,o.target_revision,o.qos,o.cause,o.phase,c.packet_id,c.claim,c.target,c.target_revision \
+                                            FROM obligations o \
+                                            LEFT JOIN outbound c ON c.publication=o.publication \
+                                            AND c.idx=o.idx WHERE o.target=?1 \
+                                            ORDER BY o.publication,o.idx")?;
         let mut rows = stmt.query([key.as_slice()])?;
         while let Some(row) = rows.next()? {
             meter.charge(256)?;
@@ -301,7 +310,14 @@ pub(super) fn erase(
             code_qos(row.get(1)?)?;
         }
     }
-    conn.prepare_cached("DELETE FROM publications WHERE id IN (SELECT publication FROM inbound WHERE session=?1) AND NOT EXISTS (SELECT 1 FROM obligations WHERE publication=publications.id) AND NOT EXISTS (SELECT 1 FROM retained WHERE publication=publications.id) AND NOT EXISTS (SELECT 1 FROM inbound WHERE publication=publications.id AND session!=?1)")?.execute([key.as_slice()])?;
+    conn.prepare_cached(
+        "DELETE FROM publications WHERE id IN (SELECT publication \
+         FROM inbound WHERE session=?1) AND NOT EXISTS (SELECT 1 \
+         FROM obligations WHERE publication=publications.id) AND NOT EXISTS (SELECT 1 \
+         FROM retained WHERE publication=publications.id) AND NOT EXISTS (SELECT 1 \
+         FROM inbound WHERE publication=publications.id AND session!=?1)",
+    )?
+    .execute([key.as_slice()])?;
     let removed = conn
         .prepare_cached("DELETE FROM inbound WHERE session=?1")?
         .execute([key.as_slice()])?;
@@ -423,8 +439,15 @@ pub(super) fn stage(
             let (session, revision, session_present) = if let Some((session, revision, _, _, _)) =
                 current.filter(|_| !replace)
             {
-                conn.prepare_cached("UPDATE sessions SET expiry=?2,opened_by=?3,detached_by=NULL,deadline=NULL WHERE id=?1")?
-                    .execute(params![session.to_be_bytes().as_slice(),expiry_code(*expiry),command.operation.to_be_bytes().as_slice()])?;
+                conn.prepare_cached(
+                    "UPDATE sessions SET expiry=?2,opened_by=?3,detached_by=NULL,deadline=NULL \
+                     WHERE id=?1",
+                )?
+                .execute(params![
+                    session.to_be_bytes().as_slice(),
+                    expiry_code(*expiry),
+                    command.operation.to_be_bytes().as_slice()
+                ])?;
                 (session, revision, true)
             } else {
                 let active: i64 = conn.query_row(
@@ -441,8 +464,17 @@ pub(super) fn stage(
                 let session = meta.next_session;
                 meta.next_session = session.checked_next().map_err(|_| Abort::Refused(failed))?;
                 let revision = Revision::new(1);
-                conn.prepare_cached("INSERT INTO sessions(id,revision,state,client_id,expiry,opened_by) VALUES(?1,?2,1,?3,?4,?5)")?
-                    .execute(params![session.to_be_bytes().as_slice(),revision.to_be_bytes().as_slice(),client_id.as_slice(),expiry_code(*expiry),command.operation.to_be_bytes().as_slice()])?;
+                conn.prepare_cached(
+                    "INSERT INTO sessions(id,revision,state,client_id,expiry,opened_by) \
+                     VALUES(?1,?2,1,?3,?4,?5)",
+                )?
+                .execute(params![
+                    session.to_be_bytes().as_slice(),
+                    revision.to_be_bytes().as_slice(),
+                    client_id.as_slice(),
+                    expiry_code(*expiry),
+                    command.operation.to_be_bytes().as_slice()
+                ])?;
                 (session, revision, false)
             };
             SessionChange::Opened {

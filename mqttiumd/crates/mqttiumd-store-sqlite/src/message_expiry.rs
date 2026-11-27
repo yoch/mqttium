@@ -88,7 +88,10 @@ pub(super) fn guard_observation(conn: &Connection, now: MessageTime) -> Guard<()
 pub(super) fn validate(conn: &Connection, target: Option<SessionId>) -> Result<(), Fault> {
     let target = target.map(|s| s.to_be_bytes());
     let mut statement = conn.prepare_cached(
-        "SELECT p.expiry_domain,p.expiry_tick,p.expiry_interval FROM publications p WHERE ?1 IS NULL OR EXISTS(SELECT 1 FROM obligations o WHERE o.publication=p.id AND o.target=?1) LIMIT ?2",
+        "SELECT p.expiry_domain,p.expiry_tick,p.expiry_interval \
+         FROM publications p WHERE ?1 IS NULL OR EXISTS(SELECT 1 \
+         FROM obligations o WHERE o.publication=p.id AND o.target=?1) \
+         LIMIT ?2",
     )?;
     let mut rows = statement.query(params![
         target.as_ref().map(|b| b.as_slice()),
@@ -103,8 +106,14 @@ pub(super) fn validate(conn: &Connection, target: Option<SessionId>) -> Result<(
         decode(row, 0)?;
     }
     let invalid: bool = conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM outbound c LEFT JOIN obligations o ON o.publication=c.publication AND o.idx=c.idx WHERE (?1 IS NULL OR c.target=?1) AND (typeof(c.started)!='integer' OR c.started NOT IN (0,1) OR o.publication IS NULL OR o.target!=c.target OR o.target_revision!=c.target_revision OR o.qos NOT IN (1,2) OR (o.phase=2 AND o.qos!=2) OR o.cause NOT IN (1,2)) LIMIT 1)",
-        [target.as_ref().map(|b| b.as_slice())], |row| row.get(0),
+        "SELECT EXISTS(SELECT 1 FROM outbound c \
+         LEFT JOIN obligations o ON o.publication=c.publication AND o.idx=c.idx \
+         WHERE (?1 IS NULL OR c.target=?1) AND (typeof(c.started)!='integer' OR c.started NOT IN \
+         (0,1) OR o.publication IS NULL OR o.target!=c.target OR \
+         o.target_revision!=c.target_revision OR o.qos NOT IN (1,2) OR (o.phase=2 AND o.qos!=2) \
+         OR o.cause NOT IN (1,2)) LIMIT 1)",
+        [target.as_ref().map(|b| b.as_slice())],
+        |row| row.get(0),
     )?;
     if invalid {
         return Err(Fault::Corrupt);
@@ -127,7 +136,10 @@ fn candidate(
     meta: &Meta,
     id: PublicationId,
 ) -> Result<(Option<MessageExpiry>, Option<Vec<u8>>), Fault> {
-    let mut statement = conn.prepare_cached("SELECT qos,retain,retained_version,topic,payload,expiry_domain,expiry_tick,expiry_interval FROM publications WHERE id=?1")?;
+    let mut statement = conn.prepare_cached("SELECT \
+                                             qos,retain,retained_version,topic,payload,expiry_domain,expiry_tick,expiry_interval \
+                                             FROM publications \
+                                             WHERE id=?1")?;
     let mut rows = statement.query([id.to_be_bytes().as_slice()])?;
     let row = rows.next()?.ok_or(Fault::Corrupt)?;
     code_qos(row.get(0)?)?;
@@ -174,11 +186,25 @@ fn candidate(
             return Err(Fault::Corrupt);
         }
     }
-    let orphan: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM outbound c LEFT JOIN obligations o ON o.publication=c.publication AND o.idx=c.idx WHERE c.publication=?1 AND o.publication IS NULL LIMIT 1)", [id.to_be_bytes().as_slice()], |row| row.get(0))?;
+    let orphan: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM outbound c \
+         LEFT JOIN obligations o ON o.publication=c.publication AND o.idx=c.idx \
+         WHERE c.publication=?1 AND o.publication IS NULL \
+         LIMIT 1)",
+        [id.to_be_bytes().as_slice()],
+        |row| row.get(0),
+    )?;
     if orphan {
         return Err(Fault::Corrupt);
     }
-    let mut obligations = conn.prepare_cached("SELECT o.idx,o.target,o.target_revision,o.qos,o.cause,o.phase,o.retain,c.target,c.target_revision,c.packet_id,c.claim,c.started,s.revision,s.state FROM obligations o LEFT JOIN outbound c ON c.publication=o.publication AND c.idx=o.idx LEFT JOIN sessions s ON s.id=o.target WHERE o.publication=?1 ORDER BY o.idx LIMIT ?2")?;
+    let mut obligations = conn.prepare_cached("SELECT \
+                                               o.idx,o.target,o.target_revision,o.qos,o.cause,o.phase,o.retain,c.target,c.target_revision,c.packet_id,c.claim,c.started,s.revision,s.state \
+                                               FROM obligations o \
+                                               LEFT JOIN outbound c \
+                                               ON c.publication=o.publication AND c.idx=o.idx \
+                                               LEFT JOIN sessions s ON s.id=o.target \
+                                               WHERE o.publication=?1 \
+                                               ORDER BY o.idx LIMIT ?2")?;
     let mut obligations = obligations.query(params![
         id.to_be_bytes().as_slice(),
         MESSAGE_EXPIRY_SWEEP_DELIVERIES as i64 + 1
@@ -317,7 +343,16 @@ pub(super) fn sweep(
                 result.quarantined += 1;
             }
             ExpiryState::Expired => {
-                let uncertain: i64 = conn.query_row("SELECT count(*) FROM (SELECT 1 FROM outbound WHERE publication=?1 AND started=0 LIMIT ?2)", params![id.to_be_bytes().as_slice(), MESSAGE_EXPIRY_SWEEP_DELIVERIES as i64 + 1], |row| row.get(0))?;
+                let uncertain: i64 = conn.query_row(
+                    "SELECT count(*) FROM (SELECT 1 \
+                     FROM outbound WHERE publication=?1 AND started=0 \
+                     LIMIT ?2)",
+                    params![
+                        id.to_be_bytes().as_slice(),
+                        MESSAGE_EXPIRY_SWEEP_DELIVERIES as i64 + 1
+                    ],
+                    |row| row.get(0),
+                )?;
                 let uncertain = u32::try_from(uncertain).map_err(|_| Fault::Corrupt)?;
                 if uncertain as usize > MESSAGE_EXPIRY_SWEEP_DELIVERIES {
                     return Err(ReadError::LimitExceeded.into());
@@ -339,7 +374,12 @@ pub(super) fn sweep(
                 let mut deliveries = BoundedVec::with_capacity(MESSAGE_EXPIRY_SWEEP_DELIVERIES)
                     .map_err(|_| ReadError::AllocationFailed)?;
                 {
-                    let mut statement = conn.prepare_cached("SELECT o.idx,o.target FROM obligations o WHERE o.publication=?1 AND NOT EXISTS(SELECT 1 FROM outbound c WHERE c.publication=o.publication AND c.idx=o.idx) ORDER BY o.idx LIMIT ?2")?;
+                    let mut statement = conn.prepare_cached(
+                        "SELECT o.idx,o.target FROM obligations o \
+                         WHERE o.publication=?1 AND NOT EXISTS(SELECT 1 \
+                         FROM outbound c WHERE c.publication=o.publication AND c.idx=o.idx) \
+                         ORDER BY o.idx LIMIT ?2",
+                    )?;
                     let mut rows = statement.query(params![
                         id.to_be_bytes().as_slice(),
                         MESSAGE_EXPIRY_SWEEP_DELIVERIES as i64 + 1
