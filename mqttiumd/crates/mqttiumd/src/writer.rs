@@ -1294,6 +1294,10 @@ impl Writer {
                             }
                             shard_rr = (shard_rr + 1) % shard_count;
                         }
+                        #[cfg(feature = "test-hooks")]
+                        if !members.is_empty() || !deferred_reads.is_empty() || other.is_some() {
+                            hold_ordinary(&hooks);
+                        }
                         let idle_turn =
                             members.is_empty() && deferred_reads.is_empty() && other.is_none();
                         if !members.is_empty() {
@@ -2804,6 +2808,24 @@ fn control_response(
 fn consume_file(path: &Path) -> bool {
     path.exists() && std::fs::remove_file(path).is_ok()
 }
+/// A test run can hold the worker before each ordinary command it serves:
+/// while `hold-ordinary` exists the worker marks `held-ordinary` and waits
+/// for a `release-ordinary` token, which it consumes.
+#[cfg(feature = "test-hooks")]
+fn hold_ordinary(hooks: &Hooks) {
+    let Some(directory) = hooks.directory.as_ref() else {
+        return;
+    };
+    let held = directory.join("held-ordinary");
+    while directory.join("hold-ordinary").exists() {
+        let _ = std::fs::write(&held, b"");
+        if consume_file(&directory.join("release-ordinary")) {
+            break;
+        }
+        thread::sleep(Duration::from_millis(1));
+    }
+    let _ = std::fs::remove_file(&held);
+}
 #[cfg(feature = "test-hooks")]
 fn recipe_identity_highwater(recipe: &Recipe) -> Result<(u64, u64), Failure> {
     if let Recipe::WillPublication(value) = recipe {
@@ -3881,6 +3903,91 @@ mod tests {
                     mqttiumd_contract::session::SessionChange::Closed { .. }))) }))
                 if effect == close_effect && returned == close_operation),
             "reserved close must return its own committed result"
+        );
+    }
+    /// The reserved lane does not wait for the business lane: control
+    /// requests queued while an ordinary command commits are all answered
+    /// before the worker serves the next ordinary command.
+    #[cfg(feature = "test-hooks")]
+    #[test]
+    fn queued_control_requests_are_answered_before_the_next_ordinary_command() {
+        let path = std::env::temp_dir().join(format!(
+            "mqttiumd-control-drain-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let directory = path.join("hooks");
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(directory.join("hold-ordinary"), b"").unwrap();
+        let events = Events::open(&path.join("events.jsonl")).unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let hooks = Hooks {
+            directory: Some(directory.clone()),
+            pause: Vec::new(),
+        };
+        let mut writer =
+            Writer::spawn(path.join("store.sqlite"), events, hooks, cancel.clone()).unwrap();
+        writer
+            .boot
+            .recv_timeout(Duration::from_secs(3))
+            .unwrap()
+            .unwrap();
+        let session = |request: u64| Request::Session {
+            request,
+            client: SharedBytes::copy_from(format!("ordinary-{request}").as_bytes(), MAX_CLIENT)
+                .unwrap(),
+        };
+        // The first ordinary command is held before it commits.
+        writer.sender.send(session(1)).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !directory.join("held-ordinary").exists() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(1));
+        }
+        let held = directory.join("held-ordinary").exists();
+        // Three control requests and a second ordinary command wait behind it.
+        for connection in 1..=3 {
+            writer
+                .control_sender
+                .send(ControlRequest::WillBarrier {
+                    connection: ConnectionGeneration::new(connection),
+                    client: SharedBytes::copy_from(
+                        format!("client-{connection}").as_bytes(),
+                        MAX_CLIENT,
+                    )
+                    .unwrap(),
+                })
+                .unwrap();
+        }
+        writer.sender.send(session(2)).unwrap();
+        // The first command commits; the second is held in its turn.
+        std::fs::write(directory.join("release-ordinary"), b"").unwrap();
+        let mut answered = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while answered.len() < 3 && Instant::now() < deadline {
+            if let Ok(ControlResponse::WillBarrier { connection, .. }) = writer
+                .control_receiver
+                .recv_timeout(Duration::from_millis(50))
+            {
+                answered.push(connection.get());
+            }
+        }
+        // Cleanup before asserting: the worker is released either way.
+        let _ = std::fs::remove_file(directory.join("hold-ordinary"));
+        cancel.store(true, Ordering::Relaxed);
+        writer.sender.send(Request::Stop).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !writer.is_finished() && Instant::now() < deadline {
+            while writer.receiver.try_recv().is_ok() {}
+            while writer.control_receiver.try_recv().is_ok() {}
+            thread::sleep(Duration::from_millis(1));
+        }
+        writer.join_finished().unwrap();
+        let _ = std::fs::remove_dir_all(path);
+        assert!(held, "the first ordinary command was never held");
+        assert_eq!(
+            answered,
+            vec![1, 2, 3],
+            "control requests queued during an ordinary commit waited for the next one"
         );
     }
     #[test]
