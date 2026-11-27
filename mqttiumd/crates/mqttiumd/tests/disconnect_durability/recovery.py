@@ -167,7 +167,7 @@ def durability(binary, case, pki, mode, cut, reason, shards, survives):
                 received_will=published is not None, received_retained_will=retained is not None)
 
 
-def takeover(binary, case, pki, shards, allow_drain):
+def takeover(binary, case, pki, shards, allow_drain, *, barrier_delay=0.0):
     point = "tls.frame.first_bytes"
     with server(binary, case, pki, "takeover", "durable", shards, point) as broker, ExitStack() as peers:
         old = peers.enter_context(peer(broker, pki, MONITOR))
@@ -182,6 +182,8 @@ def takeover(binary, case, pki, shards, allow_drain):
         source.publish(STATUS, payload, expiry=600)
         held = broker.wait_event("barrier_hit", point=point)
         assert held["details"]["ciphertext_bytes_sent"] == 3
+        if barrier_delay > 0:
+            time.sleep(barrier_delay)
         with closing(sqlite3.connect(broker.db.as_uri() + "?mode=ro", uri=True)) as db:
             [(packet_id,)] = db.execute("SELECT packet_id FROM outbound").fetchall()
         with ThreadPoolExecutor(max_workers=1) as pool:
@@ -263,6 +265,10 @@ def main():
                 for drain in (True, False):
                     play(f"takeover-k{shards}-{drain}", takeover, pki, shards, drain,
                          suite=suite, transport="mtls", shards=shards, drain=drain)
+            # Regression for R7: holding the test barrier longer than WRITE_TIMEOUT
+            # (250 ms) before the takeover opens must still drain cleanly on release.
+            play("takeover-k0-delayed-drain", lambda *a: takeover(*a, barrier_delay=0.30),
+                 pki, 0, True, suite=suite, transport="mtls", shards=0, drain=True)
             return
         mode = "volatile" if suite == "volatile-pre-apply" else suite
         for transport, credentials in (("tcp", None), ("mtls", pki)):

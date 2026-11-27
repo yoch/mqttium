@@ -417,6 +417,9 @@ impl Task {
         if scratch.write_batch.is_empty() {
             return Ok((None, false));
         }
+        #[cfg(feature = "test-hooks")]
+        let mut deadline = Instant::now() + WRITE_TIMEOUT;
+        #[cfg(not(feature = "test-hooks"))]
         let deadline = Instant::now() + WRITE_TIMEOUT;
         let mut batch = Vec::new();
         let (frame, ciphertext) = if scratch.write_batch.len() == 1 {
@@ -492,6 +495,10 @@ impl Task {
             // A held barrier keeps this reactor thread: test builds only.
             if self.armed("hold-next-tls-frame") {
                 self.observe_boundary("tls.frame.sealed", &frame, 0)?;
+                if self.core.is_cancelled() {
+                    return Err("cancelled");
+                }
+                deadline = Instant::now() + WRITE_TIMEOUT;
             }
         }
         Ok((
@@ -588,6 +595,10 @@ impl Task {
         #[cfg(feature = "test-hooks")]
         if first && encoded.fragment {
             self.observe_boundary("tls.frame.first_bytes", &encoded.frame, count)?;
+            if self.core.is_cancelled() {
+                return Err("cancelled");
+            }
+            encoded.deadline = Instant::now() + WRITE_TIMEOUT;
         }
         if encoded.offset == encoded.ciphertext.len() {
             if encoded.batch.is_empty() {
