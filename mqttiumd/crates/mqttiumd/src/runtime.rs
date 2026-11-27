@@ -103,7 +103,7 @@ pub struct Limits {
     /// Effects the core may hold between two dispatches.
     effect_box: usize,
     /// Outgoing packet identifiers in flight: eight per connection.
-    outgoing_bindings: usize,
+    pub(crate) outgoing_bindings: usize,
     pub(crate) timers: usize,
     /// Concurrent business commands/work reads allowed in flight to the writer.
     pub(crate) in_flight: usize,
@@ -559,7 +559,7 @@ struct DeferredPublish {
 }
 struct PendingFrame {
     connection: ConnectionKey,
-    kind: &'static str,
+    kind: FrameKind,
     packet_id: Option<u16>,
     receive_serial: Option<u64>,
     terminal: Option<Terminal>,
@@ -698,14 +698,6 @@ impl PeerTable {
         self.entries
             .iter()
             .filter_map(|slot| slot.as_ref().map(|(k, p)| (k, p)))
-    }
-
-    #[allow(dead_code)]
-    #[inline]
-    fn iter_mut(&mut self) -> impl Iterator<Item = (&ConnectionGeneration, &mut Peer)> + '_ {
-        self.entries
-            .iter_mut()
-            .filter_map(|slot| slot.as_mut().map(|(k, p)| (&*k, p)))
     }
 
     #[allow(dead_code)]
@@ -1138,12 +1130,29 @@ impl Runtime<'_> {
                 && !self.checkpoint_degraded
             {
                 self.checkpoint_degraded = true;
-                self.events.emit("session_clock_degraded", json!({"details":{"code":"checkpoint_late","age_ms":self.last_clock_checkpoint.elapsed().as_millis().to_string()}})).map_err(event_failure)?;
+                self.events.emit("session_clock_degraded", json!({
+                    "details": {
+                        "code": "checkpoint_late",
+                        "age_ms": self.last_clock_checkpoint.elapsed().as_millis().to_string(),
+                    },
+                })).map_err(event_failure)?;
             }
         }
         let inventory = (self.expiry_timers.len(), self.clock_checkpoint.is_some());
         if self.last_expiry_inventory != Some(inventory) {
-            self.events.emit("expiry_inventory", json!({"details":{"finite_timers":inventory.0,"checkpoint_inflight":inventory.1,"queued":self.expiry_inputs.len(),"period_ms":30000}})).map_err(event_failure)?;
+            self.events
+                .emit(
+                    "expiry_inventory",
+                    json!({
+                        "details": {
+                            "finite_timers": inventory.0,
+                            "checkpoint_inflight": inventory.1,
+                            "queued": self.expiry_inputs.len(),
+                            "period_ms": 30000,
+                        },
+                    }),
+                )
+                .map_err(event_failure)?;
             self.last_expiry_inventory = Some(inventory);
         }
         Ok(())
@@ -1232,30 +1241,37 @@ impl Runtime<'_> {
         drain_res.and(apply_res)
     }
 
-    fn attach_ready_shards(&mut self, ready: Vec<ConnectionKey>) {
+    /// Attaches the sessions whose CONNACK is queued to their shards. A
+    /// connection that cannot be attached is closed with the reason: left
+    /// open, it would get no delivery and nothing would say why.
+    fn attach_ready_shards(&mut self, ready: Vec<ConnectionKey>) -> Result<(), Failure> {
         if ready.is_empty() || self.shards.is_none() {
-            return;
+            return Ok(());
         }
         for connection in ready {
             let pending_inline = self
                 .owner
                 .pending_delegated_inline_count(connection.session);
-            let Some(revision) = self.session_revisions.get(&connection.session).copied() else {
-                continue;
-            };
             let Some(peer) = self.peers.get(&connection.generation) else {
                 continue;
             };
             if peer.closing().is_some() {
                 continue;
             }
+            let Some(revision) = self.session_revisions.get(&connection.session).copied() else {
+                self.close(connection.generation, "shard_attach_without_revision")?;
+                continue;
+            };
             let version = peer.version.unwrap_or_default();
             let receive_maximum = peer.receive_maximum;
             let max_packet = peer.max_packet;
             let outgoing = peer.io.outgoing_handle();
             if let Some(shards) = self.shards.as_mut() {
                 let route = shards.route_for(connection);
-                peer.io.install_shard_route(route);
+                if !peer.io.install_shard_route(route) {
+                    self.close(connection.generation, "shard_attached_twice")?;
+                    continue;
+                }
                 shards.attach_session(
                     connection.session,
                     revision,
@@ -1268,6 +1284,7 @@ impl Runtime<'_> {
                 );
             }
         }
+        Ok(())
     }
 
     /// How long an idle reactor may wait for a signal. A due core deadline
@@ -1381,7 +1398,15 @@ impl Runtime<'_> {
                 has_opened_by: false,
             },
         );
-        self.events.emit("connection_opened", json!({"connection":self.generation.get().to_string(),"details":{"send_buffer_bytes":sendbuf}})).map_err(event_failure)?;
+        self.events
+            .emit(
+                "connection_opened",
+                json!({
+                    "connection": self.generation.get().to_string(),
+                    "details": {"send_buffer_bytes": sendbuf},
+                }),
+            )
+            .map_err(event_failure)?;
         Ok(true)
     }
     fn queue(&mut self, input: Input) -> Result<(), Failure> {
@@ -1537,6 +1562,7 @@ impl Runtime<'_> {
     /// on a later turn.
     fn serve_requests(&mut self, generation: ConnectionGeneration) -> Result<(), Failure> {
         let room = self.ordinary_room();
+        let shards_active = self.shards.is_some();
         let Some(p) = self.peers.get_mut(&generation) else {
             return Ok(());
         };
@@ -1591,16 +1617,19 @@ impl Runtime<'_> {
         if bytes.len() > p.max_packet as usize {
             return self.close(generation, "outgoing_packet_limit");
         }
-        if p.io
-            .try_send_outgoing(net::Write {
-                expiry: None,
-                correlation: None,
-                bytes: net::FrameBytes::from(bytes),
-                payload: None,
-                report: net::WriteReport::None,
-            })
-            .is_ok()
-        {
+        let write = net::Write {
+            expiry: None,
+            correlation: None,
+            bytes: net::FrameBytes::from(bytes),
+            payload: None,
+            report: net::WriteReport::None,
+        };
+        let sent = if shards_active && !requests.unsubscribe {
+            p.io.try_send_suback(write)
+        } else {
+            p.io.try_send_outgoing(write)
+        };
+        if sent.is_ok() {
             let notify_session = (!requests.unsubscribe).then_some(p.session).flatten();
             cold.requests = None;
             p.gc_cold();
@@ -1719,15 +1748,13 @@ impl Runtime<'_> {
                 .close_observed_at = Some(observed);
         }
         self.peers[&generation].io.close();
-        let must_preserve_write_facts = self
-            .frames
-            .values()
-            .any(|frame| frame.connection.generation == generation && frame.kind == "PUBLISH")
-            || self.terminal_inputs.iter().any(|input| {
-                matches!(input,
+        let must_preserve_write_facts = self.frames.values().any(|frame| {
+            frame.connection.generation == generation && frame.kind == FrameKind::Publish
+        }) || self.terminal_inputs.iter().any(|input| {
+            matches!(input,
             Input::FrameResult {connection,..} | Input::Qos0EmitRefused {connection,..}
                 if connection.generation == generation)
-            });
+        });
         if must_preserve_write_facts {
             self.collect_written(generation)?;
             self.drain_inputs()?;
@@ -1870,7 +1897,7 @@ impl Runtime<'_> {
                     .remove(&id)
                     .ok_or_else(|| Failure::plain("frame_missing_on_close"))?;
                 self.retained_write_failed(id, &frame, code)?;
-                if frame.kind == "PUBLISH0" {
+                if frame.kind == FrameKind::Publish0 {
                     self.queue(Input::Qos0EmitRefused {
                         effect: id,
                         connection: frame.connection,
@@ -1951,13 +1978,32 @@ impl Runtime<'_> {
                 && self.work_reads.is_empty()
                 && self.frames.is_empty()
                 && self.timers.is_empty()
-                && self.owner.outbox().unwrap().is_empty();
+                && self.owner.outbox().is_empty();
             if complete {
-                self.events.emit("session_shutdown_completed", json!({"details":{"persistent_sessions":self.sessions.len(),"owner_bindings":status.bindings}})).map_err(event_failure)?;
+                self.events
+                    .emit(
+                        "session_shutdown_completed",
+                        json!({
+                            "details": {
+                                "persistent_sessions": self.sessions.len(),
+                                "owner_bindings": status.bindings,
+                            },
+                        }),
+                    )
+                    .map_err(event_failure)?;
                 return Ok(());
             }
             if Instant::now() >= deadline {
-                let mut fields = json!({"details":{"code":"pending_or_unknown","phase":"Shutdown","lifecycle_pending":status.lifecycle_pending,"retired_flights":status.retired_flights,"in_flight":self.inflight.len()+self.lifecycle_inflight.len(),"closing_inputs":self.closing_inputs.len()}});
+                let mut fields = json!({
+                    "details": {
+                        "code": "pending_or_unknown",
+                        "phase": "Shutdown",
+                        "lifecycle_pending": status.lifecycle_pending,
+                        "retired_flights": status.retired_flights,
+                        "in_flight": self.inflight.len()+self.lifecycle_inflight.len(),
+                        "closing_inputs": self.closing_inputs.len(),
+                    },
+                });
                 if let Some((pending, _)) = self.owner.lifecycle_dispatch() {
                     fields["operation"] = operation(pending);
                 }
@@ -1988,7 +2034,15 @@ impl Runtime<'_> {
                 return Err(Failure::plain("lifecycle_origin_mismatch"));
             }
             if changed_by.sequence() <= previous.sequence() {
-                self.events.emit("session_change_ignored", json!({"operation":operation(changed_by),"details":{"code":"stale_lifecycle_result"}})).map_err(event_failure)?;
+                self.events
+                    .emit(
+                        "session_change_ignored",
+                        json!({
+                            "operation": operation(changed_by),
+                            "details": {"code": "stale_lifecycle_result"},
+                        }),
+                    )
+                    .map_err(event_failure)?;
                 return Ok(());
             }
         }
@@ -2094,7 +2148,15 @@ impl Runtime<'_> {
                 }
                 self.expiry_timers.remove(&session);
 
-                let mut fields = json!({"operation":operation(changed_by),"details":{"session":session.get().to_string(),"session_present":session_present,"expiry":expiry_json(expiry),"source":"lifecycle_commit"}});
+                let mut fields = json!({
+                    "operation": operation(changed_by),
+                    "details": {
+                        "session": session.get().to_string(),
+                        "session_present": session_present,
+                        "expiry": expiry_json(expiry),
+                        "source": "lifecycle_commit",
+                    },
+                });
                 if let Some(generation) = connection {
                     fields["connection"] = json!(generation.get().to_string());
                 }
@@ -2144,17 +2206,28 @@ impl Runtime<'_> {
                 route_revision,
                 cancelled,
             } => json!({
-                "action":"Opened","session":session.get().to_string(),"revision":revision.get().to_string(),
-                "session_present":session_present,"expiry":expiry_json(expiry),
-                "retired_session":retired.map(|id|id.get().to_string()),"route_revision":route_revision.get().to_string(),
-                "cancelled_inbound":cancelled.inbound,"cancelled_deliveries":cancelled.deliveries,"cancelled_routes":cancelled.routes
+                "action": "Opened",
+                "session": session.get().to_string(),
+                "revision": revision.get().to_string(),
+                "session_present": session_present,
+                "expiry": expiry_json(expiry),
+                "retired_session": retired.map(|id|id.get().to_string()),
+                "route_revision": route_revision.get().to_string(),
+                "cancelled_inbound": cancelled.inbound,
+                "cancelled_deliveries": cancelled.deliveries,
+                "cancelled_routes": cancelled.routes,
             }),
             SessionChange::Detached {
                 session,
                 expiry,
                 detached,
             } => {
-                let mut details = json!({"action":"Detached","session":session.get().to_string(),"expiry":expiry_json(expiry),"detached_by":operation_text(detached.operation)});
+                let mut details = json!({
+                    "action": "Detached",
+                    "session": session.get().to_string(),
+                    "expiry": expiry_json(expiry),
+                    "detached_by": operation_text(detached.operation),
+                });
                 if let Some(deadline) = detached.deadline {
                     details["deadline"] = json!(deadline.to_string());
                 }
@@ -2165,8 +2238,12 @@ impl Runtime<'_> {
                 route_revision,
                 cancelled,
             } => json!({
-                "action":"Closed","session":session.get().to_string(),"route_revision":route_revision.get().to_string(),
-                "cancelled_inbound":cancelled.inbound,"cancelled_deliveries":cancelled.deliveries,"cancelled_routes":cancelled.routes
+                "action": "Closed",
+                "session": session.get().to_string(),
+                "route_revision": route_revision.get().to_string(),
+                "cancelled_inbound": cancelled.inbound,
+                "cancelled_deliveries": cancelled.deliveries,
+                "cancelled_routes": cancelled.routes,
             }),
         };
         // No ClientID or payload bytes enter bounded lifecycle diagnostics.
@@ -2220,11 +2297,28 @@ impl Runtime<'_> {
             return Ok(());
         }
         self.last_session_cardinality = Some(values);
-        self.events.emit("session_cardinality", json!({"details":{
-            "session_cache":values[0],"owner_sessions":values[1],"owner_bindings":values[2],"work_requests":values[3],"work_ready":values[4],
-            "emit_registrations":values[5],"lifecycle_requests":values[6],"closed_generations":values[7],"retired_flights":values[8],
-            "owner_inbound":values[9],"owner_outgoing":values[10],"frames":values[11],"timers":values[12]
-        }})).map_err(event_failure)
+        self.events
+            .emit(
+                "session_cardinality",
+                json!({
+                    "details": {
+                        "session_cache": values[0],
+                        "owner_sessions": values[1],
+                        "owner_bindings": values[2],
+                        "work_requests": values[3],
+                        "work_ready": values[4],
+                        "emit_registrations": values[5],
+                        "lifecycle_requests": values[6],
+                        "closed_generations": values[7],
+                        "retired_flights": values[8],
+                        "owner_inbound": values[9],
+                        "owner_outgoing": values[10],
+                        "frames": values[11],
+                        "timers": values[12],
+                    },
+                }),
+            )
+            .map_err(event_failure)
     }
 
     /// Already collected TCP facts precede the logical close. The transport
@@ -2343,7 +2437,7 @@ impl Runtime<'_> {
             + self.deferred_retries)
             .min(self.limits.drain_steps);
         let mut steps_taken = 0usize;
-        let mut outbox_len_at_dispatch = self.owner.outbox().map_or(0, |b| b.len());
+        let mut outbox_len_at_dispatch = self.owner.outbox().len();
         let mut dispatch_blocked = false;
         loop {
             let progress_before_pass = self.progress;
@@ -3021,7 +3115,14 @@ impl Runtime<'_> {
                                 .map_err(event_failure)?;
                         }
                         if let Some((id, delivery)) = finish {
-                            self.events.emit_with("core_finish_observed",||json!({"operation":operation(id),"details":{"delivery":delivery_text(delivery)}})).map_err(event_failure)?;
+                            self.events
+                                .emit_with("core_finish_observed", || {
+                                    json!({
+                                        "operation": operation(id),
+                                        "details": {"delivery": delivery_text(delivery)},
+                                    })
+                                })
+                                .map_err(event_failure)?;
                         }
                         if wakes_business || returns_credit {
                             if self.capacity_waiters != 0 {
@@ -3059,7 +3160,19 @@ impl Runtime<'_> {
                                             .receipt_status()
                                             .map(|(_, s, h)| (s, h))
                                             .unwrap_or((0, 0));
-                                        self.events.emit("receipt_window_pressure",json!({"details":{"resource":"ReceiptSlots","code":"receipt_window_business_full","span":span,"unconsumed_holes":holes}})).map_err(event_failure)?;
+                                        self.events
+                                            .emit(
+                                                "receipt_window_pressure",
+                                                json!({
+                                                    "details": {
+                                                        "resource": "ReceiptSlots",
+                                                        "code": "receipt_window_business_full",
+                                                        "span": span,
+                                                        "unconsumed_holes": holes,
+                                                    },
+                                                }),
+                                            )
+                                            .map_err(event_failure)?;
                                     }
                                 }
                                 self.defer(packet, from_retry)
@@ -3107,7 +3220,19 @@ impl Runtime<'_> {
                             Input::Packet { connection, .. } => {
                                 // No transition applied and no effect was submitted for this packet.
                                 // Close its transport rather than reorder its positive acknowledgements.
-                                self.events.emit("input_capacity_refused",json!({"connection":connection.get().to_string(),"details":{"accepted_command_rejected":false,"resource":format!("{:?}",need.resource),"wake":format!("{:?}",need.wake)}})).map_err(event_failure)?;
+                                self.events
+                                    .emit(
+                                        "input_capacity_refused",
+                                        json!({
+                                            "connection": connection.get().to_string(),
+                                            "details": {
+                                                "accepted_command_rejected": false,
+                                                "resource": format!("{:?}",need.resource),
+                                                "wake": format!("{:?}",need.wake),
+                                            },
+                                        }),
+                                    )
+                                    .map_err(event_failure)?;
                                 self.close(connection, "input_capacity")?;
                             }
                             other if Self::terminal_input(&other) => {
@@ -3156,9 +3281,18 @@ impl Runtime<'_> {
                             targets_to_check.sort_unstable();
                             targets_to_check.dedup();
                             if let Some(shards) = self.shards.as_mut() {
-                                shards.send_inline_committed(batch);
+                                let owner = &self.owner;
+                                shards.send_inline_committed(batch, |session| {
+                                    owner.delegated_inline_unknown(session)
+                                });
+                                // The held claims, then the barrier: the shard
+                                // reads the session after every claim owed.
                                 for session in targets_to_check {
-                                    if self.owner.pending_delegated_inline_count(session) == 0 {
+                                    shards.release_held_claims(
+                                        session,
+                                        owner.delegated_inline_unknown(session),
+                                    );
+                                    if owner.pending_delegated_inline_count(session) == 0 {
                                         shards.flush_dirty_barrier_if_pending(session);
                                     }
                                 }
@@ -3170,8 +3304,13 @@ impl Runtime<'_> {
                             targets_to_check.sort_unstable();
                             targets_to_check.dedup();
                             if let Some(shards) = self.shards.as_mut() {
+                                let owner = &self.owner;
                                 for session in targets_to_check {
-                                    if self.owner.pending_delegated_inline_count(session) == 0 {
+                                    shards.release_held_claims(
+                                        session,
+                                        owner.delegated_inline_unknown(session),
+                                    );
+                                    if owner.pending_delegated_inline_count(session) == 0 {
                                         shards.flush_dirty_barrier_if_pending(session);
                                     }
                                 }
@@ -3229,7 +3368,7 @@ impl Runtime<'_> {
                     for generation in inline_mark_pending {
                         self.pending_peers.insert(generation);
                     }
-                    self.attach_ready_shards(inline_attach_ready);
+                    self.attach_ready_shards(inline_attach_ready)?;
                     for session in inline_suback_ready {
                         if self.pending_suback_notify.remove(&session) {
                             self.notify_work(session)?;
@@ -3271,20 +3410,23 @@ impl Runtime<'_> {
                         self.session_cardinality_dirty = true;
                         self.emit_session_cardinality()?;
                     }
-                    outbox_len_at_dispatch = self.owner.outbox().map_or(0, |b| b.len());
+                    outbox_len_at_dispatch = self.owner.outbox().len();
                     dispatch_blocked = inline_accepted == 0 && outbox_len_at_dispatch > 0;
                 } else {
                     let must_dispatch = !applied
                         || !fast_batch_step
                         || cfg!(feature = "test-hooks")
-                        || self.owner.outbox().is_some_and(|box_| {
-                            box_.free_slots() < 16
-                                || (!dispatch_blocked
-                                    && box_.len().saturating_sub(outbox_len_at_dispatch) >= 32)
-                        });
+                        || self.owner.outbox().free_slots() < 16
+                        || (!dispatch_blocked
+                            && self
+                                .owner
+                                .outbox()
+                                .len()
+                                .saturating_sub(outbox_len_at_dispatch)
+                                >= 32);
                     if must_dispatch {
                         let accepted = self.dispatch_returning_accepted()?;
-                        outbox_len_at_dispatch = self.owner.outbox().map_or(0, |b| b.len());
+                        outbox_len_at_dispatch = self.owner.outbox().len();
                         dispatch_blocked = accepted == 0 && outbox_len_at_dispatch > 0;
                     }
                 }
@@ -3312,7 +3454,17 @@ impl Runtime<'_> {
                     self.queue(Input::DiscoverWills)?;
                 }
                 if applied && self.owner.last_step_may_unblock_work() {
-                    if let Some((session, initial)) = ready_work {
+                    if self.shards.is_some() {
+                        // The stored targets of a commit: their shards read
+                        // them after the lease's last mark.
+                        if let Some(first) = self.owner.last_inline_ready_target() {
+                            self.queue_work(first);
+                            for index in 0..self.owner.last_inline_ready_extra().len() {
+                                let target = self.owner.last_inline_ready_extra()[index];
+                                self.queue_work(target);
+                            }
+                        }
+                    } else if let Some((session, initial)) = ready_work {
                         self.rearm_ready_work(session, initial);
                     } else if let Some(first) = self.owner.last_inline_ready_target() {
                         self.rearm_ready_work(first, false);
@@ -3357,7 +3509,7 @@ impl Runtime<'_> {
             step_budget = steps_taken
                 .saturating_add(extra)
                 .min(self.limits.drain_steps);
-            outbox_len_at_dispatch = self.owner.outbox().map_or(0, |b| b.len());
+            outbox_len_at_dispatch = self.owner.outbox().len();
             dispatch_blocked = false;
         }
         if self.inputs.is_empty() {
@@ -3382,7 +3534,15 @@ impl Runtime<'_> {
                     mqttiumd_core::owner::WillDeferredReason::PayloadLimit => "payload_limit",
                     mqttiumd_core::owner::WillDeferredReason::StoreRefusal => "store_refusal",
                 };
-                self.events.emit("will_deferred",json!({"operation":operation(id),"details":{"code":code,"durable_intention_preserved":true}})).map_err(event_failure)?;
+                self.events
+                    .emit(
+                        "will_deferred",
+                        json!({
+                            "operation": operation(id),
+                            "details": {"code": code, "durable_intention_preserved": true},
+                        }),
+                    )
+                    .map_err(event_failure)?;
             }
             self.last_will_deferred = deferred;
         }
@@ -3558,7 +3718,7 @@ impl Runtime<'_> {
         for generation in mark_pending {
             self.pending_peers.insert(generation);
         }
-        self.attach_ready_shards(attach_ready);
+        self.attach_ready_shards(attach_ready)?;
         for session in suback_ready {
             if self.pending_suback_notify.remove(&session) {
                 self.notify_work(session)?;
@@ -3662,7 +3822,15 @@ impl Runtime<'_> {
                         reply,
                     })?;
                 } else {
-                    self.events.emit("receipt_collection_result_ignored",json!({"command_kind":"ReceiptCollection","details":crate::writer::collection_details(collection)})).map_err(event_failure)?;
+                    self.events
+                        .emit(
+                            "receipt_collection_result_ignored",
+                            json!({
+                                "command_kind": "ReceiptCollection",
+                                "details": crate::writer::collection_details(collection),
+                            }),
+                        )
+                        .map_err(event_failure)?;
                 }
             }
             ControlResponse::Lifecycle {
@@ -3693,7 +3861,10 @@ impl Runtime<'_> {
                         reply,
                     });
                 } else {
-                    self.events.emit("session_result_ignored", json!({"operation":crate::events::operation(operation),"details":{"effect":effect_text(effect),"code":"stale_lifecycle_result"}})).map_err(event_failure)?;
+                    self.events.emit("session_result_ignored", json!({
+                        "operation": crate::events::operation(operation),
+                        "details": {"effect": effect_text(effect), "code": "stale_lifecycle_result"},
+                    })).map_err(event_failure)?;
                 }
             }
             ControlResponse::MessageExpiryUnknown { now, after } => {
@@ -3756,7 +3927,17 @@ impl Runtime<'_> {
                     self.last_clock_checkpoint = Instant::now();
                     self.checkpoint_degraded = false;
                 }
-                self.events.emit("session_clock_checkpoint", json!({"details":{"logical":self.clock_anchor.logical.to_string(),"tick":self.clock_anchor.reading.tick.to_string()}})).map_err(event_failure)?;
+                self.events
+                    .emit(
+                        "session_clock_checkpoint",
+                        json!({
+                            "details": {
+                                "logical": self.clock_anchor.logical.to_string(),
+                                "tick": self.clock_anchor.reading.tick.to_string(),
+                            },
+                        }),
+                    )
+                    .map_err(event_failure)?;
             }
             ControlResponse::Failed(failure) => return Err(failure),
             ControlResponse::Closed { .. } => {
@@ -3859,18 +4040,26 @@ impl Runtime<'_> {
                     ) {
                         self.last_finish_result = Some((effect, operation, reply));
                     }
+                    // With shards, the step of an admission's commit names its
+                    // stored targets, and they are notified after it: the step
+                    // marks their leases dirty, and the shard must see that
+                    // mark. A resolution names no target here either.
+                    let named_by_step = self.shards.is_some()
+                        && self.owner.names_stored_targets_at_commit(operation);
                     self.queue(Input::StoreResult {
                         effect,
                         operation,
                         reply,
                     })?;
-                    if matches!(
-                        reply,
-                        StoreReply::Outcome(StoreOutcome::Committed(
-                            CommitFacts::PublicationAdmitted { .. }
-                                | CommitFacts::RetainedQos0Stored { .. }
-                        ))
-                    ) {
+                    if !named_by_step
+                        && matches!(
+                            reply,
+                            StoreReply::Outcome(StoreOutcome::Committed(
+                                CommitFacts::PublicationAdmitted { .. }
+                                    | CommitFacts::RetainedQos0Stored { .. }
+                            ))
+                        )
+                    {
                         for target in targets {
                             self.notify_work(target)?;
                         }
@@ -3915,7 +4104,17 @@ impl Runtime<'_> {
                             session,
                             result,
                         });
-                        self.events.emit("work_page_held",json!({"details":{"session":session.get().to_string(),"effect":effect_text(effect)}})).map_err(event_failure)?;
+                        self.events
+                            .emit(
+                                "work_page_held",
+                                json!({
+                                    "details": {
+                                        "session": session.get().to_string(),
+                                        "effect": effect_text(effect),
+                                    },
+                                }),
+                            )
+                            .map_err(event_failure)?;
                         continue;
                     }
                     if self.work_reads.remove(&effect) != Some(session) {
@@ -3924,7 +4123,18 @@ impl Runtime<'_> {
                     let page = result.map_err(|e| Failure::read(e, ReadPhase::Work))?;
                     self.session_cardinality_dirty = true;
                     if !self.session_ids.contains(&session) {
-                        self.events.emit("work_page_ignored", json!({"details":{"session":session.get().to_string(),"effect":effect_text(effect),"code":"retired_session"}})).map_err(event_failure)?;
+                        self.events
+                            .emit(
+                                "work_page_ignored",
+                                json!({
+                                    "details": {
+                                        "session": session.get().to_string(),
+                                        "effect": effect_text(effect),
+                                        "code": "retired_session",
+                                    },
+                                }),
+                            )
+                            .map_err(event_failure)?;
                         continue;
                     }
                     #[cfg(feature = "test-hooks")]
@@ -4137,7 +4347,24 @@ impl Runtime<'_> {
                 );
             }
         }
-        self.events.emit("connect_validated",json!({"connection":generation.get().to_string(),"details":{"protocol_level":connect.version.level(),"keep_alive":connect.keep_alive,"max_packet_size":connect.max_packet_size,"receive_maximum":connect.receive_maximum,"topic_alias_maximum":connect.topic_alias_maximum,"request_problem_information":connect.request_problem_information,"clean_start":connect.clean_start,"expiry":expiry_json(connect.expiry)}})).map_err(event_failure)?;
+        self.events
+            .emit(
+                "connect_validated",
+                json!({
+                    "connection": generation.get().to_string(),
+                    "details": {
+                        "protocol_level": connect.version.level(),
+                        "keep_alive": connect.keep_alive,
+                        "max_packet_size": connect.max_packet_size,
+                        "receive_maximum": connect.receive_maximum,
+                        "topic_alias_maximum": connect.topic_alias_maximum,
+                        "request_problem_information": connect.request_problem_information,
+                        "clean_start": connect.clean_start,
+                        "expiry": expiry_json(connect.expiry),
+                    },
+                }),
+            )
+            .map_err(event_failure)?;
         let now_ns = self.elapsed_ns(Instant::now());
         if let Some(p) = self.peers.get_mut(&generation) {
             if p.connected || p.pending {
@@ -4150,7 +4377,15 @@ impl Runtime<'_> {
         }
         #[cfg(feature = "test-hooks")]
         if self.captured.is_none() {
-            self.events.emit("input_captured",json!({"connection":generation.get().to_string(),"details":{"packet_kind":"CONNECT"}})).map_err(event_failure)?;
+            self.events
+                .emit(
+                    "input_captured",
+                    json!({
+                        "connection": generation.get().to_string(),
+                        "details": {"packet_kind": "CONNECT"},
+                    }),
+                )
+                .map_err(event_failure)?;
             self.captured = Some((generation, connect.clone()));
         }
         self.queue(Input::ConnectionSettings {
@@ -4445,7 +4680,15 @@ impl Runtime<'_> {
         ) {
             Ok(v) => v,
             Err(error) => {
-                self.events.emit("packet_refused",json!({"connection":generation.get().to_string(),"details":{"code":error.code(),"reason":error.reason_code()}})).map_err(event_failure)?;
+                self.events
+                    .emit(
+                        "packet_refused",
+                        json!({
+                            "connection": generation.get().to_string(),
+                            "details": {"code": error.code(), "reason": error.reason_code()},
+                        }),
+                    )
+                    .map_err(event_failure)?;
                 // Refusal output has the same bounded absolute write path as business frames.
                 if let Some(p) = self.peers.get_mut(&generation) {
                     let cap = if p.connected {
@@ -4580,18 +4823,25 @@ impl Runtime<'_> {
                     return Err(Failure::plain("timed_publish_kind"));
                 };
                 *saved = Some(expiry);
-                self.events.emit("message_expiry_received", json!({"connection":generation.get().to_string(),"details":{
-                    "topic":std::str::from_utf8(topic.as_slice()).map_err(|_| Failure::plain("invalid_topic"))?.chars().take(256).collect::<String>(),
-                    "qos":qos.to_wire(),"retain":retain,"interval":interval,
-                    "authority":"reader_frame_completion",
-                    "domain":hex_domain(observed.domain),"tick":observed.tick.to_string()
-                }})).map_err(event_failure)?;
+                self.events.emit("message_expiry_received", json!({
+                    "connection": generation.get().to_string(),
+                    "details": {
+                        "topic": std::str::from_utf8(topic.as_slice()).map_err(|_| Failure::plain("invalid_topic"))?.chars().take(256).collect::<String>(),
+                        "qos": qos.to_wire(),
+                        "retain": retain,
+                        "interval": interval,
+                        "authority": "reader_frame_completion",
+                        "domain": hex_domain(observed.domain),
+                        "tick": observed.tick.to_string(),
+                    },
+                })).map_err(event_failure)?;
                 self.message_clock_needed = true;
                 Packet::Core(packet)
             }
             other => other,
         };
         let started = self.started;
+        let shards_active = self.shards.is_some();
         let p = self
             .peers
             .get_mut(&generation)
@@ -4612,6 +4862,9 @@ impl Runtime<'_> {
             } => {
                 if !p.connected {
                     return self.close(generation, "packet_before_connack");
+                }
+                if shards_active && !unsubscribe {
+                    p.io.owe_suback();
                 }
                 let cold = p.cold_mut();
                 if cold.requests.is_some() {
@@ -4636,7 +4889,10 @@ impl Runtime<'_> {
                     && expiry.is_some_and(|value| value != SessionExpiry::OnDisconnect)
                 {
                     let bytes = codec::disconnect_reason(0x82);
-                    self.events.emit("packet_refused", json!({"connection":generation.get().to_string(),"details":{"code":"SessionExpiryIncreaseForbidden","reason":0x82}})).map_err(event_failure)?;
+                    self.events.emit("packet_refused", json!({
+                        "connection": generation.get().to_string(),
+                        "details": {"code": "SessionExpiryIncreaseForbidden", "reason": 0x82},
+                    })).map_err(event_failure)?;
                     if bytes.len() <= p.max_packet_bytes()
                         && p.io
                             .try_send_outgoing(net::Write {
@@ -4689,6 +4945,9 @@ impl Runtime<'_> {
                 if !p.connected {
                     return self.close(generation, "packet_before_connack");
                 }
+                if shards_active && matches!(packet, InboundPacket::Subscribe { .. }) {
+                    p.io.owe_suback();
+                }
                 p.ingress = p
                     .ingress
                     .checked_add(1)
@@ -4713,7 +4972,15 @@ impl Runtime<'_> {
                             mqttiumd_contract::packet::Qos::AtLeastOnce,
                         )
                         .is_ok();
-                    self.events.emit("qos0_receive_credit",json!({"connection":generation.get().to_string(),"details":{"charged":charged,"wrong_qos":1}})).map_err(event_failure)?;
+                    self.events
+                        .emit(
+                            "qos0_receive_credit",
+                            json!({
+                                "connection": generation.get().to_string(),
+                                "details": {"charged": charged, "wrong_qos": 1},
+                            }),
+                        )
+                        .map_err(event_failure)?;
                 }
                 if let InboundPacket::Publish {
                     packet_id: Some(id),
@@ -4725,7 +4992,19 @@ impl Runtime<'_> {
                     let pid = id.get();
                     let wire_qos = qos.to_wire();
                     let dup = *dup;
-                    self.events.emit_with("publish_validated", || json!({"connection":generation.get().to_string(),"details":{"packet_id":pid,"qos":wire_qos,"dup":dup,"publish_order":ingress_order.to_string()}})).map_err(event_failure)?;
+                    self.events
+                        .emit_with("publish_validated", || {
+                            json!({
+                                "connection": generation.get().to_string(),
+                                "details": {
+                                    "packet_id": pid,
+                                    "qos": wire_qos,
+                                    "dup": dup,
+                                    "publish_order": ingress_order.to_string(),
+                                },
+                            })
+                        })
+                        .map_err(event_failure)?;
                 }
                 if let InboundPacket::Publish {
                     packet_id: Some(id),
@@ -4785,7 +5064,15 @@ impl Runtime<'_> {
                             wire: pending_terminal,
                         });
                         self.pending_peers.insert(generation);
-                        self.events.emit("publish_waiting_wire",json!({"connection":generation.get().to_string(),"details":{"publish_order":ingress_order.to_string()}})).map_err(event_failure)?;
+                        self.events
+                            .emit(
+                                "publish_waiting_wire",
+                                json!({
+                                    "connection": generation.get().to_string(),
+                                    "details": {"publish_order": ingress_order.to_string()},
+                                }),
+                            )
+                            .map_err(event_failure)?;
                         return Ok(());
                     }
                     let bytes = net::FrameBytes::from_slice(&[0xe0, 2, 0x93, 0]);
@@ -5051,9 +5338,11 @@ impl Runtime<'_> {
                     let backpressured = if has_cold {
                         self.peers.get_mut(&generation).is_some_and(|peer| {
                             if let Some(effect) = peer.blocked_output()
-                                && self.owner.outbox().is_some_and(|outbox| {
-                                    outbox.pending().any(|pending| pending.id() == effect)
-                                })
+                                && self
+                                    .owner
+                                    .outbox()
+                                    .pending()
+                                    .any(|pending| pending.id() == effect)
                             {
                                 peer.io.terminal_reason().is_none()
                             } else {
@@ -5180,8 +5469,17 @@ impl Runtime<'_> {
                                 match incoming {
                                     net::Incoming::Authenticated { elapsed } => {
                                         non_ack_drained += 1;
-                                        self.events.emit("tls_authenticated", json!({"connection":generation.get().to_string(),
-                                            "details":{"version":"TLS1.3","handshake_us":elapsed.as_micros() as u64}}))
+                                        self.events
+                                            .emit(
+                                                "tls_authenticated",
+                                                json!({
+                                                    "connection": generation.get().to_string(),
+                                                    "details": {
+                                                        "version": "TLS1.3",
+                                                        "handshake_us": elapsed.as_micros() as u64,
+                                                    },
+                                                }),
+                                            )
                                             .map_err(event_failure)?;
                                     }
                                     net::Incoming::Packet {
@@ -5383,8 +5681,17 @@ impl Runtime<'_> {
                             }
                             match incoming {
                                 Ok(net::Incoming::Authenticated { elapsed }) => {
-                                    self.events.emit("tls_authenticated", json!({"connection":generation.get().to_string(),
-                                        "details":{"version":"TLS1.3","handshake_us":elapsed.as_micros() as u64}}))
+                                    self.events
+                                        .emit(
+                                            "tls_authenticated",
+                                            json!({
+                                                "connection": generation.get().to_string(),
+                                                "details": {
+                                                    "version": "TLS1.3",
+                                                    "handshake_us": elapsed.as_micros() as u64,
+                                                },
+                                            }),
+                                        )
                                         .map_err(event_failure)?;
                                 }
                                 Ok(net::Incoming::Packet {
@@ -5645,10 +5952,24 @@ impl Runtime<'_> {
                         if let Some((effect, connection)) = correlation
                             && self.frames.get(&effect).is_some_and(|frame| {
                                 frame.connection == connection
-                                    && matches!(frame.kind, "PUBLISH" | "PUBLISH0")
+                                    && matches!(
+                                        frame.kind,
+                                        FrameKind::Publish | FrameKind::Publish0
+                                    )
                             })
                         {
-                            self.events.emit("message_transmission_started",json!({"connection":connection.generation.get().to_string(),"details":{"effect":effect_text(effect),"authority":"positive_socket_write"}})).map_err(event_failure)?;
+                            self.events
+                                .emit(
+                                    "message_transmission_started",
+                                    json!({
+                                        "connection": connection.generation.get().to_string(),
+                                        "details": {
+                                            "effect": effect_text(effect),
+                                            "authority": "positive_socket_write",
+                                        },
+                                    }),
+                                )
+                                .map_err(event_failure)?;
                             self.queue(Input::FrameResult {
                                 effect,
                                 connection,
@@ -5668,8 +5989,20 @@ impl Runtime<'_> {
                             }
                             self.outgoing_bindings
                                 .retain(|_, value| value.frame != effect);
-                            self.events.emit("message_transmission_not_started",json!({"connection":connection.generation.get().to_string(),"details":{"effect":effect_text(effect),"reason":format!("{reason:?}"),"authority":"zero_socket_bytes"}})).map_err(event_failure)?;
-                            if pending.kind == "PUBLISH0" {
+                            self.events
+                                .emit(
+                                    "message_transmission_not_started",
+                                    json!({
+                                        "connection": connection.generation.get().to_string(),
+                                        "details": {
+                                            "effect": effect_text(effect),
+                                            "reason": format!("{reason:?}"),
+                                            "authority": "zero_socket_bytes",
+                                        },
+                                    }),
+                                )
+                                .map_err(event_failure)?;
+                            if pending.kind == FrameKind::Publish0 {
                                 let reason = match reason {
                                     mqttiumd_contract::message_expiry::MessageExpiryBlock::Expired => Qos0DropReason::MessageExpired,
                                     mqttiumd_contract::message_expiry::MessageExpiryBlock::TemporalUncertain => Qos0DropReason::TemporalUncertain,
@@ -5694,7 +6027,7 @@ impl Runtime<'_> {
                             if self
                                 .frames
                                 .get(&effect)
-                                .is_some_and(|frame| frame.kind == "PUBLISH")
+                                .is_some_and(|frame| frame.kind == FrameKind::Publish)
                                 && self.hooks.directory.as_ref().is_some_and(|dir| {
                                     consume_control(&dir.join("hold-next-outgoing-written"))
                                 })
@@ -5712,16 +6045,38 @@ impl Runtime<'_> {
                                 ));
                                 self.deferred_outgoing_written =
                                     Some((effect, connection, bytes, Instant::now()));
-                                self.events.emit("outgoing_written_held",json!({"connection":connection.generation.get().to_string(),"details":{"effect":effect_text(effect),"socket_write_complete":true,"bytes":bytes}})).map_err(event_failure)?;
+                                self.events
+                                    .emit(
+                                        "outgoing_written_held",
+                                        json!({
+                                            "connection": connection.generation.get().to_string(),
+                                            "details": {
+                                                "effect": effect_text(effect),
+                                                "socket_write_complete": true,
+                                                "bytes": bytes,
+                                            },
+                                        }),
+                                    )
+                                    .map_err(event_failure)?;
                                 continue;
                             }
                             #[cfg(feature = "test-hooks")]
                             if !self.deferred_ack_used
                                 && self.hooks.pause.iter().any(|p| p == "ack.receipt")
                                 && let Some(pending) = self.frames.get(&effect)
-                                && pending.kind == "PUBACK"
+                                && pending.kind == FrameKind::Puback
                             {
-                                self.events.emit("barrier_hit", json!({"point":"ack.receipt","connection":generation.get().to_string(),"details":{"effect":effect_text(effect),"packet_id":pending.packet_id.unwrap_or(0),"publish_order":pending.receive_serial.map(|v|v.to_string()).unwrap_or_default(),"bytes":bytes,"socket_write_complete":true}})).map_err(event_failure)?;
+                                self.events.emit("barrier_hit", json!({
+                                    "point": "ack.receipt",
+                                    "connection": generation.get().to_string(),
+                                    "details": {
+                                        "effect": effect_text(effect),
+                                        "packet_id": pending.packet_id.unwrap_or(0),
+                                        "publish_order": pending.receive_serial.map(|v|v.to_string()).unwrap_or_default(),
+                                        "bytes": bytes,
+                                        "socket_write_complete": true,
+                                    },
+                                })).map_err(event_failure)?;
                                 self.deferred_ack_used = true;
                                 self.deferred_ack =
                                     Some((effect, connection, bytes, Instant::now()));
@@ -5809,7 +6164,16 @@ impl Runtime<'_> {
                     frame.wire_released |= released;
                     let frame_kind = frame.kind;
                     let frame_serial = frame.receive_serial;
-                    self.events.emit_with("wire_receive_credit",||json!({"connection":generation.get().to_string(),"details":{"effect":effect_text(progress.effect),"packet_kind":frame_kind,"packet_id":id,"publish_order":frame_serial.map(|v|v.to_string()).unwrap_or_default(),"released":released}})).map_err(event_failure)?;
+                    self.events.emit_with("wire_receive_credit",||json!({
+                        "connection": generation.get().to_string(),
+                        "details": {
+                            "effect": effect_text(progress.effect),
+                            "packet_kind": frame_kind.as_str(),
+                            "packet_id": id,
+                            "publish_order": frame_serial.map(|v|v.to_string()).unwrap_or_default(),
+                            "released": released,
+                        },
+                    })).map_err(event_failure)?;
                 }
             }
             Ok(())
@@ -5874,7 +6238,15 @@ impl Runtime<'_> {
     ) -> Result<(), Failure> {
         let Some(pending) = self.frames.remove(&effect) else {
             if !self.peers.contains_key(&connection.generation) {
-                self.events.emit("frame_result_ignored", json!({"connection":connection.generation.get().to_string(),"details":{"effect":effect_text(effect),"code":"retired_transport"}})).map_err(event_failure)?;
+                self.events
+                    .emit(
+                        "frame_result_ignored",
+                        json!({
+                            "connection": connection.generation.get().to_string(),
+                            "details": {"effect": effect_text(effect), "code": "retired_transport"},
+                        }),
+                    )
+                    .map_err(event_failure)?;
                 return Ok(());
             }
             return Err(Failure::plain("uncorrelated_frame_result"));
@@ -5885,13 +6257,38 @@ impl Runtime<'_> {
         }
         let generation = connection.generation;
         let (kind, id) = (pending.kind, pending.packet_id);
-        if kind == "PUBLISH0" {
-            self.events.emit_with("frame_written",||json!({"connection":generation.get().to_string(),"details":{"packet_kind":"PUBLISH","qos":0,"effect":effect_text(effect),"bytes":bytes}})).map_err(event_failure)?;
-        } else if kind != "PINGRESP" || pending.was_retained {
+        if kind == FrameKind::Publish0 {
+            self.events
+                .emit_with("frame_written", || {
+                    json!({
+                        "connection": generation.get().to_string(),
+                        "details": {
+                            "packet_kind": "PUBLISH",
+                            "qos": 0,
+                            "effect": effect_text(effect),
+                            "bytes": bytes,
+                        },
+                    })
+                })
+                .map_err(event_failure)?;
+        } else if kind != FrameKind::Pingresp || pending.was_retained {
             let serial = pending.receive_serial;
-            self.events.emit_with("frame_written",||json!({"connection":generation.get().to_string(),"details":{"packet_kind":kind,"effect":effect_text(effect),"packet_id":id.unwrap_or(0),"publish_order":serial.map(|v|v.to_string()).unwrap_or_default(),"bytes":bytes}})).map_err(event_failure)?;
+            self.events
+                .emit_with("frame_written", || {
+                    json!({
+                        "connection": generation.get().to_string(),
+                        "details": {
+                            "packet_kind": kind.as_str(),
+                            "effect": effect_text(effect),
+                            "packet_id": id.unwrap_or(0),
+                            "publish_order": serial.map(|v|v.to_string()).unwrap_or_default(),
+                            "bytes": bytes,
+                        },
+                    })
+                })
+                .map_err(event_failure)?;
         }
-        if kind == "PUBREC"
+        if kind == FrameKind::Pubrec
             && pending.terminal.is_none()
             && let Some(id) = id
             && let Some(peer) = self.peers.get_mut(&generation)
@@ -5916,10 +6313,23 @@ impl Runtime<'_> {
                 released
             };
             let serial = pending.receive_serial;
-            self.events.emit_with("receive_credit", || json!({"connection":generation.get().to_string(),"details":{"packet_kind":kind,"effect":effect_text(effect),"packet_id":id,"publish_order":serial.map(|v|v.to_string()).unwrap_or_default(),"released":released}})).map_err(event_failure)?;
+            self.events
+                .emit_with("receive_credit", || {
+                    json!({
+                        "connection": generation.get().to_string(),
+                        "details": {
+                            "packet_kind": kind.as_str(),
+                            "effect": effect_text(effect),
+                            "packet_id": id,
+                            "publish_order": serial.map(|v|v.to_string()).unwrap_or_default(),
+                            "released": released,
+                        },
+                    })
+                })
+                .map_err(event_failure)?;
         }
         #[cfg(feature = "test-hooks")]
-        if kind == "PUBLISH"
+        if kind == FrameKind::Publish
             && self
                 .hooks
                 .directory
@@ -5934,7 +6344,15 @@ impl Runtime<'_> {
                     total: bytes as u64,
                 },
             ));
-            self.events.emit("outgoing_frame_result_copied",json!({"connection":generation.get().to_string(),"details":{"effect":effect_text(effect),"bytes":bytes}})).map_err(event_failure)?;
+            self.events
+                .emit(
+                    "outgoing_frame_result_copied",
+                    json!({
+                        "connection": generation.get().to_string(),
+                        "details": {"effect": effect_text(effect), "bytes": bytes},
+                    }),
+                )
+                .map_err(event_failure)?;
         }
         self.queue(Input::FrameResult {
             effect,
@@ -5960,13 +6378,24 @@ impl Runtime<'_> {
             if let Some((effect, connection, bytes, since)) = self.deferred_outgoing_written {
                 if !self.frames.contains_key(&effect) {
                     self.deferred_outgoing_written = None;
-                    self.events.emit("outgoing_written_discarded",json!({"connection":connection.generation.get().to_string(),"details":{"effect":effect_text(effect),"code":"connection_closed"}})).map_err(event_failure)?;
+                    self.events.emit("outgoing_written_discarded",json!({
+                        "connection": connection.generation.get().to_string(),
+                        "details": {"effect": effect_text(effect), "code": "connection_closed"},
+                    })).map_err(event_failure)?;
                 } else if since.elapsed() > Duration::from_secs(30) {
                     return Err(Failure::plain("outgoing_written_deadline"));
                 } else if consume_control(&dir.join("release-outgoing-written")) {
                     self.deferred_outgoing_written = None;
                     self.written_complete(effect, connection, bytes)?;
-                    self.events.emit("outgoing_written_released",json!({"connection":connection.generation.get().to_string(),"details":{"effect":effect_text(effect)}})).map_err(event_failure)?;
+                    self.events
+                        .emit(
+                            "outgoing_written_released",
+                            json!({
+                                "connection": connection.generation.get().to_string(),
+                                "details": {"effect": effect_text(effect)},
+                            }),
+                        )
+                        .map_err(event_failure)?;
                 }
             }
             if consume_control(&dir.join("replay-last-outgoing-frame-result")) {
@@ -5978,7 +6407,15 @@ impl Runtime<'_> {
                     connection,
                     progress,
                 })?;
-                self.events.emit("outgoing_frame_result_replayed",json!({"connection":connection.generation.get().to_string(),"details":{"effect":effect_text(effect)}})).map_err(event_failure)?;
+                self.events
+                    .emit(
+                        "outgoing_frame_result_replayed",
+                        json!({
+                            "connection": connection.generation.get().to_string(),
+                            "details": {"effect": effect_text(effect)},
+                        }),
+                    )
+                    .map_err(event_failure)?;
             }
             if consume_control(&dir.join("replay-last-finish-result")) {
                 let (effect, operation_id, reply) = self
@@ -5989,7 +6426,16 @@ impl Runtime<'_> {
                     operation: operation_id,
                     reply,
                 })?;
-                self.events.emit("finish_result_replayed",json!({"operation":operation(operation_id),"command_kind":"Finish","details":{"effect":effect_text(effect)}})).map_err(event_failure)?;
+                self.events
+                    .emit(
+                        "finish_result_replayed",
+                        json!({
+                            "operation": operation(operation_id),
+                            "command_kind": "Finish",
+                            "details": {"effect": effect_text(effect)},
+                        }),
+                    )
+                    .map_err(event_failure)?;
             }
         }
         if self
@@ -6013,7 +6459,18 @@ impl Runtime<'_> {
                 let page = result.map_err(|e| Failure::read(e, ReadPhase::Work))?;
                 self.session_cardinality_dirty = true;
                 if !self.session_ids.contains(&session) {
-                    self.events.emit("work_page_ignored", json!({"details":{"session":session.get().to_string(),"effect":effect_text(effect),"code":"retired_session"}})).map_err(event_failure)?;
+                    self.events
+                        .emit(
+                            "work_page_ignored",
+                            json!({
+                                "details": {
+                                    "session": session.get().to_string(),
+                                    "effect": effect_text(effect),
+                                    "code": "retired_session",
+                                },
+                            }),
+                        )
+                        .map_err(event_failure)?;
                     continue;
                 }
                 for item in page.items.as_slice() {
@@ -6066,7 +6523,16 @@ impl Runtime<'_> {
                     std::fs::remove_file(release).map_err(|_| Failure::plain("hook_release"))?;
                     self.deferred_ack = None;
                     self.written_complete(effect, connection, bytes)?;
-                    self.events.emit("barrier_released", json!({"point":"ack.receipt","connection":connection.generation.get().to_string(),"details":{"effect":effect_text(effect)}})).map_err(event_failure)?;
+                    self.events
+                        .emit(
+                            "barrier_released",
+                            json!({
+                                "point": "ack.receipt",
+                                "connection": connection.generation.get().to_string(),
+                                "details": {"effect": effect_text(effect)},
+                            }),
+                        )
+                        .map_err(event_failure)?;
                 }
             }
         }
@@ -6121,7 +6587,7 @@ impl Runtime<'_> {
                 .emit(
                     "frame_failed",
                     json!({"connection":frame.connection.generation.get().to_string(),
-                "details":{"effect":effect_text(effect),"packet_kind":frame.kind,"code":code}}),
+                "details":{"effect":effect_text(effect),"packet_kind":frame.kind.as_str(),"code":code}}),
                 )
                 .map_err(event_failure)?;
         }
@@ -6136,7 +6602,10 @@ impl AppliedSessionChange {
             SessionChange::Closed { session, .. } => ("Closed", session),
             SessionChange::Detached { session, .. } => ("Detached", session),
         };
-        let mut fields = json!({"operation":operation(self.operation),"details":{"action":action,"session":session.get().to_string()}});
+        let mut fields = json!({
+            "operation": operation(self.operation),
+            "details": {"action": action, "session": session.get().to_string()},
+        });
         if let Some(connection) = self.connection {
             fields["connection"] = json!(connection.get().to_string());
         }
@@ -6153,7 +6622,10 @@ struct SessionCloseObservation {
 #[cfg(feature = "test-hooks")]
 impl SessionCloseObservation {
     fn fields(self) -> serde_json::Value {
-        let mut fields = json!({"connection":self.generation.get().to_string(),"details":{"session":self.session.get().to_string()}});
+        let mut fields = json!({
+            "connection": self.generation.get().to_string(),
+            "details": {"session": self.session.get().to_string()},
+        });
         if let Some(token) = self.opened_by {
             fields["operation"] = operation(token);
         }
@@ -6247,1146 +6719,6 @@ struct Sink<'a, 'b> {
     session_change: Option<AppliedSessionChange>,
     error: Option<Failure>,
 }
-impl Sink<'_, '_> {
-    fn push_terminal(&mut self, input: Input) {
-        if let Some(id) = Runtime::terminal_effect(&input) {
-            *self.terminal_effects.get_or_insert_default(id) += 1;
-        }
-        self.terminal_inputs.push_back(input);
-    }
-
-    fn writer_reply_room(&mut self) -> bool {
-        let pending =
-            self.inflight.len() + self.work_reads.len() + usize::from(self.will_reads.is_some());
-        if self.inputs.len() + pending < WRITER_INPUTS {
-            return true;
-        }
-        let queued = *self.queued_writer_replies.get_or_insert_with(|| {
-            self.inputs
-                .iter()
-                .filter(|input| Runtime::writer_input(input))
-                .count()
-        });
-        queued + pending < WRITER_INPUTS
-    }
-}
-fn recipe_touches_routes(recipe: &Recipe) -> bool {
-    match recipe {
-        Recipe::AnnotatedPublication(value) => recipe_touches_routes(value.inner.as_ref()),
-        Recipe::AdmitPublication(_)
-        | Recipe::ClaimedPublication(_)
-        | Recipe::MultiClaimedPublication(_)
-        | Recipe::RetainedPublication(_)
-        | Recipe::RetainedQos0(_)
-        | Recipe::ExpiringPublication(_)
-        | Recipe::UpdateSubscriptions(_)
-        | Recipe::ReplaySubscriptions(_)
-        | Recipe::TimedReplaySubscriptions(_) => true,
-        _ => false,
-    }
-}
-
-impl Sink<'_, '_> {
-    fn submit_lifecycle(&mut self, effect: OwnedEffect) -> SubmitResult {
-        if self.lifecycle_inflight.len() >= LIFECYCLE_IN_FLIGHT {
-            return SubmitResult::NotSubmitted {
-                effect,
-                reason: SubmitBlock::InFlightLimit,
-            };
-        }
-        let operation_id = match effect.effect() {
-            Effect::Persist { command } => command.recipe.operation(),
-            Effect::ResolveAndFence { operation } => *operation,
-            _ => unreachable!("lifecycle effect classified by caller"),
-        };
-        let id = effect.id();
-        let details = match effect.effect() {
-            Effect::Persist { command } => recipe_details(command.recipe.get()),
-            _ => json!({"action":"Resolve"}),
-        };
-        match self
-            .writer
-            .try_send_control(ControlRequest::Lifecycle(effect))
-        {
-            Ok(()) => {
-                self.lifecycle_inflight.insert(id, operation_id);
-                if self.events.emit("command_submitted", json!({"operation":operation(operation_id),"command_kind":"SessionLifecycle","details":details})).is_err() {
-                    self.error = Some(Failure::plain("events_unavailable"));
-                }
-                SubmitResult::Accepted
-            }
-            Err(TrySendError::Full(ControlRequest::Lifecycle(effect))) => {
-                SubmitResult::NotSubmitted {
-                    effect,
-                    reason: SubmitBlock::QueueFull,
-                }
-            }
-            Err(TrySendError::Disconnected(ControlRequest::Lifecycle(effect))) => {
-                self.error = Some(Failure::plain("writer_control_disconnected"));
-                SubmitResult::NotSubmitted {
-                    effect,
-                    reason: SubmitBlock::Closed,
-                }
-            }
-            _ => unreachable!("exact control request variant"),
-        }
-    }
-}
-#[cfg(feature = "test-hooks")]
-impl Sink<'_, '_> {
-    fn release_qos0(&mut self) {
-        let Some(front) = self.emission_barriers.front_mut() else {
-            return;
-        };
-        if !front.released {
-            let Some(dir) = &self.hooks.directory else {
-                self.error = Some(Failure::plain("hook_directory"));
-                return;
-            };
-            let release = dir.join(format!("release-{}", front.point));
-            if release.exists() {
-                if std::fs::remove_file(release).is_err() {
-                    self.error = Some(Failure::plain("hook_release"));
-                    return;
-                }
-                front.released = true;
-            } else if front.since.elapsed() > Duration::from_secs(30) {
-                self.error = Some(Failure::plain("hook_deadline"));
-                return;
-            } else {
-                return;
-            }
-        }
-        let held = self
-            .emission_barriers
-            .pop_front()
-            .expect("checked bounded queue");
-        self.releasing_qos0 = true;
-        let result = self.try_submit(held.effect);
-        self.releasing_qos0 = false;
-        if let SubmitResult::NotSubmitted { effect, .. } = result {
-            self.emission_barriers.push_front(HeldEmission {
-                point: held.point,
-                effect,
-                since: held.since,
-                released: true,
-            });
-        }
-    }
-}
-impl EffectSink for Sink<'_, '_> {
-    fn try_submit(&mut self, effect: OwnedEffect) -> SubmitResult {
-        let id = effect.id();
-        let refused = |effect, reason| SubmitResult::NotSubmitted { effect, reason };
-        if self.error.is_some() {
-            return refused(effect, SubmitBlock::Closed);
-        }
-        // Applying a cache fact or shutting down a transport belongs between
-        // effects: a later Persist/CONNACK must not race this dispatch tail.
-        if self.session_change.is_some() || !self.close.is_empty() {
-            return refused(effect, SubmitBlock::QueueFull);
-        }
-        if !matches!(effect.effect(), Effect::ArmDeadline { .. }) {
-            self.direct_skip_next_deadline = false;
-        }
-        match effect.effect() {
-            Effect::SessionChanged {
-                operation,
-                connection,
-                client_id,
-                change,
-            } => {
-                self.session_change = Some(AppliedSessionChange {
-                    operation: *operation,
-                    connection: *connection,
-                    client_id: client_id.clone(),
-                    change: *change,
-                });
-                let _ = effect.into_parts();
-                SubmitResult::Accepted
-            }
-            Effect::SessionRefused { connection, reason } => {
-                let generation = *connection;
-                let reason = *reason;
-                if let Some(peer) = self.peers.get_mut(&generation) {
-                    let bytes = match codec::session_refusal_for(
-                        peer.version.unwrap_or_default(),
-                        reason,
-                    ) {
-                        Ok(bytes) => bytes,
-                        Err(_) => {
-                            self.error = Some(Failure::plain("invalid_session_refusal"));
-                            return refused(effect, SubmitBlock::Closed);
-                        }
-                    };
-                    if bytes.len() <= peer.max_packet_bytes()
-                        && peer
-                            .io
-                            .try_send_outgoing(net::Write {
-                                expiry: None,
-                                correlation: None,
-                                bytes: net::FrameBytes::from(bytes),
-                                payload: None,
-                                report: net::WriteReport::Complete,
-                            })
-                            .is_ok()
-                    {
-                        peer.set_closing(("session_refused", Instant::now()));
-                        self.mark_pending_peers.push(generation);
-                    } else {
-                        self.close.push((generation, "session_refused"));
-                    }
-                }
-                if self.events.emit("session_refused", json!({"connection":generation.get().to_string(),"details":{"reason_code":reason,"code":"lifecycle_rejected_certain"}})).is_err() {
-                    self.error = Some(Failure::plain("events_unavailable"));
-                }
-                let _ = effect.into_parts();
-                SubmitResult::Accepted
-            }
-            Effect::Qos0Dropped {
-                origin,
-                target,
-                reason,
-            } => {
-                let (origin, target, reason) = (*origin, *target, *reason);
-                if self.events.emit_with("qos0_dropped",||json!({"details":{"origin":qos0_origin(origin),"target":target.map(|t|t.get().to_string()).unwrap_or_default(),"reason":reason.code()}})).is_err(){self.error=Some(Failure::plain("events_unavailable"));}
-                let _ = effect.into_parts();
-                SubmitResult::Accepted
-            }
-            Effect::DeliveryDiscarded {
-                delivery,
-                target,
-                operation: finished,
-                reason,
-            } => {
-                let (delivery, target, finished, reason) = (*delivery, *target, *finished, *reason);
-                if self
-                    .events
-                    .emit_with("delivery_discarded", || {
-                        json!({
-                            "operation": operation(finished),
-                            "command_kind": "Finish",
-                            "details": {
-                                "delivery": delivery_text(delivery),
-                                "target": target.get().to_string(),
-                                "reason": reason.code(),
-                            },
-                        })
-                    })
-                    .is_err()
-                {
-                    self.error = Some(Failure::plain("events_unavailable"));
-                }
-                let _ = effect.into_parts();
-                SubmitResult::Accepted
-            }
-            Effect::EmitQos0 {
-                expiry,
-                properties,
-                connection,
-                origin,
-                cause,
-                retain,
-                topic,
-                payload,
-            } => {
-                let (connection, origin) = (*connection, *origin);
-                if self
-                    .terminal_inputs
-                    .len()
-                    .checked_add(2 * self.frames.len())
-                    .is_none_or(|used| used >= self.limits.terminal_inputs)
-                    || self.frames.len() >= self.limits.frames
-                {
-                    return refused(effect, SubmitBlock::QueueFull);
-                }
-                #[cfg(feature = "test-hooks")]
-                if let Qos0Origin::Consumed {
-                    operation: id_op, ..
-                } = origin
-                    && self.hooks.pause.iter().any(|p| p == "consume.emission")
-                    && !self.releasing_qos0
-                {
-                    if self.emission_barriers.len() >= IN_FLIGHT {
-                        return refused(effect, SubmitBlock::QueueFull);
-                    }
-                    if self.events.emit("barrier_hit",json!({"point":"consume.emission","command_kind":"Consume","operation":operation(id_op)})).is_err(){self.error=Some(Failure::plain("events_unavailable"));return refused(effect,SubmitBlock::Closed);}
-                    self.emission_barriers.push_back(HeldEmission {
-                        point: "consume.emission",
-                        effect,
-                        since: Instant::now(),
-                        released: false,
-                    });
-                    return SubmitResult::Accepted;
-                }
-                let generation = connection.generation;
-                let result = if let Some(peer) = self.peers.get_mut(&generation).filter(|p| {
-                    p.closing().is_none()
-                        && self.bindings.get(&connection.session) == Some(&generation)
-                }) {
-                    let version = peer.version.unwrap_or_default();
-                    let expiry_val = expiry.as_deref().copied();
-                    match codec::encode_qos0_segments(
-                        version,
-                        topic,
-                        payload,
-                        *retain
-                            && (version == Version::V5 || *cause == DeliveryCause::RetainedReplay),
-                        expiry_val.map(|value| value.interval),
-                        properties.as_deref(),
-                    ) {
-                        Ok(encoded) if encoded.total_len <= peer.max_packet_bytes() => {
-                            let write_expiry = expiry_val.map(|expiry| {
-                                Box::new(net::WriteExpiry {
-                                    expiry,
-                                    value_offset: encoded.expiry_value_offset,
-                                    started: false,
-                                })
-                            });
-                            #[cfg(feature = "test-hooks")]
-                            let duplicate = if MUTANT_REPLAY_QOS0
-                                && matches!(origin, Qos0Origin::Consumed { .. })
-                            {
-                                Some((encoded.header.clone(), encoded.payload.clone()))
-                            } else {
-                                None
-                            };
-                            let result = peer.io.try_send_outgoing(net::Write {
-                                expiry: write_expiry,
-                                correlation: Some((id, connection)),
-                                bytes: encoded.header,
-                                payload: encoded.payload,
-                                report: net::WriteReport::Complete,
-                            });
-                            #[cfg(feature = "test-hooks")]
-                            if result.is_ok()
-                                && let Some((bytes, payload)) = duplicate
-                            {
-                                let _ = peer.io.try_send_outgoing(net::Write {
-                                    expiry: None,
-                                    correlation: None,
-                                    bytes,
-                                    payload,
-                                    report: net::WriteReport::None,
-                                });
-                            }
-                            match result {
-                                Ok(()) => Ok(()),
-                                Err(TrySendError::Full(_))
-                                    if *cause == DeliveryCause::RetainedReplay =>
-                                {
-                                    return refused(effect, SubmitBlock::TransportBackpressure);
-                                }
-                                Err(TrySendError::Full(_)) => Err(Qos0DropReason::OutputSaturated),
-                                Err(TrySendError::Disconnected(_)) => {
-                                    Err(Qos0DropReason::ConnectionClosed)
-                                }
-                            }
-                        }
-                        _ => Err(Qos0DropReason::PacketTooLarge),
-                    }
-                } else {
-                    Err(Qos0DropReason::ConnectionClosed)
-                };
-                match result {
-                    Ok(()) => {
-                        self.frames.insert(
-                            id,
-                            PendingFrame {
-                                connection,
-                                kind: "PUBLISH0",
-                                packet_id: None,
-                                receive_serial: None,
-                                terminal: None,
-                                wire_released: false,
-                                was_retained: false,
-                            },
-                        );
-                        if self.events.emit_with("frame_queued",||json!({"connection":generation.get().to_string(),"details":{"packet_kind":"PUBLISH","qos":0,"origin":qos0_origin(origin),"effect":effect_text(id)}})).is_err(){self.error=Some(Failure::plain("events_unavailable"));}
-                    }
-                    Err(reason) => self.push_terminal(Input::Qos0EmitRefused {
-                        effect: id,
-                        connection,
-                        reason,
-                    }),
-                }
-                let _ = effect.into_parts();
-                SubmitResult::Accepted
-            }
-            Effect::Persist { command }
-                if matches!(
-                    command.recipe.get(),
-                    Recipe::SessionLifecycle(_) | Recipe::WillPublication(_)
-                ) =>
-            {
-                let conflicts_with_route_ops = match command.recipe.get() {
-                    Recipe::WillPublication(_) => true,
-                    Recipe::SessionLifecycle(lifecycle) => matches!(
-                        &lifecycle.action,
-                        SessionAction::Close { .. }
-                            | SessionAction::EndWill {
-                                expiry: SessionExpiry::OnDisconnect,
-                                ..
-                            }
-                            | SessionAction::Expire { .. }
-                            | SessionAction::Open {
-                                expected: Some(_),
-                                clean_start: true,
-                                ..
-                            }
-                            | SessionAction::OpenAt {
-                                expected: Some(_),
-                                clean_start: true,
-                                ..
-                            }
-                            | SessionAction::OpenWillAt {
-                                expected: Some(_),
-                                clean_start: true,
-                                ..
-                            }
-                    ),
-                    _ => false,
-                };
-                if conflicts_with_route_ops && !self.inflight_route_ops.is_empty() {
-                    return refused(effect, SubmitBlock::QueueFull);
-                }
-                if let Recipe::SessionLifecycle(lifecycle) = command.recipe.get()
-                    && let SessionAction::Open {
-                        expected: Some(guard),
-                        ..
-                    }
-                    | SessionAction::OpenAt {
-                        expected: Some(guard),
-                        ..
-                    }
-                    | SessionAction::OpenWillAt {
-                        expected: Some(guard),
-                        ..
-                    } = &lifecycle.action
-                    && self
-                        .peers
-                        .values()
-                        .any(|p| p.session == Some(guard.session) && p.closing().is_some())
-                {
-                    return refused(effect, SubmitBlock::QueueFull);
-                }
-                self.submit_lifecycle(effect)
-            }
-            Effect::Persist { command } => {
-                if self.inflight.len() >= self.limits.in_flight || !self.writer_reply_room() {
-                    return refused(effect, SubmitBlock::InFlightLimit);
-                }
-                let operation_id = command.recipe.operation();
-                let record_submitted = self.events.records("command_submitted");
-                let submitted_meta = record_submitted.then(|| {
-                    (
-                        crate::writer::recipe_kind(command.recipe.get()),
-                        recipe_details(command.recipe.get()),
-                    )
-                });
-                #[cfg(feature = "test-hooks")]
-                if MUTANT_EARLY_QOS0
-                    && let Recipe::ConsumeDelivery(c) = command.recipe.get()
-                    && let Some(item) = self.work_cache.get(&c.delivery)
-                    && let Some(g) = self.bindings.get(&c.target)
-                    && let Some(peer) = self.peers.get(g)
-                    && let Ok(bytes) = codec::encode_qos0(&item.topic, &item.payload)
-                {
-                    let _ = peer.io.try_send_outgoing(net::Write {
-                        expiry: None,
-                        correlation: None,
-                        bytes: net::FrameBytes::from(bytes),
-                        payload: None,
-                        report: net::WriteReport::Complete,
-                    });
-                }
-                #[cfg(feature = "test-hooks")]
-                let early_finish = if MUTANT_EARLY_FINISH
-                    && let Recipe::FinishDelivery(f) = command.recipe.get()
-                {
-                    Some(Input::StoreResult {
-                        effect: id,
-                        operation: operation_id,
-                        reply: StoreReply::Outcome(StoreOutcome::Committed(
-                            CommitFacts::DeliveryFinished {
-                                delivery: f.delivery,
-                                target: f.target,
-                                packet_id: f.packet_id,
-                                claim: f.claim,
-                            },
-                        )),
-                    })
-                } else {
-                    None
-                };
-                #[cfg(feature = "test-hooks")]
-                if MUTANT_EARLY_OUTGOING
-                    && let Recipe::ClaimDelivery(c) = command.recipe.get()
-                    && let Some(item) = self.work_cache.get(&c.delivery)
-                    && let Some(generation) = self.bindings.get(&c.target)
-                    && let Some(peer) = self.peers.get(generation)
-                    && let Ok(bytes) =
-                        codec::encode_publish(c.packet_id, &item.topic, &item.payload, false)
-                {
-                    let _ = peer.io.try_send_outgoing(net::Write {
-                        expiry: None,
-                        correlation: None,
-                        bytes: net::FrameBytes::from(bytes),
-                        payload: None,
-                        report: net::WriteReport::Complete,
-                    });
-                }
-                #[cfg(feature = "test-hooks")]
-                if MUTANT_EARLY_ACK
-                    && let mqttiumd_contract::command::Recipe::AdmitPublication(admission) =
-                        command.recipe.get()
-                    && admission.qos == mqttiumd_contract::packet::Qos::ExactlyOnce
-                    && let Some(p) = self.peers.values().find(|p| {
-                        p.receiving_serial(admission.source.packet_id.get())
-                            .is_some()
-                    })
-                {
-                    let _ = p.io.try_send_outgoing(net::Write {
-                        expiry: None,
-                        correlation: None,
-                        bytes: net::FrameBytes::from(
-                            codec::encode(OutboundFrame::Pubrec {
-                                packet_id: admission.source.packet_id,
-                                reason: mqttiumd_contract::packet::AckReason::Success,
-                            })
-                            .unwrap_or_default(),
-                        ),
-                        payload: None,
-                        report: net::WriteReport::Complete,
-                    });
-                }
-                #[cfg(feature = "test-hooks")]
-                if MUTANT_EARLY_PUBACK
-                    && let mqttiumd_contract::command::Recipe::AdmitPublication(admission) =
-                        command.recipe.get()
-                    && admission.qos == mqttiumd_contract::packet::Qos::AtLeastOnce
-                    && let Some(p) = self.peers.values().find(|p| {
-                        p.receiving_serial(admission.source.packet_id.get())
-                            .is_some()
-                    })
-                {
-                    let _ = p.io.try_send_outgoing(net::Write {
-                        expiry: None,
-                        correlation: None,
-                        bytes: net::FrameBytes::from(
-                            codec::encode(OutboundFrame::Puback {
-                                packet_id: admission.source.packet_id,
-                                reason: mqttiumd_contract::packet::PubackReason::Success,
-                            })
-                            .unwrap_or_default(),
-                        ),
-                        payload: None,
-                        report: net::WriteReport::Complete,
-                    });
-                }
-                if self.writer.is_direct() {
-                    let (id, Effect::Persist { command }) = effect.into_parts() else {
-                        unreachable!("matched Effect::Persist");
-                    };
-                    let reply = self
-                        .writer
-                        .apply_persist_direct(command, &mut self.pending_work_targets);
-                    self.inputs.push_back(Input::StoreResult {
-                        effect: id,
-                        operation: operation_id,
-                        reply,
-                    });
-                    if let Some(count) = self.queued_writer_replies.as_mut() {
-                        *count += 1;
-                    }
-                    self.direct_skip_next_deadline = matches!(
-                        reply,
-                        StoreReply::Outcome(
-                            StoreOutcome::Committed(_) | StoreOutcome::RejectedCertain(_)
-                        )
-                    );
-                    if let Some((command_kind, details)) = submitted_meta
-                        && self
-                            .events
-                            .emit(
-                                "command_submitted",
-                                json!({"operation":operation(operation_id),"command_kind":command_kind,"details":details}),
-                            )
-                            .is_err()
-                    {
-                        self.error = Some(Failure::plain("events_unavailable"));
-                    }
-                    return SubmitResult::Accepted;
-                }
-                let touches_routes = recipe_touches_routes(command.recipe.get());
-                match self.writer.try_send(Request::Effect(effect)) {
-                    Ok(()) => {
-                        self.inflight.insert(id, operation_id);
-                        if touches_routes {
-                            self.inflight_route_ops.insert(id, ());
-                        }
-                        #[cfg(feature = "test-hooks")]
-                        if let Some(input) = early_finish {
-                            self.inputs.push_back(input);
-                            if let Some(count) = self.queued_writer_replies.as_mut() {
-                                *count += 1;
-                            }
-                        }
-                        if let Some((command_kind, details)) = submitted_meta
-                            && self
-                                .events
-                                .emit(
-                                    "command_submitted",
-                                    json!({"operation":operation(operation_id),"command_kind":command_kind,"details":details}),
-                                )
-                                .is_err()
-                        {
-                            self.error = Some(Failure::plain("events_unavailable"));
-                        }
-                        SubmitResult::Accepted
-                    }
-                    Err(TrySendError::Full(Request::Effect(effect))) => {
-                        refused(effect, SubmitBlock::QueueFull)
-                    }
-                    Err(TrySendError::Disconnected(Request::Effect(effect))) => {
-                        self.error = Some(Failure::plain("writer_disconnected"));
-                        refused(effect, SubmitBlock::Closed)
-                    }
-                    _ => unreachable!(),
-                }
-            }
-            Effect::ResolveAndFence { operation }
-                if self.lifecycle_operation == Some(*operation)
-                    || self.will_operation == Some(*operation) =>
-            {
-                self.submit_lifecycle(effect)
-            }
-            Effect::ResolveAndFence { operation } => {
-                if self.inflight.len() >= self.limits.in_flight || !self.writer_reply_room() {
-                    return refused(effect, SubmitBlock::InFlightLimit);
-                }
-                let op = *operation;
-                match self.writer.try_send(Request::Effect(effect)) {
-                    Ok(()) => {
-                        self.inflight.insert(id, op);
-                        SubmitResult::Accepted
-                    }
-                    Err(TrySendError::Full(Request::Effect(e))) => {
-                        refused(e, SubmitBlock::QueueFull)
-                    }
-                    Err(TrySendError::Disconnected(Request::Effect(e))) => {
-                        refused(e, SubmitBlock::Closed)
-                    }
-                    _ => unreachable!(),
-                }
-            }
-            Effect::EmitFrame {
-                connection,
-                frame,
-                publish_order,
-                pubrel,
-            } => {
-                let (connection, frame) = (*connection, *frame);
-                let receive_serial = *publish_order;
-                let binding = match (*pubrel, frame) {
-                    (Some((delivery, claim)), OutboundFrame::Pubrel { packet_id }) => {
-                        let key = (connection, packet_id);
-                        if self.outgoing_bindings.len() >= self.limits.outgoing_bindings {
-                            return refused(effect, SubmitBlock::InFlightLimit);
-                        }
-                        if self.outgoing_bindings.contains_key(&key) {
-                            self.error = Some(Failure::plain("pubrel_binding_conflict"));
-                            return refused(effect, SubmitBlock::InFlightLimit);
-                        }
-                        Some((
-                            key,
-                            PubackTarget {
-                                delivery,
-                                claim,
-                                frame: id,
-                            },
-                        ))
-                    }
-                    (None, _) => None,
-                    (Some(_), _) => unreachable!("only PUBREL binds an outgoing occurrence here"),
-                };
-                let terminal = match frame {
-                    OutboundFrame::Puback { .. } => Some(Terminal::Puback),
-                    OutboundFrame::Pubcomp { .. } => Some(Terminal::Pubcomp),
-                    OutboundFrame::Pubrec { reason, .. }
-                        if reason != mqttiumd_contract::packet::AckReason::Success =>
-                    {
-                        Some(Terminal::RejectedPubrec)
-                    }
-                    _ => None,
-                };
-                let generation = connection.generation;
-                let (kind, packet_id) = frame_info(frame);
-                if self
-                    .terminal_inputs
-                    .len()
-                    .checked_add(2 * self.frames.len())
-                    .is_none_or(|used| used >= self.limits.terminal_inputs)
-                    || self.frames.len() >= self.limits.frames
-                    || (!self.shards_active
-                        && kind == "CONNACK"
-                        && ordinary_room(
-                            self.inputs,
-                            self.ordinary_reserved,
-                            self.limits.ordinary_inputs,
-                        ) == 0)
-                {
-                    return refused(effect, SubmitBlock::QueueFull);
-                }
-                let Some(peer) = self.peers.get_mut(&generation).filter(|peer| {
-                    peer.closing().is_none()
-                        && self.bindings.get(&connection.session) == Some(&generation)
-                }) else {
-                    let _ = effect.into_parts();
-                    if self.events.emit("frame_failed",json!({"connection":generation.get().to_string(),"details":{"effect":effect_text(id),"packet_kind":kind,"code":"unusable_generation"}})).is_err(){self.error=Some(Failure::plain("events_unavailable"));}
-                    self.push_terminal(Input::FrameResult {
-                        effect: id,
-                        connection,
-                        progress: FrameProgress::Failed,
-                    });
-                    return SubmitResult::Accepted;
-                };
-                // The answer of one unit request of a larger SUBSCRIBE or
-                // UNSUBSCRIBE: it is kept for the one acknowledgement of
-                // the whole request and reported to the core as written.
-                let part_of = matches!(frame, OutboundFrame::Unsuback { .. });
-                if let Some(answered) = packet_id
-                    && matches!(kind, "SUBACK" | "UNSUBACK")
-                    && let Some(requests) = peer.cold.as_mut().and_then(|c| c.requests.as_mut())
-                    && requests.awaiting
-                    && requests.packet_id.get() == answered
-                    && requests.unsubscribe == part_of
-                {
-                    let version = peer.version.unwrap_or_default();
-                    let Ok(bytes) = codec::encode_for(version, frame) else {
-                        self.close.push((generation, "failure_without_wire_ack"));
-                        return refused(effect, SubmitBlock::Closed);
-                    };
-                    requests
-                        .served
-                        .extend_from_slice(codec::filter_ack_codes(version, &bytes));
-                    requests.awaiting = false;
-                    let _ = effect.into_parts();
-                    self.push_terminal(Input::FrameResult {
-                        effect: id,
-                        connection,
-                        progress: FrameProgress::Written {
-                            confirmed: bytes.len() as u64,
-                            total: bytes.len() as u64,
-                        },
-                    });
-                    return SubmitResult::Accepted;
-                }
-                let bytes = match codec::encode_frame_bytes(peer.version.unwrap_or_default(), frame)
-                {
-                    Ok(bytes) if bytes.len() <= peer.max_packet_bytes() => bytes,
-                    Err(error) if error.code() == "AckNotEncodableInMqtt311" => {
-                        let code = if matches!(
-                            frame,
-                            OutboundFrame::Puback {
-                                reason: mqttiumd_contract::packet::PubackReason::QuotaExceeded,
-                                ..
-                            } | OutboundFrame::Pubrec {
-                                reason: mqttiumd_contract::packet::AckReason::QuotaExceeded,
-                                ..
-                            }
-                        ) {
-                            "capacity_exceeded"
-                        } else {
-                            "failure_without_wire_ack"
-                        };
-                        self.close.push((generation, code));
-                        return refused(effect, SubmitBlock::Closed);
-                    }
-                    _ => {
-                        self.close.push((generation, "outgoing_queue_full"));
-                        return refused(effect, SubmitBlock::Closed);
-                    }
-                };
-                let report = if cfg!(any(test, feature = "test-hooks")) && terminal.is_some() {
-                    net::WriteReport::CompleteAndWireProgress
-                } else {
-                    net::WriteReport::Complete
-                };
-                match peer.io.try_send_outgoing(net::Write {
-                    expiry: None,
-                    correlation: Some((id, connection)),
-                    bytes,
-                    payload: None,
-                    report,
-                }) {
-                    Ok(()) => {
-                        if let Some((key, target)) = binding {
-                            self.outgoing_bindings.insert(key, target);
-                        }
-                        if kind == "CONNACK" {
-                            // Pipeline processing starts only after the core's
-                            // CONNACK occupies the ordered socket output queue.
-                            peer.pending = false;
-                            self.mark_pending_peers.push(generation);
-                            // Readiness is effective only after the ordered
-                            // CONNACK enters the bounded writer queue. The
-                            // earlier cache-install fence deliberately kept
-                            // this destination ineligible for discovery.
-                            if self.shards_active {
-                                self.shard_attach_ready.push(connection);
-                            } else if self.queued_work_sessions.insert(connection.session) {
-                                self.inputs.push_back(Input::WorkAvailable {
-                                    session: connection.session,
-                                });
-                            }
-                        } else if self.shards_active && kind == "SUBACK" {
-                            self.shard_suback_ready.push(connection.session);
-                        }
-                        self.frames.insert(
-                            id,
-                            PendingFrame {
-                                connection,
-                                kind,
-                                packet_id,
-                                receive_serial,
-                                terminal,
-                                wire_released: false,
-                                was_retained: peer.submitted_output(id),
-                            },
-                        );
-                        let _ = effect.into_parts();
-                        if kind!="PINGRESP"&&self.events.emit_with("frame_queued",||json!({"connection":generation.get().to_string(),"details":{"packet_kind":kind,"effect":effect_text(id),"packet_id":packet_id.unwrap_or(0)}})).is_err(){self.error=Some(Failure::plain("events_unavailable"));}
-                        SubmitResult::Accepted
-                    }
-                    Err(TrySendError::Full(_)) => {
-                        self.mark_pending_peers.push(generation);
-                        if peer.cold_mut().blocked_output.replace(id) != Some(id)
-                            && self.events.emit_with("effect_retained",||json!({"connection":generation.get().to_string(),"details":{"code":"output_queue_full","effect":effect_text(id),"packet_kind":kind}})).is_err(){self.error=Some(Failure::plain("events_unavailable"));}
-                        refused(effect, SubmitBlock::TransportBackpressure)
-                    }
-                    Err(TrySendError::Disconnected(_)) => {
-                        self.close.push((generation, "outgoing_queue_full"));
-                        refused(effect, SubmitBlock::Closed)
-                    }
-                }
-            }
-            Effect::CloseConnection { connection, reason } => {
-                let code = match reason {
-                    CloseReason::ProtocolError => "protocol_error",
-                    CloseReason::SessionTakenOver => "session_taken_over",
-                    CloseReason::OutcomeUnknown => "outcome_unknown",
-                    CloseReason::CapacityExceeded => "capacity_exceeded",
-                };
-                let mut flushing = false;
-                // An MQTT 5 client is told why: its session was taken over,
-                // or a limit of the broker was exceeded (Quota exceeded).
-                let notice = match reason {
-                    CloseReason::SessionTakenOver => Some(0x8e),
-                    CloseReason::CapacityExceeded => Some(0x97),
-                    CloseReason::ProtocolError | CloseReason::OutcomeUnknown => None,
-                };
-                if let Some(notice) = notice
-                    && let Some(peer) = self.peers.get_mut(connection)
-                {
-                    if peer.closing().is_some() {
-                        flushing = true;
-                    } else if peer.version != Some(Version::V311) {
-                        let bytes = codec::disconnect_reason(notice);
-                        if bytes.len() <= peer.max_packet_bytes()
-                            && peer
-                                .io
-                                .try_send_outgoing(net::Write {
-                                    expiry: None,
-                                    correlation: None,
-                                    bytes: net::FrameBytes::from(bytes),
-                                    payload: None,
-                                    report: net::WriteReport::Complete,
-                                })
-                                .is_ok()
-                        {
-                            peer.set_closing((code, Instant::now()));
-                            self.mark_pending_peers.push(*connection);
-                            flushing = true;
-                        }
-                    }
-                }
-                if !flushing {
-                    self.close.push((*connection, code));
-                }
-                let _ = effect.into_parts();
-                SubmitResult::Accepted
-            }
-            Effect::CollectReceipts { collection } => {
-                let collection = *collection;
-                match self.writer.try_send_control(ControlRequest::Collect {
-                    effect: id,
-                    collection,
-                }) {
-                    Ok(()) => {
-                        let mut details = crate::writer::collection_details(collection);
-                        details["effect"] = json!(effect_text(id));
-                        if self
-                            .events
-                            .emit(
-                                "receipt_collection_submitted",
-                                json!({"command_kind":"ReceiptCollection","details":details}),
-                            )
-                            .is_err()
-                        {
-                            self.error = Some(Failure::plain("events_unavailable"));
-                        }
-                        let _ = effect.into_parts();
-                        SubmitResult::Accepted
-                    }
-                    Err(TrySendError::Full(_)) => refused(effect, SubmitBlock::QueueFull),
-                    Err(TrySendError::Disconnected(_)) => {
-                        self.error = Some(Failure::plain("writer_control_disconnected"));
-                        refused(effect, SubmitBlock::Closed)
-                    }
-                }
-            }
-            Effect::ArmDeadline { token, after } => {
-                if std::mem::take(&mut self.direct_skip_next_deadline) {
-                    let _ = effect.into_parts();
-                    return SubmitResult::Accepted;
-                }
-                if self.timers.len() >= self.limits.timers {
-                    return refused(effect, SubmitBlock::QueueFull);
-                }
-                let Some(due) = Instant::now().checked_add(Duration::from_millis(after.get()))
-                else {
-                    self.error = Some(Failure::plain("timer_overflow"));
-                    return refused(effect, SubmitBlock::Closed);
-                };
-                self.timers.insert(*token, due);
-                let _ = effect.into_parts();
-                SubmitResult::Accepted
-            }
-            Effect::Continue { continuation } => {
-                if ordinary_room(
-                    self.inputs,
-                    self.ordinary_reserved,
-                    self.limits.ordinary_inputs,
-                ) == 0
-                {
-                    return refused(effect, SubmitBlock::QueueFull);
-                }
-                self.inputs.push_front(Input::Continue {
-                    continuation: *continuation,
-                    budget: WorkUnits::new(65536),
-                });
-                let _ = effect.into_parts();
-                SubmitResult::Accepted
-            }
-            Effect::LoadWills { .. } => {
-                if self.will_reads.is_some() || !self.writer_reply_room() {
-                    return refused(effect, SubmitBlock::InFlightLimit);
-                }
-                match self.writer.try_send(Request::Effect(effect)) {
-                    Ok(()) => {
-                        *self.will_reads = Some(id);
-                        SubmitResult::Accepted
-                    }
-                    Err(TrySendError::Full(Request::Effect(effect))) => {
-                        refused(effect, SubmitBlock::QueueFull)
-                    }
-                    Err(TrySendError::Disconnected(Request::Effect(effect))) => {
-                        refused(effect, SubmitBlock::Closed)
-                    }
-                    _ => unreachable!(),
-                }
-            }
-            Effect::LoadWork { session, .. } => {
-                if self.work_reads.len() >= self.limits.in_flight || !self.writer_reply_room() {
-                    return refused(effect, SubmitBlock::InFlightLimit);
-                }
-                let session = *session;
-                match self.writer.try_send(Request::Effect(effect)) {
-                    Ok(()) => {
-                        self.work_reads.insert(id, session);
-                        SubmitResult::Accepted
-                    }
-                    Err(TrySendError::Full(Request::Effect(e))) => {
-                        refused(e, SubmitBlock::QueueFull)
-                    }
-                    Err(TrySendError::Disconnected(Request::Effect(e))) => {
-                        self.error = Some(Failure::plain("writer_disconnected"));
-                        refused(e, SubmitBlock::Closed)
-                    }
-                    _ => unreachable!(),
-                }
-            }
-            Effect::EmitPublish {
-                expiry,
-                properties,
-                started,
-                connection,
-                delivery,
-                cause,
-                qos,
-                packet_id,
-                claim,
-                topic,
-                payload,
-                dup,
-                retain,
-            } => {
-                let (connection, delivery, packet_id, claim, dup, retain) =
-                    (*connection, *delivery, *packet_id, *claim, *dup, *retain);
-                #[cfg(feature = "test-hooks")]
-                if self
-                    .hooks
-                    .pause
-                    .iter()
-                    .any(|point| point == "publish.emission")
-                    && !self.releasing_qos0
-                {
-                    if self.emission_barriers.len() >= IN_FLIGHT {
-                        return refused(effect, SubmitBlock::QueueFull);
-                    }
-                    if self.events.emit("barrier_hit",json!({"point":"publish.emission","command_kind":"Claim","operation":operation(claim),"details":{"delivery":delivery_text(delivery)}})).is_err() {
-                        self.error=Some(Failure::plain("events_unavailable")); return refused(effect, SubmitBlock::Closed);
-                    }
-                    self.emission_barriers.push_back(HeldEmission {
-                        point: "publish.emission",
-                        effect,
-                        since: Instant::now(),
-                        released: false,
-                    });
-                    return SubmitResult::Accepted;
-                }
-                if self
-                    .terminal_inputs
-                    .len()
-                    .checked_add(2 * self.frames.len())
-                    .is_none_or(|used| used >= self.limits.terminal_inputs)
-                    || self.frames.len() >= self.limits.frames
-                {
-                    return refused(effect, SubmitBlock::QueueFull);
-                }
-                let generation = connection.generation;
-                let Some(peer) = self.peers.get_mut(&generation).filter(|p| {
-                    p.closing().is_none()
-                        && self.bindings.get(&connection.session) == Some(&generation)
-                }) else {
-                    let _ = effect.into_parts();
-                    if self
-                        .events
-                        .emit(
-                            "frame_failed",
-                            json!({
-                                "connection": generation.get().to_string(),
-                                "details": {"effect": effect_text(id), "packet_kind": "PUBLISH",
-                                            "code": "unusable_generation"}
-                            }),
-                        )
-                        .is_err()
-                    {
-                        self.error = Some(Failure::plain("events_unavailable"));
-                    }
-                    self.push_terminal(Input::FrameResult {
-                        effect: id,
-                        connection,
-                        progress: FrameProgress::Failed,
-                    });
-                    return SubmitResult::Accepted;
-                };
-                let version = peer.version.unwrap_or_default();
-                let retain =
-                    retain && (version == Version::V5 || *cause == DeliveryCause::RetainedReplay);
-                let expiry_val = expiry.as_deref().copied();
-                let encoded = match codec::encode_delivery_segments(
-                    version,
-                    (packet_id, *qos),
-                    topic,
-                    payload,
-                    dup,
-                    retain,
-                    expiry_val.map(|value| value.interval),
-                    properties.as_deref(),
-                ) {
-                    Ok(encoded) if encoded.total_len <= peer.max_packet_bytes() => encoded,
-                    _ => {
-                        self.close.push((generation, "outgoing_packet_limit"));
-                        return refused(effect, SubmitBlock::Closed);
-                    }
-                };
-                let write_expiry = expiry_val.map(|expiry| {
-                    Box::new(net::WriteExpiry {
-                        expiry,
-                        value_offset: encoded.expiry_value_offset,
-                        started: *started,
-                    })
-                });
-                let binding_key = (connection, packet_id);
-                let binding = PubackTarget {
-                    delivery,
-                    claim,
-                    frame: id,
-                };
-                if self.outgoing_bindings.contains_key(&binding_key) {
-                    self.error = Some(Failure::plain("outgoing_binding_conflict"));
-                    return refused(effect, SubmitBlock::InFlightLimit);
-                }
-                if self.outgoing_bindings.len() >= self.limits.outgoing_bindings {
-                    return refused(effect, SubmitBlock::InFlightLimit);
-                }
-                // Register before the network task can observe this frame.
-                // A rejected queue submission rolls this precise entry back.
-                self.outgoing_bindings.insert(binding_key, binding);
-                let track_written = write_expiry.is_some()
-                    || peer.blocked_output() == Some(id)
-                    || self.events.records("frame_written")
-                    || cfg!(any(test, feature = "test-hooks"));
-                match peer.io.try_send_outgoing(net::Write {
-                    expiry: write_expiry,
-                    correlation: track_written.then_some((id, connection)),
-                    bytes: encoded.header,
-                    payload: encoded.payload,
-                    report: if track_written {
-                        net::WriteReport::Complete
-                    } else {
-                        net::WriteReport::None
-                    },
-                }) {
-                    Ok(()) => {
-                        let was_retained = peer.submitted_output(id);
-                        if track_written {
-                            self.frames.insert(
-                                id,
-                                PendingFrame {
-                                    connection,
-                                    kind: "PUBLISH",
-                                    packet_id: Some(packet_id.get()),
-                                    receive_serial: None,
-                                    terminal: None,
-                                    wire_released: false,
-                                    was_retained,
-                                },
-                            );
-                        }
-                        let _ = effect.into_parts();
-                        if self.events.emit_with("frame_queued",||json!({"connection":generation.get().to_string(),"details":{"packet_kind":"PUBLISH","effect":effect_text(id),"delivery":delivery_text(delivery),"target":connection.session.get().to_string(),"packet_id":packet_id.get(),"claim":operation_text(claim),"dup":dup,"retain":retain}})).is_err(){self.error=Some(Failure::plain("events_unavailable"));}
-                        SubmitResult::Accepted
-                    }
-                    Err(TrySendError::Full(_)) => {
-                        self.outgoing_bindings.remove(&binding_key);
-                        self.mark_pending_peers.push(generation);
-                        if peer.cold_mut().blocked_output.replace(id) != Some(id)
-                            && self.events.emit_with("effect_retained",||json!({"connection":generation.get().to_string(),"details":{"code":"output_queue_full","effect":effect_text(id),"packet_kind":"PUBLISH"}})).is_err(){self.error=Some(Failure::plain("events_unavailable"));}
-                        refused(effect, SubmitBlock::TransportBackpressure)
-                    }
-                    Err(TrySendError::Disconnected(_)) => {
-                        self.outgoing_bindings.remove(&binding_key);
-                        self.close.push((generation, "outgoing_queue_full"));
-                        refused(effect, SubmitBlock::Closed)
-                    }
-                }
-            }
-        }
-    }
-}
 fn input_connection(input: &Input) -> Option<ConnectionGeneration> {
     match input {
         Input::Packet { connection, .. } => Some(*connection),
@@ -7404,23 +6736,87 @@ fn puback_fields(
     observation: Option<u64>,
     code: &str,
 ) -> serde_json::Value {
-    let target=target.map(|target|json!({"delivery_id":{"publication_id":{"incarnation":target.delivery.publication.incarnation().get().to_string(),"epoch":target.delivery.publication.epoch().get().to_string(),"owner":target.delivery.publication.owner().get().to_string(),"sequence":target.delivery.publication.sequence().get().to_string()},"index":target.delivery.index},"claim_operation_id":operation(target.claim),"frame_effect_id":{"epoch":target.frame.epoch.get().to_string(),"owner":target.frame.owner.get().to_string(),"sequence":target.frame.sequence.get().to_string()}}));
-    let mut puback = json!({"connection":{"session":connection.session.get().to_string(),"generation":connection.generation.get().to_string()},"packet_id":packet_id.get(),"reason_code":reason,"target":target});
+    let target = target.map(|target| {
+        json!({
+            "delivery_id": {
+                "publication_id": {
+                    "incarnation": target.delivery.publication.incarnation().get().to_string(),
+                    "epoch": target.delivery.publication.epoch().get().to_string(),
+                    "owner": target.delivery.publication.owner().get().to_string(),
+                    "sequence": target.delivery.publication.sequence().get().to_string(),
+                },
+                "index": target.delivery.index,
+            },
+            "claim_operation_id": operation(target.claim),
+            "frame_effect_id": {
+                "epoch": target.frame.epoch.get().to_string(),
+                "owner": target.frame.owner.get().to_string(),
+                "sequence": target.frame.sequence.get().to_string(),
+            },
+        })
+    });
+    let mut puback = json!({
+        "connection": {
+            "session": connection.session.get().to_string(),
+            "generation": connection.generation.get().to_string(),
+        },
+        "packet_id": packet_id.get(),
+        "reason_code": reason,
+        "target": target,
+    });
     if let Some(sequence) = observation {
         puback["source_observation_sequence"] = json!(sequence.to_string());
     }
-    json!({"connection":connection.generation.get().to_string(),"puback":puback,"details":{"authority":"reader_dequeue","code":code}})
+    json!({
+        "connection": connection.generation.get().to_string(),
+        "puback": puback,
+        "details": {"authority": "reader_dequeue", "code": code},
+    })
 }
-fn frame_info(frame: OutboundFrame) -> (&'static str, Option<u16>) {
+/// The kind of an outgoing frame the runtime tracks until its write is
+/// reported. `Publish0` is a QoS 0 PUBLISH, which has no packet identifier.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum FrameKind {
+    Connack,
+    Pingresp,
+    Puback,
+    Pubrec,
+    Pubcomp,
+    Pubrel,
+    Suback,
+    Unsuback,
+    Publish,
+    Publish0,
+}
+
+impl FrameKind {
+    /// The name the event journal gives the frame.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Connack => "CONNACK",
+            Self::Pingresp => "PINGRESP",
+            Self::Puback => "PUBACK",
+            Self::Pubrec => "PUBREC",
+            Self::Pubcomp => "PUBCOMP",
+            Self::Pubrel => "PUBREL",
+            Self::Suback => "SUBACK",
+            Self::Unsuback => "UNSUBACK",
+            Self::Publish => "PUBLISH",
+            Self::Publish0 => "PUBLISH0",
+        }
+    }
+}
+
+fn frame_info(frame: OutboundFrame) -> (FrameKind, Option<u16>) {
     match frame {
-        OutboundFrame::Connack { .. } => ("CONNACK", None),
-        OutboundFrame::Pingresp => ("PINGRESP", None),
-        OutboundFrame::Puback { packet_id, .. } => ("PUBACK", Some(packet_id.get())),
-        OutboundFrame::Pubrec { packet_id, .. } => ("PUBREC", Some(packet_id.get())),
-        OutboundFrame::Pubcomp { packet_id, .. } => ("PUBCOMP", Some(packet_id.get())),
-        OutboundFrame::Pubrel { packet_id } => ("PUBREL", Some(packet_id.get())),
-        OutboundFrame::Suback { packet_id, .. } => ("SUBACK", Some(packet_id.get())),
-        OutboundFrame::Unsuback { packet_id, .. } => ("UNSUBACK", Some(packet_id.get())),
+        OutboundFrame::Connack { .. } => (FrameKind::Connack, None),
+        OutboundFrame::Pingresp => (FrameKind::Pingresp, None),
+        OutboundFrame::Puback { packet_id, .. } => (FrameKind::Puback, Some(packet_id.get())),
+        OutboundFrame::Pubrec { packet_id, .. } => (FrameKind::Pubrec, Some(packet_id.get())),
+        OutboundFrame::Pubcomp { packet_id, .. } => (FrameKind::Pubcomp, Some(packet_id.get())),
+        OutboundFrame::Pubrel { packet_id } => (FrameKind::Pubrel, Some(packet_id.get())),
+        OutboundFrame::Suback { packet_id, .. } => (FrameKind::Suback, Some(packet_id.get())),
+        OutboundFrame::Unsuback { packet_id, .. } => (FrameKind::Unsuback, Some(packet_id.get())),
     }
 }
 /// PUBLISH, SUBSCRIBE and UNSUBSCRIBE ask the broker for new work. Every
@@ -7472,12 +6868,23 @@ fn recipe_details(recipe: &Recipe) -> serde_json::Value {
                 (v.publication, &v.topic)
             }
         };
-        return json!({"publication":format!("{:?}",publication),"topic":String::from_utf8_lossy(topic.as_slice()).chars().take(256).collect::<String>(),
-            "message_expiry_domain":hex_domain(value.expiry.observed.domain),"message_expiry_tick":value.expiry.observed.tick.to_string(),"message_expiry_interval":value.expiry.interval});
+        return json!({
+            "publication": format!("{:?}",publication),
+            "topic": String::from_utf8_lossy(topic.as_slice()).chars().take(256).collect::<String>(),
+            "message_expiry_domain": hex_domain(value.expiry.observed.domain),
+            "message_expiry_tick": value.expiry.observed.tick.to_string(),
+            "message_expiry_interval": value.expiry.interval,
+        });
     }
     match recipe {
         Recipe::WillPublication(value) => {
-            json!({"will":operation_text(value.will),"publication":format!("{:?}",value.publication),"destinations":value.targets.len(),"topic_bytes":value.topic.len(),"payload_bytes":value.payload.length.get()})
+            json!({
+                "will": operation_text(value.will),
+                "publication": format!("{:?}",value.publication),
+                "destinations": value.targets.len(),
+                "topic_bytes": value.topic.len(),
+                "payload_bytes": value.payload.length.get(),
+            })
         }
         Recipe::SessionLifecycle(lifecycle) => match &lifecycle.action {
             SessionAction::Open {
@@ -7498,7 +6905,12 @@ fn recipe_details(recipe: &Recipe) -> serde_json::Value {
                 expiry,
                 ..
             } => {
-                json!({"action":"Open","clean_start":clean_start,"expiry":expiry_json(*expiry),"expected_session":expected.map(|g|g.session.get().to_string())})
+                json!({
+                    "action": "Open",
+                    "clean_start": clean_start,
+                    "expiry": expiry_json(*expiry),
+                    "expected_session": expected.map(|g|g.session.get().to_string()),
+                })
             }
             SessionAction::EndWill {
                 guard,
@@ -7506,39 +6918,72 @@ fn recipe_details(recipe: &Recipe) -> serde_json::Value {
                 observed_at,
                 publish,
             } => {
-                json!({"action":"EndWill","session":guard.session.get().to_string(),"opened_by":guard.opened_by.map(operation_text),"expiry":expiry_json(*expiry),"observed_at":observed_at.to_string(),"publish":publish})
+                json!({
+                    "action": "EndWill",
+                    "session": guard.session.get().to_string(),
+                    "opened_by": guard.opened_by.map(operation_text),
+                    "expiry": expiry_json(*expiry),
+                    "observed_at": observed_at.to_string(),
+                    "publish": publish,
+                })
             }
             SessionAction::Detach {
                 guard,
                 expiry,
                 observed_at,
             } => {
-                json!({"action":"Detach","session":guard.session.get().to_string(),"expiry":expiry_json(*expiry),"observed_at":observed_at.to_string()})
+                json!({
+                    "action": "Detach",
+                    "session": guard.session.get().to_string(),
+                    "expiry": expiry_json(*expiry),
+                    "observed_at": observed_at.to_string(),
+                })
             }
             SessionAction::Expire {
                 guard,
                 detached,
                 now,
             } => {
-                json!({"action":"Expire","session":guard.session.get().to_string(),"detached_by":operation(detached.operation),"deadline":detached.deadline.map(|n|n.to_string()),"now":now.to_string()})
+                json!({
+                    "action": "Expire",
+                    "session": guard.session.get().to_string(),
+                    "detached_by": operation(detached.operation),
+                    "deadline": detached.deadline.map(|n|n.to_string()),
+                    "now": now.to_string(),
+                })
             }
             SessionAction::Close { guard, reason } => {
-                json!({"action":"Close","session":guard.session.get().to_string(),"opened_by":guard.opened_by.map(operation_text).unwrap_or_default(),"reason":format!("{reason:?}")})
+                json!({
+                    "action": "Close",
+                    "session": guard.session.get().to_string(),
+                    "opened_by": guard.opened_by.map(operation_text).unwrap_or_default(),
+                    "reason": format!("{reason:?}"),
+                })
             }
         },
         Recipe::ConsumeDelivery(c) => {
             json!({"delivery":delivery_text(c.delivery),"target":c.target.get().to_string()})
         }
         Recipe::ClaimDelivery(c) => {
-            json!({"delivery":delivery_text(c.delivery),"target":c.target.get().to_string(),"packet_id":c.packet_id.get()})
+            json!({
+                "delivery": delivery_text(c.delivery),
+                "target": c.target.get().to_string(),
+                "packet_id": c.packet_id.get(),
+            })
         }
         Recipe::FinishDelivery(c) => {
-            json!({"delivery":delivery_text(c.delivery),"target":c.target.get().to_string(),"packet_id":c.packet_id.get(),"claim":operation_text(c.claim)})
+            json!({
+                "delivery": delivery_text(c.delivery),
+                "target": c.target.get().to_string(),
+                "packet_id": c.packet_id.get(),
+                "claim": operation_text(c.claim),
+            })
         }
         _ => json!({}),
     }
 }
-fn qos0_origin(origin: Qos0Origin) -> String {
+/// The origin of a QoS 0 delivery as the journal names it.
+pub(crate) fn qos0_origin(origin: Qos0Origin) -> String {
     match origin {
         Qos0Origin::Volatile { publication } => format!(
             "volatile/{}/{}/{}",
@@ -7580,842 +7025,9 @@ fn nz(v: u32) -> NonZeroU32 {
     NonZeroU32::new(v).expect("fixed nonzero budget")
 }
 
-fn normalize_path_for_collision(path: &std::path::Path) -> PathBuf {
-    if let (Some(parent), Some(name)) = (path.parent(), path.file_name()) {
-        let dir = if parent.as_os_str().is_empty() {
-            std::path::Path::new(".")
-        } else {
-            parent
-        };
-        if let Ok(canon) = std::fs::canonicalize(dir) {
-            return canon.join(name);
-        }
-    }
-    path.to_path_buf()
-}
-
-fn path_with_suffix(path: &std::path::Path, suffix: &str) -> PathBuf {
-    let mut os = path.as_os_str().to_os_string();
-    os.push(suffix);
-    PathBuf::from(os)
-}
-
-fn paths_collide_with_db(events: &std::path::Path, db: &std::path::Path) -> bool {
-    let ev = normalize_path_for_collision(events);
-    let ev_prev = path_with_suffix(&ev, ".previous");
-    let db_norm = normalize_path_for_collision(db);
-    let db_paths = [
-        db_norm.clone(),
-        path_with_suffix(&db_norm, "-wal"),
-        path_with_suffix(&db_norm, "-shm"),
-        path_with_suffix(&db_norm, ".mlog"),
-        path_with_suffix(&db_norm, ".writer-lock"),
-    ];
-    db_paths.iter().any(|p| *p == ev || *p == ev_prev)
-}
-
-pub fn run(config: Config) -> Result<(), Failure> {
-    let disk_db_active = matches!(
-        config.storage_mode,
-        crate::writer::StorageMode::Durable
-            | crate::writer::StorageMode::Log
-            | crate::writer::StorageMode::Volatile {
-                snapshot_interval: Some(_),
-            }
-    ) || config.require_existing_db;
-    if disk_db_active && paths_collide_with_db(&config.events, &config.db) {
-        return Err(Failure::plain("events_db_path_collision"));
-    }
-    let events = Events::open_at(&config.events, config.event_level).map_err(event_failure)?;
-    let security = match &config.tls {
-        Some(files) => Security::load(files).map(Some).map_err(Failure::plain),
-        None if config.listen.ip().is_loopback() => Ok(None),
-        None => Err(Failure::plain("cleartext_requires_loopback")),
-    };
-    let security = match security {
-        Ok(security) => security,
-        Err(failure) => {
-            let _ = events.emit("startup_or_runtime_refused", failure.fields());
-            return Err(failure);
-        }
-    };
-    let cancel = Arc::new(AtomicBool::new(false));
-    let signal = cancel.clone();
-    ctrlc::set_handler(move || signal.store(true, Ordering::Relaxed))
-        .map_err(|_| Failure::plain("signal_handler"))?;
-    events.emit("starting",json!({"details":{"test_hooks":cfg!(feature="test-hooks"),"sqlite_kill_points":mqttiumd_store_sqlite::KILL_POINTS_ENABLED}})).map_err(event_failure)?;
-    let policy = security
-        .as_ref()
-        .map(|security| security.policy.storage().clone());
-    let delivery_shards = config
-        .delivery_shards
-        .min(crate::delivery_shard::MAX_DELIVERY_SHARDS);
-    let use_direct = matches!(
-        config.storage_mode,
-        crate::writer::StorageMode::Volatile { .. }
-    ) && delivery_shards == 0;
-    if use_direct {
-        let (mut direct, boot) = DirectWriter::open(
-            config.db,
-            events.clone(),
-            config.hooks.clone(),
-            cancel.clone(),
-            policy,
-            config.require_existing_db,
-            config.storage_mode,
-        )?;
-        let result = run_inner(
-            &config.listen,
-            config.hooks,
-            &events,
-            cancel.clone(),
-            StoreHandle::Direct(&mut direct),
-            Some(boot),
-            security,
-            config.limits,
-            0,
-        );
-        if let Err(failure) = &result {
-            let _ = events.emit("startup_or_runtime_refused", failure.fields());
-        }
-        cancel.store(true, Ordering::Relaxed);
-        let writer_result = direct.finish();
-        if let Err(failure) = &writer_result {
-            let _ = events.emit("startup_or_runtime_refused", failure.fields());
-        } else {
-            events.emit("stopped",json!({"details":{"writer_released":true,"accepted_commands_certainly_rejected":false}})).map_err(event_failure)?;
-        }
-        return result.and(writer_result);
-    }
-    let mut writer = Writer::spawn_configured_sharded(
-        config.db,
-        events.clone(),
-        config.hooks.clone(),
-        cancel.clone(),
-        policy,
-        config.require_existing_db,
-        config.storage_mode,
-        delivery_shards,
-    )?;
-    let result = run_inner(
-        &config.listen,
-        config.hooks,
-        &events,
-        cancel.clone(),
-        StoreHandle::Threaded(&mut writer),
-        None,
-        security,
-        config.limits,
-        delivery_shards,
-    );
-    if let Err(failure) = &result {
-        let _ = events.emit("startup_or_runtime_refused", failure.fields());
-    }
-    cancel.store(true, Ordering::Relaxed);
-    // Stop is queued after already accepted work. No accepted command is called rejected.
-    let deadline = Instant::now() + Duration::from_secs(5);
-    let mut stop_sent = false;
-    while Instant::now() < deadline && !writer.is_finished() {
-        if !stop_sent && writer.sender.try_send(Request::Stop).is_ok() {
-            stop_sent = true;
-        }
-        while writer.receiver.try_recv().is_ok() {}
-        while writer.control_receiver.try_recv().is_ok() {}
-        thread::sleep(Duration::from_millis(2));
-    }
-    if !writer.is_finished() {
-        let _ = events.emit(
-            "shutdown_incomplete",
-            json!({"details":{"code":"writer_deadline","accepted_outcome":"unknown"}}),
-        );
-        return Err(Failure::plain("writer_shutdown_deadline"));
-    }
-    let writer_result = writer.join_finished();
-    if let Err(failure) = &writer_result {
-        let _ = events.emit("startup_or_runtime_refused", failure.fields());
-    } else {
-        events.emit("stopped",json!({"details":{"writer_released":true,"accepted_commands_certainly_rejected":false}})).map_err(event_failure)?;
-    }
-    result.and(writer_result)
-}
-/// Accepts on its own thread so that the reactor never polls the listener.
-/// The lane is bounded: a reactor that does not take connections leaves
-/// them in the kernel backlog.
-struct Acceptor {
-    accepted: std::sync::mpsc::Receiver<Result<std::net::TcpStream, ()>>,
-    handle: thread::JoinHandle<()>,
-}
-
-impl Acceptor {
-    fn spawn(
-        listener: TcpListener,
-        cancel: Arc<AtomicBool>,
-        wake: crate::wake::Wake,
-    ) -> Result<Self, Failure> {
-        listener
-            .set_nonblocking(false)
-            .map_err(|_| Failure::plain("listen_blocking"))?;
-        let (sender, accepted) = std::sync::mpsc::sync_channel(4);
-        let handle = thread::Builder::new()
-            .name("mqttiumd-acceptor".into())
-            .spawn(move || {
-                while !cancel.load(Ordering::Relaxed) {
-                    let item = match listener.accept() {
-                        Ok((stream, _)) => Ok(stream),
-                        Err(error)
-                            if matches!(
-                                error.kind(),
-                                std::io::ErrorKind::Interrupted
-                                    | std::io::ErrorKind::ConnectionAborted
-                                    | std::io::ErrorKind::WouldBlock
-                            ) =>
-                        {
-                            continue;
-                        }
-                        Err(_) => Err(()),
-                    };
-                    if cancel.load(Ordering::Relaxed) {
-                        break;
-                    }
-                    let failed = item.is_err();
-                    if sender.send(item).is_err() {
-                        break;
-                    }
-                    wake.wake();
-                    if failed {
-                        break;
-                    }
-                }
-            })
-            .map_err(|_| Failure::plain("acceptor_spawn"))?;
-        Ok(Self { accepted, handle })
-    }
-
-    /// The cancel flag is already set. One local connection ends the
-    /// blocking accept; the listener closes with the thread.
-    fn stop(self, address: SocketAddr) {
-        drop(self.accepted);
-        let _ = std::net::TcpStream::connect_timeout(&address, Duration::from_millis(200));
-        let deadline = Instant::now() + Duration::from_secs(1);
-        while !self.handle.is_finished() && Instant::now() < deadline {
-            thread::sleep(Duration::from_millis(2));
-        }
-        if self.handle.is_finished() {
-            let _ = self.handle.join();
-        }
-    }
-}
-
-fn check_startup_cancel(cancel: &AtomicBool) -> Result<(), Failure> {
-    if cancel.load(Ordering::Relaxed) {
-        Err(Failure::plain("startup_cancelled"))
-    } else {
-        Ok(())
-    }
-}
-fn startup_reply<T>(
-    receiver: &std::sync::mpsc::Receiver<T>,
-    cancel: &AtomicBool,
-    deadline: Instant,
-    code: &'static str,
-) -> Result<T, Failure> {
-    loop {
-        // An already produced typed failure is read before observing the stop
-        // flag. Cancelling an outstanding request never calls it rejected.
-        match receiver.try_recv() {
-            Ok(reply) => return Ok(reply),
-            Err(TryRecvError::Disconnected) => return Err(Failure::plain("writer_disconnected")),
-            Err(TryRecvError::Empty) => {}
-        }
-        check_startup_cancel(cancel)?;
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            return Err(Failure::plain(code));
-        }
-        match receiver.recv_timeout(remaining.min(Duration::from_millis(10))) {
-            Ok(reply) => return Ok(reply),
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                return Err(Failure::plain("writer_disconnected"));
-            }
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
-        }
-    }
-}
-#[allow(clippy::too_many_arguments)]
-fn run_inner(
-    listen: &SocketAddr,
-    hooks: Hooks,
-    events: &Events,
-    cancel: Arc<AtomicBool>,
-    mut writer: StoreHandle<'_>,
-    direct_boot: Option<Boot>,
-    security: Option<Security>,
-    limits: Limits,
-    delivery_shards: usize,
-) -> Result<(), Failure> {
-    let _ = &hooks;
-    let (boot, wake) = match (&mut writer, direct_boot) {
-        (StoreHandle::Direct(_), Some(boot)) => (boot, crate::wake::Wake::new()),
-        (StoreHandle::Threaded(w), None) => {
-            let boot = w
-                .boot
-                .recv_timeout(Duration::from_secs(10))
-                .map_err(|_| Failure::plain("startup_deadline"))??;
-            (boot, w.wake.clone())
-        }
-        _ => return Err(Failure::plain("startup_protocol")),
-    };
-    let epoch = boot.grant.epoch();
-    let incarnation = boot.grant.incarnation();
-    let collect_closed = boot.collect_closed;
-    let sqlite = boot.sqlite.clone();
-    let storage_mode = boot.storage_mode;
-    let total_owners = NonZeroU32::new(
-        u32::try_from(delivery_shards)
-            .ok()
-            .and_then(|n| n.checked_add(1))
-            .ok_or_else(|| Failure::plain("authority_allocation"))?,
-    )
-    .ok_or_else(|| Failure::plain("authority_allocation"))?;
-    let mut authority = OwnerAuthority::from_grant(boot.grant, total_owners)
-        .map_err(|_| Failure::plain("authority_allocation"))?;
-    let outbox = authority
-        .create_outbox(
-            LogicalOwnerId::new(0),
-            NonZeroUsize::new(limits.effect_box).expect("nonzero"),
-            nz(64),
-        )
-        .map_err(|_| Failure::plain("outbox_creation"))?;
-    // Every session can hold a window of exchanges only its client ends:
-    // the table is sized for the sessions, not for the connections (record
-    // 0061).
-    let max_exchanges = crate::writer::SESSIONS * crate::receiving::MAXIMUM;
-    let mut owner = Owner::new(
-        OwnerConfig {
-            max_sessions: nz(crate::writer::SESSIONS as u32),
-            max_routes: nz(mqttiumd_contract::pubsub::MAX_SUBSCRIPTIONS as u32),
-            max_exchanges: nz(max_exchanges as u32),
-            session_qos2_exchanges: nz(crate::receiving::MAXIMUM as u32),
-            account: AccountId::new(1),
-            payload_bytes: PayloadBytes::new(64 * 1024 * 1024),
-            resolution_delay: LogicalDuration::new(10000),
-            retained_operations: nz(128),
-            remembered_connections: nz(8),
-        },
-        outbox,
-    )
-    .map_err(|_| Failure::plain("owner_creation"))?;
-    #[cfg(feature = "test-hooks")]
-    let enable_inline_claims = hooks.directory.is_none();
-    #[cfg(not(feature = "test-hooks"))]
-    let enable_inline_claims = true;
-    if enable_inline_claims {
-        owner.enable_inline_claims();
-    }
-    if delivery_shards > 0 {
-        owner.enable_delegated_deliveries();
-    }
-    let mut session_revisions = FlatMap::new();
-    for s in boot.sessions.values() {
-        session_revisions.insert(s.id, s.revision);
-    }
-    // The worker handle stays in outer run for cleanup even if recovery fails.
-    let expiry_timers = boot
-        .sessions
-        .values()
-        .filter_map(|s| {
-            s.detached
-                .as_deref()
-                .copied()
-                .filter(|d| d.deadline.is_some())
-                .map(|detached| {
-                    (
-                        s.id,
-                        ExpiryTimer {
-                            guard: SessionGuard {
-                                session: s.id,
-                                opened_by: s.opened_by,
-                            },
-                            detached,
-                            queued: false,
-                        },
-                    )
-                })
-        })
-        .collect();
-    let mut runtime = Runtime {
-        progress: 0,
-        wake,
-        limits,
-        security,
-        message_expiry_request: None,
-        message_expiry_retry: false,
-        message_expiry_retry_attempts: 0,
-        message_expiry_observation: None,
-        message_expiry_after: None,
-        message_expiry_scan: Instant::now(),
-        message_expiry_input: None,
-        message_last_time: None,
-        last_message_clock_sync: Instant::now(),
-        message_clock_needed: true,
-        clock: boot.clock,
-        clock_anchor: boot.clock_anchor,
-        clock_checkpoint: None,
-        last_clock_checkpoint: Instant::now(),
-        checkpoint_degraded: false,
-        expiry_timers,
-        expiry_inputs: VecDeque::new(),
-        last_expiry_inventory: None,
-        owner,
-        _authority: authority,
-        shards: None,
-        shard_notices: Vec::new(),
-        pending_suback_notify: FlatSet::new(),
-        incarnation,
-        epoch,
-        writer,
-        events: events.clone(),
-        peers: PeerTable::new(),
-        topic_cache: codec::TopicCache::new(),
-        ready_peers: net::ReadyQueue::new(),
-        ready_raw: Vec::new(),
-        pending_peers: FlatSet::new(),
-        capacity_waiters: 0,
-        retiring: Vec::new(),
-        session_ids: boot.sessions.values().map(|s| s.id).collect(),
-        session_revisions,
-        sessions: boot.sessions,
-        session_requests: BTreeMap::new(),
-        will_connects: BTreeMap::new(),
-        will_reads: None,
-        last_will_deferred: None,
-        next_session_request: 0,
-        generation: ConnectionGeneration::new(0),
-        peer_cursor: 0,
-        peer_keys: Vec::new(),
-        scratch_incoming: VecDeque::new(),
-        scratch_written: Vec::new(),
-        scratch_progress: Vec::new(),
-        last_peer_deadline_scan: Instant::now(),
-        inputs: VecDeque::new(),
-        ack_inputs: VecDeque::new(),
-        control_inputs: VecDeque::new(),
-        closing_inputs: VecDeque::new(),
-        terminal_inputs: VecDeque::new(),
-        terminal_effects: ScopedFlatMap::new(),
-        deferred_inputs: VecDeque::new(),
-        deferred_by_conn: FlatMap::new(),
-        effects_awaited: false,
-        deferred_retries: 0,
-        credit_progress: Instant::now(),
-        timers: BTreeMap::new(),
-        inflight: ScopedFlatMap::new(),
-        inflight_route_ops: ScopedFlatMap::new(),
-        lifecycle_inflight: BTreeMap::new(),
-        last_session_change: None,
-        session_cardinality_dirty: false,
-        last_session_cardinality: None,
-        work_reads: ScopedFlatMap::new(),
-        pending_work: VecDeque::new(),
-        pending_work_set: BTreeSet::new(),
-        queued_work_sessions: FlatSet::new(),
-        cached_bindings: FlatMap::new(),
-        bindings_dirty: true,
-        stale_frames_dirty: false,
-        timers_dirty: false,
-        receipt_pressure_blocked: false,
-        last_work_scan: Instant::now(),
-        last_will_scan: Instant::now(),
-        last_maintenance_flush: Instant::now(),
-        maintenance_needed: false,
-        #[cfg(feature = "test-hooks")]
-        work_cache: BTreeMap::new(),
-        #[cfg(feature = "test-hooks")]
-        deferred_work: VecDeque::new(),
-        #[cfg(feature = "test-hooks")]
-        emission_barriers: VecDeque::new(),
-        #[cfg(feature = "test-hooks")]
-        last_consume_result: None,
-        started: Instant::now(),
-        #[cfg(feature = "test-hooks")]
-        captured: None,
-        #[cfg(feature = "test-hooks")]
-        hooks,
-        #[cfg(feature = "test-hooks")]
-        deferred_ack: None,
-        #[cfg(feature = "test-hooks")]
-        deferred_ack_used: false,
-        retained_output: Default::default(),
-        frames: ScopedFlatMap::new(),
-        outgoing_bindings: FlatMap::new(),
-        puback_observation: 0,
-        #[cfg(feature = "test-hooks")]
-        copied_puback: None,
-        #[cfg(feature = "test-hooks")]
-        deferred_outgoing_written: None,
-        #[cfg(feature = "test-hooks")]
-        copied_outgoing_frame: None,
-        #[cfg(feature = "test-hooks")]
-        last_finish_result: None,
-        #[cfg(feature = "test-hooks")]
-        copied_session_change: None,
-        #[cfg(feature = "test-hooks")]
-        copied_session_close: None,
-    };
-    let result = (|| {
-        let mut cursor = None;
-        let mut rows = 0usize;
-        let mut saw_epoch = false;
-        loop {
-            check_startup_cancel(&cancel)?;
-            let response = match runtime.writer.exec_recovery(cursor)? {
-                Some(reply) => reply,
-                None => {
-                    let StoreHandle::Threaded(w) = &runtime.writer else {
-                        return Err(Failure::plain("recovery_protocol"));
-                    };
-                    startup_reply(
-                        &w.receiver,
-                        &cancel,
-                        Instant::now() + Duration::from_secs(10),
-                        "recovery_deadline",
-                    )?
-                }
-            };
-            let Response::Recovery(page) = response else {
-                return Err(Failure::plain("recovery_protocol"));
-            };
-            let page = page.map_err(|refused| match refused {
-                mqttiumd_store_api::RecoveryRefused::Read(e) => {
-                    Failure::read(e, ReadPhase::Recovery)
-                }
-                _ => Failure::plain(refused.code()),
-            })?;
-            check_startup_cancel(&cancel)?;
-            rows = rows
-                .checked_add(page.facts.as_slice().len())
-                .filter(|v| *v <= 65536)
-                .ok_or_else(|| Failure::read(ReadError::LimitExceeded, ReadPhase::Recovery))?;
-            for fact in page.facts.as_slice() {
-                if let RecoveredFact::Epoch {
-                    incarnation: found,
-                    epoch: found_epoch,
-                } = fact
-                {
-                    if *found != incarnation || *found_epoch != epoch {
-                        return Err(Failure::plain("recovered_epoch_mismatch"));
-                    }
-                    saw_epoch = true;
-                }
-            }
-            let last = page.next.is_none();
-            cursor = page.next;
-            runtime.queue(Input::Recovery {
-                facts: page.facts,
-                last,
-            })?;
-            runtime.drain_inputs()?;
-            if !runtime.inputs.is_empty() {
-                return Err(Failure::plain("recovery_incomplete"));
-            }
-            if last {
-                break;
-            }
-        }
-        if !saw_epoch || runtime.owner.is_recovering() {
-            return Err(Failure::plain("recovery_incomplete"));
-        }
-        if collect_closed {
-            let collection = ClosedReceiptCollection {
-                through: mqttiumd_contract::ids::RunEpoch::new(
-                    epoch
-                        .get()
-                        .checked_sub(1)
-                        .ok_or_else(|| Failure::plain("epoch_underflow"))?,
-                ),
-                limit: 128,
-            };
-            let deadline = Instant::now() + Duration::from_secs(10);
-            let mut completed = false;
-            for _ in 0..128 {
-                check_startup_cancel(&cancel)?;
-                if Instant::now() >= deadline {
-                    return Err(Failure::plain("startup_collection_deadline"));
-                }
-                let reply = match runtime.writer.exec_closed_collection(collection)? {
-                    Some(reply) => reply,
-                    None => {
-                        let StoreHandle::Threaded(w) = &runtime.writer else {
-                            return Err(Failure::plain("startup_collection_protocol"));
-                        };
-                        startup_reply(
-                            &w.control_receiver,
-                            &cancel,
-                            deadline,
-                            "startup_collection_deadline",
-                        )?
-                    }
-                };
-                let ControlResponse::Closed {
-                    collection: found,
-                    result,
-                } = reply
-                else {
-                    return Err(Failure::plain("startup_collection_protocol"));
-                };
-                if found != collection {
-                    return Err(Failure::plain("startup_collection_protocol"));
-                }
-                match result? {
-                    ClosedReceiptReply::Applied {
-                        through,
-                        removed,
-                        removed_origins,
-                        retained,
-                        more,
-                    } => {
-                        events.emit("closed_receipts_collected",json!({"details":{"through":through.get().to_string(),"removed":removed,"removed_origins":removed_origins,"retained":retained.to_string(),"more":more}})).map_err(event_failure)?;
-                        if !more {
-                            completed = true;
-                            break;
-                        }
-                    }
-                    ClosedReceiptReply::PendingOrUnknown => thread::sleep(Duration::from_millis(2)),
-                    ClosedReceiptReply::Refused(_) => {
-                        return Err(Failure::plain("startup_collection_refused"));
-                    }
-                }
-            }
-            if !completed {
-                return Err(Failure::plain("startup_collection_budget"));
-            }
-        }
-        // Empty-prefix registration is itself an exact owner transition. No
-        // listener or business command exists until its durable reply is applied.
-        check_startup_cancel(&cancel)?;
-        runtime.queue(Input::MaintainReceipts)?;
-        let deadline = Instant::now() + Duration::from_secs(30);
-        while !runtime.owner.collection_ready() {
-            if Instant::now() >= deadline {
-                return Err(Failure::plain("receipt_registration_deadline"));
-            }
-            runtime.writer_results()?;
-            check_startup_cancel(&cancel)?;
-            runtime.due_deadlines()?;
-            runtime.drain_inputs()?;
-            runtime.dispatch()?;
-            thread::sleep(Duration::from_millis(1));
-        }
-        if delivery_shards > 0 {
-            check_startup_cancel(&cancel)?;
-            let shard_limits = runtime
-                .owner
-                .shard_limits()
-                .ok_or_else(|| Failure::plain("shard_limits_missing"))?;
-            let mut outboxes = Vec::with_capacity(delivery_shards);
-            for i in 1..=delivery_shards {
-                let ob = runtime
-                    ._authority
-                    .create_outbox(
-                        LogicalOwnerId::new(i as u64),
-                        NonZeroUsize::new(limits.effect_box).expect("nonzero"),
-                        nz(64),
-                    )
-                    .map_err(|_| Failure::plain("shard_outbox_creation"))?;
-                outboxes.push(ob);
-            }
-            let store_handles = match &mut runtime.writer {
-                StoreHandle::Threaded(w) => w.take_shard_handles(),
-                StoreHandle::Direct(_) => {
-                    return Err(Failure::plain("shard_requires_threaded_writer"));
-                }
-            };
-            let pool = crate::delivery_shard::ShardPool::spawn(
-                outboxes,
-                store_handles,
-                shard_limits,
-                limits,
-                events.clone(),
-                runtime.clock.clone(),
-                runtime.wake.clone(),
-                cancel.clone(),
-            )?;
-            runtime.shards = Some(pool);
-        }
-        runtime.emit_session_clock_anchor()?;
-        let now = runtime.message_now()?;
-        events.emit("message_expiry_clock", json!({"details":{
-            "domain":hex_domain(now.domain),"tick":now.tick.to_string(),"origin_status":runtime.clock.origin_status(),
-            "policy":"quarantine-on-unknown-origin","time_unit":"nanoseconds","scan_ms":100,"batch":MESSAGE_EXPIRY_PAGE_SIZE,
-            "started_proof":"positive-socket-write-then-durable-marker","terminal_input_slots":limits.terminal_inputs,
-            "socket_write_receipt_slots":net::WRITTEN_SLOTS
-        }})).map_err(event_failure)?;
-        events.emit("receipt_policy",json!({"details":{"receipt_window":mqttiumd_contract::receipts::RECEIPT_WINDOW,"receipt_data_window":mqttiumd_contract::receipts::RECEIPT_DATA_WINDOW,"receipt_control_reserve":mqttiumd_contract::receipts::RECEIPT_CONTROL_RESERVE,"receipt_collection_rows":mqttiumd_contract::receipts::MAX_COLLECTION_ROWS,"receipt_collection_bytes":mqttiumd_store_api::ReadBudget::COLLECTION.max_bytes,"receipt_collection_field_bytes":mqttiumd_store_api::ReadBudget::COLLECTION.max_field_bytes,"receipt_collection_trigger":mqttiumd_contract::receipts::RECEIPT_COLLECTION_TRIGGER,"max_receipt_origins":mqttiumd_contract::receipts::MAX_RECEIPT_ORIGINS,"startup_origins_trigger":32,"startup_receipts_trigger":4096,"startup_closed_collection":collect_closed,"control_request_slots":crate::writer::CONTROL_QUEUE,"control_reply_slots":crate::writer::CONTROL_QUEUE,"control_input_slots":crate::writer::CONTROL_QUEUE}})).map_err(event_failure)?;
-        if let Some(sqlite) = &sqlite {
-            events.emit("sqlite_configuration",json!({"details":{"journal_mode":sqlite.journal_mode,"synchronous":sqlite.synchronous,"wal_autocheckpoint":sqlite.wal_autocheckpoint,"checkpoint_policy":sqlite.checkpoint_policy,"sqlite_version":sqlite.sqlite_version,"user_version":sqlite.user_version,"page_size":sqlite.page_size,"kill_points":sqlite.kill_points,"hooks_active":false,"install_order":"sqlite-autocheckpoint-before-optional-business-hook"}})).map_err(event_failure)?;
-        }
-        let sqlite_schema = sqlite.as_ref().map_or_else(
-            || {
-                if runtime.security.is_some() {
-                    mqttiumd_store_sqlite::SECURE_SCHEMA_VERSION
-                } else {
-                    mqttiumd_store_sqlite::SCHEMA_VERSION
-                }
-            },
-            |s| s.user_version,
-        );
-        check_startup_cancel(&cancel)?;
-        let listener =
-            TcpListener::bind(listen).map_err(|_| Failure::plain("listen_unavailable"))?;
-        let address = listener
-            .local_addr()
-            .map_err(|_| Failure::plain("listen_address"))?;
-        check_startup_cancel(&cancel)?;
-        let profile = if runtime.security.is_some() {
-            "mtls-will-pubsub-v1"
-        } else {
-            "tcp-will-pubsub-v1"
-        };
-        let pi_candidate_limit =
-            mqttiumd_core::owner::outgoing_pi_candidate_limit(max_exchanges, u16::MAX);
-        let pi_bitmap_bits = mqttiumd_core::owner::OUTGOING_PI_BITMAP_BITS;
-        let mut readiness = json!({"details":{"address":address.to_string(),"epoch":epoch.get().to_string(),"incarnation":incarnation.get().to_string(),"max_connections":limits.connections,"max_sessions":crate::writer::SESSIONS,"max_packet_bytes":net::MAX_PACKET_BYTES,"max_client_id_bytes":crate::writer::MAX_CLIENT,"max_topic_bytes":crate::writer::MAX_TOPIC,"max_payload_bytes":crate::writer::MAX_PAYLOAD,"receive_maximum":crate::receiving::MAXIMUM,"max_exchange_slots":max_exchanges,"input_slots":net::INPUT_SLOTS,"output_slots":net::OUTPUT_SLOTS,"writer_slots":crate::writer::QUEUE,"commands_in_flight":limits.in_flight,"max_timers":limits.timers,"receipt_slots":crate::writer::limits().receipt_slots.get(),"partial_packet_ms":5000,"connect_ms":3000,"write_ms":250,"remembered_connections":8,"max_subscriptions":mqttiumd_contract::pubsub::MAX_SUBSCRIPTIONS,"max_targets":mqttiumd_contract::retained::MAX_RETAIN_MASK_TARGETS,"outgoing_per_connection":mqttiumd_core::owner::MAX_OUTGOING_WINDOW,"outgoing_metadata":limits.outgoing_bindings,"outgoing_packet_identifier_max":u16::MAX,"outgoing_packet_identifier_probe_limit":pi_candidate_limit,"outgoing_payload_bytes":64*1024*1024,"work_page_items":8,"work_scan_ms":100,"wildcard_subscriptions":true,"no_local":true,"shared_subscriptions":false,"subscription_identifiers":false,"sqlite_schema":sqlite_schema,"retained_available":true,"retained_topics":mqttiumd_contract::retained::MAX_RETAINED_TOPICS,"retained_bytes":mqttiumd_contract::retained::MAX_RETAINED_BYTES,"max_replay_candidates":mqttiumd_contract::retained::MAX_REPLAYS,"profile":profile}});
-        if let Some(details) = readiness["details"].as_object_mut() {
-            details.insert("storage_mode".into(), json!(storage_mode.mode_name()));
-            details.insert(
-                "durability_guarantee".into(),
-                json!(storage_mode.durability_guarantee()),
-            );
-            details.insert(
-                "snapshot_interval_secs".into(),
-                json!(storage_mode.snapshot_interval_secs()),
-            );
-            details.insert("delivery_shards".into(), json!(delivery_shards));
-            details.insert(
-                "outgoing_packet_identifier_bitmap_bits".into(),
-                json!(pi_bitmap_bits),
-            );
-            details.insert(
-                "outgoing_packet_identifier_fallback_probes".into(),
-                json!(pi_candidate_limit.saturating_sub(usize::from(pi_bitmap_bits))),
-            );
-            details.insert(
-                "qos0_window".into(),
-                json!(mqttiumd_core::owner::QOS0_WINDOW),
-            );
-            details.insert(
-                "qos0_output_reserve".into(),
-                json!(net::QOS0_OUTPUT_RESERVE),
-            );
-            details.insert(
-                "session_expiry_timer_slots".into(),
-                json!(crate::writer::SESSIONS),
-            );
-            details.insert(
-                "session_expiry_per_turn".into(),
-                json!(SESSION_EXPIRY_PER_TURN),
-            );
-        }
-        if let Some(security) = &runtime.security {
-            events.emit("tls_profile", json!({"details":{"version":"TLS1.3","client_certificate":"required",
-                "policy_fingerprint":hex_domain(security.policy.storage().fingerprint),"max_handshakes":security::MAX_UNAUTHENTICATED,
-                "handshake_ms":security::HANDSHAKE_TIMEOUT.as_millis() as u64,"handshake_bytes":security::HANDSHAKE_BYTES,
-                "certificate_bytes":security::CERT_BYTES,"chain_bytes":security::CHAIN_BYTES,"chain_certificates":security::CHAIN_CERTS,
-                "tls_buffer_bytes":security::TLS_BUFFER_BYTES,"resumption":false,"early_data":false}})).map_err(event_failure)?;
-        }
-        events.emit("will_capabilities",json!({"details":{"will":true,"will_qos":1,"will_retain":true,"will_delay_interval":0,"will_message_expiry":false,"max_will_intents":mqttiumd_contract::will::MAX_WILL_INTENTS,"max_will_bytes":mqttiumd_contract::will::MAX_WILL_BYTES,"max_will_receipt_bytes":8388608}})).map_err(event_failure)?;
-        events.emit("ready", readiness).map_err(event_failure)?;
-        match storage_mode {
-            crate::writer::StorageMode::Durable => {
-                println!("mqttiumd ready {address} ({profile})");
-            }
-            crate::writer::StorageMode::Log => {
-                println!(
-                    "mqttiumd ready {address} ({profile}, storage=log, durability={})",
-                    storage_mode.durability_guarantee()
-                );
-            }
-            crate::writer::StorageMode::Volatile { .. } => {
-                println!(
-                    "mqttiumd ready {address} ({profile}, storage=volatile, durability={})",
-                    storage_mode.durability_guarantee()
-                );
-            }
-        }
-        let acceptor = Acceptor::spawn(listener, cancel.clone(), runtime.wake.clone())?;
-        let served = (|| {
-            let mut counters_due = Instant::now() + COUNTERS_INTERVAL;
-            while !cancel.load(Ordering::Relaxed) {
-                let before = runtime.progress;
-                for _ in 0..32 {
-                    if !runtime.admits_handshake() {
-                        break;
-                    }
-                    match acceptor.accepted.try_recv() {
-                        Ok(Ok(stream)) => {
-                            runtime.progress = runtime.progress.wrapping_add(1);
-                            let _ = runtime.accept(stream)?;
-                        }
-                        Ok(Err(())) => return Err(Failure::plain("accept_failed")),
-                        Err(TryRecvError::Empty) => break,
-                        Err(TryRecvError::Disconnected) => {
-                            return Err(Failure::plain("accept_failed"));
-                        }
-                    }
-                }
-                runtime.turn()?;
-                let idle = runtime.progress == before;
-                // The idle wait below is shorter than the interval, so the
-                // summary is at most one tick late.
-                if Instant::now() >= counters_due {
-                    runtime.events.flush_tallies().map_err(event_failure)?;
-                    counters_due = Instant::now() + COUNTERS_INTERVAL;
-                }
-                if idle {
-                    // Nothing was runnable. Every producer signals after it
-                    // publishes; the timeout only bounds the wall-clock
-                    // checks that have no producer.
-                    runtime.wake.wait(runtime.idle_wait());
-                }
-            }
-            // What was counted since the last summary is not lost at the end.
-            runtime.events.flush_tallies().map_err(event_failure)
-        })();
-        acceptor.stop(address);
-        served
-    })();
-    cancel.store(true, Ordering::Relaxed);
-    // A typed startup/read failure remains authoritative and performs no
-    // further durable writes. A normal stop finishes safe zero-expiry ends.
-    let session_result = if result.is_ok() {
-        runtime.shutdown_sessions(Duration::from_secs(2))
-    } else {
-        Ok(())
-    };
-    for (_, p) in std::mem::take(&mut runtime.peers) {
-        p.io.close();
-        runtime.retiring.push(p.io);
-    }
-    let deadline = Instant::now() + Duration::from_secs(2);
-    while runtime.retiring.iter().any(|p| !p.is_finished()) && Instant::now() < deadline {
-        thread::sleep(Duration::from_millis(2));
-    }
-    let mut socket_result = Ok(());
-    for mut p in runtime.retiring {
-        if !p.join_finished() {
-            socket_result = Err(Failure::plain("socket_shutdown_deadline"));
-        }
-    }
-    let shard_result = if let Some(pool) = runtime.shards.take() {
-        pool.shutdown(Duration::from_secs(3))
-    } else {
-        Ok(())
-    };
-    result
-        .and(session_result)
-        .and(shard_result)
-        .and(socket_result)
-}
+mod sink;
+mod start;
+pub use start::run;
 
 #[cfg(test)]
 #[path = "runtime_tests.rs"]

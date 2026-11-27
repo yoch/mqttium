@@ -1,13 +1,15 @@
 {
   "module": "MDisconnectQueue.tla",
   "status": "refinement",
-  "summary": "On the old connection during MQTT 5 takeover, both the coordinator and the delivery shard submit to one FIFO. Admitting DISCONNECT seals the queue under its mutex while the socket task drains earlier frames in order.",
+  "summary": "The order of the MQTT packets one connection writes once a DISCONNECT is queued for it (net.rs OutgoingState::enqueue, ConnCore::try_send_outgoing, ConnCore::pop_outgoing_batch, ConnCore::finish_task): admitting DISCONNECT seals the output queue under its mutex for every producer, the socket task writes the earlier frames in order and DISCONNECT last, and a task that ends seals and empties the queue. The second producer is the delivery shard with --delivery-shards K >= 1, and stands for a later submission of the coordinator with the single owner. TerminalWire does not say that a queued DISCONNECT is written (reach-no-disconnect). Not modelled: the write reservation of a shard (ShardIoRoute::reserve_write), receipts, what a producer does with a refusal, a second DISCONNECT, TCP and TLS framing, the close and the next generation (MTakeoverInFlight).",
   "issues": [648],
   "tests": ["mqttiumd/crates/mqttiumd/src/net.rs"],
-  "replays": [{"file": "mqttiumd/crates/mqttiumd/src/net.rs", "test": "a_queued_disconnect_is_terminal_for_every_outgoing_handle"}],
+  "replays": [{"file": "mqttiumd/crates/mqttiumd/src/net.rs", "test": "a_queued_disconnect_is_terminal_for_every_outgoing_handle"}, {"file": "mqttiumd/crates/mqttiumd/src/net.rs", "test": "a_finished_task_seals_its_queue_and_fails_each_admitted_frame_once"}],
+  "not_replayed": "a_queued_disconnect_is_terminal_for_every_outgoing_handle submits on both handles from one thread: no test races a shard thread against the coordinator. a_finished_task_seals_its_queue_and_fails_each_admitted_frame_once replays ReaderEnds with queued PINGRESP frames, not with a queued DISCONNECT (reach-no-disconnect).",
   "configs": [
     {"config": "MDisconnectQueue-safety.cfg", "expect": "pass", "invariants": ["TypeOK", "TerminalWire"]},
     {"config": "MDisconnectQueue-mut-no-seal.cfg", "expect": "violation", "invariant": "TerminalWire"},
-    {"config": "MDisconnectQueue-reach-drained-prefix.cfg", "expect": "violation", "invariant": "NoDrainedPrefixWitness"}
+    {"config": "MDisconnectQueue-reach-drained-prefix.cfg", "expect": "violation", "invariant": "NoDrainedPrefixWitness"},
+    {"config": "MDisconnectQueue-reach-no-disconnect.cfg", "expect": "violation", "invariant": "NoLostDisconnectWitness"}
   ]
 }

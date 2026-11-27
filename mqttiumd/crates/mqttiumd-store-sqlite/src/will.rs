@@ -53,7 +53,10 @@ fn metadata(
         return Err(Fault::Corrupt);
     }
     if state == WillState::Armed {
-        let mut statement=conn.prepare_cached("SELECT opened_by,client_id FROM sessions WHERE id=?1 AND state=1 AND detached_by IS NULL")?;
+        let mut statement = conn.prepare_cached(
+            "SELECT opened_by,client_id FROM sessions \
+             WHERE id=?1 AND state=1 AND detached_by IS NULL",
+        )?;
         let mut rows = statement.query([session.to_be_bytes().as_slice()])?;
         let Some(binding) = rows.next()? else {
             return Err(Fault::Corrupt);
@@ -187,7 +190,10 @@ pub(super) fn page(
 
 pub(super) fn has_client(conn: &Connection, client: &[u8]) -> Result<bool, Fault> {
     let meta = read_meta(conn)?;
-    let mut statement=conn.prepare_cached("SELECT w.state,w.client_id,length(w.topic),length(w.payload),w.id,w.session,s.opened_by,s.client_id,s.detached_by,w.retain FROM wills w LEFT JOIN sessions s ON s.id=w.session LIMIT 1025")?;
+    let mut statement=conn.prepare_cached("SELECT \
+                                           w.state,w.client_id,length(w.topic),length(w.payload),w.id,w.session,s.opened_by,s.client_id,s.detached_by,w.retain \
+                                           FROM wills w LEFT JOIN sessions s ON s.id=w.session \
+                                           LIMIT 1025")?;
     let mut rows = statement.query([])?;
     let mut count = 0usize;
     let mut found = false;
@@ -328,7 +334,8 @@ pub(super) fn open(
         (will, facts)
     {
         conn.prepare_cached(
-            "INSERT INTO wills(id,session,state,client_id,topic,payload,retain) VALUES(?1,?2,1,?3,?4,?5,?6)",
+            "INSERT INTO wills(id,session,state,client_id,topic,payload,retain) \
+             VALUES(?1,?2,1,?3,?4,?5,?6)",
         )?
         .execute(params![
             command.operation.to_be_bytes().as_slice(),
@@ -478,7 +485,11 @@ const MAX_OPEN_RECEIPT_BYTES: u64 = 8 * 1024 * 1024;
 fn receipt_capacity_scan(conn: &Connection) -> Result<(usize, u64), Fault> {
     let mut bytes = 0u64;
     let mut rows_count = 0usize;
-    let mut statement = conn.prepare_cached("SELECT length(recipe) FROM operations WHERE substr(recipe,7,1)=x'08' AND substr(recipe,40,1) IN (x'05',x'07') LIMIT 65537")?;
+    let mut statement = conn.prepare_cached(
+        "SELECT length(recipe) FROM operations \
+         WHERE substr(recipe,7,1)=x'08' AND substr(recipe,40,1) IN (x'05',x'07') \
+         LIMIT 65537",
+    )?;
     let mut rows = statement.query([])?;
     while let Some(row) = rows.next()? {
         rows_count = rows_count.checked_add(1).ok_or(ReadError::LimitExceeded)?;

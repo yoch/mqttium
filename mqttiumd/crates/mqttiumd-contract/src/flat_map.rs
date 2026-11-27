@@ -3,12 +3,14 @@
 //!
 //! Designed strictly for `#![no_std]` + `alloc` + `#![forbid(unsafe_code)]`
 //! point-lookup tables inside the pure core, runtime, and in-memory store:
-//! - Uses a deterministic SplitMix64 bit-mixer (zero randomness, zero `std`).
+//! - Uses a deterministic Fibonacci multiply-shift mixer (zero randomness, zero
+//!   `std`).
 //! - Uses backward-shift deletion instead of tombstones so high-churn steady-
 //!   state tables (in-flight slots, deliveries, frames, obligations) never
 //!   degrade or allocate after warm-up.
-//! - Never used where iteration order determines protocol output or range
-//!   queries are required (those remain in `BTreeMap` / `ScopedMap`).
+//! - Its iteration order is that of the table, not of the keys: a reader
+//!   whose output depends on order sorts what it reads, and a table that
+//!   needs range queries stays in `BTreeMap` / `ScopedMap`.
 
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
@@ -355,27 +357,32 @@ impl<K: FlatKey, V> FlatMap<K, V> {
         }
     }
 
+    /// Keeps the entries `f` accepts. `f` sees every entry once.
     pub fn retain(&mut self, mut f: impl FnMut(&K, &mut V) -> bool) {
-        let cap = self.slots.len();
-        if cap == 0 || self.len == 0 {
+        if self.len == 0 {
             return;
         }
-        let mut i = 0;
-        while i < cap {
+        // The scan starts after an empty slot, and the table always has
+        // one: no run of entries then goes round the place it started, so
+        // a removal only moves entries the scan has not reached yet.
+        let Some(start) = self.slots.iter().position(Option::is_none) else {
+            return;
+        };
+        let mask = self.slots.len() - 1;
+        let mut offset = 1;
+        while offset <= mask {
+            let i = (start + offset) & mask;
             let keep = match &mut self.slots[i] {
                 Some((k, v)) => f(k, v),
-                None => {
-                    i += 1;
-                    continue;
-                }
+                None => true,
             };
-            if !keep {
+            if keep {
+                offset += 1;
+            } else {
                 self.slots[i] = None;
                 self.len -= 1;
+                // The entry that takes this place, if any, is seen next.
                 self.backward_shift_from(i);
-                // Re-check `i` because a later entry may have shifted into `i`.
-            } else {
-                i += 1;
             }
         }
     }
@@ -510,6 +517,11 @@ impl<K: FlatKey> FlatSet<K> {
 /// Active-scope keys live in a compact `FlatMap<K::Local, V>` (8-byte keys,
 /// zero steady-state allocations, backward-shift deletion), while keys from
 /// recovered prior epochs fall back to a cold `BTreeMap<K, V>`.
+///
+/// The active scope is that of the first key received, until a key of a
+/// later run arrives: its scope then becomes the active one, and what the
+/// compact map held moves to the fallback. A table rebuilt after a restart
+/// receives what earlier runs left before the keys of its own run.
 #[derive(Clone, Debug)]
 pub struct ScopedFlatMap<K: ScopedKey, V>
 where
@@ -597,11 +609,22 @@ where
         let scope = key.scope();
         match self.hot_scope {
             Some(hot) if hot == scope => self.hot.insert(key.local(), value),
-            None => {
-                self.hot_scope = Some(scope);
+            Some(hot) if !K::later_run(scope, hot) => self.cold.insert(key, value),
+            _ => {
+                self.activate(scope);
                 self.hot.insert(key.local(), value)
             }
-            Some(_) => self.cold.insert(key, value),
+        }
+    }
+
+    /// Makes `scope` the active one: none was, or `scope` is of a later
+    /// run. No key of `scope` is in the fallback, since the first of them
+    /// comes here.
+    fn activate(&mut self, scope: K::Scope) {
+        if let Some(earlier) = self.hot_scope.replace(scope) {
+            for (local, value) in core::mem::take(&mut self.hot).into_entries() {
+                self.cold.insert(K::from_parts(earlier, local), value);
+            }
         }
     }
 
@@ -620,11 +643,11 @@ where
         let scope = key.scope();
         match self.hot_scope {
             Some(hot) if hot == scope => self.hot.get_or_insert_default(key.local()),
-            None => {
-                self.hot_scope = Some(scope);
+            Some(hot) if !K::later_run(scope, hot) => self.cold.entry(key).or_default(),
+            _ => {
+                self.activate(scope);
                 self.hot.get_or_insert_default(key.local())
             }
-            Some(_) => self.cold.entry(key).or_default(),
         }
     }
 
@@ -771,5 +794,123 @@ mod tests {
         assert_eq!(map.get(&k_hot), None);
         assert_eq!(map.get(&k_cold), Some(&200));
         assert_eq!(map.len(), 1);
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+    struct LastSlotKey(u64);
+
+    impl FlatKey for LastSlotKey {
+        fn flat_hash(self) -> u64 {
+            // Every key belongs in the last slot: the run of entries goes
+            // round the end of the table.
+            u64::MAX
+        }
+    }
+
+    /// `retain` shows every entry to its predicate once, also when removing
+    /// one moves entries from the start of the table to its end.
+    #[test]
+    fn retain_calls_its_predicate_once_for_each_entry() {
+        let mut flat = FlatMap::new();
+        for key in 0..8 {
+            flat.insert(LastSlotKey(key), ());
+        }
+        let mut calls = BTreeMap::new();
+        flat.retain(|key, ()| {
+            *calls.entry(*key).or_insert(0u32) += 1;
+            key.0 % 3 != 0
+        });
+        for key in 0..8 {
+            assert_eq!(calls.get(&LastSlotKey(key)), Some(&1));
+            assert_eq!(flat.contains_key(&LastSlotKey(key)), key % 3 != 0);
+        }
+        assert_eq!(flat.len(), 5);
+    }
+
+    fn operation(epoch: u64, owner: u64, sequence: u64) -> OperationId {
+        OperationId::new(
+            StoreIncarnation::new(1),
+            RunEpoch::new(epoch),
+            LogicalOwnerId::new(owner),
+            OperationSeq::new(sequence),
+        )
+    }
+
+    /// A table rebuilt after a restart first receives what earlier runs
+    /// left. The keys the run then creates are the busy ones: they get the
+    /// hot storage, whatever was inserted first.
+    #[test]
+    fn scoped_flat_map_gives_its_hot_storage_to_the_newest_run() {
+        let mut map: ScopedFlatMap<OperationId, u64> = ScopedFlatMap::new();
+        let left = [
+            (operation(1, 0, 7), 17),
+            (operation(1, 0, 8), 18),
+            (operation(2, 0, 7), 27),
+        ];
+        for (key, value) in left {
+            assert_eq!(map.insert(key, value), None);
+        }
+        let first_of_the_run = operation(3, 0, 1);
+        assert_eq!(map.insert(first_of_the_run, 31), None);
+        assert_eq!(map.hot_scope, Some(first_of_the_run.scope()));
+
+        // A key of an earlier run, or of another owner of this run, moves
+        // nothing.
+        let late = operation(2, 0, 9);
+        let other_owner = operation(3, 5, 1);
+        assert_eq!(map.insert(late, 29), None);
+        *map.get_or_insert_default(other_owner) += 35;
+        assert_eq!(map.hot_scope, Some(first_of_the_run.scope()));
+
+        assert_eq!(map.len(), 6);
+        for (key, value) in left {
+            assert_eq!(map.get(&key), Some(&value));
+        }
+        assert_eq!(map.get(&first_of_the_run), Some(&31));
+        assert_eq!(map.get(&late), Some(&29));
+        assert_eq!(map.get(&other_owner), Some(&35));
+
+        // The same through the other way in.
+        let mut counted: ScopedFlatMap<OperationId, u64> = ScopedFlatMap::new();
+        *counted.get_or_insert_default(operation(1, 0, 7)) += 1;
+        *counted.get_or_insert_default(first_of_the_run) += 1;
+        assert_eq!(counted.hot_scope, Some(first_of_the_run.scope()));
+        assert_eq!(counted.get(&operation(1, 0, 7)), Some(&1));
+    }
+
+    #[test]
+    fn scoped_flat_map_matches_an_ordered_map_across_runs_and_owners() {
+        let mut map: ScopedFlatMap<OperationId, u64> = ScopedFlatMap::new();
+        let mut oracle = BTreeMap::new();
+        let mut rng: u64 = 0x0dd0_5eed_cafe_f00d;
+        let mut next = || {
+            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
+            rng >> 33
+        };
+        for step in 0..20_000u64 {
+            // Later steps draw from later runs, as a broker restarted
+            // several times does, with stragglers of the earlier ones.
+            let newest = 1 + step / 5_000;
+            let epoch = 1 + next() % newest;
+            let key = operation(epoch, next() % 2, next() % 48);
+            match next() % 10 {
+                0..=4 => assert_eq!(map.insert(key, step), oracle.insert(key, step)),
+                5 => *map.get_or_insert_default(key) += 1,
+                6..=8 => assert_eq!(map.remove(&key), oracle.remove(&key)),
+                _ => assert_eq!(map.get(&key), oracle.get(&key)),
+            }
+            if let Some(value) = map.get(&key)
+                && oracle.get(&key) != Some(value)
+            {
+                // Only the counted insertion leaves the oracle behind.
+                *oracle.entry(key).or_default() += 1;
+                assert_eq!(oracle.get(&key), Some(value));
+            }
+            assert_eq!(map.len(), oracle.len());
+        }
+        let mut seen: Vec<(OperationId, u64)> = map.iter().map(|(k, v)| (k, *v)).collect();
+        seen.sort();
+        let expected: Vec<(OperationId, u64)> = oracle.into_iter().collect();
+        assert_eq!(seen, expected);
     }
 }

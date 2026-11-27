@@ -1,4 +1,4 @@
-//! Pure deterministic hooks for multi-owner Delivery Shards (Lot 10).
+//! Pure deterministic hooks for multi-owner Delivery Shards (record 0066).
 //!
 //! A Coordinator owner (`LogicalOwnerId(0)`) owns ingress, routing, sessions,
 //! wills, and publication admission. Outgoing delivery work (QoS 1/2 emit,
@@ -18,9 +18,9 @@ use core::num::NonZeroUsize;
 use super::connections::Connection;
 use super::deliveries::{Delivery, Phase};
 use super::pubsub::{Emission, Volatile};
-use super::{Draft, Effects, Limits, Owner, OwnerConfig, OwnerRefused, Stop, draw};
+use super::{Draft, Effects, Owner, OwnerConfig, OwnerRefused, Stop, draw};
 use crate::contract::capacity::{CapacityNeed, PayloadBytes, Resource, WakeCondition};
-use crate::contract::effects::{Effect, EffectSink, Input, Outbox};
+use crate::contract::effects::{Effect, EffectReservation, EffectSink, Input, Outbox};
 use crate::contract::ids::{
     ConnectionGeneration, ConnectionKey, ContinuationId, DeliveryId, OperationId, OutboundPacketId,
     Revision, SessionId,
@@ -32,8 +32,9 @@ use crate::contract::pubsub::{DeliveryClaim, Qos0DropReason, Qos0Origin};
 use crate::contract::session::SessionExpiry;
 use crate::contract::step::{CoreFault, Exhaustion, Progress, StepOutcome, TurnGrant};
 
-/// Recovered store limits needed to construct a standalone `DeliveryShard`
-/// owner without running a recovery inventory pass.
+/// The store limits recovery gives an owner (`RecoveredFact::Limits`). A
+/// `DeliveryShard` owner runs no recovery inventory and receives the
+/// coordinator's instead.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct ShardLimits {
     pub max_targets: u32,
@@ -151,11 +152,7 @@ impl Owner {
         let mut owner = Self::new(config, outbox)?;
         owner.recovery = None;
         owner.epoch_recovered = true;
-        owner.limits = Some(Limits {
-            max_targets: limits.max_targets,
-            max_topic_bytes: limits.max_topic_bytes,
-            max_payload_bytes: limits.max_payload_bytes,
-        });
+        owner.limits = Some(limits);
         owner.route_revision = Some(Revision::new(0));
         owner.inline_claim_enabled = true;
         Ok(owner)
@@ -165,11 +162,7 @@ impl Owner {
     /// supplied them.
     #[must_use]
     pub fn shard_limits(&self) -> Option<ShardLimits> {
-        self.limits.map(|l| ShardLimits {
-            max_targets: l.max_targets,
-            max_topic_bytes: l.max_topic_bytes,
-            max_payload_bytes: l.max_payload_bytes,
-        })
+        self.limits
     }
 
     /// Configures this Coordinator owner to delegate outgoing deliveries
@@ -177,12 +170,6 @@ impl Owner {
     /// `DeliveryShard` owners.
     pub fn enable_delegated_deliveries(&mut self) {
         self.delegated_deliveries = true;
-    }
-
-    /// Whether this owner delegates outgoing deliveries to external shards.
-    #[must_use]
-    pub fn delegated_deliveries_enabled(&self) -> bool {
-        self.delegated_deliveries
     }
 
     /// Applies `input` with an external `InlineClaimOracle`, without immediate
@@ -232,6 +219,28 @@ impl Owner {
     #[must_use]
     pub fn last_finished_delivery(&self) -> Option<(SessionId, Option<OutboundPacketId>)> {
         self.last_finished_delivery
+    }
+
+    /// Whether an inline admission carrying a claim for `session` has an
+    /// unknown outcome. A claim of the session committed meanwhile is held
+    /// by the caller and handed over once none is: the earlier claim may
+    /// still commit, and its publication comes first.
+    #[must_use]
+    pub fn delegated_inline_unknown(&self, session: SessionId) -> bool {
+        !self.delegated_inline_unknown.is_empty()
+            && self.delegated_inline_unknown.iter().any(|operation| {
+                self.delegated_inline_by_op
+                    .get(operation)
+                    .is_some_and(|batch| batch.claims.iter().any(|claim| claim.target == session))
+            })
+    }
+
+    /// Whether the step of the commit of `operation` names the stored
+    /// targets of its publication (`Self::last_inline_ready_target`): an
+    /// admission whose targets were not all claimed inline.
+    #[must_use]
+    pub fn names_stored_targets_at_commit(&self, operation: OperationId) -> bool {
+        self.non_inline_targets_by_op.contains_key(&operation)
     }
 
     /// Number of in-flight delegated inline-claimed admissions currently
@@ -414,6 +423,7 @@ impl Owner {
     /// Retires `session` and all of its deliveries on a `DeliveryShard` owner
     /// (in-flight store commands stay retired until their result arrives).
     pub fn shard_retire_session(&mut self, session: SessionId) -> Result<(), CoreFault> {
+        self.scan_fences.remove(&session);
         self.pubsub.retire_session(session);
         if let Some(&idx) = self.session_by_id.get(&session) {
             if let Some(conn) = self.sessions.as_slice()[idx].connection {
@@ -436,6 +446,20 @@ impl Owner {
             self.pubsub.connections.clear_known_through(generation);
         }
         self.mark_session_dirty(session, true);
+    }
+
+    /// Whether this delivery shard may read `session` from the store. While
+    /// fenced the session's known deliveries are still sent; no read
+    /// starts, and a read that was asked for waits. A shard fences a
+    /// session the coordinator may still owe a committed inline claim: read
+    /// now, its committed row would be delivered, and the claim, when it
+    /// arrives, delivered again.
+    pub fn shard_fence_scans(&mut self, session: SessionId, fenced: bool) {
+        if fenced {
+            self.scan_fences.insert(session);
+        } else if !self.scan_fences.is_empty() {
+            self.scan_fences.remove(&session);
+        }
     }
 
     /// Returns `Some((in_flight_count, used_pi_mask))` when `session` on
@@ -593,36 +617,9 @@ impl Owner {
             Err(Stop::Exhausted(ex)) => return ShardStepOutcome::Exhausted(ex),
             Err(Stop::Fatal(fault)) => return ShardStepOutcome::Fatal(fault),
         };
-        if self.receipts.enabled
-            && draft.effects.count > 0
-            && self.outbox.free_slots() < draft.effects.count.saturating_add(2)
-        {
-            return ShardStepOutcome::NeedCapacity(CapacityNeed {
-                resource: Resource::EffectSlots,
-                amount: u64::try_from(
-                    draft.effects.count.saturating_add(2) - self.outbox.free_slots(),
-                )
-                .unwrap_or(u64::MAX),
-                wake: WakeCondition::EffectAccepted,
-            });
-        }
-        let direct_sink =
-            sink.filter(|_| self.outbox.is_empty() && !self.outbox.has_live_reservations());
-        let reservation = match (
-            NonZeroUsize::new(draft.effects.count),
-            direct_sink.is_some(),
-        ) {
-            (None, _) => None,
-            (Some(slots), true) => {
-                if let Err(refusal) = self.outbox.check_reserve(slots) {
-                    return Self::shard_reservation_refused(refusal);
-                }
-                None
-            }
-            (Some(slots), false) => match self.outbox.reserve(slots) {
-                Ok(key) => Some(key),
-                Err(refusal) => return Self::shard_reservation_refused(refusal),
-            },
+        let (direct_sink, reservation) = match self.shard_reserve(&draft, sink) {
+            Ok(place) => place,
+            Err(outcome) => return outcome,
         };
         if let Some((effect, connection)) = emission {
             delivery.window = Some(connection.generation);
@@ -647,26 +644,10 @@ impl Owner {
         }
         self.counters = draft.counters;
         self.revision = next_revision;
-        let mut accepted = 0;
-        if let Some(sink) = direct_sink {
-            if draft.effects.count > 0 {
-                match self
-                    .outbox
-                    .dispatch_immediate(&mut draft.effects.items[..draft.effects.count], sink)
-                {
-                    Ok(n) => accepted = n,
-                    Err(_) => return ShardStepOutcome::Fatal(CoreFault::ReservationOverrun),
-                }
-            }
-        } else if let Some(key) = reservation {
-            for slot in &mut draft.effects.items[..draft.effects.count] {
-                if let Some(effect) = slot.take()
-                    && self.outbox.publish(key, effect).is_err()
-                {
-                    return ShardStepOutcome::Fatal(CoreFault::ReservationOverrun);
-                }
-            }
-        }
+        let accepted = match self.shard_dispatch(&mut draft, direct_sink, reservation) {
+            Ok(accepted) => accepted,
+            Err(outcome) => return outcome,
+        };
         if emission.is_some() && self.session_provably_idle_work(claim.target) {
             self.last_step_may_unblock_work = false;
         }
@@ -748,36 +729,9 @@ impl Owner {
             }
             schedule_continuation = Some(continuation);
         }
-        if self.receipts.enabled
-            && draft.effects.count > 0
-            && self.outbox.free_slots() < draft.effects.count.saturating_add(2)
-        {
-            return ShardStepOutcome::NeedCapacity(CapacityNeed {
-                resource: Resource::EffectSlots,
-                amount: u64::try_from(
-                    draft.effects.count.saturating_add(2) - self.outbox.free_slots(),
-                )
-                .unwrap_or(u64::MAX),
-                wake: WakeCondition::EffectAccepted,
-            });
-        }
-        let direct_sink =
-            sink.filter(|_| self.outbox.is_empty() && !self.outbox.has_live_reservations());
-        let reservation = match (
-            NonZeroUsize::new(draft.effects.count),
-            direct_sink.is_some(),
-        ) {
-            (None, _) => None,
-            (Some(slots), true) => {
-                if let Err(refusal) = self.outbox.check_reserve(slots) {
-                    return Self::shard_reservation_refused(refusal);
-                }
-                None
-            }
-            (Some(slots), false) => match self.outbox.reserve(slots) {
-                Ok(key) => Some(key),
-                Err(refusal) => return Self::shard_reservation_refused(refusal),
-            },
+        let (direct_sink, reservation) = match self.shard_reserve(&draft, sink) {
+            Ok(place) => place,
+            Err(outcome) => return outcome,
         };
         if fits {
             let item = Volatile {
@@ -803,6 +757,66 @@ impl Owner {
         }
         self.counters = draft.counters;
         self.revision = next_revision;
+        let accepted = match self.shard_dispatch(&mut draft, direct_sink, reservation) {
+            Ok(accepted) => accepted,
+            Err(outcome) => return outcome,
+        };
+        ShardStepOutcome::Applied {
+            accepted,
+            emitted: false,
+        }
+    }
+
+    /// Where a shard step puts its effects, decided before it changes any
+    /// state: the sink itself when the box is empty, otherwise places
+    /// reserved in the box; or why the step cannot be applied now.
+    fn shard_reserve<'s>(
+        &mut self,
+        draft: &Draft,
+        sink: Option<&'s mut dyn EffectSink>,
+    ) -> Result<(Option<&'s mut dyn EffectSink>, Option<EffectReservation>), ShardStepOutcome> {
+        if self.receipts.enabled
+            && draft.effects.count > 0
+            && self.outbox.free_slots() < draft.effects.count.saturating_add(2)
+        {
+            return Err(ShardStepOutcome::NeedCapacity(CapacityNeed {
+                resource: Resource::EffectSlots,
+                amount: u64::try_from(
+                    draft.effects.count.saturating_add(2) - self.outbox.free_slots(),
+                )
+                .unwrap_or(u64::MAX),
+                wake: WakeCondition::EffectAccepted,
+            }));
+        }
+        let direct_sink =
+            sink.filter(|_| self.outbox.is_empty() && !self.outbox.has_live_reservations());
+        let reservation = match (
+            NonZeroUsize::new(draft.effects.count),
+            direct_sink.is_some(),
+        ) {
+            (None, _) => None,
+            (Some(slots), true) => {
+                if let Err(refusal) = self.outbox.check_reserve(slots) {
+                    return Err(Self::shard_reservation_refused(refusal));
+                }
+                None
+            }
+            (Some(slots), false) => match self.outbox.reserve(slots) {
+                Ok(key) => Some(key),
+                Err(refusal) => return Err(Self::shard_reservation_refused(refusal)),
+            },
+        };
+        Ok((direct_sink, reservation))
+    }
+
+    /// Hands a shard step's effects to the sink, or publishes them into the
+    /// places `shard_reserve` reserved; how many the sink accepted.
+    fn shard_dispatch(
+        &mut self,
+        draft: &mut Draft,
+        direct_sink: Option<&mut dyn EffectSink>,
+        reservation: Option<EffectReservation>,
+    ) -> Result<usize, ShardStepOutcome> {
         let mut accepted = 0;
         if let Some(sink) = direct_sink {
             if draft.effects.count > 0 {
@@ -811,7 +825,7 @@ impl Owner {
                     .dispatch_immediate(&mut draft.effects.items[..draft.effects.count], sink)
                 {
                     Ok(n) => accepted = n,
-                    Err(_) => return ShardStepOutcome::Fatal(CoreFault::ReservationOverrun),
+                    Err(_) => return Err(ShardStepOutcome::Fatal(CoreFault::ReservationOverrun)),
                 }
             }
         } else if let Some(key) = reservation {
@@ -819,14 +833,11 @@ impl Owner {
                 if let Some(effect) = slot.take()
                     && self.outbox.publish(key, effect).is_err()
                 {
-                    return ShardStepOutcome::Fatal(CoreFault::ReservationOverrun);
+                    return Err(ShardStepOutcome::Fatal(CoreFault::ReservationOverrun));
                 }
             }
         }
-        ShardStepOutcome::Applied {
-            accepted,
-            emitted: false,
-        }
+        Ok(accepted)
     }
 
     fn shard_stop(stop: Stop) -> ShardStepOutcome {

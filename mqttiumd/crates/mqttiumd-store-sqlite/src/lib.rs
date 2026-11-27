@@ -188,7 +188,7 @@ pub use policy_transition::{
 };
 pub use schema::{FORMAT, SCHEMA_VERSION};
 pub use security::{SECURE_SCHEMA_VERSION, StoragePolicy};
-pub use snapshot::save_state_atomic;
+pub use snapshot::{save_state_atomic, sync_parent_dir};
 
 #[derive(Clone, Copy)]
 struct Admission<'a> {
@@ -762,7 +762,20 @@ fn insert_operation(
             (DECISION_REJECTED, None, None, Some(reason), resource, None)
         }
     };
-    conn.prepare_cached("INSERT INTO operations(id,decision,publication,exchange,reason,resource,recipe,facts) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)")?.execute(params![operation.to_be_bytes().as_slice(),code,publication,exchange,reason,resource,recipe,facts])?;
+    conn.prepare_cached(
+        "INSERT INTO operations(id,decision,publication,exchange,reason,resource,recipe,facts) \
+         VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+    )?
+    .execute(params![
+        operation.to_be_bytes().as_slice(),
+        code,
+        publication,
+        exchange,
+        reason,
+        resource,
+        recipe,
+        facts
+    ])?;
     Ok(())
 }
 
@@ -843,7 +856,10 @@ fn session_row(
     session: SessionId,
 ) -> Result<Option<(Revision, SessionState)>, Fault> {
     let row = conn
-        .prepare_cached("SELECT revision, state, expiry, opened_by, detached_by, deadline FROM sessions WHERE id = ?1")?
+        .prepare_cached(
+            "SELECT revision, state, expiry, opened_by, detached_by, deadline \
+             FROM sessions WHERE id = ?1",
+        )?
         .query_row([session.to_be_bytes().as_slice()], |row| {
             let binding = reader::optional_blob(row, 3, 32)?;
             Ok((
@@ -851,8 +867,8 @@ fn session_row(
                 row.get::<_, i64>(1)?,
                 row.get::<_, i64>(2)?,
                 binding,
-                reader::optional_blob(row,4,32)?,
-                reader::optional_blob(row,5,8)?,
+                reader::optional_blob(row, 4, 32)?,
+                reader::optional_blob(row, 5, 8)?,
             ))
         })
         .optional()?;
@@ -1183,7 +1199,8 @@ fn stage_publication_with_claim(
             let target_bytes = target.session.to_be_bytes();
             let taken = conn
                 .prepare_cached(
-                    "SELECT 1 FROM outbound WHERE (publication=?1 AND idx=?2) OR (target=?3 AND packet_id=?4) LIMIT 1",
+                    "SELECT 1 FROM outbound WHERE (publication=?1 AND idx=?2) OR (target=?3 AND \
+                     packet_id=?4) LIMIT 1",
                 )?
                 .query_row(
                     params![
@@ -1200,7 +1217,8 @@ fn stage_publication_with_claim(
                 return refused(failed);
             }
             conn.prepare_cached(
-                "INSERT INTO outbound(publication,idx,target,target_revision,packet_id,claim) VALUES(?1,?2,?3,?4,?5,?6)",
+                "INSERT INTO outbound(publication,idx,target,target_revision,packet_id,claim) \
+                 VALUES(?1,?2,?3,?4,?5,?6)",
             )?
             .execute(params![
                 delivery_pub.as_slice(),
@@ -1306,10 +1324,15 @@ fn stage_release(
     let packet = i64::from(release.packet_id.get());
     let marker = conn
         .prepare_cached(
-            "SELECT exchange, phase, publication FROM inbound WHERE session = ?1 AND packet_id = ?2",
+            "SELECT exchange, phase, publication \
+             FROM inbound WHERE session = ?1 AND packet_id = ?2",
         )?
         .query_row(params![session.as_slice(), packet], |row| {
-            Ok((blob(row, 0)?, row.get::<_, i64>(1)?, reader::copy_blob(row, 2, 32)?))
+            Ok((
+                blob(row, 0)?,
+                row.get::<_, i64>(1)?,
+                reader::copy_blob(row, 2, 32)?,
+            ))
         })
         .optional()?;
     let publication = match marker {
@@ -1432,7 +1455,8 @@ fn stage_admin(
                 .map_err(|_| Abort::Refused(AdminRefused::Exhausted))?;
             let revision = Revision::new(1);
             conn.prepare_cached(
-                "INSERT INTO sessions (id, revision, state, client_id, expiry, opened_by) VALUES (?1, ?2, ?3, ?4, 1, NULL)",
+                "INSERT INTO sessions (id, revision, state, client_id, expiry, opened_by) \
+                 VALUES (?1, ?2, ?3, ?4, 1, NULL)",
             )?
             .execute(params![
                 session.to_be_bytes().as_slice(),
@@ -1487,7 +1511,8 @@ fn stage_admin(
                 None => 0,
             };
             conn.prepare_cached(
-                "INSERT INTO routes (topic, position, session, qos, options) VALUES (?1, ?2, ?3, ?4, 0)",
+                "INSERT INTO routes (topic, position, session, qos, options) \
+                 VALUES (?1, ?2, ?3, ?4, 0)",
             )?
             .execute(params![
                 topic.as_slice(),
@@ -2289,6 +2314,11 @@ impl SqliteStore {
     /// Snapshots the entire state and closes SQLite while retaining the
     /// exclusive writer lease, allowing another engine (such as the volatile
     /// store) to assume ownership of `path` with no lock gap.
+    ///
+    /// That engine replaces the database file and deletes its write-ahead
+    /// log. The log is therefore emptied into the file first: the close
+    /// does it only when no other connection, a reader, is open. A reader
+    /// that holds the log back makes the hand-over fail as unavailable.
     pub fn into_state_and_lease(self) -> Result<(DurableState, Settings, WriterLease), OpenError> {
         let state = self.snapshot().map_err(OpenError::Read)?;
         let Self {
@@ -2297,6 +2327,11 @@ impl SqliteStore {
             _writer_lock,
             ..
         } = self;
+        let held_back: i64 =
+            conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| row.get(0))?;
+        if held_back != 0 {
+            return Err(OpenError::Read(ReadError::Unavailable));
+        }
         conn.close().map_err(|(_, error)| OpenError::Sql(error))?;
         Ok((state, settings, _writer_lock))
     }
@@ -2638,8 +2673,11 @@ impl SqliteStore {
             return Err(Fault::Read(ReadError::LimitExceeded));
         }
         let orphan: bool = conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM outbound c LEFT JOIN obligations o ON o.publication=c.publication AND o.idx=c.idx WHERE o.publication IS NULL LIMIT 1)",
-            [], |row| row.get(0),
+            "SELECT EXISTS(SELECT 1 FROM outbound c \
+             LEFT JOIN obligations o ON o.publication=c.publication AND o.idx=c.idx \
+             WHERE o.publication IS NULL LIMIT 1)",
+            [],
+            |row| row.get(0),
         )?;
         if orphan {
             return Err(Fault::Corrupt);
@@ -2830,7 +2868,12 @@ impl SqliteStore {
             },
         )?;
         section(
-            "SELECT o.publication,o.idx,o.target,o.target_revision,c.packet_id,c.claim,c.target,c.target_revision,o.qos,s.revision,s.state,p.expiry_domain,p.expiry_tick,p.expiry_interval,c.started,o.phase FROM obligations o LEFT JOIN publications p ON p.id=o.publication LEFT JOIN outbound c ON c.publication=o.publication AND c.idx=o.idx LEFT JOIN sessions s ON s.id=o.target WHERE ?1=?1 AND ?2=?2 ORDER BY o.publication,o.idx",
+            "SELECT \
+             o.publication,o.idx,o.target,o.target_revision,c.packet_id,c.claim,c.target,c.target_revision,o.qos,s.revision,s.state,p.expiry_domain,p.expiry_tick,p.expiry_interval,c.started,o.phase \
+             FROM obligations o LEFT JOIN publications p ON p.id=o.publication \
+             LEFT JOIN outbound c ON c.publication=o.publication AND c.idx=o.idx \
+             LEFT JOIN sessions s ON s.id=o.target \
+             WHERE ?1=?1 AND ?2=?2 ORDER BY o.publication,o.idx",
             &mut out,
             &mut position,
             &mut |row| {
@@ -2892,7 +2935,9 @@ impl SqliteStore {
             },
         )?;
         section(
-            "SELECT epoch,owner,consumed_through,publication_through,payload_through FROM receipt_origins WHERE ?1=?1 AND ?2=?2 ORDER BY epoch,owner",
+            "SELECT epoch,owner,consumed_through,publication_through,payload_through \
+             FROM receipt_origins WHERE ?1=?1 AND ?2=?2 \
+             ORDER BY epoch,owner",
             &mut out,
             &mut position,
             &mut |row| {
@@ -2975,7 +3020,8 @@ fn read_snapshot(conn: &Connection, budget: ReadBudget) -> Result<DurableState, 
         let mut sessions = BTreeMap::new();
         {
             let mut statement = conn.prepare(
-                "SELECT id, client_id, revision, state, expiry, opened_by, detached_by, deadline FROM sessions",
+                "SELECT id, client_id, revision, state, expiry, opened_by, detached_by, deadline \
+                 FROM sessions",
             )?;
             let mut rows = statement.query([])?;
             while let Some(row) = rows.next()? {
@@ -3034,7 +3080,8 @@ fn read_snapshot(conn: &Connection, budget: ReadBudget) -> Result<DurableState, 
         let mut operations = BTreeMap::new();
         {
             let mut statement = conn.prepare(
-                "SELECT id, recipe, decision, publication, exchange, reason, resource, facts FROM operations",
+                "SELECT id, recipe, decision, publication, exchange, reason, resource, facts \
+                 FROM operations",
             )?;
             let mut rows = statement.query([])?;
             while let Some(row) = rows.next()? {
@@ -3062,7 +3109,9 @@ fn read_snapshot(conn: &Connection, budget: ReadBudget) -> Result<DurableState, 
         let mut publications = BTreeMap::new();
         {
             let mut statement = conn.prepare(
-                "SELECT id, operation, source, topic, qos, retain, payload, retained_version, expiry_domain, expiry_tick, expiry_interval, properties FROM publications",
+                "SELECT id, operation, source, topic, qos, retain, payload, retained_version, \
+                 expiry_domain, expiry_tick, expiry_interval, properties \
+                 FROM publications",
             )?;
             let mut rows = statement.query([])?;
             let max_props = mqttiumd_contract::properties::MAX_PROPERTY_BYTES + 1024;
@@ -3128,7 +3177,8 @@ fn read_snapshot(conn: &Connection, budget: ReadBudget) -> Result<DurableState, 
         let mut obligations = BTreeMap::new();
         {
             let mut statement = conn.prepare(
-                "SELECT publication, idx, target, target_revision, qos, cause, phase, retain FROM obligations",
+                "SELECT publication, idx, target, target_revision, qos, cause, phase, retain \
+                 FROM obligations",
             )?;
             let mut rows = statement.query([])?;
             while let Some(row) = rows.next()? {
@@ -3173,7 +3223,8 @@ fn read_snapshot(conn: &Connection, budget: ReadBudget) -> Result<DurableState, 
         let mut outbound = BTreeMap::new();
         {
             let mut statement = conn.prepare(
-                "SELECT publication,idx,target,target_revision,packet_id,claim,started FROM outbound",
+                "SELECT publication,idx,target,target_revision,packet_id,claim,started \
+                 FROM outbound",
             )?;
             let mut rows = statement.query([])?;
             while let Some(row) = rows.next()? {

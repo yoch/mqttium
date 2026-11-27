@@ -1,7 +1,7 @@
 {
   "module": "MReadBehind.tla",
   "status": "refinement",
-  "summary": "Receiver window pressure with independent PUBREL, bounded lookahead and a terminal decision only when the peer alone can release a slot.",
+  "summary": "What the runtime thread reads behind an MQTT 3.1.1 PUBLISH that waits for a slot of the receive window (Peer::overtakes_deferred, Peer::keep_behind, Window::all_wait_for_remote_pubrel in runtime.rs and receiving.rs; record 0060): only the PUBREL of another exchange goes ahead, the packets kept behind are bounded in number and bytes, and the wait ends by an admission or by closing the connection once only the peer can free a slot. One connection of the default single-owner runtime; with --delivery-shards K >= 1 the same reader runs in the Coordinator and was not examined there.",
   "issues": [
     672
   ],
@@ -36,13 +36,14 @@
       "test": "a_3_1_1_client_with_more_qos2_exchanges_than_the_window_completes_them_all"
     }
   ],
+  "not_replayed": "The three lookahead tests of runtime_tests.rs stage the packets kept behind and the held packet through Peer::keep_behind and the peer's cold state instead of reading them from a socket. mut-wait (a reader that never closes) has no replay of its own: the two closing tests show the close it lacks.",
   "configs": [
     {
       "config": "MReadBehind-safety.cfg",
       "expect": "pass",
       "invariants": [
         "Bounded",
-        "IndependentOnly",
+        "NoPublishOvertaken",
         "CloseOnlyWhenPeerOwes"
       ]
     },
@@ -57,9 +58,14 @@
       "property": "Terminates"
     },
     {
+      "config": "MReadBehind-mut-bytes.cfg",
+      "expect": "violation",
+      "invariant": "Bounded"
+    },
+    {
       "config": "MReadBehind-mut-cross.cfg",
       "expect": "violation",
-      "invariant": "IndependentOnly"
+      "invariant": "NoPublishOvertaken"
     },
     {
       "config": "MReadBehind-mut-close.cfg",

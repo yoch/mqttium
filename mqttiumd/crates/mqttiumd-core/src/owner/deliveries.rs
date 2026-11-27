@@ -304,7 +304,10 @@ impl SessionDeliveries {
         }
     }
 
-    fn sub_pi(&mut self, packet_id: OutboundPacketId, deliveries: &BoundedSlab<Delivery>) {
+    /// Clears `packet_id` from the mask. While a collision is counted the
+    /// mask is rebuilt from the rows of `all` instead, and the answer is
+    /// true: it then reflects every identifier those rows hold now.
+    fn sub_pi(&mut self, packet_id: OutboundPacketId, deliveries: &BoundedSlab<Delivery>) -> bool {
         let id = packet_id.get();
         if id <= OUTGOING_PI_BITMAP_BITS {
             if self.pi_collisions == 0 {
@@ -330,8 +333,10 @@ impl SessionDeliveries {
                 }
                 self.used_pi_mask = mask;
                 self.pi_collisions = collisions;
+                return true;
             }
         }
+        false
     }
 }
 
@@ -457,11 +462,6 @@ impl Deliveries {
 
     pub(super) fn values(&self) -> impl Iterator<Item = &Delivery> {
         self.rows.values()
-    }
-
-    #[allow(dead_code)]
-    pub(super) fn to_vec(&self) -> alloc::vec::Vec<Delivery> {
-        self.rows.values().cloned().collect()
     }
 
     pub(super) fn slot_of(&self, id: DeliveryId) -> Option<usize> {
@@ -675,7 +675,7 @@ impl Deliveries {
         if let Some(sd) = self.by_session.get_mut(&target) {
             sd.all.remove(&index);
             if let Some(pi) = removed_pi {
-                sd.sub_pi(pi, &self.rows);
+                let _ = sd.sub_pi(pi, &self.rows);
             }
             if let Some(generation) = sent_gen {
                 sd.sub_sent(generation);
@@ -835,10 +835,11 @@ impl Deliveries {
             && let Some(sd) = self.by_session.get_mut(&target)
         {
             if old_pi != new_pi {
-                if let Some(pi) = old_pi {
-                    sd.sub_pi(pi, &self.rows);
-                }
-                if let Some(pi) = new_pi {
+                // A rebuild already reads the row with its new identifier.
+                let rebuilt = old_pi.is_some_and(|pi| sd.sub_pi(pi, &self.rows));
+                if let Some(pi) = new_pi
+                    && !rebuilt
+                {
                     sd.add_pi(pi);
                 }
             }
@@ -1169,30 +1170,37 @@ impl Deliveries {
         }
         (None, !blocked_all)
     }
-
-    pub(super) fn rebuild_indices(&mut self) {
-        self.by_id.clear();
-        self.by_op.clear();
-        self.by_deadline.clear();
-        self.by_frame.clear();
-        self.by_claim_op.clear();
-        self.by_claim_result_op.clear();
-        self.by_target_pi.clear();
-        self.by_session.clear();
-        self.by_window.clear();
-        self.control_candidates.clear();
-        self.expiring.clear();
-        self.pubrec_pending_count = 0;
-        self.loaded_payload_bytes = 0;
-        let live: alloc::vec::Vec<usize> = self.rows.iter().map(|(idx, _)| idx).collect();
-        for index in live {
-            self.index(index);
-        }
-    }
 }
 
 #[cfg(test)]
 mod tests {
+    /// Used by the tests only.
+    impl super::Deliveries {
+        pub(in crate::owner) fn to_vec(&self) -> alloc::vec::Vec<Delivery> {
+            self.rows.values().cloned().collect()
+        }
+
+        pub(in crate::owner) fn rebuild_indices(&mut self) {
+            self.by_id.clear();
+            self.by_op.clear();
+            self.by_deadline.clear();
+            self.by_frame.clear();
+            self.by_claim_op.clear();
+            self.by_claim_result_op.clear();
+            self.by_target_pi.clear();
+            self.by_session.clear();
+            self.by_window.clear();
+            self.control_candidates.clear();
+            self.expiring.clear();
+            self.pubrec_pending_count = 0;
+            self.loaded_payload_bytes = 0;
+            let live: alloc::vec::Vec<usize> = self.rows.iter().map(|(idx, _)| idx).collect();
+            for index in live {
+                self.index(index);
+            }
+        }
+    }
+
     use super::*;
     use alloc::string::String;
     use alloc::vec::Vec;
@@ -1322,5 +1330,70 @@ mod tests {
         pub(in crate::owner) fn last_mut(&mut self) -> Option<&mut Delivery> {
             self.rows.last_mut()
         }
+    }
+
+    const TARGET: SessionId = SessionId::new(7);
+
+    fn claimed(index: u32, packet_id: u16) -> Delivery {
+        let publication = PublicationId::new(
+            StoreIncarnation::new(1),
+            RunEpoch::new(1),
+            LogicalOwnerId::new(0),
+            PublicationSeq::new(1),
+        );
+        Delivery {
+            id: DeliveryId { publication, index },
+            target: TARGET,
+            revision: Revision::new(1),
+            qos: Qos::AtLeastOnce,
+            cause: DeliveryCause::LiveExact,
+            retain: false,
+            expiry: None,
+            properties: None,
+            claim: Some(DeliveryClaim {
+                operation: OperationId::new(
+                    StoreIncarnation::new(1),
+                    RunEpoch::new(1),
+                    LogicalOwnerId::new(0),
+                    OperationSeq::new(u64::from(index) + 1),
+                ),
+                packet_id: OutboundPacketId::new(packet_id).unwrap(),
+                started: false,
+                await_pubcomp: false,
+            }),
+            topic: None,
+            payload: None,
+            phase: Phase::AwaitPuback,
+            claim_result: None,
+            window: None,
+            frame: None,
+            local_write_completed: false,
+            may_have_started: false,
+            certain_never_started: false,
+            early_puback: false,
+            early_pubrec: None,
+            pubrec_rank: None,
+            retired: false,
+        }
+    }
+
+    /// A session whose rows hold one identifier twice counts one collision.
+    /// Moving another of its rows to a new identifier does not add one.
+    #[test]
+    fn a_new_identifier_counts_no_collision_it_does_not_make() {
+        let mut deliveries = Deliveries::new(NonZeroU32::new(8).unwrap()).unwrap();
+        for (index, packet_id) in [(0, 1), (1, 1), (2, 2)] {
+            deliveries.push(claimed(index, packet_id)).unwrap();
+        }
+        let moved = *deliveries.by_id.get(&claimed(2, 2).id).unwrap();
+        deliveries.mutate(moved, |row| {
+            if let Some(claim) = row.claim.as_mut() {
+                claim.packet_id = OutboundPacketId::new(3).unwrap();
+            }
+        });
+        assert_eq!(deliveries.by_session[&TARGET].pi_collisions, 1);
+        let kept = deliveries.index_snapshot();
+        deliveries.rebuild_indices();
+        assert_eq!(kept, deliveries.index_snapshot());
     }
 }

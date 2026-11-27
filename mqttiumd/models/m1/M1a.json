@@ -1,7 +1,7 @@
 {
   "module": "M1a.tla",
   "status": "specification",
-  "summary": "Admission of an inbound QoS 2 publication and authorisation of PUBREC: one admission per exchange, both obligations or none, an answer only on known commit, across a lost result, an unknown outcome and one crash.",
+  "summary": "Admission of an inbound QoS 2 publication and authorisation of PUBREC: one admission per exchange, both obligations or none, an answer only on known commit, across a lost result, an unknown outcome and one crash. A specification of one owner and one store, the shape of the default single-owner runtime; an admission that also carries delivery claims, and with --delivery-shards K >= 1 their reservation with the delivery shards, are outside it.",
   "issues": [647],
   "tests": [],
   "configs": [

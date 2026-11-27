@@ -1,5 +1,6 @@
-//! End-to-end TCP wire and crash-recovery integration tests for Lot 10
-//! multi-core resident `DeliveryShard` workers (`--delivery-shards K`).
+//! End-to-end TCP wire and crash-recovery integration tests of the
+//! multi-core resident `DeliveryShard` workers (`--delivery-shards K`,
+//! record 0066).
 #![cfg(target_os = "linux")]
 
 use std::collections::BTreeSet;
@@ -372,6 +373,14 @@ fn sharded_slow_subscriber_isolation_and_fifo_drain() {
     let broker = Broker::start("slow-iso", "log", 2);
     let addr = broker.address;
     let total = 80usize;
+    // The slow subscriber drains in at least 80 * 40 ms = 3.2 s, and a
+    // publisher it paced would take at least 78 * 40 ms = 3.1 s. The fast
+    // subscribers must be done within 2 s, room for a loaded runner: 1.41 s
+    // at worst on CI before the slow subscriber went from 8 to 40 ms (report
+    // 0048). A per-subscriber buffer of fewer than 28 publications that
+    // paced the publisher would still exceed it.
+    let slow_ack_delay = Duration::from_millis(40);
+    let fast_bound = Duration::from_secs(2);
 
     let ready = Arc::new(AtomicUsize::new(0));
     let fast_done = Arc::new(AtomicUsize::new(0));
@@ -393,7 +402,7 @@ fn sharded_slow_subscriber_isolation_and_fifo_drain() {
                 let (_qos, _, _, pid, payload) = decode_v5_publish(hdr, &body);
                 let got = usize::from_be_bytes(payload[..8].try_into().unwrap());
                 assert_eq!(got, expected, "slow-sub FIFO violation");
-                thread::sleep(Duration::from_millis(8));
+                thread::sleep(slow_ack_delay);
                 send_ack(&mut sub, 0x40, pid.unwrap());
                 expected += 1;
             }
@@ -442,14 +451,13 @@ fn sharded_slow_subscriber_isolation_and_fifo_drain() {
         assert!(reason < 0x80);
     }
 
-    // Fast subscribers should finish well before the slow subscriber finishes 80 * 8ms = 640ms.
     let wait = Instant::now();
     while fast_done.load(Ordering::Acquire) < 3 && wait.elapsed() < Duration::from_secs(5) {
         thread::sleep(Duration::from_millis(5));
     }
     assert_eq!(fast_done.load(Ordering::Acquire), 3);
     assert!(
-        start.elapsed() < Duration::from_millis(550),
+        start.elapsed() < fast_bound,
         "fast subscribers appeared blocked by slow subscriber: {:?}",
         start.elapsed()
     );
@@ -1094,5 +1102,44 @@ fn sharded_receipt_collection_under_sustained_fanout() {
 
     for h in sub_handles {
         h.join().unwrap();
+    }
+}
+
+/// The readiness line tells the operator that the sharded mode is
+/// experimental, and says nothing of shards without them.
+#[test]
+fn the_readiness_line_marks_the_sharded_mode_experimental() {
+    for shards in [0usize, 2] {
+        let directory = std::env::temp_dir().join(format!(
+            "mqttiumd-ready-line-{}-{shards}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).unwrap();
+        let mut child = Command::new(env!("CARGO_BIN_EXE_mqttiumd"))
+            .arg("--db")
+            .arg(directory.join("store.sqlite"))
+            .args(["--listen", "127.0.0.1:0"])
+            .arg("--events")
+            .arg(directory.join("events.jsonl"))
+            .args(["--delivery-shards", &shards.to_string()])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .unwrap();
+        let mut line = String::new();
+        BufReader::new(child.stdout.take().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = std::fs::remove_dir_all(&directory);
+        assert!(line.starts_with("mqttiumd ready "), "{line:?}");
+        assert_eq!(
+            line.contains("delivery_shards=2 experimental"),
+            shards == 2,
+            "{line:?}"
+        );
+        assert_eq!(line.contains("experimental"), shards != 0, "{line:?}");
     }
 }

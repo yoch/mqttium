@@ -178,7 +178,8 @@ pub(super) fn claim(
     let index = i64::from(command.delivery.index);
     let row = conn
         .prepare_cached(
-            "SELECT target,target_revision,qos FROM obligations WHERE publication=?1 AND idx=?2 AND phase=1",
+            "SELECT target,target_revision,qos \
+             FROM obligations WHERE publication=?1 AND idx=?2 AND phase=1",
         )?
         .query_row(params![publication.as_slice(), index], |row| {
             Ok((
@@ -197,7 +198,25 @@ pub(super) fn claim(
     {
         return refused(failed);
     }
-    if conn.prepare_cached("SELECT 1 FROM outbound WHERE (publication=?1 AND idx=?2) OR (target=?3 AND packet_id=?4) LIMIT 1")?.query_row(params![publication.as_slice(),index,target,i64::from(command.packet_id.get())],|_|Ok(())).optional()?.is_some() {return refused(failed)}
+    if conn
+        .prepare_cached(
+            "SELECT 1 FROM outbound WHERE (publication=?1 AND idx=?2) OR (target=?3 AND \
+             packet_id=?4) LIMIT 1",
+        )?
+        .query_row(
+            params![
+                publication.as_slice(),
+                index,
+                target,
+                i64::from(command.packet_id.get())
+            ],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some()
+    {
+        return refused(failed);
+    }
     charge(
         meta,
         Accounts {
@@ -206,7 +225,18 @@ pub(super) fn claim(
             ..Accounts::default()
         },
     )?;
-    conn.prepare_cached("INSERT INTO outbound(publication,idx,target,target_revision,packet_id,claim) VALUES(?1,?2,?3,?4,?5,?6)")?.execute(params![publication.as_slice(),index,command.target.to_be_bytes().as_slice(),command.target_revision.to_be_bytes().as_slice(),i64::from(command.packet_id.get()),command.operation.to_be_bytes().as_slice()])?;
+    conn.prepare_cached(
+        "INSERT INTO outbound(publication,idx,target,target_revision,packet_id,claim) \
+         VALUES(?1,?2,?3,?4,?5,?6)",
+    )?
+    .execute(params![
+        publication.as_slice(),
+        index,
+        command.target.to_be_bytes().as_slice(),
+        command.target_revision.to_be_bytes().as_slice(),
+        i64::from(command.packet_id.get()),
+        command.operation.to_be_bytes().as_slice()
+    ])?;
     Ok(CommitFacts::DeliveryClaimed {
         delivery: command.delivery,
         target: command.target,
@@ -224,7 +254,20 @@ pub(super) fn finish(
     active_session(conn, command.target, command.target_revision)?;
     let publication = command.delivery.publication.to_be_bytes();
     let index = i64::from(command.delivery.index);
-    let row=conn.prepare_cached("SELECT target,target_revision,packet_id,claim FROM outbound WHERE publication=?1 AND idx=?2")?.query_row(params![publication.as_slice(),index],|row|Ok((reader::copy_blob(row,0,8)?,reader::copy_blob(row,1,8)?,row.get::<_,i64>(2)?,reader::copy_blob(row,3,32)?))).optional()?;
+    let row = conn
+        .prepare_cached(
+            "SELECT target,target_revision,packet_id,claim \
+             FROM outbound WHERE publication=?1 AND idx=?2",
+        )?
+        .query_row(params![publication.as_slice(), index], |row| {
+            Ok((
+                reader::copy_blob(row, 0, 8)?,
+                reader::copy_blob(row, 1, 8)?,
+                row.get::<_, i64>(2)?,
+                reader::copy_blob(row, 3, 32)?,
+            ))
+        })
+        .optional()?;
     let Some((target, revision, packet, claim)) = row else {
         return refused(failed);
     };
@@ -291,8 +334,24 @@ pub(super) fn mark_started(
 ) -> Guard<CommitFacts> {
     let failed = RejectReason::PreconditionFailed;
     active_session(conn, command.target, command.target_revision)?;
-    let changed = conn.prepare_cached("UPDATE outbound SET started=1 WHERE publication=?1 AND idx=?2 AND target=?3 AND target_revision=?4 AND packet_id=?5 AND claim=?6 AND EXISTS(SELECT 1 FROM obligations o JOIN publications p ON p.id=o.publication WHERE o.publication=outbound.publication AND o.idx=outbound.idx AND o.target=outbound.target AND o.target_revision=outbound.target_revision AND o.qos IN (1,2) AND o.phase=1 AND p.expiry_domain IS NOT NULL)")?
-        .execute(params![command.delivery.publication.to_be_bytes().as_slice(), i64::from(command.delivery.index), command.target.to_be_bytes().as_slice(), command.target_revision.to_be_bytes().as_slice(), i64::from(command.packet_id.get()), command.claim.to_be_bytes().as_slice()])?;
+    let changed = conn
+        .prepare_cached(
+            "UPDATE outbound SET started=1 \
+             WHERE publication=?1 AND idx=?2 AND target=?3 AND target_revision=?4 AND \
+             packet_id=?5 AND claim=?6 AND EXISTS(SELECT 1 \
+             FROM obligations o JOIN publications p ON p.id=o.publication \
+             WHERE o.publication=outbound.publication AND o.idx=outbound.idx AND \
+             o.target=outbound.target AND o.target_revision=outbound.target_revision AND o.qos IN \
+             (1,2) AND o.phase=1 AND p.expiry_domain IS NOT NULL)",
+        )?
+        .execute(params![
+            command.delivery.publication.to_be_bytes().as_slice(),
+            i64::from(command.delivery.index),
+            command.target.to_be_bytes().as_slice(),
+            command.target_revision.to_be_bytes().as_slice(),
+            i64::from(command.packet_id.get()),
+            command.claim.to_be_bytes().as_slice()
+        ])?;
     if changed != 1 {
         return refused(failed);
     }
@@ -313,7 +372,11 @@ pub(super) fn expire(
     let failed = RejectReason::PreconditionFailed;
     message_expiry::guard_observation(conn, command.observed)?;
     let started: Option<i64> = conn
-        .prepare_cached("SELECT c.started FROM outbound c JOIN obligations o USING(publication,idx) WHERE c.publication=?1 AND c.idx=?2 AND o.phase=1")?
+        .prepare_cached(
+            "SELECT c.started FROM outbound c \
+             JOIN obligations o USING(publication,idx) \
+             WHERE c.publication=?1 AND c.idx=?2 AND o.phase=1",
+        )?
         .query_row(
             params![
                 command.finish.delivery.publication.to_be_bytes().as_slice(),
@@ -351,7 +414,8 @@ pub(super) fn consume(
     let index = i64::from(command.delivery.index);
     let row = conn
         .prepare_cached(
-            "SELECT target,target_revision,qos FROM obligations WHERE publication=?1 AND idx=?2 AND phase=1",
+            "SELECT target,target_revision,qos \
+             FROM obligations WHERE publication=?1 AND idx=?2 AND phase=1",
         )?
         .query_row(params![publication.as_slice(), index], |row| {
             Ok((
@@ -587,7 +651,17 @@ pub(super) fn work(
         }
         let invalid: bool = read
             .prepare_cached(
-                "SELECT EXISTS(SELECT 1 FROM obligations o LEFT JOIN publications p ON p.id=o.publication WHERE o.target=?1 AND (typeof(o.qos)!='integer' OR o.qos NOT IN (0,1,2) OR typeof(o.cause)!='integer' OR o.cause NOT IN (1,2) OR typeof(o.retain)!='integer' OR o.retain NOT IN (0,1) OR typeof(o.phase)!='integer' OR o.phase NOT IN (1,2) OR (o.phase=2 AND o.qos!=2) OR p.id IS NULL OR typeof(p.qos)!='integer' OR p.qos NOT IN (0,1,2) OR (o.retain=1 AND p.retain!=1) OR (o.cause=2 AND (o.retain!=1 OR p.retained_version IS NULL OR p.retained_version=p.id)) OR (o.cause=1 AND p.retained_version IS NOT NULL)) LIMIT 1)",
+                "SELECT EXISTS(SELECT 1 FROM obligations o \
+                 LEFT JOIN publications p ON p.id=o.publication \
+                 WHERE o.target=?1 AND (typeof(o.qos)!='integer' OR o.qos NOT IN (0,1,2) OR \
+                 typeof(o.cause)!='integer' OR o.cause NOT IN (1,2) OR \
+                 typeof(o.retain)!='integer' OR o.retain NOT IN (0,1) OR \
+                 typeof(o.phase)!='integer' OR o.phase NOT IN (1,2) OR (o.phase=2 AND o.qos!=2) \
+                 OR p.id IS NULL OR typeof(p.qos)!='integer' OR p.qos NOT IN (0,1,2) OR \
+                 (o.retain=1 AND p.retain!=1) OR (o.cause=2 AND (o.retain!=1 OR \
+                 p.retained_version IS NULL OR p.retained_version=p.id)) OR (o.cause=1 AND \
+                 p.retained_version IS NOT NULL)) \
+                 LIMIT 1)",
             )?
             .query_row([session.to_be_bytes().as_slice()], |row| row.get(0))?;
         if invalid {
@@ -611,7 +685,11 @@ pub(super) fn work(
         }
         let broken: bool = read
             .prepare_cached(
-                "SELECT EXISTS(SELECT 1 FROM outbound c LEFT JOIN obligations o ON o.publication=c.publication AND o.idx=c.idx WHERE c.target=?1 AND (o.publication IS NULL OR o.target!=c.target OR o.target_revision!=c.target_revision OR o.qos NOT IN (1,2)) LIMIT 1)",
+                "SELECT EXISTS(SELECT 1 FROM outbound c \
+                 LEFT JOIN obligations o ON o.publication=c.publication AND o.idx=c.idx \
+                 WHERE c.target=?1 AND (o.publication IS NULL OR o.target!=c.target OR \
+                 o.target_revision!=c.target_revision OR o.qos NOT IN (1,2)) \
+                 LIMIT 1)",
             )?
             .query_row([session.to_be_bytes().as_slice()], |row| row.get(0))?;
         if broken {
@@ -621,8 +699,23 @@ pub(super) fn work(
             caches.work_verified.insert(session);
         }
     }
-    const SQL_FIRST: &str = "SELECT o.publication,o.idx,o.target_revision,p.topic,y.bytes,c.packet_id,c.claim,c.target,c.target_revision,s.revision,s.state,o.qos,o.retain,p.expiry_domain,p.expiry_tick,p.expiry_interval,c.started,o.cause,o.phase,p.properties FROM obligations o LEFT JOIN publications p ON p.id=o.publication LEFT JOIN payloads y ON y.id=p.payload LEFT JOIN outbound c ON c.publication=o.publication AND c.idx=o.idx LEFT JOIN sessions s ON s.id=o.target WHERE o.target=?1 ORDER BY o.publication,o.idx LIMIT ?2";
-    const SQL_AFTER: &str = "SELECT o.publication,o.idx,o.target_revision,p.topic,y.bytes,c.packet_id,c.claim,c.target,c.target_revision,s.revision,s.state,o.qos,o.retain,p.expiry_domain,p.expiry_tick,p.expiry_interval,c.started,o.cause,o.phase,p.properties FROM obligations o LEFT JOIN publications p ON p.id=o.publication LEFT JOIN payloads y ON y.id=p.payload LEFT JOIN outbound c ON c.publication=o.publication AND c.idx=o.idx LEFT JOIN sessions s ON s.id=o.target WHERE o.target=?1 AND (o.publication,o.idx)>(?2,?3) ORDER BY o.publication,o.idx LIMIT ?4";
+    const SQL_FIRST: &str = "SELECT \
+                             o.publication,o.idx,o.target_revision,p.topic,y.bytes,c.packet_id,c.claim,c.target,c.target_revision,s.revision,s.state,o.qos,o.retain,p.expiry_domain,p.expiry_tick,p.expiry_interval,c.started,o.cause,o.phase,p.properties \
+                             FROM obligations o LEFT JOIN publications p ON p.id=o.publication \
+                             LEFT JOIN payloads y ON y.id=p.payload \
+                             LEFT JOIN outbound c ON c.publication=o.publication AND c.idx=o.idx \
+                             LEFT JOIN sessions s ON s.id=o.target \
+                             WHERE o.target=?1 ORDER BY o.publication,o.idx \
+                             LIMIT ?2";
+    const SQL_AFTER: &str = "SELECT \
+                             o.publication,o.idx,o.target_revision,p.topic,y.bytes,c.packet_id,c.claim,c.target,c.target_revision,s.revision,s.state,o.qos,o.retain,p.expiry_domain,p.expiry_tick,p.expiry_interval,c.started,o.cause,o.phase,p.properties \
+                             FROM obligations o LEFT JOIN publications p ON p.id=o.publication \
+                             LEFT JOIN payloads y ON y.id=p.payload \
+                             LEFT JOIN outbound c ON c.publication=o.publication AND c.idx=o.idx \
+                             LEFT JOIN sessions s ON s.id=o.target \
+                             WHERE o.target=?1 AND (o.publication,o.idx)>(?2,?3) \
+                             ORDER BY o.publication,o.idx \
+                             LIMIT ?4";
     let mut items = BoundedVec::with_capacity(limit).map_err(|_| ReadError::AllocationFailed)?;
     let mut meter = reader::Meter::new(budget);
     let mut more = false;

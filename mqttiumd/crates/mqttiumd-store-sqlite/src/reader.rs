@@ -204,7 +204,8 @@ pub(crate) fn snapshot(conn: &Connection, meta: &Meta, budget: ReadBudget) -> Re
     meter.charge(256)?;
     let tables: [(&str, &[(usize, usize)]); 13] = [
         (
-            "SELECT id, client_id, revision, state, expiry, opened_by, detached_by, deadline FROM sessions",
+            "SELECT id, client_id, revision, state, expiry, opened_by, detached_by, deadline \
+             FROM sessions",
             &[
                 (0, 8),
                 (1, MAX_CLIENT_ID_BYTES),
@@ -233,7 +234,8 @@ pub(crate) fn snapshot(conn: &Connection, meta: &Meta, budget: ReadBudget) -> Re
             &[(0, meta.limits.max_topic_bytes), (1, 8)],
         ),
         (
-            "SELECT id, recipe, decision, publication, exchange, reason, resource, facts FROM operations",
+            "SELECT id, recipe, decision, publication, exchange, reason, resource, facts \
+             FROM operations",
             &[
                 (0, 32),
                 (1, budget.max_field_bytes),
@@ -244,11 +246,14 @@ pub(crate) fn snapshot(conn: &Connection, meta: &Meta, budget: ReadBudget) -> Re
         ),
         ("SELECT id FROM fences", &[(0, 32)]),
         (
-            "SELECT epoch,owner,consumed_through,publication_through,payload_through FROM receipt_origins",
+            "SELECT epoch,owner,consumed_through,publication_through,payload_through \
+             FROM receipt_origins",
             &[(0, 8), (1, 8), (2, 8), (3, 8), (4, 8)],
         ),
         (
-            "SELECT id, operation, source, topic, qos, retain, payload, retained_version,expiry_domain,expiry_tick,expiry_interval,properties FROM publications",
+            "SELECT id, operation, source, topic, qos, retain, payload, \
+             retained_version,expiry_domain,expiry_tick,expiry_interval,properties \
+             FROM publications",
             &[
                 (0, 32),
                 (1, 32),
@@ -274,7 +279,8 @@ pub(crate) fn snapshot(conn: &Connection, meta: &Meta, budget: ReadBudget) -> Re
             &[(0, 32), (1, meta.limits.max_payload_bytes), (2, 8)],
         ),
         (
-            "SELECT publication, idx, target, target_revision, qos, cause, phase, retain FROM obligations",
+            "SELECT publication, idx, target, target_revision, qos, cause, phase, retain \
+             FROM obligations",
             &[(0, 32), (2, 8), (3, 8)],
         ),
         (

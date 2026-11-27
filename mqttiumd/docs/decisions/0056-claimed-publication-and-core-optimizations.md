@@ -1,6 +1,6 @@
 # 0056 — Atomic `ClaimedPublication` (recipe kind 24) and Lot 5/6 core-runtime optimizations
 
-Status: **Proposed** (23 November 2026). Applied to `mqttiumd-contract`, `mqttiumd-core`, `mqttiumd-store-sqlite`, `mqttiumd-store-volatile`, `mqttiumd-lab`, and `mqttiumd`.
+Status: **Accepted with amendments** (27 November 2026, by the repository owner after the validation of `9dfd568`, which corrected the text where the code contradicted it, report 0043; proposed on 23 November 2026). Applied to `mqttiumd-contract`, `mqttiumd-core`, `mqttiumd-store-sqlite`, `mqttiumd-store-volatile`, `mqttiumd-lab`, and `mqttiumd`.
 
 ## Context
 
@@ -28,7 +28,7 @@ In the received exact-delivery pipeline, a single online 1-to-1 QoS 1 publicatio
    - On `StoreResult(Committed(PublicationAdmitted))`, `Owner` transitions the inline delivery to `AwaitPuback` and emits `EmitPublish` in the **same** transition when `draft.effects.count + 1 < MAX_TRANSITION_EFFECTS` and `plan_delivery_emit` returns `Frame` (leaving `Held` and `TooLarge` to `WorkAvailable`). On `RejectedCertain`, the provisional delivery is removed and its `PacketId` and window slot are released. On subscriber session retirement while in flight, the delivery is kept retired (`retired_flights` counted) until the owning `Slot` resolves.
 3. **Pure-Rust `bbtree` / Redis / FlashMQ-inspired data-structure and runtime optimizations**:
    - `ScopedMap<K, V>` (`crates/mqttiumd-contract/src/scoped_map.rs`, `#![forbid(unsafe_code)]`, `no_std + alloc`) prefix-strips active-scope 32-byte IDs to `u64` local keys with canonical `Ord` merge iteration across hot and cold scopes.
-   - Prefix-stripped 88-byte `Answers` in `Owner`, `Arc<[u8]>` zero-copy `FrozenRecipe` bytes, single-pass `AdmitPublication::encode_body`, and zero-copy `VolatileStore` operation receipts.
+   - Prefix-stripped 88-byte `Answers` in `Owner`, a `FrozenRecipe` that shares the decoded recipe (`Arc<Recipe>`) and encodes its canonical bytes only when a durable medium or a snapshot needs them, single-pass `AdmitPublication::encode_body`, and zero-copy `VolatileStore` operation receipts.
    - Redis-inspired compact structures: inline 8-slot `Receiving` table, `SmallIndexSet` sorted `Vec<usize>`, `u64` bitmask `free_packet_id()`, `pubrec_pending_count` fast skip, 1-slot inline `LaneState` without `Condvar` outside tests, and demand-allocated TLS/read/write buffers (reducing idle footprint from 71.1 KiB → 8.6 KiB plain and 50.2 KiB → 19.7 KiB mTLS per connection).
    - O(1) `Outbox` `ControlCounts` (`u32`) and `Runtime::drain_inputs` dispatch-block gating eliminating the 54 % CPU quadratic spin, plus deterministic 64-bit FNV-1a hash-indexed exact `RouteIndex` (`crates/mqttiumd-core/src/owner/routing.rs`) with exact byte verification.
 

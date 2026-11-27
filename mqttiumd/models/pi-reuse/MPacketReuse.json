@@ -1,7 +1,7 @@
 {
   "module": "MPacketReuse.tla",
   "status": "specification",
-  "summary": "Finite outgoing QoS1 Packet Identifier reservation and reuse, immutable ACK observation targets, independent causal identities and exact terminal credit under claim/finish uncertainty.",
+  "summary": "Finite outgoing QoS1 Packet Identifier reservation and reuse, immutable ACK observation targets, independent causal identities and exact terminal credit under claim/finish uncertainty. One owner and one allocator (Deliveries::free_packet_id), as in the default single-owner runtime; with --delivery-shards K >= 1 the identifiers the Coordinator takes from InlineClaimLease for inline claims, and its handshake with the shard that owns the session, are outside the model.",
   "issues": [
     648
   ],

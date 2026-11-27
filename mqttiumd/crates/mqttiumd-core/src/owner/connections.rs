@@ -16,8 +16,9 @@ pub(super) struct Read {
 }
 
 /// Per-connection outgoing delivery settings and catch-up flags.
-/// Pagination cursors (`after`, `known_through`, `loading`) live in sparse
-/// side maps on [`Connections`] so idle connections remain compact.
+/// Pagination cursors (`after_by_gen`, `known_through_by_gen`,
+/// `loading_by_gen`) live in sparse side maps on [`Connections`] so idle
+/// connections remain compact.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(super) struct Connection {
     pub(super) generation: ConnectionGeneration,
@@ -336,18 +337,21 @@ impl Connections {
             self.after_by_gen.remove(&generation);
         }
     }
-
-    pub(super) fn rebuild_indices(&mut self) {
-        self.by_generation.clear();
-        self.by_loading_effect.clear();
-        for index in 0..self.rows.len() {
-            self.index(index);
-        }
-    }
 }
 
 #[cfg(test)]
 mod tests {
+    /// Used by the tests only.
+    impl super::Connections {
+        pub(in crate::owner) fn rebuild_indices(&mut self) {
+            self.by_generation.clear();
+            self.by_loading_effect.clear();
+            for index in 0..self.rows.len() {
+                self.index(index);
+            }
+        }
+    }
+
     use super::*;
     use alloc::string::String;
     use alloc::vec::Vec;

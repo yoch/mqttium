@@ -1,4 +1,5 @@
 //! Regressions of the real product reactor and its socket/writer adapters.
+use super::start::run_inner;
 use super::*;
 
 /// The ordinary lane of the bounded profile these tests run with: the
@@ -421,8 +422,20 @@ fn pump(runtime: &mut Runtime<'_>) {
     runtime.dispatch().unwrap();
 }
 
+#[track_caller]
 fn until(runtime: &mut Runtime<'_>, condition: impl Fn(&Runtime<'_>) -> bool) {
-    let deadline = Instant::now() + Duration::from_secs(1);
+    until_within(runtime, Duration::from_secs(1), condition);
+}
+
+/// `until` for a wait that spans several durable commits, one after the
+/// other: its budget is that of the commits on a slow disk.
+#[track_caller]
+fn until_within(
+    runtime: &mut Runtime<'_>,
+    budget: Duration,
+    condition: impl Fn(&Runtime<'_>) -> bool,
+) {
+    let deadline = Instant::now() + budget;
     while !condition(runtime) && Instant::now() < deadline {
         pump(runtime);
         thread::sleep(Duration::from_millis(1));
@@ -503,14 +516,18 @@ fn closing_qos0_without_collecting_written_retires_the_exact_attempt() {
             .unwrap();
         for _ in 0..8 {
             runtime.drain_inputs().unwrap();
-            if runtime.frames.values().any(|f| f.kind == "PUBLISH0") {
+            if runtime
+                .frames
+                .values()
+                .any(|f| f.kind == FrameKind::Publish0)
+            {
                 break;
             }
         }
         let effect = runtime
             .frames
             .iter()
-            .find(|(_, f)| f.kind == "PUBLISH0")
+            .find(|(_, f)| f.kind == FrameKind::Publish0)
             .expect("actual adapter accepted QoS0 attempt")
             .0;
         runtime
@@ -728,7 +745,10 @@ fn check_retained_qos0_replay(version: codec::Version) {
             codec::Version::V5 => (0x31, vec![0, 1, topic, 0, b'v']),
         };
         runtime.packet(slow, 0x82, subscribe.clone()).unwrap();
-        until(runtime, |r| {
+        // The subscription and its retained replay take seventeen store
+        // commits, one after the other: 1 s failed on a runner whose fsync
+        // took about 100 ms.
+        until_within(runtime, Duration::from_secs(10), |r| {
             r.retained_output.pending(slow) == QOS0_CONSUMED_WINDOW && r.owner.outbox_is_empty()
         });
         runtime.packet(fast, 0x82, subscribe).unwrap();
@@ -2590,11 +2610,21 @@ fn a_real_delayed_pubcomp_write_receipt_cannot_release_a_new_packet_identifier_u
         // The socket task writes PUBCOMP, but the reactor has not consumed its
         // receipt. A real peer is already allowed to reuse this identifier.
         assert_eq!(read_frame(&mut client).0, 0x70);
-        assert!(runtime.frames.values().any(|p| p.kind == "PUBCOMP"));
+        assert!(
+            runtime
+                .frames
+                .values()
+                .any(|p| p.kind == FrameKind::Pubcomp)
+        );
         runtime.packet(generation, 0x34, publish_body(1)).unwrap();
         let serial = runtime.peers[&generation].receiving_serial(1).unwrap();
         let deadline = Instant::now() + Duration::from_secs(1);
-        while runtime.frames.values().any(|p| p.kind == "PUBCOMP") && Instant::now() < deadline {
+        while runtime
+            .frames
+            .values()
+            .any(|p| p.kind == FrameKind::Pubcomp)
+            && Instant::now() < deadline
+        {
             runtime.connections().unwrap();
             thread::sleep(Duration::from_millis(1));
         }
@@ -2623,9 +2653,13 @@ fn a_real_puback_write_receipt_returns_its_receive_credit() {
         until(runtime, |r| r.session_requests.is_empty());
         assert_eq!(read_frame(&mut client).0, 0x20);
         runtime.packet(generation, 0x32, publish_body(1)).unwrap();
-        until(runtime, |r| r.frames.values().any(|p| p.kind == "PUBACK"));
+        until(runtime, |r| {
+            r.frames.values().any(|p| p.kind == FrameKind::Puback)
+        });
         assert_eq!(read_frame(&mut client).0, 0x40);
-        until(runtime, |r| !r.frames.values().any(|p| p.kind == "PUBACK"));
+        until(runtime, |r| {
+            !r.frames.values().any(|p| p.kind == FrameKind::Puback)
+        });
         assert_eq!(
             runtime.peers[&generation].receiving_serial(1),
             None,
@@ -2665,10 +2699,12 @@ fn a_new_identifier_after_received_puback_does_not_exceed_receive_maximum() {
         assert_eq!(read_frame(&mut client).0, 0x20);
         seven_qos2(runtime, generation, &mut client);
         runtime.packet(generation, 0x32, publish_body(8)).unwrap();
-        until(runtime, |r| r.frames.values().any(|p| p.kind == "PUBACK"));
+        until(runtime, |r| {
+            r.frames.values().any(|p| p.kind == FrameKind::Puback)
+        });
         assert_eq!(read_frame(&mut client), (0x40, unmatched(8)));
         assert!(
-            runtime.frames.values().any(|p| p.kind == "PUBACK"),
+            runtime.frames.values().any(|p| p.kind == FrameKind::Puback),
             "the core's write receipt is still unprocessed"
         );
         let mut bytes = vec![0x32, 7];
@@ -2698,7 +2734,7 @@ fn a_new_identifier_after_received_puback_does_not_exceed_receive_maximum() {
         until(runtime, |r| {
             r.frames
                 .values()
-                .any(|p| p.kind == "PUBACK" && p.packet_id == Some(9))
+                .any(|p| p.kind == FrameKind::Puback && p.packet_id == Some(9))
         });
         assert_eq!(read_frame(&mut client), (0x40, unmatched(9)));
     });
@@ -2719,7 +2755,9 @@ fn a_received_puback_can_precede_publication_of_its_network_progress() {
         until(runtime, |r| r.frames.is_empty());
         runtime.peers[&generation].io.pause_wire_progress(true);
         runtime.packet(generation, 0x32, publish_body(8)).unwrap();
-        until(runtime, |r| r.frames.values().any(|p| p.kind == "PUBACK"));
+        until(runtime, |r| {
+            r.frames.values().any(|p| p.kind == FrameKind::Puback)
+        });
         assert_eq!(read_frame(&mut client), (0x40, unmatched(8)));
         let deadline = Instant::now() + Duration::from_secs(1);
         while !runtime.peers[&generation].io.wire_progress_is_waiting() && Instant::now() < deadline
@@ -2757,7 +2795,7 @@ fn a_received_puback_can_precede_publication_of_its_network_progress() {
         until(runtime, |r| {
             r.frames
                 .values()
-                .any(|p| p.kind == "PUBACK" && p.packet_id == Some(9))
+                .any(|p| p.kind == FrameKind::Puback && p.packet_id == Some(9))
         });
         assert_eq!(read_frame(&mut client), (0x40, unmatched(9)));
         assert!(runtime.peers[&generation].deferred_publish().is_none());
@@ -2820,7 +2858,7 @@ fn a_new_identifier_progresses_while_the_old_core_ack_receipt_is_held() {
             && !runtime
                 .frames
                 .values()
-                .any(|p| p.kind == "PUBACK" && p.packet_id == Some(9))
+                .any(|p| p.kind == FrameKind::Puback && p.packet_id == Some(9))
         {
             pump(runtime);
             thread::sleep(Duration::from_millis(1));
@@ -2852,14 +2890,16 @@ fn a_peer_reuses_qos1_identifier_before_the_old_internal_written_receipt() {
         let session = runtime.sessions[b"qos1-reuse-race".as_slice()].id;
         let id = InboundPacketId::new(1).unwrap();
         runtime.packet(generation, 0x32, publish_body(1)).unwrap();
-        until(runtime, |r| r.frames.values().any(|p| p.kind == "PUBACK"));
+        until(runtime, |r| {
+            r.frames.values().any(|p| p.kind == FrameKind::Puback)
+        });
         // This read proves the client can legally reuse PI 1. Deliberately do
         // not poll the socket's internal Written channel before the new input.
         assert_eq!(read_frame(&mut client), (0x40, unmatched(1)));
         let old = runtime
             .frames
             .iter()
-            .find(|(_, f)| f.kind == "PUBACK")
+            .find(|(_, f)| f.kind == FrameKind::Puback)
             .unwrap()
             .0;
         runtime.packet(generation, 0x3a, publish_body(1)).unwrap();
@@ -2891,7 +2931,9 @@ fn a_peer_reuses_qos1_identifier_before_the_old_internal_written_receipt() {
             runtime.owner.exchange(session, id).unwrap().1,
             ExchangePhase::AdmissionPending
         );
-        until(runtime, |r| r.frames.values().any(|p| p.kind == "PUBACK"));
+        until(runtime, |r| {
+            r.frames.values().any(|p| p.kind == FrameKind::Puback)
+        });
         assert_eq!(read_frame(&mut client), (0x40, unmatched(1)));
     });
 }
@@ -2946,14 +2988,14 @@ fn finish_retained_durable_publish(close_before_enqueue: bool) {
         );
         runtime.packet(source, 0x32, publish_body(1)).unwrap();
         until(runtime, |r| {
-            !r.peers.contains_key(&target)||r.owner.outbox().unwrap().pending().any(|effect|matches!(effect.effect(),Effect::EmitPublish{connection,..}if connection.generation==target))
+            !r.peers.contains_key(&target)||r.owner.outbox().pending().any(|effect|matches!(effect.effect(),Effect::EmitPublish{connection,..}if connection.generation==target))
         });
         assert!(
             runtime.peers.contains_key(&target),
             "temporary_publish_queue_full_closed_generation"
         );
         assert!(runtime.peers[&target].closing().is_none());
-        let retained:Vec<_>=runtime.owner.outbox().unwrap().pending().filter(|effect|matches!(effect.effect(),Effect::EmitPublish{connection,..}if connection.generation==target)).map(|effect|(effect.id(),effect.effect().clone())).collect();
+        let retained:Vec<_>=runtime.owner.outbox().pending().filter(|effect|matches!(effect.effect(),Effect::EmitPublish{connection,..}if connection.generation==target)).map(|effect|(effect.id(),effect.effect().clone())).collect();
         assert_eq!(retained.len(), 1);
         let (effect, publication) = &retained[0];
         let Effect::EmitPublish {
@@ -2985,7 +3027,6 @@ fn finish_retained_durable_publish(close_before_enqueue: bool) {
         let pending = runtime
             .owner
             .outbox()
-            .unwrap()
             .pending()
             .find(|pending| pending.id() == *effect)
             .unwrap();
@@ -3009,7 +3050,6 @@ fn finish_retained_durable_publish(close_before_enqueue: bool) {
                 !r.peers.contains_key(&target)
                     && r.owner
                         .outbox()
-                        .unwrap()
                         .pending()
                         .all(|pending| pending.id() != *effect)
             });
@@ -3075,7 +3115,6 @@ fn finish_retained_durable_publish(close_before_enqueue: bool) {
             runtime
                 .owner
                 .outbox()
-                .unwrap()
                 .pending()
                 .all(|pending| pending.id() != *effect)
         );
@@ -3134,7 +3173,9 @@ fn a_slow_transport_holds_its_acks_while_an_independent_exchange_progresses() {
                 .packet(independent, 0x82, vec![0, 1, 0, 0, 1, b't', 1])
                 .unwrap();
             until(runtime, |r| {
-                r.frames.values().all(|frame| frame.kind != "SUBACK")
+                r.frames
+                    .values()
+                    .all(|frame| frame.kind != FrameKind::Suback)
                     && r.inflight.is_empty()
                     && r.inputs.is_empty()
             });
@@ -3164,7 +3205,6 @@ fn a_slow_transport_holds_its_acks_while_an_independent_exchange_progresses() {
             let pending = |r: &Runtime<'_>| {
                 r.owner
                     .outbox()
-                    .unwrap()
                     .pending()
                     .filter_map(|effect| match effect.effect() {
                         Effect::EmitFrame {
@@ -3205,7 +3245,7 @@ fn a_slow_transport_holds_its_acks_while_an_independent_exchange_progresses() {
             runtime.packet(independent, 0x32, publish_body(7)).unwrap();
             until(runtime, |r| {
                 r.frames.values().any(|frame| {
-                    frame.connection.generation == independent && frame.kind == "PUBLISH"
+                    frame.connection.generation == independent && frame.kind == FrameKind::Publish
                 })
             });
             let frames = [read_frame(&mut receiver_b), read_frame(&mut receiver_b)];
@@ -3514,7 +3554,6 @@ fn a_saturated_four_slot_output_retains_the_committed_puback_until_terminal_fail
         let retained: Vec<_> = runtime
             .owner
             .outbox()
-            .unwrap()
             .pending()
             .filter(|e| {
                 matches!(
@@ -3537,7 +3576,7 @@ fn a_saturated_four_slot_output_retains_the_committed_puback_until_terminal_fail
         assert!(!runtime.peers.contains_key(&generation));
         runtime.drain_inputs().unwrap();
         runtime.dispatch().unwrap();
-        assert!(runtime.owner.outbox().unwrap().is_empty());
+        assert!(runtime.owner.outbox().is_empty());
         let events: Vec<serde_json::Value> =
             std::fs::read_to_string(directory.join("events.jsonl"))
                 .unwrap()
@@ -3873,7 +3912,9 @@ fn terminal_admission_results_retire_deadlines_after_the_owner_applies_them() {
         until(runtime, |r| r.session_requests.is_empty());
         assert_eq!(read_frame(&mut client).0, 0x20);
         runtime.packet(generation, 0x32, publish_body(1)).unwrap();
-        until(runtime, |r| r.frames.values().any(|p| p.kind == "PUBACK"));
+        until(runtime, |r| {
+            r.frames.values().any(|p| p.kind == FrameKind::Puback)
+        });
         assert_eq!(read_frame(&mut client).0, 0x40);
         until(runtime, |r| r.inflight.is_empty() && r.inputs.is_empty());
         assert!(
@@ -4133,9 +4174,13 @@ fn four_blocked_ordinary_deadlines_cannot_occupy_the_collectors_reserved_reply_l
         );
         for _ in known_open_span..63 {
             runtime.packet(generation, 0x32, publish_body(1)).unwrap();
-            until(runtime, |r| r.frames.values().any(|f| f.kind == "PUBACK"));
+            until(runtime, |r| {
+                r.frames.values().any(|f| f.kind == FrameKind::Puback)
+            });
             assert_eq!(read_frame(&mut client).0, 0x40);
-            until(runtime, |r| !r.frames.values().any(|f| f.kind == "PUBACK"));
+            until(runtime, |r| {
+                !r.frames.values().any(|f| f.kind == FrameKind::Puback)
+            });
         }
         runtime.packet(generation, 0x32, publish_body(1)).unwrap();
         let deadline = Instant::now() + Duration::from_secs(2);
@@ -4190,7 +4235,7 @@ fn four_blocked_ordinary_deadlines_cannot_occupy_the_collectors_reserved_reply_l
                 StepOutcome::Applied { .. }
             ));
         }
-        assert_eq!(runtime.owner.outbox().unwrap().len(), 126);
+        assert_eq!(runtime.owner.outbox().len(), 126);
         assert!(
             matches!(runtime.owner.step(Input::Deadline {token:ordinary[0],now:LogicalTime::new(10000)},TurnGrant {work_limit:WorkUnits::new(65536)}),StepOutcome::NeedCapacity {need,..} if need.resource==Resource::EffectSlots),
             "ordinary retries demonstrably need the two business slots reserved for maintenance"
@@ -4498,12 +4543,7 @@ fn stale_puback_during_takeover_with_a_blocked_close_cannot_stop_other_connectio
             runtime.inputs,
             runtime.deferred_inputs,
             runtime.control_inputs,
-            runtime
-                .owner
-                .outbox()
-                .unwrap()
-                .pending()
-                .collect::<Vec<_>>(),
+            runtime.owner.outbox().pending().collect::<Vec<_>>(),
             runtime
                 .peers
                 .iter()
@@ -4578,13 +4618,12 @@ fn stale_puback_during_takeover_with_a_blocked_close_cannot_stop_other_connectio
         let blocked_persist = runtime
             .owner
             .outbox()
-            .unwrap()
             .pending()
             .next()
             .expect("the seventeenth admission waits for a real store slot")
             .id();
         assert!(matches!(
-            runtime.owner.outbox().unwrap().pending().next().unwrap().effect(),
+            runtime.owner.outbox().pending().next().unwrap().effect(),
             Effect::Persist { command } if matches!(command.recipe.get(), Recipe::AdmitPublication(admission) if admission.source.session == runtime.sessions[b"takeover-pressure-c".as_slice()].id)
         ));
         // Observe a real old-generation PUBACK before the takeover cut, then
@@ -4669,14 +4708,7 @@ fn stale_puback_during_takeover_with_a_blocked_close_cannot_stop_other_connectio
                 "session lifecycle did not consume an ordinary writer slot"
             );
             assert_eq!(
-                runtime
-                    .owner
-                    .outbox()
-                    .unwrap()
-                    .pending()
-                    .next()
-                    .unwrap()
-                    .id(),
+                runtime.owner.outbox().pending().next().unwrap().id(),
                 blocked_persist,
                 "the same ordinary effect remains retained with its original identity"
             );
@@ -5583,7 +5615,9 @@ fn closing_an_ephemeral_transport_keeps_accepted_frame_facts_under_input_pressur
         until(runtime, |r| r.frames.is_empty() && r.inputs.is_empty());
         runtime.packet(generation, 0x32, publish_body(1)).unwrap();
         until(runtime, |r| {
-            r.frames.values().any(|frame| frame.kind == "PUBACK")
+            r.frames
+                .values()
+                .any(|frame| frame.kind == FrameKind::Puback)
         });
         assert_eq!(read_frame(&mut client).0, 0x40);
         for order in 0..ORDINARY_INPUTS {
@@ -5811,7 +5845,7 @@ fn accepted_frames_reserve_their_terminal_fact_before_reactor_backpressure() {
                 runtime.frames.len(),
                 TERMINAL_INPUTS
             );
-            if runtime.owner.outbox().unwrap().pending().any(|effect| {
+            if runtime.owner.outbox().pending().any(|effect| {
                 matches!(
                     effect.effect(),
                     Effect::EmitFrame {
@@ -5852,7 +5886,7 @@ fn accepted_frames_reserve_their_terminal_fact_before_reactor_backpressure() {
             r.inputs.is_empty()
                 && r.terminal_inputs.is_empty()
                 && r.frames.is_empty()
-                && r.owner.outbox().unwrap().is_empty()
+                && r.owner.outbox().is_empty()
         });
         assert_eq!(
             runtime.peers.len(),
@@ -6252,7 +6286,6 @@ fn certain_detach_failure_is_observable_instead_of_losing_offline_expiration() {
         let (effect, operation) = runtime
             .owner
             .outbox()
-            .unwrap()
             .pending()
             .find_map(|pending| match pending.effect() {
                 Effect::Persist { command } => Some((pending.id(), command.recipe.operation())),
@@ -6529,7 +6562,7 @@ fn disconnect_four_before_real_open_reply_survives_source_cleanup_and_admits_onc
             !r.owner.will_status().reading
                 && !r.owner.will_status().admission_pending
                 && r.will_reads.is_none()
-                && r.owner.outbox().unwrap().is_empty()
+                && r.owner.outbox().is_empty()
         });
         let after =
             mqttiumd_store_sqlite::SqliteStore::inspect(&directory.join("store.sqlite")).unwrap();
@@ -7292,7 +7325,6 @@ fn blocked_output_and_full_input_preserve_independent_work_and_reconnect_credit(
             let held_acks = |r: &Runtime<'_>| {
                 r.owner
                     .outbox()
-                    .unwrap()
                     .pending()
                     .filter_map(|effect| match effect.effect() {
                         Effect::EmitFrame {
@@ -7489,18 +7521,33 @@ fn blocked_output_and_full_input_preserve_independent_work_and_reconnect_credit(
             eprintln!(
                 "progression witness {}",
                 json!({
-                    "reversed": reverse, "slow_generation": slow.get(), "publisher_generation": publisher.get(),
-                    "resumed_generation": resumed.get(), "ordinary_input_count": ORDINARY_INPUTS,
+                    "reversed": reverse,
+                    "slow_generation": slow.get(),
+                    "publisher_generation": publisher.get(),
+                    "resumed_generation": resumed.get(),
+                    "ordinary_input_count": ORDINARY_INPUTS,
                     "actual_writer_reply": effect_text(committed_effect),
                     "held_frames": pending.iter().map(|(effect, mid)| (effect_text(*effect), *mid)).collect::<Vec<_>>(),
-                    "repeated_dispatch_passes": 3, "independent_subscriber_micros": independent_micros,
-                    "independent_publisher_puback": 7, "independent_subscriber_packet_id": b_id,
-                    "session_present": true, "replay_dup": true, "packet_id": 1,
-                    "original_frame": effect_text(old_target.frame), "resumed_frame": effect_text(new_target.frame),
+                    "repeated_dispatch_passes": 3,
+                    "independent_subscriber_micros": independent_micros,
+                    "independent_publisher_puback": 7,
+                    "independent_subscriber_packet_id": b_id,
+                    "session_present": true,
+                    "replay_dup": true,
+                    "packet_id": 1,
+                    "original_frame": effect_text(old_target.frame),
+                    "resumed_frame": effect_text(new_target.frame),
                     "late_written_bytes": old_completion,
-                    "outgoing_claims_before_and_after_old_callback": [waiting.outbound.len(), after_late.outbound.len()],
-                    "obligations_before_and_after_old_callback": [waiting.obligations.len(), after_late.obligations.len()],
-                    "final_claims": final_state.outbound.len(), "final_obligations": final_state.obligations.len(),
+                    "outgoing_claims_before_and_after_old_callback": [
+                        waiting.outbound.len(),
+                        after_late.outbound.len(),
+                    ],
+                    "obligations_before_and_after_old_callback": [
+                        waiting.obligations.len(),
+                        after_late.obligations.len(),
+                    ],
+                    "final_claims": final_state.outbound.len(),
+                    "final_obligations": final_state.obligations.len(),
                 })
             );
         });
@@ -7953,5 +8000,9 @@ fn an_unsuback_owed_while_the_output_is_full_is_delivered_when_room_returns() {
     });
 }
 
+#[path = "runtime_tests/sharded_faults.rs"]
+mod sharded_faults;
+#[path = "runtime_tests/sharded_lease.rs"]
+mod sharded_lease;
 #[path = "runtime_tests/sharded_retained.rs"]
 mod sharded_retained;

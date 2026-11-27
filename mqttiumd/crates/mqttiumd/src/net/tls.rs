@@ -252,10 +252,14 @@ impl Task {
         sent: usize,
     ) -> Result<(), &'static str> {
         let (effect, connection) = frame.correlation.ok_or("tls_hook_missing_frame")?;
-        self.trace.0.barrier_fields(point, serde_json::json!({"point":point,
-            "connection":connection.generation.get().to_string(), "details":{
-                "effect":format!("{}/{}/{}",effect.epoch.get(),effect.owner.get(),effect.sequence.get()),
-                "ciphertext_bytes_sent":sent}}), &self.trace.1, &self.core.cancelled)
+        self.trace.0.barrier_fields(point, serde_json::json!({
+            "point": point,
+            "connection": connection.generation.get().to_string(),
+            "details": {
+                "effect": format!("{}/{}/{}",effect.epoch.get(),effect.owner.get(),effect.sequence.get()),
+                "ciphertext_bytes_sent": sent,
+            },
+        }), &self.trace.1, &self.core.cancelled)
             .map_err(|_| "tls_hook_failed")
     }
 
@@ -624,14 +628,14 @@ impl Task {
                 return Ok(progressed);
             }
         }
-        let avail = self.core.incoming_free_slots();
-        let limit = avail.clamp(1, BURST);
-        let credit = self.core.reserve_shard_read(limit);
-        let limit = credit.as_ref().map_or(limit, |batch| batch.remaining);
-        if limit == 0 {
-            return Ok(progressed);
-        }
         scratch.incoming_batch.clear();
+        let Some((credit, parse, without_credit)) = self
+            .core
+            .plan_read(&mut self.stalled, &mut scratch.incoming_batch)
+        else {
+            return Ok(progressed);
+        };
+        let limit = scratch.incoming_batch.len() + parse;
         let mut heard_packet = false;
         let mut cached_fixed: Option<FrameObservation> = None;
         let mut parse_err: Option<&'static str> = None;
@@ -684,6 +688,11 @@ impl Task {
         if heard_packet {
             record_heard(&self.core);
         }
+        super::ConnCore::park_unpaid_ack(
+            &mut self.stalled,
+            &mut scratch.incoming_batch,
+            without_credit,
+        );
         if !scratch.incoming_batch.is_empty() {
             self.core.push_incoming_batch(
                 &mut scratch.incoming_batch,

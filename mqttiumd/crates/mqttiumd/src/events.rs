@@ -341,7 +341,13 @@ impl Events {
             let marker = event_bytes(
                 seq,
                 "log_rotated",
-                &json!({"details":{"retained_from":log.first_seq.to_string(),"previous_last_seq":log.seq.to_string(),"discarded_through":(log.first_seq-1).to_string()}}),
+                &json!({
+                    "details": {
+                        "retained_from": log.first_seq.to_string(),
+                        "previous_last_seq": log.seq.to_string(),
+                        "discarded_through": (log.first_seq-1).to_string(),
+                    },
+                }),
             )?;
             std::fs::rename(&log.path, &log.previous)?;
             let file = OpenOptions::new()
@@ -377,7 +383,13 @@ impl Events {
     }
 }
 fn event_bytes(seq: u64, kind: &str, fields: &Value) -> io::Result<Vec<u8>> {
-    let mut event = json!({"format":"mqttiumd.product-event","schema_version":1,"seq":seq.to_string(),"kind":kind,"pid":std::process::id()});
+    let mut event = json!({
+        "format": "mqttiumd.product-event",
+        "schema_version": 1,
+        "seq": seq.to_string(),
+        "kind": kind,
+        "pid": std::process::id(),
+    });
     for (k, v) in fields
         .as_object()
         .ok_or_else(|| io::Error::other("event fields"))?
@@ -392,7 +404,12 @@ fn event_bytes(seq: u64, kind: &str, fields: &Value) -> io::Result<Vec<u8>> {
     Ok(bytes)
 }
 pub fn operation(id: OperationId) -> Value {
-    json!({"incarnation":id.incarnation().get().to_string(),"epoch":id.epoch().get().to_string(),"owner":id.owner().get().to_string(),"sequence":id.sequence().get().to_string()})
+    json!({
+        "incarnation": id.incarnation().get().to_string(),
+        "epoch": id.epoch().get().to_string(),
+        "owner": id.owner().get().to_string(),
+        "sequence": id.sequence().get().to_string(),
+    })
 }
 
 #[cfg(test)]
@@ -448,7 +465,21 @@ mod tests {
         let events = Events::open(&path).unwrap();
         let text = "x".repeat(240);
         for index in 0..34_000 {
-            events.emit("frame_queued",json!({"details":{"packet_kind":"PUBLISH","effect":index.to_string(),"a":text,"b":text,"c":text,"d":text}})).expect("bounded observations rotate instead of exhausting the product log budget");
+            events
+                .emit(
+                    "frame_queued",
+                    json!({
+                        "details": {
+                            "packet_kind": "PUBLISH",
+                            "effect": index.to_string(),
+                            "a": text,
+                            "b": text,
+                            "c": text,
+                            "d": text,
+                        },
+                    }),
+                )
+                .expect("bounded observations rotate instead of exhausting the product log budget");
         }
         let previous = directory.0.join("events.jsonl.previous");
         assert!(

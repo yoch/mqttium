@@ -172,6 +172,10 @@ jobs:
           python-version: "3.13"
       # The runner image provides a JDK; run_tlc.py pins and hash-checks TLC.
       - run: java -version
+      # -B: the checker is imported by its tests, and a __pycache__
+      # directory under models/ would be taken for a model directory.
+      - name: The checker of the model files refuses what it claims to check
+        run: python -B models/test_check_models.py
       - name: Model files are consistent
         run: python models/check_models.py
       - name: Model-check every directory of models
@@ -250,6 +254,10 @@ jobs:
           cargo test -p mqttiumd --features test-hooks --locked
       - name: The distribution profile builds
         run: cargo build -p mqttiumd --profile dist --locked
+      # The gate itself needs a quiet machine and is run by hand; its
+      # arithmetic, its rule and the packets it writes are checked here.
+      - name: Tests of the performance gate's tools
+        run: python3 tools/test_perf_gate.py
       # The register of server-side normative statements names a test or a
       # code location for each row: every identifier of the two OASIS
       # indexes appears once, every cited test and file exists, and

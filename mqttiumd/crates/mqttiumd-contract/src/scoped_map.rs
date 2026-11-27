@@ -1,6 +1,5 @@
-//! Prefix-stripped deterministic ordered map (`ScopedMap`), inspired by
-//! `bbtree`'s prefix stripping while remaining `#![forbid(unsafe_code)]`,
-//! `no_std + alloc`, and strictly canonical in `Ord`.
+//! Prefix-stripped deterministic ordered map (`ScopedMap`): `no_std +
+//! alloc`, without unsafe code, and strictly canonical in `Ord`.
 //!
 //! Within a run epoch, 24 of the 32 bytes in `OperationId`, `PublicationId`,
 //! `PayloadId`, and `DeliveryId` (and 16 of the 24 bytes in `EffectId`) are a
@@ -27,6 +26,9 @@ pub trait ScopedKey: Ord + Copy {
     fn scope(self) -> Self::Scope;
     fn local(self) -> Self::Local;
     fn from_parts(scope: Self::Scope, local: Self::Local) -> Self;
+    /// Whether `scope` belongs to a later run of the broker than `than`,
+    /// whatever their owners.
+    fn later_run(scope: Self::Scope, than: Self::Scope) -> bool;
 }
 
 impl ScopedKey for OperationId {
@@ -43,6 +45,10 @@ impl ScopedKey for OperationId {
 
     fn from_parts(scope: Self::Scope, local: Self::Local) -> Self {
         Self::new(scope.0, scope.1, scope.2, local)
+    }
+
+    fn later_run(scope: Self::Scope, than: Self::Scope) -> bool {
+        (scope.0, scope.1) > (than.0, than.1)
     }
 }
 
@@ -61,6 +67,10 @@ impl ScopedKey for PublicationId {
     fn from_parts(scope: Self::Scope, local: Self::Local) -> Self {
         Self::new(scope.0, scope.1, scope.2, local)
     }
+
+    fn later_run(scope: Self::Scope, than: Self::Scope) -> bool {
+        (scope.0, scope.1) > (than.0, than.1)
+    }
 }
 
 impl ScopedKey for PayloadId {
@@ -77,6 +87,10 @@ impl ScopedKey for PayloadId {
 
     fn from_parts(scope: Self::Scope, local: Self::Local) -> Self {
         Self::new(scope.0, scope.1, scope.2, local)
+    }
+
+    fn later_run(scope: Self::Scope, than: Self::Scope) -> bool {
+        (scope.0, scope.1) > (than.0, than.1)
     }
 }
 
@@ -102,6 +116,10 @@ impl ScopedKey for DeliveryId {
             index: local.1,
         }
     }
+
+    fn later_run(scope: Self::Scope, than: Self::Scope) -> bool {
+        (scope.0, scope.1) > (than.0, than.1)
+    }
 }
 
 impl ScopedKey for EffectId {
@@ -122,6 +140,10 @@ impl ScopedKey for EffectId {
             owner: scope.1,
             sequence: local,
         }
+    }
+
+    fn later_run(scope: Self::Scope, than: Self::Scope) -> bool {
+        scope.0 > than.0
     }
 }
 

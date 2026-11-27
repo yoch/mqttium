@@ -11,17 +11,24 @@ import tarfile
 import tempfile
 
 
+# (name, test, source file, anchor, mutation, the assertion that must fail).
+# Each anchor names one site of the product. The window of a connection is
+# the count the delivery table keeps (`Deliveries::active`); the first
+# mutation takes out of it the deliveries that await PUBCOMP.
 CASES = (
     ("early-window", "qos2_keeps_window_and_identifier_until_pubcomp_finish_is_known",
-     ".filter(|d| d.window == Some(generation))",
-     ".filter(|d| d.window == Some(generation) && !d.claim.is_some_and(|claim| claim.await_pubcomp))",
+     "deliveries.rs",
+     "        self.by_window\n            .get(&generation)\n            .map_or(0, SmallIndexSet::len)\n",
+     "        self.by_window.get(&generation).map_or(0, |set| {\n"
+     "            set.iter().filter(|&index| !self.rows[index].awaits_pubcomp()).count()\n"
+     "        })\n",
      "qos2_receive_maximum_released_before_pubcomp"),
     ("wrong-replay-leg", "recovered_qos2_phase_selects_pubrel_even_with_publish_bytes_available",
+     "pubsub.rs",
      "if claim.await_pubcomp {\n            let effect = draft.emit",
      "if claim.await_pubcomp && delivery.claim_result.is_some() {\n            let effect = draft.emit",
      "qos2_recovery_replayed_publish_instead_of_pubrel"),
 )
-
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
@@ -33,7 +40,7 @@ def main():
     output.mkdir()
     source = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=root, text=True).strip()
     receipts = {}
-    for name, test, old, mutant, expected in CASES:
+    for name, test, source_file, old, mutant, expected in CASES:
         with tempfile.TemporaryDirectory(prefix=f"mqttiumd-qos2-{name}-") as temp:
             with subprocess.Popen(["git", "archive", source, "mqttiumd"], cwd=root,
                                   stdout=subprocess.PIPE) as archive:
@@ -42,7 +49,7 @@ def main():
                 if archive.wait() != 0:
                     raise RuntimeError("source_archive_failed")
             base = Path(temp) / "mqttiumd"
-            path = base / "crates/mqttiumd-core/src/owner/pubsub.rs"
+            path = base / "crates/mqttiumd-core/src/owner" / source_file
             original = path.read_text()
             if original.count(old) != 1:
                 raise RuntimeError(f"{name}: expected one mutation anchor")

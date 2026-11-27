@@ -423,6 +423,23 @@ struct OutgoingState {
     /// Saturating count of popped outgoing frames; while `< 3` (CONNACK
     /// handshake / idle phase) an empty queue frees its backing buffer.
     sent_seen: u8,
+    /// SUBSCRIBE packets of this connection the coordinator has read and
+    /// whose SUBACK it has not queued yet. A delivery shard queues nothing
+    /// while it is not zero: the store may answer the shard's read of the
+    /// session after the subscription committed, and the frames the single
+    /// owner emits after that commit follow its SUBACK. The input lane of a
+    /// connection bounds it far below its saturation.
+    subacks_owed: u16,
+}
+
+/// Who queues a frame on a connection, for the order of a SUBACK.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Producer {
+    Coordinator,
+    /// The coordinator's SUBACK: queuing it pays one SUBACK owed.
+    CoordinatorSuback,
+    /// A delivery shard, which waits for every SUBACK owed.
+    Shard,
 }
 
 impl OutgoingState {
@@ -512,7 +529,7 @@ struct RouteAcks {
     budget: Arc<ShardAckBudget>,
 }
 
-struct ShardAckBatch {
+pub(super) struct ShardAckBatch {
     acks: Arc<RouteAcks>,
     remaining: usize,
 }
@@ -707,9 +724,12 @@ pub struct OutgoingHandle {
 }
 
 impl OutgoingHandle {
+    /// Queues a frame of the shard, after every SUBACK the coordinator owes
+    /// this connection: until then the frame is refused as `Full`, and the
+    /// shard keeps it as it keeps any frame refused for want of room.
     #[inline]
     pub fn try_send_outgoing(&self, frame: Write) -> Result<(), TrySendError<Write>> {
-        self.core.try_send_outgoing(frame)
+        self.core.try_send(frame, Producer::Shard)
     }
 
     /// Only the owning shard admits its correlated writes. I/O threads can
@@ -759,7 +779,8 @@ pub(super) struct ConnCore {
     written_pending: AtomicBool,
     progress_pending: AtomicBool,
     shard_route_active: AtomicBool,
-    shard_route: OnceLock<ShardIoRoute>,
+    /// Boxed: a connection without shards pays a pointer, not the route.
+    shard_route: OnceLock<Box<ShardIoRoute>>,
     pub(super) principal: Option<Box<OnceLock<Principal>>>,
     to_core: Mutex<ToCoreState>,
     outgoing: Mutex<OutgoingState>,
@@ -862,6 +883,7 @@ impl ConnCore {
                 tx_alive: true,
                 accepting_frames: true,
                 sent_seen: 0,
+                subacks_owed: 0,
             }),
             #[cfg(test)]
             changed: Condvar::new(),
@@ -936,6 +958,18 @@ impl ConnCore {
     }
 
     pub(super) fn try_send_outgoing(&self, frame: Write) -> Result<(), TrySendError<Write>> {
+        self.try_send(frame, Producer::Coordinator)
+    }
+
+    /// Records a SUBSCRIBE read by the coordinator, whose SUBACK frames of
+    /// a delivery shard will wait for.
+    pub(super) fn owe_suback(&self) {
+        if let Ok(mut state) = self.outgoing.lock() {
+            state.subacks_owed = state.subacks_owed.saturating_add(1);
+        }
+    }
+
+    fn try_send(&self, frame: Write, producer: Producer) -> Result<(), TrySendError<Write>> {
         let mut state = match self.outgoing.lock() {
             Ok(guard) => guard,
             Err(_) => return Err(TrySendError::Disconnected(frame)),
@@ -943,7 +977,9 @@ impl ConnCore {
         if !state.accepting_frames {
             return Err(TrySendError::Disconnected(frame));
         }
-        if state.queue.len() >= OUTPUT_SLOTS {
+        if state.queue.len() >= OUTPUT_SLOTS
+            || (producer == Producer::Shard && state.subacks_owed != 0)
+        {
             #[cfg(test)]
             if let Some(held) = state.held.as_mut()
                 && let Some((id, _)) = frame.correlation
@@ -963,6 +999,11 @@ impl ConnCore {
             return Err(TrySendError::Full(frame));
         }
         state.enqueue(frame);
+        if producer == Producer::CoordinatorSuback {
+            // Queued under the lock a shard takes before it reads the
+            // count: a frame of the shard that sees it paid follows it.
+            state.subacks_owed = state.subacks_owed.saturating_sub(1);
+        }
         drop(state);
         #[cfg(test)]
         self.changed.notify_all();
@@ -1087,6 +1128,56 @@ impl ConnCore {
         })
     }
 
+    /// Plans a read turn into `batch`: the shard credit it holds, how many
+    /// packets it parses, and whether it reads without credit. A turn of a
+    /// connection routed to a shard reserves credit first, since a packet's
+    /// kind is known only once parsed. Without credit it still reads one
+    /// packet: one that needs no credit goes on (PINGREQ, DISCONNECT, a
+    /// PUBLISH), an acknowledgement is kept by `park_unpaid_ack` until credit
+    /// returns, and nothing behind it is read meanwhile. `None`: nothing may
+    /// be read now.
+    pub(super) fn plan_read(
+        &self,
+        stalled: &mut Option<Box<StalledState>>,
+        batch: &mut Vec<Incoming>,
+    ) -> Option<(Option<ShardAckBatch>, usize, bool)> {
+        let limit = self.incoming_free_slots().clamp(1, BURST);
+        let Some(credit) = self.reserve_shard_read(limit) else {
+            return Some((None, limit, false));
+        };
+        let remaining = credit.remaining;
+        if let Some(st) = stalled.as_mut()
+            && let Some(ack) = st.unpaid_ack.take()
+        {
+            if remaining == 0 {
+                st.unpaid_ack = Some(ack);
+                return None;
+            }
+            if st.is_empty() {
+                *stalled = None;
+            }
+            batch.push(ack);
+            return Some((Some(credit), remaining - 1, false));
+        }
+        if remaining == 0 {
+            return Some((Some(credit), 1, true));
+        }
+        Some((Some(credit), remaining, false))
+    }
+
+    /// After a read without credit: an acknowledgement it read waits in the
+    /// task for credit, the next `plan_read` sends it.
+    pub(super) fn park_unpaid_ack(
+        stalled: &mut Option<Box<StalledState>>,
+        batch: &mut Vec<Incoming>,
+        without_credit: bool,
+    ) {
+        if without_credit && batch.last().is_some_and(is_shard_ack) {
+            let ack = batch.pop().expect("an acknowledgement was read");
+            stalled.get_or_insert_with(Default::default).unpaid_ack = Some(ack);
+        }
+    }
+
     /// Pushes a batch of newly framed packets (plus any previously held
     /// packets in strict order) under a single mutex acquisition and wake.
     /// When a `ShardIoRoute` is installed, subscriber ACKs
@@ -1099,9 +1190,7 @@ impl ConnCore {
         mut reservation: Option<ShardAckBatch>,
     ) -> Result<bool, &'static str> {
         if let Some(reservation) = reservation.as_mut()
-            && batch.iter().any(|item| {
-                matches!(item, Incoming::Packet { first, .. } if matches!(first >> 4, 4 | 5 | 7))
-            })
+            && batch.iter().any(is_shard_ack)
         {
             // Routes are installed once and the reservation belongs to this connection.
             let route = self.shard_route.get().expect("reserved shard route");
@@ -1878,7 +1967,6 @@ impl Inbound<WireProgress> {
         }
     }
 
-    #[allow(dead_code)]
     pub fn recv_timeout(&self, timeout: Duration) -> Result<WireProgress, RecvTimeoutError> {
         match &self.receiver {
             InboundRx::Shared(core, _) => core.recv_timeout_progress(timeout),
@@ -2220,6 +2308,21 @@ impl Connection {
         }
     }
 
+    /// Records a SUBSCRIBE read on this connection: frames of a delivery
+    /// shard wait until its SUBACK is queued by `try_send_suback`.
+    pub fn owe_suback(&self) {
+        self.core.owe_suback();
+    }
+
+    /// Queues the SUBACK of a SUBSCRIBE recorded by `owe_suback`.
+    pub fn try_send_suback(&self, frame: Write) -> Result<(), TrySendError<Write>> {
+        #[cfg(test)]
+        if let OutboundTx::Std(_) = &self.outgoing.sender {
+            return self.outgoing.try_send(frame);
+        }
+        self.core.try_send(frame, Producer::CoordinatorSuback)
+    }
+
     #[inline]
     pub fn drain_incoming(&self, out: &mut VecDeque<Incoming>, limit: usize) -> DrainStatus {
         #[cfg(test)]
@@ -2347,6 +2450,17 @@ impl Connection {
         self.core.outgoing.lock().unwrap().held.as_ref()?.refused
     }
 
+    /// The first byte of each frame waiting in the output queue, in order.
+    #[cfg(test)]
+    pub fn queued_first_bytes(&self) -> Vec<u8> {
+        let state = self.core.outgoing.lock().unwrap();
+        state
+            .queue
+            .iter()
+            .filter_map(|frame| frame.bytes.first().copied())
+            .collect()
+    }
+
     #[cfg(test)]
     pub fn pause_wire_progress(&self, pause: bool) {
         self.core.pause_progress.store(pause, Ordering::Release);
@@ -2430,9 +2544,15 @@ impl Connection {
     /// Installs the direct I/O route for this connection once `CONNACK` has
     /// been queued so subscriber ACKs and shard-owned `Written` receipts bypass
     /// the Coordinator thread.
-    pub fn install_shard_route(&self, route: ShardIoRoute) {
-        let _ = self.core.shard_route.set(route);
+    /// Installs the route of this connection to its shard. A connection
+    /// has one route: false when one was installed already, which is kept.
+    #[must_use]
+    pub fn install_shard_route(&self, route: ShardIoRoute) -> bool {
+        if self.core.shard_route.set(Box::new(route)).is_err() {
+            return false;
+        }
         self.core.shard_route_active.store(true, Ordering::Release);
+        true
     }
 }
 
@@ -2488,19 +2608,30 @@ pub(super) enum Report {
 }
 
 /// Cold backpressure state for a transport task, allocated only when a lane
-/// towards the core refuses an item. Idle and steady-state tasks keep `None`.
+/// towards the core refuses an item or an acknowledgement waits for the
+/// shard's credit. Idle and steady-state tasks keep `None`.
 #[derive(Default)]
 pub(super) struct StalledState {
     pub(super) held: VecDeque<Incoming>,
     pub(super) reports: VecDeque<Report>,
     pub(super) stalled_since: Option<Instant>,
+    /// An acknowledgement for the shard read without credit
+    /// (`ConnCore::plan_read`). Nothing is read after it until it is sent.
+    pub(super) unpaid_ack: Option<Incoming>,
 }
 
 impl StalledState {
     #[inline]
     pub(super) fn is_empty(&self) -> bool {
-        self.held.is_empty() && self.reports.is_empty()
+        self.held.is_empty() && self.reports.is_empty() && self.unpaid_ack.is_none()
     }
+}
+
+/// Whether `item` goes to the shard of a routed connection: a subscriber's
+/// PUBACK, PUBREC or PUBCOMP.
+#[inline]
+fn is_shard_ack(item: &Incoming) -> bool {
+    matches!(item, Incoming::Packet { first, .. } if matches!(first >> 4, 4 | 5 | 7))
 }
 
 /// Where a parser takes its bytes. Zero means none is available now; the
@@ -3429,14 +3560,13 @@ impl Task {
                 return Ok(progressed);
             }
         }
-        let avail = self.core.incoming_free_slots();
-        let limit = avail.clamp(1, BURST);
-        let credit = self.core.reserve_shard_read(limit);
-        let limit = credit.as_ref().map_or(limit, |batch| batch.remaining);
-        if limit == 0 {
-            return Ok(progressed);
-        }
         scratch.incoming_batch.clear();
+        let Some((credit, limit, without_credit)) = self
+            .core
+            .plan_read(&mut self.stalled, &mut scratch.incoming_batch)
+        else {
+            return Ok(progressed);
+        };
         let mut heard_packet = false;
         let mut cached_fixed: Option<FrameObservation> = None;
         let mut source = ScratchSource {
@@ -3475,6 +3605,11 @@ impl Task {
         if heard_packet {
             record_heard(&self.core);
         }
+        ConnCore::park_unpaid_ack(
+            &mut self.stalled,
+            &mut scratch.incoming_batch,
+            without_credit,
+        );
         if !scratch.incoming_batch.is_empty() {
             self.core.push_incoming_batch(
                 &mut scratch.incoming_batch,
@@ -3571,6 +3706,22 @@ mod tests {
         let (server, peer) = socket_pair();
         let (_, connection) = open(server, Wake::new(), None, false).unwrap();
         (connection, peer)
+    }
+
+    /// Every connection keeps the place of a shard route, whatever the
+    /// number of shards. Without shards it pays a pointer for it, not the
+    /// route itself.
+    #[test]
+    fn a_connection_pays_one_pointer_for_the_place_of_its_shard_route() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let _client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let connection = spawn(listener.accept().unwrap().0).unwrap();
+        let place = std::mem::size_of_val(&connection.core.shard_route);
+        assert!(
+            place <= 2 * std::mem::size_of::<usize>(),
+            "the place of the shard route takes {place} bytes in each connection"
+        );
+        connection.close();
     }
 
     #[test]
@@ -3773,7 +3924,11 @@ mod tests {
         let (connection, _peer) = manual_pair();
         let (effect, key) = correlation(9).unwrap();
         let inbox = ShardInbox::new(Wake::new(), 3, 1);
-        connection.install_shard_route(ShardIoRoute::new(effect.owner, key, Arc::clone(&inbox)));
+        assert!(connection.install_shard_route(ShardIoRoute::new(
+            effect.owner,
+            key,
+            Arc::clone(&inbox)
+        )));
         let packet = |first, body: &[u8]| Incoming::Packet {
             first,
             body: FrameBytes::from_slice(body),
@@ -3812,12 +3967,81 @@ mod tests {
         assert_eq!(headers, [0x34, 0x62]);
     }
 
+    /// A connection routed to a shard whose acknowledgement credit is spent
+    /// (by other connections of the shard, or its own earlier ACKs) still
+    /// reads what needs no credit: a PINGREQ reaches the core, and keep-alive
+    /// hears the client. Before an ACK can be known as one it is read; it
+    /// waits in the task for credit, and what follows it waits behind it.
+    #[test]
+    fn a_shard_connection_without_ack_credit_still_reads_what_needs_none() {
+        let (connection, mut peer) = manual_pair();
+        let mut task = manual_task(&connection);
+        let (effect, key) = correlation(9).unwrap();
+        let inbox = ShardInbox::new(Wake::new(), 1, 1);
+        assert!(connection.install_shard_route(ShardIoRoute::new(
+            effect.owner,
+            key,
+            Arc::clone(&inbox)
+        )));
+        let spent = connection.core.reserve_shard_read(1).unwrap();
+        assert_eq!(spent.remaining, 1);
+        let mut scratch = ReactorScratch::new();
+        let turns = |task: &mut Task, scratch: &mut ReactorScratch| {
+            for _ in 0..8 {
+                task.turn(scratch).unwrap();
+            }
+        };
+        let firsts = |connection: &Connection| {
+            let mut incoming = VecDeque::new();
+            connection.drain_incoming(&mut incoming, 8);
+            incoming
+                .into_iter()
+                .map(|packet| match packet {
+                    Incoming::Packet { first, .. } => first,
+                    _ => panic!("expected a packet"),
+                })
+                .collect::<Vec<_>>()
+        };
+
+        peer.write_all(&[0xc0, 0]).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut read = Vec::new();
+        while read.is_empty() && Instant::now() < deadline {
+            turns(&mut task, &mut scratch);
+            read = firsts(&connection);
+        }
+        assert_eq!(read, [0xc0], "a PINGREQ was not read without ACK credit");
+
+        // An ACK, then a DISCONNECT: the ACK waits for credit, the DISCONNECT
+        // behind it.
+        peer.write_all(&[0x40, 2, 0, 9, 0xe0, 0]).unwrap();
+        thread::sleep(Duration::from_millis(20));
+        turns(&mut task, &mut scratch);
+        assert!(
+            firsts(&connection).is_empty(),
+            "the DISCONNECT passed the ACK"
+        );
+        let mut shard = VecDeque::new();
+        assert_eq!(inbox.drain_into(&mut shard, 4), 0);
+        drop(spent);
+        turns(&mut task, &mut scratch);
+        assert_eq!(inbox.drain_into(&mut shard, 4), 1);
+        assert!(matches!(shard.pop_front(), Some(ShardIoEvent::AckPacket {
+            first: 0x40, body, ..
+        }) if body.as_slice() == [0, 9]));
+        assert_eq!(firsts(&connection), [0xe0]);
+    }
+
     #[test]
     fn sharded_ack_backpressure_preserves_the_unread_suffix_and_write_receipts() {
         let (connection, _peer) = manual_pair();
         let (effect, key) = correlation(9).unwrap();
         let inbox = ShardInbox::new(Wake::new(), 2, 1);
-        connection.install_shard_route(ShardIoRoute::new(effect.owner, key, Arc::clone(&inbox)));
+        assert!(connection.install_shard_route(ShardIoRoute::new(
+            effect.owner,
+            key,
+            Arc::clone(&inbox)
+        )));
         let packet = |first, index| Incoming::Packet {
             first,
             body: FrameBytes::from(vec![0, index]),
@@ -3914,7 +4138,11 @@ mod tests {
         let (interrupted, _) = correlation(3).unwrap();
         let (refused, _) = correlation(4).unwrap();
         let inbox = ShardInbox::new(Wake::new(), 1, 3);
-        connection.install_shard_route(ShardIoRoute::new(finished.owner, key, Arc::clone(&inbox)));
+        assert!(connection.install_shard_route(ShardIoRoute::new(
+            finished.owner,
+            key,
+            Arc::clone(&inbox)
+        )));
         let route = connection.core.shard_route.get().unwrap();
         // Reserve precisely the three admitted occurrences. The active list
         // may still reference a write whose completion was already published.
@@ -3995,7 +4223,11 @@ mod tests {
         let (first, key) = correlation(1).unwrap();
         let (second, _) = correlation(2).unwrap();
         let inbox = ShardInbox::new(Wake::new(), 1, 2);
-        connection.install_shard_route(ShardIoRoute::new(first.owner, key, Arc::clone(&inbox)));
+        assert!(connection.install_shard_route(ShardIoRoute::new(
+            first.owner,
+            key,
+            Arc::clone(&inbox)
+        )));
         let (bytes, mut expiry) = timed_frame();
         expiry.value_offset = Some(bytes.len());
         let output = connection.outgoing_handle();
@@ -4023,6 +4255,275 @@ mod tests {
         );
         assert!(
             matches!(reports.pop_front(), Some(ShardIoEvent::Written { written: Written::Failed { correlation: Some((id, _)), .. }, .. }) if id == second)
+        );
+    }
+
+    // The tests below drive one plain task by hand, with no route to a
+    // shard: the coordinator is the only producer of frames and the only
+    // consumer of receipts (models/transport-credit, models/takeover).
+
+    fn manual_task(connection: &Connection) -> Task {
+        Task {
+            core: Arc::clone(&connection.core),
+            clock: Arc::new(FakeClock::new(reading(100))),
+            leftover: None,
+            parser: Parser::default(),
+            stalled: None,
+            active: None,
+            paused: None,
+        }
+    }
+
+    fn pingresp(sequence: u64) -> Write {
+        Write {
+            correlation: correlation(sequence),
+            bytes: FrameBytes::from_slice(&[0xd0, 0]),
+            payload: None,
+            expiry: None,
+            report: WriteReport::Complete,
+        }
+    }
+
+    /// Leaves no room in the receipt lane, as a core that collects nothing.
+    fn fill_written_lane(connection: &Connection) {
+        for filler in 0..WRITTEN_SLOTS as u64 {
+            let mut fresh = vec![Report::Written(Written::Complete {
+                correlation: correlation(10_000 + filler),
+                bytes: 2,
+            })];
+            assert!(
+                connection
+                    .core
+                    .flush_reports(&mut fresh, &mut None)
+                    .unwrap()
+            );
+        }
+    }
+
+    fn completed(written: &[Written]) -> Vec<Option<(EffectId, ConnectionKey)>> {
+        written
+            .iter()
+            .map(|receipt| match receipt {
+                Written::Complete { correlation, .. } => *correlation,
+                other => panic!("expected a completion, got {other:?}"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_full_output_queue_refuses_a_frame_until_the_task_takes_one() {
+        // No reactor drives this connection: the queue keeps what it accepts.
+        let (connection, _peer) = manual_pair();
+        for sequence in 0..OUTPUT_SLOTS as u64 {
+            connection.try_send_outgoing(pingresp(sequence)).unwrap();
+        }
+        let refused = match connection.try_send_outgoing(pingresp(1000)) {
+            Err(TrySendError::Full(frame)) => frame,
+            other => panic!("a full queue accepted a frame or was closed: {other:?}"),
+        };
+        assert_eq!(
+            refused.correlation,
+            correlation(1000),
+            "the refused frame comes back intact"
+        );
+        let mut taken = Vec::new();
+        connection
+            .core
+            .pop_outgoing_batch(&mut taken, false, COALESCE_BYTES, MAX_COALESCE_FRAMES)
+            .unwrap();
+        assert_eq!(taken.len(), 1);
+        connection.try_send_outgoing(refused).unwrap();
+        assert!(matches!(
+            connection.try_send_outgoing(pingresp(1001)),
+            Err(TrySendError::Full(_))
+        ));
+    }
+
+    #[test]
+    fn a_finished_task_seals_its_queue_and_fails_each_admitted_frame_once() {
+        let (connection, mut peer) = manual_pair();
+        let task = manual_task(&connection);
+        connection.try_send_outgoing(pingresp(1)).unwrap();
+        connection.try_send_outgoing(pingresp(2)).unwrap();
+        // The task ends before it took either frame.
+        Box::new(task).finish("eof");
+        // A frame submitted afterwards is refused. Accepted, it would wait
+        // in a queue nothing reads and get no receipt.
+        assert!(matches!(
+            connection.try_send_outgoing(pingresp(3)),
+            Err(TrySendError::Disconnected(frame)) if frame.correlation == correlation(3)
+        ));
+        let mut written = Vec::new();
+        assert_eq!(
+            connection.drain_written(&mut written, WRITTEN_SLOTS),
+            DrainStatus::Empty
+        );
+        let failed: Vec<_> = written
+            .iter()
+            .map(|receipt| match receipt {
+                Written::Failed {
+                    correlation,
+                    code: "eof",
+                } => *correlation,
+                other => panic!("expected a failure, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(failed, [correlation(1), correlation(2)]);
+        written.clear();
+        assert_eq!(
+            connection.drain_written(&mut written, WRITTEN_SLOTS),
+            DrainStatus::Disconnected
+        );
+        assert!(written.is_empty());
+        // The socket was shut before the queue was emptied: no queued frame left.
+        peer.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+        assert_eq!(peer.read(&mut [0u8; 2]).unwrap(), 0);
+    }
+
+    #[test]
+    fn a_turn_offers_its_receipts_together_and_takes_no_frame_while_one_is_refused() {
+        let (connection, mut peer) = manual_pair();
+        let mut task = manual_task(&connection);
+        fill_written_lane(&connection);
+        // Two frames one write can carry, then two that are written alone.
+        let large = |sequence: u64| Write {
+            payload: Some(
+                SharedBytes::copy_from(
+                    &[7; SEGMENTED_PAYLOAD_THRESHOLD + 1],
+                    SEGMENTED_PAYLOAD_THRESHOLD + 1,
+                )
+                .unwrap(),
+            ),
+            ..pingresp(sequence)
+        };
+        for frame in [pingresp(1), pingresp(2), large(3), large(4)] {
+            connection.try_send_outgoing(frame).unwrap();
+        }
+        let turn = task.turn(&mut ReactorScratch::new()).unwrap();
+        assert!(turn.progress && turn.waiting);
+        // Every frame left in this one turn, before any receipt was offered.
+        let mut bytes = vec![0; 2 * 2 + 2 * (2 + SEGMENTED_PAYLOAD_THRESHOLD + 1)];
+        peer.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+        peer.read_exact(&mut bytes).unwrap();
+        // The lane had no room: the task keeps the receipts of four frames.
+        assert_eq!(task.stalled.as_ref().map(|s| s.reports.len()), Some(4));
+        // A fifth frame stays in the queue while those receipts wait.
+        connection.try_send_outgoing(pingresp(5)).unwrap();
+        // The wait of the refused receipts is not what this test measures.
+        task.stalled.as_mut().unwrap().stalled_since = None;
+        let turn = task.turn(&mut ReactorScratch::new()).unwrap();
+        assert!(!turn.progress && turn.waiting);
+        assert_eq!(connection.core.outgoing.lock().unwrap().queue.len(), 1);
+        assert_eq!(task.stalled.as_ref().map(|s| s.reports.len()), Some(4));
+        // The core collects: the receipts leave in order, then the frame.
+        let mut written = Vec::new();
+        connection.drain_written(&mut written, WRITTEN_SLOTS);
+        assert_eq!(written.len(), WRITTEN_SLOTS);
+        assert!(task.turn(&mut ReactorScratch::new()).unwrap().progress);
+        assert!(task.stalled.is_none());
+        written.clear();
+        connection.drain_written(&mut written, WRITTEN_SLOTS);
+        assert_eq!(
+            completed(&written),
+            [1, 2, 3, 4, 5].map(correlation),
+            "receipts in the order of their frames"
+        );
+        let mut last = [0u8; 2];
+        peer.read_exact(&mut last).unwrap();
+        assert_eq!(last, [0xd0, 0]);
+    }
+
+    #[test]
+    fn a_receipt_refused_for_the_whole_wait_ends_the_task_and_a_full_lane_drops_its_facts() {
+        let (connection, _peer) = manual_pair();
+        let mut task = manual_task(&connection);
+        fill_written_lane(&connection);
+        connection.try_send_outgoing(pingresp(1)).unwrap();
+        assert!(task.turn(&mut ReactorScratch::new()).unwrap().progress);
+        // The completion of the first frame is refused; a second frame waits.
+        assert_eq!(task.stalled.as_ref().map(|s| s.reports.len()), Some(1));
+        connection.try_send_outgoing(pingresp(2)).unwrap();
+        // The core has collected nothing for the whole wait.
+        task.stalled.as_mut().unwrap().stalled_since = Some(
+            Instant::now()
+                .checked_sub(RESULT_WAIT)
+                .expect("a monotonic clock older than the wait"),
+        );
+        let code = task.turn(&mut ReactorScratch::new()).unwrap_err();
+        assert_eq!(code, "write_result_queue_full");
+        Box::new(task).finish(code);
+        // The terminal facts were offered once to a lane that had no room:
+        // neither the completion of the first frame nor the failure of the
+        // second is there. The owner of the frames fails them at its close.
+        let mut written = Vec::new();
+        assert_eq!(
+            connection.drain_written(&mut written, WRITTEN_SLOTS + 2),
+            DrainStatus::Empty
+        );
+        assert_eq!(
+            completed(&written),
+            (0..WRITTEN_SLOTS as u64)
+                .map(|filler| correlation(10_000 + filler))
+                .collect::<Vec<_>>()
+        );
+        written.clear();
+        assert_eq!(
+            connection.drain_written(&mut written, WRITTEN_SLOTS),
+            DrainStatus::Disconnected
+        );
+        assert!(written.is_empty());
+    }
+
+    #[test]
+    fn a_frame_that_cannot_start_fails_once_and_the_frame_before_it_keeps_its_completion() {
+        let (connection, _peer) = manual_pair();
+        let mut task = manual_task(&connection);
+        let (bytes, mut expiry) = timed_frame();
+        expiry.value_offset = Some(bytes.len());
+        connection.try_send_outgoing(pingresp(1)).unwrap();
+        connection
+            .try_send_outgoing(Write {
+                correlation: correlation(2),
+                bytes: FrameBytes::from(bytes),
+                payload: None,
+                expiry: Some(Box::new(expiry)),
+                report: WriteReport::Complete,
+            })
+            .unwrap();
+        let code = task.turn(&mut ReactorScratch::new()).unwrap_err();
+        assert_eq!(code, "output_expiry_offset");
+        Box::new(task).finish(code);
+        let mut written = Vec::new();
+        connection.drain_written(&mut written, WRITTEN_SLOTS);
+        assert!(
+            matches!(written.as_slice(), [
+                Written::Complete { correlation: first, bytes: 2 },
+                Written::Failed { correlation: second, code: "output_expiry_offset" },
+            ] if *first == correlation(1) && *second == correlation(2)),
+            "one terminal receipt per frame, in order: {written:?}"
+        );
+    }
+
+    #[test]
+    fn a_closed_plain_connection_is_shut_when_its_reason_reads_and_writes_nothing_more() {
+        let (connection, mut peer) = manual_pair();
+        let mut task = manual_task(&connection);
+        connection.try_send_outgoing(pingresp(1)).unwrap();
+        // The owner closes while the frame is still queued.
+        connection.close();
+        assert_eq!(connection.terminal_reason(), Some("cancelled"));
+        // The reason reads: the socket is already shut, whatever the task does.
+        peer.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+        assert_eq!(peer.read(&mut [0u8; 2]).unwrap(), 0);
+        let code = task.turn(&mut ReactorScratch::new()).unwrap_err();
+        assert_eq!(code, "cancelled");
+        Box::new(task).finish(code);
+        let mut written = Vec::new();
+        connection.drain_written(&mut written, WRITTEN_SLOTS);
+        assert!(
+            matches!(written.as_slice(), [Written::Failed { correlation: queued, code: "cancelled" }]
+                if *queued == correlation(1)),
+            "the queued frame fails once: {written:?}"
         );
     }
 

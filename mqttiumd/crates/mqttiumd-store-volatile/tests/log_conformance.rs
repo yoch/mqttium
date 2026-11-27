@@ -304,6 +304,125 @@ fn log_apply_group_matches_sqlite_and_recovers_after_uncompacted_crash() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A group the writer may legitimately form must survive a restart whatever
+/// its size on disk. Seventy admissions of one mebibyte each are one group
+/// of the writer (at most `LOG_MAX_GROUP` commands, each within the payload
+/// limit) and more than the 64 MiB a frame may hold when it is read back.
+/// Every member is answered committed, so every member must be found again.
+#[test]
+fn log_reopens_after_a_group_larger_than_one_frame() {
+    const MEMBERS: u64 = 70;
+    const PAYLOAD: usize = 1024 * 1024;
+    let dir = temp_dir("large-group");
+    let path = dir.join("store.sqlite");
+    let limits = Limits {
+        payload_bytes: mqttiumd_contract::capacity::PayloadBytes::new(128 * 1024 * 1024),
+        references: mqttiumd_contract::capacity::References::new(256),
+        exchange_slots: mqttiumd_contract::capacity::ExchangeSlots::new(128),
+        receipt_slots: mqttiumd_contract::capacity::ReceiptSlots::new(256),
+        max_payload_bytes: PAYLOAD,
+        ..fixture_limits()
+    };
+    let mut world = World::with_limits(
+        &|incarnation, lim| {
+            LogStore::open_or_create(&path, incarnation, lim, None, false).expect("log")
+        },
+        limits,
+    );
+    let payload =
+        mqttiumd_contract::packet::SharedBytes::copy_from(&vec![0x5a_u8; PAYLOAD], PAYLOAD)
+            .expect("within the limit");
+    let length = mqttiumd_contract::capacity::PayloadBytes::new(PAYLOAD as u64);
+    let commands: Vec<Command> = (1..=MEMBERS)
+        .map(|sequence| {
+            let packet_id = u16::try_from(sequence).expect("small");
+            // The builder of the fixture copies at most a kibibyte: the
+            // admission is rebuilt around the large payload.
+            let small = world.admission(sequence, packet_id, b"x", &[world.b]);
+            let mut large = conformance::altered(&small, |admit| {
+                admit.payload.length = length;
+                admit.costs.payload_bytes = length;
+            });
+            large.payload = Some(payload.clone());
+            large
+        })
+        .collect();
+    let group: Vec<&Command> = commands.iter().collect();
+    assert!(group.len() <= LOG_MAX_GROUP);
+    let replies = world
+        .store
+        .apply_group(&group)
+        .expect("a group within the bound");
+    for (sequence, reply) in (1..=MEMBERS).zip(&replies) {
+        assert!(
+            matches!(reply.reply, StoreReply::Outcome(StoreOutcome::Committed(_))),
+            "member {sequence}: {:?}",
+            reply.reply
+        );
+    }
+    let expected = world
+        .store
+        .snapshot()
+        .expect("the state that was acknowledged");
+    drop(world);
+
+    let reopened = LogStore::open_or_create(&path, StoreIncarnation::new(9), limits, None, true)
+        .expect("a log the store wrote and acknowledged opens again");
+    assert_eq!(reopened.snapshot().unwrap(), expected);
+    drop(reopened);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// One command that no frame can hold is not written at all: it is answered
+/// unknown, as a write that failed, and the log stays readable. The product
+/// cannot form such a command (its payload limit is one mebibyte); a store
+/// opened with wider limits must still never write what it refuses to read.
+#[test]
+fn log_does_not_write_a_command_larger_than_one_frame() {
+    const PAYLOAD: usize = 65 * 1024 * 1024;
+    let dir = temp_dir("large-command");
+    let path = dir.join("store.sqlite");
+    let limits = Limits {
+        payload_bytes: mqttiumd_contract::capacity::PayloadBytes::new(128 * 1024 * 1024),
+        max_payload_bytes: PAYLOAD,
+        ..fixture_limits()
+    };
+    let mut world = World::with_limits(
+        &|incarnation, lim| {
+            LogStore::open_or_create(&path, incarnation, lim, None, false).expect("log")
+        },
+        limits,
+    );
+    let before = world.admission(1, 1, b"before", &[world.b]);
+    assert!(world.store.apply(&before).committed_now);
+    let expected = world.store.snapshot().expect("the state before");
+
+    let length = mqttiumd_contract::capacity::PayloadBytes::new(PAYLOAD as u64);
+    let small = world.admission(2, 2, b"x", &[world.b]);
+    let mut large = conformance::altered(&small, |admit| {
+        admit.payload.length = length;
+        admit.costs.payload_bytes = length;
+    });
+    large.payload = Some(
+        mqttiumd_contract::packet::SharedBytes::copy_from(&vec![0x5a_u8; PAYLOAD], PAYLOAD)
+            .expect("within the limit"),
+    );
+    let refused = world.store.apply(&large);
+    assert_eq!(
+        refused.reply,
+        StoreReply::Outcome(StoreOutcome::PendingOrUnknown)
+    );
+    assert!(!refused.committed_now && !refused.wrote);
+    assert_eq!(world.store.snapshot().expect("unchanged"), expected);
+    drop(world);
+
+    let reopened = LogStore::open_or_create(&path, StoreIncarnation::new(9), limits, None, true)
+        .expect("the log holds only frames the store reads back");
+    assert_eq!(reopened.snapshot().unwrap(), expected);
+    drop(reopened);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn log_recovers_from_torn_tail_and_refuses_midfile_corruption() {
     let dir = temp_dir("torn-tail");
@@ -858,6 +977,263 @@ fn failed_wal_replacement_suspends_durable_writes_until_repaired() {
         .expect("reopen after repaired compaction");
     assert_eq!(reopened.snapshot().expect("recovered"), expected);
 
+    drop(reopened);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A store with two committed admissions, closed: its paths, its limits, the
+/// length of its log and the state it must give back.
+struct ClosedLog {
+    dir: PathBuf,
+    path: PathBuf,
+    wal_path: PathBuf,
+    limits: Limits,
+    valid_len: u64,
+    expected: mqttiumd_store_api::DurableState,
+    /// A third admission, not applied.
+    third: Command,
+}
+
+fn closed_log(name: &str) -> ClosedLog {
+    let dir = temp_dir(name);
+    let path = dir.join("store.sqlite");
+    let wal_path = dir.join("store.sqlite.mlog");
+    let limits = fixture_limits();
+    let mut world = World::with_limits(
+        &|incarnation, lim| {
+            LogStore::open_or_create(&path, incarnation, lim, None, false).expect("log")
+        },
+        limits,
+    );
+    assert!(
+        world
+            .store
+            .apply(&world.admission(1, 7, b"first", &[world.b]))
+            .committed_now
+    );
+    assert!(
+        world
+            .store
+            .apply(&world.admission(2, 8, b"second", &[world.c]))
+            .committed_now
+    );
+    let valid_len = world.store.wal_len();
+    let expected = world.store.snapshot().expect("expected state");
+    let third = world.admission(3, 9, b"third", &[world.b]);
+    drop(world);
+    ClosedLog {
+        dir,
+        path,
+        wal_path,
+        limits,
+        valid_len,
+        expected,
+        third,
+    }
+}
+
+/// Leaves, after the last committed frame, zeros and then `residue` at
+/// `residue_at`: what a frame cut by a power loss leaves when the sectors
+/// written last reached the medium and earlier ones did not.
+fn leave_residue(log: &ClosedLog, residue_at: u64, residue: &[u8]) {
+    let mut file = OpenOptions::new().write(true).open(&log.wal_path).unwrap();
+    file.set_len(log.valid_len).unwrap();
+    file.seek(SeekFrom::Start(residue_at)).unwrap();
+    file.write_all(residue).unwrap();
+    file.write_all(&[0u8; 4096]).unwrap();
+    file.sync_all().unwrap();
+}
+
+const SECTOR: u64 = 512;
+const FRAME_LIMIT: u64 = 64 * 1024 * 1024;
+
+/// A frame is written over several sectors and a power loss keeps any of
+/// them. When the first is lost the log shows, after its last committed
+/// frame, zeros up to a sector boundary and then the rest of the frame. No
+/// answer was given for that frame: the log opens and the residue is cut.
+#[test]
+fn log_recovers_from_a_torn_frame_whose_first_sector_was_lost() {
+    let log = closed_log("torn-headless");
+    let next_sector = (log.valid_len / SECTOR + 1) * SECTOR;
+    leave_residue(&log, next_sector, &[0xa5; 3000]);
+
+    let recovered =
+        LogStore::open_or_create(&log.path, StoreIncarnation::new(9), log.limits, None, true)
+            .expect("a log cut by a power loss opens");
+    assert_eq!(recovered.snapshot().unwrap(), log.expected);
+    assert_eq!(recovered.wal_len(), log.valid_len);
+    drop(recovered);
+    assert_eq!(
+        std::fs::metadata(&log.wal_path).unwrap().len(),
+        log.valid_len,
+        "the residue is cut"
+    );
+    let _ = std::fs::remove_dir_all(&log.dir);
+}
+
+/// What a single frame cannot have left is not a torn tail. A zero length
+/// followed by bytes in the same sector is damage inside a sector, and bytes
+/// farther than one frame may reach belong to frames that were committed:
+/// both are refused.
+#[test]
+fn log_refuses_a_zero_length_that_no_torn_frame_explains() {
+    let log = closed_log("zero-length-damage");
+    assert!(
+        (log.valid_len / SECTOR + 1) * SECTOR - log.valid_len > 5,
+        "the fixture leaves room in the sector of the next frame"
+    );
+    leave_residue(&log, log.valid_len + 4, &[0xa5]);
+    let err = LogStore::open_or_create(&log.path, StoreIncarnation::new(9), log.limits, None, true)
+        .expect_err("damage inside the first sector");
+    assert!(matches!(err, OpenError::Corrupt), "got {err:?}");
+
+    leave_residue(&log, log.valid_len + 8 + FRAME_LIMIT + SECTOR, &[0xa5]);
+    let err = LogStore::open_or_create(&log.path, StoreIncarnation::new(9), log.limits, None, true)
+        .expect_err("bytes beyond the reach of one frame");
+    assert!(matches!(err, OpenError::Corrupt), "got {err:?}");
+    let _ = std::fs::remove_dir_all(&log.dir);
+}
+
+/// A frame whose write failed is cut from the file; when the cut fails too
+/// its bytes stay beyond the end of the log. Before the next frame is
+/// written every byte beyond the end is zero again, so that no later crash
+/// leaves a frame followed by them.
+#[test]
+fn log_zeroes_what_lies_beyond_its_end_before_it_appends() {
+    let log = closed_log("uncut-bytes");
+    // The store holds a log that ends with its last frame, as after a cut.
+    let file = OpenOptions::new().write(true).open(&log.wal_path).unwrap();
+    file.set_len(log.valid_len).unwrap();
+    drop(file);
+    let mut store =
+        LogStore::open_or_create(&log.path, StoreIncarnation::new(9), log.limits, None, true)
+            .expect("reopen");
+    {
+        // One mebibyte of a frame that was neither committed nor cut.
+        let mut file = OpenOptions::new().write(true).open(&log.wal_path).unwrap();
+        file.seek(SeekFrom::Start(log.valid_len)).unwrap();
+        file.write_all(&vec![0xab; 1024 * 1024]).unwrap();
+        file.sync_all().unwrap();
+    }
+    assert!(store.apply(&log.third).committed_now);
+    let end = store.wal_len();
+    let expected = store
+        .snapshot()
+        .expect("the state with the third admission");
+    drop(store);
+
+    let mut beyond = Vec::new();
+    let mut file = OpenOptions::new().read(true).open(&log.wal_path).unwrap();
+    file.seek(SeekFrom::Start(end)).unwrap();
+    file.read_to_end(&mut beyond).unwrap();
+    assert!(
+        beyond.iter().all(|&byte| byte == 0),
+        "{} bytes of the frame that failed are left beyond the end of the log",
+        beyond.iter().filter(|&&byte| byte != 0).count()
+    );
+    let reopened =
+        LogStore::open_or_create(&log.path, StoreIncarnation::new(9), log.limits, None, true)
+            .expect("the log opens");
+    assert_eq!(reopened.snapshot().unwrap(), expected);
+    drop(reopened);
+    let _ = std::fs::remove_dir_all(&log.dir);
+}
+
+/// A checkpoint whose log could not be replaced leaves the store unable to
+/// write. The replacement is tried again by the next write: once the cause
+/// is gone the store writes again, without waiting for anyone to ask for a
+/// checkpoint.
+#[test]
+fn log_resumes_a_rotation_that_failed_at_the_next_write() {
+    let log = closed_log("rotation-resumed");
+    let mut store =
+        LogStore::open_or_create(&log.path, StoreIncarnation::new(9), log.limits, None, true)
+            .expect("reopen");
+    std::fs::remove_file(&log.wal_path).expect("remove the log");
+    std::fs::create_dir(&log.wal_path).expect("a directory in the way of the log");
+    assert!(store.compact().is_err(), "the log cannot be replaced");
+    assert_eq!(
+        store.apply(&log.third).reply,
+        StoreReply::Outcome(StoreOutcome::PendingOrUnknown),
+        "nothing is written while the log is stale"
+    );
+
+    std::fs::remove_dir(&log.wal_path).expect("the way is free again");
+    assert!(
+        store.apply(&log.third).committed_now,
+        "the next write replaces the log and is committed"
+    );
+    let expected = store
+        .snapshot()
+        .expect("the state with the third admission");
+    drop(store);
+    let reopened =
+        LogStore::open_or_create(&log.path, StoreIncarnation::new(9), log.limits, None, true)
+            .expect("the log opens");
+    assert_eq!(reopened.snapshot().unwrap(), expected);
+    drop(reopened);
+    let _ = std::fs::remove_dir_all(&log.dir);
+}
+
+/// A checkpoint that fails is not attempted again by every commit: each
+/// attempt writes the whole state. The next one waits until the log has
+/// grown by the checkpoint threshold again.
+#[test]
+fn log_does_not_retry_a_failed_checkpoint_at_every_commit() {
+    const THRESHOLD: u64 = 8 * 1024;
+    let dir = temp_dir("checkpoint-retry");
+    let path = dir.join("store.sqlite");
+    let limits = Limits {
+        payload_bytes: mqttiumd_contract::capacity::PayloadBytes::new(1024 * 1024),
+        references: mqttiumd_contract::capacity::References::new(256),
+        exchange_slots: mqttiumd_contract::capacity::ExchangeSlots::new(128),
+        receipt_slots: mqttiumd_contract::capacity::ReceiptSlots::new(256),
+        ..fixture_limits()
+    };
+    let mut world = World::with_limits(
+        &|incarnation, lim| {
+            LogStore::open_or_create(&path, incarnation, lim, None, false).expect("log")
+        },
+        limits,
+    );
+    world.store.set_checkpoint_bytes(THRESHOLD);
+    let mut sequence = 0u64;
+    let mut admit = |world: &mut World<LogStore>| {
+        sequence += 1;
+        let packet_id = u16::try_from(sequence).expect("small");
+        let command = world.admission(sequence, packet_id, &[0x5a; 1024], &[world.b]);
+        assert!(world.store.apply(&command).committed_now, "{sequence}");
+    };
+
+    // The checkpoint file cannot be replaced: every attempt fails.
+    std::fs::remove_file(&path).expect("remove the checkpoint");
+    std::fs::create_dir(&path).expect("a directory in the way of the checkpoint");
+    while world.store.wal_len() < THRESHOLD {
+        admit(&mut world);
+    }
+    let at_failure = world.store.wal_len();
+
+    std::fs::remove_dir(&path).expect("the way is free again");
+    admit(&mut world);
+    assert!(
+        world.store.wal_len() > at_failure,
+        "the commit after a failed checkpoint attempts another one"
+    );
+    for _ in 0..32 {
+        if world.store.wal_len() < at_failure {
+            break;
+        }
+        admit(&mut world);
+    }
+    assert!(
+        world.store.wal_len() < at_failure,
+        "the checkpoint is attempted again once the log has grown"
+    );
+    let expected = world.store.snapshot().expect("state");
+    drop(world);
+    let reopened = LogStore::open_or_create(&path, StoreIncarnation::new(9), limits, None, true)
+        .expect("the log opens");
+    assert_eq!(reopened.snapshot().unwrap(), expected);
     drop(reopened);
     let _ = std::fs::remove_dir_all(&dir);
 }

@@ -275,6 +275,41 @@
       "sha256": "e9528d104f839803a7abcc3080e797c06805ab2c126ec7307a280c7bdfe784cb"
     },
     {
+      "decision": "0051",
+      "path": "docs/decisions/0051-core-scaling-indexed-routing-and-credits.md",
+      "sha256": "4e38a897f192e8ae71d1ff85e02785d6bdee3ac7e868d75c2f4c4138ba9183b5"
+    },
+    {
+      "decision": "0052",
+      "path": "docs/decisions/0052-volatile-store-and-periodic-snapshot.md",
+      "sha256": "ecd059ea1ef834f45c23fe329660b58051ddfc7faee4c848b39aabb382757151"
+    },
+    {
+      "decision": "0053",
+      "path": "docs/decisions/0053-publish-properties.md",
+      "sha256": "ebc7ade8162ad03c610e0a605af7fcceacbe22abfe52fa5743f9a4bd5642266c"
+    },
+    {
+      "decision": "0054",
+      "path": "docs/decisions/0054-mosquitto-config-subset.md",
+      "sha256": "3c8fa330c1fdc80f07709ce49d3055c6b869496676d4a0f2fb10ba61c495d95f"
+    },
+    {
+      "decision": "0055",
+      "path": "docs/decisions/0055-logstore-append-only-wal.md",
+      "sha256": "f260b49de5e54614a591c22f24ff76b56cd17dd640a836b56ea6a12204ecb10a"
+    },
+    {
+      "decision": "0056",
+      "path": "docs/decisions/0056-claimed-publication-and-core-optimizations.md",
+      "sha256": "0bef6f10fe06c05b4effd49b7bfcaecbdb9b1f8f6c07e6c597448588c350d99d"
+    },
+    {
+      "decision": "0057",
+      "path": "docs/decisions/0057-flatmap-direct-volatile-and-zero-alloc-framing.md",
+      "sha256": "61dbaf6953cf591860a7754bd4bebe4326d8c81c4aae036a7762b454c5ac81f5"
+    },
+    {
       "decision": "0058",
       "path": "docs/decisions/0058-client-disconnect-reasons-and-tls-close-notify.md",
       "sha256": "551cc01f0ca55e74ff6d6b8caa2222c0ef51237a0dfdba240b3010bdac114f37"
@@ -303,6 +338,16 @@
       "decision": "0063",
       "path": "docs/decisions/0063-qos0-paced-per-connection.md",
       "sha256": "28466068ad14541167db64d7f62280f177877380c19509df1d500b97afb108c6"
+    },
+    {
+      "decision": "0064",
+      "path": "docs/decisions/0064-lot8-direct-dispatch-compact-state-and-wal-safety.md",
+      "sha256": "ca76fee4379fc8dce4b1520fff0087023649276f695d47c8976adb8a69006bf4"
+    },
+    {
+      "decision": "0065",
+      "path": "docs/decisions/0065-lot9-refusals-fairness-and-atomic-fanout.md",
+      "sha256": "946b1753ba52a71ab8e7f08ffca19c1ab6903313c6d99798cde4f39782eefea7"
     }
   ],
   "entries": [

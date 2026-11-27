@@ -4,6 +4,136 @@ Status: **Proposed** (25 November 2026). Applied to `mqttiumd-core`, `mqttiumd-s
 
 This record introduces no wire-format changes, no SQLite schema changes (Schema 14/15 unchanged), no `.mlog` record changes, and no new `Recipe` variants (`Recipe` kinds `0..=25` unchanged). `crates/mqttiumd-contract/src/capacity.rs` and all files hashed in `proofs/credits/BODY.sha256` remain byte-for-byte unchanged (`71378725…`), pure crates keep `#![no_std]` + `alloc` and `#![forbid(unsafe_code)]`, the pure-crate boundary suite passes (`17/17`), and the contract digest reported by `mqttiumd-lab validate --contracts contracts/v1` remains unchanged (`sha256:21e96cc81c1f48d59841d8424fee2290102c6782b025222f2d6d2fe72ccf9bb5`).
 
+## Relation to record 0044, and what the code does not meet (added 26 November 2026)
+
+Added by the validation of the lot 10 head (`9dfd568`, report 0043). With
+`K = 0`, the default, the runtime is the one of record 0044 (accepted).
+With `K >= 1` this record departs from it in three places, and it does
+not amend it: the owner decides whether it does.
+
+- 0044 keeps "the single logical owner for version 0.1" and leaves
+  partitioned owners (ARC-001) to a later decision. This record brings
+  them, as an option.
+- 0044 says "no loop polls on a timer for work". A delivery shard waits
+  at most `IDLE_TICK` (20 ms), and 1 ms while its outbox holds an effect
+  its sink refused, and dispatches again at each wake.
+- 0044 keeps "no wait on a full remote queue" from ARC-021. The
+  coordinator sends to a shard with a blocking send (`ShardPool::send_to`):
+  a shard that does not empty its channel stops the ingress plane.
+
+Statements of this record the code does not meet, kept below as written:
+
+- "Coordinator emits ... without blocking on delivery shards" (Context,
+  item 2): see the blocking send above.
+- "`SUBACK` before retained replay": the deferral of `NotifyDirty` did
+  not cover a read the shard had already started, the one it makes when
+  a session attaches. The store could answer it after the commit of the
+  SUBSCRIBE that follows the CONNACK, and the shard then queued the
+  retained replay before the coordinator queued the SUBACK
+  (`tests/delivery_shards.rs` failed about once in 25 runs). Fixed the
+  same day: a shard's frames wait for every SUBACK owed to their
+  connection (`a_shard_frame_does_not_overtake_the_suback_of_its_connection`).
+  MQTT 3.8.4 lets a server send matching PUBLISH packets before the
+  SUBACK; this order is the product's, kept equal to that of `K = 0` and
+  of the reference broker.
+- "`K = 0` preserves the exact Lot 9 path": reports 0040 and 0041 give
+  different `K = 0` figures, and `ConnCore` carries the shard route of
+  every connection whatever `K`.
+- The contract digest it quotes (`21e96cc8...`) is not the one `validate`
+  printed at `9dfd568` (`cdd2b28f...`).
+- Report 0041, which it cites for its figures, measured a commit 47
+  commits older than `9dfd568` with a load generator that could write
+  past its buffer (fixed by `675128d`), single runs, against an unpinned
+  Mosquitto 2.1.2 holding its state in memory while mqttiumd synchronised
+  a log. Its volatile `fanin-32x1-q1` row goes from 0.04 ms at `K = 0` to
+  365 ms at `K = 2` (p50); this record does not mention it.
+
+The mode stays experimental until the defects and suspects listed in
+`docs/reception/open-conditions.md` are closed and the coordinator and
+shard protocol has a model. The inline-claim lease and its barrier have
+one since the third part below; the owner decides when the mode leaves
+"experimental".
+
+### Corrected since (lot 3 of the validation, first part)
+
+Each by a test committed while it failed, then the fix:
+
+- A shard thread runs its loop under `catch_unwind`; a panic is reported
+  to the coordinator as the fault `delivery_shard_panicked` and the broker
+  stops, instead of leaving the shard's sessions without deliveries.
+- The stop of a shard is a flag, read when its lane is empty, instead of
+  a message a full lane could drop. The shard still ends without applying
+  acknowledgements it received and had not applied; their deliveries are
+  sent again on the next connection.
+- A shard releases the reactors' wake-ups before it waits, as
+  `Runtime::turn` does; the fairness model reactor-wake assumes now holds
+  for every holder.
+- A connection the shards cannot attach (no session revision, or a second
+  attach of one generation) is closed with a reason that names the cause.
+- A shard keeps at most `PENDING_QOS0_LIMIT` (4,096) delegated QoS 0
+  deliveries its core cannot take yet, and sheds the next ones with the
+  journal entry the core gives a QoS 0 its volatile queue cannot hold.
+- The count of claims in flight on a lease never wraps below zero.
+- The route of a connection to its shard is boxed: a connection without
+  shards pays a pointer for it, not 112 bytes.
+- The readiness line ends with `delivery_shards=K experimental`.
+
+Second part, each by a failing test first:
+
+- A shard's claims avoid the packet identifiers the coordinator reserved
+  in the lease: at each dirty message the shard gives its core the lease's
+  bits, and `Deliveries::free_packet_id` picks beside them. Before, a dirty
+  notification sent while an inline claim was pending made the shard
+  claim with the reserved identifier (suspect S1).
+- A shard publishes no lease while an inline claim committed for the
+  session waits to be applied; its identifier was missing from the bitmap
+  it published, and the coordinator could reserve it again (suspect B2).
+- A claim committed just before the detach of its generation is not
+  written to the closed generation and leaves nothing behind (suspect S2,
+  a witness: no defect).
+
+Third part, each by a failing test first (report 0046), and checked by
+the model `models/inline-lease`:
+
+- A stored target of a committed admission is notified after the
+  coordinator's step of the commit, on the store's answer and on a
+  resolution alike. Before, the step marked the lease dirty after the
+  notification and nothing sent that mark: after one publication admitted
+  without an inline claim the coordinator never claimed inline for that
+  subscriber again; and a stored publication committed by a resolution
+  was never delivered.
+- A committed inline claim is held while an inline admission of its
+  session has an unknown outcome, and the held claims are handed over in
+  order before the session's barrier. Before, the subscriber could
+  receive the later publication first (suspect B1).
+- A shard does not read a session the coordinator may still owe a
+  committed claim: not after a dirty message without sequence, and not
+  before the claims that came before a barrier are applied; such a
+  session is not ready work meanwhile. Before, a read during an unknown
+  outcome took the claim's committed row and the subscriber received it
+  twice.
+- With that fence the first item of the second part is withdrawn: the
+  shard's claims no longer look at the coordinator's reserved
+  identifiers, which no longer exist when it claims. The second item
+  stays.
+- A connection without acknowledgement credit reads one packet: one that
+  needs no credit goes on, an acknowledgement waits in the task for
+  credit and what follows it waits behind it.
+- The shard's QoS 0 drop entry names its origin as the coordinator's
+  does; a journal entry the shard cannot write stops the broker, as at
+  the coordinator; a PUBREL's binding is checked and bounded as there.
+
+**The coordinator's send to a shard stays blocking, for a reason.** A
+shard waits only for a bounded time and empties its lane at each pass,
+moving what it cannot serve yet into queues that are now bounded by
+shedding, not by refusing the lane; a shard that dies is reported (first
+item above), and the send then fails instead of waiting. The send can
+therefore wait only while a live shard is between two passes. Bounding
+the shard by leaving its lane full instead would turn into a cycle: the
+coordinator waits for the shard, the shard for the store worker, and the
+worker, which takes no request while a reply lane is full, for the
+coordinator.
+
 ## Context
 
 In Lot 9 (record [0065](0065-lot9-refusals-fairness-and-atomic-fanout.md), report [0040](../reports/0040-lot9-arm64-fairness-fanout-and-sharding.md)), ARM64 `perf` profiling after atomic `1:N` `Recipe::MultiClaimedPublication` showed that the single `Owner` thread consumed **100 % of 1 core** (`65–92 %` of all broker CPU) on high fan-out (`fanout-1x16`) and high-concurrency (`128p`) workloads, while `log-writer` used only `~22–24 %` and the two I/O reactor threads combined used `~8–20 %`. Roughly `70–75 %` of the single Owner thread's CPU on `1:16` fan-out was pure recipient-side work (`EmitPublish`, `ObservedPuback`, `FinishDelivery`, `Deliveries` index maintenance, and `LoadWork` pagination).

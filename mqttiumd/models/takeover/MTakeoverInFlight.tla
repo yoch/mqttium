@@ -4,8 +4,16 @@
 (* are in flight on its previous connection, as written in                 *)
 (* crates/mqttiumd/src/runtime.rs (`connect`, `start_takeover`,            *)
 (* `pump_will_connects`, `close`, `finish_close`, `collect_written`),      *)
-(* net.rs (`Control::stop`, `Connection::close`, `Lanes::finish`) and      *)
-(* crates/mqttiumd-core/src/owner.rs (`plan_frame_result`).                *)
+(* net.rs (`ConnCore::stop`, `Connection::close`,                          *)
+(* `ConnCore::finish_task`) and crates/mqttiumd-core/src/owner.rs          *)
+(* (`plan_frame_result`).                                                  *)
+(*                                                                         *)
+(* Scope: the product run with the single owner (`--delivery-shards 0`).   *)
+(* The coordinator is the only producer of frames and the only consumer    *)
+(* of receipts. With `--delivery-shards K`, K >= 1, a shard also writes    *)
+(* to the old connection and reads the receipts of its own writes, and     *)
+(* `finish_close` returns until the task has finished and the shard has    *)
+(* detached the session: none of that is here.                             *)
 (*                                                                         *)
 (* Generation 1 is the connection the session is bound to, generation 2    *)
 (* the one that takes it over. A frame belongs to the generation it was    *)
@@ -14,35 +22,42 @@
 (*   - `start_takeover` marks the old peer `closing`: it gets no new       *)
 (*     frame. Its close follows (at once for MQTT 3.1.1, after the         *)
 (*     DISCONNECT or the 300 ms bound for MQTT 5).                         *)
-(*   - `Connection::close` is `Control::stop` on the core thread, three    *)
+(*   - `Connection::close` is `ConnCore::stop` on the core thread, three   *)
 (*     steps the task may interleave: `cancelled` is set, the socket is    *)
 (*     shut down, and only then the terminal reason is recorded.           *)
 (*   - With Deferred (a TLS connection) `Connection::close` only sets      *)
 (*     `cancelled`: the task owns the state that seals close_notify, so    *)
 (*     it shuts the socket and records the reason when it ends, and        *)
 (*     `Runtime::close` leaves the peer in the table until `is_finished`.  *)
-(*   - The task checks `cancelled` and then writes; a write on a socket    *)
-(*     that is shut down fails. A task that ends runs `Lanes::finish`.     *)
+(*   - The plain task checks `cancelled` and then writes; a write on a     *)
+(*     socket that is shut down fails. The TLS task reads `cancelled`      *)
+(*     only at the start of a turn. A task that ends runs                  *)
+(*     `ConnCore::finish_task`: the output queue is sealed and emptied     *)
+(*     under its lock, then the terminal receipts are offered under the    *)
+(*     lock of the lanes.                                                  *)
 (*   - `finish_close` gives Failed to every frame the old generation       *)
 (*     still has in `Runtime::frames`, queues ConnectionClosed and         *)
-(*     removes the peer; its lanes are not read again.                     *)
+(*     removes the peer; its lanes are not read again. With the single     *)
+(*     owner it is one step of the core thread.                            *)
 (*   - `pump_will_connects` starts the open of the new generation only     *)
 (*     once the old peer is removed.                                       *)
 (*   - The owner ends a connection on a Failed result only when the        *)
 (*     result names the generation the session is bound to.                *)
 (*                                                                         *)
 (* The owner takes its inputs from several lanes whose relative order the  *)
-(* model does not fix: `inbox` is a set. `Lanes::reports`, Started and     *)
-(* NotStarted are in MTransportCredit; the DISCONNECT of MQTT 5, the Will  *)
-(* barrier and the store are not here. The history of the verifier         *)
-(* (prefix h) is read by no guard.                                         *)
+(* model does not fix: `inbox` is a set. `StalledState::reports`, Started, *)
+(* NotStarted and the writes that carry several frames are in              *)
+(* MTransportCredit; the DISCONNECT of MQTT 5 and the seal it puts on the  *)
+(* output queue are in MDisconnectQueue; the Will barrier and the store    *)
+(* are not here. The history of the verifier (prefix h) is read by no      *)
+(* guard.                                                                  *)
 (***************************************************************************)
 EXTENDS Naturals, Sequences, FiniteSets
 
 CONSTANTS
     NumOld,     \* frames the core has for generation 1
     NumNew,     \* frames the core has for generation 2
-    OutSlots,   \* capacity of a frame lane
+    OutSlots,   \* capacity of an output queue
     WrittenCap, \* capacity of a receipt lane
     Preserve,   \* the core waits for the task's facts before it closes
     Deferred,   \* the task shuts its own socket: a TLS connection
@@ -84,14 +99,14 @@ VARIABLES
     inbox,      \* inputs queued for the owner
     binding,    \* Owner::connection_of(session)
     result,     \* per frame: the terminal result the owner applied
-    stopPc,     \* the core inside Control::stop: 0, or the step it is at
+    stopPc,     \* the core inside ConnCore::stop: 0, or the step it is at
     stopGen,    \* the generation it is stopping
-    recorded,   \* per generation: Control::terminal is set
-    cancelled,  \* per generation: Control::cancelled
+    recorded,   \* per generation: ToCoreState::terminal is set
+    cancelled,  \* per generation: ConnCore::cancelled
     shut,       \* per generation: the socket is shut down
-    out,        \* per generation: the frame lane
-    written,    \* per generation: the receipt lane
-    tpc,        \* per generation: the task, "run", "fin" or "done"
+    out,        \* per generation: OutgoingState::queue
+    written,    \* per generation: ToCoreState::written
+    tpc,        \* per generation: the task, "run", "fin", "sealed" or "done"
     active,     \* per generation: the frame in progress, or NoFrame
     phase,      \* per generation, of that frame: "new", "checked", "written"
     finished,   \* per generation: Link::finished
@@ -107,7 +122,7 @@ taskVars == <<tpc, active, phase, finished>>
 histVars == <<hForeignEnd, hWriteAfterBound, hWriteAfterRecord>>
 vars == <<coreVars, ownerVars, stopVars, ctlVars, out, written, taskVars, histVars>>
 
-\* The three steps of Control::stop, in order. RecordBeforeShutdown is
+\* The three steps of ConnCore::stop, in order. RecordBeforeShutdown is
 \* the order the function had before the socket was shut first. With
 \* Deferred the core takes the first step only: the flag.
 StopOrder ==
@@ -145,17 +160,18 @@ Init ==
 
 (***************************************************************************)
 (* The core thread. It does one thing at a time: no step below happens     *)
-(* while it is inside Control::stop.                                       *)
+(* while it is inside ConnCore::stop.                                      *)
 (***************************************************************************)
 
 \* Sink::try_submit: a frame goes to the peer of its generation only while
-\* that peer is not closing and the session is bound to it.
+\* that peer is not closing and the session is bound to it. The queue of a
+\* task that ended accepts nothing once `finish_task` has sealed it.
 CoreSubmit(f) ==
     LET g == GenOf(f) IN
     /\ Idle
     /\ f \notin submitted /\ \A e \in Of(g) : e < f => e \in submitted
     /\ g \in peers /\ ~closing[g] /\ binding = g
-    /\ Len(out[g]) < OutSlots /\ tpc[g] # "done"
+    /\ Len(out[g]) < OutSlots /\ tpc[g] \in {"run", "fin"}
     /\ out' = [out EXCEPT ![g] = Append(@, f)]
     /\ submitted' = submitted \cup {f}
     /\ pendingF' = pendingF \cup {f}
@@ -186,7 +202,7 @@ NewConnect ==
                    written, taskVars, histVars>>
 
 \* Runtime::close begins: the retire code is set and Connection::close
-\* enters Control::stop.
+\* enters ConnCore::stop.
 BeginClose(g) ==
     /\ Idle /\ g \in peers /\ ~retire[g]
     /\ retire' = [retire EXCEPT ![g] = TRUE]
@@ -229,13 +245,14 @@ CoreStopRecord ==
 
 \* finish_close: Failed for every frame the generation still has in the
 \* table, ConnectionClosed, and the peer leaves the table. With Preserve
-\* the core first waits for `is_finished` and reads the lane up to its
-\* first Failed. LeaveFramesAtClose removes the peer and leaves its
+\* the core closes at once only if reading the lane left the generation
+\* no frame; otherwise it waits for `is_finished` and reads the lane up to
+\* its first Failed. LeaveFramesAtClose removes the peer and leaves its
 \* frames. With Deferred the core waits for `is_finished` in every case:
 \* only then is the socket shut. DeferredWithoutWaiting does not wait.
 CoreFinishClose(g) ==
     /\ Idle /\ g \in peers /\ retire[g]
-    /\ Preserve => finished[g] /\ FactsRead(g)
+    /\ Preserve => pendingF \cap Of(g) = {} \/ (finished[g] /\ FactsRead(g))
     /\ (Deferred /\ Mutation # "DeferredWithoutWaiting") => finished[g]
     /\ peers' = peers \ {g}
     /\ LET left == pendingF \cap Of(g) IN
@@ -301,8 +318,8 @@ OwnerOpen ==
 (* The transport task of a generation, on its reactor thread.              *)
 (***************************************************************************)
 
-\* The task ends: `Driven::finish` runs Control::stop on its own thread,
-\* where no write of this task can interleave, then Lanes::finish. The
+\* The task ends: `Driven::finish` runs ConnCore::stop on its own thread,
+\* where no write of this task can interleave, then finish_task. The
 \* reason the task records is the one kept if the core has not recorded
 \* its own yet. A TLS task first attempts close_notify, which is not a
 \* frame and is not modelled.
@@ -319,10 +336,12 @@ TaskTake(g) ==
     /\ out' = [out EXCEPT ![g] = Tail(@)]
     /\ UNCHANGED <<coreVars, ownerVars, stopVars, ctlVars, written, tpc, finished, histVars>>
 
-\* `control.is_cancelled()` before the write of write_attempt.
+\* `is_cancelled()` before a write of the plain task (`output_turn`,
+\* `write_attempt`). The TLS task has no such check between the start of
+\* a turn and its writes: with Deferred the frame goes on.
 TaskCheck(g) ==
     /\ tpc[g] = "run" /\ active[g] # NoFrame /\ phase[g] = "new"
-    /\ IF cancelled[g]
+    /\ IF cancelled[g] /\ ~Deferred
        THEN End(g) /\ UNCHANGED phase
        ELSE phase' = [phase EXCEPT ![g] = "checked"] /\ UNCHANGED <<tpc, ctlVars>>
     /\ UNCHANGED <<coreVars, ownerVars, stopVars, out, written, active, finished, histVars>>
@@ -347,7 +366,7 @@ TaskReport(g) ==
     /\ active' = [active EXCEPT ![g] = NoFrame]
     /\ UNCHANGED <<coreVars, ownerVars, stopVars, ctlVars, out, tpc, phase, finished, histVars>>
 
-\* `control.is_cancelled()` at the start of a turn.
+\* `is_cancelled()` at the start of a turn.
 TaskCancelled(g) ==
     /\ tpc[g] = "run" /\ cancelled[g]
     /\ End(g)
@@ -359,26 +378,31 @@ TaskError(g) ==
     /\ End(g)
     /\ UNCHANGED <<coreVars, ownerVars, stopVars, out, written, active, phase, finished, histVars>>
 
-\* Lanes::finish, one receipt at a time: the receipt of the frame in
-\* progress (Complete if its bytes left, Failed otherwise), then Failed
-\* for each frame still in the lane. Each is offered once; the first
-\* refusal stops the loop. Then `retire` sets `Link::finished`.
-TaskFinish(g) ==
+\* finish_task, under the output lock: the queue is sealed and its frames
+\* are taken. They stay in `out` here, which nothing reads but TaskFinish.
+TaskSeal(g) ==
     /\ tpc[g] = "fin"
-    /\ LET f == IF active[g] # NoFrame THEN active[g]
-                ELSE IF out[g] # <<>> THEN Head(out[g]) ELSE NoFrame
-           kind == IF active[g] # NoFrame /\ phase[g] = "written" THEN "Complete" ELSE "Failed"
-       IN IF f = NoFrame \/ ~Room(g)
-          THEN /\ tpc' = [tpc EXCEPT ![g] = "done"]
-               /\ finished' = [finished EXCEPT ![g] = TRUE]
-               /\ active' = [active EXCEPT ![g] = NoFrame]
-               /\ out' = IF f # NoFrame /\ active[g] = NoFrame
-                         THEN [out EXCEPT ![g] = Tail(@)] ELSE out
-               /\ UNCHANGED written
-          ELSE /\ written' = [written EXCEPT ![g] = Append(@, [frame |-> f, kind |-> kind])]
-               /\ active' = [active EXCEPT ![g] = NoFrame]
-               /\ out' = IF active[g] = NoFrame THEN [out EXCEPT ![g] = Tail(@)] ELSE out
-               /\ UNCHANGED <<tpc, finished>>
+    /\ tpc' = [tpc EXCEPT ![g] = "sealed"]
+    /\ UNCHANGED <<coreVars, ownerVars, stopVars, ctlVars, out, written, active, phase,
+                   finished, histVars>>
+
+\* finish_task, under the lock of the lanes: the receipt of the frame in
+\* progress (Complete if its bytes left, Failed otherwise), then Failed
+\* for each frame taken from the queue, each offered once; what the lane
+\* has no room for is dropped. Then `retire` sets `Link::finished`.
+TaskFinish(g) ==
+    /\ tpc[g] = "sealed"
+    /\ LET first == IF active[g] = NoFrame THEN <<>>
+                    ELSE <<[frame |-> active[g],
+                            kind |-> IF phase[g] = "written" THEN "Complete" ELSE "Failed"]>>
+           all == first \o [i \in 1..Len(out[g]) |-> [frame |-> out[g][i], kind |-> "Failed"]]
+           room == WrittenCap - Len(written[g])
+       IN written' = [written EXCEPT ![g] =
+                         @ \o SubSeq(all, 1, IF room < Len(all) THEN room ELSE Len(all))]
+    /\ active' = [active EXCEPT ![g] = NoFrame]
+    /\ out' = [out EXCEPT ![g] = <<>>]
+    /\ tpc' = [tpc EXCEPT ![g] = "done"]
+    /\ finished' = [finished EXCEPT ![g] = TRUE]
     /\ UNCHANGED <<coreVars, ownerVars, stopVars, ctlVars, phase, histVars>>
 
 \* The end of a run: the second connection arrived, both peers are gone
@@ -412,6 +436,7 @@ Next ==
     \/ \E g \in Gens : TaskReport(g)
     \/ \E g \in Gens : TaskCancelled(g)
     \/ \E g \in Gens : TaskError(g)
+    \/ \E g \in Gens : TaskSeal(g)
     \/ \E g \in Gens : TaskFinish(g)
     \/ Quiescent
 
@@ -431,7 +456,8 @@ FairSpec ==
           /\ WF_vars(CoreCollect(g)) /\ WF_vars(CoreCloseDue(g))
           /\ WF_vars(CoreFinishClose(g))
           /\ WF_vars(TaskTake(g)) /\ WF_vars(TaskCheck(g)) /\ WF_vars(TaskWrite(g))
-          /\ WF_vars(TaskReport(g)) /\ WF_vars(TaskCancelled(g)) /\ WF_vars(TaskFinish(g))
+          /\ WF_vars(TaskReport(g)) /\ WF_vars(TaskCancelled(g))
+          /\ WF_vars(TaskSeal(g)) /\ WF_vars(TaskFinish(g))
 
 (***************************************************************************)
 (* Safety.                                                                 *)
@@ -449,7 +475,7 @@ TypeOK ==
     /\ recorded \in [Gens -> BOOLEAN] /\ cancelled \in [Gens -> BOOLEAN]
     /\ shut \in [Gens -> BOOLEAN] /\ finished \in [Gens -> BOOLEAN]
     /\ out \in [Gens -> Seq(Frames)] /\ written \in [Gens -> Seq(Receipts)]
-    /\ tpc \in [Gens -> {"run", "fin", "done"}]
+    /\ tpc \in [Gens -> {"run", "fin", "sealed", "done"}]
     /\ active \in [Gens -> Frames \cup {NoFrame}]
     /\ phase \in [Gens -> {"new", "checked", "written"}]
     /\ hForeignEnd \in BOOLEAN /\ hWriteAfterBound \in BOOLEAN

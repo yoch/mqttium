@@ -224,6 +224,18 @@ fn parse_arguments(args_iter: impl Iterator<Item = String>) -> Result<Config, St
                     }
                 }
             }
+            // Reached only when the guard of the option's own arm refused it.
+            "--db" | "--existing-db" => {
+                return Err("--db and --existing-db exclude each other".to_owned());
+            }
+            "--storage-mode"
+            | "--snapshot-interval"
+            | "--tls-cert"
+            | "--tls-key"
+            | "--client-ca"
+            | "--identities" => {
+                return Err(format!("{arg} is given more than once"));
+            }
             _ => return Err("unknown or unavailable option".to_owned()),
         }
     }
@@ -474,6 +486,47 @@ mod tests {
                 Some("unknown or unavailable option")
             );
         }
+    }
+
+    /// An option the parser knows but refuses here is named in the refusal,
+    /// not reported as unknown.
+    #[test]
+    fn a_known_option_refused_here_is_named() {
+        let refusal = |args: &[&str]| {
+            parse_arguments(args.iter().map(|arg| (*arg).to_owned()))
+                .err()
+                .unwrap_or_default()
+        };
+        assert_eq!(
+            refusal(&["--db", "a.sqlite", "--existing-db", "b.sqlite"]),
+            "--db and --existing-db exclude each other"
+        );
+        assert_eq!(
+            refusal(&["--existing-db", "a.sqlite", "--db", "b.sqlite"]),
+            "--db and --existing-db exclude each other"
+        );
+        for option in [
+            "--storage-mode",
+            "--snapshot-interval",
+            "--tls-cert",
+            "--tls-key",
+            "--client-ca",
+            "--identities",
+        ] {
+            let value = if option == "--snapshot-interval" {
+                "5"
+            } else {
+                "durable"
+            };
+            assert_eq!(
+                refusal(&["--db", "a.sqlite", option, value, option, value]),
+                format!("{option} is given more than once")
+            );
+        }
+        assert_eq!(
+            refusal(&["--db", "a.sqlite", "--no-such-option", "x"]),
+            "unknown or unavailable option"
+        );
     }
 
     #[test]

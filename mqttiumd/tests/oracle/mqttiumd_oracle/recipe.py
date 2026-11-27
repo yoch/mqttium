@@ -35,6 +35,8 @@ WIDE_RETAINED_PUBLICATION = 20
 WIDE_RETAINED_QOS0 = 21
 WIDE_RETAINED_WILL_PUBLICATION = 22
 ANNOTATED_PUBLICATION = 23
+CLAIMED_PUBLICATION = 24
+MULTI_CLAIMED_PUBLICATION = 25
 LEGACY_MAX_TARGETS = 16
 MAX_RETAINED_REPLAYS = 32_768
 MAX_RETAINED_TARGETS = 1_024
@@ -90,6 +92,29 @@ class Admit:
     targets: tuple
 
     kind = "AdmitPublication"
+
+
+@dataclass(frozen=True)
+class InlineClaim:
+    target_index: int
+    packet_id: int
+
+
+@dataclass(frozen=True)
+class ClaimedPublication:
+    """An admission and the claims of its QoS 1/2 targets made in the same
+    commit: one claim is kind 24, two or more are kind 25."""
+
+    admission: Admit
+    claims: tuple
+
+    @property
+    def kind(self) -> str:
+        return "ClaimedPublication" if len(self.claims) == 1 else "MultiClaimedPublication"
+
+    @property
+    def operation(self) -> tuple:
+        return self.admission.operation
 
 
 @dataclass(frozen=True)
@@ -614,6 +639,71 @@ def _nested(reader: _Reader, allowed: tuple[int, ...], *, target_limit: int = MA
     return decode(nested, _target_limit=target_limit)
 
 
+def _admission(reader: _Reader, target_limit: int | None) -> Admit:
+    """The body of an admission, shared by kinds 1, 24 and 25."""
+    operation, request, publication = reader.scoped(), reader.scoped(), reader.scoped()
+    session, revision = reader.number(8), reader.number(8)
+    packet_id, generation = reader.number(2), reader.number(8)
+    route_revision = reader.number(8)
+    qos, retain = reader.number(1), reader.number(1)
+    topic = reader.take(reader.number(2))
+    payload, length = reader.scoped(), reader.number(8)
+    costs = tuple(reader.number(8) for _ in range(4))
+    count = reader.number(2)
+    if target_limit is not None and count > target_limit:
+        raise RecipeError("invalid retained target count")
+    targets = tuple(
+        Target(
+            reader.number(8),
+            reader.number(8),
+            reader.number(4),
+            reader.number(1),
+            reader.number(1),
+        )
+        for _ in range(count)
+    )
+    if packet_id == 0 or qos > 2 or retain > 1:
+        raise RecipeError("invalid field")
+    return Admit(
+        operation,
+        request,
+        publication,
+        session,
+        revision,
+        packet_id,
+        generation,
+        route_revision,
+        qos,
+        bool(retain),
+        topic,
+        payload,
+        length,
+        costs,
+        targets,
+    )
+
+
+def _checked_claims(admission: Admit, claims: tuple, kind: int) -> tuple:
+    """The claims of a claimed publication, as the contract accepts them:
+    no retained admission, existing QoS 1/2 targets, and for kind 25 two
+    claims or more, in ascending order of target, one for each session."""
+    if admission.retain:
+        raise RecipeError("inline claim on a retained admission")
+    if kind == MULTI_CLAIMED_PUBLICATION and not 2 <= len(claims) <= len(admission.targets):
+        raise RecipeError("invalid inline claim count")
+    sessions = set()
+    previous = -1
+    for claim in claims:
+        if claim.target_index <= previous or claim.target_index >= len(admission.targets):
+            raise RecipeError("invalid inline claim target")
+        previous = claim.target_index
+        target = admission.targets[claim.target_index]
+        if target.effective_qos == 0 or claim.packet_id == 0 or target.session in sessions:
+            raise RecipeError("invalid inline claim")
+        sessions.add(target.session)
+    return claims
+
+
 def decode(data: bytes, *, _target_limit: int | None = None):
     """The recipe ``data`` holds, or ``RecipeError``."""
     reader = _Reader(data)
@@ -634,6 +724,8 @@ def decode(data: bytes, *, _target_limit: int | None = None):
                 EXPIRING_PUBLICATION,
                 WIDE_RETAINED_PUBLICATION,
                 WIDE_RETAINED_QOS0,
+                CLAIMED_PUBLICATION,
+                MULTI_CLAIMED_PUBLICATION,
             ),
             target_limit=MAX_RETAINED_TARGETS,
         )
@@ -743,46 +835,12 @@ def decode(data: bytes, *, _target_limit: int | None = None):
             raise RecipeError("invalid replay identity range")
         recipe = ReplaySubscriptions(update, first)
     elif kind == ADMIT_PUBLICATION:
-        operation, request, publication = reader.scoped(), reader.scoped(), reader.scoped()
-        session, revision = reader.number(8), reader.number(8)
-        packet_id, generation = reader.number(2), reader.number(8)
-        route_revision = reader.number(8)
-        qos, retain = reader.number(1), reader.number(1)
-        topic = reader.take(reader.number(2))
-        payload, length = reader.scoped(), reader.number(8)
-        costs = tuple(reader.number(8) for _ in range(4))
-        count = reader.number(2)
-        if _target_limit is not None and count > _target_limit:
-            raise RecipeError("invalid retained target count")
-        targets = tuple(
-            Target(
-                reader.number(8),
-                reader.number(8),
-                reader.number(4),
-                reader.number(1),
-                reader.number(1),
-            )
-            for _ in range(count)
-        )
-        if packet_id == 0 or qos > 2 or retain > 1:
-            raise RecipeError("invalid field")
-        recipe = Admit(
-            operation,
-            request,
-            publication,
-            session,
-            revision,
-            packet_id,
-            generation,
-            route_revision,
-            qos,
-            bool(retain),
-            topic,
-            payload,
-            length,
-            costs,
-            targets,
-        )
+        recipe = _admission(reader, _target_limit)
+    elif kind in (CLAIMED_PUBLICATION, MULTI_CLAIMED_PUBLICATION):
+        admission = _admission(reader, _target_limit)
+        count = 1 if kind == CLAIMED_PUBLICATION else reader.number(2)
+        claims = tuple(InlineClaim(reader.number(2), reader.number(2)) for _ in range(count))
+        recipe = ClaimedPublication(admission, _checked_claims(admission, claims, kind))
     elif kind == RELEASE_INBOUND:
         recipe = Release(reader.scoped(), reader.number(8), reader.number(2), reader.number(8))
         if recipe.packet_id == 0:

@@ -30,7 +30,12 @@ when:
   that must satisfy it;
 * the README of the directory has no correspondence table, or the table
   does not name every action of ``Next``, or a row does not say where the
-  action is replayed.
+  action is replayed;
+* the README names, as ``Type::member`` between backticks, a type that no
+  file under ``crates/`` defines, or a member that none declares. The check
+  is by name: it finds a model that still cites code which was renamed or
+  removed, and does not show that the member belongs to that type, nor that
+  the code does what the row says.
 
 ``invariants`` is a member of the sidecar entries of mqttiumd; the runner
 ignores it.
@@ -58,6 +63,7 @@ It uses the standard library only. TLC itself is run by the runner with
 
 from __future__ import annotations
 
+import functools
 import importlib.util
 import re
 import sys
@@ -65,6 +71,11 @@ from pathlib import Path
 
 MODELS = Path(__file__).resolve().parent
 REPOSITORY = MODELS.parents[1]
+CRATES = MODELS.parent / "crates"
+
+# Types of the standard library and of dependencies that a README names with
+# a member: they are not looked for under ``crates/``.
+EXTERNAL_TYPES = frozenset({"Shutdown", "TransactionBehavior"})
 
 _SPEC = importlib.util.spec_from_file_location(
     "run_tlc", REPOSITORY / "tools" / "formal" / "run_tlc.py"
@@ -113,6 +124,15 @@ _MODULE_HEADER = re.compile(r"^-{4,}\s*MODULE\s+(\w+)\s*-{4,}", re.MULTILINE)
 _OPERATOR = r"^{name}\s*(?:\([^)]*\))?\s*=="
 _DEFINITION = r"^{name}\s*==(.*?)(?=^\S|\Z)"
 _CORRESPONDENCE = re.compile(r"^## Correspondence\b.*?$(.*?)(?=^## |\Z)", re.MULTILINE | re.DOTALL)
+_CODE_SPAN = re.compile(r"`([^`\n]+)`")
+_CODE_PATH = re.compile(r"\b([A-Z][A-Za-z0-9]*)::([A-Za-z_][A-Za-z0-9_]*)")
+_TYPE = re.compile(r"\b(?:struct|enum|trait|type|union)\s+([A-Za-z_]\w*)")
+_MEMBER = re.compile(
+    r"\b(?:fn|const|static)\s+([A-Za-z_]\w*)"  # functions and constants
+    r"|^\s*(?:pub(?:\([^)]*\))?\s+)?([a-z_]\w*)\s*:"  # fields
+    r"|^\s*([A-Z]\w*)\s*(?:[({,=]|$)",  # variants
+    re.MULTILINE,
+)
 
 
 def read_config(text: str) -> dict[str, list[str]]:
@@ -183,6 +203,45 @@ def check_correspondence(directory: Path, module_text: str) -> list[str]:
         if action not in named:
             defects.append(
                 f"{directory.name}/README.md: the correspondence table does not name {action}"
+            )
+    return defects
+
+
+@functools.cache
+def code_names(crates: Path = CRATES) -> tuple[frozenset[str], frozenset[str]]:
+    """The types the crates define, and every name one of them declares as a
+    function, a constant, a field or a variant."""
+    types: set[str] = set()
+    members: set[str] = set()
+    for path in sorted(crates.rglob("*.rs")):
+        text = path.read_text(encoding="utf-8")
+        types.update(_TYPE.findall(text))
+        for found in _MEMBER.findall(text):
+            members.update(name for name in found if name)
+    return frozenset(types), frozenset(members)
+
+
+def check_code_names(directory: Path) -> list[str]:
+    """Every ``Type::member`` the README writes as code exists in the crates."""
+    readme = directory / "README.md"
+    if not readme.is_file():
+        return []
+    types, members = code_names()
+    defects = []
+    cited: set[tuple[str, str]] = set()
+    for span in _CODE_SPAN.findall(readme.read_text(encoding="utf-8")):
+        cited.update(_CODE_PATH.findall(span))
+    for owner, member in sorted(cited):
+        if owner in EXTERNAL_TYPES:
+            continue
+        if owner not in types:
+            defects.append(
+                f"{directory.name}/README.md: names {owner}::{member}; no type {owner} under crates/"
+            )
+        elif member not in members and member not in types:
+            defects.append(
+                f"{directory.name}/README.md: names {owner}::{member}; "
+                f"nothing under crates/ declares {member}"
             )
     return defects
 
@@ -353,6 +412,7 @@ def check_directory(directory: Path) -> list[str]:
         defects.append(f"{directory.name}/{name}: belongs to no sidecar")
     for name in sorted(claimed - present):
         defects.append(f"{directory.name}/{name}: named by a sidecar, does not exist")
+    defects.extend(check_code_names(directory))
     return defects
 
 

@@ -467,9 +467,9 @@ pub fn message_expiry_details(
     after: Option<mqttiumd_contract::ids::PublicationId>,
 ) -> serde_json::Value {
     json!({
-        "domain":hex_domain(now.domain),
-        "tick":now.tick.to_string(),
-        "after":after.map(|id|format!("{}/{}/{}/{}",id.incarnation().get(),id.epoch().get(),id.owner().get(),id.sequence().get())).unwrap_or_default()
+        "domain": hex_domain(now.domain),
+        "tick": now.tick.to_string(),
+        "after": after.map(|id|format!("{}/{}/{}/{}",id.incarnation().get(),id.epoch().get(),id.owner().get(),id.sequence().get())).unwrap_or_default(),
     })
 }
 pub fn limits() -> Limits {
@@ -652,7 +652,15 @@ pub enum Response {
 }
 pub fn collection_details(collection: ReceiptCollection) -> serde_json::Value {
     let closure = collection.closure;
-    json!({"incarnation":closure.origin.incarnation.get().to_string(),"epoch":closure.origin.epoch.get().to_string(),"owner":closure.origin.owner.get().to_string(),"through":closure.through.get().to_string(),"publication_through":closure.publication_through.get().to_string(),"payload_through":closure.payload_through.get().to_string(),"limit":collection.limit})
+    json!({
+        "incarnation": closure.origin.incarnation.get().to_string(),
+        "epoch": closure.origin.epoch.get().to_string(),
+        "owner": closure.origin.owner.get().to_string(),
+        "through": closure.through.get().to_string(),
+        "publication_through": closure.publication_through.get().to_string(),
+        "payload_through": closure.payload_through.get().to_string(),
+        "limit": collection.limit,
+    })
 }
 
 pub fn returned_closure_details(
@@ -940,19 +948,14 @@ impl Writer {
                 StorageMode::Volatile { .. } => "volatile-writer".into(),
             })
             .spawn(move || -> Result<(), Failure> {
-                let (mut store, boot) = match bootstrap_bound(
-                    &path,
-                    clock,
-                    policy,
-                    require_existing,
-                    storage_mode,
-                ) {
-                    Ok(value) => value,
-                    Err(error) => {
-                        let _ = btx.send(Err(error));
-                        return Ok(());
-                    }
-                };
+                let (mut store, boot) =
+                    match bootstrap_bound(&path, clock, policy, require_existing, storage_mode) {
+                        Ok(value) => value,
+                        Err(error) => {
+                            let _ = btx.send(Err(error));
+                            return Ok(());
+                        }
+                    };
                 worker_has_expiring.store(store.has_expiring_publications(), Ordering::Release);
                 if btx.send(Ok(boot)).is_err() {
                     return Ok(());
@@ -975,11 +978,13 @@ impl Writer {
                 let mut members: Vec<Member> = Vec::with_capacity(group);
                 let mut deferred_reads: Vec<(usize, EffectId, Effect)> = Vec::new();
                 let mut shard_rr: usize = 0;
-                #[cfg(feature="test-hooks")]
+                #[cfg(feature = "test-hooks")]
                 let mut duplicate_control: Option<ControlResponse> = None;
                 loop {
-                    #[cfg(feature="test-hooks")]
-                    if replay_controls(&mut store,&state,&hooks,&events).is_err() { cancel.store(true,Ordering::Relaxed); }
+                    #[cfg(feature = "test-hooks")]
+                    if replay_controls(&mut store, &state, &hooks, &events).is_err() {
+                        cancel.store(true, Ordering::Relaxed);
+                    }
                     // A reply lane an owner has not drained is retried on a
                     // short timer; nothing else in this loop waits on a timer.
                     let mut stalled = false;
@@ -1044,49 +1049,99 @@ impl Writer {
                     }
                     // Even a completely unread ordinary result lane cannot prevent
                     // a reserved receipt closure from committing and replying.
-                    #[cfg(feature="test-hooks")]
+                    #[cfg(feature = "test-hooks")]
                     if lanes[0].pending_control.is_none() {
                         lanes[0].pending_control = duplicate_control.take();
                     }
+                    // The reserved lane does not wait for the business lane:
+                    // every control request queued now is served in this pass
+                    // and its answer handed over at once. An answer the owner
+                    // has no room for waits in `pending_control` and stops the
+                    // lane until the next pass.
                     for (idx, lane) in lanes.iter_mut().enumerate() {
-                        if lane.closed || lane.pending_control.is_some() {
-                            continue;
-                        }
-                        match lane.crx.try_recv() {
-                            Ok(request) => {
-                                let reply = control_response(
-                                    &mut store, request, &events, &hooks, &cancel, &mut state,
-                                );
-                                worker_has_expiring.store(
-                                    store.has_expiring_publications(),
-                                    Ordering::Release,
-                                );
-                                #[cfg(feature="test-hooks")]
-                                if idx == 0 {
-                                    if let ControlResponse::Collected { collection, result:Ok(ReceiptCollectionReply::Applied { .. }),.. } = &reply
-                                        && hooks.directory.as_ref().is_some_and(|d| consume_file(&d.join("duplicate-close-result"))) {
-                                        let _ = events.emit("receipt_collection_result_duplicated",json!({"command_kind":"ReceiptCollection","details":collection_details(*collection)}));
-                                        duplicate_control = Some(reply.clone());
-                                    }
-                                    if let ControlResponse::MessageExpiry { now, after, result:Ok(_),.. } = &reply
-                                        && hooks.directory.as_ref().is_some_and(|d| consume_file(&d.join("duplicate-next-message-expire-result"))) {
-                                        let _ = events.emit("message_expiry_result_duplicated",json!({"details":message_expiry_details(*now,*after)}));
-                                        duplicate_control = Some(reply.clone());
-                                    }
-                                }
-                                lane.pending_control = Some(reply);
-                                any_control_pending = true;
+                        for _ in 0..CONTROL_QUEUE {
+                            if lane.closed || lane.pending_control.is_some() {
+                                break;
                             }
-                            Err(TryRecvError::Empty) => {}
-                            Err(TryRecvError::Disconnected) => {
-                                if idx == 0 {
-                                    return if stopping {
-                                        stop_result
-                                    } else {
-                                        store.maybe_snapshot(&events, true)
-                                    };
+                            match lane.crx.try_recv() {
+                                Ok(request) => {
+                                    let reply = control_response(
+                                        &mut store, request, &events, &hooks, &cancel, &mut state,
+                                    );
+                                    worker_has_expiring.store(
+                                        store.has_expiring_publications(),
+                                        Ordering::Release,
+                                    );
+                                    #[cfg(feature = "test-hooks")]
+                                    if idx == 0 {
+                                        if let ControlResponse::Collected {
+                                            collection,
+                                            result: Ok(ReceiptCollectionReply::Applied { .. }),
+                                            ..
+                                        } = &reply
+                                            && hooks.directory.as_ref().is_some_and(|d| {
+                                                consume_file(&d.join("duplicate-close-result"))
+                                            })
+                                        {
+                                            let _ = events.emit(
+                                                "receipt_collection_result_duplicated",
+                                                json!({
+                                                    "command_kind": "ReceiptCollection",
+                                                    "details": collection_details(*collection),
+                                                }),
+                                            );
+                                            duplicate_control = Some(reply.clone());
+                                        }
+                                        if let ControlResponse::MessageExpiry {
+                                            now,
+                                            after,
+                                            result: Ok(_),
+                                            ..
+                                        } = &reply
+                                            && hooks.directory.as_ref().is_some_and(|d| {
+                                                consume_file(
+                                                    &d.join("duplicate-next-message-expire-result"),
+                                                )
+                                            })
+                                        {
+                                            let _ = events.emit(
+                                                "message_expiry_result_duplicated",
+                                                json!({
+                                                    "details": message_expiry_details(*now,*after),
+                                                }),
+                                            );
+                                            duplicate_control = Some(reply.clone());
+                                        }
+                                    }
+                                    match lane.cctx.try_send(reply) {
+                                        Ok(()) => lane.wake.wake(),
+                                        Err(TrySendError::Full(reply)) => {
+                                            lane.pending_control = Some(reply);
+                                            any_control_pending = true;
+                                        }
+                                        Err(TrySendError::Disconnected(_)) => {
+                                            if idx == 0 {
+                                                return if stopping {
+                                                    stop_result
+                                                } else {
+                                                    store.maybe_snapshot(&events, true)
+                                                };
+                                            }
+                                            lane.closed = true;
+                                        }
+                                    }
                                 }
-                                lane.closed = true;
+                                Err(TryRecvError::Empty) => break,
+                                Err(TryRecvError::Disconnected) => {
+                                    if idx == 0 {
+                                        return if stopping {
+                                            stop_result
+                                        } else {
+                                            store.maybe_snapshot(&events, true)
+                                        };
+                                    }
+                                    lane.closed = true;
+                                }
                             }
                         }
                     }
@@ -1145,68 +1200,72 @@ impl Writer {
                             let shard_count = lane_count - 1;
                             let coord_reserve = (group / 8).clamp(8, 64).min(group);
                             let shard_budget = group.saturating_sub(coord_reserve);
-                            let drain_shards = |lanes: &mut [OwnerLane],
-                                                members: &mut Vec<Member>,
-                                                deferred_reads: &mut Vec<(usize, EffectId, Effect)>,
-                                                other: &mut Option<NonGroupItem>,
-                                                limit: usize,
-                                                start: usize| {
-                                while members.len() < limit
-                                    && deferred_reads.len() < group
-                                    && other.is_none()
-                                {
-                                    let mut made_progress = false;
-                                    for step in 0..shard_count {
-                                        if members.len() >= limit
-                                            || deferred_reads.len() >= group
-                                            || other.is_some()
-                                        {
-                                            break;
-                                        }
-                                        let idx = 1 + ((start + step) % shard_count);
-                                        if lanes[idx].closed {
-                                            continue;
-                                        }
-                                        match lanes[idx].rx.try_recv() {
-                                            Ok(Request::Effect(effect)) => {
-                                                made_progress = true;
-                                                match effect.into_parts() {
-                                                    (effect, Effect::Persist { command })
-                                                        if group > 1 =>
-                                                    {
-                                                        members.push(Member {
-                                                            owner_idx: idx,
-                                                            effect,
-                                                            command,
-                                                        });
-                                                    }
-                                                    (effect, work @ Effect::LoadWork { .. })
-                                                        if group > 1 =>
-                                                    {
-                                                        deferred_reads.push((idx, effect, work));
-                                                    }
-                                                    (effect, work) => {
-                                                        *other = Some((idx, Ok((effect, work))));
-                                                        break;
-                                                    }
-                                                }
-                                            }
-                                            Ok(request) => {
-                                                made_progress = true;
-                                                *other = Some((idx, Err(request)));
+                            let drain_shards =
+                                |lanes: &mut [OwnerLane],
+                                 members: &mut Vec<Member>,
+                                 deferred_reads: &mut Vec<(usize, EffectId, Effect)>,
+                                 other: &mut Option<NonGroupItem>,
+                                 limit: usize,
+                                 start: usize| {
+                                    while members.len() < limit
+                                        && deferred_reads.len() < group
+                                        && other.is_none()
+                                    {
+                                        let mut made_progress = false;
+                                        for step in 0..shard_count {
+                                            if members.len() >= limit
+                                                || deferred_reads.len() >= group
+                                                || other.is_some()
+                                            {
                                                 break;
                                             }
-                                            Err(TryRecvError::Empty) => {}
-                                            Err(TryRecvError::Disconnected) => {
-                                                lanes[idx].closed = true;
+                                            let idx = 1 + ((start + step) % shard_count);
+                                            if lanes[idx].closed {
+                                                continue;
+                                            }
+                                            match lanes[idx].rx.try_recv() {
+                                                Ok(Request::Effect(effect)) => {
+                                                    made_progress = true;
+                                                    match effect.into_parts() {
+                                                        (effect, Effect::Persist { command })
+                                                            if group > 1 =>
+                                                        {
+                                                            members.push(Member {
+                                                                owner_idx: idx,
+                                                                effect,
+                                                                command,
+                                                            });
+                                                        }
+                                                        (
+                                                            effect,
+                                                            work @ Effect::LoadWork { .. },
+                                                        ) if group > 1 => {
+                                                            deferred_reads
+                                                                .push((idx, effect, work));
+                                                        }
+                                                        (effect, work) => {
+                                                            *other =
+                                                                Some((idx, Ok((effect, work))));
+                                                            break;
+                                                        }
+                                                    }
+                                                }
+                                                Ok(request) => {
+                                                    made_progress = true;
+                                                    *other = Some((idx, Err(request)));
+                                                    break;
+                                                }
+                                                Err(TryRecvError::Empty) => {}
+                                                Err(TryRecvError::Disconnected) => {
+                                                    lanes[idx].closed = true;
+                                                }
                                             }
                                         }
+                                        if !made_progress {
+                                            break;
+                                        }
                                     }
-                                    if !made_progress {
-                                        break;
-                                    }
-                                }
-                            };
+                                };
                             drain_shards(
                                 &mut lanes,
                                 &mut members,
@@ -1259,10 +1318,16 @@ impl Writer {
                             }
                             shard_rr = (shard_rr + 1) % shard_count;
                         }
+                        #[cfg(feature = "test-hooks")]
+                        if !members.is_empty() || !deferred_reads.is_empty() || other.is_some() {
+                            hold_ordinary(&hooks);
+                        }
                         let idle_turn =
                             members.is_empty() && deferred_reads.is_empty() && other.is_none();
                         if !members.is_empty() {
-                            group_responses_into(&mut store, &members, &events, &cancel, &mut lanes);
+                            group_responses_into(
+                                &mut store, &members, &events, &cancel, &mut lanes,
+                            );
                             members.clear();
                             worker_has_expiring
                                 .store(store.has_expiring_publications(), Ordering::Release);
@@ -1787,11 +1852,27 @@ fn record_result(
                     will: Some(spec), ..
                 } => Some((
                     "will_installed",
-                    json!({"operation":operation(id),"will":operation(id),"details":{"topic_bytes":spec.topic.len(),"payload_bytes":spec.payload.len(),"authority":"durable_open_commit"}}),
+                    json!({
+                        "operation": operation(id),
+                        "will": operation(id),
+                        "details": {
+                            "topic_bytes": spec.topic.len(),
+                            "payload_bytes": spec.payload.len(),
+                            "authority": "durable_open_commit",
+                        },
+                    }),
                 )),
                 SessionAction::EndWill { guard, publish, .. } => Some((
                     "will_decided",
-                    json!({"operation":operation(id),"will":guard.opened_by.map(operation),"details":{"publish":publish,"session":guard.session.get().to_string(),"authority":"durable_end_commit"}}),
+                    json!({
+                        "operation": operation(id),
+                        "will": guard.opened_by.map(operation),
+                        "details": {
+                            "publish": publish,
+                            "session": guard.session.get().to_string(),
+                            "authority": "durable_end_commit",
+                        },
+                    }),
                 )),
                 _ => None,
             },
@@ -1803,7 +1884,16 @@ fn record_result(
                 })),
             ) => Some((
                 "will_admitted",
-                json!({"operation":operation(id),"will":operation(will),"details":{"publication":format!("{}/{}/{}/{}",publication.incarnation().get(),publication.epoch().get(),publication.owner().get(),publication.sequence().get()),"targets":value.targets.len(),"retained":value.live_retain.is_some(),"authority":"durable_admission_commit"}}),
+                json!({
+                    "operation": operation(id),
+                    "will": operation(will),
+                    "details": {
+                        "publication": format!("{}/{}/{}/{}",publication.incarnation().get(),publication.epoch().get(),publication.owner().get(),publication.sequence().get()),
+                        "targets": value.targets.len(),
+                        "retained": value.live_retain.is_some(),
+                        "authority": "durable_admission_commit",
+                    },
+                }),
             )),
             _ => None,
         };
@@ -1813,7 +1903,22 @@ fn record_result(
             cancel.store(true, Ordering::Relaxed);
         }
     }
-    if events.emit_with("store_result",||json!({"operation":operation(id),"command_kind":kind,"details":{"committed_now":applied.committed_now,"wrote":applied.wrote,"outcome":outcome_name(applied.reply)}})).is_err(){cancel.store(true,Ordering::Relaxed);}
+    if events
+        .emit_with("store_result", || {
+            json!({
+                "operation": operation(id),
+                "command_kind": kind,
+                "details": {
+                    "committed_now": applied.committed_now,
+                    "wrote": applied.wrote,
+                    "outcome": outcome_name(applied.reply),
+                },
+            })
+        })
+        .is_err()
+    {
+        cancel.store(true, Ordering::Relaxed);
+    }
 }
 
 /// One command of a group, the owner lane that submitted it, and the effect
@@ -1926,7 +2031,14 @@ fn effect_response(
             {
                 state.captured = Some(command.clone());
                 if let Some(a) = command.recipe.get().admission() {
-                    let _ = events.emit("receipt_replay_captured",json!({"command_kind":"Admission","operation":operation(id),"details":{"publication":identity_text(a.publication.incarnation().get(),a.publication.epoch().get(),a.publication.owner().get(),a.publication.sequence().get()),"payload":identity_text(a.payload.id.incarnation().get(),a.payload.id.epoch().get(),a.payload.id.owner().get(),a.payload.id.sequence().get())}}));
+                    let _ = events.emit("receipt_replay_captured",json!({
+                        "command_kind": "Admission",
+                        "operation": operation(id),
+                        "details": {
+                            "publication": identity_text(a.publication.incarnation().get(),a.publication.epoch().get(),a.publication.owner().get(),a.publication.sequence().get()),
+                            "payload": identity_text(a.payload.id.incarnation().get(),a.payload.id.epoch().get(),a.payload.id.owner().get(),a.payload.id.sequence().get()),
+                        },
+                    }));
                 }
             }
             #[cfg(feature = "test-hooks")]
@@ -2045,7 +2157,18 @@ fn effect_response(
             let reply = StoreReply::Outcome(store.resolve_and_fence(id).outcome);
             #[cfg(feature = "test-hooks")]
             let reply = hold_business_reply(state, hooks, id, "Resolution", reply, events);
-            if events.emit("store_resolved",json!({"operation":operation(id),"details":{"outcome":outcome_name(reply).to_ascii_lowercase()}})).is_err(){cancel.store(true,Ordering::Relaxed);}
+            if events
+                .emit(
+                    "store_resolved",
+                    json!({
+                        "operation": operation(id),
+                        "details": {"outcome": outcome_name(reply).to_ascii_lowercase()},
+                    }),
+                )
+                .is_err()
+            {
+                cancel.store(true, Ordering::Relaxed);
+            }
             Response::Store {
                 effect,
                 operation: id,
@@ -2075,10 +2198,13 @@ fn effect_response(
                             && hooks
                                 .barrier_fields(
                                     "work.read.before",
-                                    json!({"point":"work.read.before","details":{
-                                        "session":session.get().to_string(),
-                                        "effect":format!("{}/{}/{}",effect.epoch.get(),effect.owner.get(),effect.sequence.get())
-                                    }}),
+                                    json!({
+                                        "point": "work.read.before",
+                                        "details": {
+                                            "session": session.get().to_string(),
+                                            "effect": format!("{}/{}/{}",effect.epoch.get(),effect.owner.get(),effect.sequence.get()),
+                                        },
+                                    }),
                                     events,
                                     cancel,
                                 )
@@ -2168,7 +2294,14 @@ fn hold_business_reply(
             *held = Some(id);
         }
         if *held == Some(id) {
-            let _=events.emit("store_result_held",json!({"operation":operation(id),"command_kind":name,"details":{"outcome":outcome_name(reply),"source":kind}}));
+            let _ = events.emit(
+                "store_result_held",
+                json!({
+                    "operation": operation(id),
+                    "command_kind": name,
+                    "details": {"outcome": outcome_name(reply), "source": kind},
+                }),
+            );
             return StoreReply::Outcome(mqttiumd_contract::outcome::StoreOutcome::PendingOrUnknown);
         }
     }
@@ -2201,7 +2334,14 @@ fn hold_admission_reply(
         state.held_admission = Some(id);
     }
     if state.held_admission == Some(id) {
-        let _ = events.emit("store_result_held",json!({"operation":operation(id),"command_kind":"Admission","details":{"outcome":outcome_name(reply),"source":kind}}));
+        let _ = events.emit(
+            "store_result_held",
+            json!({
+                "operation": operation(id),
+                "command_kind": "Admission",
+                "details": {"outcome": outcome_name(reply), "source": kind},
+            }),
+        );
         StoreReply::Outcome(mqttiumd_contract::outcome::StoreOutcome::PendingOrUnknown)
     } else {
         reply
@@ -2378,7 +2518,39 @@ fn replay_controls(
             )) => format!("{reason:?}"),
             _ => String::new(),
         };
-        events.emit("receipt_replay_result",json!({"operation":operation(probe.recipe.operation()),"command_kind":"Admission","details":{"mode":mode,"outcome":outcome_name(applied.reply),"reason":reason,"business_changed":business_changed,"wrote":applied.wrote,"committed_now":applied.committed_now,"before_receipts":before.accounts.receipt_slots.get().to_string(),"after_receipts":after.accounts.receipt_slots.get().to_string(),"before_references":before.accounts.references.get().to_string(),"after_references":after.accounts.references.get().to_string(),"before_payload_bytes":before.accounts.payload_bytes.get().to_string(),"after_payload_bytes":after.accounts.payload_bytes.get().to_string(),"before_publications":before.publications.len(),"after_publications":after.publications.len(),"before_payloads":before.payloads.len(),"after_payloads":after.payloads.len(),"before_obligations":before.obligations.len(),"after_obligations":after.obligations.len(),"current_route_revision":before.route_revision.get().to_string(),"closure_through":frontier.through.get().to_string(),"publication_through":frontier.publication_through.get().to_string(),"payload_through":frontier.payload_through.get().to_string()}})).map_err(|_|Failure::plain("events_unavailable"))?;
+        events
+            .emit(
+                "receipt_replay_result",
+                json!({
+                    "operation": operation(probe.recipe.operation()),
+                    "command_kind": "Admission",
+                    "details": {
+                        "mode": mode,
+                        "outcome": outcome_name(applied.reply),
+                        "reason": reason,
+                        "business_changed": business_changed,
+                        "wrote": applied.wrote,
+                        "committed_now": applied.committed_now,
+                        "before_receipts": before.accounts.receipt_slots.get().to_string(),
+                        "after_receipts": after.accounts.receipt_slots.get().to_string(),
+                        "before_references": before.accounts.references.get().to_string(),
+                        "after_references": after.accounts.references.get().to_string(),
+                        "before_payload_bytes": before.accounts.payload_bytes.get().to_string(),
+                        "after_payload_bytes": after.accounts.payload_bytes.get().to_string(),
+                        "before_publications": before.publications.len(),
+                        "after_publications": after.publications.len(),
+                        "before_payloads": before.payloads.len(),
+                        "after_payloads": after.payloads.len(),
+                        "before_obligations": before.obligations.len(),
+                        "after_obligations": after.obligations.len(),
+                        "current_route_revision": before.route_revision.get().to_string(),
+                        "closure_through": frontier.through.get().to_string(),
+                        "publication_through": frontier.publication_through.get().to_string(),
+                        "payload_through": frontier.payload_through.get().to_string(),
+                    },
+                }),
+            )
+            .map_err(|_| Failure::plain("events_unavailable"))?;
     }
     Ok(())
 }
@@ -2407,7 +2579,19 @@ fn control_response(
                 let stop = cancel.clone();
                 let hook = Box::new(move |point| {
                     if point == mqttiumd_store_sqlite::kill_points::KillPoint::CommitPrepared
-                        && hc.barrier_fields("message.expire.prepared", json!({"point":"message.expire.prepared","command_kind":"MessageExpiry","details":message_expiry_details(now, after)}), &ev, &stop).is_err() {
+                        && hc
+                            .barrier_fields(
+                                "message.expire.prepared",
+                                json!({
+                                    "point": "message.expire.prepared",
+                                    "command_kind": "MessageExpiry",
+                                    "details": message_expiry_details(now, after),
+                                }),
+                                &ev,
+                                &stop,
+                            )
+                            .is_err()
+                    {
                         stop.store(true, Ordering::Relaxed);
                     }
                 });
@@ -2426,23 +2610,51 @@ fn control_response(
             if let Ok(sweep) = &result {
                 #[cfg(feature = "test-hooks")]
                 if (!sweep.removed.is_empty() || sweep.retained_removed > 0)
-                    && hooks.barrier_fields("message.expire.committed", json!({"point":"message.expire.committed","command_kind":"MessageExpiry","details":message_expiry_details(now, after)}), events, cancel).is_err() {
+                    && hooks
+                        .barrier_fields(
+                            "message.expire.committed",
+                            json!({
+                                "point": "message.expire.committed",
+                                "command_kind": "MessageExpiry",
+                                "details": message_expiry_details(now, after),
+                            }),
+                            events,
+                            cancel,
+                        )
+                        .is_err()
+                {
                     cancel.store(true, Ordering::Relaxed);
                 }
                 for removed in sweep.removed.as_slice() {
                     let publication = removed.delivery.publication;
-                    if events.emit("message_expiry_removed",json!({"details":{
-                        "source":"durable_commit","publication":format!("{}/{}/{}/{}",publication.incarnation().get(),publication.epoch().get(),publication.owner().get(),publication.sequence().get()),
-                        "index":removed.delivery.index,"target":removed.target.get().to_string()
-                    }})).is_err() { return ControlResponse::Failed(Failure::plain("events_unavailable")); }
+                    if events.emit("message_expiry_removed",json!({
+                        "details": {
+                            "source": "durable_commit",
+                            "publication": format!("{}/{}/{}/{}",publication.incarnation().get(),publication.epoch().get(),publication.owner().get(),publication.sequence().get()),
+                            "index": removed.delivery.index,
+                            "target": removed.target.get().to_string(),
+                        },
+                    })).is_err() { return ControlResponse::Failed(Failure::plain("events_unavailable")); }
                 }
                 let removed = sweep.removed.len();
                 if (removed != 0 || sweep.retained_removed > 0 || sweep.quarantined > 0)
-                    && events.emit("message_expiry_sweep", json!({"details":{
-                        "source":"durable_commit","domain":hex_domain(now.domain),"tick":now.tick.to_string(),
-                        "removed":removed,"retained_removed":sweep.retained_removed,
-                        "quarantined":sweep.quarantined,"more":sweep.more
-                    }})).is_err() {
+                    && events
+                        .emit(
+                            "message_expiry_sweep",
+                            json!({
+                                "details": {
+                                    "source": "durable_commit",
+                                    "domain": hex_domain(now.domain),
+                                    "tick": now.tick.to_string(),
+                                    "removed": removed,
+                                    "retained_removed": sweep.retained_removed,
+                                    "quarantined": sweep.quarantined,
+                                    "more": sweep.more,
+                                },
+                            }),
+                        )
+                        .is_err()
+                {
                     return ControlResponse::Failed(Failure::plain("events_unavailable"));
                 }
             }
@@ -2526,7 +2738,22 @@ fn control_response(
                 store.set_receipt_hook(Some(Box::new(move |point, current| {
                     let mut details = collection_details(current);
                     details["requested_limit"] = json!(collection.limit);
-                    if current.closure.through.get()!=0 && hc.barrier_fields(point.name(), json!({"point":point.name(),"command_kind":"ReceiptCollection","details":details}), &ev, &stop).is_err() { stop.store(true, Ordering::Relaxed); }
+                    if current.closure.through.get() != 0
+                        && hc
+                            .barrier_fields(
+                                point.name(),
+                                json!({
+                                    "point": point.name(),
+                                    "command_kind": "ReceiptCollection",
+                                    "details": details,
+                                }),
+                                &ev,
+                                &stop,
+                            )
+                            .is_err()
+                    {
+                        stop.store(true, Ordering::Relaxed);
+                    }
                 })));
             }
             let result = store
@@ -2604,6 +2831,24 @@ fn control_response(
 #[cfg(feature = "test-hooks")]
 fn consume_file(path: &Path) -> bool {
     path.exists() && std::fs::remove_file(path).is_ok()
+}
+/// A test run can hold the worker before each ordinary command it serves:
+/// while `hold-ordinary` exists the worker marks `held-ordinary` and waits
+/// for a `release-ordinary` token, which it consumes.
+#[cfg(feature = "test-hooks")]
+fn hold_ordinary(hooks: &Hooks) {
+    let Some(directory) = hooks.directory.as_ref() else {
+        return;
+    };
+    let held = directory.join("held-ordinary");
+    while directory.join("hold-ordinary").exists() {
+        let _ = std::fs::write(&held, b"");
+        if consume_file(&directory.join("release-ordinary")) {
+            break;
+        }
+        thread::sleep(Duration::from_millis(1));
+    }
+    let _ = std::fs::remove_file(&held);
 }
 #[cfg(feature = "test-hooks")]
 fn recipe_identity_highwater(recipe: &Recipe) -> Result<(u64, u64), Failure> {
@@ -3504,9 +3749,11 @@ mod tests {
                 })
                 .unwrap();
         }
-        let deadline = Instant::now() + Duration::from_secs(3);
+        // 65 durable commits: a loaded runner may take seconds. The wait
+        // ends as soon as they are visible.
+        let deadline = Instant::now() + Duration::from_secs(30);
         while SqliteStore::inspect(&db).unwrap().sessions.len() != 65 && Instant::now() < deadline {
-            thread::sleep(Duration::from_millis(1));
+            thread::sleep(Duration::from_millis(10));
         }
         let established = SqliteStore::inspect(&db).unwrap().sessions.len() == 65;
         let collection = ReceiptCollection {
@@ -3680,6 +3927,91 @@ mod tests {
                     mqttiumd_contract::session::SessionChange::Closed { .. }))) }))
                 if effect == close_effect && returned == close_operation),
             "reserved close must return its own committed result"
+        );
+    }
+    /// The reserved lane does not wait for the business lane: control
+    /// requests queued while an ordinary command commits are all answered
+    /// before the worker serves the next ordinary command.
+    #[cfg(feature = "test-hooks")]
+    #[test]
+    fn queued_control_requests_are_answered_before_the_next_ordinary_command() {
+        let path = std::env::temp_dir().join(format!(
+            "mqttiumd-control-drain-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let directory = path.join("hooks");
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(directory.join("hold-ordinary"), b"").unwrap();
+        let events = Events::open(&path.join("events.jsonl")).unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let hooks = Hooks {
+            directory: Some(directory.clone()),
+            pause: Vec::new(),
+        };
+        let mut writer =
+            Writer::spawn(path.join("store.sqlite"), events, hooks, cancel.clone()).unwrap();
+        writer
+            .boot
+            .recv_timeout(Duration::from_secs(3))
+            .unwrap()
+            .unwrap();
+        let session = |request: u64| Request::Session {
+            request,
+            client: SharedBytes::copy_from(format!("ordinary-{request}").as_bytes(), MAX_CLIENT)
+                .unwrap(),
+        };
+        // The first ordinary command is held before it commits.
+        writer.sender.send(session(1)).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !directory.join("held-ordinary").exists() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(1));
+        }
+        let held = directory.join("held-ordinary").exists();
+        // Three control requests and a second ordinary command wait behind it.
+        for connection in 1..=3 {
+            writer
+                .control_sender
+                .send(ControlRequest::WillBarrier {
+                    connection: ConnectionGeneration::new(connection),
+                    client: SharedBytes::copy_from(
+                        format!("client-{connection}").as_bytes(),
+                        MAX_CLIENT,
+                    )
+                    .unwrap(),
+                })
+                .unwrap();
+        }
+        writer.sender.send(session(2)).unwrap();
+        // The first command commits; the second is held in its turn.
+        std::fs::write(directory.join("release-ordinary"), b"").unwrap();
+        let mut answered = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while answered.len() < 3 && Instant::now() < deadline {
+            if let Ok(ControlResponse::WillBarrier { connection, .. }) = writer
+                .control_receiver
+                .recv_timeout(Duration::from_millis(50))
+            {
+                answered.push(connection.get());
+            }
+        }
+        // Cleanup before asserting: the worker is released either way.
+        let _ = std::fs::remove_file(directory.join("hold-ordinary"));
+        cancel.store(true, Ordering::Relaxed);
+        writer.sender.send(Request::Stop).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !writer.is_finished() && Instant::now() < deadline {
+            while writer.receiver.try_recv().is_ok() {}
+            while writer.control_receiver.try_recv().is_ok() {}
+            thread::sleep(Duration::from_millis(1));
+        }
+        writer.join_finished().unwrap();
+        let _ = std::fs::remove_dir_all(path);
+        assert!(held, "the first ordinary command was never held");
+        assert_eq!(
+            answered,
+            vec![1, 2, 3],
+            "control requests queued during an ordinary commit waited for the next one"
         );
     }
     #[test]

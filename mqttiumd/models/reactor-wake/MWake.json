@@ -1,7 +1,7 @@
 {
   "module": "MWake.tla",
   "status": "refinement",
-  "summary": "Wake (wake.rs), the signal the core thread and the store worker wait on: a producer publishes then swaps `pending` and notifies under the lock, the consumer re-checks `pending` under the lock before it blocks; no published value waits for the timeout, which the model does not contain.",
+  "summary": "Wake (wake.rs), the signal a thread of the runtime waits on: a producer publishes then swaps `pending` and notifies under the lock, the one consumer re-checks `pending` under the lock before it blocks; no published value waits for the timeout, which the model does not contain. Checked against the two waiters of the default single-owner runtime, the core thread and the store worker. With --delivery-shards K >= 1 each shard worker waits on a Wake of its own with the same loop; that loop was read and has no replay.",
   "issues": [648],
   "tests": ["mqttiumd/crates/mqttiumd/src/wake.rs"],
   "replays": [{"file": "mqttiumd/crates/mqttiumd/src/wake.rs", "test": "a_signal_raised_before_the_wait_is_consumed_without_waiting"}, {"file": "mqttiumd/crates/mqttiumd/src/wake.rs", "test": "a_signal_from_another_thread_ends_the_wait_early"}, {"file": "mqttiumd/crates/mqttiumd/src/wake.rs", "test": "no_published_item_waits_for_the_timeout"}],

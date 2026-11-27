@@ -1,6 +1,6 @@
 # Record 0054: Native `mosquitto.conf` subset reader and static checker
 
-Status: **Proposed** (22 November 2026).
+Status: **Accepted** (27 November 2026, by the repository owner after the validation of `9dfd568`, report 0043; proposed on 22 November 2026).
 
 ## Context
 

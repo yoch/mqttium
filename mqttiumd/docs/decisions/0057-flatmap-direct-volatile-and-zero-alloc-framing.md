@@ -1,6 +1,6 @@
 # 0057 — Deterministic `FlatMap`, direct synchronous `VolatileStore`, and zero-allocation framing (Lot 7)
 
-Status: **Proposed** (23 November 2026). Applied to `mqttiumd-contract`, `mqttiumd-core`, `mqttiumd-store-volatile`, and `mqttiumd`.
+Status: **Accepted with amendments** (27 November 2026, by the repository owner after the validation of `9dfd568`, which corrected the text where the code contradicted it, report 0043; proposed on 23 November 2026). Applied to `mqttiumd-contract`, `mqttiumd-core`, `mqttiumd-store-volatile`, and `mqttiumd`.
 
 ## Context
 
@@ -25,10 +25,11 @@ Following Lot 5 (`4afeff66`) and Lot 6 (`4c4e4506`, records [0055](0055-logstore
 
 1. **Deterministic open-addressed `FlatMap<K, V>`, `FlatSet<K>`, and `ScopedFlatMap<K, V>` (`crates/mqttiumd-contract/src/flat_map.rs`)**:
    - Implemented in pure `#![no_std]` + `alloc` under `#![forbid(unsafe_code)]` and all `mqttiumd-lab --test boundary` token rules, with zero external crates.
-   - Uses a deterministic 64-bit SplitMix64 avalanche mixer (`FlatKey::flat_hash`) with zero ambient randomness.
+   - Uses a deterministic 64-bit Fibonacci multiply-shift mixer (`FlatKey::flat_hash`, `mix64`) with zero ambient randomness.
    - Uses power-of-two linear probing with **backward-shift deletion** (zero tombstones) so high-churn steady-state tables never accumulate deleted slots or reallocate after warm-up.
    - `ScopedFlatMap<K: ScopedKey, V>` combines prefix-stripping (active run-epoch keys stored by their 8-byte `K::Local` sequence in `FlatMap`) with a cold `BTreeMap<K, V>` fallback for prior-epoch keys.
-   - Applied strictly to point-lookup tables across `Owner`, `pubsub::State`, `RouteIndex::exact`, `Runtime`, and `VolatileStore`. Tables whose iteration order or range scans (`range(..)`) are semantically significant (`operations`, `publications`, `obligations`, `obligations_by_target`, `sessions`, `routes`, `retained`, `wills`, `fences`, `timers`) remain in `BTreeMap` / `ScopedMap`.
+     The active scope is that of the first key a map receives, until a key of a later run arrives; that key's scope then becomes the active one and what the compact map held moves to the fallback (`ScopedKey::later_run`, added on 26 November 2026). Before that rule the first key decided for the whole run: a table rebuilt after a restart received first what earlier runs had left, a retained message or a message queued for an absent session, and every key of the new run went to the ordered fallback.
+   - Applied strictly to point-lookup tables across `Owner`, `pubsub::State`, `RouteIndex::exact`, `Runtime`, and `VolatileStore`. Tables whose iteration order or range scans (`range(..)`) are semantically significant (`routes`, `retained`, `wills`, `fences`, `inbound`, `timers`) remain in `BTreeMap` / `ScopedMap`. In `VolatileStore`, `publications`, `payloads`, `obligations` and `outbound` are `ScopedFlatMap`s: the readers that need their order sort what they read, and `operations` and `sessions` have tables of their own (`OriginOpTable`, `SessionTable`).
 2. **O(1) delivery indices and swap-remove reindexing (`crates/mqttiumd-core/src/owner{,.rs,/pubsub.rs}`)**:
    - Added `delivery_by_target_pi: FlatMap<(SessionId, OutboundPacketId), usize>` so `Owner::puback_target` and `Owner::qos2_ack_target` resolve in O(1).
    - Added `sent_on_gen: FlatMap<(SessionId, ConnectionGeneration), usize>` and `busy_by_session: FlatMap<SessionId, usize>` on `pubsub::State`, proving in O(1) when `sent + busy == deliveries_by_session[session].len()` that no delivery can satisfy `waiting_to_send(generation, now)` and short-circuiting `next_send` and `has_ready_work` without scanning.

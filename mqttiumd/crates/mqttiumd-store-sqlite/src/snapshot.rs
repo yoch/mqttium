@@ -72,7 +72,10 @@ fn create_temp_with_permissions(
     Ok(())
 }
 
-fn sync_parent_dir(path: &Path) -> Result<(), OpenError> {
+/// Makes durable the directory entry of `path`: opens its parent directory
+/// (the current one for a bare name) and syncs it. Used after a rename
+/// that replaces a file of the store.
+pub fn sync_parent_dir(path: &Path) -> Result<(), OpenError> {
     let dir = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -513,6 +516,43 @@ mod tests {
         }
 
         drop(lease);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The state is handed over to an engine that replaces the database
+    /// file and deletes its write-ahead log. Nothing committed may then be
+    /// in that log only, also when SQLite did not empty it at the close
+    /// because another connection, a reader such as `inspect`, was open.
+    #[test]
+    fn handing_the_state_over_leaves_no_commit_in_the_write_ahead_log() {
+        use mqttiumd_store_api::{AdminCommand, DurableStore};
+
+        let dir = temp_dir("handover");
+        let db = dir.join("state.sqlite");
+        let mut store = SqliteStore::create(&db, StoreIncarnation::new(3), test_limits()).unwrap();
+        store
+            .admin(AdminCommand::CreateSession {
+                client_id: b"client".to_vec(),
+            })
+            .expect("a session");
+        let reader = Connection::open_with_flags(&db, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        let _: i64 = reader
+            .query_row("SELECT count(*) FROM sqlite_master", [], |row| row.get(0))
+            .unwrap();
+
+        let (state, _settings, lease) = store.into_state_and_lease().unwrap();
+        let log = sidecar_path(&db, "-wal");
+        let left = std::fs::metadata(&log).map_or(0, |meta| meta.len());
+        assert_eq!(left, 0, "bytes left in the write-ahead log");
+
+        // The main file alone holds the state.
+        drop(reader);
+        drop(lease);
+        remove_if_exists(&log).unwrap();
+        remove_if_exists(&sidecar_path(&db, "-shm")).unwrap();
+        let reopened = SqliteStore::open(&db).expect("the main file opens alone");
+        assert_eq!(reopened.try_snapshot().unwrap(), state);
+        drop(reopened);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

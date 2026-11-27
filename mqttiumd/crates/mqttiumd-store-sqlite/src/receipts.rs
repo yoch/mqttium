@@ -55,7 +55,10 @@ pub(crate) fn frontier(
     if origin.incarnation != meta.ledger.incarnation() {
         return Err(Fault::Corrupt);
     }
-    let mut statement = conn.prepare_cached("SELECT epoch,owner,consumed_through,publication_through,payload_through FROM receipt_origins WHERE epoch=?1 AND owner=?2")?;
+    let mut statement = conn.prepare_cached("SELECT \
+                                             epoch,owner,consumed_through,publication_through,payload_through \
+                                             FROM receipt_origins \
+                                             WHERE epoch=?1 AND owner=?2")?;
     let mut rows = statement.query(params![
         origin.epoch.to_be_bytes().as_slice(),
         origin.owner.to_be_bytes().as_slice()
@@ -72,7 +75,11 @@ pub(crate) fn all_frontiers(
 ) -> Result<BTreeMap<ReceiptOrigin, ReceiptClosure>, Fault> {
     let mut out = BTreeMap::new();
     let mut meter = reader::Meter::new(budget);
-    let mut statement = conn.prepare_cached("SELECT epoch,owner,consumed_through,publication_through,payload_through FROM receipt_origins ORDER BY epoch,owner LIMIT ?1")?;
+    let mut statement = conn.prepare_cached("SELECT \
+                                             epoch,owner,consumed_through,publication_through,payload_through \
+                                             FROM receipt_origins \
+                                             ORDER BY epoch,owner \
+                                             LIMIT ?1")?;
     let mut rows =
         statement.query([i64::try_from(MAX_RECEIPT_ORIGINS + 1).map_err(|_| Fault::Corrupt)?])?;
     while let Some(row) = rows.next()? {
@@ -158,7 +165,10 @@ fn initial_compatible(
         return Ok(false);
     }
     let mut meter = reader::Meter::new(ReadBudget::SNAPSHOT);
-    let mut statement = conn.prepare_cached("SELECT id,recipe,decision,publication,exchange,reason,resource,facts FROM operations WHERE id>=?1 AND id<=?2 ORDER BY id")?;
+    let mut statement = conn.prepare_cached("SELECT \
+                                             id,recipe,decision,publication,exchange,reason,resource,facts \
+                                             FROM operations WHERE id>=?1 AND id<=?2 \
+                                             ORDER BY id")?;
     let mut rows = statement.query(params![first.as_slice(), last.as_slice()])?;
     while let Some(row) = rows.next()? {
         let bytes = reader::borrow_blob(row, 1, ReadBudget::SNAPSHOT.max_field_bytes)?;
@@ -340,7 +350,11 @@ pub(crate) fn prepare(
     let removed = u16::try_from(keys.len()).map_err(|_| Fault::Corrupt)?;
     let changed = stored != Some(closure) || removed != 0;
     if changed && (!MUTANT_DELETE_WITHOUT_CLOSURE || stored.is_none()) {
-        conn.prepare_cached("INSERT INTO receipt_origins(epoch,owner,consumed_through,publication_through,payload_through) VALUES(?1,?2,?3,?4,?5) ON CONFLICT(epoch,owner) DO UPDATE SET consumed_through=excluded.consumed_through,publication_through=excluded.publication_through,payload_through=excluded.payload_through")?
+        conn.prepare_cached("INSERT INTO \
+                             receipt_origins(epoch,owner,consumed_through,publication_through,payload_through) \
+                             VALUES(?1,?2,?3,?4,?5) ON CONFLICT(epoch,owner) DO UPDATE \
+                             SET \
+                             consumed_through=excluded.consumed_through,publication_through=excluded.publication_through,payload_through=excluded.payload_through")?
             .execute(params![origin.epoch.to_be_bytes().as_slice(),origin.owner.to_be_bytes().as_slice(),closure.through.to_be_bytes().as_slice(),closure.publication_through.to_be_bytes().as_slice(),closure.payload_through.to_be_bytes().as_slice()])?;
     }
     let retained = remove_keys(conn, meta, &keys)?;
@@ -360,7 +374,9 @@ fn read_operation_bounded(
     operation: OperationId,
     meter: &mut reader::Meter,
 ) -> Result<Option<OperationRecord>, Fault> {
-    let mut statement=conn.prepare_cached("SELECT recipe,decision,publication,exchange,reason,resource,facts FROM operations WHERE id=?1")?;
+    let mut statement=conn.prepare_cached("SELECT \
+                                           recipe,decision,publication,exchange,reason,resource,facts \
+                                           FROM operations WHERE id=?1")?;
     let mut rows = statement.query([operation.to_be_bytes().as_slice()])?;
     let Some(row) = rows.next()? else {
         return Ok(None);
@@ -410,7 +426,11 @@ pub(crate) fn prepare_closed(
     origins
         .try_reserve_exact(usize::from(collection.limit) + 1)
         .map_err(|_| ReadError::AllocationFailed)?;
-    let mut statement=conn.prepare_cached("SELECT epoch,owner FROM receipt_origins WHERE epoch>=?1 AND epoch<=?2 ORDER BY epoch,owner LIMIT ?3")?;
+    let mut statement = conn.prepare_cached(
+        "SELECT epoch,owner FROM receipt_origins \
+         WHERE epoch>=?1 AND epoch<=?2 \
+         ORDER BY epoch,owner LIMIT ?3",
+    )?;
     let mut rows = statement.query(params![
         RunEpoch::new(1).to_be_bytes().as_slice(),
         through.to_be_bytes().as_slice(),

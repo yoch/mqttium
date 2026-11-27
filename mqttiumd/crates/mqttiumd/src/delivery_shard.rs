@@ -1,5 +1,5 @@
 //! Resident multi-core `DeliveryShard` worker threads and lock-free
-//! `InlineClaimLease` oracle (Lot 10).
+//! `InlineClaimLease` oracle (record 0066).
 //!
 //! Each shard owns an independent deterministic `Owner` (`LogicalOwnerId(1..=K)`),
 //! a dedicated SPSC `ShardStoreHandle` to the single exclusive `Writer`, a
@@ -48,7 +48,7 @@ use crate::net::{
     self, OutgoingHandle, ShardInbox, ShardIoEvent, ShardIoRoute, Write, WriteExpiry, WriteReport,
     Written,
 };
-use crate::runtime::Limits;
+use crate::runtime::{FrameKind, Limits};
 use crate::session_time::SessionClock;
 use crate::wake::{Signalled, Wake};
 use crate::writer::{
@@ -59,6 +59,9 @@ use crate::writer::{
 pub const MAX_DELIVERY_SHARDS: usize = 16;
 
 const COORD_CHANNEL_CAP: usize = 4_096;
+/// Deliveries of delegated QoS 0 a shard keeps while its core cannot take
+/// them: what one full lane of the coordinator brings.
+const PENDING_QOS0_LIMIT: usize = COORD_CHANNEL_CAP;
 const IDLE_TICK: Duration = Duration::from_millis(20);
 const BACKPRESSURE_TICK: Duration = Duration::from_millis(1);
 const BOUNDS: Bounds = Bounds {
@@ -138,11 +141,20 @@ impl InlineClaimLease {
             let mask = !(1u64 << (zb % 64));
             let prev = self.used_pi[zb / 64].fetch_and(mask, Ordering::Release);
             if prev & (1u64 << (zb % 64)) != 0 {
-                self.in_flight.fetch_sub(1, Ordering::AcqRel);
+                self.release_in_flight();
             }
         } else {
-            self.in_flight.fetch_sub(1, Ordering::AcqRel);
+            // Above the bitmap nothing records whether this identifier was
+            // counted: the count is lowered, never below zero.
+            self.release_in_flight();
         }
+    }
+
+    #[inline]
+    fn release_in_flight(&self) {
+        let _ = self
+            .in_flight
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1));
     }
 
     /// Invoked exclusively by the owning `DeliveryShard` when Coordinator has
@@ -217,10 +229,36 @@ pub(crate) enum CoordToShard {
         properties: Option<Arc<PublishProperties>>,
         targets: Vec<DelegatedQos0Target>,
     },
+    /// What a test asks of the shard where it reads this message.
+    #[cfg(test)]
+    Test(ShardTest),
     MessagesExpired {
         deliveries: Vec<ExpiredDelivery>,
     },
-    Shutdown,
+}
+
+/// What a test asks of a shard, at the place of its message in the lane.
+#[cfg(test)]
+pub(crate) enum ShardTest {
+    /// Panic.
+    Panic,
+    /// Wait until the sender is dropped or sends.
+    Pause(mpsc::Receiver<()>),
+    /// Nothing: a message that only takes a place in the lane.
+    Nothing,
+}
+
+#[cfg(test)]
+impl ShardTest {
+    fn run(self) {
+        match self {
+            Self::Panic => panic!("a test asked this delivery shard to panic"),
+            Self::Pause(release) => {
+                let _ = release.recv();
+            }
+            Self::Nothing => {}
+        }
+    }
 }
 
 /// Rare notices sent from a `DeliveryShard` worker back to the Coordinator.
@@ -237,6 +275,11 @@ struct ShardClient {
     owner_id: LogicalOwnerId,
     tx: Signalled<CoordToShard>,
     inbox: Arc<ShardInbox>,
+    /// Asked for by `ShardPool::shutdown`. A flag rather than a message of
+    /// the lane, so that a full lane cannot lose it; the shard reads it
+    /// when its lane is empty, after every message sent before it.
+    stop: Arc<AtomicBool>,
+    wake: crate::wake::Wake,
     handle: Option<JoinHandle<Result<(), Failure>>>,
 }
 
@@ -247,7 +290,19 @@ pub(crate) struct ShardPool {
     notices: Arc<Notices>,
     leases: FlatMap<SessionId, Arc<InlineClaimLease>>,
     pending_dirty_barriers: FlatMap<SessionId, u64>,
+    /// Committed inline claims not yet handed to their shard: an inline
+    /// admission of their session has an unknown outcome. In the order of
+    /// their admissions; at most the lease's room per session.
+    held_claims: FlatMap<SessionId, Vec<HeldClaim>>,
     last_fatal: Option<Failure>,
+}
+
+/// A committed inline claim the coordinator holds back.
+struct HeldClaim {
+    claim: DelegatedClaim,
+    topic: SharedBytes,
+    payload: SharedBytes,
+    properties: Option<Arc<PublishProperties>>,
 }
 
 impl ShardPool {
@@ -290,9 +345,12 @@ impl ShardPool {
             let inbox_worker = Arc::clone(&inbox);
             let (ready_tx, ready_rx) = mpsc::sync_channel(1);
             let worker_notices = Arc::clone(&notices);
+            let panic_notices = Arc::clone(&notices);
             let worker_events = events.clone();
             let worker_clock = Arc::clone(&clock);
             let worker_cancel = Arc::clone(&cancel);
+            let stop = Arc::new(AtomicBool::new(false));
+            let worker_stop = Arc::clone(&stop);
 
             let owner = Owner::new_delivery_shard(shard_owner_config, outbox, shard_limits)
                 .map_err(|_| Failure::plain("shard_owner_creation"))?;
@@ -310,6 +368,7 @@ impl ShardPool {
                         worker_clock,
                         limits,
                         worker_cancel,
+                        worker_stop,
                     );
                     match worker.register_receipts(Duration::from_secs(30)) {
                         Ok(()) => {
@@ -320,9 +379,15 @@ impl ShardPool {
                             return Err(err);
                         }
                     }
-                    let res = worker.run_loop();
+                    // A panic leaves the worker's state unknown: nothing of it
+                    // is used again, and the coordinator stops the broker as
+                    // for any fault of a shard.
+                    let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        worker.run_loop()
+                    }))
+                    .unwrap_or_else(|_| Err(Failure::plain("delivery_shard_panicked")));
                     if let Err(err) = &res {
-                        worker.notify_coord(ShardToCoord::Fatal(err.clone()));
+                        panic_notices.publish(ShardToCoord::Fatal(err.clone()));
                     }
                     res
                 })
@@ -333,6 +398,8 @@ impl ShardPool {
                 owner_id,
                 tx: coord_tx,
                 inbox,
+                stop,
+                wake: shard_wake,
                 handle: Some(handle),
             });
         }
@@ -348,6 +415,7 @@ impl ShardPool {
             notices,
             leases: FlatMap::new(),
             pending_dirty_barriers: FlatMap::new(),
+            held_claims: FlatMap::new(),
             last_fatal: None,
         })
     }
@@ -455,6 +523,7 @@ impl ShardPool {
             let _ = lease.mark_dirty();
         }
         self.pending_dirty_barriers.remove(&session);
+        self.held_claims.remove(&session);
         let idx = self.shard_index(session);
         self.send_to(idx, CoordToShard::Retire { session });
     }
@@ -511,7 +580,69 @@ impl ShardPool {
         }
     }
 
-    pub(crate) fn send_inline_committed(&mut self, batch: DelegatedInlineBatch) {
+    /// Hands the committed inline claims of `batch` to their shards. A
+    /// claim whose session has an inline admission of unknown outcome
+    /// (`unknown`), or claims already held, is held in admission order
+    /// until `release_held_claims`: the earlier publication may still
+    /// commit, and the subscriber receives it first.
+    pub(crate) fn send_inline_committed(
+        &mut self,
+        mut batch: DelegatedInlineBatch,
+        unknown: impl Fn(SessionId) -> bool,
+    ) {
+        if !self.held_claims.is_empty() || batch.claims.iter().any(|claim| unknown(claim.target)) {
+            let held = &mut self.held_claims;
+            batch.claims.retain(|claim| {
+                if !held.contains_key(&claim.target) && !unknown(claim.target) {
+                    return true;
+                }
+                let claims = held.get_or_insert_default(claim.target);
+                let order = |claim: &DelegatedClaim| claim.claim_operation.sequence().get();
+                let at = claims.partition_point(|item| order(&item.claim) < order(claim));
+                claims.insert(
+                    at,
+                    HeldClaim {
+                        claim: *claim,
+                        topic: batch.topic.clone(),
+                        payload: batch.payload.clone(),
+                        properties: batch.properties.clone(),
+                    },
+                );
+                false
+            });
+            if batch.claims.is_empty() {
+                return;
+            }
+        }
+        self.send_claims(batch);
+    }
+
+    /// Hands the held claims of `session` to its shard, in admission order,
+    /// once no inline admission of the session has an unknown outcome. The
+    /// runtime calls it before it flushes the session's barrier: the shard
+    /// reads the session only after these claims.
+    pub(crate) fn release_held_claims(&mut self, session: SessionId, unknown: bool) {
+        if unknown || self.held_claims.is_empty() {
+            return;
+        }
+        let Some(claims) = self.held_claims.remove(&session) else {
+            return;
+        };
+        let idx = self.shard_index(session);
+        for held in claims {
+            self.send_to(
+                idx,
+                CoordToShard::InlineCommitted {
+                    topic: held.topic,
+                    payload: held.payload,
+                    properties: held.properties,
+                    claims: vec![held.claim],
+                },
+            );
+        }
+    }
+
+    fn send_claims(&mut self, batch: DelegatedInlineBatch) {
         let k = self.shards.len();
         if k == 1 || batch.claims.len() <= 1 {
             if let Some(first) = batch.claims.first() {
@@ -606,6 +737,32 @@ impl ShardPool {
         }
     }
 
+    /// Whether the coordinator may reserve for `session` now: the predicate
+    /// of `InlineClaimLease::try_reserve`, without its room check.
+    #[cfg(test)]
+    pub(crate) fn lease_is_eligible(&self, session: SessionId) -> bool {
+        self.leases.get(&session).is_some_and(|lease| {
+            let dirty = lease.dirty_seq.load(Ordering::Acquire);
+            dirty != 0
+                && lease.acked_dirty_seq.load(Ordering::Acquire) == dirty
+                && lease.eligible_gen.load(Ordering::Acquire) != 0
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn send_for_test(&mut self, shard_idx: usize, test: ShardTest) {
+        self.send_to(shard_idx, CoordToShard::Test(test));
+    }
+
+    /// Whether the lane of the shard took the message, without waiting.
+    #[cfg(test)]
+    pub(crate) fn try_send_for_test(&mut self, shard_idx: usize, test: ShardTest) -> bool {
+        self.shards[shard_idx]
+            .tx
+            .try_send(CoordToShard::Test(test))
+            .is_ok()
+    }
+
     pub(crate) fn drain_notices(&mut self, out: &mut Vec<ShardToCoord>) -> Result<(), Failure> {
         if let Some(err) = self.notices.drain_into(out).or(self.last_fatal.take()) {
             return Err(err);
@@ -617,7 +774,8 @@ impl ShardPool {
     /// so all in-flight shard store commands drain before the `Writer` stops.
     pub(crate) fn shutdown(mut self, budget: Duration) -> Result<(), Failure> {
         for shard in &self.shards {
-            let _ = shard.tx.try_send(CoordToShard::Shutdown);
+            shard.stop.store(true, Ordering::Release);
+            shard.wake.wake();
         }
         let deadline = Instant::now() + budget;
         let mut first_err = None;
@@ -693,7 +851,7 @@ struct ShardSession {
 
 struct ShardPendingFrame {
     connection: ConnectionKey,
-    kind: &'static str,
+    kind: FrameKind,
 }
 
 struct PendingInlineItem {
@@ -726,6 +884,9 @@ struct DeliveryShardWorker {
     started: Instant,
     progress: u64,
     stopping: bool,
+    stop: Arc<AtomicBool>,
+    #[cfg(test)]
+    wakes_held: bool,
 
     sessions: FlatMap<SessionId, ShardSession>,
     // The coordinator retains the closing peer until its own receipt is set.
@@ -745,6 +906,9 @@ struct DeliveryShardWorker {
     control_inputs: VecDeque<Input>,
     terminal_inputs: VecDeque<Input>,
     queued_work_sessions: FlatSet<SessionId>,
+    /// Sessions not read from the store while a committed inline claim of
+    /// theirs waits in `pending_inline` (`fence_after_message`).
+    inline_fenced: FlatSet<SessionId>,
     pending_inline: VecDeque<PendingInlineItem>,
     pending_qos0: VecDeque<PendingQos0Item>,
     io_scratch: VecDeque<ShardIoEvent>,
@@ -770,9 +934,13 @@ impl DeliveryShardWorker {
         clock: Arc<dyn SessionClock>,
         limits: Limits,
         cancel: Arc<AtomicBool>,
+        stop: Arc<AtomicBool>,
     ) -> Self {
         let now = Instant::now();
         Self {
+            stop,
+            #[cfg(test)]
+            wakes_held: false,
             owner,
             store,
             coord_rx,
@@ -800,6 +968,7 @@ impl DeliveryShardWorker {
             control_inputs: VecDeque::new(),
             terminal_inputs: VecDeque::new(),
             queued_work_sessions: FlatSet::new(),
+            inline_fenced: FlatSet::new(),
             pending_inline: VecDeque::new(),
             pending_qos0: VecDeque::new(),
             io_scratch: VecDeque::new(),
@@ -841,22 +1010,33 @@ impl DeliveryShardWorker {
     fn run_loop(&mut self) -> Result<(), Failure> {
         loop {
             let before = self.progress;
-            let _wakes = net::hold_wakes();
             let now = Instant::now();
-
-            self.drain_store_replies()?;
-            if !self.owner.outbox_is_empty() {
+            {
+                // The wake-ups this pass gives the reactors are coalesced
+                // and given when the guard drops, before any wait.
+                let _wakes = net::hold_wakes();
+                #[cfg(test)]
+                {
+                    self.wakes_held = true;
+                }
+                self.drain_store_replies()?;
+                if !self.owner.outbox_is_empty() {
+                    self.dispatch()?;
+                }
+                self.drain_io_events()?;
+                self.drain_inputs()?;
+                self.drain_coord_messages()?;
+                self.drain_pending_inline()?;
+                self.drain_pending_qos0()?;
+                self.due_deadlines(now)?;
+                self.drain_inputs()?;
                 self.dispatch()?;
+                self.schedule_maintenance();
             }
-            self.drain_io_events()?;
-            self.drain_inputs()?;
-            self.drain_coord_messages()?;
-            self.drain_pending_inline()?;
-            self.drain_pending_qos0()?;
-            self.due_deadlines(now)?;
-            self.drain_inputs()?;
-            self.dispatch()?;
-            self.schedule_maintenance();
+            #[cfg(test)]
+            {
+                self.wakes_held = false;
+            }
 
             if self.stopping {
                 if self.inflight.is_empty()
@@ -883,6 +1063,14 @@ impl DeliveryShardWorker {
                 } else {
                     self.idle_wait(now)
                 };
+                // A hold kept through the wait would suppress the kicks of
+                // every producer that holds nothing (record 0044, model
+                // reactor-wake).
+                #[cfg(test)]
+                assert!(
+                    !self.wakes_held,
+                    "a delivery shard waits while it holds the reactors' wake-ups"
+                );
                 self.store.wake.wait(wait);
             }
         }
@@ -925,6 +1113,47 @@ impl DeliveryShardWorker {
         }
     }
 
+    /// Fences `session` from reads of the store, or opens it, after a dirty
+    /// message of the coordinator. A message without sequence means inline
+    /// claims are pending: one may commit, and a read would deliver its
+    /// row before the claim arrives, then again. A message with a sequence
+    /// comes after every claim committed for the session; those still
+    /// waiting in `pending_inline` are applied before the session is read.
+    fn fence_after_message(&mut self, session: SessionId, dirty_seq: u64) {
+        let pending = dirty_seq == 0;
+        let waiting = !pending
+            && self
+                .pending_inline
+                .iter()
+                .any(|item| item.claim.target == session);
+        if waiting {
+            self.inline_fenced.insert(session);
+        } else if !self.inline_fenced.is_empty() {
+            self.inline_fenced.remove(&session);
+        }
+        self.owner.shard_fence_scans(session, pending || waiting);
+    }
+
+    /// Opens the sessions whose waiting claims are all applied.
+    fn open_drained_fences(&mut self) {
+        let drained: Vec<SessionId> = self
+            .inline_fenced
+            .iter()
+            .copied()
+            .filter(|&session| {
+                !self
+                    .pending_inline
+                    .iter()
+                    .any(|item| item.claim.target == session)
+            })
+            .collect();
+        for session in drained {
+            self.inline_fenced.remove(&session);
+            self.owner.shard_fence_scans(session, false);
+            self.queue_work(session);
+        }
+    }
+
     fn try_publish_lease(&mut self, session: SessionId) {
         let Some(sess) = self.sessions.get_mut(&session) else {
             return;
@@ -933,6 +1162,15 @@ impl DeliveryShardWorker {
             return;
         }
         if sess.scan_started_dirty_seq < sess.seen_dirty_seq {
+            return;
+        }
+        // A committed inline claim not yet applied is no row of the core:
+        // published now, the lease would not count its identifier.
+        if self
+            .pending_inline
+            .iter()
+            .any(|item| item.claim.target == session)
+        {
             return;
         }
         let generation = sess.generation;
@@ -1164,7 +1402,7 @@ impl DeliveryShardWorker {
                 reason,
             } => {
                 if let Some(frame) = self.frames.remove(&effect) {
-                    if frame.kind == "PUBLISH0" {
+                    if frame.kind == FrameKind::Publish0 {
                         let drop_reason = match reason {
                             mqttiumd_contract::message_expiry::MessageExpiryBlock::Expired => {
                                 Qos0DropReason::MessageExpired
@@ -1207,7 +1445,7 @@ impl DeliveryShardWorker {
                 ..
             } => {
                 if let Some(frame) = self.frames.remove(&effect) {
-                    if frame.kind == "PUBLISH0" {
+                    if frame.kind == FrameKind::Publish0 {
                         self.terminal_inputs.push_back(Input::Qos0EmitRefused {
                             effect,
                             connection,
@@ -1326,6 +1564,7 @@ impl DeliveryShardWorker {
                                     in_flight_load: None,
                                 },
                             );
+                            self.fence_after_message(session, dirty_seq);
                             self.queue_work(session);
                         }
                         CoordToShard::Detach {
@@ -1345,6 +1584,7 @@ impl DeliveryShardWorker {
                             self.owner
                                 .shard_retire_session(session)
                                 .map_err(|_| Failure::plain("shard_retire_fault"))?;
+                            self.inline_fenced.remove(&session);
                         }
                         CoordToShard::NotifyDirty {
                             session,
@@ -1360,6 +1600,7 @@ impl DeliveryShardWorker {
                                 }
                             }
                             self.owner.shard_notify_dirty(session, clear_known_through);
+                            self.fence_after_message(session, dirty_seq);
                             self.queue_work(session);
                         }
                         CoordToShard::DirtyBarrier { session, dirty_seq } => {
@@ -1368,6 +1609,7 @@ impl DeliveryShardWorker {
                                 sess.seen_dirty_seq = sess.seen_dirty_seq.max(dirty_seq);
                             }
                             self.owner.shard_notify_dirty(session, false);
+                            self.fence_after_message(session, dirty_seq);
                             self.queue_work(session);
                         }
                         CoordToShard::InlineCommitted {
@@ -1394,6 +1636,10 @@ impl DeliveryShardWorker {
                             targets,
                         } => {
                             for target in targets {
+                                if self.pending_qos0.len() >= PENDING_QOS0_LIMIT {
+                                    self.shed_qos0(origin, target.target)?;
+                                    continue;
+                                }
                                 self.pending_qos0.push_back(PendingQos0Item {
                                     origin,
                                     target: target.target,
@@ -1415,12 +1661,18 @@ impl DeliveryShardWorker {
                                     .push_back(Input::MessagesExpired { deliveries: bv });
                             }
                         }
-                        CoordToShard::Shutdown => {
-                            self.stopping = true;
-                        }
+                        #[cfg(test)]
+                        CoordToShard::Test(test) => test.run(),
                     }
                 }
-                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Empty) => {
+                    // Stored after the coordinator's last message: seen
+                    // here, nothing it sent before the stop is still queued.
+                    if self.stop.load(Ordering::Acquire) {
+                        self.stopping = true;
+                    }
+                    break;
+                }
                 Err(TryRecvError::Disconnected) => {
                     self.stopping = true;
                     break;
@@ -1441,7 +1693,7 @@ impl DeliveryShardWorker {
             .collect();
         for id in stale {
             if let Some(frame) = self.frames.remove(&id) {
-                if frame.kind == "PUBLISH0" {
+                if frame.kind == FrameKind::Publish0 {
                     self.terminal_inputs.push_back(Input::Qos0EmitRefused {
                         effect: id,
                         connection: frame.connection,
@@ -1503,6 +1755,9 @@ impl DeliveryShardWorker {
                     {
                         self.queue_work_front(item.claim.target);
                     }
+                    // The claim is a row now: the lease it held back may be
+                    // published, with its identifier.
+                    self.try_publish_lease(item.claim.target);
                 }
                 ShardStepOutcome::NeedCapacity(_) => {
                     self.pending_inline.push_front(item);
@@ -1512,7 +1767,27 @@ impl DeliveryShardWorker {
                 ShardStepOutcome::Fatal(_) => return Err(Failure::plain("shard_core_fault")),
             }
         }
+        if !self.inline_fenced.is_empty() {
+            self.open_drained_fences();
+        }
         Ok(())
+    }
+
+    /// Drops a delegated QoS 0 delivery the shard has no room to keep, as
+    /// the core drops one its volatile queue cannot hold, with the same
+    /// journal entry.
+    fn shed_qos0(&self, origin: Qos0Origin, target: SessionId) -> Result<(), Failure> {
+        self.events
+            .emit_with("qos0_dropped", || {
+                json!({
+                    "details": {
+                        "origin": crate::runtime::qos0_origin(origin),
+                        "target": target.get().to_string(),
+                        "reason": Qos0DropReason::CapacityExceeded.code(),
+                    }
+                })
+            })
+            .map_err(|_| Failure::plain("events_unavailable"))
     }
 
     fn drain_pending_qos0(&mut self) -> Result<(), Failure> {
@@ -2176,6 +2451,9 @@ impl EffectSink for ShardSink<'_> {
                     self.error = Some(Failure::plain("shard_outgoing_binding_conflict"));
                     return refused(effect, SubmitBlock::InFlightLimit);
                 }
+                if self.outgoing_bindings.len() >= self.limits.outgoing_bindings {
+                    return refused(effect, SubmitBlock::InFlightLimit);
+                }
                 self.outgoing_bindings.insert(binding_key, binding);
                 let track_written = write_expiry.is_some() || self.events.records("frame_written");
                 match sess.outgoing.try_send_outgoing(Write {
@@ -2195,7 +2473,7 @@ impl EffectSink for ShardSink<'_> {
                                 id,
                                 ShardPendingFrame {
                                     connection,
-                                    kind: "PUBLISH",
+                                    kind: FrameKind::Publish,
                                 },
                             );
                         }
@@ -2236,6 +2514,18 @@ impl EffectSink for ShardSink<'_> {
                     )),
                     _ => None,
                 };
+                // As the coordinator's sink: a PUBREL binds its identifier to
+                // the delivery; one already bound is a fault, and the table
+                // is bounded.
+                if let Some((key, _)) = binding {
+                    if self.outgoing_bindings.len() >= self.limits.outgoing_bindings {
+                        return refused(effect, SubmitBlock::InFlightLimit);
+                    }
+                    if self.outgoing_bindings.contains_key(&key) {
+                        self.error = Some(Failure::plain("shard_pubrel_binding_conflict"));
+                        return refused(effect, SubmitBlock::InFlightLimit);
+                    }
+                }
                 let Some(sess) = self.sessions.get(&connection.session).filter(|s| {
                     s.generation == connection.generation && !s.outgoing.is_cancelled()
                 }) else {
@@ -2285,7 +2575,7 @@ impl EffectSink for ShardSink<'_> {
                             id,
                             ShardPendingFrame {
                                 connection,
-                                kind: "PUBREL",
+                                kind: FrameKind::Pubrel,
                             },
                         );
                         let _ = effect.into_parts();
@@ -2382,7 +2672,7 @@ impl EffectSink for ShardSink<'_> {
                             id,
                             ShardPendingFrame {
                                 connection,
-                                kind: "PUBLISH0",
+                                kind: FrameKind::Publish0,
                             },
                         );
                     }
@@ -2418,18 +2708,21 @@ impl EffectSink for ShardSink<'_> {
                 reason,
             } => {
                 let (origin, target, reason) = (*origin, *target, *reason);
-                let _ = self.events.emit_with("qos0_dropped", || {
-                    json!({
-                        "details": {
-                            "target": target.map(|t| t.get().to_string()).unwrap_or_default(),
-                            "reason": reason.code(),
-                            "origin_kind": match origin {
-                                Qos0Origin::Volatile { .. } => "volatile",
-                                Qos0Origin::Consumed { .. } => "consumed",
+                if self
+                    .events
+                    .emit_with("qos0_dropped", || {
+                        json!({
+                            "details": {
+                                "origin": crate::runtime::qos0_origin(origin),
+                                "target": target.map(|t| t.get().to_string()).unwrap_or_default(),
+                                "reason": reason.code(),
                             }
-                        }
+                        })
                     })
-                });
+                    .is_err()
+                {
+                    self.error = Some(Failure::plain("events_unavailable"));
+                }
                 let _ = effect.into_parts();
                 SubmitResult::Accepted
             }
@@ -2440,7 +2733,7 @@ impl EffectSink for ShardSink<'_> {
                 reason,
             } => {
                 let (delivery, target, finished, reason) = (*delivery, *target, *finished, *reason);
-                let _ = self.events.emit_with("delivery_discarded", || {
+                let journaled = self.events.emit_with("delivery_discarded", || {
                     json!({
                         "operation": crate::events::operation(finished),
                         "command_kind": "Finish",
@@ -2458,6 +2751,9 @@ impl EffectSink for ShardSink<'_> {
                         }
                     })
                 });
+                if journaled.is_err() {
+                    self.error = Some(Failure::plain("events_unavailable"));
+                }
                 let _ = effect.into_parts();
                 SubmitResult::Accepted
             }
