@@ -16,8 +16,9 @@ pub(super) struct Read {
 }
 
 /// Per-connection outgoing delivery settings and catch-up flags.
-/// Pagination cursors (`after`, `known_through`, `loading`) live in sparse
-/// side maps on [`Connections`] so idle connections remain compact.
+/// Pagination cursors (`after_by_gen`, `known_through_by_gen`,
+/// `loading_by_gen`) live in sparse side maps on [`Connections`] so idle
+/// connections remain compact.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(super) struct Connection {
     pub(super) generation: ConnectionGeneration,

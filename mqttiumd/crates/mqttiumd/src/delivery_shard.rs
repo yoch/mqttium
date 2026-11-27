@@ -1,5 +1,5 @@
 //! Resident multi-core `DeliveryShard` worker threads and lock-free
-//! `InlineClaimLease` oracle (Lot 10).
+//! `InlineClaimLease` oracle (record 0066).
 //!
 //! Each shard owns an independent deterministic `Owner` (`LogicalOwnerId(1..=K)`),
 //! a dedicated SPSC `ShardStoreHandle` to the single exclusive `Writer`, a

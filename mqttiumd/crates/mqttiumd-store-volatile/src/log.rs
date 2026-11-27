@@ -8,8 +8,8 @@
 //! session clock checkpoint, message expiry sweep, or `AdminCommand`).
 //! Instead of translating each command into multiple SQL statements across
 //! 12 B-tree tables and 4 KiB WAL pages, `LogStore`:
-//! 1. Encodes one compact CRC-32C-framed group record (reusing
-//!    `FrozenRecipe::canonical_bytes()` with zero re-serialization).
+//! 1. Encodes one compact CRC-32C-framed group record (each recipe as
+//!    its canonical bytes, `FrozenRecipe::encode_canonical_into`).
 //! 2. Appends to `<path>.mlog` and calls `File::sync_data()` (`fdatasync`)
 //!    **before** mutating in-memory state (`DUR-001`, `DUR-002`).
 //! 3. Applies the deterministic transitions to `VolatileStore` in O(log N) RAM

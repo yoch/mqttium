@@ -1,4 +1,4 @@
-//! Pure deterministic hooks for multi-owner Delivery Shards (Lot 10).
+//! Pure deterministic hooks for multi-owner Delivery Shards (record 0066).
 //!
 //! A Coordinator owner (`LogicalOwnerId(0)`) owns ingress, routing, sessions,
 //! wills, and publication admission. Outgoing delivery work (QoS 1/2 emit,

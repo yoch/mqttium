@@ -1,6 +1,5 @@
-//! Prefix-stripped deterministic ordered map (`ScopedMap`), inspired by
-//! `bbtree`'s prefix stripping while remaining `#![forbid(unsafe_code)]`,
-//! `no_std + alloc`, and strictly canonical in `Ord`.
+//! Prefix-stripped deterministic ordered map (`ScopedMap`): `no_std +
+//! alloc`, without unsafe code, and strictly canonical in `Ord`.
 //!
 //! Within a run epoch, 24 of the 32 bytes in `OperationId`, `PublicationId`,
 //! `PayloadId`, and `DeliveryId` (and 16 of the 24 bytes in `EffectId`) are a

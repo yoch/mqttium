@@ -1,5 +1,6 @@
-//! End-to-end TCP wire and crash-recovery integration tests for Lot 10
-//! multi-core resident `DeliveryShard` workers (`--delivery-shards K`).
+//! End-to-end TCP wire and crash-recovery integration tests of the
+//! multi-core resident `DeliveryShard` workers (`--delivery-shards K`,
+//! record 0066).
 #![cfg(target_os = "linux")]
 
 use std::collections::BTreeSet;

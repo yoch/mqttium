@@ -328,7 +328,7 @@ struct Limits {
 /// - I5, consumed. A terminated operation never goes through the
 ///   application path again; its late results only meet the check of I4.
 ///
-/// Prefix-stripped answer set (bbtree-inspired): all retained effects for an
+/// Prefix-stripped answer set: all retained effects for an
 /// operation belong to one `(epoch, owner)` scope, so only 8-byte `EffectSeq`
 /// values plus a presence bitmask are stored inline (88 B vs 280 B).
 #[derive(Clone, PartialEq, Eq, Debug)]
