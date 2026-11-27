@@ -1053,71 +1053,95 @@ impl Writer {
                     if lanes[0].pending_control.is_none() {
                         lanes[0].pending_control = duplicate_control.take();
                     }
+                    // The reserved lane does not wait for the business lane:
+                    // every control request queued now is served in this pass
+                    // and its answer handed over at once. An answer the owner
+                    // has no room for waits in `pending_control` and stops the
+                    // lane until the next pass.
                     for (idx, lane) in lanes.iter_mut().enumerate() {
-                        if lane.closed || lane.pending_control.is_some() {
-                            continue;
-                        }
-                        match lane.crx.try_recv() {
-                            Ok(request) => {
-                                let reply = control_response(
-                                    &mut store, request, &events, &hooks, &cancel, &mut state,
-                                );
-                                worker_has_expiring
-                                    .store(store.has_expiring_publications(), Ordering::Release);
-                                #[cfg(feature = "test-hooks")]
-                                if idx == 0 {
-                                    if let ControlResponse::Collected {
-                                        collection,
-                                        result: Ok(ReceiptCollectionReply::Applied { .. }),
-                                        ..
-                                    } = &reply
-                                        && hooks.directory.as_ref().is_some_and(|d| {
-                                            consume_file(&d.join("duplicate-close-result"))
-                                        })
-                                    {
-                                        let _ = events.emit(
-                                            "receipt_collection_result_duplicated",
-                                            json!({
-                                                "command_kind": "ReceiptCollection",
-                                                "details": collection_details(*collection),
-                                            }),
-                                        );
-                                        duplicate_control = Some(reply.clone());
-                                    }
-                                    if let ControlResponse::MessageExpiry {
-                                        now,
-                                        after,
-                                        result: Ok(_),
-                                        ..
-                                    } = &reply
-                                        && hooks.directory.as_ref().is_some_and(|d| {
-                                            consume_file(
-                                                &d.join("duplicate-next-message-expire-result"),
-                                            )
-                                        })
-                                    {
-                                        let _ = events.emit(
-                                            "message_expiry_result_duplicated",
-                                            json!({
-                                                "details": message_expiry_details(*now,*after),
-                                            }),
-                                        );
-                                        duplicate_control = Some(reply.clone());
-                                    }
-                                }
-                                lane.pending_control = Some(reply);
-                                any_control_pending = true;
+                        for _ in 0..CONTROL_QUEUE {
+                            if lane.closed || lane.pending_control.is_some() {
+                                break;
                             }
-                            Err(TryRecvError::Empty) => {}
-                            Err(TryRecvError::Disconnected) => {
-                                if idx == 0 {
-                                    return if stopping {
-                                        stop_result
-                                    } else {
-                                        store.maybe_snapshot(&events, true)
-                                    };
+                            match lane.crx.try_recv() {
+                                Ok(request) => {
+                                    let reply = control_response(
+                                        &mut store, request, &events, &hooks, &cancel, &mut state,
+                                    );
+                                    worker_has_expiring.store(
+                                        store.has_expiring_publications(),
+                                        Ordering::Release,
+                                    );
+                                    #[cfg(feature = "test-hooks")]
+                                    if idx == 0 {
+                                        if let ControlResponse::Collected {
+                                            collection,
+                                            result: Ok(ReceiptCollectionReply::Applied { .. }),
+                                            ..
+                                        } = &reply
+                                            && hooks.directory.as_ref().is_some_and(|d| {
+                                                consume_file(&d.join("duplicate-close-result"))
+                                            })
+                                        {
+                                            let _ = events.emit(
+                                                "receipt_collection_result_duplicated",
+                                                json!({
+                                                    "command_kind": "ReceiptCollection",
+                                                    "details": collection_details(*collection),
+                                                }),
+                                            );
+                                            duplicate_control = Some(reply.clone());
+                                        }
+                                        if let ControlResponse::MessageExpiry {
+                                            now,
+                                            after,
+                                            result: Ok(_),
+                                            ..
+                                        } = &reply
+                                            && hooks.directory.as_ref().is_some_and(|d| {
+                                                consume_file(
+                                                    &d.join("duplicate-next-message-expire-result"),
+                                                )
+                                            })
+                                        {
+                                            let _ = events.emit(
+                                                "message_expiry_result_duplicated",
+                                                json!({
+                                                    "details": message_expiry_details(*now,*after),
+                                                }),
+                                            );
+                                            duplicate_control = Some(reply.clone());
+                                        }
+                                    }
+                                    match lane.cctx.try_send(reply) {
+                                        Ok(()) => lane.wake.wake(),
+                                        Err(TrySendError::Full(reply)) => {
+                                            lane.pending_control = Some(reply);
+                                            any_control_pending = true;
+                                        }
+                                        Err(TrySendError::Disconnected(_)) => {
+                                            if idx == 0 {
+                                                return if stopping {
+                                                    stop_result
+                                                } else {
+                                                    store.maybe_snapshot(&events, true)
+                                                };
+                                            }
+                                            lane.closed = true;
+                                        }
+                                    }
                                 }
-                                lane.closed = true;
+                                Err(TryRecvError::Empty) => break,
+                                Err(TryRecvError::Disconnected) => {
+                                    if idx == 0 {
+                                        return if stopping {
+                                            stop_result
+                                        } else {
+                                            store.maybe_snapshot(&events, true)
+                                        };
+                                    }
+                                    lane.closed = true;
+                                }
                             }
                         }
                     }
