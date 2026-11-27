@@ -1,6 +1,6 @@
 # 0057 — Deterministic `FlatMap`, direct synchronous `VolatileStore`, and zero-allocation framing (Lot 7)
 
-Status: **Proposed** (23 November 2026). Applied to `mqttiumd-contract`, `mqttiumd-core`, `mqttiumd-store-volatile`, and `mqttiumd`.
+Status: **Accepted with amendments** (27 November 2026, by the repository owner after the validation of `9dfd568`, which corrected the text where the code contradicted it, report 0043; proposed on 23 November 2026). Applied to `mqttiumd-contract`, `mqttiumd-core`, `mqttiumd-store-volatile`, and `mqttiumd`.
 
 ## Context
 

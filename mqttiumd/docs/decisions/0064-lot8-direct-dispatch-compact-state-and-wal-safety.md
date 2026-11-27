@@ -1,6 +1,6 @@
 # 0064 — Direct effect dispatch, compact session/delivery state, ownership-moving volatile persistence, and fail-closed WAL compaction (Lot 8)
 
-Status: **Proposed** (24 November 2026). Applied to `mqttiumd-contract`, `mqttiumd-core`, `mqttiumd-store-volatile`, `mqttiumd-store-sqlite`, `mqttiumd-lab`, and `mqttiumd`. [Report 0039](../reports/0039-lot8-arm64-qos1-throughput-and-idle-ram.md) holds the ARM64 empirical A/B measurements and full verification ledger.
+Status: **Accepted with amendments** (27 November 2026, by the repository owner after the validation of `9dfd568`, which corrected the text where the code contradicted it, report 0043; proposed on 24 November 2026). Applied to `mqttiumd-contract`, `mqttiumd-core`, `mqttiumd-store-volatile`, `mqttiumd-store-sqlite`, `mqttiumd-lab`, and `mqttiumd`. [Report 0039](../reports/0039-lot8-arm64-qos1-throughput-and-idle-ram.md) holds the ARM64 empirical A/B measurements and full verification ledger. Its figures are not part of the decision: a single run, on code that later commits changed (report 0043).
 
 No wire format, canonical recipe encoding, SQLite schema, or `.mlog` record encoding changes. `crates/mqttiumd-contract/src/capacity.rs` is untouched, keeping `proofs/credits/BODY.sha256` identical, and the contract digest reported by `mqttiumd-lab validate` remains unchanged (`sha256:21e96cc81c1f48d59841d8424fee2290102c6782b025222f2d6d2fe72ccf9bb5`).
 

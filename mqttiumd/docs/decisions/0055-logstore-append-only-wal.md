@@ -1,6 +1,6 @@
 # 0055 — Append-only durable WAL store (`LogStore`, `--storage-mode log`)
 
-Status: **Proposed** (23 November 2026). Applied to `mqttiumd-store-volatile`, `mqttiumd-store-sqlite`, and `mqttiumd`.
+Status: **Accepted with amendments** (27 November 2026, by the repository owner after the validation of `9dfd568`, which corrected the text where the code contradicted it, report 0043; proposed on 23 November 2026). Applied to `mqttiumd-store-volatile`, `mqttiumd-store-sqlite`, and `mqttiumd`.
 
 ## Context
 

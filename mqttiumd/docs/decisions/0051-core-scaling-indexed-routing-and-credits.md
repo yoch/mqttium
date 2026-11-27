@@ -1,6 +1,6 @@
 # 0051 — Core scaling, indexed routing, aligned exchange credits, and transport batching
 
-Status: **Proposed** (22 November 2026). Applied to contract, core, SQLite store, and runtime.
+Status: **Accepted** (27 November 2026, by the repository owner after the validation of `9dfd568`, report 0043; proposed on 22 November 2026). Applied to contract, core, SQLite store, and runtime.
 
 Amended by 0061 (accepted): `OwnerConfig.max_exchanges` is `SESSIONS × receiving::MAXIMUM`
 (32,768) whatever the connection limit, and `OwnerConfig.session_qos2_exchanges` bounds the

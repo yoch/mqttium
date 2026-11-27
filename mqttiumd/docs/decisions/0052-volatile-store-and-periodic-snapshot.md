@@ -1,8 +1,8 @@
 # 0052 — Indexed volatile store with optional periodic atomic SQLite snapshots
 
-Status: **Proposed** (22 November 2026). Applied to `mqttiumd-store-volatile`, `mqttiumd-store-sqlite`, and `mqttiumd`.
+Status: **Accepted** (27 November 2026, by the repository owner after the validation of `9dfd568`, report 0043; proposed on 22 November 2026). Applied to `mqttiumd-store-volatile`, `mqttiumd-store-sqlite`, and `mqttiumd`.
 
-Amended by 0055 (proposed): a third storage mode, `log`, with the guarantee `per_commit_fdatasync_append_log`; `--storage-mode` takes `durable|log|volatile`.
+Amended by 0055: a third storage mode, `log`, with the guarantee `per_commit_fdatasync_append_log`; `--storage-mode` takes `durable|log|volatile`.
 
 ## Context
 
