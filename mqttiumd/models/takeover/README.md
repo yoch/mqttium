@@ -175,7 +175,7 @@ while another failed.
 
 | Model action | Code | Replay |
 | - | - | - |
-| `CoreSubmit` | `Sink::try_submit`: `peer.closing().is_none()` and `bindings.get(&connection.session) == Some(&generation)`, then `Connection::try_send_outgoing` (`runtime.rs`) | `a_real_puback_write_receipt_returns_its_receive_credit` (`runtime_tests.rs`) for a frame accepted on the bound generation; `a_finished_task_seals_its_queue_and_fails_each_admitted_frame_once` (`net.rs`) for the refusal once the task has ended |
+| `CoreSubmit` | `Sink::try_submit`: `peer.closing().is_none()` and `bindings.get(&connection.session) == Some(&generation)`, then `Connection::try_send_outgoing` (`runtime/sink.rs`) | `a_real_puback_write_receipt_returns_its_receive_credit` (`runtime_tests.rs`) for a frame accepted on the bound generation; `a_finished_task_seals_its_queue_and_fails_each_admitted_frame_once` (`net.rs`) for the refusal once the task has ended |
 | `CoreCollect` | `collect_written` | `a_real_puback_write_receipt_returns_its_receive_credit` (`runtime_tests.rs`) |
 | `NewConnect` | `connect`, `start_takeover` | `stale_puback_during_takeover_with_a_blocked_close_cannot_stop_other_connections` (`runtime_tests.rs`): the old peer is `closing` and the new one is not bound |
 | `CoreCloseDue`, `CoreCloseOther` | `Runtime::close`, up to the call of `Connection::close` | `stale_puback_during_takeover_with_a_blocked_close_cannot_stop_other_connections` for the close a takeover makes due; `closing_qos0_without_collecting_written_retires_the_exact_attempt` (`runtime_tests.rs`) for another reason |
