@@ -1,4 +1,5 @@
 //! Regressions of the real product reactor and its socket/writer adapters.
+use super::start::run_inner;
 use super::*;
 
 /// The ordinary lane of the bounded profile these tests run with: the
