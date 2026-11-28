@@ -7159,6 +7159,124 @@ fn tls_test_peer(
     (generation, client)
 }
 
+/// TLS counterpart of `a_shard_connection_without_ack_credit_still_reads_what_needs_none`:
+/// when a routed TLS connection's shard ACK budget is exhausted, a packet that
+/// needs no credit (PINGREQ) still reaches the coordinator, while an ACK is
+/// parked in-order ahead of a following DISCONNECT until credit returns.
+#[test]
+fn tls_shard_connection_without_ack_credit_still_reads_what_needs_none() {
+    with_runtime(128, |runtime, directory| {
+        let (generation, mut client) = tls_test_peer(runtime, directory);
+        let wake = crate::wake::Wake::new();
+        let inbox = net::ShardInbox::new(wake, 1, 1);
+        let key = ConnectionKey {
+            session: SessionId::new(1),
+            generation,
+        };
+        assert!(
+            runtime.peers[&generation]
+                .io
+                .install_shard_route(net::ShardIoRoute::new(
+                    LogicalOwnerId::new(1),
+                    key,
+                    Arc::clone(&inbox),
+                ))
+        );
+        // Drain the initial TLS `Authenticated` notice so later reads observe packets.
+        let mut incoming = VecDeque::new();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !incoming
+            .iter()
+            .any(|p| matches!(p, net::Incoming::Authenticated { .. }))
+            && Instant::now() < deadline
+        {
+            runtime.peers[&generation]
+                .io
+                .drain_incoming(&mut incoming, 8);
+            thread::sleep(Duration::from_millis(1));
+        }
+        incoming.clear();
+
+        // Consume the single ACK credit via a first PUBACK left unconsumed in the inbox.
+        client.write_all(&[0x40, 2, 0, 1]).unwrap();
+        client.flush().unwrap();
+        let mut first_ack = VecDeque::new();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while first_ack.is_empty() && Instant::now() < deadline {
+            inbox.drain_into(&mut first_ack, 4);
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(
+            first_ack.len(),
+            1,
+            "initial PUBACK should spend the 1 ACK credit"
+        );
+
+        // With 0 ACK credit left, a PINGREQ must still be read and reach the coordinator.
+        client.write_all(&[0xc0, 0]).unwrap();
+        client.flush().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !incoming
+            .iter()
+            .any(|p| matches!(p, net::Incoming::Packet { first: 0xc0, .. }))
+            && Instant::now() < deadline
+        {
+            runtime.peers[&generation]
+                .io
+                .drain_incoming(&mut incoming, 8);
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(
+            incoming
+                .iter()
+                .any(|p| matches!(p, net::Incoming::Packet { first: 0xc0, .. })),
+            "TLS PINGREQ did not pass while shard ACK credit was zero: {incoming:?}"
+        );
+        incoming.clear();
+
+        // Next send a second PUBACK followed by DISCONNECT: the PUBACK must park
+        // until credit returns, and the DISCONNECT must not overtake it.
+        client.write_all(&[0x40, 2, 0, 2, 0xe0, 0]).unwrap();
+        client.flush().unwrap();
+        thread::sleep(Duration::from_millis(40));
+        runtime.peers[&generation]
+            .io
+            .drain_incoming(&mut incoming, 8);
+        assert!(
+            incoming.is_empty(),
+            "TLS DISCONNECT overtook a parked unpaid PUBACK: {incoming:?}"
+        );
+        let mut more_acks = VecDeque::new();
+        assert_eq!(inbox.drain_into(&mut more_acks, 4), 0);
+
+        // Release the credit held by the first PUBACK -> second PUBACK reaches the shard
+        // and DISCONNECT reaches the coordinator.
+        first_ack.clear();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while (more_acks.is_empty() || incoming.is_empty()) && Instant::now() < deadline {
+            inbox.drain_into(&mut more_acks, 4);
+            runtime.peers[&generation]
+                .io
+                .drain_incoming(&mut incoming, 8);
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(matches!(
+            more_acks.pop_front(),
+            Some(net::ShardIoEvent::AckPacket {
+                first: 0x40,
+                body,
+                ..
+            }) if body.as_slice() == [0, 2]
+        ));
+        assert!(
+            incoming
+                .iter()
+                .any(|p| matches!(p, net::Incoming::Packet { first: 0xe0, .. })),
+            "TLS DISCONNECT did not arrive after ACK credit returned: {incoming:?}"
+        );
+    });
+}
+
 #[test]
 fn tls_terminal_writer_cannot_discard_an_already_decoded_normal_disconnect() {
     with_runtime(128, |runtime, directory| {

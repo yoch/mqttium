@@ -613,6 +613,11 @@ impl ShardInbox {
         self.pending.load(Ordering::Acquire)
     }
 
+    #[inline]
+    pub fn wake(&self) {
+        self.wake.wake();
+    }
+
     fn push_batch(&self, items: &mut Vec<ShardIoEvent>) {
         if items.is_empty() {
             return;
@@ -759,6 +764,16 @@ impl OutgoingHandle {
     pub fn is_cancelled(&self) -> bool {
         self.core.is_cancelled()
     }
+
+    #[inline]
+    pub fn is_closing(&self) -> bool {
+        self.core.is_closing()
+    }
+
+    #[inline]
+    pub fn mark_closing(&self) {
+        self.core.mark_closing();
+    }
 }
 
 /// Single shared allocation holding all cross-thread connection state: socket,
@@ -772,6 +787,8 @@ pub(super) struct ConnCore {
     ready: Option<(Arc<ReadyQueue>, u64)>,
     pub(super) heard: AtomicU64,
     pub(super) cancelled: AtomicBool,
+    closing: AtomicBool,
+    outgoing_waiter: AtomicBool,
     activity: AtomicBool,
     in_pending: AtomicBool,
     // Slots held by the coordinator until it consumes or returns the batch.
@@ -860,6 +877,8 @@ impl ConnCore {
             ready,
             heard: AtomicU64::new(0),
             cancelled: AtomicBool::new(false),
+            closing: AtomicBool::new(false),
+            outgoing_waiter: AtomicBool::new(false),
             activity: AtomicBool::new(initial_activity),
             in_pending: AtomicBool::new(false),
             incoming_borrowed: AtomicU8::new(0),
@@ -899,6 +918,16 @@ impl ConnCore {
     #[inline]
     pub(super) fn is_cancelled(&self) -> bool {
         self.cancelled.load(Ordering::Acquire)
+    }
+
+    #[inline]
+    pub(super) fn is_closing(&self) -> bool {
+        self.closing.load(Ordering::Acquire)
+    }
+
+    #[inline]
+    pub(super) fn mark_closing(&self) {
+        self.closing.store(true, Ordering::Release);
     }
 
     #[inline]
@@ -977,12 +1006,17 @@ impl ConnCore {
             Ok(guard) => guard,
             Err(_) => return Err(TrySendError::Disconnected(frame)),
         };
-        if !state.accepting_frames {
+        if !state.accepting_frames
+            || (producer == Producer::Shard && self.closing.load(Ordering::Acquire))
+        {
             return Err(TrySendError::Disconnected(frame));
         }
         if state.queue.len() >= OUTPUT_SLOTS
             || (producer == Producer::Shard && state.subacks_owed != 0)
         {
+            if producer == Producer::Shard {
+                self.outgoing_waiter.store(true, Ordering::Release);
+            }
             #[cfg(test)]
             if let Some(held) = state.held.as_mut()
                 && let Some((id, _)) = frame.correlation
@@ -999,16 +1033,30 @@ impl ConnCore {
             && effect.owner == route.owner_id
             && !route.reserve_write(effect)
         {
+            if producer == Producer::Shard {
+                self.outgoing_waiter.store(true, Ordering::Release);
+            }
             return Err(TrySendError::Full(frame));
         }
         state.enqueue(frame);
         self.outgoing_pending.store(true, Ordering::Release);
+        let mut wake_shard = false;
         if producer == Producer::CoordinatorSuback {
             // Queued under the lock a shard takes before it reads the
             // count: a frame of the shard that sees it paid follows it.
             state.subacks_owed = state.subacks_owed.saturating_sub(1);
+            if state.subacks_owed == 0
+                && state.queue.len() < OUTPUT_SLOTS
+                && self.outgoing_waiter.load(Ordering::Acquire)
+                && self.outgoing_waiter.swap(false, Ordering::AcqRel)
+            {
+                wake_shard = true;
+            }
         }
         drop(state);
+        if wake_shard && let Some(route) = self.shard_route.get() {
+            route.inbox.wake();
+        }
         #[cfg(test)]
         self.changed.notify_all();
         self.link.notify();
@@ -1097,7 +1145,14 @@ impl ConnCore {
             !state.queue.is_empty() || !state.tx_alive,
             Ordering::Release,
         );
+        let wake_shard = state.subacks_owed == 0
+            && state.queue.len() < OUTPUT_SLOTS
+            && self.outgoing_waiter.load(Ordering::Acquire)
+            && self.outgoing_waiter.swap(false, Ordering::AcqRel);
         drop(state);
+        if wake_shard && let Some(route) = self.shard_route.get() {
+            route.inbox.wake();
+        }
         #[cfg(test)]
         self.changed.notify_one();
         Ok(())
@@ -2560,6 +2615,13 @@ impl Connection {
         }
     }
 
+    /// Marks the connection closing so routed delivery shards stop enqueueing
+    /// frames while the coordinator flushes a terminal DISCONNECT (D7).
+    #[inline]
+    pub fn mark_closing(&self) {
+        self.core.mark_closing();
+    }
+
     /// Installs the direct I/O route for this connection once `CONNACK` has
     /// been queued so subscriber ACKs and shard-owned `Written` receipts bypass
     /// the Coordinator thread.
@@ -3587,6 +3649,7 @@ impl Task {
         else {
             return Ok(progressed);
         };
+        progressed |= !scratch.incoming_batch.is_empty();
         let mut heard_packet = false;
         let mut cached_fixed: Option<FrameObservation> = None;
         let mut source = ScratchSource {
@@ -5244,5 +5307,49 @@ mod tests {
         }
         assert!(start.elapsed() < Duration::from_millis(2800));
         finish(&mut connection);
+    }
+
+    /// Defect D7: draining a saturated outgoing socket must wake the routed
+    /// delivery shard directly so held effects do not wait for a 1 ms timer.
+    #[test]
+    fn socket_drain_wakes_shard_without_polling_tick() {
+        let (mut connection, mut peer) = pair();
+        let (effect, key) = correlation(1).unwrap();
+        let wake = Wake::new();
+        let inbox = ShardInbox::new(wake.clone(), 4, 4);
+        assert!(connection.install_shard_route(ShardIoRoute::new(
+            effect.owner,
+            key,
+            Arc::clone(&inbox),
+        )));
+        connection.hold_output(true);
+        let shard = connection.outgoing_handle();
+        let frame = || Write {
+            correlation: None,
+            bytes: FrameBytes::from_slice(&[0xd0, 0]),
+            payload: None,
+            expiry: None,
+            report: WriteReport::None,
+        };
+        for _ in 0..OUTPUT_SLOTS {
+            shard.try_send_outgoing(frame()).unwrap();
+        }
+        assert!(matches!(
+            shard.try_send_outgoing(frame()),
+            Err(TrySendError::Full(_))
+        ));
+        let _ = wake.take();
+        connection.hold_output(false);
+        let woken = wake.wait(Duration::from_millis(400));
+        let mut drained = [0u8; 2];
+        peer.set_read_timeout(Some(Duration::from_millis(400)))
+            .unwrap();
+        let _ = peer.read(&mut drained);
+        connection.close();
+        finish(&mut connection);
+        assert!(
+            woken,
+            "draining a saturated socket did not signal the waiting delivery shard (D7)"
+        );
     }
 }

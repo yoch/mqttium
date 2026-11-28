@@ -646,6 +646,7 @@ impl Task {
         else {
             return Ok(progressed);
         };
+        progressed |= !scratch.incoming_batch.is_empty();
         let limit = scratch.incoming_batch.len() + parse;
         let mut heard_packet = false;
         let mut cached_fixed: Option<FrameObservation> = None;

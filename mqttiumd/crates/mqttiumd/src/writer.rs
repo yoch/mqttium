@@ -992,8 +992,8 @@ impl Writer {
                     // A reply lane an owner has not drained is retried on a
                     // short timer; nothing else in this loop waits on a timer.
                     let mut stalled = false;
-                    let mut any_pending = false;
                     let mut any_control_pending = false;
+                    let mut idle_turn = true;
                     for (idx, lane) in lanes.iter_mut().enumerate() {
                         let mut woke = false;
                         while let Some(reply) = lane.pending_control.pop_front() {
@@ -1045,9 +1045,6 @@ impl Writer {
                         }
                         if woke {
                             lane.wake.wake();
-                        }
-                        if !lane.pending.is_empty() {
-                            any_pending = true;
                         }
                         if !lane.pending_control.is_empty() {
                             any_control_pending = true;
@@ -1235,7 +1232,7 @@ impl Writer {
                             any_control_pending = true;
                         }
                     }
-                    if !any_pending && !stopping {
+                    if !stopping && (lanes.len() > 1 || lanes[0].pending.is_empty()) {
                         // Consecutive Persist commands across all owners commit
                         // as one group transaction. Read-only LoadWork requests
                         // run immediately after the group commit so they see all
@@ -1325,7 +1322,7 @@ impl Writer {
                                                 break;
                                             }
                                             let idx = 1 + ((start + step) % shard_count);
-                                            if lanes[idx].closed {
+                                            if lanes[idx].closed || !lanes[idx].pending.is_empty() {
                                                 continue;
                                             }
                                             match lanes[idx].rx.try_recv() {
@@ -1379,7 +1376,8 @@ impl Writer {
                                 shard_budget,
                                 shard_rr,
                             );
-                            while members.len() < group
+                            while lanes[0].pending.is_empty()
+                                && members.len() < group
                                 && deferred_reads.len() < group
                                 && other.is_none()
                             {
@@ -1427,7 +1425,7 @@ impl Writer {
                         if !members.is_empty() || !deferred_reads.is_empty() || other.is_some() {
                             hold_ordinary(&hooks);
                         }
-                        let idle_turn =
+                        idle_turn =
                             members.is_empty() && deferred_reads.is_empty() && other.is_none();
                         if !members.is_empty() {
                             group_responses_into(
@@ -1483,8 +1481,11 @@ impl Writer {
                             requests.wait(idle);
                         }
                     }
-                    if stalled {
-                        thread::sleep(Duration::from_millis(1));
+                    if stalled && idle_turn {
+                        // Wake immediately if another unblocked owner submits a
+                        // request, while still retrying the stalled reply lane
+                        // within 1 ms (D8).
+                        requests.wait(Duration::from_millis(1));
                     }
                 }
             })
@@ -4636,5 +4637,153 @@ mod tests {
             writer.join_finished().unwrap();
             let _ = std::fs::remove_dir_all(path);
         }
+    }
+
+    /// Defect D8: one stalled shard whose reply lane is full must not block
+    /// the coordinator or any other delivery shard from committing or reading
+    /// through the shared writer.
+    #[test]
+    fn stalled_shard_reply_lane_does_not_block_other_owners() {
+        use mqttiumd_contract::ids::{EffectSeq, LogicalOwnerId, SessionId};
+        use mqttiumd_contract::pubsub::WORK_PAGE_LIMIT;
+        use std::num::{NonZeroU32, NonZeroUsize};
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        let path = std::env::temp_dir().join(format!(
+            "mqttiumd-d8-hol-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir(&path).unwrap();
+        let events = Events::open(&path.join("events.jsonl")).unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut writer = Writer::spawn_configured_sharded(
+            path.join("store.sqlite"),
+            events,
+            Hooks::default(),
+            cancel,
+            None,
+            false,
+            StorageMode::Volatile {
+                snapshot_interval: None,
+            },
+            2,
+        )
+        .unwrap();
+        let boot = writer
+            .boot
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        let mut shards = writer.take_shard_handles();
+        let s1 = shards.remove(0);
+        let s2 = shards.remove(0);
+
+        let epoch = boot.grant.epoch();
+        let mut authority = mqttiumd_contract::effects::OwnerAuthority::from_grant(
+            boot.grant,
+            NonZeroU32::new(3).unwrap(),
+        )
+        .unwrap();
+        let slots = NonZeroUsize::new(16).unwrap();
+        let one = NonZeroU32::new(1).unwrap();
+        let mut b0 = authority
+            .create_outbox(LogicalOwnerId::new(0), slots, one)
+            .unwrap();
+        let mut b1 = authority
+            .create_outbox(LogicalOwnerId::new(1), slots, one)
+            .unwrap();
+        let mut b2 = authority
+            .create_outbox(LogicalOwnerId::new(2), slots, one)
+            .unwrap();
+
+        let make_load = |outbox: &mut mqttiumd_contract::effects::Outbox, seq: u64| {
+            let id = EffectId {
+                epoch,
+                owner: outbox.id().owner(),
+                sequence: EffectSeq::new(seq),
+            };
+            let key = outbox.reserve(NonZeroUsize::new(1).unwrap()).unwrap();
+            outbox
+                .publish(
+                    key,
+                    OwnedEffect::new(
+                        id,
+                        Effect::LoadWork {
+                            session: SessionId::new(1),
+                            after: None,
+                            limit: WORK_PAGE_LIMIT,
+                        },
+                    ),
+                )
+                .unwrap();
+            let mut sink = Vec::new();
+            struct VecSink<'a>(&'a mut Vec<OwnedEffect>);
+            impl mqttiumd_contract::effects::EffectSink for VecSink<'_> {
+                fn try_submit(
+                    &mut self,
+                    effect: OwnedEffect,
+                ) -> mqttiumd_contract::effects::SubmitResult {
+                    self.0.push(effect);
+                    mqttiumd_contract::effects::SubmitResult::Accepted
+                }
+            }
+            let _ = outbox.dispatch(&mut VecSink(&mut sink));
+            sink.pop().unwrap()
+        };
+
+        // Saturate shard 1's reply lane (capacity QUEUE * 2) plus overflow into
+        // its writer-side pending queue without draining `s1.receiver`.
+        let flood = QUEUE * 2 + 4;
+        for seq in 1..=(flood as u64) {
+            s1.sender
+                .send(Request::Effect(make_load(&mut b1, seq)))
+                .unwrap();
+        }
+        // Give the writer time to fill `s1.receiver` and park overflow in `lanes[1].pending`.
+        thread::sleep(Duration::from_millis(40));
+
+        // While shard 1 stays stalled, coordinator (owner 0) and shard 2 (owner 2)
+        // must still make immediate progress.
+        writer
+            .sender
+            .send(Request::Effect(make_load(&mut b0, 1)))
+            .unwrap();
+        s2.sender
+            .send(Request::Effect(make_load(&mut b2, 1)))
+            .unwrap();
+
+        let coord_ok = writer
+            .receiver
+            .recv_timeout(Duration::from_millis(500))
+            .is_ok();
+        let shard2_ok = s2.receiver.recv_timeout(Duration::from_millis(500)).is_ok();
+
+        // Drain shard 1 before asserting so the writer always stops cleanly even on failure.
+        let mut s1_received = 0usize;
+        while s1_received < flood {
+            if s1.receiver.recv_timeout(Duration::from_secs(2)).is_err() {
+                break;
+            }
+            s1_received += 1;
+        }
+        drop(s1);
+        drop(s2);
+        writer.sender.send(Request::Stop).unwrap();
+        let _ = writer.receiver.recv_timeout(Duration::from_secs(2));
+        let start = Instant::now();
+        while !writer.is_finished() && start.elapsed() < Duration::from_secs(2) {
+            thread::sleep(Duration::from_millis(5));
+        }
+        let _ = writer.join_finished();
+        let _ = std::fs::remove_dir_all(path);
+
+        assert!(
+            coord_ok,
+            "stalled shard 1 reply lane blocked coordinator (D8)"
+        );
+        assert!(shard2_ok, "stalled shard 1 reply lane blocked shard 2 (D8)");
+        assert_eq!(s1_received, flood, "shard 1 lost queued replies");
     }
 }

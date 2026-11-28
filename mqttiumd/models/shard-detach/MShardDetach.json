@@ -1,0 +1,55 @@
+{
+  "module": "MShardDetach.tla",
+  "status": "refinement",
+  "summary": "Generation closure, closing-connection fence (D7), and O(1) shard detach fence (D9) across the coordinator, I/O task, and delivery shard (--delivery-shards K >= 1, ADR 0066). Proves that a shard cannot write to a generation once the coordinator marks ConnCore::closing, that DeliveryShardWorker::finish_detaches signals completion only once I/O queues, the O(1) terminal_by_conn counter, and in-flight FinishDelivery/PreparePubrel work have all settled, and that a replacement generation never overlaps an un-detached generation. Refutes three mutants removing each fence.",
+  "issues": [
+    685
+  ],
+  "tests": [
+    "mqttiumd/crates/mqttiumd/src/delivery_shard/fence_tests.rs"
+  ],
+  "replays": [
+    {
+      "file": "mqttiumd/crates/mqttiumd/src/delivery_shard/fence_tests.rs",
+      "test": "submitted_ack_precedes_detach_even_when_the_writer_withholds_credit"
+    },
+    {
+      "file": "mqttiumd/crates/mqttiumd/src/delivery_shard/fence_tests.rs",
+      "test": "finish_detaches_tracks_terminal_inputs_per_connection_and_finishes_in_order"
+    },
+    {
+      "file": "mqttiumd/crates/mqttiumd/src/delivery_shard/fence_tests.rs",
+      "test": "shard_sink_refuses_writes_to_closing_connection_and_oversize_publish"
+    }
+  ],
+  "not_replayed": "All safety invariants and mutant counterexamples are replayed by deterministic unit tests in delivery_shard/fence_tests.rs.",
+  "configs": [
+    {
+      "config": "MShardDetach-safety.cfg",
+      "expect": "pass",
+      "invariants": [
+        "TypeOK",
+        "NoWriteAfterClosing",
+        "TerminalIndexExact",
+        "NoDetachWithPendingWork",
+        "NoOverlapWithNextGen",
+        "TerminalConsistent"
+      ]
+    },
+    {
+      "config": "MShardDetach-mut-write-while-closing.cfg",
+      "expect": "violation",
+      "invariant": "NoWriteAfterClosing"
+    },
+    {
+      "config": "MShardDetach-mut-ignore-terminal.cfg",
+      "expect": "violation",
+      "invariant": "NoDetachWithPendingWork"
+    },
+    {
+      "config": "MShardDetach-mut-ignore-finish-inflight.cfg",
+      "expect": "violation",
+      "invariant": "NoDetachWithPendingWork"
+    }
+  ]
+}

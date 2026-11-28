@@ -873,6 +873,7 @@ fn a_pubrel_binding_is_checked_and_bounded_as_the_coordinator_does() {
             next_timer_due: &mut worker.next_timer_due,
             inputs: &mut worker.inputs,
             terminal_inputs: &mut worker.terminal_inputs,
+            terminal_by_conn: &mut worker.terminal_by_conn,
             events: &worker.events,
             limits: worker.limits,
             close_notices: &mut close_notices,
@@ -1001,4 +1002,435 @@ fn a_claim_committed_just_before_its_detach_is_not_written_to_the_closed_generat
         "the claim was left behind"
     );
     socket.close();
+}
+
+/// Defect D7: a delivery shard's effect sink must journal `frame_queued`,
+/// `effect_retained` (once per retained effect), and `frame_failed`, match the
+/// coordinator on oversize PUBLISH refusal, and emit a close notice when a
+/// transport outgoing lane is disconnected.
+#[test]
+fn shard_sink_journals_frame_lifecycle_and_notifies_close_on_disconnected_or_oversize() {
+    let Harness {
+        incarnation,
+        epoch,
+        mut worker,
+        commands,
+        events,
+        _lanes,
+    } = harness("d7-sink-parity");
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let _client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+    let socket = net::spawn(listener.accept().unwrap().0).unwrap();
+    socket.hold_output(true);
+
+    let session = SessionId::new(1);
+    let generation = ConnectionGeneration::new(10);
+    let key = ConnectionKey {
+        session,
+        generation,
+    };
+    let lease = InlineClaimLease::new();
+    commands
+        .send(CoordToShard::Attach {
+            session,
+            revision: Revision::new(1),
+            generation,
+            receive_maximum: 8,
+            maximum_packet_size: 24,
+            version: Version::V5,
+            outgoing: socket.outgoing_handle(),
+            lease,
+            dirty_seq: 1,
+        })
+        .unwrap();
+    worker.drain_coord_messages().unwrap();
+
+    let source = LogicalOwnerId::new(0);
+    let bytes = |s: &[u8]| SharedBytes::copy_from(s, 1024).unwrap();
+    let make_claim = |seq: u64, pi: u16| DelegatedClaim {
+        delivery: DeliveryId {
+            publication: PublicationId::new(incarnation, epoch, source, PublicationSeq::new(seq)),
+            index: 0,
+        },
+        target: session,
+        target_revision: Revision::new(1),
+        qos: Qos::AtLeastOnce,
+        claim_operation: OperationId::new(incarnation, epoch, source, OperationSeq::new(seq)),
+        packet_id: OutboundPacketId::new(pi).unwrap(),
+        generation,
+    };
+
+    // 1. First small PUBLISH queues and must journal `frame_queued`.
+    worker.pending_inline.push_back(PendingInlineItem {
+        claim: make_claim(1, 1),
+        topic: bytes(b"t"),
+        payload: bytes(b"a"),
+        properties: None,
+    });
+    worker.drain_pending_inline().unwrap();
+    worker.dispatch().unwrap();
+
+    // 2. Fill the remaining outgoing slots, then submit a second PUBLISH:
+    //    it must be retained and journal `effect_retained` once across retries.
+    for _ in 1..net::OUTPUT_SLOTS {
+        socket
+            .try_send_outgoing(Write {
+                expiry: None,
+                correlation: None,
+                bytes: net::FrameBytes::from_slice(&[0xd0, 0]),
+                payload: None,
+                report: WriteReport::None,
+            })
+            .unwrap();
+    }
+    worker.pending_inline.push_back(PendingInlineItem {
+        claim: make_claim(2, 2),
+        topic: bytes(b"t"),
+        payload: bytes(b"b"),
+        properties: None,
+    });
+    worker.drain_pending_inline().unwrap();
+    worker.dispatch().unwrap();
+    worker.dispatch().unwrap();
+
+    // 3. Cancel the socket and retry: the retained PUBLISH must journal `frame_failed`.
+    socket.close();
+    worker.dispatch().unwrap();
+
+    // 4. On a fresh connection, seal `accepting_frames` by queuing DISCONNECT (0xe0)
+    //    without cancelling yet; shard's EmitPublish must emit a CloseConnection notice.
+    let listener2 = TcpListener::bind("127.0.0.1:0").unwrap();
+    let _client2 = TcpStream::connect(listener2.local_addr().unwrap()).unwrap();
+    let socket2 = net::spawn(listener2.accept().unwrap().0).unwrap();
+    socket2.hold_output(true);
+    let session2 = SessionId::new(2);
+    let gen2 = ConnectionGeneration::new(20);
+    worker.notices.attach(gen2);
+    commands
+        .send(CoordToShard::Attach {
+            session: session2,
+            revision: Revision::new(1),
+            generation: gen2,
+            receive_maximum: 8,
+            maximum_packet_size: 1024,
+            version: Version::V5,
+            outgoing: socket2.outgoing_handle(),
+            lease: InlineClaimLease::new(),
+            dirty_seq: 1,
+        })
+        .unwrap();
+    worker.drain_coord_messages().unwrap();
+    socket2
+        .try_send_outgoing(Write {
+            expiry: None,
+            correlation: None,
+            bytes: net::FrameBytes::from_slice(&[0xe0, 0]),
+            payload: None,
+            report: WriteReport::None,
+        })
+        .unwrap();
+    worker.pending_inline.push_back(PendingInlineItem {
+        claim: DelegatedClaim {
+            delivery: DeliveryId {
+                publication: PublicationId::new(incarnation, epoch, source, PublicationSeq::new(3)),
+                index: 0,
+            },
+            target: session2,
+            target_revision: Revision::new(1),
+            qos: Qos::AtLeastOnce,
+            claim_operation: OperationId::new(incarnation, epoch, source, OperationSeq::new(3)),
+            packet_id: OutboundPacketId::new(1).unwrap(),
+            generation: gen2,
+        },
+        topic: bytes(b"t"),
+        payload: bytes(b"c"),
+        properties: None,
+    });
+    worker.drain_pending_inline().unwrap();
+    worker.dispatch().unwrap();
+
+    let mut notices = Vec::new();
+    let _ = worker.notices.drain_into(&mut notices);
+    let journal = std::fs::read_to_string(&events).unwrap();
+    let _ = std::fs::remove_file(&events);
+    socket2.close();
+
+    assert!(
+        journal
+            .lines()
+            .any(|l| l.contains("\"frame_queued\"") && l.contains("\"PUBLISH\"")),
+        "shard sink never journaled frame_queued (D7)"
+    );
+    let retained_count = journal
+        .lines()
+        .filter(|l| l.contains("\"effect_retained\"") && l.contains("\"output_queue_full\""))
+        .count();
+    assert_eq!(
+        retained_count, 1,
+        "shard sink must journal effect_retained once per retained effect (D7), got {retained_count}"
+    );
+    assert!(
+        journal
+            .lines()
+            .any(|l| l.contains("\"frame_failed\"") && l.contains("\"unusable_generation\"")),
+        "shard sink never journaled frame_failed (D7)"
+    );
+    assert!(
+        notices.iter().any(|n| matches!(
+            n,
+            ShardToCoord::CloseConnection {
+                generation: g,
+                code: "outgoing_queue_full",
+                ..
+            } if *g == gen2
+        )),
+        "shard sink sent no CloseConnection notice for disconnected outgoing lane (D7)"
+    );
+    let _ = key;
+}
+
+/// Defect D7 (closing-connection fence & oversize PUBLISH parity):
+/// once the coordinator marks a connection closing, a shard refuses every write
+/// onto that socket; and an oversize PUBLISH returns `SubmitBlock::Closed` and
+/// marks the connection closing so no later frame slips onto the wire.
+#[test]
+fn shard_sink_refuses_writes_to_closing_connection_and_oversize_publish() {
+    let Harness {
+        incarnation,
+        epoch,
+        mut worker,
+        commands,
+        events,
+        _lanes,
+    } = harness("d7-closing-oversize");
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let _client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+    let socket = net::spawn(listener.accept().unwrap().0).unwrap();
+    socket.hold_output(true);
+
+    let session = SessionId::new(1);
+    let generation = ConnectionGeneration::new(10);
+    worker.notices.attach(generation);
+    commands
+        .send(CoordToShard::Attach {
+            session,
+            revision: Revision::new(1),
+            generation,
+            receive_maximum: 8,
+            maximum_packet_size: 16,
+            version: Version::V5,
+            outgoing: socket.outgoing_handle(),
+            lease: InlineClaimLease::new(),
+            dirty_seq: 1,
+        })
+        .unwrap();
+    worker.drain_coord_messages().unwrap();
+
+    // 1. Coordinator marks connection closing (e.g., while flushing DISCONNECT).
+    //    Shard must not write any PUBLISH to the socket.
+    socket.mark_closing();
+    let source = LogicalOwnerId::new(0);
+    let bytes = |s: &[u8]| SharedBytes::copy_from(s, 1024).unwrap();
+    worker.pending_inline.push_back(PendingInlineItem {
+        claim: DelegatedClaim {
+            delivery: DeliveryId {
+                publication: PublicationId::new(incarnation, epoch, source, PublicationSeq::new(1)),
+                index: 0,
+            },
+            target: session,
+            target_revision: Revision::new(1),
+            qos: Qos::AtLeastOnce,
+            claim_operation: OperationId::new(incarnation, epoch, source, OperationSeq::new(1)),
+            packet_id: OutboundPacketId::new(1).unwrap(),
+            generation,
+        },
+        topic: bytes(b"t"),
+        payload: bytes(b"a"),
+        properties: None,
+    });
+    worker.drain_pending_inline().unwrap();
+    worker.dispatch().unwrap();
+    assert_eq!(
+        socket.queued_first_bytes(),
+        Vec::<u8>::new(),
+        "shard wrote to a connection the coordinator marked closing (D7)"
+    );
+
+    // 2. Fresh connection with small max_packet: oversize PUBLISH must emit
+    //    CloseConnection("outgoing_packet_limit"), mark closing, and refuse
+    //    (SubmitBlock::Closed) so no second frame slips ahead of close.
+    let listener2 = TcpListener::bind("127.0.0.1:0").unwrap();
+    let _client2 = TcpStream::connect(listener2.local_addr().unwrap()).unwrap();
+    let socket2 = net::spawn(listener2.accept().unwrap().0).unwrap();
+    socket2.hold_output(true);
+    let session2 = SessionId::new(2);
+    let gen2 = ConnectionGeneration::new(20);
+    worker.notices.attach(gen2);
+    commands
+        .send(CoordToShard::Attach {
+            session: session2,
+            revision: Revision::new(1),
+            generation: gen2,
+            receive_maximum: 8,
+            maximum_packet_size: 1024,
+            version: Version::V5,
+            outgoing: socket2.outgoing_handle(),
+            lease: InlineClaimLease::new(),
+            dirty_seq: 1,
+        })
+        .unwrap();
+    worker.drain_coord_messages().unwrap();
+    // Shrink shard-side max_packet below the encoded PUBLISH size to hit the
+    // sink's defensive oversize check (matching runtime/sink.rs:1198).
+    worker.sessions.get_mut(&session2).unwrap().max_packet = 8;
+    worker.pending_inline.push_back(PendingInlineItem {
+        claim: DelegatedClaim {
+            delivery: DeliveryId {
+                publication: PublicationId::new(incarnation, epoch, source, PublicationSeq::new(2)),
+                index: 0,
+            },
+            target: session2,
+            target_revision: Revision::new(1),
+            qos: Qos::AtLeastOnce,
+            claim_operation: OperationId::new(incarnation, epoch, source, OperationSeq::new(2)),
+            packet_id: OutboundPacketId::new(1).unwrap(),
+            generation: gen2,
+        },
+        topic: bytes(b"topic"),
+        payload: bytes(b"oversized-payload"),
+        properties: None,
+    });
+    worker.drain_pending_inline().unwrap();
+    assert!(
+        socket2.outgoing_handle().is_closing(),
+        "oversize PUBLISH did not mark outgoing closing"
+    );
+    assert!(
+        !worker.owner.outbox_is_empty(),
+        "oversize PUBLISH must stay retained until retry observes closing (matching runtime/sink.rs)"
+    );
+    worker.dispatch().unwrap();
+    assert!(worker.owner.outbox_is_empty());
+
+    let mut notices = Vec::new();
+    let _ = worker.notices.drain_into(&mut notices);
+    assert!(
+        notices.iter().any(|n| matches!(
+            n,
+            ShardToCoord::CloseConnection {
+                generation: g,
+                code: "outgoing_packet_limit",
+                ..
+            } if *g == gen2
+        )),
+        "oversize PUBLISH did not send CloseConnection notice"
+    );
+    let _ = std::fs::remove_file(&events);
+    socket.close();
+    socket2.close();
+}
+
+/// Defect D9 / `MShardDetach` replay: `finish_detaches` tracks queued terminal
+/// inputs per connection in O(1) (`terminal_by_conn`): an independent session
+/// detaches immediately while a session with a queued terminal input waits until
+/// its terminal input is stepped.
+#[test]
+fn finish_detaches_tracks_terminal_inputs_per_connection_and_finishes_in_order() {
+    let Harness {
+        epoch,
+        mut worker,
+        commands,
+        events,
+        _lanes,
+        ..
+    } = harness("d9-terminal-index");
+    let _ = std::fs::remove_file(&events);
+    let listener1 = TcpListener::bind("127.0.0.1:0").unwrap();
+    let _c1 = TcpStream::connect(listener1.local_addr().unwrap()).unwrap();
+    let sock1 = net::spawn(listener1.accept().unwrap().0).unwrap();
+    let listener2 = TcpListener::bind("127.0.0.1:0").unwrap();
+    let _c2 = TcpStream::connect(listener2.local_addr().unwrap()).unwrap();
+    let sock2 = net::spawn(listener2.accept().unwrap().0).unwrap();
+
+    let s1 = SessionId::new(1);
+    let g1 = ConnectionGeneration::new(10);
+    let k1 = ConnectionKey {
+        session: s1,
+        generation: g1,
+    };
+    let s2 = SessionId::new(2);
+    let g2 = ConnectionGeneration::new(20);
+    let k2 = ConnectionKey {
+        session: s2,
+        generation: g2,
+    };
+    for (s, g, sock) in [(s1, g1, &sock1), (s2, g2, &sock2)] {
+        commands
+            .send(CoordToShard::Attach {
+                session: s,
+                revision: Revision::new(1),
+                generation: g,
+                receive_maximum: 8,
+                maximum_packet_size: 1024,
+                version: Version::V5,
+                outgoing: sock.outgoing_handle(),
+                lease: InlineClaimLease::new(),
+                dirty_seq: 1,
+            })
+            .unwrap();
+    }
+    worker.drain_coord_messages().unwrap();
+
+    // Queue a pending terminal input belonging solely to k1.
+    worker.push_terminal_back(Input::FrameResult {
+        effect: EffectId {
+            epoch,
+            owner: LogicalOwnerId::new(1),
+            sequence: mqttiumd_contract::ids::EffectSeq::new(999),
+        },
+        connection: k1,
+        progress: FrameProgress::Failed,
+    });
+    assert_eq!(worker.terminal_by_conn.get(&k1), Some(&1));
+    assert_eq!(worker.terminal_by_conn.get(&k2), None);
+
+    let done1 = Arc::new(AtomicBool::new(false));
+    let done2 = Arc::new(AtomicBool::new(false));
+    commands
+        .send(CoordToShard::Detach {
+            connection: k1,
+            dirty_seq: 2,
+            completed: Arc::clone(&done1),
+        })
+        .unwrap();
+    commands
+        .send(CoordToShard::Detach {
+            connection: k2,
+            dirty_seq: 2,
+            completed: Arc::clone(&done2),
+        })
+        .unwrap();
+    worker.drain_coord_messages().unwrap();
+
+    assert!(
+        done2.load(Ordering::Acquire),
+        "independent k2 must detach immediately"
+    );
+    assert!(
+        !done1.load(Ordering::Acquire),
+        "k1 must wait while its terminal input is still queued"
+    );
+
+    // Draining k1's terminal input clears `terminal_by_conn[k1]` and unblocks detach.
+    worker.drain_inputs().unwrap();
+    assert!(worker.terminal_by_conn.is_empty());
+    worker.finish_detaches().unwrap();
+    assert!(
+        done1.load(Ordering::Acquire),
+        "k1 must detach once its terminal input drains"
+    );
+    assert_eq!(worker.owner.connection_of(s1), None);
+    assert_eq!(worker.owner.connection_of(s2), None);
+    sock1.close();
+    sock2.close();
 }

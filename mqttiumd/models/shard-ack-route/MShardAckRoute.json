@@ -1,0 +1,63 @@
+{
+  "module": "MShardAckRoute.tla",
+  "status": "refinement",
+  "summary": "Direct I/O ACK and write-receipt routing between TCP/TLS socket tasks, the coordinator input queue, and a delivery shard inbox (--delivery-shards K >= 1, ADR 0066). Models ShardAckBudget credit reservation, single-packet zero-credit reads for non-ACK packets (PINGREQ), parking an unpaid ACK ahead of subsequent packets (DISCONNECT) via ConnCore::park_unpaid_ack, credit retention through DeliveryShardWorker.ack_inputs, and single-slot WriteSlot accounting across Started and terminal Written events. Configurations prove budget conservation, DISCONNECT ordering, and terminal delivery, witness zero-credit non-ACK progress, and refute three mutants.",
+  "issues": [
+    685
+  ],
+  "tests": [
+    "mqttiumd/crates/mqttiumd/src/net.rs",
+    "mqttiumd/crates/mqttiumd/src/runtime_tests.rs"
+  ],
+  "replays": [
+    {
+      "file": "mqttiumd/crates/mqttiumd/src/net.rs",
+      "test": "a_shard_connection_without_ack_credit_still_reads_what_needs_none"
+    },
+    {
+      "file": "mqttiumd/crates/mqttiumd/src/runtime_tests.rs",
+      "test": "tls_shard_connection_without_ack_credit_still_reads_what_needs_none"
+    },
+    {
+      "file": "mqttiumd/crates/mqttiumd/src/net.rs",
+      "test": "sharded_ack_backpressure_preserves_the_unread_suffix_and_write_receipts"
+    },
+    {
+      "file": "mqttiumd/crates/mqttiumd/src/net.rs",
+      "test": "shard_socket_close_reports_only_admitted_unfinished_writes_once"
+    }
+  ],
+  "not_replayed": "All safety invariants, zero-credit non-ACK reachability, and mutant counterexamples are replayed by TCP and TLS tests in net.rs and runtime_tests.rs.",
+  "configs": [
+    {
+      "config": "MShardAckRoute-safety.cfg",
+      "expect": "pass",
+      "invariants": [
+        "TypeOK",
+        "BudgetBounded",
+        "DisconnectNeverOvertakesAck",
+        "TerminalConsistent"
+      ]
+    },
+    {
+      "config": "MShardAckRoute-reach-nonack-zero-credit.cfg",
+      "expect": "violation",
+      "invariant": "NeverReadNonAckAtZeroCredit"
+    },
+    {
+      "config": "MShardAckRoute-mut-no-park.cfg",
+      "expect": "violation",
+      "invariant": "DisconnectNeverOvertakesAck"
+    },
+    {
+      "config": "MShardAckRoute-mut-early-credit.cfg",
+      "expect": "violation",
+      "invariant": "BudgetBounded"
+    },
+    {
+      "config": "MShardAckRoute-mut-double-write-free.cfg",
+      "expect": "violation",
+      "invariant": "BudgetBounded"
+    }
+  ]
+}

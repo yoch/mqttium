@@ -408,6 +408,7 @@ impl Peer {
     #[inline]
     fn set_closing(&mut self, value: (&'static str, Instant)) {
         self.cold_mut().closing = Some(value);
+        self.io.mark_closing();
     }
 
     #[inline]
@@ -1751,6 +1752,7 @@ impl Runtime<'_> {
         cold.retire_code = Some(code);
         cold.closing.get_or_insert((code, Instant::now()));
         let needs_observed = cold.close_observed_at.is_none();
+        peer.io.mark_closing();
         self.pending_peers.insert(generation);
         if needs_observed {
             let observed = self.session_now()?;

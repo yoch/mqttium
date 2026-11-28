@@ -1,0 +1,55 @@
+{
+  "module": "MShardStop.tla",
+  "status": "refinement",
+  "summary": "Ordered delivery-shard shutdown and panic reporting (--delivery-shards K >= 1, ADR 0066): ShardPool::shutdown sets an atomic stop flag outside the bounded CoordToShard lane so a full lane never drops stop, DeliveryShardWorker drains all prior lane messages and in-flight store commands before exiting, catch_unwind publishes ShardToCoord::Fatal to the dedicated Notices slot on panic, and the coordinator sends Writer::Stop strictly after all shards exit. Configurations prove deadlock-free termination and all four safety invariants, and refute three mutants.",
+  "issues": [
+    685
+  ],
+  "tests": [
+    "mqttiumd/crates/mqttiumd/src/runtime_tests/sharded_faults.rs",
+    "mqttiumd/crates/mqttiumd/src/delivery_shard/notice_tests.rs"
+  ],
+  "replays": [
+    {
+      "file": "mqttiumd/crates/mqttiumd/src/runtime_tests/sharded_faults.rs",
+      "test": "a_shard_whose_lane_is_full_still_stops"
+    },
+    {
+      "file": "mqttiumd/crates/mqttiumd/src/runtime_tests/sharded_faults.rs",
+      "test": "a_shard_that_panics_is_reported_to_the_coordinator"
+    },
+    {
+      "file": "mqttiumd/crates/mqttiumd/src/delivery_shard/notice_tests.rs",
+      "test": "fatal_survives_saturated_close_lane"
+    }
+  ],
+  "not_replayed": "All safety invariants and mutant counterexamples are replayed by deterministic tests in sharded_faults.rs and notice_tests.rs.",
+  "configs": [
+    {
+      "config": "MShardStop-safety.cfg",
+      "expect": "pass",
+      "invariants": [
+        "TypeOK",
+        "StopNeverLost",
+        "CleanExitDrainedAll",
+        "WriterStopsAfterShard",
+        "PanicAlwaysReported"
+      ]
+    },
+    {
+      "config": "MShardStop-mut-lane-stop.cfg",
+      "expect": "violation",
+      "invariant": "StopNeverLost"
+    },
+    {
+      "config": "MShardStop-mut-drop-inflight.cfg",
+      "expect": "violation",
+      "invariant": "CleanExitDrainedAll"
+    },
+    {
+      "config": "MShardStop-mut-silent-panic.cfg",
+      "expect": "violation",
+      "invariant": "PanicAlwaysReported"
+    }
+  ]
+}

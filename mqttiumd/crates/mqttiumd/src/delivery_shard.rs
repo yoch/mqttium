@@ -847,6 +847,7 @@ struct ShardSession {
     published_dirty_seq: u64,
     lease_published: bool,
     in_flight_load: Option<(EffectId, u64)>,
+    blocked_output: Option<EffectId>,
 }
 
 struct ShardPendingFrame {
@@ -905,6 +906,9 @@ struct DeliveryShardWorker {
     ack_inputs: VecDeque<(Input, net::ShardAckCredit)>,
     control_inputs: VecDeque<Input>,
     terminal_inputs: VecDeque<Input>,
+    /// O(1) per-connection count of queued terminal inputs so `finish_detaches`
+    /// never scans `terminal_inputs` per pending detach (D9).
+    terminal_by_conn: FlatMap<ConnectionKey, usize>,
     queued_work_sessions: FlatSet<SessionId>,
     /// Sessions not read from the store while a committed inline claim of
     /// theirs waits in `pending_inline` (`fence_after_message`).
@@ -967,6 +971,7 @@ impl DeliveryShardWorker {
             ack_inputs: VecDeque::new(),
             control_inputs: VecDeque::new(),
             terminal_inputs: VecDeque::new(),
+            terminal_by_conn: FlatMap::new(),
             queued_work_sessions: FlatSet::new(),
             inline_fenced: FlatSet::new(),
             pending_inline: VecDeque::new(),
@@ -1384,13 +1389,17 @@ impl DeliveryShardWorker {
         Ok(())
     }
 
+    fn push_terminal_back(&mut self, input: Input) {
+        push_terminal_back(&mut self.terminal_inputs, &mut self.terminal_by_conn, input);
+    }
+
     fn handle_written(&mut self, _generation: ConnectionGeneration, written: Written) {
         match written {
             Written::Started {
                 correlation: Some((effect, connection)),
             } => {
                 if self.frames.contains_key(&effect) {
-                    self.terminal_inputs.push_back(Input::FrameResult {
+                    self.push_terminal_back(Input::FrameResult {
                         effect,
                         connection,
                         progress: FrameProgress::Started,
@@ -1411,13 +1420,13 @@ impl DeliveryShardWorker {
                                 Qos0DropReason::TemporalUncertain
                             }
                         };
-                        self.terminal_inputs.push_back(Input::Qos0EmitRefused {
+                        self.push_terminal_back(Input::Qos0EmitRefused {
                             effect,
                             connection,
                             reason: drop_reason,
                         });
                     } else {
-                        self.terminal_inputs.push_back(Input::FrameResult {
+                        self.push_terminal_back(Input::FrameResult {
                             effect,
                             connection,
                             progress: FrameProgress::NotStarted { reason },
@@ -1430,7 +1439,7 @@ impl DeliveryShardWorker {
                 bytes,
             } => {
                 if self.frames.remove(&effect).is_some() {
-                    self.terminal_inputs.push_back(Input::FrameResult {
+                    self.push_terminal_back(Input::FrameResult {
                         effect,
                         connection,
                         progress: FrameProgress::Written {
@@ -1446,13 +1455,13 @@ impl DeliveryShardWorker {
             } => {
                 if let Some(frame) = self.frames.remove(&effect) {
                     if frame.kind == FrameKind::Publish0 {
-                        self.terminal_inputs.push_back(Input::Qos0EmitRefused {
+                        self.push_terminal_back(Input::Qos0EmitRefused {
                             effect,
                             connection,
                             reason: Qos0DropReason::ConnectionClosed,
                         });
                     } else {
-                        self.terminal_inputs.push_back(Input::FrameResult {
+                        self.push_terminal_back(Input::FrameResult {
                             effect,
                             connection,
                             progress: FrameProgress::Failed,
@@ -1477,11 +1486,7 @@ impl DeliveryShardWorker {
                     && (session.outgoing.pending_shard_acks() != 0
                         || session.outgoing.pending_shard_written() != 0)
             });
-            let terminal_pending = self.terminal_inputs.iter().any(|input| {
-                matches!(input,
-                Input::FrameResult {connection,..} | Input::Qos0EmitRefused {connection,..}
-                    if *connection == key)
-            });
+            let terminal_pending = self.terminal_by_conn.contains_key(&key);
             if !io_pending && !terminal_pending {
                 let progress = self.owner.shard_ack_progress(key);
                 if progress != ShardAckProgress::Waiting {
@@ -1562,6 +1567,7 @@ impl DeliveryShardWorker {
                                     published_dirty_seq: 0,
                                     lease_published: false,
                                     in_flight_load: None,
+                                    blocked_output: None,
                                 },
                             );
                             self.fence_after_message(session, dirty_seq);
@@ -1694,13 +1700,13 @@ impl DeliveryShardWorker {
         for id in stale {
             if let Some(frame) = self.frames.remove(&id) {
                 if frame.kind == FrameKind::Publish0 {
-                    self.terminal_inputs.push_back(Input::Qos0EmitRefused {
+                    self.push_terminal_back(Input::Qos0EmitRefused {
                         effect: id,
                         connection: frame.connection,
                         reason: Qos0DropReason::ConnectionClosed,
                     });
                 } else {
-                    self.terminal_inputs.push_back(Input::FrameResult {
+                    self.push_terminal_back(Input::FrameResult {
                         effect: id,
                         connection: frame.connection,
                         progress: FrameProgress::Failed,
@@ -1728,6 +1734,7 @@ impl DeliveryShardWorker {
                 next_timer_due: &mut self.next_timer_due,
                 inputs: &mut self.inputs,
                 terminal_inputs: &mut self.terminal_inputs,
+                terminal_by_conn: &mut self.terminal_by_conn,
                 events: &self.events,
                 limits: self.limits,
                 close_notices: &mut close_notices,
@@ -1808,6 +1815,7 @@ impl DeliveryShardWorker {
                 next_timer_due: &mut self.next_timer_due,
                 inputs: &mut self.inputs,
                 terminal_inputs: &mut self.terminal_inputs,
+                terminal_by_conn: &mut self.terminal_by_conn,
                 events: &self.events,
                 limits: self.limits,
                 close_notices: &mut close_notices,
@@ -1927,7 +1935,12 @@ impl DeliveryShardWorker {
                 .flatten()
                 .or_else(|| {
                     (!terminal_blocked)
-                        .then(|| self.terminal_inputs.pop_front())
+                        .then(|| {
+                            pop_terminal_front(
+                                &mut self.terminal_inputs,
+                                &mut self.terminal_by_conn,
+                            )
+                        })
                         .flatten()
                 })
                 .or_else(|| {
@@ -2046,6 +2059,7 @@ impl DeliveryShardWorker {
                 next_timer_due: &mut self.next_timer_due,
                 inputs: &mut self.inputs,
                 terminal_inputs: &mut self.terminal_inputs,
+                terminal_by_conn: &mut self.terminal_by_conn,
                 events: &self.events,
                 limits: self.limits,
                 close_notices: &mut close_notices,
@@ -2130,7 +2144,11 @@ impl DeliveryShardWorker {
                             control_blocked = true;
                         }
                         Input::FrameResult { .. } | Input::Qos0EmitRefused { .. } => {
-                            self.terminal_inputs.push_front(input);
+                            push_terminal_front(
+                                &mut self.terminal_inputs,
+                                &mut self.terminal_by_conn,
+                                input,
+                            );
                             terminal_blocked = true;
                         }
                         Input::StoreResult { .. }
@@ -2185,6 +2203,7 @@ impl DeliveryShardWorker {
             next_timer_due: &mut self.next_timer_due,
             inputs: &mut self.inputs,
             terminal_inputs: &mut self.terminal_inputs,
+            terminal_by_conn: &mut self.terminal_by_conn,
             events: &self.events,
             limits: self.limits,
             close_notices: &mut close_notices,
@@ -2234,6 +2253,96 @@ impl DeliveryShardWorker {
     }
 }
 
+#[inline]
+fn terminal_conn(input: &Input) -> Option<ConnectionKey> {
+    match input {
+        Input::FrameResult { connection, .. } | Input::Qos0EmitRefused { connection, .. } => {
+            Some(*connection)
+        }
+        _ => None,
+    }
+}
+
+#[inline]
+fn push_terminal_back(
+    queue: &mut VecDeque<Input>,
+    by_conn: &mut FlatMap<ConnectionKey, usize>,
+    input: Input,
+) {
+    if let Some(conn) = terminal_conn(&input) {
+        let next = by_conn.get(&conn).copied().unwrap_or(0) + 1;
+        by_conn.insert(conn, next);
+    }
+    queue.push_back(input);
+}
+
+#[inline]
+fn push_terminal_front(
+    queue: &mut VecDeque<Input>,
+    by_conn: &mut FlatMap<ConnectionKey, usize>,
+    input: Input,
+) {
+    if let Some(conn) = terminal_conn(&input) {
+        let next = by_conn.get(&conn).copied().unwrap_or(0) + 1;
+        by_conn.insert(conn, next);
+    }
+    queue.push_front(input);
+}
+
+#[inline]
+fn pop_terminal_front(
+    queue: &mut VecDeque<Input>,
+    by_conn: &mut FlatMap<ConnectionKey, usize>,
+) -> Option<Input> {
+    let input = queue.pop_front()?;
+    if let Some(conn) = terminal_conn(&input)
+        && let Some(count) = by_conn.get_mut(&conn)
+    {
+        if *count <= 1 {
+            by_conn.remove(&conn);
+        } else {
+            *count -= 1;
+        }
+    }
+    Some(input)
+}
+
+#[inline]
+fn shard_effect_text(id: EffectId) -> String {
+    format!(
+        "{}/{}/{}",
+        id.epoch.get(),
+        id.owner.get(),
+        id.sequence.get()
+    )
+}
+
+#[inline]
+fn shard_delivery_text(delivery: mqttiumd_contract::ids::DeliveryId) -> String {
+    format!(
+        "{}/{}/{}/{}/{}",
+        delivery.publication.incarnation().get(),
+        delivery.publication.epoch().get(),
+        delivery.publication.owner().get(),
+        delivery.publication.sequence().get(),
+        delivery.index
+    )
+}
+
+#[inline]
+fn shard_frame_info(frame: OutboundFrame) -> (&'static str, u16) {
+    match frame {
+        OutboundFrame::Connack { .. } => ("CONNACK", 0),
+        OutboundFrame::Puback { packet_id, .. } => ("PUBACK", packet_id.get()),
+        OutboundFrame::Pubrec { packet_id, .. } => ("PUBREC", packet_id.get()),
+        OutboundFrame::Pubrel { packet_id } => ("PUBREL", packet_id.get()),
+        OutboundFrame::Pubcomp { packet_id, .. } => ("PUBCOMP", packet_id.get()),
+        OutboundFrame::Suback { packet_id, .. } => ("SUBACK", packet_id.get()),
+        OutboundFrame::Unsuback { packet_id, .. } => ("UNSUBACK", packet_id.get()),
+        OutboundFrame::Pingresp => ("PINGRESP", 0),
+    }
+}
+
 struct ShardSink<'a> {
     store: &'a mut ShardStoreHandle,
     sessions: &'a mut FlatMap<SessionId, ShardSession>,
@@ -2245,10 +2354,66 @@ struct ShardSink<'a> {
     next_timer_due: &'a mut Option<Instant>,
     inputs: &'a mut VecDeque<Input>,
     terminal_inputs: &'a mut VecDeque<Input>,
+    terminal_by_conn: &'a mut FlatMap<ConnectionKey, usize>,
     events: &'a Events,
     limits: Limits,
     close_notices: &'a mut Vec<ShardToCoord>,
     error: Option<Failure>,
+}
+
+impl ShardSink<'_> {
+    #[inline]
+    fn push_terminal(&mut self, input: Input) {
+        push_terminal_back(self.terminal_inputs, self.terminal_by_conn, input);
+    }
+
+    fn emit_frame_failed(
+        &mut self,
+        generation: ConnectionGeneration,
+        id: EffectId,
+        packet_kind: &'static str,
+    ) {
+        if self
+            .events
+            .emit_with("frame_failed", || {
+                json!({
+                    "connection": generation.get().to_string(),
+                    "details": {
+                        "effect": shard_effect_text(id),
+                        "packet_kind": packet_kind,
+                        "code": "unusable_generation",
+                    },
+                })
+            })
+            .is_err()
+        {
+            self.error = Some(Failure::plain("events_unavailable"));
+        }
+    }
+
+    fn emit_effect_retained(
+        &mut self,
+        generation: ConnectionGeneration,
+        id: EffectId,
+        packet_kind: &'static str,
+    ) {
+        if self
+            .events
+            .emit_with("effect_retained", || {
+                json!({
+                    "connection": generation.get().to_string(),
+                    "details": {
+                        "code": "output_queue_full",
+                        "effect": shard_effect_text(id),
+                        "packet_kind": packet_kind,
+                    },
+                })
+            })
+            .is_err()
+        {
+            self.error = Some(Failure::plain("events_unavailable"));
+        }
+    }
 }
 
 impl EffectSink for ShardSink<'_> {
@@ -2393,11 +2558,14 @@ impl EffectSink for ShardSink<'_> {
             } => {
                 let (connection, delivery, packet_id, claim, dup, retain) =
                     (*connection, *delivery, *packet_id, *claim, *dup, *retain);
-                let Some(sess) = self.sessions.get(&connection.session).filter(|s| {
-                    s.generation == connection.generation && !s.outgoing.is_cancelled()
+                let Some(sess) = self.sessions.get_mut(&connection.session).filter(|s| {
+                    s.generation == connection.generation
+                        && !s.outgoing.is_cancelled()
+                        && !s.outgoing.is_closing()
                 }) else {
                     let _ = effect.into_parts();
-                    self.terminal_inputs.push_back(Input::FrameResult {
+                    self.emit_frame_failed(connection.generation, id, "PUBLISH");
+                    self.push_terminal(Input::FrameResult {
                         effect: id,
                         connection,
                         progress: FrameProgress::Failed,
@@ -2420,18 +2588,13 @@ impl EffectSink for ShardSink<'_> {
                 ) {
                     Ok(encoded) if encoded.total_len <= sess.max_packet as usize => encoded,
                     _ => {
+                        sess.outgoing.mark_closing();
                         self.close_notices.push(ShardToCoord::CloseConnection {
                             generation: connection.generation,
                             code: "outgoing_packet_limit",
                             disconnect_reason: None,
                         });
-                        let _ = effect.into_parts();
-                        self.terminal_inputs.push_back(Input::FrameResult {
-                            effect: id,
-                            connection,
-                            progress: FrameProgress::Failed,
-                        });
-                        return SubmitResult::Accepted;
+                        return refused(effect, SubmitBlock::Closed);
                     }
                 };
                 let write_expiry = expiry_val.map(|expiry| {
@@ -2455,7 +2618,9 @@ impl EffectSink for ShardSink<'_> {
                     return refused(effect, SubmitBlock::InFlightLimit);
                 }
                 self.outgoing_bindings.insert(binding_key, binding);
-                let track_written = write_expiry.is_some() || self.events.records("frame_written");
+                let track_written = write_expiry.is_some()
+                    || sess.blocked_output == Some(id)
+                    || self.events.records("frame_written");
                 match sess.outgoing.try_send_outgoing(Write {
                     expiry: write_expiry,
                     correlation: track_written.then_some((id, connection)),
@@ -2468,6 +2633,9 @@ impl EffectSink for ShardSink<'_> {
                     },
                 }) {
                     Ok(()) => {
+                        if sess.blocked_output == Some(id) {
+                            sess.blocked_output = None;
+                        }
                         if track_written {
                             self.frames.insert(
                                 id,
@@ -2478,21 +2646,51 @@ impl EffectSink for ShardSink<'_> {
                             );
                         }
                         let _ = effect.into_parts();
+                        if self
+                            .events
+                            .emit_with("frame_queued", || {
+                                json!({
+                                    "connection": connection.generation.get().to_string(),
+                                    "details": {
+                                        "packet_kind": "PUBLISH",
+                                        "effect": shard_effect_text(id),
+                                        "delivery": shard_delivery_text(delivery),
+                                        "target": connection.session.get().to_string(),
+                                        "packet_id": packet_id.get(),
+                                        "claim": format!(
+                                            "{}/{}/{}/{}",
+                                            claim.incarnation().get(),
+                                            claim.epoch().get(),
+                                            claim.owner().get(),
+                                            claim.sequence().get()
+                                        ),
+                                        "dup": dup,
+                                        "retain": retain,
+                                    },
+                                })
+                            })
+                            .is_err()
+                        {
+                            self.error = Some(Failure::plain("events_unavailable"));
+                        }
                         SubmitResult::Accepted
                     }
                     Err(TrySendError::Full(_)) => {
                         self.outgoing_bindings.remove(&binding_key);
+                        if sess.blocked_output.replace(id) != Some(id) {
+                            self.emit_effect_retained(connection.generation, id, "PUBLISH");
+                        }
                         refused(effect, SubmitBlock::TransportBackpressure)
                     }
                     Err(TrySendError::Disconnected(_)) => {
                         self.outgoing_bindings.remove(&binding_key);
-                        let _ = effect.into_parts();
-                        self.terminal_inputs.push_back(Input::FrameResult {
-                            effect: id,
-                            connection,
-                            progress: FrameProgress::Failed,
+                        sess.outgoing.mark_closing();
+                        self.close_notices.push(ShardToCoord::CloseConnection {
+                            generation: connection.generation,
+                            code: "outgoing_queue_full",
+                            disconnect_reason: None,
                         });
-                        SubmitResult::Accepted
+                        refused(effect, SubmitBlock::Closed)
                     }
                 }
             }
@@ -2503,6 +2701,7 @@ impl EffectSink for ShardSink<'_> {
                 ..
             } => {
                 let (connection, frame) = (*connection, *frame);
+                let (packet_kind, packet_id_val) = shard_frame_info(frame);
                 let binding = match (*pubrel, frame) {
                     (Some((delivery, claim)), OutboundFrame::Pubrel { packet_id }) => Some((
                         (connection, packet_id),
@@ -2526,11 +2725,14 @@ impl EffectSink for ShardSink<'_> {
                         return refused(effect, SubmitBlock::InFlightLimit);
                     }
                 }
-                let Some(sess) = self.sessions.get(&connection.session).filter(|s| {
-                    s.generation == connection.generation && !s.outgoing.is_cancelled()
+                let Some(sess) = self.sessions.get_mut(&connection.session).filter(|s| {
+                    s.generation == connection.generation
+                        && !s.outgoing.is_cancelled()
+                        && !s.outgoing.is_closing()
                 }) else {
                     let _ = effect.into_parts();
-                    self.terminal_inputs.push_back(Input::FrameResult {
+                    self.emit_frame_failed(connection.generation, id, packet_kind);
+                    self.push_terminal(Input::FrameResult {
                         effect: id,
                         connection,
                         progress: FrameProgress::Failed,
@@ -2539,7 +2741,8 @@ impl EffectSink for ShardSink<'_> {
                 };
                 let Ok(bytes) = codec::encode_frame_bytes(sess.version, frame) else {
                     let _ = effect.into_parts();
-                    self.terminal_inputs.push_back(Input::FrameResult {
+                    self.emit_frame_failed(connection.generation, id, packet_kind);
+                    self.push_terminal(Input::FrameResult {
                         effect: id,
                         connection,
                         progress: FrameProgress::Failed,
@@ -2547,18 +2750,13 @@ impl EffectSink for ShardSink<'_> {
                     return SubmitResult::Accepted;
                 };
                 if bytes.len() > sess.max_packet as usize {
+                    sess.outgoing.mark_closing();
                     self.close_notices.push(ShardToCoord::CloseConnection {
                         generation: connection.generation,
                         code: "outgoing_packet_limit",
                         disconnect_reason: None,
                     });
-                    let _ = effect.into_parts();
-                    self.terminal_inputs.push_back(Input::FrameResult {
-                        effect: id,
-                        connection,
-                        progress: FrameProgress::Failed,
-                    });
-                    return SubmitResult::Accepted;
+                    return refused(effect, SubmitBlock::Closed);
                 }
                 if let Some((key, target)) = binding {
                     self.outgoing_bindings.insert(key, target);
@@ -2571,6 +2769,9 @@ impl EffectSink for ShardSink<'_> {
                     report: WriteReport::Complete,
                 }) {
                     Ok(()) => {
+                        if sess.blocked_output == Some(id) {
+                            sess.blocked_output = None;
+                        }
                         self.frames.insert(
                             id,
                             ShardPendingFrame {
@@ -2579,11 +2780,31 @@ impl EffectSink for ShardSink<'_> {
                             },
                         );
                         let _ = effect.into_parts();
+                        if !matches!(frame, OutboundFrame::Pingresp)
+                            && self
+                                .events
+                                .emit_with("frame_queued", || {
+                                    json!({
+                                        "connection": connection.generation.get().to_string(),
+                                        "details": {
+                                            "packet_kind": packet_kind,
+                                            "effect": shard_effect_text(id),
+                                            "packet_id": packet_id_val,
+                                        },
+                                    })
+                                })
+                                .is_err()
+                        {
+                            self.error = Some(Failure::plain("events_unavailable"));
+                        }
                         SubmitResult::Accepted
                     }
                     Err(TrySendError::Full(_)) => {
                         if let Some((key, _)) = binding {
                             self.outgoing_bindings.remove(&key);
+                        }
+                        if sess.blocked_output.replace(id) != Some(id) {
+                            self.emit_effect_retained(connection.generation, id, packet_kind);
                         }
                         refused(effect, SubmitBlock::TransportBackpressure)
                     }
@@ -2591,13 +2812,13 @@ impl EffectSink for ShardSink<'_> {
                         if let Some((key, _)) = binding {
                             self.outgoing_bindings.remove(&key);
                         }
-                        let _ = effect.into_parts();
-                        self.terminal_inputs.push_back(Input::FrameResult {
-                            effect: id,
-                            connection,
-                            progress: FrameProgress::Failed,
+                        sess.outgoing.mark_closing();
+                        self.close_notices.push(ShardToCoord::CloseConnection {
+                            generation: connection.generation,
+                            code: "outgoing_queue_full",
+                            disconnect_reason: None,
                         });
-                        SubmitResult::Accepted
+                        refused(effect, SubmitBlock::Closed)
                     }
                 }
             }
@@ -2605,18 +2826,19 @@ impl EffectSink for ShardSink<'_> {
                 expiry,
                 properties,
                 connection,
+                origin,
                 cause,
                 retain,
                 topic,
                 payload,
-                ..
             } => {
-                let connection = *connection;
-                let result = if let Some(sess) = self
-                    .sessions
-                    .get(&connection.session)
-                    .filter(|s| s.generation == connection.generation && !s.outgoing.is_cancelled())
-                {
+                let (connection, origin) = (*connection, *origin);
+                let result = if let Some(sess) =
+                    self.sessions.get(&connection.session).filter(|s| {
+                        s.generation == connection.generation
+                            && !s.outgoing.is_cancelled()
+                            && !s.outgoing.is_closing()
+                    }) {
                     // A previously closed transport can still own pending
                     // write receipts. Retain the effect while that shared
                     // budget drains; only socket pressure is a QoS 0 drop.
@@ -2675,9 +2897,26 @@ impl EffectSink for ShardSink<'_> {
                                 kind: FrameKind::Publish0,
                             },
                         );
+                        if self
+                            .events
+                            .emit_with("frame_queued", || {
+                                json!({
+                                    "connection": connection.generation.get().to_string(),
+                                    "details": {
+                                        "packet_kind": "PUBLISH",
+                                        "qos": 0,
+                                        "origin": crate::runtime::qos0_origin(origin),
+                                        "effect": shard_effect_text(id),
+                                    },
+                                })
+                            })
+                            .is_err()
+                        {
+                            self.error = Some(Failure::plain("events_unavailable"));
+                        }
                     }
                     Err(reason) => {
-                        self.terminal_inputs.push_back(Input::Qos0EmitRefused {
+                        self.push_terminal(Input::Qos0EmitRefused {
                             effect: id,
                             connection,
                             reason,
