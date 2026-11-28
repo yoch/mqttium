@@ -350,12 +350,6 @@ pub(super) enum ClaimSlots {
     Many(alloc::boxed::Box<SmallIndexSet>),
 }
 
-impl Default for ClaimSlots {
-    fn default() -> Self {
-        Self::Empty
-    }
-}
-
 pub(super) enum ClaimSlotsIter<'a> {
     Empty,
     One(core::option::IntoIter<usize>),
@@ -671,9 +665,12 @@ impl Deliveries {
             self.by_frame.insert(effect, index);
         }
         if let Some(claim) = d.claim {
-            self.by_claim_op
-                .get_or_insert_default(claim.operation)
-                .insert(index);
+            if let Some(slots) = self.by_claim_op.get_mut(&claim.operation) {
+                slots.insert(index);
+            } else {
+                self.by_claim_op
+                    .insert(claim.operation, ClaimSlots::One(index));
+            }
             if !d.retired {
                 self.by_target_pi.insert((d.target, claim.packet_id), index);
             }
@@ -893,7 +890,11 @@ impl Deliveries {
                 }
             }
             if let Some(op) = new_claim {
-                self.by_claim_op.get_or_insert_default(op).insert(index);
+                if let Some(slots) = self.by_claim_op.get_mut(&op) {
+                    slots.insert(index);
+                } else {
+                    self.by_claim_op.insert(op, ClaimSlots::One(index));
+                }
             }
         }
         if old_target_pi != new_target_pi {
