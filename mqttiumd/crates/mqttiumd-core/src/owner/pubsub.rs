@@ -2143,7 +2143,7 @@ impl Owner {
                 draft,
             );
         }
-        if self.lifecycle.is_some() {
+        if !self.lifecycle.is_empty() {
             return Err(blocked());
         }
         let (packet_id, subscribing) = match packet {

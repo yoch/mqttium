@@ -216,7 +216,9 @@ fn with_runtime_layout(
         inflight: ScopedSeqMap::new(),
         inflight_route_ops: ScopedSeqMap::new(),
         lifecycle_inflight: BTreeMap::new(),
+        scratch_lifecycle_ops: Vec::new(),
         last_session_change: None,
+        batch_session_changes: Vec::new(),
         session_cardinality_dirty: false,
         last_session_cardinality: None,
         work_reads: ScopedSeqMap::new(),
@@ -868,6 +870,79 @@ fn retained_qos0_replay_batches_consume_commits_in_log_mode() {
                 added < 10,
                 "expected batched retained QoS 0 consume commits (< 10 frames), observed {added}"
             );
+        },
+    );
+}
+
+#[test]
+fn burst_of_distinct_session_opens_batches_into_fewer_log_commits() {
+    fn count_mlog_frames(path: &Path) -> usize {
+        let bytes = std::fs::read(path).expect("read .mlog");
+        let mut pos = 24usize;
+        let mut frames = 0usize;
+        while pos + 4 <= bytes.len() {
+            let body_len =
+                u32::from_be_bytes([bytes[pos], bytes[pos + 1], bytes[pos + 2], bytes[pos + 3]])
+                    as usize;
+            if body_len == 0 {
+                break;
+            }
+            frames += 1;
+            // v2 frame layout: 4-byte body_len + body + 16-byte footer.
+            pos += 4 + body_len + 16;
+        }
+        frames
+    }
+    with_runtime_layout(
+        128,
+        TestWriter::Log,
+        Hooks::default(),
+        |runtime, directory| {
+            let mlog = directory.join("store.sqlite.mlog");
+            let frames_before = count_mlog_frames(&mlog);
+            let mut clients = Vec::new();
+            for index in 0..12usize {
+                let (generation, socket) = peer(runtime);
+                runtime
+                    .connect(
+                        generation,
+                        connect_packet(format!("burst-open-{index}").as_bytes()),
+                    )
+                    .unwrap();
+                clients.push((generation, socket));
+            }
+            // Collect all 12 WillBarrier replies so all 12 OpenSessionWillAt
+            // inputs enter the core together and coalesce into Writer::apply_group.
+            let barrier_deadline = Instant::now() + Duration::from_secs(2);
+            while !runtime.will_connects.is_empty() && Instant::now() < barrier_deadline {
+                runtime.writer_results().unwrap();
+                thread::sleep(Duration::from_millis(1));
+            }
+            assert!(runtime.will_connects.is_empty());
+            runtime.drain_inputs().unwrap();
+            runtime.dispatch().unwrap();
+            until(runtime, |r| {
+                r.session_requests.is_empty()
+                    && r.lifecycle_inflight.is_empty()
+                    && !r.owner.session_status().lifecycle_pending
+                    && r.frames.is_empty()
+                    && r.owner.outbox_is_empty()
+            });
+            for (generation, socket) in &mut clients {
+                let (first, body) = served_frame(runtime, socket);
+                assert_eq!((first, &body[..2]), (0x20, &[0, 0][..]));
+                runtime.packet(*generation, 0xc0, vec![]).unwrap();
+                assert_eq!(served_frame(runtime, socket), (0xd0, vec![]));
+            }
+            let frames_after = count_mlog_frames(&mlog);
+            let added = frames_after - frames_before;
+            // Before reserve R4 (MSessionOpenBatch), 12 distinct session opens
+            // always required 12 serial commits because LIFECYCLE_IN_FLIGHT = 1.
+            assert!(
+                added < 10,
+                "expected batched session-open commits (< 10 .mlog frames for 12 opens), observed {added}"
+            );
+            assert_eq!(runtime.sessions.len(), 12);
         },
     );
 }
@@ -7763,7 +7838,9 @@ fn direct_volatile_store_commits_inline_and_saves_snapshot() {
         inflight: ScopedSeqMap::new(),
         inflight_route_ops: ScopedSeqMap::new(),
         lifecycle_inflight: BTreeMap::new(),
+        scratch_lifecycle_ops: Vec::new(),
         last_session_change: None,
+        batch_session_changes: Vec::new(),
         session_cardinality_dirty: false,
         last_session_cardinality: None,
         work_reads: ScopedSeqMap::new(),

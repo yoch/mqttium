@@ -83,6 +83,7 @@ its source; a test fails when the register and the records drift apart.
 | [0066](0066-lot10-delivery-owners-sharding.md) | Proposed | Opt-in multi-core resident *Delivery Owners* sharding (`--delivery-shards K`, `0..=16`, default `0`), multi-owner `OriginOpTable` hot rings, pure-core `DeliveryShard` hooks and `InlineClaimOracle`, lock-free `InlineClaimLease` and direct `ShardIoRoute` ACK steering with strict `CONNACK`/`PUBACK`/`DISCONNECT` wire ordering, and drain-first multi-owner group commit (Lot 10) | Core, `mqttiumd-store-volatile`, runtime |
 | [0067](0067-bounded-operational-event-details.md) | Proposed | Typed limits for readiness, receipt policy, operations counters and the two TLS capacity revisions | Runtime |
 | [0068](0068-logstore-v2-backward-readable-footer.md) | Proposed | LogStore `.mlog` v2 self-authenticating backward-readable frame footer closing the torn-first-sector ambiguity of ADR 0055 | `mqttiumd-store-volatile` |
+| [0069](0069-concurrent-distinct-session-open-batching.md) | Proposed | Bounded concurrent distinct-client session openings (`LIFECYCLE_IN_FLIGHT = 16`, `CONTROL_QUEUE = 32`) batched via `Writer::apply_group` (amends 0048) | Contract, core, runtime |
 
 What each record leaves open is tracked in
 [`../reception/open-conditions.md`](../reception/open-conditions.md).

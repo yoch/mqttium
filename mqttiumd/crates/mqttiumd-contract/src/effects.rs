@@ -1185,15 +1185,28 @@ impl Outbox {
         sink: &mut dyn EffectSink,
         flight: Option<(OperationId, DeadlineToken)>,
     ) -> DispatchReport {
-        if self.queue.is_empty() || (flight.is_none() && self.controls.session == 0) {
+        self.dispatch_session_controls_matching(
+            sink,
+            flight.is_some(),
+            |op| flight.is_some_and(|(current, _)| op == current),
+            |token| flight.and_then(|(op, current)| (token == current).then_some(op)),
+        )
+    }
+
+    /// Bounded session controls across one or more concurrent lifecycle
+    /// flights. A blocked control fences later controls in this pass, and each
+    /// flight's `ResolveAndFence` or `ArmDeadline` waits until its own
+    /// `Persist` leaves the queue.
+    pub fn dispatch_session_controls_matching(
+        &mut self,
+        sink: &mut dyn EffectSink,
+        has_flights: bool,
+        is_live_op: impl Fn(OperationId) -> bool,
+        op_for_deadline: impl Fn(DeadlineToken) -> Option<OperationId>,
+    ) -> DispatchReport {
+        if self.queue.is_empty() || (!has_flights && self.controls.session == 0) {
             return DispatchReport::default();
         }
-        let mut waiting = self.controls.session != 0
-            && flight.is_some_and(|(operation, _)| {
-                self.queue.iter().any(|e| {
-                    matches!(e.effect(), Effect::Persist {command} if command.recipe.operation() == operation)
-                })
-            });
         let mut accepted = 0;
         let mut blocked = None;
         let count = self.queue.len();
@@ -1201,11 +1214,25 @@ impl Outbox {
             let Some(effect) = self.pop_front_tracked() else {
                 break;
             };
+            let persist_queued = |op: OperationId, queue: &BoundedQueue<OwnedEffect>| {
+                queue.iter().any(|e| {
+                    matches!(
+                        e.effect(),
+                        Effect::Persist { command } if command.recipe.operation() == op
+                    )
+                })
+            };
             let lifecycle_persist = matches!(effect.effect(), Effect::Persist {command} if matches!(command.recipe.get(), crate::command::Recipe::SessionLifecycle(_)));
-            let lifecycle_resolve = !waiting
-                && matches!(effect.effect(), Effect::ResolveAndFence {operation} if flight.is_some_and(|(current,_)| *operation == current));
-            let lifecycle_deadline = !waiting
-                && matches!(effect.effect(), Effect::ArmDeadline {token,..} if flight.is_some_and(|(_,current)| *token == current));
+            let lifecycle_resolve = matches!(
+                effect.effect(),
+                Effect::ResolveAndFence { operation }
+                    if is_live_op(*operation) && !persist_queued(*operation, &self.queue)
+            );
+            let lifecycle_deadline = matches!(
+                effect.effect(),
+                Effect::ArmDeadline { token, .. }
+                    if op_for_deadline(*token).is_some_and(|op| !persist_queued(op, &self.queue))
+            );
             let selected = lifecycle_persist
                 || lifecycle_resolve
                 || lifecycle_deadline
@@ -1219,9 +1246,6 @@ impl Outbox {
                 match sink.try_submit(effect) {
                     SubmitResult::Accepted => {
                         accepted += 1;
-                        if lifecycle_persist {
-                            waiting = false;
-                        }
                         None
                     }
                     SubmitResult::NotSubmitted { effect, reason } => {

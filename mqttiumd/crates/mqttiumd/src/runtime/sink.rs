@@ -57,27 +57,30 @@ impl Sink<'_, '_> {
             _ => unreachable!("lifecycle effect classified by caller"),
         };
         let id = effect.id();
-        let details = match effect.effect() {
+        let record_submitted = self.events.records("command_submitted");
+        let details = record_submitted.then(|| match effect.effect() {
             Effect::Persist { command } => recipe_details(command.recipe.get()),
             _ => json!({"action":"Resolve"}),
-        };
+        });
         match self
             .writer
-            .try_send_control(ControlRequest::Lifecycle(effect))
+            .try_send_control_quiet(ControlRequest::Lifecycle(effect))
         {
             Ok(()) => {
+                self.wake_control = true;
                 self.lifecycle_inflight.insert(id, operation_id);
-                if self
-                    .events
-                    .emit(
-                        "command_submitted",
-                        json!({
-                            "operation": operation(operation_id),
-                            "command_kind": "SessionLifecycle",
-                            "details": details,
-                        }),
-                    )
-                    .is_err()
+                if let Some(details) = details
+                    && self
+                        .events
+                        .emit(
+                            "command_submitted",
+                            json!({
+                                "operation": operation(operation_id),
+                                "command_kind": "SessionLifecycle",
+                                "details": details,
+                            }),
+                        )
+                        .is_err()
                 {
                     self.error = Some(Failure::plain("events_unavailable"));
                 }
@@ -679,7 +682,7 @@ impl EffectSink for Sink<'_, '_> {
                 }
             }
             Effect::ResolveAndFence { operation }
-                if self.lifecycle_operation == Some(*operation)
+                if self.lifecycle_ops.contains(operation)
                     || self.will_operation == Some(*operation) =>
             {
                 self.submit_lifecycle(effect)

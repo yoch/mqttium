@@ -411,6 +411,19 @@ impl<T> Signalled<T> {
         result
     }
 
+    /// Publishes without blocking and without signalling `wake`; the caller
+    /// must invoke [`Self::wake`] once the batch is enqueued.
+    #[inline]
+    pub fn try_send_quiet(&self, value: T) -> Result<(), TrySendError<T>> {
+        self.sender.try_send(value)
+    }
+
+    /// Signals the consumer after one or more [`Self::try_send_quiet`] calls.
+    #[inline]
+    pub fn wake(&self) {
+        self.wake.wake();
+    }
+
     /// Publishes, waiting for room.
     pub fn send(&self, value: T) -> Result<(), SendError<T>> {
         let result = self.sender.send(value);

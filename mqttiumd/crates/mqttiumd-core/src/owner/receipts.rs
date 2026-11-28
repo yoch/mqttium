@@ -263,10 +263,7 @@ impl Owner {
             || self.slot_by_deadline.contains_key(&token)
             || self.pubsub.deadline_is_live(token)
             || self.wills.deadline_is_live(token)
-            || self
-                .lifecycle
-                .as_ref()
-                .is_some_and(|flight| flight.in_flight.deadline == token)
+            || self.lifecycle_deadline_is_live(token)
     }
 
     fn receipt_flight(

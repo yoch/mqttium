@@ -113,7 +113,7 @@ impl Owner {
     pub(super) fn plan_will_discover(&self, draft: &mut Draft) -> Result<super::Change, Stop> {
         if self.wills.read.is_some()
             || self.wills.flight.is_some()
-            || self.lifecycle.is_some()
+            || !self.lifecycle.is_empty()
             || self.pubsub.control_pending()
         {
             return Ok(super::Change::Nothing);

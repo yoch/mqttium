@@ -64,7 +64,9 @@ const WRITER_INPUTS: usize = crate::writer::QUEUE;
 const DEADLINE_INPUTS: usize = 4;
 const ORDINARY_INPUTS: usize = 92;
 const OUTGOING_BINDINGS: usize = 128;
-const LIFECYCLE_IN_FLIGHT: usize = 1;
+/// Maximum concurrent distinct non-destructive session openings in flight on
+/// the reserved control lane (ADR 0048 amended for reserve R4 / MSessionOpenBatch).
+const LIFECYCLE_IN_FLIGHT: usize = 16;
 /// Closing and terminal facts applied by one pass over the inputs. With
 /// the ordinary inputs of the same pass they stay under the effect box.
 const PASS_FACTS: usize = 16;
@@ -833,7 +835,9 @@ struct Runtime<'a> {
     /// invalidate in-flight admissions of unrelated clients.
     inflight_route_ops: ScopedSeqMap<EffectId, ()>,
     lifecycle_inflight: BTreeMap<EffectId, OperationId>,
+    scratch_lifecycle_ops: Vec<OperationId>,
     last_session_change: Option<OperationId>,
+    batch_session_changes: Vec<OperationId>,
     session_cardinality_dirty: bool,
     last_session_cardinality: Option<[usize; 13]>,
     work_reads: ScopedSeqMap<EffectId, SessionId>,
@@ -1730,7 +1734,7 @@ impl Runtime<'_> {
             input,
             Input::DiscoverWills | Input::ReceiptsCollected { .. } | Input::MaintainReceipts
         ) || matches!(input, Input::StoreResult { operation, .. } if self.owner.lifecycle_operation_is_live(*operation) || self.owner.will_operation_is_live(*operation))
-            || matches!(input,Input::Deadline {token,..} if self.owner.collection_deadline_is_live(*token) || self.owner.lifecycle_dispatch().is_some_and(|(_,deadline)| deadline == *token) || self.owner.will_dispatch().is_some_and(|(_,deadline)| deadline == *token))
+            || matches!(input,Input::Deadline {token,..} if self.owner.collection_deadline_is_live(*token) || self.owner.lifecycle_deadline_is_live(*token) || self.owner.will_dispatch().is_some_and(|(_,deadline)| deadline == *token))
     }
     fn close(
         &mut self,
@@ -2042,7 +2046,9 @@ impl Runtime<'_> {
             {
                 return Err(Failure::plain("lifecycle_origin_mismatch"));
             }
-            if changed_by.sequence() <= previous.sequence() {
+            if changed_by.sequence() <= previous.sequence()
+                || self.batch_session_changes.contains(&changed_by)
+            {
                 self.events
                     .emit(
                         "session_change_ignored",
@@ -2054,6 +2060,17 @@ impl Runtime<'_> {
                     .map_err(event_failure)?;
                 return Ok(());
             }
+        } else if self.batch_session_changes.contains(&changed_by) {
+            self.events
+                .emit(
+                    "session_change_ignored",
+                    json!({
+                        "operation": operation(changed_by),
+                        "details": {"code": "stale_lifecycle_result"},
+                    }),
+                )
+                .map_err(event_failure)?;
+            return Ok(());
         }
         #[cfg(feature = "test-hooks")]
         if self
@@ -2204,7 +2221,20 @@ impl Runtime<'_> {
                 }
             }
         }
-        self.last_session_change = Some(changed_by);
+        if self.owner.lifecycle_count() == 0 {
+            let max_op = self
+                .batch_session_changes
+                .drain(..)
+                .chain(core::iter::once(changed_by))
+                .max_by_key(|op| op.sequence())
+                .unwrap_or(changed_by);
+            self.last_session_change = Some(match self.last_session_change {
+                Some(prev) if prev.sequence() > max_op.sequence() => prev,
+                _ => max_op,
+            });
+        } else {
+            self.batch_session_changes.push(changed_by);
+        }
         let mut details = match change {
             SessionChange::Opened {
                 session,
@@ -2758,7 +2788,7 @@ impl Runtime<'_> {
                                         outgoing_binding_prune = OutgoingPrune::Full;
                                     }
                                     will_progress = matches!(
-                                        self.owner.lifecycle_action(),
+                                        self.owner.lifecycle_action_of(*operation),
                                         Some(SessionAction::EndWill { .. })
                                     );
                                 }
@@ -2859,6 +2889,7 @@ impl Runtime<'_> {
                     | Input::OpenSession { connection, .. }
                     | Input::OpenSessionAt { connection, .. } => {
                         opening = Some(*connection);
+                        fast_batch_step = true;
                         may_change_bindings = true;
                         may_change_timers = has_timers;
                         if has_outgoing_bindings {
@@ -2920,13 +2951,13 @@ impl Runtime<'_> {
                     }
                 );
                 let control_refusal =
-                    lifecycle_result.and_then(|_| match self.owner.lifecycle_action() {
+                    lifecycle_result.and_then(|op| match self.owner.lifecycle_action_of(op) {
                         Some(SessionAction::Detach { .. }) => Some("session_detach_rejected"),
                         Some(SessionAction::Expire { .. }) => Some("session_expire_rejected"),
                         _ => None,
                     });
                 let previous_lifecycle =
-                    opening.and_then(|_| self.owner.lifecycle_dispatch().map(|(op, _)| op));
+                    opening.and_then(|conn| self.owner.lifecycle_op_for_connection(conn));
                 let mut applied = false;
                 let work_limit = if is_recovery {
                     WorkUnits::new(u64::MAX)
@@ -2949,7 +2980,7 @@ impl Runtime<'_> {
                     && lifecycle_result.is_none()
                     && !will_progress
                     && !may_change_bindings
-                    && self.owner.lifecycle_dispatch().is_none()
+                    && self.owner.lifecycle_count() == 0
                     && self.owner.will_dispatch().is_none()
                 {
                     dispatched_inline = true;
@@ -2967,7 +2998,7 @@ impl Runtime<'_> {
                         inflight: &mut self.inflight,
                         inflight_route_ops: &mut self.inflight_route_ops,
                         lifecycle_inflight: &mut self.lifecycle_inflight,
-                        lifecycle_operation: None,
+                        lifecycle_ops: &[],
                         will_operation: None,
                         will_reads: &mut self.will_reads,
                         work_reads: &mut self.work_reads,
@@ -2998,6 +3029,7 @@ impl Runtime<'_> {
                         mark_pending_peers: &mut self.sink_mark_pending,
                         pending_work_targets: &mut self.sink_work_targets,
                         direct_skip_next_deadline: false,
+                        wake_control: false,
                         session_change: None,
                         error: None,
                     };
@@ -3019,6 +3051,11 @@ impl Runtime<'_> {
                     inline_accepted = accepted;
                     inline_changed = sink.session_change.take();
                     inline_error = sink.error.take();
+                    let wake_control = sink.wake_control;
+                    drop(sink);
+                    if wake_control {
+                        self.writer.wake_control();
+                    }
                     outcome
                 } else if let Some(shards) = self.shards.as_mut() {
                     self.owner.step_in_place_with_oracle(
@@ -3045,7 +3082,8 @@ impl Runtime<'_> {
                             peer.gc_cold();
                         }
                         if let Some(connection) = opening
-                            && let Some((operation, _)) = self.owner.lifecycle_dispatch()
+                            && let Some(operation) =
+                                self.owner.lifecycle_op_for_connection(connection)
                             && previous_lifecycle != Some(operation)
                             && let Some(pending) = self
                                 .session_requests
@@ -3660,6 +3698,8 @@ impl Runtime<'_> {
             self.refresh_bindings();
             self.bindings_dirty = false;
         }
+        self.owner
+            .copy_lifecycle_ops(&mut self.scratch_lifecycle_ops);
         let shards_active = self.shards.is_some();
         let mut sink = Sink {
             writer: &mut self.writer,
@@ -3669,7 +3709,7 @@ impl Runtime<'_> {
             inflight: &mut self.inflight,
             inflight_route_ops: &mut self.inflight_route_ops,
             lifecycle_inflight: &mut self.lifecycle_inflight,
-            lifecycle_operation: self.owner.lifecycle_dispatch().map(|(op, _)| op),
+            lifecycle_ops: &self.scratch_lifecycle_ops,
             will_operation: self.owner.will_dispatch().map(|(op, _)| op),
             will_reads: &mut self.will_reads,
             work_reads: &mut self.work_reads,
@@ -3700,6 +3740,7 @@ impl Runtime<'_> {
             mark_pending_peers: &mut self.sink_mark_pending,
             pending_work_targets: &mut self.sink_work_targets,
             direct_skip_next_deadline: false,
+            wake_control: false,
             session_change: None,
             error: None,
         };
@@ -3711,7 +3752,11 @@ impl Runtime<'_> {
             .dispatch(&mut self.retained_output.sink(&mut sink));
         let changed = sink.session_change.take();
         let error = sink.error.take();
+        let wake_control = sink.wake_control;
         drop(sink);
+        if wake_control {
+            self.writer.wake_control();
+        }
         if !self.sink_mark_pending.is_empty() {
             for generation in self.sink_mark_pending.drain(..) {
                 self.pending_peers.insert(generation);
@@ -4532,9 +4577,10 @@ impl Runtime<'_> {
                         .previous
                         .is_none_or(|old| !self.peers.contains_key(&old))
             })
-            .take(4)
+            .take(LIFECYCLE_IN_FLIGHT)
             .map(|(id, _)| *id)
             .collect();
+        let mut sent = false;
         for connection in ready {
             let current = self
                 .will_connects
@@ -4558,13 +4604,22 @@ impl Runtime<'_> {
                 connection,
                 client: pending.connect.client_id.clone(),
             };
-            match self.writer.try_send_control(request) {
-                Ok(()) => pending.awaiting = true,
+            match self.writer.try_send_control_quiet(request) {
+                Ok(()) => {
+                    pending.awaiting = true;
+                    sent = true;
+                }
                 Err(TrySendError::Full(_)) => break,
                 Err(TrySendError::Disconnected(_)) => {
+                    if sent {
+                        self.writer.wake_control();
+                    }
                     return Err(Failure::plain("writer_control_disconnected"));
                 }
             }
+        }
+        if sent {
+            self.writer.wake_control();
         }
         Ok(())
     }
@@ -6720,7 +6775,7 @@ struct Sink<'a, 'b> {
     inflight: &'a mut ScopedSeqMap<EffectId, OperationId>,
     inflight_route_ops: &'a mut ScopedSeqMap<EffectId, ()>,
     lifecycle_inflight: &'a mut BTreeMap<EffectId, OperationId>,
-    lifecycle_operation: Option<OperationId>,
+    lifecycle_ops: &'a [OperationId],
     will_operation: Option<OperationId>,
     will_reads: &'a mut Option<EffectId>,
     work_reads: &'a mut ScopedSeqMap<EffectId, SessionId>,
@@ -6750,6 +6805,7 @@ struct Sink<'a, 'b> {
     mark_pending_peers: &'a mut Vec<ConnectionGeneration>,
     pending_work_targets: &'a mut Vec<SessionId>,
     direct_skip_next_deadline: bool,
+    wake_control: bool,
     session_change: Option<AppliedSessionChange>,
     error: Option<Failure>,
 }

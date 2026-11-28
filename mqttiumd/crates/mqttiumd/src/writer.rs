@@ -448,7 +448,7 @@ impl DurableStore for StoreBackend {
 }
 
 pub const QUEUE: usize = 1024;
-pub const CONTROL_QUEUE: usize = 4;
+pub const CONTROL_QUEUE: usize = 32;
 /// Commands one transaction may carry: bounded by both request lane and SQLite group cap.
 const GROUP: usize = if QUEUE < mqttiumd_store_sqlite::MAX_GROUP {
     QUEUE
@@ -790,7 +790,8 @@ struct OwnerLane {
     cctx: crate::wake::LaneSender<ControlResponse>,
     wake: crate::wake::Wake,
     pending: VecDeque<Response>,
-    pending_control: Option<ControlResponse>,
+    pending_control: VecDeque<ControlResponse>,
+    staged_control: Option<ControlRequest>,
     closed: bool,
 }
 
@@ -911,7 +912,8 @@ impl Writer {
             cctx,
             wake: wake.clone(),
             pending: VecDeque::new(),
-            pending_control: None,
+            pending_control: VecDeque::new(),
+            staged_control: None,
             closed: false,
         });
         let mut shard_handles = Vec::with_capacity(extra_owners);
@@ -928,7 +930,8 @@ impl Writer {
                 cctx: scctx,
                 wake: swake.clone(),
                 pending: VecDeque::new(),
-                pending_control: None,
+                pending_control: VecDeque::new(),
+                staged_control: None,
                 closed: false,
             });
             shard_handles.push(ShardStoreHandle {
@@ -993,12 +996,13 @@ impl Writer {
                     let mut any_control_pending = false;
                     for (idx, lane) in lanes.iter_mut().enumerate() {
                         let mut woke = false;
-                        if let Some(reply) = lane.pending_control.take() {
+                        while let Some(reply) = lane.pending_control.pop_front() {
                             match lane.cctx.try_send(reply) {
                                 Ok(()) => woke = true,
                                 Err(TrySendError::Full(reply)) => {
                                     stalled = true;
-                                    lane.pending_control = Some(reply);
+                                    lane.pending_control.push_front(reply);
+                                    break;
                                 }
                                 Err(TrySendError::Disconnected(_)) => {
                                     if idx == 0 {
@@ -1009,6 +1013,8 @@ impl Writer {
                                         };
                                     }
                                     lane.closed = true;
+                                    lane.pending_control.clear();
+                                    break;
                                 }
                             }
                         }
@@ -1043,7 +1049,7 @@ impl Writer {
                         if !lane.pending.is_empty() {
                             any_pending = true;
                         }
-                        if lane.pending_control.is_some() {
+                        if !lane.pending_control.is_empty() {
                             any_control_pending = true;
                         }
                     }
@@ -1053,20 +1059,98 @@ impl Writer {
                     // Even a completely unread ordinary result lane cannot prevent
                     // a reserved receipt closure from committing and replying.
                     #[cfg(feature = "test-hooks")]
-                    if lanes[0].pending_control.is_none() {
-                        lanes[0].pending_control = duplicate_control.take();
+                    if lanes[0].pending_control.is_empty()
+                        && let Some(dup) = duplicate_control.take()
+                    {
+                        lanes[0].pending_control.push_back(dup);
                     }
                     // The reserved lane does not wait for the business lane:
                     // every control request queued now is served in this pass
-                    // and its answer handed over at once. An answer the owner
+                    // and its answer handed over at once. Consecutive
+                    // ControlRequest::Lifecycle(Persist) items on owner 0
+                    // batch into one atomic store.apply_group transaction
+                    // (reserve R4 / MSessionOpenBatch). An answer the owner
                     // has no room for waits in `pending_control` and stops the
                     // lane until the next pass.
                     for (idx, lane) in lanes.iter_mut().enumerate() {
                         for _ in 0..CONTROL_QUEUE {
-                            if lane.closed || lane.pending_control.is_some() {
+                            if lane.closed || !lane.pending_control.is_empty() {
                                 break;
                             }
-                            match lane.crx.try_recv() {
+                            let next_req = if let Some(staged) = lane.staged_control.take() {
+                                Ok(staged)
+                            } else {
+                                lane.crx.try_recv()
+                            };
+                            match next_req {
+                                Ok(ControlRequest::Lifecycle(effect))
+                                    if idx == 0
+                                        && group > 1
+                                        && matches!(effect.effect(), Effect::Persist { .. }) =>
+                                {
+                                    let mut lc_batch: Vec<(
+                                        EffectId,
+                                        mqttiumd_contract::command::Command,
+                                    )> = Vec::new();
+                                    if let (eid, Effect::Persist { command }) = effect.into_parts()
+                                    {
+                                        lc_batch.push((eid, command));
+                                    }
+                                    while lc_batch.len() < group.min(CONTROL_QUEUE) {
+                                        match lane.crx.try_recv() {
+                                            Ok(ControlRequest::Lifecycle(more))
+                                                if matches!(
+                                                    more.effect(),
+                                                    Effect::Persist { .. }
+                                                ) =>
+                                            {
+                                                if let (eid, Effect::Persist { command }) =
+                                                    more.into_parts()
+                                                {
+                                                    lc_batch.push((eid, command));
+                                                }
+                                            }
+                                            Ok(other_req) => {
+                                                lane.staged_control = Some(other_req);
+                                                break;
+                                            }
+                                            Err(TryRecvError::Empty) => break,
+                                            Err(TryRecvError::Disconnected) => break,
+                                        }
+                                    }
+                                    lifecycle_group_responses_into(
+                                        &mut store,
+                                        &lc_batch,
+                                        &events,
+                                        &cancel,
+                                        &mut lane.pending_control,
+                                    );
+                                    worker_has_expiring.store(
+                                        store.has_expiring_publications(),
+                                        Ordering::Release,
+                                    );
+                                    let mut woke = false;
+                                    while let Some(reply) = lane.pending_control.pop_front() {
+                                        match lane.cctx.try_send(reply) {
+                                            Ok(()) => woke = true,
+                                            Err(TrySendError::Full(reply)) => {
+                                                lane.pending_control.push_front(reply);
+                                                any_control_pending = true;
+                                                break;
+                                            }
+                                            Err(TrySendError::Disconnected(_)) => {
+                                                return if stopping {
+                                                    stop_result
+                                                } else {
+                                                    store.maybe_snapshot(&events, true)
+                                                };
+                                            }
+                                        }
+                                    }
+                                    if woke {
+                                        lane.wake.wake();
+                                    }
+                                }
                                 Ok(request) => {
                                     let reply = control_response(
                                         &mut store, request, &events, &hooks, &cancel, &mut state,
@@ -1119,7 +1203,7 @@ impl Writer {
                                     match lane.cctx.try_send(reply) {
                                         Ok(()) => lane.wake.wake(),
                                         Err(TrySendError::Full(reply)) => {
-                                            lane.pending_control = Some(reply);
+                                            lane.pending_control.push_back(reply);
                                             any_control_pending = true;
                                         }
                                         Err(TrySendError::Disconnected(_)) => {
@@ -1146,6 +1230,9 @@ impl Writer {
                                     lane.closed = true;
                                 }
                             }
+                        }
+                        if lane.staged_control.is_some() {
+                            any_control_pending = true;
                         }
                     }
                     if !any_pending && !stopping {
@@ -1672,6 +1759,25 @@ impl StoreHandle<'_> {
         }
     }
 
+    pub(crate) fn try_send_control_quiet(
+        &mut self,
+        request: ControlRequest,
+    ) -> Result<(), TrySendError<ControlRequest>> {
+        match self {
+            Self::Threaded(writer) => writer.control_sender.try_send_quiet(request),
+            Self::Direct(direct) => {
+                direct.exec_control(request);
+                Ok(())
+            }
+        }
+    }
+
+    pub(crate) fn wake_control(&self) {
+        if let Self::Threaded(writer) = self {
+            writer.control_sender.wake();
+        }
+    }
+
     pub(crate) fn try_recv_control(&mut self) -> Result<ControlResponse, TryRecvError> {
         match self {
             Self::Threaded(writer) => writer.control_receiver.try_recv(),
@@ -1997,6 +2103,42 @@ fn group_responses_into(
             operation: recipe.operation(),
             reply: applied.reply,
             targets: targets_of(recipe),
+        });
+    }
+}
+
+fn lifecycle_group_responses_into(
+    store: &mut StoreBackend,
+    batch: &[(EffectId, mqttiumd_contract::command::Command)],
+    events: &Events,
+    cancel: &AtomicBool,
+    out: &mut VecDeque<ControlResponse>,
+) {
+    let commands: Vec<_> = batch.iter().map(|(_, command)| command).collect();
+    if commands.len() > 1
+        && events
+            .emit_with(
+                "store_group",
+                || json!({"details":{"commands":commands.len()}}),
+            )
+            .is_err()
+    {
+        cancel.store(true, Ordering::Relaxed);
+    }
+    let applied = store.apply_group(&commands).unwrap_or_else(|_| {
+        commands
+            .iter()
+            .map(|command| store.apply(command))
+            .collect()
+    });
+    for ((effect, command), applied) in batch.iter().zip(applied) {
+        let recipe = command.recipe.get();
+        record_applied(recipe, &applied, events, cancel);
+        record_result(recipe, &applied, events, cancel);
+        out.push_back(ControlResponse::Lifecycle {
+            effect: *effect,
+            operation: recipe.operation(),
+            reply: applied.reply,
         });
     }
 }

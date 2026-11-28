@@ -1,0 +1,57 @@
+{
+  "module": "MSessionOpenBatch.tla",
+  "status": "refinement",
+  "summary": "Bounded concurrent distinct-client_id session openings batched into one Writer::apply_group transaction (reserve R4, amending ADR 0048 LIFECYCLE_IN_FLIGHT = 1). Distinct non-destructive Open flights run concurrently up to MaxConcurrent under headroom and distinct-client guards, while exclusive transitions (takeovers, destructive CleanStart, Close, Detach, Expire) run strictly serialized when no other flight is active. Configurations prove capacity, single-flight-per-client, exclusive isolation, and idle consistency, witness multi-open group commits, and check three targeted mutants removing each guard.",
+  "issues": [
+    685
+  ],
+  "tests": [
+    "mqttiumd/crates/mqttiumd-core/src/owner/sessions.rs",
+    "mqttiumd/crates/mqttiumd/src/runtime_tests.rs"
+  ],
+  "replays": [
+    {
+      "file": "mqttiumd/crates/mqttiumd-core/src/owner/sessions.rs",
+      "test": "concurrent_distinct_opens_pipeline_and_serialize_conflicts_and_exclusives"
+    },
+    {
+      "file": "mqttiumd/crates/mqttiumd/src/runtime_tests.rs",
+      "test": "burst_of_distinct_session_opens_batches_into_fewer_log_commits"
+    }
+  ],
+  "not_replayed": "All safety invariants, multi-open batching reachability, and mutant counterexamples are replayed by concurrent_distinct_opens_pipeline_and_serialize_conflicts_and_exclusives (distinct-client guard, capacity headroom guard, exclusive close/takeover serialization, out-of-order result application) and burst_of_distinct_session_opens_batches_into_fewer_log_commits (real Writer::apply_group batching of concurrent session opens).",
+  "configs": [
+    {
+      "config": "MSessionOpenBatch-safety.cfg",
+      "expect": "pass",
+      "invariants": [
+        "TypeOK",
+        "CapacityRespected",
+        "AtMostOneFlightPerClient",
+        "NoExclusiveOverlap",
+        "OwnerStoreConsistentWhenIdle",
+        "NoUnexpectedBatchRefusal"
+      ]
+    },
+    {
+      "config": "MSessionOpenBatch-reach-batch.cfg",
+      "expect": "violation",
+      "invariant": "NeverBatched"
+    },
+    {
+      "config": "MSessionOpenBatch-mut-same-client.cfg",
+      "expect": "violation",
+      "invariant": "AtMostOneFlightPerClient"
+    },
+    {
+      "config": "MSessionOpenBatch-mut-no-capacity.cfg",
+      "expect": "violation",
+      "invariant": "NoUnexpectedBatchRefusal"
+    },
+    {
+      "config": "MSessionOpenBatch-mut-exclusive-overlap.cfg",
+      "expect": "violation",
+      "invariant": "NoExclusiveOverlap"
+    }
+  ]
+}

@@ -1226,7 +1226,7 @@ pub struct Owner {
     pubsub: pubsub::State,
     receipts: receipts::State,
     wills: will::State,
-    lifecycle: Option<sessions::Flight>,
+    lifecycle: alloc::vec::Vec<sessions::Flight>,
     lifecycle_enabled: bool,
     inline_claim_enabled: bool,
     delegated_deliveries: bool,
@@ -1252,7 +1252,7 @@ pub struct Owner {
     /// Last priority control attempts confirmed absent from `outbox` so
     /// steady-state `Owner::dispatch` avoids rotating the entire outbox.
     receipt_priority_dispatched: Option<(EffectId, DeadlineToken)>,
-    lifecycle_flight_dispatched: Option<(OperationId, DeadlineToken)>,
+    lifecycle_dispatch_dirty: bool,
     will_flight_dispatched: Option<(OperationId, DeadlineToken)>,
     /// Reusable effect staging buffer borrowed by `Draft` during a step so the
     /// stack never zero-initializes ~900 bytes of `[Option<OwnedEffect>; 3]`.
@@ -1462,7 +1462,7 @@ impl Owner {
             pubsub,
             receipts,
             wills: will::State::new(),
-            lifecycle: None,
+            lifecycle: alloc::vec::Vec::new(),
             lifecycle_enabled: false,
             inline_claim_enabled: false,
             delegated_deliveries: false,
@@ -1487,7 +1487,7 @@ impl Owner {
             release_continuation: None,
             release_continuations_started: false,
             receipt_priority_dispatched: None,
-            lifecycle_flight_dispatched: None,
+            lifecycle_dispatch_dirty: false,
             will_flight_dispatched: None,
             scratch_effects: Some(alloc::boxed::Box::new(Effects::empty())),
             outbox,
@@ -1534,15 +1534,25 @@ impl Owner {
         let lifecycle = if self.lifecycle_enabled
             && !(pending_route_admissions && self.lifecycle_mutates_routes())
         {
-            let flight = self.lifecycle_dispatch();
             if !self.outbox.has_session_control()
-                && (flight.is_none() || self.lifecycle_flight_dispatched == flight)
+                && (self.lifecycle.is_empty() || !self.lifecycle_dispatch_dirty)
             {
                 None
             } else {
-                let report = self.outbox.dispatch_session_controls(sink, flight);
+                let flights = &self.lifecycle;
+                let report = self.outbox.dispatch_session_controls_matching(
+                    sink,
+                    !flights.is_empty(),
+                    |op| flights.iter().any(|f| f.in_flight.operation == op),
+                    |token| {
+                        flights
+                            .iter()
+                            .find(|f| f.in_flight.deadline == token)
+                            .map(|f| f.in_flight.operation)
+                    },
+                );
                 if report.blocked.is_none() {
-                    self.lifecycle_flight_dispatched = flight;
+                    self.lifecycle_dispatch_dirty = false;
                 }
                 Some(report)
             }
@@ -1627,7 +1637,7 @@ impl Owner {
                 ReplaceRefusal::Create(reason) => RenewRefused::Create(reason),
             })?;
         self.receipt_priority_dispatched = None;
-        self.lifecycle_flight_dispatched = None;
+        self.lifecycle_dispatch_dirty = !self.lifecycle.is_empty();
         self.will_flight_dispatched = None;
         Ok(())
     }
@@ -1854,7 +1864,7 @@ impl Owner {
     /// Whether the active lifecycle command may remove a session or advance
     /// `route_revision` in the store.
     fn lifecycle_mutates_routes(&self) -> bool {
-        self.lifecycle.as_ref().is_some_and(|flight| {
+        self.lifecycle.iter().any(|flight| {
             matches!(
                 &flight.command.action,
                 crate::contract::session::SessionAction::Close { .. }
@@ -2798,7 +2808,7 @@ impl Owner {
             return protocol_error(draft);
         }
         if matches!(packet, InboundPacket::Publish { .. })
-            && (self.pubsub.control_pending() || self.lifecycle.is_some())
+            && (self.pubsub.control_pending() || !self.lifecycle.is_empty())
         {
             return Err(Stop::Need(CapacityNeed {
                 resource: Resource::ResultSlots,
@@ -3728,7 +3738,7 @@ impl Owner {
             return Err(IMPOSSIBLE);
         }
         let contradiction = Stop::Fatal(CoreFault::ContradictoryOutcome { operation });
-        if self.lifecycle.is_some()
+        if !self.lifecycle.is_empty()
             && let Some(change) = self.plan_session_result(effect, operation, reply, draft)?
         {
             return Ok(change);
@@ -4367,10 +4377,10 @@ impl Owner {
         self.receipts.apply_issued(receipt_issued)?;
         self.receipts.consume(receipt_consumed)?;
         if let Some(connection) = closed {
-            if let Some(flight) = self.lifecycle.as_mut()
-                && flight.connection == connection
-            {
-                flight.connection_closed = true;
+            for flight in &mut self.lifecycle {
+                if flight.connection == connection {
+                    flight.connection_closed = true;
+                }
             }
             // Closing a generation is terminal for its queued/emitting
             // ACKs, even if the adapter never accepted their Outbox effect.

@@ -160,15 +160,10 @@ impl LeaseTable {
         max_leases: NonZeroU32,
     ) -> Result<Self, AllocationFailed> {
         let count = usize::try_from(max_leases.get()).map_err(|_| AllocationFailed)?;
-        let mut slots = BoundedVec::with_capacity(count)?;
+        // Pre-reserve exact capacity without touching backing pages at startup;
+        // slots materialize lazily inside the reserved buffer on first use.
+        let slots = BoundedVec::with_capacity(count)?;
         let free_slots = FreeBitset::all_free(count)?;
-        for _ in 0..count {
-            let free = LeaseSlot {
-                next_generation: Some(LeaseGeneration::new(0)),
-                record: None,
-            };
-            slots.try_push(free).map_err(|_| AllocationFailed)?;
-        }
         Ok(Self {
             account: Account::new(account, limit),
             slots,
@@ -176,6 +171,16 @@ impl LeaseTable {
             held_count: 0,
             exhausted_count: 0,
         })
+    }
+
+    fn ensure_slot(&mut self, index: usize) -> &mut LeaseSlot {
+        while self.slots.len() <= index {
+            let _ = self.slots.try_push(LeaseSlot {
+                next_generation: Some(LeaseGeneration::new(0)),
+                record: None,
+            });
+        }
+        &mut self.slots.as_mut_slice()[index]
     }
 
     /// The slot `key` names when it holds exactly that lease: the whole
@@ -193,7 +198,7 @@ impl LeaseTable {
         }
         // A held slot is freed by a release unless its lease took the
         // last generation: that slot is spent already.
-        if self.exhausted_count < self.slots.len() {
+        if self.exhausted_count < self.slots.capacity() {
             Err(LeaseRefused::TableFull)
         } else {
             Err(LeaseRefused::TableExhausted)
@@ -276,8 +281,10 @@ impl LeaseTable {
         let index = self.admit(cost)?;
         // `admit` found the slot free and its generation not exhausted.
         let slot = u32::try_from(index).map_err(|_| LeaseRefused::TableExhausted)?;
-        let entry = &mut self.slots.as_mut_slice()[index];
-        let generation = entry.next_generation.ok_or(LeaseRefused::TableExhausted)?;
+        let generation = match self.slots.as_slice().get(index) {
+            Some(entry) => entry.next_generation.ok_or(LeaseRefused::TableExhausted)?,
+            None => LeaseGeneration::new(0),
+        };
         let record = match self.account.reserve(slot, generation, cost) {
             Ok(record) => record,
             // `admit` compared the same limits; the account is the authority.
@@ -289,12 +296,14 @@ impl LeaseTable {
             }
         };
         let key = record.key();
+        let entry = self.ensure_slot(index);
         entry.record = Some(record);
         // The generation is used whatever follows; the last leaves `None`.
         entry.next_generation = generation.checked_next().ok();
+        let spent = entry.next_generation.is_none();
         self.free_slots.clear(index);
         self.held_count += 1;
-        if entry.next_generation.is_none() {
+        if spent {
             self.exhausted_count += 1;
         }
         Ok(key)
@@ -366,18 +375,20 @@ impl LeaseTable {
             return Err(RestoreRefused::ForeignAccount);
         }
         let index = usize::try_from(key.slot).map_err(|_| RestoreRefused::UnknownSlot)?;
-        let Some(entry) = self.slots.as_slice().get(index) else {
+        if index >= self.slots.capacity() {
             return Err(RestoreRefused::UnknownSlot);
-        };
-        if entry.record.is_some() {
-            return Err(RestoreRefused::SlotHeld);
         }
-        // A spent slot used every generation.
-        if entry
-            .next_generation
-            .is_none_or(|next| key.generation < next)
-        {
-            return Err(RestoreRefused::GenerationReused);
+        if let Some(entry) = self.slots.as_slice().get(index) {
+            if entry.record.is_some() {
+                return Err(RestoreRefused::SlotHeld);
+            }
+            // A spent slot used every generation.
+            if entry
+                .next_generation
+                .is_none_or(|next| key.generation < next)
+            {
+                return Err(RestoreRefused::GenerationReused);
+            }
         }
         // Recovery charges the restored lease like a new one, through the
         // one charge path, under the generation the durable row names.
@@ -387,12 +398,13 @@ impl LeaseTable {
                 return Err(RestoreRefused::LimitExceeded(resource));
             }
         };
-        let entry = &mut self.slots.as_mut_slice()[index];
+        let entry = self.ensure_slot(index);
         entry.record = Some(record);
         entry.next_generation = key.generation.checked_next().ok();
+        let spent = entry.next_generation.is_none();
         self.free_slots.clear(index);
         self.held_count += 1;
-        if entry.next_generation.is_none() {
+        if spent {
             self.exhausted_count += 1;
         }
         Ok(())
@@ -411,7 +423,7 @@ mod snapshot {
     impl LeaseTable {
         /// The usage of the account and the view of each slot.
         pub(crate) fn snapshot(&self) -> (Credits, Vec<LeaseSlotView>) {
-            let slots = self
+            let mut slots: Vec<LeaseSlotView> = self
                 .slots
                 .as_slice()
                 .iter()
@@ -422,6 +434,7 @@ mod snapshot {
                     )
                 })
                 .collect();
+            slots.resize(self.slots.capacity(), (Some(0), None));
             (self.account.used(), slots)
         }
     }
@@ -716,8 +729,8 @@ mod tests {
 
     fn table_at_last_generation(max_leases: u32) -> LeaseTable {
         let mut table = table(100, 8, max_leases);
-        for slot in table.slots.as_mut_slice() {
-            slot.next_generation = Some(LeaseGeneration::new(u64::MAX));
+        for index in 0..max_leases as usize {
+            table.ensure_slot(index).next_generation = Some(LeaseGeneration::new(u64::MAX));
         }
         table
     }
@@ -895,5 +908,27 @@ mod tests {
             table.reserve(credits(1, 1)),
             Err(LeaseRefused::TableExhausted)
         );
+    }
+
+    #[test]
+    fn lazy_slots_initialize_on_demand_without_changing_refusals() {
+        let mut table = table(100, 8, 64);
+        assert_eq!(table.slots.len(), 0);
+        assert_eq!(table.slots.capacity(), 64);
+        assert_eq!(
+            table.restore(key(10, 0), credits(101, 1)),
+            Err(RestoreRefused::LimitExceeded(Resource::PayloadBytes))
+        );
+        assert_eq!(
+            table.slots.len(),
+            0,
+            "refused restore must not materialize virgin slots"
+        );
+        let first = table.reserve(credits(10, 1)).expect("room");
+        assert_eq!(first, key(0, 0));
+        assert_eq!(table.slots.len(), 1);
+        assert_eq!(table.restore(key(5, 2), credits(10, 1)), Ok(()));
+        assert_eq!(table.slots.len(), 6);
+        assert_invariant(&table);
     }
 }

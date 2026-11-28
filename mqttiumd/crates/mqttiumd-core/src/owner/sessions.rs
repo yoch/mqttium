@@ -19,12 +19,17 @@ pub struct SessionStatus {
     pub lifecycle_pending: bool,
 }
 
+/// Maximum distinct non-destructive session openings admitted concurrently.
+pub const MAX_CONCURRENT_SESSION_OPENS: usize = 16;
+
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub(super) struct Flight {
     pub(super) command: SessionLifecycle,
     pub(super) client_id: SharedBytes,
     pub(super) connection: ConnectionGeneration,
     pub(super) connection_closed: bool,
+    pub(super) batch_safe: bool,
+    pub(super) creates_session: bool,
     pub(super) in_flight: InFlight,
 }
 
@@ -32,16 +37,19 @@ pub(super) struct Flight {
 pub(super) enum Change {
     Submit(Flight),
     Await {
+        operation: OperationId,
         phase: CommandPhase,
         resolution: Option<(DeadlineToken, EffectId)>,
     },
-    TransportClosed,
+    TransportClosed(OperationId),
     Applied {
+        operation: OperationId,
         finished: Finished,
         change: SessionChange,
         followup: Option<Flight>,
     },
     Refused {
+        operation: OperationId,
         finished: Finished,
         followup: Option<Flight>,
     },
@@ -74,11 +82,11 @@ impl Owner {
                 && d.valid_for(expiry)
         })
     }
-    /// The one accepted opening request, including a transport already closed.
+    /// An accepted opening request, including a transport already closed.
     /// This is an observation for bounded adapter follow-up, not a session grant.
     #[must_use]
     pub fn opening_connection(&self) -> Option<ConnectionGeneration> {
-        self.lifecycle.as_ref().and_then(|f| {
+        self.lifecycle.iter().find_map(|f| {
             matches!(
                 f.command.action,
                 SessionAction::Open { .. }
@@ -91,20 +99,55 @@ impl Owner {
     #[must_use]
     pub fn lifecycle_dispatch(&self) -> Option<(OperationId, DeadlineToken)> {
         self.lifecycle
-            .as_ref()
+            .first()
             .map(|f| (f.in_flight.operation, f.in_flight.deadline))
     }
-    /// Observe the current correlated lifecycle request without granting
+    /// Number of currently in-flight session lifecycle operations.
+    #[must_use]
+    pub fn lifecycle_count(&self) -> usize {
+        self.lifecycle.len()
+    }
+    /// Copies every live session lifecycle operation ID into `out`.
+    pub fn copy_lifecycle_ops(&self, out: &mut alloc::vec::Vec<OperationId>) {
+        out.clear();
+        for flight in &self.lifecycle {
+            out.push(flight.in_flight.operation);
+        }
+    }
+    /// Returns the live session lifecycle operation associated with `connection`, if any.
+    #[must_use]
+    pub fn lifecycle_op_for_connection(
+        &self,
+        connection: ConnectionGeneration,
+    ) -> Option<OperationId> {
+        self.lifecycle
+            .iter()
+            .find(|f| f.connection == connection)
+            .map(|f| f.in_flight.operation)
+    }
+    /// Observe the first correlated lifecycle request without granting
     /// authority to apply a result or fabricate a retry identity.
     #[must_use]
     pub fn lifecycle_action(&self) -> Option<&SessionAction> {
-        self.lifecycle.as_ref().map(|flight| &flight.command.action)
+        self.lifecycle.first().map(|flight| &flight.command.action)
+    }
+    /// Observe the correlated lifecycle request for a specific operation.
+    #[must_use]
+    pub fn lifecycle_action_of(&self, operation: OperationId) -> Option<&SessionAction> {
+        self.lifecycle
+            .iter()
+            .find(|f| f.in_flight.operation == operation)
+            .map(|flight| &flight.command.action)
     }
     #[must_use]
     pub fn lifecycle_operation_is_live(&self, operation: OperationId) -> bool {
         self.lifecycle
-            .as_ref()
-            .is_some_and(|f| f.in_flight.operation == operation)
+            .iter()
+            .any(|f| f.in_flight.operation == operation)
+    }
+    #[must_use]
+    pub fn lifecycle_deadline_is_live(&self, token: DeadlineToken) -> bool {
+        self.lifecycle.iter().any(|f| f.in_flight.deadline == token)
     }
     #[must_use]
     pub fn session_status(&self) -> SessionStatus {
@@ -120,7 +163,7 @@ impl Owner {
             inbound: self.slots.len(),
             outgoing: self.pubsub.deliveries.len() + self.pubsub.volatile.len(),
             closed_generations: self.closed.len(),
-            lifecycle_pending: self.lifecycle.is_some(),
+            lifecycle_pending: !self.lifecycle.is_empty(),
         }
     }
     pub(super) fn session_work_bound(&self, input: &Input) -> u64 {
@@ -144,12 +187,18 @@ impl Owner {
             base
         }
     }
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "lifecycle flight construction carries batching and creation flags explicitly"
+    )]
     fn session_flight(
         &self,
         action: SessionAction,
         client_id: SharedBytes,
         connection: ConnectionGeneration,
         connection_closed: bool,
+        batch_safe: bool,
+        creates_session: bool,
         draft: &mut Draft,
     ) -> Result<Flight, Stop> {
         let operation = self.operation(draft)?;
@@ -165,6 +214,8 @@ impl Owner {
             client_id,
             connection,
             connection_closed,
+            batch_safe,
+            creates_session,
             in_flight,
         })
     }
@@ -185,7 +236,7 @@ impl Owner {
         if self.is_closed(connection) {
             return Ok(super::Change::Nothing);
         }
-        if self.lifecycle.is_some() || self.pubsub.control_pending() {
+        if self.pubsub.control_pending() {
             return Err(waiting());
         }
         if self.session_of(connection).is_some() {
@@ -204,6 +255,34 @@ impl Owner {
             // An old untimed interface cannot turn an unobserved expiry into
             // a resume, even when the requested replacement policy is Never.
             return Err(IMPOSSIBLE);
+        }
+        let creates_session = known.is_none();
+        let non_destructive_resume = known.is_some_and(|s| {
+            !clean_start
+                && s.connection.is_none()
+                && s.expiry != SessionExpiry::OnDisconnect
+                && !s
+                    .detached()
+                    .and_then(|d| d.deadline)
+                    .is_some_and(|deadline| now.is_some_and(|now| now >= deadline))
+        });
+        let no_close_followup = will.is_some() || expiry != SessionExpiry::OnDisconnect;
+        let batch_safe = no_close_followup && (creates_session || non_destructive_resume);
+        if !self.lifecycle.is_empty() {
+            let pending_fresh = self.lifecycle.iter().filter(|f| f.creates_session).count();
+            let can_batch = batch_safe
+                && self.lifecycle.len() < MAX_CONCURRENT_SESSION_OPENS
+                && self.lifecycle.iter().all(|f| f.batch_safe)
+                && !self
+                    .lifecycle
+                    .iter()
+                    .any(|f| f.client_id == *client_id || f.connection == connection)
+                && (!creates_session
+                    || self.sessions.len().saturating_add(pending_fresh)
+                        < self.sessions.capacity());
+            if !can_batch {
+                return Err(waiting());
+            }
         }
         if let Some(previous) = known.and_then(|s| s.connection) {
             draft.close(previous, CloseReason::SessionTakenOver)?;
@@ -236,7 +315,15 @@ impl Owner {
             },
             (None, Some(_)) => return Err(IMPOSSIBLE),
         };
-        let flight = self.session_flight(action, client_id.clone(), connection, false, draft)?;
+        let flight = self.session_flight(
+            action,
+            client_id.clone(),
+            connection,
+            false,
+            batch_safe,
+            creates_session,
+            draft,
+        )?;
         Ok(changed(Change::Submit(flight)))
     }
     #[expect(
@@ -292,7 +379,7 @@ impl Owner {
         if expiry.deadline(observed_at).is_none() {
             return Err(IMPOSSIBLE);
         }
-        if self.lifecycle.is_some() || self.pubsub.control_pending() {
+        if !self.lifecycle.is_empty() || self.pubsub.control_pending() {
             return Err(waiting());
         }
         draft.end(connection.generation)?;
@@ -309,6 +396,8 @@ impl Owner {
             session.client_id.clone(),
             connection.generation,
             true,
+            false,
+            false,
             draft,
         )?;
         Ok(changed(Change::Submit(flight)))
@@ -335,7 +424,7 @@ impl Owner {
         {
             return Ok(super::Change::Nothing);
         }
-        if self.lifecycle.is_some() || self.pubsub.control_pending() {
+        if !self.lifecycle.is_empty() || self.pubsub.control_pending() {
             return Err(waiting());
         }
         draft.end(connection.generation)?;
@@ -350,6 +439,8 @@ impl Owner {
             session.client_id.clone(),
             connection.generation,
             true,
+            false,
+            false,
             draft,
         )?;
         Ok(changed(Change::Submit(flight)))
@@ -381,7 +472,7 @@ impl Owner {
         if expiry == SessionExpiry::OnDisconnect || expiry.deadline(observed_at).is_none() {
             return Err(IMPOSSIBLE);
         }
-        if self.lifecycle.is_some() || self.pubsub.control_pending() {
+        if !self.lifecycle.is_empty() || self.pubsub.control_pending() {
             return Err(waiting());
         }
         draft.end(connection.generation)?;
@@ -397,6 +488,8 @@ impl Owner {
             session.client_id.clone(),
             connection.generation,
             true,
+            false,
+            false,
             draft,
         )?;
         Ok(changed(Change::Submit(flight)))
@@ -422,7 +515,7 @@ impl Owner {
         {
             return Ok(super::Change::Nothing);
         }
-        if self.lifecycle.is_some() || self.pubsub.control_pending() {
+        if !self.lifecycle.is_empty() || self.pubsub.control_pending() {
             return Err(waiting());
         }
         // This transportless flight never emits a frame/close or exposes the
@@ -436,6 +529,8 @@ impl Owner {
             session.client_id.clone(),
             ConnectionGeneration::new(0),
             true,
+            false,
+            false,
             draft,
         )?;
         Ok(changed(Change::Submit(flight)))
@@ -445,7 +540,7 @@ impl Owner {
         connection: ConnectionGeneration,
         draft: &mut Draft,
     ) -> Result<Option<super::Change>, Stop> {
-        if self.lifecycle.as_ref().is_some_and(|f| {
+        if let Some(flight) = self.lifecycle.iter().find(|f| {
             f.connection == connection
                 && matches!(
                     f.command.action,
@@ -455,7 +550,9 @@ impl Owner {
                 )
         }) {
             draft.end(connection)?;
-            return Ok(Some(changed(Change::TransportClosed)));
+            return Ok(Some(changed(Change::TransportClosed(
+                flight.in_flight.operation,
+            ))));
         }
         let Some(session) = self
             .session_of(connection)
@@ -466,19 +563,23 @@ impl Owner {
         if session.will_managed || session.expiry != SessionExpiry::OnDisconnect {
             return Ok(None);
         }
-        if let Some(flight) = &self.lifecycle {
-            let covered = match &flight.command.action {
-                SessionAction::Open { expected, .. }
-                | SessionAction::OpenAt { expected, .. }
-                | SessionAction::OpenWillAt { expected, .. } => expected
-                    .is_some_and(|g| g.session == session.id && g.opened_by == session.opened_by),
-                SessionAction::Close { guard, .. }
-                | SessionAction::Detach { guard, .. }
-                | SessionAction::Expire { guard, .. }
-                | SessionAction::EndWill { guard, .. } => {
-                    guard.session == session.id && guard.opened_by == session.opened_by
-                }
-            };
+        if !self.lifecycle.is_empty() {
+            let covered = self
+                .lifecycle
+                .iter()
+                .any(|flight| match &flight.command.action {
+                    SessionAction::Open { expected, .. }
+                    | SessionAction::OpenAt { expected, .. }
+                    | SessionAction::OpenWillAt { expected, .. } => expected.is_some_and(|g| {
+                        g.session == session.id && g.opened_by == session.opened_by
+                    }),
+                    SessionAction::Close { guard, .. }
+                    | SessionAction::Detach { guard, .. }
+                    | SessionAction::Expire { guard, .. }
+                    | SessionAction::EndWill { guard, .. } => {
+                        guard.session == session.id && guard.opened_by == session.opened_by
+                    }
+                });
             if covered {
                 return Ok(None);
             }
@@ -531,6 +632,8 @@ impl Owner {
             flight.client_id.clone(),
             flight.connection,
             true,
+            false,
+            false,
             draft,
         )
         .map(Some)
@@ -576,6 +679,8 @@ impl Owner {
             previous.client_id.clone(),
             flight.connection,
             true,
+            false,
+            false,
             draft,
         )
         .map(Some)
@@ -589,8 +694,8 @@ impl Owner {
     ) -> Result<Option<super::Change>, Stop> {
         let Some(flight) = self
             .lifecycle
-            .as_ref()
-            .filter(|f| f.in_flight.operation == operation)
+            .iter()
+            .find(|f| f.in_flight.operation == operation)
         else {
             return Ok(None);
         };
@@ -650,6 +755,7 @@ impl Owner {
                     )?;
                 }
                 Ok(Some(changed(Change::Applied {
+                    operation,
                     finished,
                     change,
                     followup,
@@ -683,10 +789,15 @@ impl Owner {
                     })?;
                 }
                 let followup = self.followup_for_refused_takeover(flight, draft)?;
-                Ok(Some(changed(Change::Refused { finished, followup })))
+                Ok(Some(changed(Change::Refused {
+                    operation,
+                    finished,
+                    followup,
+                })))
             }
             (Verdict::Transition(CommandPhase::Indeterminate), _) => {
                 Ok(Some(changed(Change::Await {
+                    operation,
                     phase: CommandPhase::Indeterminate,
                     resolution: None,
                 })))
@@ -846,8 +957,8 @@ impl Owner {
     ) -> Result<Option<super::Change>, Stop> {
         let Some(flight) = self
             .lifecycle
-            .as_ref()
-            .filter(|f| f.in_flight.deadline == token)
+            .iter()
+            .find(|f| f.in_flight.deadline == token)
         else {
             return Ok(None);
         };
@@ -855,33 +966,44 @@ impl Owner {
         else {
             return Err(IMPOSSIBLE);
         };
-        let effect = draft.emit(Effect::ResolveAndFence {
-            operation: flight.in_flight.operation,
-        })?;
+        let operation = flight.in_flight.operation;
+        let effect = draft.emit(Effect::ResolveAndFence { operation })?;
         let deadline = draw(&mut draft.counters.deadline, DeadlineToken::checked_next)?;
         draft.emit(Effect::ArmDeadline {
             token: deadline,
             after: self.resolution_delay,
         })?;
         Ok(Some(changed(Change::Await {
+            operation,
             phase,
             resolution: Some((deadline, effect)),
         })))
     }
     pub(super) fn apply_session(&mut self, change: Change) -> Result<(), CoreFault> {
+        self.lifecycle_dispatch_dirty = true;
         match change {
             Change::Submit(flight) => {
                 self.lifecycle_enabled = true;
-                self.lifecycle = Some(flight);
+                self.lifecycle.push(flight);
             }
-            Change::TransportClosed => {
-                self.lifecycle
-                    .as_mut()
-                    .ok_or(CoreFault::StalePlan)?
-                    .connection_closed = true;
+            Change::TransportClosed(operation) => {
+                let flight = self
+                    .lifecycle
+                    .iter_mut()
+                    .find(|f| f.in_flight.operation == operation)
+                    .ok_or(CoreFault::StalePlan)?;
+                flight.connection_closed = true;
             }
-            Change::Await { phase, resolution } => {
-                let flight = self.lifecycle.as_mut().ok_or(CoreFault::StalePlan)?;
+            Change::Await {
+                operation,
+                phase,
+                resolution,
+            } => {
+                let flight = self
+                    .lifecycle
+                    .iter_mut()
+                    .find(|f| f.in_flight.operation == operation)
+                    .ok_or(CoreFault::StalePlan)?;
                 flight.in_flight.phase = phase;
                 if let Some((deadline, effect)) = resolution {
                     flight.in_flight.deadline = deadline;
@@ -891,11 +1013,17 @@ impl Owner {
                 }
             }
             Change::Applied {
+                operation,
                 finished,
                 change,
                 followup,
             } => {
-                let flight = self.lifecycle.take().ok_or(CoreFault::StalePlan)?;
+                let pos = self
+                    .lifecycle
+                    .iter()
+                    .position(|f| f.in_flight.operation == operation)
+                    .ok_or(CoreFault::StalePlan)?;
+                let flight = self.lifecycle.remove(pos);
                 match change {
                     SessionChange::Opened {
                         session,
@@ -955,12 +1083,25 @@ impl Owner {
                     }
                 }
                 self.remember_finished(finished)?;
-                self.lifecycle = followup;
+                if let Some(next_flight) = followup {
+                    self.lifecycle.push(next_flight);
+                }
             }
-            Change::Refused { finished, followup } => {
-                self.lifecycle.take().ok_or(CoreFault::StalePlan)?;
+            Change::Refused {
+                operation,
+                finished,
+                followup,
+            } => {
+                let pos = self
+                    .lifecycle
+                    .iter()
+                    .position(|f| f.in_flight.operation == operation)
+                    .ok_or(CoreFault::StalePlan)?;
+                self.lifecycle.remove(pos);
                 self.remember_finished(finished)?;
-                self.lifecycle = followup;
+                if let Some(next_flight) = followup {
+                    self.lifecycle.push(next_flight);
+                }
             }
         }
         Ok(())
@@ -1182,7 +1323,7 @@ mod tests {
         }
     }
     fn answer(owner: &mut Owner, reply: StoreOutcome) -> Vec<(EffectId, Effect)> {
-        let flight = owner.lifecycle.as_ref().unwrap();
+        let flight = owner.lifecycle.first().unwrap();
         let input = Input::StoreResult {
             effect: flight.in_flight.answers.persist_id(),
             operation: flight.command.operation,
@@ -1266,7 +1407,7 @@ mod tests {
     fn closing_an_unknown_open_survives_eviction_from_the_closed_generation_ring() {
         let mut owner = world();
         let opening = submit(&mut owner, 1, b"ephemeral", SessionExpiry::OnDisconnect);
-        let original = owner.lifecycle.clone().unwrap();
+        let original = owner.lifecycle.first().unwrap().clone();
         answer(&mut owner, StoreOutcome::PendingOrUnknown);
         apply(
             &mut owner,
@@ -1302,7 +1443,7 @@ mod tests {
             }
         )));
         assert!(
-            matches!(owner.lifecycle.as_ref().unwrap().command.action, SessionAction::Close { guard, .. } if guard.session == SessionId::new(1) && guard.opened_by == Some(operation))
+            matches!(owner.lifecycle.first().unwrap().command.action, SessionAction::Close { guard, .. } if guard.session == SessionId::new(1) && guard.opened_by == Some(operation))
         );
         known(&mut owner, &followup, closed(1));
         let effects = apply(
@@ -1382,7 +1523,7 @@ mod tests {
             },
         );
         assert!(
-            matches!(owner.lifecycle.as_ref().unwrap().command.action, SessionAction::Close { guard, .. } if guard.opened_by == Some(new_token))
+            matches!(owner.lifecycle.first().unwrap().command.action, SessionAction::Close { guard, .. } if guard.opened_by == Some(new_token))
         );
         known(&mut owner, &close, closed(1));
         assert!(owner.routes.is_empty());
@@ -1398,7 +1539,7 @@ mod tests {
                 connection: ConnectionGeneration::new(1),
             },
         );
-        let original = owner.lifecycle.clone().unwrap();
+        let original = owner.lifecycle.first().unwrap().clone();
         answer(&mut owner, StoreOutcome::PendingOrUnknown);
         assert_eq!(
             owner.sessions.len(),
@@ -1491,7 +1632,7 @@ mod tests {
     fn reused_client_id_does_not_retarget_old_lifecycle_or_transport_facts() {
         let mut owner = world();
         let first = submit(&mut owner, 1, b"reusable", SessionExpiry::OnDisconnect);
-        let original = owner.lifecycle.clone().unwrap();
+        let original = owner.lifecycle.first().unwrap().clone();
         let (old_token, _) = known(&mut owner, &first, opened(1, SessionExpiry::OnDisconnect));
         let close = apply(
             &mut owner,
@@ -1499,7 +1640,7 @@ mod tests {
                 connection: ConnectionGeneration::new(1),
             },
         );
-        let old_close = owner.lifecycle.clone().unwrap();
+        let old_close = owner.lifecycle.first().unwrap().clone();
         known(&mut owner, &close, closed(1));
         let next = submit(&mut owner, 2, b"reusable", SessionExpiry::Never);
         let (new_token, _) = known(&mut owner, &next, opened(2, SessionExpiry::Never));
@@ -1542,7 +1683,7 @@ mod tests {
                 owner.sessions.as_slice()[0].connection,
                 Some(ConnectionGeneration::new(2))
             );
-            assert!(owner.lifecycle.is_none());
+            assert!(owner.lifecycle.is_empty());
         }
     }
     #[test]
@@ -1552,7 +1693,7 @@ mod tests {
         let (opened_by, _) = known(&mut owner, &first, opened(1, SessionExpiry::OnDisconnect));
         let takeover = submit(&mut owner, 2, b"ephemeral", SessionExpiry::Never);
         assert!(takeover.iter().any(|(_, e)| matches!(e, Effect::CloseConnection { connection, .. } if *connection == ConnectionGeneration::new(1))));
-        let flight = owner.lifecycle.clone().unwrap();
+        let flight = owner.lifecycle.first().unwrap().clone();
         let effects = apply(
             &mut owner,
             Input::StoreResult {
@@ -1570,7 +1711,7 @@ mod tests {
         let first = submit(&mut owner, 1, b"persistent", SessionExpiry::Never);
         known(&mut owner, &first, opened(1, SessionExpiry::Never));
         submit(&mut owner, 2, b"other", SessionExpiry::Never);
-        let flight = owner.lifecycle.clone().unwrap();
+        let flight = owner.lifecycle.first().unwrap().clone();
         let previous = owner.sessions.as_slice().to_vec();
         let input = Input::StoreResult {
             effect: flight.in_flight.answers.persist_id(),
@@ -1587,7 +1728,7 @@ mod tests {
             "committed_creation_exceeds_owner_capacity"
         );
         assert_eq!(owner.sessions.as_slice(), previous.as_slice());
-        assert_eq!(owner.lifecycle, Some(flight));
+        assert_eq!(owner.lifecycle.as_slice(), &[flight]);
         assert!(drain(&mut owner).is_empty());
     }
     #[test]
@@ -1714,7 +1855,7 @@ mod tests {
             },
         );
         let detached = SessionDetachment {
-            operation: owner.lifecycle.as_ref().unwrap().command.operation,
+            operation: owner.lifecycle.first().unwrap().command.operation,
             deadline: expiry.deadline(observed_at).unwrap(),
         };
         let (_, emitted) = known(
@@ -1761,7 +1902,7 @@ mod tests {
                 observed_at: 123,
             },
         );
-        let original = owner.lifecycle.as_ref().unwrap().clone();
+        let original = owner.lifecycle.first().unwrap().clone();
         assert!(matches!(
             original.command.action,
             SessionAction::Detach {
@@ -1791,7 +1932,7 @@ mod tests {
             })
             .unwrap();
         assert_eq!(operation, original.command.operation);
-        assert_eq!(owner.lifecycle.as_ref().unwrap().command, original.command);
+        assert_eq!(owner.lifecycle.first().unwrap().command, original.command);
         let detached = SessionDetachment {
             operation,
             deadline: Some(1_000_000_123),
@@ -2103,7 +2244,7 @@ mod tests {
                 observed_at: 123,
             },
         );
-        let flight = owner.lifecycle.as_ref().unwrap().clone();
+        let flight = owner.lifecycle.first().unwrap().clone();
         let outcome = owner.step(
             Input::StoreResult {
                 effect: flight.in_flight.answers.persist_id(),
@@ -2126,7 +2267,7 @@ mod tests {
             "detach_result_recalculated_deadline"
         );
         assert!(owner.sessions.as_slice()[0].detached.is_none());
-        assert_eq!(owner.lifecycle.as_ref().unwrap().command, flight.command);
+        assert_eq!(owner.lifecycle.first().unwrap().command, flight.command);
     }
 
     #[test]
@@ -2146,7 +2287,7 @@ mod tests {
                 now: 1_000_000_000,
             },
         );
-        let flight = owner.lifecycle.as_ref().unwrap().clone();
+        let flight = owner.lifecycle.first().unwrap().clone();
         answer(&mut owner, StoreOutcome::PendingOrUnknown);
         assert_eq!(
             owner.sessions.len(),
@@ -2221,7 +2362,7 @@ mod tests {
             SessionExpiry::After(1),
             1_000_000_000,
         );
-        let flight = owner.lifecycle.as_ref().unwrap().clone();
+        let flight = owner.lifecycle.first().unwrap().clone();
         let mut wrong = opened(1, SessionExpiry::After(1));
         if let SessionChange::Opened {
             session_present, ..
@@ -2306,5 +2447,260 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Replays `models/session-open-batch/MSessionOpenBatch.tla`:
+    /// concurrent distinct non-destructive opens pipeline up to headroom,
+    /// same-client / same-connection / capacity-overflow / exclusive
+    /// transitions serialize cleanly, and out-of-order commits preserve
+    /// owner/store consistency.
+    #[test]
+    fn concurrent_distinct_opens_pipeline_and_serialize_conflicts_and_exclusives() {
+        let incarnation = StoreIncarnation::new(1);
+        let epoch = RunEpoch::new(2);
+        let mut opening = EpochOpening::new(incarnation, StartupNonce::new([7; 16]));
+        let command = opening.submit(RunEpoch::new(1)).unwrap();
+        let _ = opening
+            .observe(OpeningReply {
+                command,
+                outcome: OpeningOutcome::Committed(EpochOpened { incarnation, epoch }),
+            })
+            .unwrap();
+        let mut authority =
+            OwnerAuthority::from_grant(opening.hand_over().unwrap(), bound(1)).unwrap();
+        let outbox = authority
+            .create_outbox(
+                LogicalOwnerId::new(4),
+                NonZeroUsize::new(64).unwrap(),
+                bound(8),
+            )
+            .unwrap();
+        let mut owner = Owner::new(
+            OwnerConfig {
+                max_sessions: bound(3),
+                max_routes: bound(4),
+                max_exchanges: bound(8),
+                session_qos2_exchanges: NonZeroU32::MAX,
+                account: AccountId::new(1),
+                payload_bytes: PayloadBytes::new(1024),
+                resolution_delay: LogicalDuration::new(1),
+                retained_operations: bound(16),
+                remembered_connections: bound(8),
+            },
+            outbox,
+        )
+        .unwrap();
+        let facts = [
+            RecoveredFact::Epoch {
+                incarnation: owner.incarnation,
+                epoch: owner.epoch,
+            },
+            RecoveredFact::Limits {
+                max_targets_per_admission: 2,
+                max_topic_bytes: 128,
+                max_payload_bytes: PayloadBytes::new(128),
+            },
+            RecoveredFact::RouteTable {
+                revision: Revision::new(0),
+            },
+        ];
+        assert!(
+            apply(
+                &mut owner,
+                Input::Recovery {
+                    facts: BoundedVec::from_slice(&facts, facts.len()).unwrap(),
+                    last: true,
+                },
+            )
+            .is_empty()
+        );
+
+        let open_will = |owner: &mut Owner,
+                         generation: u64,
+                         client_id: &[u8],
+                         clean_start: bool,
+                         expiry: SessionExpiry,
+                         now: u64| {
+            owner.step(
+                Input::OpenSessionWillAt {
+                    connection: ConnectionGeneration::new(generation),
+                    client_id: bytes(client_id),
+                    clean_start,
+                    expiry,
+                    now,
+                    will: None,
+                },
+                TURN,
+            )
+        };
+
+        // 1. Concurrent distinct opens pipeline (replays NeverBatched witness).
+        assert!(matches!(
+            open_will(&mut owner, 1, b"c1", false, SessionExpiry::OnDisconnect, 1),
+            StepOutcome::Applied { .. }
+        ));
+        let e1 = drain(&mut owner);
+        assert!(matches!(
+            open_will(&mut owner, 2, b"c2", false, SessionExpiry::Never, 2),
+            StepOutcome::Applied { .. }
+        ));
+        let e2 = drain(&mut owner);
+        assert_eq!(owner.lifecycle_count(), 2);
+
+        // 2. Same-client and same-connection opens serialize (replays mut-same-client).
+        assert!(matches!(
+            open_will(&mut owner, 3, b"c1", false, SessionExpiry::Never, 3),
+            StepOutcome::NeedCapacity { .. }
+        ));
+        assert!(matches!(
+            open_will(&mut owner, 1, b"c3", false, SessionExpiry::Never, 3),
+            StepOutcome::NeedCapacity { .. }
+        ));
+
+        // 3. Third distinct open fits max_sessions=3; fourth is refused until capacity frees
+        // (replays mut-no-capacity).
+        assert!(matches!(
+            open_will(&mut owner, 4, b"c3", false, SessionExpiry::Never, 4),
+            StepOutcome::Applied { .. }
+        ));
+        let e3 = drain(&mut owner);
+        assert_eq!(owner.lifecycle_count(), 3);
+        assert!(matches!(
+            open_will(&mut owner, 5, b"c4", false, SessionExpiry::Never, 5),
+            StepOutcome::NeedCapacity { .. }
+        ));
+
+        // 4. Out-of-order commits (c2, then c3, then c1) deliver each peer its own CONNACK.
+        let (op2, f2) = known(&mut owner, &e2, opened(2, SessionExpiry::Never));
+        assert!(f2.iter().any(|(_, e)| matches!(
+            e,
+            Effect::EmitFrame {
+                connection,
+                frame: OutboundFrame::Connack { session_present: false },
+                ..
+            } if connection.generation == ConnectionGeneration::new(2)
+        )));
+        let (op3, f3) = known(&mut owner, &e3, opened(3, SessionExpiry::Never));
+        assert!(f3.iter().any(|(_, e)| matches!(
+            e,
+            Effect::EmitFrame {
+                connection,
+                frame: OutboundFrame::Connack { session_present: false },
+                ..
+            } if connection.generation == ConnectionGeneration::new(4)
+        )));
+        let (op1, f1) = known(&mut owner, &e1, opened(1, SessionExpiry::OnDisconnect));
+        assert!(f1.iter().any(|(_, e)| matches!(
+            e,
+            Effect::EmitFrame {
+                connection,
+                frame: OutboundFrame::Connack { session_present: false },
+                ..
+            } if connection.generation == ConnectionGeneration::new(1)
+        )));
+        assert_eq!(owner.lifecycle_count(), 0);
+        assert_eq!(owner.sessions.len(), 3);
+
+        // 5. Detach c2 (exclusive), then start a batch-safe resume of c2; exclusive
+        // transitions (EndSessionWill on c1, live takeover on c3, destructive CleanStart
+        // on c2) must all wait until the batch drains (replays mut-exclusive-overlap).
+        let detach_c2 = apply(
+            &mut owner,
+            Input::EndSessionWill {
+                connection: ConnectionKey {
+                    session: SessionId::new(2),
+                    generation: ConnectionGeneration::new(2),
+                },
+                opened_by: Some(op2),
+                expiry: SessionExpiry::Never,
+                observed_at: 10,
+                publish: false,
+            },
+        );
+        let detach_op = owner.lifecycle.first().unwrap().command.operation;
+        known(
+            &mut owner,
+            &detach_c2,
+            SessionChange::Detached {
+                session: SessionId::new(2),
+                expiry: SessionExpiry::Never,
+                detached: SessionDetachment {
+                    operation: detach_op,
+                    deadline: None,
+                },
+            },
+        );
+        assert!(matches!(
+            open_will(&mut owner, 6, b"c2", false, SessionExpiry::Never, 20),
+            StepOutcome::Applied { .. }
+        ));
+        let e2_resume = drain(&mut owner);
+        assert_eq!(owner.lifecycle_count(), 1);
+        assert!(matches!(
+            owner.step(
+                Input::EndSessionWill {
+                    connection: ConnectionKey {
+                        session: SessionId::new(1),
+                        generation: ConnectionGeneration::new(1),
+                    },
+                    opened_by: Some(op1),
+                    expiry: SessionExpiry::OnDisconnect,
+                    observed_at: 21,
+                    publish: false,
+                },
+                TURN,
+            ),
+            StepOutcome::NeedCapacity { .. }
+        ));
+        assert!(matches!(
+            open_will(&mut owner, 7, b"c3", false, SessionExpiry::Never, 22),
+            StepOutcome::NeedCapacity { .. }
+        ));
+        let mut resumed = opened(2, SessionExpiry::Never);
+        if let SessionChange::Opened {
+            session_present, ..
+        } = &mut resumed
+        {
+            *session_present = true;
+        }
+        known(&mut owner, &e2_resume, resumed);
+        assert_eq!(owner.lifecycle_count(), 0);
+
+        // 6. Exclusive close of c1 blocks concurrent open of c4 until c1 finishes.
+        let close_c1 = apply(
+            &mut owner,
+            Input::EndSessionWill {
+                connection: ConnectionKey {
+                    session: SessionId::new(1),
+                    generation: ConnectionGeneration::new(1),
+                },
+                opened_by: Some(op1),
+                expiry: SessionExpiry::OnDisconnect,
+                observed_at: 30,
+                publish: false,
+            },
+        );
+        assert_eq!(owner.lifecycle_count(), 1);
+        assert!(matches!(
+            open_will(&mut owner, 8, b"c4", false, SessionExpiry::Never, 31),
+            StepOutcome::NeedCapacity { .. }
+        ));
+        known(&mut owner, &close_c1, closed(1));
+        assert_eq!(owner.lifecycle_count(), 0);
+        assert_eq!(owner.sessions.len(), 2);
+
+        // With c1 retired, c4 opens cleanly and c3's binding remained untouched.
+        assert!(matches!(
+            open_will(&mut owner, 8, b"c4", false, SessionExpiry::Never, 32),
+            StepOutcome::Applied { .. }
+        ));
+        let e4 = drain(&mut owner);
+        known(&mut owner, &e4, opened(4, SessionExpiry::Never));
+        assert_eq!(owner.sessions.len(), 3);
+        assert_eq!(
+            owner.connection_of(SessionId::new(3)),
+            Some(ConnectionGeneration::new(4))
+        );
+        let _ = op3;
     }
 }
