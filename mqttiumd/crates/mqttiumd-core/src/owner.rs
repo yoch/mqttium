@@ -991,7 +991,6 @@ impl Effects {
         }
     }
 
-    #[inline]
     fn clear(&mut self) {
         for slot in &mut self.items[..self.count] {
             *slot = None;
@@ -1323,7 +1322,6 @@ pub enum StepResult {
 }
 
 impl StepResult {
-    #[inline]
     fn into_outcome(self, input: &mut Option<Input>) -> StepOutcome {
         match self {
             Self::Applied {
@@ -1350,7 +1348,6 @@ impl StepResult {
         }
     }
 
-    #[inline]
     fn reservation_refused(
         refusal: crate::contract::effects::ReserveRefused,
         work_used: WorkUnits,
@@ -2071,7 +2068,6 @@ impl Owner {
         self.last_observed_puback_ignored
     }
 
-    #[inline]
     fn new_draft(&mut self) -> Draft {
         let effects = self
             .scratch_effects
@@ -2093,7 +2089,6 @@ impl Owner {
         }
     }
 
-    #[inline]
     fn return_scratch_effects(&mut self, mut effects: alloc::boxed::Box<Effects>) {
         if effects.count != 0 {
             effects.clear();
@@ -2116,7 +2111,6 @@ impl Owner {
     /// In-place variant of [`Self::step`]: avoids moving the input or returning
     /// it inside a large `StepOutcome`. On `NeedCapacity`/`Exhausted`, `input`
     /// remains `Some(...)`.
-    #[inline]
     pub fn step_in_place(&mut self, input: &mut Option<Input>, grant: TurnGrant) -> StepResult {
         self.step_in_place_with_sink_and_oracle::<dyn EffectSink>(input, grant, None, None)
             .0
@@ -2140,7 +2134,6 @@ impl Owner {
 
     /// Monomorphized, in-place variant of [`Self::step_and_dispatch`] for
     /// concrete sinks: avoids both vtable dispatch and copying `Input`/`StepOutcome`.
-    #[inline]
     pub fn step_and_dispatch_in_place<S: EffectSink>(
         &mut self,
         input: &mut Option<Input>,

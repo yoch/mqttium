@@ -343,12 +343,17 @@ impl SessionDeliveries {
 /// Compact slot index for `by_claim_op`: almost all claims target a single
 /// delivery, avoiding `SmallIndexSet` overhead on the steady-state hot path
 /// while still supporting multi-target inline claims.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub(super) enum ClaimSlots {
-    #[default]
     Empty,
     One(usize),
     Many(alloc::boxed::Box<SmallIndexSet>),
+}
+
+impl Default for ClaimSlots {
+    fn default() -> Self {
+        Self::Empty
+    }
 }
 
 pub(super) enum ClaimSlotsIter<'a> {
@@ -360,7 +365,6 @@ pub(super) enum ClaimSlotsIter<'a> {
 impl Iterator for ClaimSlotsIter<'_> {
     type Item = usize;
 
-    #[inline]
     fn next(&mut self) -> Option<usize> {
         match self {
             Self::Empty => None,
@@ -371,7 +375,6 @@ impl Iterator for ClaimSlotsIter<'_> {
 }
 
 impl ClaimSlots {
-    #[inline]
     pub(super) fn len(&self) -> usize {
         match self {
             Self::Empty => 0,
@@ -380,12 +383,10 @@ impl ClaimSlots {
         }
     }
 
-    #[inline]
     pub(super) fn is_empty(&self) -> bool {
         matches!(self, Self::Empty)
     }
 
-    #[inline]
     pub(super) fn insert(&mut self, index: usize) {
         match self {
             Self::Empty => *self = Self::One(index),
@@ -403,7 +404,6 @@ impl ClaimSlots {
         }
     }
 
-    #[inline]
     pub(super) fn remove(&mut self, index: &usize) {
         match self {
             Self::Empty => {}
@@ -418,7 +418,6 @@ impl ClaimSlots {
         }
     }
 
-    #[inline]
     pub(super) fn iter(&self) -> ClaimSlotsIter<'_> {
         match self {
             Self::Empty => ClaimSlotsIter::Empty,
@@ -1002,7 +1001,6 @@ impl Deliveries {
     /// Fast path for `Change::Written`: only `local_write_completed` and
     /// `certain_never_started` change, which cannot affect any index when the
     /// delivery has no expiry.
-    #[inline]
     pub(super) fn mark_written(&mut self, index: usize, complete: bool) {
         let d = &mut self.rows[index];
         if d.expiry.is_none() {
@@ -1019,7 +1017,6 @@ impl Deliveries {
     /// Fast path for `Change::Finish`: transitions a steady-state `AwaitPuback`
     /// delivery to `FinishPending(in_flight)`, falling back to `mutate` on any
     /// unusual state (retired, early ack, expiry, etc.).
-    #[inline]
     pub(super) fn start_finish(&mut self, index: usize, in_flight: InFlight) {
         let d = &self.rows[index];
         if !d.retired
@@ -1055,7 +1052,6 @@ impl Deliveries {
     /// Fast path for `InlineSlotOutcome::Committed`: transitions a steady-state
     /// `InlineClaimPending` delivery to `AwaitPuback` and records its frame and
     /// window when emitted immediately.
-    #[inline]
     pub(super) fn commit_inline_emitted(
         &mut self,
         index: usize,

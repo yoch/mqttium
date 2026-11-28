@@ -26,13 +26,11 @@ const MIN_CAPACITY: usize = 16;
 
 /// Deterministic 64-bit Fibonacci mixer (2 instructions on ARM64: `mul` +
 /// shifted `eor`, zero collisions on sequential IDs in power-of-two tables).
-#[inline]
 fn mix64(x: u64) -> u64 {
     let h = x.wrapping_mul(0x9e37_79b9_7f4a_7c15);
     h ^ (h >> 32)
 }
 
-#[inline]
 fn combine64(a: u64, b: u64) -> u64 {
     let h = a.wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ b.wrapping_mul(0x517c_c1b7_2722_0a95);
     h ^ (h >> 32)
@@ -45,70 +43,60 @@ pub trait SeqKey: FlatKey {
 }
 
 impl SeqKey for u64 {
-    #[inline]
     fn seq_u64(self) -> u64 {
         self
     }
 }
 
 impl SeqKey for usize {
-    #[inline]
     fn seq_u64(self) -> u64 {
         self as u64
     }
 }
 
 impl SeqKey for SessionId {
-    #[inline]
     fn seq_u64(self) -> u64 {
         self.get()
     }
 }
 
 impl SeqKey for ConnectionGeneration {
-    #[inline]
     fn seq_u64(self) -> u64 {
         self.get()
     }
 }
 
 impl SeqKey for DeadlineToken {
-    #[inline]
     fn seq_u64(self) -> u64 {
         self.get()
     }
 }
 
 impl SeqKey for OperationSeq {
-    #[inline]
     fn seq_u64(self) -> u64 {
         self.get()
     }
 }
 
 impl SeqKey for PublicationSeq {
-    #[inline]
     fn seq_u64(self) -> u64 {
         self.get()
     }
 }
 
 impl SeqKey for PayloadSeq {
-    #[inline]
     fn seq_u64(self) -> u64 {
         self.get()
     }
 }
 
 impl SeqKey for EffectSeq {
-    #[inline]
     fn seq_u64(self) -> u64 {
         self.get()
     }
 }
 
 impl SeqKey for (PublicationSeq, u32) {
-    #[inline]
     fn seq_u64(self) -> u64 {
         self.0
             .get()
@@ -325,7 +313,6 @@ impl<K: FlatKey, V> FlatMap<K, V> {
         self.slots = new_slots;
     }
 
-    #[inline]
     fn ensure_capacity_for_insert(&mut self) {
         let cap = self.slots.len();
         if cap == 0 {
@@ -335,7 +322,6 @@ impl<K: FlatKey, V> FlatMap<K, V> {
         }
     }
 
-    #[inline]
     fn find_slot(&self, key: K) -> Option<usize> {
         let cap = self.slots.len();
         if cap == 0 || self.len == 0 {
@@ -353,26 +339,22 @@ impl<K: FlatKey, V> FlatMap<K, V> {
     }
 
     #[must_use]
-    #[inline]
     pub fn contains_key(&self, key: &K) -> bool {
         self.find_slot(*key).is_some()
     }
 
     #[must_use]
-    #[inline]
     pub fn get(&self, key: &K) -> Option<&V> {
         let idx = self.find_slot(*key)?;
         self.slots[idx].as_ref().map(|(_, v)| v)
     }
 
     #[must_use]
-    #[inline]
     pub fn get_mut(&mut self, key: &K) -> Option<&mut V> {
         let idx = self.find_slot(*key)?;
         self.slots[idx].as_mut().map(|(_, v)| v)
     }
 
-    #[inline]
     pub fn insert(&mut self, key: K, value: V) -> Option<V> {
         self.ensure_capacity_for_insert();
         let mask = self.slots.len() - 1;
@@ -392,7 +374,6 @@ impl<K: FlatKey, V> FlatMap<K, V> {
         }
     }
 
-    #[inline]
     pub fn get_or_insert_with(&mut self, key: K, f: impl FnOnce() -> V) -> &mut V {
         self.ensure_capacity_for_insert();
         let mask = self.slots.len() - 1;
@@ -414,7 +395,6 @@ impl<K: FlatKey, V> FlatMap<K, V> {
         }
     }
 
-    #[inline]
     pub fn get_or_insert_default(&mut self, key: K) -> &mut V
     where
         V: Default,
@@ -422,7 +402,6 @@ impl<K: FlatKey, V> FlatMap<K, V> {
         self.get_or_insert_with(key, V::default)
     }
 
-    #[inline]
     pub fn remove(&mut self, key: &K) -> Option<V> {
         let idx = self.find_slot(*key)?;
         let removed = self.slots[idx].take().map(|(_, v)| v);
@@ -431,7 +410,6 @@ impl<K: FlatKey, V> FlatMap<K, V> {
         removed
     }
 
-    #[inline]
     fn backward_shift_from(&mut self, mut hole: usize) {
         let mask = self.slots.len() - 1;
         let mut curr = (hole + 1) & mask;
@@ -669,7 +647,6 @@ where
     }
 
     #[must_use]
-    #[inline]
     pub fn contains_key(&self, key: &K) -> bool {
         if self.hot_scope == Some(key.scope()) {
             self.hot.contains_key(&key.local())
@@ -679,7 +656,6 @@ where
     }
 
     #[must_use]
-    #[inline]
     pub fn get(&self, key: &K) -> Option<&V> {
         if self.hot_scope == Some(key.scope()) {
             self.hot.get(&key.local())
@@ -689,7 +665,6 @@ where
     }
 
     #[must_use]
-    #[inline]
     pub fn get_mut(&mut self, key: &K) -> Option<&mut V> {
         if self.hot_scope == Some(key.scope()) {
             self.hot.get_mut(&key.local())
@@ -698,7 +673,6 @@ where
         }
     }
 
-    #[inline]
     pub fn insert(&mut self, key: K, value: V) -> Option<V> {
         let scope = key.scope();
         match self.hot_scope {
@@ -722,7 +696,6 @@ where
         }
     }
 
-    #[inline]
     pub fn remove(&mut self, key: &K) -> Option<V> {
         if self.hot_scope == Some(key.scope()) {
             self.hot.remove(&key.local())
@@ -731,7 +704,6 @@ where
         }
     }
 
-    #[inline]
     pub fn get_or_insert_default(&mut self, key: K) -> &mut V
     where
         V: Default,
@@ -808,13 +780,11 @@ impl<K: SeqKey, V> SeqMap<K, V> {
     }
 
     #[must_use]
-    #[inline]
     pub fn len(&self) -> usize {
         self.ring_len + self.overflow.len()
     }
 
     #[must_use]
-    #[inline]
     pub fn is_empty(&self) -> bool {
         self.ring_len == 0 && self.overflow.is_empty()
     }
@@ -829,7 +799,6 @@ impl<K: SeqKey, V> SeqMap<K, V> {
         self.overflow.clear();
     }
 
-    #[cold]
     fn grow_ring(&mut self, new_cap: usize) {
         let cap = new_cap
             .clamp(SEQ_RING_MIN, SEQ_RING_MAX)
@@ -863,7 +832,6 @@ impl<K: SeqKey, V> SeqMap<K, V> {
     }
 
     #[must_use]
-    #[inline]
     pub fn contains_key(&self, key: &K) -> bool {
         let cap = self.ring.len();
         if cap == 0 {
@@ -879,7 +847,6 @@ impl<K: SeqKey, V> SeqMap<K, V> {
     }
 
     #[must_use]
-    #[inline]
     pub fn get(&self, key: &K) -> Option<&V> {
         let cap = self.ring.len();
         if cap == 0 {
@@ -899,7 +866,6 @@ impl<K: SeqKey, V> SeqMap<K, V> {
     }
 
     #[must_use]
-    #[inline]
     pub fn get_mut(&mut self, key: &K) -> Option<&mut V> {
         let cap = self.ring.len();
         if cap == 0 {
@@ -916,7 +882,6 @@ impl<K: SeqKey, V> SeqMap<K, V> {
         }
     }
 
-    #[inline]
     pub fn insert(&mut self, key: K, value: V) -> Option<V> {
         if self.ring.is_empty() {
             self.grow_ring(SEQ_RING_MIN);
@@ -940,7 +905,6 @@ impl<K: SeqKey, V> SeqMap<K, V> {
         }
     }
 
-    #[cold]
     fn insert_collision(&mut self, key: K, value: V) -> Option<V> {
         if let Some(prev) = self.overflow.insert(key, value) {
             return Some(prev);
@@ -954,7 +918,6 @@ impl<K: SeqKey, V> SeqMap<K, V> {
         None
     }
 
-    #[inline]
     pub fn get_or_insert_default(&mut self, key: K) -> &mut V
     where
         V: Default,
@@ -981,7 +944,6 @@ impl<K: SeqKey, V> SeqMap<K, V> {
         self.get_or_insert_default_slow(key)
     }
 
-    #[cold]
     fn get_or_insert_default_slow(&mut self, key: K) -> &mut V
     where
         V: Default,
@@ -1000,7 +962,6 @@ impl<K: SeqKey, V> SeqMap<K, V> {
         self.overflow.get_or_insert_default(key)
     }
 
-    #[inline]
     pub fn remove(&mut self, key: &K) -> Option<V> {
         let cap = self.ring.len();
         if cap == 0 {
@@ -1104,13 +1065,11 @@ where
     }
 
     #[must_use]
-    #[inline]
     pub fn len(&self) -> usize {
         self.hot.len() + self.cold.len()
     }
 
     #[must_use]
-    #[inline]
     pub fn is_empty(&self) -> bool {
         self.hot.is_empty() && self.cold.is_empty()
     }
@@ -1121,7 +1080,6 @@ where
     }
 
     #[must_use]
-    #[inline]
     pub fn contains_key(&self, key: &K) -> bool {
         if self.hot_scope == Some(key.scope()) {
             self.hot.contains_key(&key.local())
@@ -1131,7 +1089,6 @@ where
     }
 
     #[must_use]
-    #[inline]
     pub fn get(&self, key: &K) -> Option<&V> {
         if self.hot_scope == Some(key.scope()) {
             self.hot.get(&key.local())
@@ -1141,7 +1098,6 @@ where
     }
 
     #[must_use]
-    #[inline]
     pub fn get_mut(&mut self, key: &K) -> Option<&mut V> {
         if self.hot_scope == Some(key.scope()) {
             self.hot.get_mut(&key.local())
@@ -1150,7 +1106,6 @@ where
         }
     }
 
-    #[inline]
     pub fn insert(&mut self, key: K, value: V) -> Option<V> {
         let scope = key.scope();
         match self.hot_scope {
@@ -1163,7 +1118,6 @@ where
         }
     }
 
-    #[cold]
     fn activate(&mut self, scope: K::Scope) {
         if let Some(earlier) = self.hot_scope.replace(scope) {
             for (local, value) in core::mem::take(&mut self.hot).into_entries() {
@@ -1172,7 +1126,6 @@ where
         }
     }
 
-    #[inline]
     pub fn remove(&mut self, key: &K) -> Option<V> {
         if self.hot_scope == Some(key.scope()) {
             self.hot.remove(&key.local())
@@ -1181,7 +1134,6 @@ where
         }
     }
 
-    #[inline]
     pub fn get_or_insert_default(&mut self, key: K) -> &mut V
     where
         V: Default,

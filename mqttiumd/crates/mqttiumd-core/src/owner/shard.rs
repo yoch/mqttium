@@ -197,7 +197,6 @@ impl Owner {
     }
 
     /// In-place variant of [`Self::step_with_oracle`].
-    #[inline]
     pub fn step_in_place_with_oracle(
         &mut self,
         input: &mut Option<Input>,
@@ -210,7 +209,6 @@ impl Owner {
 
     /// Monomorphized, in-place variant of [`Self::step_and_dispatch_with_oracle`]
     /// for concrete sinks.
-    #[inline]
     pub fn step_and_dispatch_in_place_with_oracle<S: EffectSink>(
         &mut self,
         input: &mut Option<Input>,

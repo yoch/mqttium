@@ -72,12 +72,10 @@ pub(super) struct InFlightVolatile {
 }
 
 impl InFlightVolatile {
-    #[inline]
     fn expiry(&self) -> Option<MessageExpiry> {
         self.expiry.as_deref().copied()
     }
 
-    #[inline]
     fn from_volatile(item: Volatile) -> Result<Self, CoreFault> {
         let connection = item.connection.ok_or(CoreFault::StalePlan)?;
         Ok(Self {
