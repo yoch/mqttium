@@ -5,10 +5,10 @@ the root covers the Python client and does not apply to this subtree, with
 one exception: maintained content is English. `docs/spec/fr/` is the only
 French content; it is an immutable archive.
 
-**Optimisation work starts at `docs/missions/L11-optimisation.md`**: the
-measured baseline after the validation of lot 10, the owner's performance
-gate, and the reservations left open (R1 to R10), each with its evidence,
-its code and what would close it.
+**Current work starts at `docs/missions/L12-herdr-handoff.md`** (hand-off
+after Lot 11 and report `0050`, branch `perf/lot11-production-grade-and-cpu`,
+for the three-agent Herdr workflow); see `docs/missions/L11-optimisation.md`
+for the prior Lot 10 baseline and reserve definitions (R1 to R10).
 
 ## Checks
 

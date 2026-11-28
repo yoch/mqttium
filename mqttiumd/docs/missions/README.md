@@ -219,7 +219,9 @@ afterwards, the evidence it touches is run again.
 
 ## After the validation of lot 10
 
-[Lot 11, optimisation](L11-optimisation.md) is the hand-over to the next
-optimisation work: where the branches stand, the measured baseline of
-report 0049, the owner's performance gate, and the reservations the
-validation left (reports 0043 to 0049).
+- [Lot 11, optimisation](L11-optimisation.md) is the hand-over from the
+  validation of lot 10 (reports 0043 to 0049).
+- [Lot 11 hand-off & Lot 12 start (Herdr team)](L12-herdr-handoff.md) is the
+  hand-over after Lot 11 (`perf/lot11-production-grade-and-cpu`, report
+  [`0050`](../reports/0050-lot11-production-grade-and-cpu.md)) for the
+  three-agent Herdr workflow (Architect, Implementation, Reviewer).
