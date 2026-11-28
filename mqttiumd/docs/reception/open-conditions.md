@@ -265,40 +265,70 @@ Implemented under records `0051`–`0054`, accepted on 27 November 2026, and val
 
 Still open: Will properties beyond zero Will Delay, Topic Aliases, Shared Subscriptions, Subscription Identifiers, username/password authentication, `$SYS`, multi-listener configs, and cross-host power-loss receptions remain outside the implemented profile.
 
-## Validation of the lot 10 head (`9dfd568`, 26 November 2026)
+## Validation of the lot 10 head (`9dfd568`, 26 November 2026) and Lot 11 hardening (`fe85e2ab`)
 
 The branch `refactor/lot10-validated-base` checks the proofs and the code
-of `9dfd568` and corrects what it finds; reports 0043 to 0048 have the account. The
-defects of the default path it found are fixed, each by a test committed
-while it failed. What it leaves open:
+of `9dfd568` and corrects what it finds; reports 0043 to 0048 have the account.
+The branch `perf/lot11-production-grade-and-cpu` (report
+[`0050`](../reports/0050-lot11-production-grade-and-cpu.md), head `fe85e2ab`)
+closes four open rows from the lot 10 hand-off (R1, R3, R4, and ADR 0055's
+backward footer), closes the TLS barrier half of R7, closes D7/D8/D9 plus the
+three missing sharded TLA+ models and TLS credit-exhaustion test of R5, and cuts
+idle anonymous RSS (R6) and per-delivery CPU (R2):
+
+- **Closed — fan-in regression of `76af3a5` (R1, `7bfd3efe`).**
+  `DirtyDuringLoad` (`DIRTY_SET_CAP = 16 > WORK_PAGE_LIMIT = 8`) preserves the
+  `LoadWork` scan frontier under monotonic fan-in and rewinds only on lower
+  commits, invalidations, or overflow. Backed by `models/scan-frontier`
+  (`MScanFrontier`, 7/7 TLC configurations) and deterministic replay tests; on
+  ARM64 `fanin-32x1-q1@80000` (`log`, `K = 0`), median throughput recovers from
+  68.5k/s (23,013 refused, 14.4 % loss) to 80.0k/s (0 median refused, -15.2 %
+  CPU/delivery).
+- **Closed — LogStore `.mlog` backward-readable footer (ADR 0055 / Proposed ADR
+  `0068`, `e1913ece`).** `.mlog` v2 appends a 16-byte self-authenticating
+  footer (`[body_crc][body_len][footer_crc][b"MLGE"]`) and verifies backward
+  reachability at recovery, failing closed (`OpenError::Corrupt`) on a zeroed
+  first sector followed by a valid committed footer instead of truncating it as
+  a torn tail. Physical power-loss reception and acceptance of ADR `0068`
+  remain open below.
+- **Closed — retained QoS 0 replay one commit at a time (R3, `fdd96f36`).**
+  `ConsumeDelivery` is pipelined within `QOS0_CONSUMED_WINDOW = 16` via
+  `next_pipelined_action`, preserving atomic retained snapshots (record 0032)
+  while collapsing 16 retained QoS 0 replay commits in `log` mode from 17
+  `.mlog` frames to a median of 3 `[3..5]`.
+- **Closed — session openings one at a time (R4 / Proposed ADR `0069`,
+  `8393fe68`).** `Owner::lifecycle` supports up to `LIFECYCLE_IN_FLIGHT = 16`
+  concurrent distinct-client openings (`CONTROL_QUEUE = 32`) batched through
+  `Writer::apply_group` while serialising same-`ClientID` conflicts and
+  exclusive barriers. Backed by `models/session-open-batch`
+  (`MSessionOpenBatch`, 5/5 TLC configurations); 128 concurrent MQTT 5 opens in
+  `log` mode drop from 38.53 ms / 128 `.mlog` frames to 5.86 ms / 8 frames
+  (6.58× faster, 16× fewer commits). Slow-disk reception and acceptance of ADR
+  `0069` remain open below.
+- **Closed — TLS takeover barrier flake (`secure::takeover_with_a_partially_written_tls_record`,
+  R7, `06ab8c87`).** `net/tls.rs` now resets `encoded.deadline` (`WRITE_TIMEOUT`)
+  after `test-hooks` frame barriers and checks `is_cancelled()`; covered by the
+  permanent `takeover-k0-delayed-drain` scenario in `disconnect_durability`.
+
+What remains open:
 
 | Condition | Closed by | Blocks |
 | - | - | - |
-| **The sharded mode is experimental.** With `--delivery-shards K >= 1` the inline-claim lease and its dirty barrier have a model since the third part (`models/inline-lease`); the routing of acknowledgements, the end of a generation and the stop have none, and every other runtime model describes `K = 0`. Fixed, each by a failing test first: in the first part (report 0044) a shard panic not reported, a stop lost on a full lane, the wake hold kept through a wait, silent skips at attach, unbounded delegated QoS 0, a lease count that could wrap, a retained replay before its SUBACK; in the second (report 0045) a lease published without a committed claim's identifier, and a shard claim that took a reserved identifier, now prevented by the read fence of the third; in the third (report 0046) a lease never eligible again after a stored publication, a stored publication committed by a resolution never delivered, the order of a subscriber's publications after an unknown outcome (suspect B1), a delivery sent twice after a read during an unknown outcome, reads stopped while the acknowledgement credit is spent, and three divergences of the shard's effect sink (journal origin, journal failures, PUBREL bindings). Still open: the rest of that divergence (no `frame_queued`, `frame_failed` or `effect_retained` entry from a shard, a too large PUBLISH answered otherwise, no close notice for a transport that is gone, writes to a connection the coordinator is closing, no producer signal when a socket drains, so a held effect is retried every millisecond); store worker head-of-line blocking across owners (D8); detach scans quadratic in pending detaches (D9); an answer of the store stepped after a later one when the core lacks capacity, outside the model; the TLS read turn without credit, which has no unit test. `sharded_slow_subscriber_isolation_and_fifo_drain` exceeded its 550 ms bound under CPU oversubscription (report 0047) while the publisher was not paced by the slow subscriber (report 0048); by the owner's decision its slow subscriber acknowledges every 40 ms and the bound is 2 s (`c5401cb`) | A lot decided by the owner on 27 November 2026: D8, D9, the rest of the divergence of the shard's sink, and models of the routing of acknowledgements, the end of a generation and the stop. Report 0049 measured what the mode gives on three broker cores: K = 3 raises a wide QoS 1 fan-out by 21 % (volatile) and 59 % (log) and K = 2 keeps up with the fan-in in log mode, while K >= 1 loses 16 to 41 % on 4 and 32 volatile pairs, adds latency at every load, costs up to 65 % more CPU per delivery and 7.6 MB; K = 2 is unstable on the widest fan-out, and the volatile fan-in falls behind at every K >= 1 | The mode leaving "experimental", after that lot, if the owner keeps it |
-| **Records applied while proposed.** The owner accepted 0051 to 0057, 0064 and 0065 on 27 November 2026, four of them with the amendments of report 0043. 0066 stays proposed until the sharded mode leaves "experimental": it departs from 0044 (accepted) without amending it, and names where. 0067 stays proposed by the owner's choice | Owner of the repository | Acceptance of 0066 and 0067 |
-| **Performance figures of lots 8 to 10.** Reports 0039 to 0041 are single runs, on code that later commits changed, two of them with a load generator that could write past its buffer (fixed by `675128d`), against an unpinned Mosquitto 2.1.2 kept in memory while mqttiumd synchronised a log. Report 0049 measured their claims again on the x86-64 VM, six alternated passes each, against the pinned Mosquitto 2.1.4: the gains of lots 8 and 9 hold, some smaller than on the Pi; lot 10 at K = 0 is not the lot 9 path (next row); several comparisons with Mosquitto do not hold against 2.1.4 | The ARM64 suite on the Pi, at reception | An ARM64 performance claim of those lots |
-| **The fan-in limit of the default path fell in lot 10.** With 32 publishers to one subscriber in log mode, lot 9 keeps up to between 70,000 and 80,000 publications per second, lot 10 and the head to between 60,000 and 70,000, at 18 % more CPU per delivery at 70,000/s (report 0049). `git bisect` names `76af3a5`, which fixes a lost wake-up: a rescan requested during a work read now restarts the scan from the start and skips the inline claim. Record 0066 says that K = 0 is the lot 9 path | A cheaper rescan, for instance one that resumes at the first obligation made visible during the read, with a model of the scan frontier | A fan-in claim of the default path above 60,000/s |
-| **A log image recovery cannot tell from a torn tail.** A committed frame whose first sector reads as zeros, followed only by bytes within the reach of one frame, is cut without an error (record 0055) | A frame format that can be read backwards | A power-loss claim of `--storage-mode log` |
+| **The sharded mode is experimental.** With `--delivery-shards K >= 1`, lot 11D (`3762afb1`, report 0050) closed the remaining open items from the 27 November 2026 list: `finish_detaches()` O(1) per-connection tracking (`terminal_by_conn`, D9), per-lane writer drain without cross-owner head-of-line blocking (D8), full `ShardSink` parity (`frame_queued`, `frame_failed`, deduplicated `effect_retained`, oversize `SubmitBlock::Closed`, `TrySendError::Disconnected` close notice, `ConnCore::closing` fence, and `outgoing_waiter` direct socket-drain wake, D7), the TLS read-without-credit test (which also uncovered and fixed a stranded-packet bug in `net.rs` and `net/tls.rs` when promoting a parked `unpaid_ack`), and the three missing runtime models (`models/shard-ack-route`, `models/shard-detach`, `models/shard-stop`, 13/13 TLC configurations passing). On ARM64 (report 0050), `lot11-k3` reaches 244.4k/s on `fanout-1x16-q1@240000` (`log`, 0 refused, 10.84 µs/delivery) and `lot11-k2` drops `fanout` p99 from 1,256 ms to 5.98 ms and idle `K = 2` RSS from 15.5 MB to 6.1 MB. Still open: an answer of the store stepped after a later one when the core lacks capacity (outside the model); `lot11-k2` still showed 1/4 passes with refusals at `fanout@240k`; and the owner's decision on whether to keep and promote sharded mode out of "experimental" alongside report 0049 (x86-64) and report 0050 (ARM64) | Owner of the repository (decision on keeping/promoting the mode and accepting 0066); core follow-up for out-of-order store answers under core capacity exhaustion | The mode leaving "experimental" |
+| **Records applied while proposed.** The owner accepted 0051 to 0057, 0064 and 0065 on 27 November 2026, four of them with the amendments of report 0043. 0066 stays proposed until the sharded mode leaves "experimental": it departs from 0044 (accepted) without amending it, and names where. 0067 stays proposed by the owner's choice. Lot 11 adds proposed records 0068 (`.mlog` v2 backward footer) and 0069 (concurrent distinct session open batching, amending 0048) | Owner of the repository | Acceptance of 0066, 0067, 0068 and 0069 |
+| **Performance figures of lots 8 to 10.** Reports 0039 to 0041 are single runs, on code that later commits changed, two of them with a load generator that could write past its buffer (fixed by `675128d`), against an unpinned Mosquitto 2.1.2 kept in memory while mqttiumd synchronised a log. Report 0049 measured lots 7 to 10 on x86-64 against pinned Mosquitto 2.1.4; report 0050 adds alternated ARM64 A/B campaigns on the Raspberry Pi 5 for `head` (`6915fbf3`) vs Lot 11 (`fe85e2ab`) and Mosquitto 2.1.2 (volatile-only). Historical reports 0039 to 0041 remain superseded immutable records; cross-host non-loopback and slow-disk reception remain open | Real-disk and cross-host reception | Any non-loopback or slow-disk throughput claim |
 | **A connect beside an old peer whose binding ended.** When a frame of a task that already ended has failed, the owner ends the binding while the peer is still in the table; a new connection of the session is then no takeover. Exploratory runtime runs showed no defect (CONNACK and Session Present correct); `MTakeoverInFlight` does not contain the path, and `OldClosedBeforeNewBound` was not checked on it | Model and replay | Scope of `models/takeover` |
 | **Volatile store, what the validation did not change.** The operation table keeps an owner's ring after its run (32 rings at most, then the ordered fallback), and a ring grows with the span of sequences from its oldest live entry. A recovery page reads the whole inventory, and an expiry sweep scans every delivery of each expired publication | Store lot | Recovery and expiry at the session bound |
 | **The oracle judges one owner on two stores.** It reads recipes 24 and 25 since this validation, and leaves them out of the scope of a verdict. The log store, the volatile store and the sharded mode are judged by their conformance suites and by the bench, not by the oracle | Oracle lot | Qualifying campaigns on those stores |
 | **`tools/bounded-batch.mutant` no longer applies.** It belongs to the frozen receptions of report 0026 | Not planned: frozen evidence | — |
-| **Session openings one at a time.** A CONNECT waits for a will barrier and a session opening of the writer, and the runtime keeps one opening in flight (record 0048). A burst of connections therefore needs about two journal commits per connection, one after the other, within the 3 s connect deadline (record 0022). With every `fsync` slowed by 80 ms, two connections of a burst of seventeen were closed with `connect_deadline` in log mode after the fix of report 0048 | Decided by the owner on 27 November 2026: the limit is stated in the migration guide, and a lot studies several openings in flight or openings committed together, with a model | A claim about bursts of connections on a slow disk |
-| **Retained replay one commit at a time.** In `check_retained_qos0_replay` (`crates/mqttiumd/src/runtime_tests.rs`), a SUBSCRIBE that replays 16 retained QoS 0 messages waited for 17 store commits, one after the other (`40c0e8e`); which commands they are was not analysed. See R3 of `docs/missions/L11-optimisation.md` | An analysis of those commits, and a replay that groups them while it stays atomic (record 0032) | A claim about retained replay on a disk that synchronises slowly |
-| **Two intermittent test failures.** `a_shard_that_panics_is_reported_to_the_coordinator` failed once locally (PR #684) and `secure::takeover_with_a_partially_written_tls_record` once in the CI of PR #685; neither was reproduced (248 and 15 runs). See R7 of `docs/missions/L11-optimisation.md` | A reproduction under the loads of report 0048, then a cause | — |
+| **One remaining unreproduced intermittent test failure.** `a_shard_that_panics_is_reported_to_the_coordinator` failed once locally (PR #684) and was never reproduced across 248 local runs; its panic-reporting state machine is now formally modelled in `models/shard-stop` (`MShardStop`), but no root cause for that historical single failure was reproduced. (`secure::takeover_with_a_partially_written_tls_record` is closed above) | A reproduction under CPU oversubscription / slow `fsync`, then a cause | — |
 | **What the cleanup left.** `drain_inputs` and `Sink::try_submit`, about 1,100 lines each, keep their arms inline: the large ones are the per-publication paths, and splitting them relies on the inliner. `net.rs` and `writer.rs` were not split (report 0047) | A lot that splits them arm by arm with instruction counts for each | — |
 
-Order of the work, decided by the owner on 27 November 2026; the owner left
-the three items marked "delegated" to the author of the validation:
+Order of the remaining work from the 27 November 2026 list (D8, D9, D7, the three sharded models, the backward-readable log format, and the ARM64 measurements of `head` vs Lot 11 are now implemented on `perf/lot11-production-grade-and-cpu`, report 0050):
 
-- High: store worker head-of-line blocking (D8), quadratic detach scans
-  (D9), the models the sharded mode lacks, new measurements of lots 8 to 10
-  (done on x86-64 by report 0049).
-- Medium: the rest of the divergence of the shard's sink (D7), a log format
-  that can be read backwards, the oracle on the other stores, the connect
-  beside an old peer (delegated).
-- Low: what the validation did not change in the volatile store (delegated),
-  the split of `drain_inputs` and `Sink::try_submit` (delegated).
+- Owner decisions: accept or revise proposed records 0066, 0067, 0068, 0069; decide whether to keep/promote sharded mode out of "experimental".
+- Medium: the oracle on the other stores, the connect beside an old peer (delegated).
+- Low: what the validation did not change in the volatile store (delegated), the split of `drain_inputs` and `Sink::try_submit` with callgrind instruction counts (delegated).
 
 ## Follow-up of the external audit of `47e1d12`
 
